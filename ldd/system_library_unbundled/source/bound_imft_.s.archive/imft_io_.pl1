@@ -1,0 +1,1404 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* I/O module to transmit files between Multics sites using I/O daemon record oriented communications modules */
+
+/* Created:  October 1980 by G. Palter */
+/* Modified: April 1982 by G. Palter to greatly simplify attach description and internal operation */
+/* Modified: 26 July 1982 by G. Palter to add get_channel_names control order */
+/* Modified: January 1983 by Robert Coren for communications independence */
+/* Modified: June 1983 by Robert Coren to mask quits when calling iox_$write_record */
+/* Modified: September 1983 by Robert Coren to hold quits during calls to iox_$write_record instead of masking them */
+/* Modified: September 1983 by Robert Coren to pad the allocated record buffers by an extra word */
+
+/****^  HISTORY COMMENTS:
+  1) change(87-11-15,Oke), approve(88-08-01,MCR7948), audit(88-10-11,Farley),
+     install(88-10-14,MR12.2-1165):
+     Add support for "get_transport_line" and "put_transport_chars" control
+     orders.
+  2) change(88-11-10,Beattie), approve(88-08-01,PBF7948),
+     audit(88-11-14,Farley), install(88-11-14,MR12.2-1214):
+     Check records for negative length to prevent invalid data from the
+     IO channel causing problems.  Remove check for bad version or data format
+     if first read.  See note in receive_logical_control_record entry point.
+                                                   END HISTORY COMMENTS */
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+imft_io_:
+     procedure ();
+	return;					/* not an entry */
+
+/* Attach an I/O switch for file transfer */
+
+imft_io_attach:
+     entry (P_iocb_ptr, P_attach_options, P_loud_sw, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	loud_sw = P_loud_sw;
+	code = 0;
+
+	iad_ptr = null ();				/* avoid freeing garbage if I/O switch already attached */
+
+	if iocb_ptr -> iocb.attach_descrip_ptr ^= null () then do;
+	     P_code = error_table_$not_detached;
+	     if loud_sw then call com_err_ (P_code, IMFT_IO_, "For switch ^a.", iocb_ptr -> iocb.name);
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	on condition (cleanup) call cleanup_attachment (ignore_code);
+
+	call create_ips_mask_ (addr (QUIT_NAME), 1, quit_mask);
+						/* we'll need this to mask quits while writing */
+	mask_quits = quit_mask;			/* but hcs_$set_ips_mask wants it unaligned */
+						/* Process attachment options */
+
+	if hbound (P_attach_options, 1) < 1 then
+	     call abort_attachment (error_table_$noarg,
+		"""-direction"", ""-input_description"", and ""-output_description"" must be supplied.");
+
+	allocate iad in (system_area) set (iad_ptr);
+	iad.input_switch.terminal_iocb_ptr,		/* keeps cleanup handler happy */
+	     iad.output_switch.terminal_iocb_ptr, iad.input_switch.record_buffer_ptr,
+	     iad.output_switch.record_buffer_ptr = null ();
+
+	direction = "";				/* haven't seen -direction yet */
+	input_description_idx = 0;			/* haven't seen -input_description yet */
+	output_description_idx = 0;			/* haven't seen -output_description yet */
+	io_description_idx = 0;			/* nor -io_description */
+	iad.debug_mode = "0"b;			/* haven't seen -debug yet */
+	iad.copy_data = "0"b;			/* haven't seen -copy_data yet */
+
+	iad.attach_description = "";
+	iad.open_description = "";
+
+
+	do argument_idx = lbound (P_attach_options, 1) to hbound (P_attach_options, 1);
+
+	     argument_ptr = addr (addr (P_attach_options (argument_idx)) -> string_overlay.characters (1));
+	     argument_lth = length (P_attach_options (argument_idx));
+
+	     if argument = "-direction" then do;
+		direction = get_string_argument ();
+		if (direction ^= "input") & (direction ^= "output") then
+		     call abort_attachment (error_table_$bad_arg,
+			"-direction must be followed by ""input"" or ""output""; not ""^a"".", direction);
+	     end;
+
+	     else if (argument = "-input_description") | (argument = "-ids") then do;
+		an_attach_description = get_string_argument ();
+		input_description_idx = argument_idx;
+	     end;
+
+	     else if (argument = "-output_description") | (argument = "-ods") then do;
+		an_attach_description = get_string_argument ();
+		output_description_idx = argument_idx;
+	     end;
+
+	     else if (argument = "-io_description") | (argument = "-iods") then do;
+		an_attach_description = get_string_argument ();
+		io_description_idx = argument_idx;
+	     end;
+
+	     else if argument = "-debug" then iad.debug_mode = "1"b;
+	     else if argument = "-copy_data" then iad.copy_data = "1"b;
+
+	     else call abort_attachment (error_table_$badopt, """^a""", argument);
+	end;
+
+	if direction = "" then call abort_attachment (error_table_$noarg, "-direction");
+
+	if io_description_idx = 0 then do;
+	     if input_description_idx = 0 then call abort_attachment (error_table_$noarg, "-input_description");
+
+	     if output_description_idx = 0 then call abort_attachment (error_table_$noarg, "-output_description");
+	end;
+	else if input_description_idx ^= 0 | output_description_idx ^= 0 then
+	     call abort_attachment (error_table_$inconsistent, "-io_description and -input_ or -output_description");
+
+/* Construct our attach description */
+
+	iad.attach_description = rtrim (IMFT_IO_);
+
+	iad.attach_description = iad.attach_description || " -direction ";
+	iad.attach_description = iad.attach_description || rtrim (direction);
+
+	if io_description_idx ^= 0			/* single switch for both input and output */
+	then do;
+	     argument_ptr = addr (addr (P_attach_options (io_description_idx)) -> string_overlay.characters (1));
+	     argument_lth = length (P_attach_options (io_description_idx));
+	     iad.attach_description = iad.attach_description || " -io_description " || requote_string_ (argument);
+	end;
+
+	else do;
+	     argument_ptr = addr (addr (P_attach_options (input_description_idx)) -> string_overlay.characters (1));
+	     argument_lth = length (P_attach_options (input_description_idx));
+	     iad.attach_description = iad.attach_description || " -input_description ";
+	     iad.attach_description = iad.attach_description || requote_string_ (argument);
+
+	     argument_ptr = addr (addr (P_attach_options (output_description_idx)) -> string_overlay.characters (1));
+	     argument_lth = length (P_attach_options (output_description_idx));
+	     iad.attach_description = iad.attach_description || " -output_description ";
+	     iad.attach_description = iad.attach_description || requote_string_ (argument);
+	end;
+
+/* Attach through the terminal level */
+
+	iad.input_direction = (direction = "input");
+
+	terminal_attach_count = terminal_attach_count + 1;
+	if terminal_attach_count > 999 then terminal_attach_count = 1;
+
+	if io_description_idx ^= 0			/* only need to attach one switch */
+	then do;
+	     terminal_switch_name =
+		rtrim (IMFT_IO_) || ".input_output."
+		|| ltrim (convert (terminal_attach_count_pic, terminal_attach_count));
+	     call iox_$attach_ioname (terminal_switch_name, terminal_iocb_ptr,
+		"imft_" || P_attach_options (io_description_idx), code);
+	     if code ^= 0 then
+		call abort_attachment (code, "Unable to attach channel via: imft_^a",
+		     P_attach_options (io_description_idx));
+
+	     iad.input_switch.terminal_iocb_ptr, iad.output_switch.terminal_iocb_ptr = terminal_iocb_ptr;
+	end;
+
+	else do;					/* have to attach separate input and output switches */
+	     terminal_switch_name =
+		rtrim (IMFT_IO_) || ".input." || ltrim (convert (terminal_attach_count_pic, terminal_attach_count));
+
+	     call iox_$attach_ioname (terminal_switch_name, terminal_iocb_ptr,
+		"imft_" || P_attach_options (input_description_idx), code);
+	     if code ^= 0 then
+		call abort_attachment (code, "Unable to attach input channel via: ^a",
+		     P_attach_options (input_description_idx));
+
+	     iad.input_switch.terminal_iocb_ptr = terminal_iocb_ptr;
+
+
+	     terminal_switch_name =
+		rtrim (IMFT_IO_) || ".output." || ltrim (convert (terminal_attach_count_pic, terminal_attach_count));
+
+	     call iox_$attach_ioname (terminal_switch_name, terminal_iocb_ptr,
+		"imft_" || P_attach_options (output_description_idx), code);
+	     if code ^= 0 then
+		call abort_attachment (code, "Unable to attach output channel via: ^a",
+		     P_attach_options (output_description_idx));
+
+	     iad.output_switch.terminal_iocb_ptr = terminal_iocb_ptr;
+	end;
+
+	if iad.copy_data then do;
+	     debug_switch_name = "imft.debug." || ltrim (convert (terminal_attach_count_pic, terminal_attach_count));
+	     call ioa_$rsnnl ("^a>^a.^[i^;o^]", debug_file_name, ignore_fb21, rtrim (get_wdir_ ()), debug_switch_name,
+		iad.input_direction);
+	     call iox_$attach_ioname (debug_switch_name, debug_iocb_ptr, "vfile_ " || debug_file_name || " -extend",
+		code);
+	     if code ^= 0 then call com_err_ (code, IMFT_IO_, "Trying to attach debug file.");
+	end;
+
+/* Initialize the input and output terminal switch structures */
+
+	string (iad.input_switch.flags), string (iad.output_switch.flags) = ""b;
+	iad.input_switch.data_length = 0;
+	iad.input_switch.rest_of_record_ptr = null ();
+
+/* allocate buffers for active records */
+/* include an extra word of padding so that I/O modules that work in 8-bit bytes won't go off the end */
+
+	imft_logical_record_length = IMFT_MAX_RECORD_LENGTH + 4;
+	allocate imft_logical_record in (system_area) set (iad.input_switch.record_buffer_ptr);
+	allocate imft_logical_record in (system_area) set (iad.output_switch.record_buffer_ptr);
+
+	iad.abort_in_progress = "0"b;			/* didn't encounter any errors yet */
+	iad.abort_code = 0;
+
+
+/* Mask and complete construction of the IOCB */
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.attach_descrip_ptr = addr (iad.attach_description);
+	iocb_ptr -> iocb.attach_data_ptr = iad_ptr;
+	iocb_ptr -> iocb.open = imft_io_open;
+	iocb_ptr -> iocb.detach_iocb = imft_io_detach;
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+RETURN_FROM_ATTACH:
+	P_code = code;
+	return;
+%page;
+
+/* Open an I/O switch for file transfer */
+
+imft_io_open:
+     entry (P_iocb_ptr, P_open_mode, P_open_sw, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	if iocb_ptr -> iocb.open_descrip_ptr ^= null () then do;
+	     P_code = error_table_$not_closed;
+	     return;
+	end;
+
+	open_mode = P_open_mode;
+
+	if ^((iad.input_direction & (open_mode = Stream_input)) | (^iad.input_direction & (open_mode = Stream_output)))
+	then do;					/* opening mode and direction must agree */
+	     P_code = error_table_$bad_mode;
+	     return;
+	end;
+
+	if iad.input_switch.terminal_iocb_ptr = iad.output_switch.terminal_iocb_ptr then do;
+	     call iox_$open (iad.input_switch.terminal_iocb_ptr, Sequential_input_output, "0"b, P_code);
+	     if P_code ^= 0 then return;
+	end;
+
+	else do;
+	     call iox_$open (iad.input_switch.terminal_iocb_ptr, Sequential_input, "0"b, P_code);
+	     if P_code ^= 0 then return;
+
+	     call iox_$open (iad.output_switch.terminal_iocb_ptr, Sequential_output, "0"b, P_code);
+	     if P_code ^= 0 then do;			/* must close the other one to stay happy */
+		call iox_$close (iad.input_switch.terminal_iocb_ptr, ignore_code);
+		return;
+	     end;
+	end;
+
+	iad.input_switch.first_read = "1"b;		/* so we can know to throw out old garbage */
+	call iox_$control (iad.output_switch.terminal_iocb_ptr, "resetwrite", null (), 0);
+
+	iad.open_description = rtrim (iox_modes (open_mode));
+
+	if iad.copy_data then call iox_$open (debug_iocb_ptr, Stream_output, "0"b, ignore_code);
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	if iad.input_direction then
+	     iocb_ptr -> iocb.get_chars, iocb_ptr -> iocb.get_line = imft_io_get_chars;
+	else iocb_ptr -> iocb.put_chars = imft_io_put_chars;
+
+	iocb_ptr -> iocb.control = imft_io_control;
+	iocb_ptr -> iocb.modes = imft_io_modes;
+
+	iocb_ptr -> iocb.close = imft_io_close;
+	iocb_ptr -> iocb.detach_iocb = imft_io_detach;
+
+	iocb_ptr -> iocb.open_descrip_ptr = addr (iad.open_description);
+						/* it's now open */
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = 0;
+	return;
+%page;
+
+/* Close an I/O switch used for file transfer */
+
+imft_io_close:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	code = 0;
+
+	if iocb_ptr -> iocb.open_descrip_ptr = null () then do;
+	     P_code = error_table_$not_open;
+	     return;
+	end;
+
+	if iad.input_switch.terminal_iocb_ptr = iad.output_switch.terminal_iocb_ptr then do;
+	     call iox_$control (iad.input_switch.terminal_iocb_ptr, "abort", null (), 0);
+						/* clean it out first */
+	     call iox_$close (iad.input_switch.terminal_iocb_ptr, code);
+	     if (code = error_table_$not_open) | (code = error_table_$not_attached) then code = 0;
+	end;
+
+	else do;
+	     call iox_$control (iad.output_switch.terminal_iocb_ptr, "abort", null (), 0);
+	     call iox_$control (iad.input_switch.terminal_iocb_ptr, "abort", null (), 0);
+						/* clean out both switches */
+
+	     call iox_$close (iad.output_switch.terminal_iocb_ptr, code);
+	     if (code = error_table_$not_open) | (code = error_table_$not_attached) then code = 0;
+
+	     call iox_$close (iad.input_switch.terminal_iocb_ptr, code);
+	     if (code = error_table_$not_open) | (code = error_table_$not_attached) then code = 0;
+	end;
+
+	if iad.copy_data then call iox_$close (debug_iocb_ptr, ignore_code);
+
+	ips_mask = ""b;
+
+	on condition (cleanup) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.open_descrip_ptr = null ();
+
+	iocb_ptr -> iocb.open = imft_io_open;
+	iocb_ptr -> iocb.detach_iocb = imft_io_detach;
+
+	iocb_ptr -> iocb.control, iocb_ptr -> iocb.modes, iocb_ptr -> iocb.get_chars, iocb_ptr -> iocb.get_line,
+	     iocb_ptr -> iocb.put_chars = iox_$err_no_operation;
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = code;
+
+	return;
+%page;
+
+/* Detach an I/O switch from file transfer */
+
+imft_io_detach:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	code = 0;
+
+	if iocb_ptr -> iocb.attach_descrip_ptr = null () then do;
+	     P_code = error_table_$not_attached;
+	     return;
+	end;
+
+	if iocb_ptr -> iocb.open_descrip_ptr ^= null () then do;
+	     P_code = error_table_$not_closed;
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	call cleanup_attachment (code);
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.attach_descrip_ptr = null ();	/* it's detached */
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = code;				/* in case trouble freeing the channel */
+	return;
+%page;
+
+/* Write data records to the remote Multics: formats the user's data stream into IMFT logical records and
+   transmits them to the remote Multics.  If any errors are detected while
+   writing, this I/O module signals the "imft_write_abort_" condition which imft_transmit_object_ handles through the
+   "get_abort_info" control order */
+
+imft_io_put_chars:
+     entry (P_iocb_ptr, P_data_ptr, P_data_lth, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	code = 0;
+
+	if iad.input_direction then do;		/* can't write the input side of a pipe */
+	     P_code = error_table_$invalid_write;
+	     return;
+	end;
+
+	total_data = P_data_lth;
+	data_ptr = P_data_ptr;
+	data_sent = 0;
+
+	do while (data_sent < total_data);
+	     chars_to_send = min (IMFT_MAX_RECORD_LENGTH, total_data - data_sent);
+	     call transmit_logical_data_record (IMFT_DATA, data_ptr, chars_to_send);
+						/* does the actual work */
+
+	     data_sent = data_sent + chars_to_send;
+	     data_ptr = addcharno (data_ptr, chars_to_send);
+	end;
+
+	P_code = code;
+	return;
+%page;
+
+/* Read data records from the remote Multics:  reads requested number of data characters from the remote system.
+   Data is read until either the user's buffer is filled or a control record is encountered.  If a control record is read
+   before any data is found or an I/O error occurs during a read, the condition "imft_read_abort_" is signalled which is
+   recognized by the caller.  The reason for the termination of the read request can be determined by the "get_abort_info"
+   control order.
+   If the last whole record read won't fit in the caller's buffer, the remainder is
+   held in record_buffer, and input_switch.rest_of_record_ptr points to it.
+*/
+
+imft_io_get_chars:
+     entry (P_iocb_ptr, P_buffer_ptr, P_buffer_max_length, P_data_lth, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	if ^iad.input_direction then do;		/* attempt to read the "punch" */
+	     P_code = error_table_$invalid_read;
+	     return;
+	end;
+
+	if iad.input_switch.control_record_present then call abort_read_operation (NO_ERROR);
+
+	buffer_used = 0;
+	buffer_max_length = P_buffer_max_length;
+	continue = "1"b;
+
+	do while (buffer_used < buffer_max_length & continue);
+	     if iad.input_switch.data_present		/* data left over from previous read */
+	     then do;
+		chars_to_copy = min (iad.input_switch.data_length, buffer_max_length - buffer_used);
+		substr (caller_buffer, buffer_used + 1, chars_to_copy) = substr (rest_of_record, 1, chars_to_copy);
+		buffer_used = buffer_used + chars_to_copy;
+		iad.input_switch.data_length = iad.input_switch.data_length - chars_to_copy;
+		if iad.input_switch.data_length > 0 then
+		     iad.input_switch.rest_of_record_ptr =
+			addcharno (iad.input_switch.rest_of_record_ptr, chars_to_copy);
+		else iad.input_switch.data_present = "0"b;
+	     end;
+
+	     if buffer_used < buffer_max_length		/* haven't filled caller's buffer yet */
+	     then do;
+		ilr_ptr = iad.input_switch.record_buffer_ptr;
+		imft_logical_record.version = IMFT_LOGICAL_RECORD_VERSION_1;
+		call iox_$read_record (iad.input_switch.terminal_iocb_ptr, ilr_ptr,
+		     4 * size (imft_logical_record_header) + IMFT_MAX_RECORD_LENGTH, record_length, code);
+		if code = error_table_$short_record then code = 0;
+						/* "short" records are perfectly OK */
+		if code ^= 0 then call abort_read_operation (code);
+
+		if iad.copy_data then do;
+		     call iox_$put_chars (debug_iocb_ptr, addr (MARKER), length (MARKER), ignore_code);
+		     call iox_$put_chars (debug_iocb_ptr, ilr_ptr, record_length, ignore_code);
+		end;
+
+		if imft_logical_record.type ^= IMFT_DATA/* oops, this is a control record */
+		then do;				/* save it be read by the appropriate control operation */
+		     iad.input_switch.data_present = "0"b;
+		     iad.input_switch.control_record_present = "1"b;
+						/* for the use of the next read of either type */
+		     iad.input_switch.data_length = record_length;
+						/* next read_control_record can just scoop it out */
+		     iad.input_switch.rest_of_record_ptr = ilr_ptr;
+		     continue = "0"b;		/* but mustn't read any more right now */
+
+		     if buffer_used = 0		/* there was no data to return */
+			then
+			call abort_read_operation (NO_ERROR);
+
+
+		end;
+
+		else do;				/* it's data, just as we hoped */
+		     chars_to_copy = min (imft_logical_record.length, buffer_max_length - buffer_used);
+		     substr (caller_buffer, buffer_used + 1, chars_to_copy) =
+			substr (imft_logical_record.contents, 1, chars_to_copy);
+		     buffer_used = buffer_used + chars_to_copy;
+		     if chars_to_copy < imft_logical_record.length
+						/* couldn't take it all */
+		     then do;
+			iad.input_switch.data_present = "1"b;
+						/* save it for next time */
+			iad.input_switch.data_length = imft_logical_record.length - chars_to_copy;
+			iad.input_switch.rest_of_record_ptr =
+			     addcharno (addr (imft_logical_record.contents), chars_to_copy);
+		     end;
+		     else iad.input_switch.data_present = "0"b;
+		end;
+	     end;
+	end;
+
+	P_data_lth = buffer_used;
+	P_code = 0;				/* here iff successful */
+	return;
+%page;
+
+/* Perform control operations on an I/O switch attached for file transfer */
+
+imft_io_control:
+     entry (P_iocb_ptr, P_order, P_info_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	order = P_order;
+	info_ptr = P_info_ptr;
+
+	code = 0;
+
+
+	if order = "write_command_record" then do;
+
+/* Write a command record:  Commands are sent by an output driver to the remote system's input driver to instruct the
+   input driver as to what it should do next (begin reception of an object, abort, synchronize, etc.) */
+
+	     if info_ptr = null () then code = error_table_$null_info_ptr;
+
+	     else if info_ptr -> icri.version ^= ICRI_VERSION_1 then code = error_table_$unimplemented_version;
+
+	     else if iad.input_direction then		/* must be transmitting data */
+		code = error_table_$invalid_write;
+
+	     else do;
+		icri_ptr = info_ptr;
+		if icri.timeout > 0 then do;		/* trap no response */
+		     call timer_manager_$alarm_call ((icri.timeout), RELATIVE_SECONDS, read_write_timeout);
+		     on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+		end;
+		call transmit_logical_control_record ((icri.record_type), icri.record_ptr, icri.record_lth, code);
+		call timer_manager_$reset_alarm_call (read_write_timeout);
+	     end;
+	end;
+
+
+	else if order = "read_command_record" then do;
+
+/* Read a command record: any intervening data records are discarded */
+
+	     if info_ptr = null () then code = error_table_$null_info_ptr;
+
+	     else if info_ptr -> icri.version ^= ICRI_VERSION_1 then code = error_table_$unimplemented_version;
+
+	     else if ^iad.input_direction then		/* must be receiving data to receive control records */
+		code = error_table_$invalid_read;
+
+	     else do;
+		icri_ptr = info_ptr;
+		if icri.timeout > 0 then do;		/* trap no response */
+		     call timer_manager_$alarm_call ((icri.timeout), RELATIVE_SECONDS, read_write_timeout);
+		     on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+		end;
+		call receive_logical_control_record (icri.record_ptr, icri.record_max_lth, icri.record_lth,
+		     icri.record_type, code);
+		call timer_manager_$reset_alarm_call (read_write_timeout);
+	     end;
+	end;
+
+
+	else if order = "write_reply_record" then do;
+
+/* Write a reply record:  Reply records are often sent by an input driver in response to a command record and indicate the
+   input driver's reasons for accepting or rejecting a command */
+
+	     if info_ptr = null () then code = error_table_$null_info_ptr;
+
+	     else if info_ptr -> icri.version ^= ICRI_VERSION_1 then code = error_table_$unimplemented_version;
+
+	     else if ^iad.input_direction then		/* must be receive side of a connection */
+		code = error_table_$invalid_write;
+
+	     else do;
+		icri_ptr = info_ptr;
+		if icri.timeout > 0 then do;		/* trap no response */
+		     call timer_manager_$alarm_call ((icri.timeout), RELATIVE_SECONDS, read_write_timeout);
+		     on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+		end;
+		call transmit_logical_control_record ((icri.record_type), icri.record_ptr, icri.record_lth, code);
+		call timer_manager_$reset_alarm_call (read_write_timeout);
+	     end;
+	end;
+
+
+	else if order = "read_reply_record" then do;
+
+/* Read a reply record */
+
+	     if info_ptr = null () then code = error_table_$null_info_ptr;
+
+	     else if info_ptr -> icri.version ^= ICRI_VERSION_1 then code = error_table_$unimplemented_version;
+
+	     else if iad.input_direction then		/* must be transmitting side of connection */
+		code = error_table_$invalid_read;
+
+	     else do;
+		icri_ptr = info_ptr;
+		if icri.timeout > 0 then do;		/* trap no response */
+		     call timer_manager_$alarm_call ((icri.timeout), RELATIVE_SECONDS, read_write_timeout);
+		     on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+		end;
+		call receive_logical_control_record (icri.record_ptr, icri.record_max_lth, icri.record_lth,
+		     icri.record_type, code);
+		call timer_manager_$reset_alarm_call (read_write_timeout);
+	     end;
+	end;
+
+
+	else if order = "get_abort_info" then do;
+
+/* Return cause of previous get_chars or put_chars failure */
+
+	     if info_ptr = null () then code = error_table_$null_info_ptr;
+
+	     else if info_ptr -> icri.version ^= ICRI_VERSION_1 then code = error_table_$unimplemented_version;
+
+	     else do;
+		icri_ptr = info_ptr;
+
+		if iad.abort_in_progress then do;	/* something did indeed go wrong */
+		     iad.abort_in_progress = "0"b;
+
+		     if (iad.abort_code ^= 0) & (iad.abort_code ^= imft_et_$reply_pending) then do;
+						/* I/O error during read/write */
+			icri.record_type = IMFT_ABORT;
+			abort_command_ptr = icri.record_ptr;
+			abort_command.reason = IMFT_ABORT_LOCAL_IO_ERROR;
+			abort_command.code = iad.abort_code;
+			icri.record_lth = 4 * currentsize (abort_command);
+		     end;				/* let caller see exact error */
+
+		     else do;			/* encountered a control record: return it */
+			call timer_manager_$alarm_call (ONE_MINUTE, RELATIVE_SECONDS, read_write_timeout);
+			on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+			call receive_logical_control_record (icri.record_ptr, icri.record_max_lth, icri.record_lth,
+			     icri.record_type, code);
+			call timer_manager_$reset_alarm_call (read_write_timeout);
+		     end;
+		end;
+
+		else code = error_table_$no_operation;	/* no abort was happening */
+	     end;
+	end;
+
+
+	else if order = "get_channel_names" then do;
+
+/* Return the names of the channels attached through this switch */
+
+	     if info_ptr = null () then code = error_table_$null_info_ptr;
+
+	     else if info_ptr -> get_channel_names.version ^= GET_CHANNEL_NAMES_VERSION_1 then
+		code = error_table_$unimplemented_version;
+
+	     else do;
+		get_channel_names_ptr = info_ptr;
+		local_tgci.version = tty_get_channel_info_version;
+
+		call iox_$control (iad.input_switch.terminal_iocb_ptr, "get_channel_info", addr (local_tgci), code);
+
+		if code = 0 then do;		/* got the input channel ... */
+		     get_channel_names.input_channel = local_tgci.channel_name;
+		     call iox_$control (iad.output_switch.terminal_iocb_ptr, "get_channel_info", addr (local_tgci),
+			code);
+		     if code = 0 then		/* ... and got the output channel */
+			get_channel_names.output_channel = local_tgci.channel_name;
+		end;
+
+		if code ^= 0 then			/* couldn't get one of the channel names */
+		     if code = error_table_$undefined_order_request then code = imft_et_$cant_get_channel_names;
+	     end;
+	end;
+
+
+	else if (order = "read_status") | (order = "resetread") then
+	     call iox_$control (iad.input_switch.terminal_iocb_ptr, order, info_ptr, code);
+						/* always apply these to the input connection */
+
+	else if (order = "write_status") | (order = "resetwrite") | (order = "runout") then
+	     call iox_$control (iad.output_switch.terminal_iocb_ptr, order, info_ptr, code);
+						/* always apply these to the output connection */
+
+	else if order = "abort" then do;		/* always apply this to both switches */
+	     call iox_$control (iad.input_switch.terminal_iocb_ptr, order, info_ptr, code);
+	     if iad.input_switch.terminal_iocb_ptr ^= iad.output_switch.terminal_iocb_ptr then
+		call iox_$control (iad.output_switch.terminal_iocb_ptr, order, info_ptr, code);
+	end;
+
+
+/* Handle handshaking IO for connection protocol. */
+
+	else if order = "get_transport_line" then do;
+	     icri_ptr = info_ptr;
+	     if icri.timeout > 0 then do;		/* trap no response */
+		on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+		call timer_manager_$alarm_call ((icri.timeout), RELATIVE_SECONDS, read_write_timeout);
+	     end;
+
+	     if iad.input_switch.terminal_iocb_ptr ^= null () then
+		call iox_$get_line (iad.input_switch.terminal_iocb_ptr, icri.record_ptr, icri.record_max_lth,
+		     icri.record_lth, code);
+	     else call iox_$get_line (iad.output_switch.terminal_iocb_ptr, icri.record_ptr, icri.record_max_lth,
+		     icri.record_lth, code);
+
+	     if icri.timeout > 0 then do;
+		call timer_manager_$reset_alarm_call (read_write_timeout);
+		revert condition (cleanup);
+	     end;
+	end;
+
+	else if order = "put_transport_chars" then do;
+	     icri_ptr = info_ptr;
+	     if icri.timeout > 0 then do;		/* trap no response */
+		on condition (cleanup) call timer_manager_$reset_alarm_call (read_write_timeout);
+		call timer_manager_$alarm_call ((icri.timeout), RELATIVE_SECONDS, read_write_timeout);
+	     end;
+
+	     if iad.input_switch.terminal_iocb_ptr ^= null () then
+		call iox_$put_chars (iad.input_switch.terminal_iocb_ptr, icri.record_ptr, icri.record_lth, code);
+	     else call iox_$put_chars (iad.output_switch.terminal_iocb_ptr, icri.record_ptr, icri.record_lth, code);
+
+	     if icri.timeout > 0 then do;
+		call timer_manager_$reset_alarm_call (read_write_timeout);
+		revert condition (cleanup);
+	     end;
+	end;
+
+	else do;					/* pass others on to the appropriate half of the connection */
+	     if iad.input_direction then
+		call iox_$control (iad.input_switch.terminal_iocb_ptr, order, info_ptr, code);
+	     else call iox_$control (iad.output_switch.terminal_iocb_ptr, order, info_ptr, code);
+	end;
+
+RETURN_FROM_IMFT_CONTROL:
+	P_code = code;
+
+	return;
+%page;
+
+/* Internal procedure which is invoked when a read/write of a command/reply record times out */
+
+read_write_timeout:
+     procedure ();
+
+	code = imft_et_$timeout;
+
+	if iad.debug_mode then			/* give the programmer a chance when debugging */
+	     signal condition (imft_debug_);
+
+	go to RETURN_FROM_IMFT_CONTROL;
+
+
+     end read_write_timeout;
+
+/**/
+
+/* Change modes: no modes are supported */
+
+imft_io_modes:
+     entry (P_iocb_ptr, P_new_modes, P_old_modes, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	P_old_modes = "";				/* no modes are reflected to caller */
+
+	if P_new_modes = "" then
+	     P_code = 0;
+	else P_code = error_table_$bad_mode;
+
+	return;
+%page;
+
+/* Cleanup whatever portion of an attachment exists */
+
+cleanup_attachment:
+     procedure (P_code);
+
+dcl  P_code fixed binary (35) parameter;		/* a parameter to allow callers to ignore it */
+
+	P_code = 0;
+
+	if iad_ptr ^= null () then do;		/* there is an I/O switch */
+
+	     if iad.input_switch.terminal_iocb_ptr ^= null () then do;
+		call iox_$close (iad.input_switch.terminal_iocb_ptr, ignore_code);
+		call iox_$detach_iocb (iad.input_switch.terminal_iocb_ptr, P_code);
+		call iox_$destroy_iocb (iad.input_switch.terminal_iocb_ptr, ignore_code);
+		iad.input_switch.terminal_iocb_ptr = null ();
+	     end;
+
+	     if iad.output_switch.terminal_iocb_ptr ^= null () then do;
+		call iox_$close (iad.output_switch.terminal_iocb_ptr, ignore_code);
+		call iox_$detach_iocb (iad.output_switch.terminal_iocb_ptr, P_code);
+		call iox_$destroy_iocb (iad.output_switch.terminal_iocb_ptr, ignore_code);
+		iad.output_switch.terminal_iocb_ptr = null ();
+	     end;
+
+	     if iad.input_switch.record_buffer_ptr ^= null () then do;
+		free iad.input_switch.record_buffer_ptr -> imft_logical_record in (system_area);
+		iad.input_switch.record_buffer_ptr = null ();
+	     end;
+
+	     if iad.output_switch.record_buffer_ptr ^= null () then do;
+		free iad.output_switch.record_buffer_ptr -> imft_logical_record in (system_area);
+		iad.output_switch.record_buffer_ptr = null ();
+	     end;
+
+	     if debug_iocb_ptr ^= null () then do;
+		call iox_$close (debug_iocb_ptr, ignore_code);
+		call iox_$detach_iocb (debug_iocb_ptr, ignore_code);
+		call iox_$destroy_iocb (debug_iocb_ptr, ignore_code);
+		debug_iocb_ptr = null ();
+	     end;
+
+	     free iad in (system_area);
+	     iad_ptr = null ();
+
+	end;
+
+	return;
+
+     end cleanup_attachment;
+%page;
+
+/* Wrapper to protect against errors while IPS interrupts are masked */
+
+any_other_handler:
+     procedure () options (non_quick);
+
+	if ips_mask then call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	ips_mask = ""b;
+
+	call continue_to_signal_ (ignore_code);		/* not interested, */
+
+	return;
+
+     end any_other_handler;
+
+
+
+/* Abort a call to the attach entry:  print an error message if requested */
+
+abort_attachment:
+     procedure () options (variable, non_quick);
+
+dcl  the_code fixed binary (35) based (the_code_ptr);
+dcl  the_code_ptr pointer;
+
+dcl  caller_message character (256);
+
+	call cu_$arg_ptr (1, the_code_ptr, ignore_fb21, ignore_code);
+
+	if loud_sw then do;				/* an error message is requested */
+	     call ioa_$general_rs (cu_$arg_list_ptr (), 2, 3, caller_message, ignore_fb21, "1"b, "0"b);
+	     call com_err_ (the_code, IMFT_IO_, "For switch ^a: ^a", iocb_ptr -> iocb.name, caller_message);
+	end;
+
+	call cleanup_attachment (ignore_code);		/* get rid of anything that was accomplished */
+
+	if the_code = 0 then
+	     code = error_table_$action_not_performed;
+	else code = the_code;			/* save the error code */
+
+	go to RETURN_FROM_ATTACH;
+
+     end abort_attachment;
+%page;
+
+/* Invoked if an error arises during get_chars operation */
+
+
+abort_read_operation:
+     procedure (p_code);
+
+dcl  p_code fixed binary (35) parameter;
+
+	iad.abort_in_progress = "1"b;
+	iad.abort_code = p_code;
+SIGNAL_RECEIVE_FAILURE_FOREVER:
+	signal condition (imft_read_abort_);
+	go to SIGNAL_RECEIVE_FAILURE_FOREVER;
+
+     end abort_read_operation;
+%page;
+
+/* Fetch the next argument from the attach options and validate that it is a non-null character string */
+
+get_string_argument:
+     procedure () returns (character (*));
+
+dcl  option_name character (32);
+
+	option_name = argument;			/* about to move on to the next one */
+
+	if argument_idx = hbound (P_attach_options, 1) then
+	     call abort_attachment (error_table_$noarg, "Character string following ""^a"".", option_name);
+
+	argument_idx = argument_idx + 1;
+
+	argument_ptr = addr (addr (P_attach_options (argument_idx)) -> string_overlay.characters (1));
+	argument_lth = length (P_attach_options (argument_idx));
+
+	if argument = "" then
+	     call abort_attachment (0, "Character string following ""^a"" must be non-null.", option_name);
+
+	return (argument);
+
+     end get_string_argument;
+%page;
+
+/* Transmit a logical record to the remote system */
+
+transmit_logical_record:
+     procedure ();
+
+	return;					/* not an entry */
+
+
+/* Parameters */
+
+dcl  P_logical_record_type fixed binary (7) unaligned unsigned parameter;
+						/* type of record being transmitted */
+dcl  P_logical_record_data_ptr pointer parameter;		/* -> the logical record */
+dcl  P_logical_record_data_lth fixed binary (21) parameter; /* length of logical record in characters */
+
+dcl  P_code fixed binary (35) parameter;		/* control: status code */
+
+
+/* Remaining declarations */
+
+dcl  logical_record_data character (logical_record_data_lth) unaligned based (logical_record_data_ptr);
+dcl  logical_record_data_lth fixed binary (21);
+dcl  logical_record_data_ptr pointer;
+
+dcl  1 trsi aligned like tty_read_status_info automatic;
+dcl  1 auto_event_info aligned like event_wait_info;
+
+dcl  1 write_status_info aligned,
+       2 event_channel fixed bin (71),
+       2 output_pending bit (1);
+
+dcl  put_chars_operation bit (1) aligned;		/* ON => iox_$put_chars (data records) */
+
+dcl  quit_pending bit (1);
+
+
+/* Transmit a data record: aborts by signalling imft_write_abort_ if an I/O error is encountered */
+
+transmit_logical_data_record:
+     entry (P_logical_record_type, P_logical_record_data_ptr, P_logical_record_data_lth);
+
+	put_chars_operation = "1"b;
+	go to TRANSMIT_COMMON;
+
+
+/* Transmit a control record: any errors are reflected to the caller */
+
+transmit_logical_control_record:
+     entry (P_logical_record_type, P_logical_record_data_ptr, P_logical_record_data_lth, P_code);
+
+	P_code = 0;
+	put_chars_operation = "0"b;
+
+
+TRANSMIT_COMMON:
+	if ^iad.input_direction then do;		/* output side: check for unexpected replies */
+	     trsi.input_pending = "0"b;		/* ... in case the next call fails */
+	     call iox_$control (iad.input_switch.terminal_iocb_ptr, "read_status", addr (trsi), ignore_code);
+	     if trsi.input_pending then call abort_write_operation (imft_et_$reply_pending);
+	end;
+
+	ilr_ptr = iad.output_switch.record_buffer_ptr;
+	logical_record_data_ptr = P_logical_record_data_ptr;
+	logical_record_data_lth, imft_logical_record.length = P_logical_record_data_lth;
+
+	imft_logical_record.version = IMFT_LOGICAL_RECORD_VERSION_1;
+	imft_logical_record.type = P_logical_record_type;
+	string (imft_logical_record.flags) = "0"b;
+	if logical_record_data_lth > 0 then do;
+	     if verify (logical_record_data, substr (collate9 (), 1, 256)) ^= 0
+						/* there's some data with 9th bit on */
+		then
+		imft_logical_record.binary = "1"b;
+	     else if verify (logical_record_data, collate ()) ^= 0
+						/* no 9-bit, but some 8-bit data */
+		then
+		imft_logical_record.eight_bit = "1"b;
+	     imft_logical_record.contents = logical_record_data;
+	end;
+
+/* in order to make sure the record isn't interrupted by a control record as a result of
+   a QUIT followed by an operator command, intercept quits while writing the record,
+   and signal them once we're done */
+
+	quit_pending = "0"b;
+	on condition (quit)
+	     begin;
+	     quit_pending = "1"b;
+	end;
+
+	call iox_$write_record (iad.output_switch.terminal_iocb_ptr, ilr_ptr,
+	     4 * size (imft_logical_record_header) + imft_logical_record.length, code);
+
+	revert condition (quit);
+
+	if code ^= 0 then call abort_write_operation (code);
+
+	if quit_pending then do;
+	     call iox_$control (iad.output_switch.terminal_iocb_ptr, "write_status", addr (write_status_info), code);
+
+/* try to ensure that the record has really made it out of ring 0 */
+
+	     do while ((code = 0) & write_status_info.output_pending);
+		event_wait_channel.channel_id = write_status_info.event_channel;
+		call ipc_$block (addr (event_wait_channel), addr (auto_event_info), code);
+		if code = 0 then
+		     call iox_$control (iad.output_switch.terminal_iocb_ptr, "write_status", addr (write_status_info),
+			code);
+	     end;
+
+	     signal condition (quit);
+	end;
+
+	if iad.copy_data then do;
+	     call iox_$put_chars (debug_iocb_ptr, addr (MARKER), length (MARKER), ignore_code);
+	     call iox_$put_chars (debug_iocb_ptr, ilr_ptr,
+		4 * size (imft_logical_record_header) + imft_logical_record.length, ignore_code);
+	end;
+
+
+	if ^put_chars_operation then			/* here iff all written OK */
+	     P_code = 0;
+
+RETURN_FROM_TRANSMIT_LOGICAL_RECORD:
+	return;
+
+
+
+/* Internal to transmit_logical_record: aborts the current write operation */
+
+abort_write_operation:
+	procedure (p_code);
+
+dcl  p_code fixed binary (35) parameter;
+
+	     if put_chars_operation then do;		/* data stream: abort the operation completely */
+		iad.abort_in_progress = "1"b;
+		iad.abort_code = p_code;
+SIGNAL_TRANSMISSION_FAILURE_FOREVER:
+		signal condition (imft_write_abort_);
+		go to SIGNAL_TRANSMISSION_FAILURE_FOREVER;
+	     end;					/* imft_transmit_object_ shouldn't return */
+
+	     else do;				/* writing a control record: reflect error to caller */
+		P_code = p_code;
+		go to RETURN_FROM_TRANSMIT_LOGICAL_RECORD;
+	     end;
+
+	end abort_write_operation;
+
+     end transmit_logical_record;
+%page;
+
+/* Receive the contents of a logical record from the remote system */
+
+receive_logical_record:
+     procedure ();
+
+	return;					/* not an entry */
+
+dcl  P_buffer_ptr pointer parameter;			/* -> buffer to place record contents */
+dcl  P_buffer_max_length fixed binary (21) parameter;	/* maximum size of buffer (in characters) */
+dcl  P_buffer_used fixed binary (21) parameter;		/* # of characters placed into buffer */
+
+dcl  P_record_type fixed binary parameter;		/* control: set to type of control record found */
+dcl  P_code fixed binary (35) parameter;		/* control: status cod */
+
+
+/* Remaining declarations */
+
+dcl  buffer_max_length fixed binary (21);
+dcl  buffer_ptr pointer;
+dcl  caller_buffer char (buffer_max_length) based (buffer_ptr);
+
+dcl  found bit (1);
+
+/* Receive a control record: flushes all data records until a control record is found and returned */
+
+receive_logical_control_record:
+     entry (P_buffer_ptr, P_buffer_max_length, P_buffer_used, P_record_type, P_code);
+
+	P_record_type = -1;				/* haven't found it yet */
+	P_code = 0;
+
+	buffer_ptr = P_buffer_ptr;
+	buffer_max_length = P_buffer_max_length;
+
+
+	found = "0"b;
+	iad.input_switch.data_present = "0"b;		/* if it was, we're ignoring it */
+	if iad.input_switch.control_record_present then
+	     ilr_ptr = iad.input_switch.rest_of_record_ptr;
+	else do;
+	     ilr_ptr = iad.input_switch.record_buffer_ptr;
+	     imft_logical_record.version = IMFT_LOGICAL_RECORD_VERSION_1;
+
+	     do while (^found);			/* keep reading until we find a control record */
+		call iox_$read_record (iad.input_switch.terminal_iocb_ptr, ilr_ptr,
+		     4 * size (imft_logical_record_header) + IMFT_MAX_RECORD_LENGTH, record_length, code);
+		if code = error_table_$short_record then code = 0;
+						/* short_record is not interesting */
+		if code ^= 0 then do;
+
+/****^
+     Code here used to ignore codes error_table_$unimplemented_version and
+     error_table_$improper_data_format on first read but this can leave both
+     ends of a link waiting for the other to respond if garbage is received
+     which is not good in production mode.  At least imft_driver_$init will
+     display the code and return and iodd_ will indicate that driver could
+     not be initialized.  These can be dealt with automatically.  Previous
+     code required manual intervention by site personnel to get drivers to
+     try again.
+*/
+
+		     P_code = code;
+		     return;
+		end;
+		else do;
+		     if iad.copy_data then do;
+			call iox_$put_chars (debug_iocb_ptr, addr (MARKER), length (MARKER), ignore_code);
+			call iox_$put_chars (debug_iocb_ptr, ilr_ptr, record_length, ignore_code);
+		     end;
+
+		     iad.input_switch.first_read = "0"b;
+		     if imft_logical_record.type ^= IMFT_DATA
+						/* it IS  a control record */
+			then
+			found = "1"b;
+		end;
+	     end;
+	end;
+
+	if imft_logical_record.length < 0 | imft_logical_record.length > buffer_max_length then
+						/* an overlong control record!? */
+	     P_code = error_table_$invalid_record_length;
+
+	else do;
+	     substr (caller_buffer, 1, imft_logical_record.length) = imft_logical_record.contents;
+	     P_buffer_used = imft_logical_record.length;
+	     P_record_type = imft_logical_record.type;
+	     P_code = 0;
+	end;
+
+	iad.input_switch.control_record_present = "0"b;
+	return;
+
+     end receive_logical_record;
+%page;
+
+/* Parameters */
+
+dcl  P_iocb_ptr pointer parameter;			/* *: -> I/O switch being operated upon */
+dcl  P_code fixed binary (35) parameter;
+
+dcl  P_attach_options (*) character (*) varying parameter;	/* attach: attachment arguments */
+dcl  P_loud_sw bit (1) parameter;			/* attach: ON => attachment errors should call com_err_ */
+
+dcl  P_open_mode fixed binary parameter;		/* open: opening mode */
+dcl  P_open_sw bit (1) parameter;			/* open: obsolete parameter */
+
+dcl  P_data_lth fixed binary (21) parameter;		/* get_*: set to # of characters read into buffer;
+						   put_chars: # of characters to transmit as logical record */
+
+dcl  P_buffer_ptr pointer parameter;			/* get_*: -> area to place result of read */
+dcl  P_buffer_max_length fixed binary (21) parameter;	/* get_*: size of area in characters */
+
+dcl  P_data_ptr pointer parameter;			/* put_chars: -> data stream to be written */
+
+dcl  P_order character (*) parameter;			/* control: name of control order to be performed */
+dcl  P_info_ptr pointer parameter;			/* control: -> additional information required to execute the
+						   control order */
+
+dcl  P_new_modes character (*) parameter;		/* modes: new modes to be set */
+dcl  P_old_modes character (*) parameter;		/* modes: set to modes in effect before change */
+
+
+/* Local copies of parameters */
+
+dcl  iocb_ptr pointer;
+dcl  code fixed binary (35);
+dcl  ignore_code fixed binary (35);
+dcl  ignore_fb21 fixed binary (21);
+
+dcl  argument character (argument_lth) based (argument_ptr);/* based on attach options */
+dcl  argument_lth fixed binary (21);
+dcl  argument_ptr pointer;
+
+dcl  loud_sw bit (1) aligned;
+
+dcl  open_mode fixed binary;
+
+dcl  order character (32);
+dcl  info_ptr pointer;
+
+
+/* Remaining declarations */
+
+dcl  1 local_tgci aligned like tty_get_channel_info;	/* for get_channel_names */
+
+dcl  system_area area aligned based (system_area_ptr);
+dcl  system_area_ptr pointer;
+
+dcl  argument_idx fixed binary;			/* # of attach option being processed */
+
+dcl  direction character (32);
+dcl  (input_description_idx, output_description_idx) fixed binary;
+dcl  io_description_idx fixed binary;
+
+dcl  an_attach_description character (512);
+
+dcl  terminal_switch_name character (32);
+dcl  terminal_iocb_ptr pointer;
+dcl  terminal_attach_count fixed binary static initial (0);
+dcl  terminal_attach_count_pic picture "999";
+
+dcl  ips_mask bit (36);
+dcl  quit_mask bit (36) aligned;
+
+dcl  buffer_used fixed bin (21);
+dcl  buffer_max_length fixed bin (21);
+dcl  continue bit (1);
+dcl  record_length fixed bin (21);
+dcl  chars_to_copy fixed bin (21);
+dcl  total_data fixed bin (21);
+dcl  data_sent fixed bin (21);
+dcl  chars_to_send fixed bin (21);
+dcl  data_ptr pointer;
+
+dcl  IMFT_IO_ character (32) static options (constant) initial ("imft_io_");
+
+dcl  RELATIVE_SECONDS bit (2) static options (constant) initial ("11"b);
+dcl  ONE_MINUTE fixed binary (71) static options (constant) initial (60);
+dcl  MARKER character (4) static options (constant) initial ("REC:");
+dcl  MASK_OFF bit (36) initial ((36)"0"b) internal static options (constant);
+dcl  NO_ERROR fixed binary (35) initial (0) internal static options (constant);
+dcl  QUIT_NAME (1) char (32) aligned internal static options (constant) initial ("quit");
+
+dcl  mask_quits bit (36) internal static;		/* IPS mask to prevent quits */
+
+dcl  debug_switch_name character (32);
+dcl  debug_file_name character (168);
+dcl  debug_iocb_ptr pointer internal static init (null ());
+
+dcl  caller_buffer char (buffer_max_length) based (P_buffer_ptr);
+
+/* structure for obtaining the address of the string portion of a varying character string */
+
+dcl  1 string_overlay aligned based,
+       2 lth fixed binary (21),
+       2 characters (0 refer (string_overlay.lth)) character (1) unaligned;
+
+/* format: off */
+dcl (error_table_$action_not_performed, error_table_$badopt, error_table_$bad_arg,
+     error_table_$bad_mode, error_table_$inconsistent, error_table_$invalid_read,
+     error_table_$invalid_write, error_table_$invalid_record_length, error_table_$noarg, error_table_$no_operation, error_table_$not_attached,
+     error_table_$not_closed, error_table_$not_detached, error_table_$not_open, error_table_$null_info_ptr,
+     error_table_$short_record, error_table_$undefined_order_request, error_table_$unimplemented_version)
+	fixed binary (35) external;
+
+dcl (imft_et_$cant_get_channel_names, imft_et_$reply_pending, imft_et_$timeout)
+	fixed binary (35) external;
+/* format: on */
+
+dcl  com_err_ entry () options (variable);
+dcl  continue_to_signal_ entry (fixed binary (35));
+dcl  create_ips_mask_ entry (ptr, fixed bin, bit (36) aligned);
+dcl  cu_$arg_list_ptr entry () returns (pointer);
+dcl  cu_$arg_ptr entry (fixed binary, pointer, fixed binary (21), fixed binary (35));
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  get_wdir_ entry () returns (character (168));
+dcl  hcs_$reset_ips_mask entry (bit (36), bit (36));
+dcl  hcs_$set_ips_mask entry (bit (36), bit (36));
+dcl  ioa_$general_rs entry (pointer, fixed binary, fixed binary, character (*), fixed binary (21), bit (1), bit (1));
+dcl  ioa_$rsnnl entry options (variable);
+dcl  iox_$attach_ioname entry (character (*), pointer, character (*), fixed binary (35));
+dcl  iox_$control entry (pointer, character (*), pointer, fixed binary (35));
+dcl  iox_$close entry (pointer, fixed binary (35));
+dcl  iox_$destroy_iocb entry (pointer, fixed binary (35));
+dcl  iox_$detach_iocb entry (pointer, fixed binary (35));
+dcl  iox_$err_no_operation entry () options (variable);
+dcl  iox_$get_line entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$open entry (pointer, fixed binary, bit (1) aligned, fixed binary (35));
+dcl  iox_$put_chars entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl  iox_$propagate entry (pointer);
+dcl  iox_$read_record entry (pointer, pointer, fixed binary (21), fixed binary (21), fixed binary (35));
+dcl  iox_$write_record entry (pointer, pointer, fixed binary (21), fixed binary (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  requote_string_ entry (character (*)) returns (character (*));
+dcl  timer_manager_$alarm_call entry (fixed binary (71), bit (2), entry);
+dcl  timer_manager_$reset_alarm_call entry (entry);
+
+dcl  (any_other, cleanup, imft_debug_, imft_read_abort_, imft_write_abort_, quit) condition;
+
+dcl  (addr, addcharno, collate, collate9, convert, currentsize, hbound, lbound, length, ltrim, min, null, rtrim, size,
+     string, substr, verify) builtin;
+%page;
+/* Description of a switch attached through this module */
+
+dcl  1 iad aligned based (iad_ptr),
+       2 attach_description character (1024) varying,	/* attach description for this I/O switch */
+       2 open_description character (24) varying,		/* open description for this I/O switch */
+       2 input_switch like switch_info,			/* defines the input terminal switch */
+       2 output_switch like switch_info,		/* defines the output terminal switch */
+       2 abort_code fixed binary (35),			/* status code of last aborted I/O operation */
+       2 flags aligned,
+         3 input_direction bit (1) unaligned,		/* ON => receives data from remote system */
+         3 abort_in_progress bit (1) unaligned,		/* ON => last I/O operation failed */
+         3 debug_mode bit (1) unaligned,		/* ON => trying to debug IMFT: stop on errors */
+         3 copy_data bit (1) unaligned,			/* ON => trying to debug connection: copy all data */
+         3 pad bit (32) unaligned;
+
+dcl  iad_ptr pointer;
+
+
+/* Description of a single terminal level I/O switch */
+
+dcl  1 switch_info aligned based,
+       2 terminal_iocb_ptr pointer,			/* -> IOCB for terminal level module */
+       2 record_buffer_ptr pointer,			/* -> allocated buffer for active records */
+       2 flags,
+         3 data_present bit (1) unaligned,		/* part of a data record is held here */
+         3 control_record_present bit (1) unaligned,	/* a control record is waiting to be read */
+         3 first_read bit (1) unaligned,		/* no reads have been done since latest open */
+         3 pad_bits bit (33) unaligned,
+       2 data_length fixed bin (21),			/* number of characters in held record or part thereof */
+       2 rest_of_record_ptr ptr;			/* -> held data, if any */
+
+dcl  rest_of_record char (iad.input_switch.data_length) based (iad.input_switch.rest_of_record_ptr);
+%page;
+%include iocb;
+%page;
+%include iox_modes;
+%page;
+%include tty_read_status_info;
+
+%include tty_get_channel_info;
+%page;
+%include event_wait_info;
+%page;
+%include event_wait_channel;
+%page;
+%include imft_logical_record;
+%page;
+%include "_imft_cri";
+
+%include "_imft_get_channel_names";
+%page;
+%include "_imft_std_commands";
+
+     end imft_io_;

@@ -1,0 +1,755 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+
+/* Printer DIM write module: responsible for actually sending print lines to the line printer and handling statuses
+   returned from the printer by IOI */
+
+/* Created:  31 October 1974 by Noel I. Morris */
+/* Modified: 16 March 1977 by Noel I. Morris */
+/* Modified: June 1978 by J. C. Whitmore to suppress multiple error messages */
+/* Modified: 7 August 1980 by Art Beattie to send error messages every N times and wait */
+/* Modified: 27 November 1981 by G. Palter to fix entry number 0028 (phx04610) on the io_daemon error list:
+   A power fault on a local printer will reset the VFC to the default state (6 lines/inch).  The entry in
+   prt_status_table_ for "power fault" does not indicate that the VFC and train image are lost -- the fix for this bug
+   is to add a new flag which is used by the printer DIM to indicate a VFC and image reload should be done after the
+   operator readies the printer (the next special interrupt) */
+/* Modified September 1983 by E. N. Kittlitz. Rewritten for multi-record IDCWs, no chaining or markers */
+/* Modified 83-10-20 by E. N. Kittlitz for eurc/urmpc partitioning */
+/* Modified 83-11-01 by E. N. Kittlitz for quit protection. Note that quit is the
+   most likely IPS in the daemon environement which could result in further
+   I/O to the attachment.  The older prtdim and the new prtdim_eurc_util
+   do not have IPS/quit-only protection. */
+
+/* format: style4 */
+prtdim_eurc_write:
+     procedure (arg_sdb_ptr, wkspptr, offset, nelem, nelemt, iostatus);
+
+dcl  arg_sdb_ptr ptr;				/* pointer to stream data block */
+dcl  wkspptr ptr;					/* pointer to caller's data */
+dcl  offset fixed bin (24);				/* offset into caller data */
+dcl  nelem fixed bin (24);				/* number of elements to transmit */
+dcl  nelemt fixed bin (24);				/* number of elements actually transmitted */
+dcl  iostatus bit (72) aligned;			/* IOS status */
+dcl  rcode fixed bin (35);				/* error code */
+dcl  cur_page fixed bin;				/* current page number */
+dcl  linep ptr;					/* pointer to place for data */
+dcl  lth fixed bin (18);				/* remaining length of input */
+dcl  inptr ptr;					/* pointer to rest of input */
+dcl  errmess char (256) var;				/* error message on bad status */
+dcl  n_dcws fixed bin;
+dcl  unclean bit (1) aligned;				/* true if critical operation in progress */
+dcl  quit_pending bit (1) aligned;
+
+dcl  last_iom_stat bit (72) aligned;			/* last status an error msg was printed for */
+dcl  max_err_stat_count fixed bin init (10) int static options (constant); /* max no. of errors between reporting */
+dcl  same_err_stat_count fixed bin;			/* counter for the same error status from printer */
+
+dcl  1 l_event_call_info aligned like event_call_info;
+
+dcl  (paper_low_flag init ("000000000000000001"b),	/* status flag for paper low */
+     image_flag init ("000000000000000010"b),		/* status flag for destroyed train image */
+     vfc_flag init ("000000000000000100"b),		/* status flag for destroyed VFC image */
+     slew_error init ("000000000000001000"b),		/* status flag for slew error on prev slew */
+     power_fault_flag init ("000000000000010000"b))	/* status flag for power fault */
+	bit (18) aligned static options (constant);
+
+dcl  automagic bit (1) aligned init ("0"b);
+dcl  dev_stat_bits bit (72) aligned int static options (constant) /* bits used by analyze_device_stat_ */
+	init ("377700770000"b3 || (12)"0"b3);		/* bit string in octal to mask all but */
+						/* power, maj, sub, channel and central status bits */
+dcl  TIMEOUT fixed bin (71) init (180000000) int static options (constant);
+						/* allow for any polling plus up to 63 lines */
+
+dcl  based_word bit (36) aligned based;
+dcl  wksp char (1) based unal;			/* used for getting pointer to input string */
+
+dcl  prt_conv_ entry (ptr, fixed bin (18), ptr, fixed bin (18), ptr);
+dcl  ioi_$connect entry (fixed bin, fixed bin (18), fixed bin (35));
+dcl  ioi_$get_special_status entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  analyze_device_stat_$rs entry (char (*) var, ptr, bit (72) aligned, bit (18) aligned);
+dcl  analyze_system_fault_ entry (char (*) aligned, bit (72) aligned);
+dcl  prtdim_eurc_util$finish_abort entry (ptr);
+dcl  prtdim_eurc_util$load_image entry (ptr, fixed bin (35));
+dcl  prtdim_eurc_util$load_vfc entry (ptr, fixed bin (35));
+dcl  com_err_ entry options (variable);
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+
+dcl  prt_status_table_$prt_status_table_ ext;
+
+dcl  error_table_$data_loss fixed bin (35) ext static;
+dcl  error_table_$net_timeout ext fixed bin (35);
+dcl  error_table_$request_pending fixed bin (35) ext static;
+
+dcl  (addr, addrel, bin, bit, clock, divide, mod, null, rel, stackbaseptr, stackframeptr, stacq, string, substr, unspec, wordno) builtin;
+
+dcl  (cleanup, quit) condition;
+%page;
+	unclean = "1"b;				/* pretty unsophisto, huh? */
+	iostatus = "0"b;				/* Clear IOS status. */
+	sdb_ptr = arg_sdb_ptr;			/* Copy pointer to stream data block. */
+	pip = addr (sdb.info);			/* Get pointer to printer info structure. */
+	pcip = addr (sdb.conv_info);			/* Get pointer to conversion info structure. */
+	isp = null;
+	statp = null;
+	imp = null;
+	rcode = 0;				/* Clear the error code. */
+	call set_status (0, iostatus);		/* initialize status */
+	nelemt = 0;				/* Zero elements transmitted. */
+	quit_pending = ""b;
+	on cleanup call tidy_up;
+	on quit call process_quit;
+	if sdb.aborting then do;			/* this shouldn't happen */
+	     call finish_abort;			/* foo! no i/o */
+	     go to write_returns;
+	end;
+
+	last_iom_stat = ""b;			/* start clean on each write */
+	same_err_stat_count = 0;
+	lth = nelem;				/* Get initial length of input string. */
+	inptr = addr (substr (wkspptr -> wksp, offset + 1, 1)); /* Get pointer to input string. */
+	n_dcws = 0;
+	prt_bufferp = null;
+
+	do while (lth > 0);				/* Loop until all elements transmitted. */
+	     if quit_pending then do;			/* someone hit QUIT */
+		if n_dcws > 0 then call close_buffer;	/* stop any work in progress */
+		if sdb.running then call wait_io;	/* wait for device to quiesce */
+		quit_pending = "0"b;		/* flag QUIT resignalled */
+		revert quit;			/* suspend handler */
+		signal quit;			/* resignal */
+		on quit call process_quit;		/* re-establish handler */
+		if rcode ^= 0 then go to write_returns; /* from wait_io */
+	     end;
+	     if n_dcws >= sdb.n_dcws then
+		call close_buffer;
+	     cur_page = pci.page_count;		/* Remember current page count. */
+	     if prt_bufferp = null then
+		call get_buffer (prt_bufferp, linep);
+	     else do;
+		linep = get_line_space ();
+		if linep = null then call close_buffer;
+	     end;
+	     if prt_bufferp ^= null then
+		call set_io;
+	     else call wait_io;
+
+	     if rcode ^= 0 then go to write_returns;
+
+	     if cur_page ^= pci.page_count then do;	/* If going to a new page ... */
+		sdb.stop_counter = sdb.stop_counter + 1;/* Bump the page stop counter. */
+
+		if sdb.single_page | (sdb.stop_every ^= 0 & sdb.stop_counter >= sdb.stop_every) then do;
+		     if n_dcws > 0 then call close_buffer;
+		     sdb.stop_counter = 0;		/* If time to stop ... */
+		     call set_status (error_table_$request_pending, iostatus);
+		     go to write_returns;
+		end;
+	     end;
+	end;
+
+	if n_dcws > 0 then
+	     call close_buffer;
+write_returns:
+	revert quit;				/* no more protection needed */
+	if quit_pending then do;			/* any QUITs at last minute? */
+	     quit_pending = "0"b;			/* be tidy */
+	     signal quit;				/* resignal */
+	end;
+	sdb.chars_printed = sdb.chars_printed + nelem - lth; /* boost the number done */
+	if rcode = 0 then do;			/* no nasty problems */
+	     if ^sdb.running & prt_buffers (sdb.b_begin).busy then /* something to print */
+		call start_io;			/* try to start printer */
+	     if rcode ^= 0 then call set_status (rcode, iostatus); /* preserve status of request_pending unless error */
+	end;
+	else call set_status (rcode, iostatus);
+	return;
+%page;
+/* close buffer plops in the IDCW */
+
+close_buffer: proc;
+
+dcl  i fixed bin;
+dcl  prevb fixed bin;
+
+	if n_dcws > sdb.max_dcws | n_dcws <= 0 then
+	     call abort ("close_buffer: n_dcws is outrageous");
+	if prt_buffer.busy then call abort ("closing busy buffer");
+	idcwp = addr (prt_buffer.idcw);
+	unspec (idcw) = prt_info.print_idcw;
+	idcw.chan_cmd = "06"b3;			/* multi-record */
+	idcw.count = bit (bin (n_dcws, 6), 6);
+	prt_buffer.dcw_count = n_dcws;
+	prt_buffer.data_ends = sdb.stop;
+	do i = n_dcws + 1 to hbound (prt_buffer.ddcw, 1);
+	     prt_buffer.ddcw (i) = sdb.null_line_dcw;
+	end;
+	n_dcws = 0;
+	if sdb.b_stop = prt_buffer.number then do;
+	     if sdb.b_stop ^= sdb.b_begin then
+		call abort ("close buffer not first");
+	end;
+	else do;
+	     if prt_buffer.number ^= mod (sdb.b_stop + 1, sdb.n_buffers) then
+		call abort ("close buffer circular buffer error");
+	     sdb.b_stop = prt_buffer.number;
+	end;
+	prt_buffer.busy = "1"b;
+	prt_bufferp = null;
+
+     end close_buffer;
+%page;
+/* buffer management is not a strict circular buffer because we don't want to waste
+   a buffer entry just for circular buffer discipline.  So...
+   Note that the code is capable of coping with 1 - N buffers.
+*/
+
+get_buffer: proc (a_bufferp, a_linep);
+dcl  a_bufferp ptr;
+dcl  a_linep ptr;
+dcl  n fixed bin;
+
+	a_bufferp = null;
+	a_linep = get_line_space ();
+	if a_linep = null then return;		/* no line space, why bother */
+	n = mod (sdb.b_stop + 1, sdb.n_buffers);
+	if prt_buffers (sdb.b_stop).busy then		/* some busy buffers */
+	     if prt_buffers (n).busy then return;	/* no free buffer */
+	     else a_bufferp = addr (prt_buffers (n));	/* use next buffer */
+	else if sdb.b_stop ^= sdb.b_begin then		/* check that we're really idle */
+	     call abort ("get_buffer stop^=begin, stop ^busy");
+	else do;
+	     a_bufferp = addr (prt_buffers (sdb.b_stop)); /* idle, use this one */
+	end;
+	do n = sdb.b_begin to sdb.b_stop;
+	     if ^prt_buffers (n).busy then
+		if n = sdb.b_begin & sdb.b_begin = sdb.b_stop then ;
+		else call abort ("get buffer circular error");
+	end;
+
+     end get_buffer;
+
+
+%page;
+/* try to get data space in the data portion of the workspace.  This is
+   managed as a circular buffer. */
+
+get_line_space: proc returns (ptr);
+
+	if sdb.stop >= sdb.bgin then do;		/* not wrapped, maybe empty */
+	     if sdb.stop + sdb.max_dcw_size > sdb.data_end then /* no room at top end */
+		if sdb.data_begin + sdb.max_dcw_size >= sdb.bgin then /* no room at beginning */
+		     return (null);
+		else do;				/* wrap around */
+		     if sdb.stop = sdb.bgin then	/* if empty */
+			sdb.bgin = sdb.data_end;	/* keep it empty */
+		     sdb.stop = sdb.data_begin;	/* wrap stop location */
+		end;
+	     else ;				/* use top end */
+	end;					/* sdb.stop > sdb.bgin */
+	else if sdb.stop + sdb.max_dcw_size >= sdb.bgin then /* crash into old stuff */
+	     return (null);
+	return (addr (wseg (sdb.stop)));		/* where to put it */
+
+     end get_line_space;
+%page;
+/* handle the QUIT condition */
+
+process_quit: proc;
+dcl  continue_to_signal_ entry (fixed bin (35));
+
+	if sdb.wait_flag then			/* no i/o in progress, blast it through */
+	     call continue_to_signal_ ((0));
+	else quit_pending = "1"b;
+
+     end process_quit;
+%page;
+/* convert the input to something acceptable to printer, build the dcw */
+
+set_io: proc;
+
+dcl  word_cnt fixed bin (18);
+dcl  char_cnt fixed bin (18);
+
+	call prt_conv_ (inptr, lth, linep, char_cnt, pcip); /* Perform code conversion. */
+	word_cnt = divide (char_cnt + 3, 4, 18, 0);	/* Compute number of words to write. */
+	if word_cnt > sdb.max_dcw_size then		/* oh dear */
+	     call abort ("prt_conv_ output exceeded max DCW size");
+	nelemt = nelem - lth;			/* Update the number of elements xmitted. */
+	if sdb.noprint then return;			/* Just return if print suppressed. */
+	n_dcws = n_dcws + 1;
+	dcwp = addr (prt_buffer.ddcw (n_dcws));
+	string (dcw) = "0"b;			/* Clear the DCW. */
+	dcw.address = rel (linep);			/* Set address to point to data. */
+	dcw.tally = bit (bin (word_cnt, 12));		/* Set tally of DCW. */
+	sdb.stop = sdb.stop + word_cnt;		/* admit we used it */
+	return;
+
+     end set_io;
+%page;
+/* make the printer listen to us */
+
+start_io: proc;
+
+	if ^sdb.wait_flag then
+	     if prt_buffers (sdb.b_begin).busy then do;
+		if sdb.running then
+		     call abort ("start_io called with device running");
+		call ioi_$connect (prt_info.devx, fixed (rel (addr (prt_buffers (sdb.b_begin).idcw))), rcode); /* Fire up the device. */
+		if rcode = 0 then do;
+		     sdb.alarm_time = clock () + TIMEOUT;
+		     call timer_manager_$alarm_wakeup ((sdb.alarm_time), "00"b, sdb.evchan);
+		     sdb.running = "1"b;		/* Indicate device now running. */
+		end;
+		else call abort ("connect failed " || ltrim (char (rcode)));
+	     end;
+	     else call abort ("start_io called with nothing to do");
+	return;
+
+     end start_io;
+%page;
+/* wait for I/O in progress.  */
+
+wait_io: proc;					/* need buffer space - keep device busy */
+
+	if ^sdb.running then do;			/* If printer not running ... */
+	     call start_io;				/* Get it in motion. */
+	     if rcode ^= 0 then return;
+	end;
+	call ipc_$block (addr (sdb.ev_list), addr (l_event_call_info), rcode);
+	if rcode ^= 0 then				/* Wait for I/O completion. */
+	     return;
+	call stat_check;				/* Examine status and set flags. */
+	return;
+
+     end wait_io;
+%page;
+/* Printer status check entry. */
+
+stat_check: proc;
+
+dcl  dcws_done fixed bin;
+dcl  flags bit (18) aligned;
+dcl  i fixed bin;
+dcl  residue fixed bin;
+dcl  pp ptr;
+dcl  l_idcwp ptr;
+dcl  l_prt_bufferp ptr;
+dcl  er bit (1) aligned;
+dcl  level fixed bin;
+dcl  time_out bit (1) aligned;
+dcl  run bit (1) aligned;
+dcl  offset fixed bin (18) unsigned;
+dcl  st bit (1) aligned;
+dcl  timer_rang bit (1) aligned;
+dcl  special_flag bit (1) aligned;
+dcl  temp_iom_stat bit (72) aligned;			/* temp area for iom status */
+
+dcl  l_timer_message char (8) based (imp);
+
+dcl  1 l_idcw aligned like idcw based (l_idcwp);
+dcl  1 l_prt_buffer aligned like prt_buffer based (l_prt_bufferp);
+dcl  1 l_istat aligned like istat;
+
+	isp = null;
+	statp = null;
+	imp = addr (l_event_call_info.message);		/* get pointer to ioi message */
+
+	if l_timer_message = "alarm___" then do;	/* check for timer ringing */
+	     if clock () >= sdb.alarm_time & sdb.alarm_time ^= 0 then
+		timer_rang = "1"b;			/* real alarm */
+	     else return;				/* bogus timer */
+	end;
+	else timer_rang = "0"b;
+	if sdb.wait_flag then do;			/* check for SPECIAL */
+	     sdb.alarm_time = 0;
+	     call timer_manager_$reset_alarm_wakeup (sdb.evchan); /* no more alarms */
+	     call ioi_$get_special_status (prt_info.devx, special_flag, (""b), rcode);
+	     if ^special_flag | rcode ^= 0 then do;	/* still not ready? */
+		if rcode = 0 then do;		/* if no error, set another alarm timer */
+		     sdb.alarm_time = clock () + TIMEOUT;
+		     call timer_manager_$alarm_wakeup ((sdb.alarm_time), "00"b, sdb.evchan);
+		end;
+		return;
+	     end;
+	     sdb.alarm_time = 0;
+	     sdb.wait_flag = "0"b;			/* not waiting any more */
+	     if sdb.reload_vfc_train_after_special then do; /* whatever required operator intervention ... */
+		call prtdim_eurc_util$load_image (sdb_ptr, (0)); /* ... also destroyed the train and VFC images */
+		call prtdim_eurc_util$load_vfc (sdb_ptr, (0));
+		sdb.reload_vfc_train_after_special = "0"b;
+	     end;
+	     imp = null;
+	     return;
+	end;
+
+	imp = null;
+	l_istat = sdb.status_ptr -> istat;
+	flags = "0"b;				/* Clear flags. */
+	residue = -1;
+
+	st = l_istat.st;				/* put all this crap in local variables */
+	level = bin (l_istat.level);			/* ... */
+	er = l_istat.er;				/* ... */
+	run = l_istat.run;				/* ... */
+	time_out = l_istat.time_out;			/* ... */
+	offset = bin (l_istat.offset);		/* ... */
+	temp_iom_stat = l_istat.iom_stat;		/* ... */
+	if run then
+	     call abort ("run status returned");
+
+	if ^st then do;				/* foo */
+	     statp = null;
+	     if timer_rang then			/* blow out */
+		call abort ("Completion of I/O was never indicated.");
+	     else return;				/* wait some more */
+	end;
+	sdb.status_ptr -> istat.st = "0"b;
+	sdb.running = "0"b;
+	sdb.alarm_time = 0;
+	call timer_manager_$reset_alarm_wakeup (sdb.evchan); /* no more alarms */
+	if time_out then do;			/* if caused by time out */
+	     call com_err_ (0, prt_info.devname, "IOI signalled device timeout.");
+	     rcode = error_table_$net_timeout;		/* indicate error */
+	     return;
+	end;
+
+	statp = addr (temp_iom_stat);
+	l_prt_bufferp = addr (prt_buffers (sdb.b_begin)); /* status must be on b_begin buffer */
+	if ^l_prt_buffer.busy then
+	     call abort ("stat_check found begin buffer ^busy");
+	l_idcwp = addr (l_prt_buffer.idcw);
+	if offset < bin (rel (l_idcwp))		/* check status offset */
+
+/*	     | offset > bin (rel (addr (l_prt_buffer.ddcw (l_prt_buffer.dcw_count)))) /* EURC sometimes goes too high */
+
+	then call abort ("invalid status offset");
+	residue = bin (status.rcount);
+
+	if er then do;				/* If error occurred ... */
+	     if level = IO_SYSTEM_FAULT_INTERRUPT_LEVEL then do; /* If system fault ... */
+		call analyze_system_fault_ (prt_info.devname, temp_iom_stat);
+		sdb.wait_flag = "1"b;		/* Wait for operator intervention. */
+		sdb.error_count = sdb.error_count + 1;
+		call abort ("system fault");
+	     end;
+	     else do;				/* If terminate ... */
+		call analyze_device_stat_$rs (errmess, addr (prt_status_table_$prt_status_table_),
+		     temp_iom_stat, flags);
+		if status.channel_stat ^= ""b | status.central_stat ^= ""b then
+		     call abort ((errmess));
+
+		if flags & paper_low_flag then
+		     if pci.overflow_off then		/* If in overflow_off mode ... */
+			flags = flags | report_flag | halt_flag;
+						/* Stop now to avoid printing on perf. */
+		     else if ^sdb.paper_low then do;	/* Report paper low only once. */
+			sdb.paper_low = "1"b;
+			flags = flags | report_flag;
+		     end;
+
+		if flags & power_fault_flag then	/* power fault: VFC/train images no longer valid */
+		     sdb.reload_vfc_train_after_special = "1"b;
+
+		if flags & report_flag then do;	/* If error should be reported ... */
+		     sdb.error_count = sdb.error_count + 1;
+
+		     if (temp_iom_stat & dev_stat_bits) ^= last_iom_stat then do; /* if not reported */
+			last_iom_stat = (temp_iom_stat & dev_stat_bits); /* save for next error */
+			same_err_stat_count = 1;
+			call com_err_ (0, prt_info.devname, errmess);
+		     end;
+		     else do;
+			same_err_stat_count = same_err_stat_count + 1;
+						/* Allow only a resonable amount of unreported */
+						/* errors to occur.  Then report again. */
+						/* Also want to report again if need to wait. */
+			if same_err_stat_count >= max_err_stat_count | (flags & halt_flag) ^= "0"b
+			then do;
+			     sdb.wait_flag = "1"b;
+			     call com_err_ (0, prt_info.devname, errmess);
+			end;
+		     end;
+		end;
+		sdb.wait_flag = ((flags & halt_flag) ^= "0"b) | sdb.wait_flag;
+						/* Decide if operator intervention required. */
+
+		if flags & image_flag then do;	/* If train image destroyed ... */
+		     call prtdim_eurc_util$load_image (sdb_ptr, rcode);
+		     if rcode ^= 0 then do;
+			statp = null;
+			return;
+		     end;
+		end;
+
+		if flags & vfc_flag then do;		/* If VFC image destroyed ... */
+		     call prtdim_eurc_util$load_vfc (sdb_ptr, rcode);
+		     if rcode ^= 0 then do;
+			statp = null;
+			return;
+		     end;
+		end;
+	     end;
+
+	     if sdb.wait_flag then do;
+		sdb.alarm_time = clock + TIMEOUT;
+		call timer_manager_$alarm_wakeup ((sdb.alarm_time), "00"b, sdb.evchan);
+		same_err_stat_count = 0;
+		call com_err_ (0, prt_info.devname, "***** OPERATOR INTERVENTION REQUIRED^/");
+	     end;
+
+	end;
+
+	else					/* If no error ... */
+	     sdb.paper_low = "0"b;			/* Reset paper low flag. */
+
+	if residue > l_prt_buffer.dcw_count | residue > sdb.max_dcws then
+	     call abort ("residue exceeds dcw count or max dcws");
+	if flags & backup_flag then			/* think you want to back up ? */
+	     if ((flags & eurc_no_backup_flag) = ""b) | ^sdb.flags.eurc then /* no eurc special case or not eurc */
+		residue = residue + 1;
+	if residue > l_prt_buffer.dcw_count | residue > sdb.max_dcws then
+	     call abort ("adjusted residue exceeds dcw count or max dcws");
+
+	if ^er | residue <= 0 then do;		/* terminated this buffer, too */
+	     if l_prt_buffer.data_ends <= 0 | l_prt_buffer.dcw_count <= 0 then
+		call abort ("last buffer bad data_ends/dcw_count");
+	     sdb.bgin = l_prt_buffer.data_ends;		/* only update bgin when whole buffer is done */
+	     l_prt_buffer.busy = "0"b;
+	     l_prt_buffer.ddcw (*) = sdb.null_line_dcw;
+	     l_prt_buffer.idcw = "777777000014"b3;
+	     l_prt_buffer.data_ends = 0;
+	     l_prt_buffer.dcw_count = 0;
+	     if sdb.b_begin ^= sdb.b_stop then
+		sdb.b_begin = mod (sdb.b_begin + 1, sdb.n_buffers);
+	     l_prt_bufferp = null;
+	end;
+	else do;
+	     if l_prt_buffer.data_ends <= 0 | l_prt_buffer.dcw_count <= 0 then
+		call abort ("processing error buffer - bad data_ends/dcw_count");
+	     dcws_done = l_prt_buffer.dcw_count - residue;
+	     do i = 1 to hbound (l_prt_buffer.ddcw, 1);	/* fix up dcws */
+		if i <= residue then		/* this dcw or trailing slot will be used in next connect */
+		     l_prt_buffer.ddcw (i) = l_prt_buffer.ddcw (i + dcws_done);
+		else l_prt_buffer.ddcw (i) = sdb.null_line_dcw;
+	     end;
+	     l_idcw.count = bit (bin (residue, 6), 6);
+	     l_prt_buffer.dcw_count = residue;
+	     l_prt_bufferp = null;
+	end;					/* er */
+	statp = null;
+	return;
+
+     end stat_check;
+%page;
+/* entry to wait out current I/O and scrap unprinted info  */
+
+prtdim_resetwrite: entry (arg_sdb_ptr, iostatus);
+
+	unclean = "1"b;
+	iostatus = "0"b;
+	sdb_ptr = arg_sdb_ptr;
+	pip = addr (sdb.info);
+	pcip = addr (sdb.conv_info);
+	isp = null;
+	statp = null;
+	imp = null;
+	rcode = 0;
+	quit_pending = ""b;
+	on cleanup call tidy_up;
+	on quit call process_quit;
+	if sdb.aborting then do;			/* wants to throw away the world, be nice */
+	     call prtdim_eurc_util$finish_abort (sdb_ptr);
+	     if sdb.aborting then do;
+		call set_status (error_table_$data_loss, iostatus);
+		go to resetwrite_returns;		/* still a mess */
+	     end;
+	     iostatus = ""b;
+	     sdb.wait_flag = "0"b;
+	end;
+	do while (sdb.running);			/* Wait for printer to stop. */
+	     call wait_io;				/* stop */
+	     if quit_pending then do;			/* any defered QUIT? */
+		quit_pending = "0"b;
+		revert quit;
+		signal quit;
+		on quit call process_quit;
+	     end;
+	     if rcode ^= 0 then do;			/* from wait_io, not disturbed by QUIT hack */
+		call set_status (rcode, iostatus);
+		go to resetwrite_returns;
+	     end;
+	end;
+
+	sdb.bgin,
+	     sdb.stop = sdb.data_begin;		/* Reset all indices. */
+	prt_buffers (*).busy = "0"b;
+	sdb.b_stop, sdb.b_begin = 0;
+
+resetwrite_returns:
+	revert quit;
+	if quit_pending then do;
+	     quit_pending = "0"b;
+	     signal quit;
+	end;
+	return;					/* Output all scrapped. */
+%page;
+/* entry to await all pending unprinted information */
+
+runout: entry (arg_sdb_ptr, iostatus);
+
+	unclean = "1"b;
+	iostatus = "0"b;
+	sdb_ptr = arg_sdb_ptr;
+	pip = addr (sdb.info);
+	pcip = addr (sdb.conv_info);
+	isp = null;
+	statp = null;
+	imp = null;
+	rcode = 0;
+	quit_pending = ""b;
+	on cleanup call tidy_up;
+	on quit call process_quit;
+	if sdb.aborting then do;			/* shouldn't happen */
+	     call finish_abort;
+	     go to runout_returns;
+	end;
+	do while (prt_buffers (sdb.b_begin).busy);	/* as long as there's stuff to do */
+	     call wait_io;				/* Start printer and wait for completion. */
+	     if quit_pending then do;			/* process quit first */
+		quit_pending = "0"b;
+		revert quit;
+		signal quit;
+		on quit call process_quit;
+	     end;
+	     if rcode ^= 0 then do;
+		call set_status (rcode, iostatus);
+		go to runout_returns;
+	     end;
+	end;
+	call ipc_$drain_chn (sdb.evchan, (0));		/* ioi has nothing left to say */
+runout_returns:
+	revert quit;
+	if quit_pending then do;
+	     quit_pending = "0"b;
+	     signal quit;
+	end;
+	return;					/* Output all flushed. */
+%page;
+abort: proc (a_message);
+dcl  a_message char (132);
+dcl  sub_err_ entry () options (variable);
+
+	call dump (a_message);
+	sdb.aborting = "1"b;
+	call com_err_ (0, prt_info.devname, "***** Unexpected status or program error.");
+	call com_err_ (0, prt_info.devname, "***** ^a.", a_message);
+	call com_err_ (0, prt_info.devname, "***** Data has been lost.");
+	call finish_abort;				/* try to clean it up now */
+	call sub_err_ (error_table_$data_loss, "prtdim_eurc_write", ACTION_CANT_RESTART, null (), (0), "Unexpected status or program error.");
+
+     end abort;
+
+
+dump: proc (a_message);
+dcl  a_message char (*);
+dcl  copy_length fixed bin (19);
+dcl  name char (30) varying;
+dcl  d_stackp ptr;
+dcl  d_wsegp ptr;
+dcl  code fixed bin (35);
+dcl  sb ptr;
+
+dcl  1 bumf aligned based,
+       2 version fixed bin (71),
+       2 time fixed bin (71),
+       2 sp ptr,
+       2 message char (128);
+
+dcl  copy_seg (copy_length * 4) char unaligned based;
+
+dcl  hcs_$get_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl  terminate_file_ entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+
+	name = "prtdim." || unique_chars_ (""b) || "." || prt_info.devname;
+	call hcs_$make_seg (">dumps>printer_dumps", name || ".s", "", RW_ACCESS_BIN, d_stackp, code);
+	if code ^= 0 then return;
+	call com_err_ (0, prt_info.devname, "***** creating dump ^a (^a), sp=^o.", name, a_message, fixed (rel (stackframeptr ())));
+	sb = stackbaseptr ();
+	copy_length = fixed (rel (sb -> stack_header.stack_end_ptr));
+	d_stackp -> copy_seg = sb -> copy_seg;
+	call terminate_file_ (d_stackp, copy_length * 36, TERM_FILE_TRUNC_BC_TERM, (0));
+	call hcs_$make_seg (">dumps>printer_dumps", name || ".w", "", RW_ACCESS_BIN, d_wsegp, code);
+	if code ^= 0 then return;
+	copy_length = 1024 * (divide (fixed (rel (sdb.status_ptr)), 1024, 17, 0) + 1);
+	d_wsegp -> copy_seg = sdb.wsegp -> copy_seg;
+	d_wsegp = addrel (d_wsegp, copy_length);
+	d_wsegp -> bumf.version = 1;
+	d_wsegp -> time = clock ();
+	d_wsegp -> bumf.sp = stackframeptr ();
+	d_wsegp -> bumf.message = a_message;
+	d_wsegp = addrel (d_wsegp, size (bumf));
+	copy_length = size (sdb);
+	d_wsegp -> copy_seg = sdb_ptr -> copy_seg;
+	d_wsegp = addrel (d_wsegp, copy_length);
+	call terminate_file_ (d_wsegp, fixed (rel (d_wsegp)) * 36, TERM_FILE_TRUNC_BC_TERM, (0));
+     end dump;
+
+
+finish_abort: proc;
+dcl  old_wait_flag bit (1) aligned;
+
+	old_wait_flag = sdb.wait_flag;
+	call prtdim_resetwrite (sdb_ptr, iostatus);
+	sdb.wait_flag = old_wait_flag;
+	call set_status (error_table_$data_loss, iostatus);
+
+     end finish_abort;
+
+
+set_status: proc (a_code, a_iostatus);
+dcl  a_code fixed bin (35);
+dcl  a_iostatus bit (72) aligned;
+
+	substr (a_iostatus, 1, 36) = unspec (a_code);
+	substr (a_iostatus, 41, 1) = "1"b;
+
+     end set_status;
+
+
+tidy_up: proc;
+
+	if ^unclean | sdb.aborting then return;		/* if nothing to worry about or already cleaning up */
+	sdb.aborting = "1"b;
+	call finish_abort;				/* try to quiesce device now */
+
+     end tidy_up;
+
+/* format: off */
+%page; %include access_mode_values;
+%page; %include event_call_info;
+%page; %include interrupt_levels;
+%page; %include ioi_stat;
+%page; %include iom_dcw;
+%page; %include iom_pcw;
+%page; %include iom_stat;
+%page; %include prt_conv_info;
+%page; %include prt_info;
+%page; %include prt_sdb;
+%page; %include stack_header;
+%page; %include status_flags;
+%page; %include sub_err_flags;
+%page; %include terminate_file;
+
+     end prtdim_eurc_write;

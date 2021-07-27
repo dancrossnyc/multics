@@ -1,0 +1,419 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Bull Inc., 1987                *
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+" *                                                         *
+" ***********************************************************
+
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	page_synch
+"
+"	Module to manage Data Management synchronized pages for ALM
+"	Page Control.
+"
+"	Entries:
+"
+"	cleanup  	when a synch page is evicted, for housekeeping
+"	move	when a synch page is moved from one frame to another
+"	write     when Page Control wants to write a synch page, to see
+"		whether it can
+"	unlink_journal when a journal time stamp is changed, to unlink
+"		all held CMEs
+"
+"	Written October 1982 by J. Bongiovanni
+"	Modified June 1983 by M. Pandolf to better meter invalid formats
+"	Modified May 1984 by Chris Jones to add move entry
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	name	page_synch
+
+	segdef	cleanup
+	segdef	move
+	segdef	write
+	segdef	unlink_journal
+
+minus_one:
+	dec	-1
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	cleanup
+"
+"	Called when a synch page is evicted from memory, to do housekeeping
+"	and reset CME bits.
+"
+"	tsx7	page_synch$cleanup
+"
+"	On entry,
+"		x4 -> CME
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+cleanup:
+	spriap	page_synch_temp		" Save register
+	eppap	dm_journal_seg_$
+
+	ldq	page_fault$cme_flags,*x4	" CME flags
+	canq	cme.synch_held,dl		" Held page?
+	tze	cleanup_not_held		" No
+	tsx6	thread_out		" Yes - thread out of per-journal list
+
+cleanup_not_held:
+	lca	cme.synch_held+1,dl		" Reset held bit
+	ansa	page_fault$cme_flags,*x4
+
+	tra	ret_0
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"	move
+"
+"	Called when a synch-held page is moved from one frame to another.
+"	Its entry in dm_journal_seg_ must be updated.
+"
+"	tsx7	page_synch$move
+"
+"	On entry,
+"		x4 -> new CME
+"		x5 -> old CME
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+move:
+	lda	page_fault$cme_flags,*x5
+	ana	cme.synch_held,dl
+	tze	0,x7			" not held, nothing to do
+	spriap	page_synch_temp
+	orsa	page_fault$cme_flags,*x4	" turn on synch_help in new
+	eaq	0,x5			" save this for a minute
+	lxl5	page_fault$cme_synch_page_entryp,*qu
+	sxl5	page_fault$cme_synch_page_entryp,*x4
+	eppap	dm_journal_seg_$		" point to dm_page_entry
+	stx4	ap|dm_page_entry.cme_relp,x5
+	eax5	0,qu			" copy it back
+	tra	ret_0
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"	write
+"
+"	Called when Page Control wants to write a synch page. If the page
+"	must be held, it is threaded to a per-journal list.
+"
+"	tsx7	page_synch$write
+"	<return if page must be held>
+"	<return if OK to write>
+"
+"	On entry,
+"		x4 -> CME
+"		bp -> PTW
+"		abs_seg1 -> memory frame for page
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+write:
+	spriap	page_synch_temp		" Save register
+	eppap	dm_journal_seg_$
+	aos	ap|dm_journal.synch_write_calls " Meter
+
+	tsx6	page_fault$savex		" Recursive use of x7
+
+	lda	page_fault$cme_flags,*x4
+	cana	cme.synch_held,dl		" Page already held?
+	tze	write_not_held		" No
+	tsx6	thread_out		" Yes - thread out of list
+
+write_not_held:
+	tsx6	check_page_hold		" Should we hold?
+	tra	invalid_format		" Bogus synch page format
+	tra	write_hold		" Hold for sure
+
+"	Maybe not hold, but race exists since page is accessible to other
+"	CPUs. Remove access and check again
+
+	lca	ptw.valid+1,dl
+	ansa	bp|0			" Remove access in PTW
+	tsx6	page_fault$check_accessible	" Is segment accessible?
+	tsx7	cam_cache$cam_cache		" Yes, zap AMs
+
+	tsx6	check_page_hold		" Check again for hold
+	tra	invalid_format		" Bogus format
+	tra	write_hold		" Hold
+	tra	ret_unsavex_1		" Can write - done restores access
+
+write_hold:
+	lda	ptw.valid,dl		" Restore access
+	orsa 	bp|0
+	lda	ap|dm_journal.n_held_pages_mem " Check held against threshold
+	cmpa	ap|dm_journal.max_held_pages_mem
+	tpl	write_over_threshold	" Exceeded
+	aos	ap|dm_journal.synch_write_holds " Meter
+	tsx6	thread_in			" Thread into list per-journal
+	tra	ret_unsavex_0		" And return
+
+invalid_format:
+	lda	ptw.valid,dl		" Restore access
+	orsa	bp|0
+	tra	ret_unsavex_1		" For now
+
+write_over_threshold:
+	aos	ap|dm_journal.synch_write_tosses " Meter
+	tra	ret_unsavex_1		" And toss by allowing write
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	unlink_journal
+"
+"	Called when a journal time stamp is changed to unlink all CMEs,
+"	causing pages not to be held. Pages which should still be held
+"	will be detected when next we try to write them.
+"
+"	call page_synch$unlink_journal (Journal_Index)
+"
+"	Must be called with PTL held
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+unlink_journal:
+	push
+
+	ldq	ap|2,*			" Journal index
+	tmoz	unlink_returns		" Bogus
+	eppap	dm_journal_seg_$
+	cmpq	ap|dm_journal.n_journals	" Valid index
+	tpnz	unlink_returns		" No
+	mpy	dm_per_journal_size,dl
+	eaq	ap|dm_journal.per_journal-dm_per_journal_size,ql " QU -> per journal entry
+	stq	page_synch_temp
+	aos	ap|dm_journal.unlink_calls	" Meter
+
+unlink_loop:
+	ldq	page_synch_temp		" QU -> per journal entry
+	ldx0	ap|dm_per_journal.entry_relp,qu " x0 -> page entry
+	tze	unlink_returns		" None left
+	aos	ap|dm_journal.unlink_steps	" Meter
+	ldx4	ap|dm_page_entry.cme_relp,x0	" x4 -> CME
+	tze	page_error$dm_journal_seg_problem " Bad news, indeed
+	tsx6	thread_out		" Unthread this entry
+	tra	unlink_loop
+
+unlink_returns:
+	return
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	Return points - restore registers and return
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+ret_0:
+	lprpap	page_synch_temp
+	tra	0,x7
+
+ret_1:
+	lprpap	page_synch_temp
+	tra	1,x7
+
+ret_2:
+	lprpap	page_synch_temp
+	tra	2,x7
+
+ret_unsavex_0:
+	lprpap	page_synch_temp
+	tra	page_fault$unsavex
+
+ret_unsavex_1:
+	lprpap	page_synch_temp
+	tra	page_fault$unsavex_1
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	Internal procedure to check whether a page should be held, and
+"	not written.
+"	
+"	tsx6	check_page_hold
+"	<return if invalid synch page format>
+"	<return if should hold>
+"	<return if write OK>
+"
+"	On entry,
+"		x4 -> CME
+"		abs_seg1 -> main memory for page
+"
+"	On exit,
+"		ap -> dm_journal_seg_
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+check_page_hold:
+
+	eppap	abs_seg1$			" ap -> page
+	ldaq	ap|synch_page.version_word
+	tze	null_version_word
+	lda	ap|synch_page.version_word
+	ana	synch_page.version,du
+	cmpa	SYNCH_PAGE_VERSION_1,du	" Good format for header
+	tnz	invalid_version_number	" No
+	lda	ap|synch_page.journal_index_word
+	arl	synch_page.journal_index_shift
+	ana	synch_page.journal_index_mask,dl " Pick up journal index
+	tze	invalid_journal_index	" No good
+	sta	page_synch_index		" save
+	ldaq	ap|synch_page.time_stamp_word
+	anaq	synch_page.time_stamp_mask	" Get time stamp
+	staq	page_synch_time		" And save
+	rccl	sys_info$clock_,*		" Check for reasonable value
+	cmpaq	page_synch_time		" Can't be later than clock
+	tmi	invalid_time_stamp
+
+	eppap	dm_journal_seg_$
+
+	ldq	page_synch_index
+	cmpq	ap|dm_journal.n_journals	" Index valid
+	tpnz	0,x6			" No
+	mpy	dm_per_journal_size,dl	" Convert to offset
+	eax0	ap|dm_journal.per_journal-dm_per_journal_size,ql " x0 -> per_journal entry
+	szn	ap|dm_per_journal.uid,x0	" In use?
+	tze	0,x6			" No - bogousity
+
+	ldaq	page_synch_time
+	cmpaq	ap|dm_per_journal.time_stamp,x0 " Hold page?
+	tmoz	2,x6			" No
+	tra	1,x6			" Yes
+
+null_version_word:
+	eppap	dm_journal_seg_$
+	aos	ap|dm_journal.synch_write_no_stamp " Meter
+	tra	0,x6
+
+invalid_version_number:	
+	eppap	dm_journal_seg_$
+	aos	ap|dm_journal.synch_write_inv_vers " Meter
+	tra	0,x6
+
+invalid_journal_index:
+	eppap	dm_journal_seg_$
+	aos	ap|dm_journal.synch_write_inv_ix " Meter
+	tra	0,x6
+
+invalid_time_stamp:
+	eppap	dm_journal_seg_$
+	aos	ap|dm_journal.synch_write_inv_time " Meter
+	tra	0,x6
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	Internal procedure to thread an entry into a per-journal list
+"
+"	tsx6	thread_in
+"
+"	On entry,
+"		ap -> dm_journal_seg_$
+"		x4 -> CME
+"		x0 -> per_journal entry
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+thread_in:
+	ldx1	ap|dm_journal.free_list_relp	" Next free entry
+	tze	page_error$no_free_dm_entries	" None
+
+	ldq	ap|0,x1			" QU -> next free
+	stq	ap|dm_journal.free_list_relp
+
+	stx4	ap|dm_page_entry.cme_relp,x1
+
+	ldx5	ap|dm_per_journal.entry_relp,x0 " Entry in list
+	tnz	thread_in_non_empty		" List non-empty
+
+	stx1	ap|dm_per_journal.entry_relp,x0 " Save in list ptr
+	stx1	ap|dm_page_entry.fp,x1	" Entry threads to self
+	sxl1	ap|dm_page_entry.bp,x1
+	tra	thread_in_done
+
+thread_in_non_empty:
+	lda	ap|dm_page_entry.fp,x5	" x5 -> an entry in the list
+	sxl1	ap|dm_page_entry.bp,x5	" entry -> back to new entry
+	stx5	ap|dm_page_entry.fp,x1	" new entry -> forward to entry
+	stx1	ap|dm_page_entry.fp,al	" prev entry -> forward to new entry
+	eax5	0,al
+	sxl5	ap|dm_page_entry.bp,x1	" new entry -> back to prev entry
+
+thread_in_done:
+	sxl0	ap|dm_page_entry.journal_relp,x1 " pointer to per_journal
+	sxl1	page_fault$cme_synch_page_entryp,*x4 " CME -> entry
+	lda	cme.synch_held,dl
+	orsa	page_fault$cme_flags,*x4	" Mark CME as held
+	aos	ap|dm_per_journal.n_held,x0	" Bump count of held this journal
+	aos	ap|dm_journal.n_held_pages_mem " And total held
+
+	tra	0,x6
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	Internal procedure to thread an entry out of a per-journal list
+"
+"	tsx6	thread_out
+"
+"	On entry,
+"		ap -> dm_journal_seg_$
+"		x4 -> CME
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+thread_out:
+
+	lda	cme.synch_held,dl
+	era	minus_one
+	ansa	page_fault$cme_flags,*x4	" Mark CME as not-held
+
+	lxl1	page_fault$cme_synch_page_entryp,*x4 " x1 -> entry
+	tze	page_error$dm_journal_seg_problem
+	lda	-1,du
+	ansa	page_fault$cme_synch_page_entryp,*x4 " Reset CME pointer
+
+	lxl0	ap|dm_page_entry.journal_relp,x1 " x0 -> per-journal entry
+
+	lxl5	ap|dm_page_entry.bp,x1	" x5 -> prev entry
+	cmpx1	ap|dm_page_entry.fp,x1	" Thread to self?
+	tnz	thread_out_non_empty	" No - list won't be empty
+	
+	stz	ap|dm_per_journal.entry_relp,x0 " Mark list as empty
+	tra	thread_out_done
+
+thread_out_non_empty:
+	lda	ap|dm_page_entry.fp,x1	" AU -> next entry
+	sxl5	ap|dm_page_entry.bp,au	" next -> back to prev
+	eax5	0,au			" x5 -> next entry
+	stx5	ap|dm_page_entry.fp,al	" prev -> forward to next
+	stx5	ap|dm_per_journal.entry_relp,x0 " In case it pointed to this one
+
+thread_out_done:
+	lda	ap|dm_journal.free_list_relp	" Thread entry into free list
+	sta	ap|dm_page_entry.fp,x1
+	eaa	0,x1
+	sta	ap|dm_journal.free_list_relp
+
+	lda	ap|dm_per_journal.n_held,x0	" Decrement per-journal count
+	sbla	1,dl
+	sta	ap|dm_per_journal.n_held,x0
+	lda	ap|dm_journal.n_held_pages_mem " Decrement total count
+	sbla	1,dl
+	sta	ap|dm_journal.n_held_pages_mem
+
+	tra	0,x6
+"
+	include	cmp
+"
+	include	dm_journal_seg_
+"
+	include	ptw
+"
+	include	pxss_page_stack
+"
+	include	synch_page
+
+
+	end

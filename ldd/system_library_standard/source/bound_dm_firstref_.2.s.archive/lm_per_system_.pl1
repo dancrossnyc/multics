@@ -1,0 +1,1214 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+/* ***********************************************************
+   *                                                         *
+   * copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/*  DESCRIPTION:
+Data Management Locking
+*/
+
+/*  HISTORY:
+
+Written by J. Bongiovanni,  11/01/82.
+Modified:
+12/01/82 by J. Bongiovanni:  For multi-segment lock data.
+01/01/83 by J. Bongiovanni:  For deterministic deadlock detection.
+03/01/83 by Lindsey Spratt to increase the lock_seg_timeout to 5 min.
+04/24/83 by Benson I. Margulies:  To handle mylock more gracefully.
+04/26/83 by Benson I. Margulies:  To log timeouts on the lock_seg lock.
+05/06/83 by Benson I. Margulies:  To not create one ev channel per txn.
+05/10/83 by Benson I. Margulies:  To meter.
+08/05/83 by Lee A. Newcomb to remove obsolete code args. from calls
+	  to dm_per_system_ entries.
+05/01/84 by R. Michael Tague:  Added %include dm_lm_meters.
+07/17/84 by Matthew Pierret:   Changed call to fm_open_$post_txn to
+            file_manager_$post_transaction.
+09/19/84 by Lindsey L. Spratt:  Fixed VALID_TXN to check for the invalid TXID
+            = "0"b and return false.  txnmgr_$get_txn_index will return the
+            idx for the current txn (and a 0 error code) when given "0"b.
+            Fixed CONFLICT(6,6) to equal "1"b, it was "0"b (see MTB514, Fig.
+            1, Compatibility Matrix).  Fixed to call lm_signal_deadlock_ when
+            either returning from ipc_$block with an event_info.message of
+            LOCK_MESSAGE_DEADLOCK, or if waiting on a lock would cause a
+            deadlock (according to CHECK_DEADLOCK).
+09/25/84 by Lindsey L. Spratt:  Removed use of the MAX_WAIT_TIME, the timer in
+            REALLY_WAIT is now set to the give_up_time.
+            Changed to do deadlock detection before waiting on the lock at
+            all, as opposed to only doing deadlock detection after the first
+            wait.  This change is necessary because of the removal of
+            MAX_WAIT_TIME.
+            Fixed to set the Lock_Txn_Table.deadlock_inx to 0 for invalid txns
+            in CHECK_DEADLOCK.
+10/17/84 by Stanford S. Cox:  MAIN: Chg all int proc to have prefix var names
+	  and use ER, chg CONFLICT (6, 6) to "1"b.  ER: Added for common
+	  return.  SETUP_LOCK: Chg RETRY_LOCK_LOOP to use do while.  LOCK_OBJECT:
+	  Chg LOCK_LOOP to use do while.
+01/22/85 by Lindsey L. Spratt:  Added the SETUP_UNLOCK internal proc for use
+            by the $unlock_lock_data entry.  It was just calling UNLOCK, which
+            relied on lock_seg_ptr being set by a previous call to SETUP_LOCK.
+02/07/85 by Stanford S. Cox: unlock_all: Rmvd call to fm$post_transaction,
+   	  LOCK_OBJECT: Added call to lm_signal_$timeout.
+02/26/85 by Lindsey L. Spratt:  Fixed to UNWAIT_ME before signalling deadlock.
+            Fixed to only cause deadlock resolution in CHECK_DEADLOCK when
+            lm_check_for_deadlock_ has found a deadlock.  Fixed to make the
+            deadlock meters consistent with the actual deadlock resolution.
+03/01/85 by Lindsey L. Spratt:  Added the SEND_WAKEUP internal proc, which
+            handles itt overflows and logs other errors encountered when
+            calling hcs_$wakeup.  Changed to wake up and retry the lock very
+	  INTERMEDIATE_WAIT_TIME (30 seconds), in case the wakeup on which
+	  the proc is blocked isn't sent.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+*/
+
+/* format: style3,idind30 */
+lm_per_system_$lock:
+     proc (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_code);
+
+/*  Parameter  */
+
+dcl	p_ci_number		fixed bin (27) parameter;
+						/* Control Interval Number */
+dcl	p_checkpoint_id		bit (36) aligned parameter;
+						/* Checkpoint Unique ID */
+dcl	p_code			fixed bin (35) parameter;
+						/* Standard Error p_code */
+dcl	p_mode_obtained		fixed bin parameter;/* Lock Mode Obtained */
+dcl	p_mode_req		fixed bin parameter;/* Lock Mode Requested */
+dcl	p_f_uid			bit (36) aligned parameter;
+						/* Page File Unique ID */
+dcl	p_timeout			fixed bin (71) parameter;
+						/* How long to wait */
+
+/*  Automatic  */
+
+dcl	ci_number			fixed bin (27);
+dcl	code			fixed bin (35);
+dcl	give_up_time		fixed bin (71);
+dcl	mode_req			fixed bin;
+dcl	f_uid			bit (36) aligned;
+dcl	error_in_unlock_all		bit (1) aligned;
+
+/*  Static  */
+
+dcl	COMMON_MODE		(2:6, 2:6) fixed bin int static options (constant)
+				init (2, 3, 2, 6, 6, 3, 3, 3, 3, 3, 2, 3, 4, 5, 6, 6, 3, 5, 5, 6, 6, 3, 6, 6, 6);
+
+dcl	CONFLICT			(2:6, 2:6) bit (1) aligned int static options (constant)
+				init ("0"b, "1"b, "0"b, "1"b, "1"b, "1"b, "1"b, "1"b, "1"b, "1"b, "0"b, "1"b,
+				"0"b, "0"b, "0"b, "1"b, "1"b, "0"b, "0"b, "1"b, "1"b, "1"b, "0"b, "1"b, "1"b);
+
+dcl	(
+	YES			init ("1"b),
+	NO			init ("0"b)
+	)			bit (1) aligned internal static options (constant);
+
+dcl	LOCK_SEG_TIMEOUT		fixed bin (71) int static options (constant) init (300000000 /* 5 minutes */);
+dcl	ITT_OVERFLOW_WAIT_TIME	init (1e7 /* 10 seconds */) fixed bin (71) int static options (constant);
+dcl	INTERMEDIATE_WAIT_INTERVAL	init (3e7 /* 30 seconds */) fixed bin (71) int static options (constant);
+dcl	ID_IS_INVALID		init ("0"b) bit (1) aligned internal static options (constant);
+dcl	TIME_IS_ABSOLUTE		init (2) fixed bin (17) int static options (constant);
+dcl	RELATIVE_SECONDS		init ("11"b) bit (2) int static options (constant);
+dcl	MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+				init (10) fixed bin internal static options (constant);
+dcl	ME			char (14) int static options (constant) init ("lm_per_system_");
+
+/*  Based  */
+
+dcl	dm_area			area based (dm_data_$inner_ring_areap);
+
+/*  External  */
+
+dcl	dm_system_data_$max_n_transactions
+				fixed bin ext;
+dcl	dm_data_$inner_ring_areap	ptr external;
+dcl	dm_data_$current_txn_id	bit (36) aligned external;
+dcl	lm_data_$ev_channel		fixed bin (71) ext static;
+dcl	lm_data_$txn_table_ptr	pointer ext static;
+dcl	lm_data_$lock_segments_ptr	ptr external;
+dcl	lm_data_$lock_seg_ptr	ptr external;
+dcl	lm_data_$n_lock_segments	fixed bin external;
+dcl	dm_error_$fast_lock_mylock	ext static fixed bin (35);
+dcl	dm_error_$fast_lock_invalid_reset
+				fixed bin (35) external;
+dcl	dm_error_$lock_invalid_mode	fixed bin (35) external;
+dcl	dm_error_$lock_invalid_uid	fixed bin (35) external;
+dcl	dm_error_$lock_not_found	fixed bin (35) external;
+dcl	dm_error_$lock_table_overflow fixed bin (35) external;
+dcl	dm_error_$lock_timeout	fixed bin (35) external;
+dcl	dm_error_$unimplemented_entry fixed bin (35) external;
+dcl	error_table_$unimplemented_version
+				fixed bin (35) ext static;
+dcl	error_table_$itt_overflow	fixed bin (35) ext static;
+dcl	error_table_$process_unknown	fixed bin (35) ext static;
+dcl	dm_system_data_$lock_ips_mask bit (36) aligned external;
+
+/*  Entry  */
+
+dcl	dm_misc_util_$log		entry options (variable);
+dcl	lm_check_for_deadlock_	entry (ptr, ptr, fixed bin, bit (36) aligned, fixed bin (35));
+dcl	lm_signal_$deadlock		entry (bit (36) aligned, bit (36) aligned, fixed bin (35), fixed bin);
+dcl	lm_signal_$timeout		entry (bit (36) aligned, bit (36) aligned, fixed bin (35), fixed bin,
+				fixed bin (71));
+dcl	cu_$level_get		entry (fixed bin);
+dcl	cu_$level_set		entry (fixed bin);
+dcl	dm_per_system_$initiate	entry (char (*), char (*), ptr);
+dcl	lm_expand_lock_seg_		entry (fixed bin (35));
+dcl	get_ring_			entry () returns (fixed bin (3));
+dcl	hcs_$get_alarm_timer	entry (fixed bin (71), fixed bin (71));
+dcl	hcs_$reset_ips_mask		entry (bit (36) aligned, bit (36) aligned);
+dcl	hcs_$set_alarm_timer	entry (fixed bin (71), fixed bin, fixed bin (71));
+dcl	hcs_$set_ips_mask		entry (bit (36) aligned, bit (36) aligned);
+dcl	hcs_$wakeup		entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl	ipc_$block		entry (ptr, ptr, fixed bin (35));
+dcl	ipc_$create_ev_chn		entry (fixed bin (71), fixed bin (35));
+dcl	lm_hash_$hash_in		entry (ptr);
+dcl	lm_hash_$hash_out		entry (ptr);
+dcl	lm_hash_$search		entry (bit (36) aligned, fixed bin (27), ptr);
+dcl	lock_manager_$lock_fast	entry (ptr, fixed bin (71), fixed bin (35));
+dcl	lock_manager_$unlock_fast	entry (ptr, fixed bin (35));
+dcl	lm_salvage_lock_seg_	entry (fixed bin (35));
+dcl	sub_err_			entry () options (variable);
+dcl	timer_manager_$sleep	entry (fixed bin (71), bit (2));
+declare	transaction_manager_$get_txn_index
+				entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+
+/*  Builtin  */
+
+dcl	addr			builtin;
+dcl	clock			builtin;
+dcl	null			builtin;
+dcl	ptr			builtin;
+dcl	wordno			builtin;
+dcl	substr			builtin;
+dcl	unspec			builtin;
+
+/*  Condition  */
+
+dcl	cleanup			condition;
+
+
+	f_uid = p_f_uid;
+	ci_number = p_ci_number;
+	mode_req = p_mode_req;
+	give_up_time = p_timeout + clock ();
+
+	if f_uid = ""b
+	then call ERROR_RETURN (dm_error_$lock_invalid_uid);
+
+	call VALIDATE_MODE (mode_req);
+
+	call SETUP_LOCK ();
+
+	on cleanup call CLEAN_LOCK;
+	call LOCK_OBJECT (give_up_time, f_uid, ci_number, mode_req, p_mode_obtained, p_code);
+
+	call UNLOCK;
+MAIN_RETURN:
+	return;
+
+
+
+unlock_all:
+     entry;
+
+	call SETUP_LOCK ();
+	error_in_unlock_all = "0"b;
+	on cleanup call CLEAN_LOCK;
+
+	lock_seg.meters.unlock_all_calls = lock_seg.meters.unlock_all_calls + 1;
+
+/**** Note that lm_per_process_ has already made sure that ****/
+/**** lm_data_$txn_table_ptr is correct. ****/
+/**** no need to validate that.  ****/
+
+UNLOCK_ALL_FOR_PROCESS:
+	do while (lock_transaction_table.own_ptr.seg_inx ^= -1);
+	     lock_owner_ptr = PTR (lock_transaction_table.own_ptr);
+	     lock_object_ptr = PTR (lock_owner.lock_ptr);
+	     call UNLOCK_OBJECT (lock_object_ptr, code);
+	     if code ^= 0
+	     then do;
+		     call dm_misc_util_$log (INFORM_SV, code, "lm_per_system_$unlock_all", "Error unlocking ^d ^w ^p",
+			lock_object.seg_inx, lock_object.uid, lock_object.ci_no);
+		     error_in_unlock_all = "1"b;
+		end;
+	end;
+
+/**** if error_in_unlock_all then call lm_salvage_lock_seg_; retry? */
+	lock_transaction_table.txn_id = (36)"0"b;	/* Mark free */
+	call UNLOCK;
+
+	return;
+
+unlock:
+     entry (p_f_uid, p_ci_number, p_code);
+
+	f_uid = p_f_uid;
+	ci_number = p_ci_number;
+
+	call SETUP_LOCK ();
+
+	on cleanup call CLEAN_LOCK;
+
+	lock_object_ptr = FIND_LOCK (f_uid, ci_number);
+
+	call UNLOCK_OBJECT (lock_object_ptr, p_code);
+
+	call UNLOCK;
+
+	return;
+
+
+lock_resolve_deadlock:
+     entry (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_checkpoint_id, p_code);
+
+	p_code = dm_error_$unimplemented_entry;
+	return;
+
+checkpoint:
+     entry (p_checkpoint_id, p_code);
+
+	p_code = dm_error_$unimplemented_entry;
+	return;
+
+unlock_to_checkpoint:
+     entry (p_checkpoint_id, p_code);
+
+	p_code = dm_error_$unimplemented_entry;
+	return;
+lock_lock_data:
+     entry (p_code);
+
+	call SETUP_LOCK ();
+	return;
+
+unlock_lock_data:
+     entry (p_code);
+
+	call SETUP_UNLOCK ();
+	p_code = 0;
+	return;
+
+ERROR_RETURN:
+     proc (er_p_code);
+dcl	er_p_code			fixed bin (35);
+
+	call CLEAN_LOCK ();
+	p_code = er_p_code;
+	goto MAIN_RETURN;
+     end ERROR_RETURN;
+
+/*  Internal Procedures to lock the lock table and set up pointers, and
+    to unlock it. */
+
+SETUP_LOCK:
+     proc ();
+
+dcl	sul_code			fixed bin (35);
+dcl	sul_lock_segs_synchronized	bit (1) aligned init ("0"b);
+
+	lock_seg_ptr = lm_data_$lock_seg_ptr;
+	call CHECK_VERSION (LOCK_SEG_VERSION_1, lock_seg.version, "lock_seg");
+	lock_transaction_table_ptr = lm_data_$txn_table_ptr;
+	lock_segments_ptr = lm_data_$lock_segments_ptr;
+
+LOCK:
+     entry ();
+
+RETRY_LOCK_LOOP:
+	do while (^sul_lock_segs_synchronized);
+	     call lock_manager_$lock_fast (addr (lock_seg.lock), LOCK_SEG_TIMEOUT, code);
+	     if code ^= 0
+	     then if code = dm_error_$fast_lock_invalid_reset | code = dm_error_$fast_lock_mylock
+		then do;
+			call dm_misc_util_$log (INFORM_SV, code, "lm_per_system_ SETUP", "locking lock_seg.");
+			call lm_salvage_lock_seg_ (sul_code);
+			if sul_code ^= 0
+			then call ERROR_RETURN (sul_code);
+		     end;
+		else do;
+			call dm_misc_util_$log (INFORM_SV, code, "lm_per_system_ SETUP", "locking lock seg.");
+			call ERROR_RETURN (code);
+		     end;
+
+	     if lm_data_$n_lock_segments ^= lock_seg.n_lock_segments
+	     then do;
+		     call UNLOCK;
+		     call SYNCH_LOCK_SEGMENTS ();
+		end;
+	     else sul_lock_segs_synchronized = "1"b;
+	end RETRY_LOCK_LOOP;
+     end SETUP_LOCK;
+
+
+SETUP_UNLOCK:
+     proc ();
+
+dcl	ul_code			fixed bin (35);
+
+	lock_seg_ptr = lm_data_$lock_seg_ptr;
+	call CHECK_VERSION (LOCK_SEG_VERSION_1, lock_seg.version, "lock_seg");
+
+UNLOCK:
+     entry ();
+
+	call lock_manager_$unlock_fast (addr (lock_seg.lock), ul_code);
+	if ul_code ^= 0
+	then call dm_misc_util_$log (INFORM_SV, ul_code, "lm_per_system_ UNLOCK", "unlocking lock_seg.");
+
+     end SETUP_UNLOCK;
+
+/*  Internal Procedure to get per-process table of lock segments into synch
+    with the per-system lock segments. No lock is required (we depend on
+    lock_seg.n_lock_segments monotonicity, and careful ordering of operations). */
+
+SYNCH_LOCK_SEGMENTS:
+     proc ();
+
+dcl	sl_lock_segx		fixed bin;
+dcl	sl_new_lock_segments_ptr	ptr;
+dcl	sl_new_n_lock_segments	fixed bin;
+dcl	sl_save_level		fixed bin;
+
+
+/* Note that there's no cleanup handler to restore the level. It would make
+   this procedure non-quick. The level will be restored by ring-alarm. This
+   is OK, since it should happen ra(y. */
+
+	call cu_$level_get (sl_save_level);
+	call cu_$level_set (get_ring_ ());
+
+	sl_new_n_lock_segments = lock_seg.n_lock_segments;
+	allocate lock_segments in (dm_area) set (sl_new_lock_segments_ptr);
+	do sl_lock_segx = 1 to lm_data_$n_lock_segments;
+	     sl_new_lock_segments_ptr -> lock_segments.seg_baseptr (sl_lock_segx) =
+		lock_segments.seg_baseptr (sl_lock_segx);
+	end;
+	free lock_segments;
+	lock_segments_ptr, lm_data_$lock_segments_ptr = sl_new_lock_segments_ptr;
+
+	do sl_lock_segx = lm_data_$n_lock_segments + 1 to sl_new_n_lock_segments;
+	     lock_segno = sl_lock_segx;
+	     call dm_per_system_$initiate (LOCK_SEGNAME || lock_segno, "", lock_aux_seg_ptr);
+	     lock_segments.seg_baseptr (sl_lock_segx) = ptr (lock_aux_seg_ptr, 0);
+	end;
+	lm_data_$n_lock_segments = sl_new_n_lock_segments;
+	call cu_$level_set (sl_save_level);
+
+     end SYNCH_LOCK_SEGMENTS;
+
+/*  Internal Procedure to validate a lock mode parameter  */
+
+VALIDATE_MODE:
+     proc (vm_p_mode);
+
+dcl	vm_p_mode			fixed bin;
+
+	if vm_p_mode < LOCK_MODE_S | vm_p_mode > LOCK_MODE_SIX
+	then call ERROR_RETURN (dm_error_$lock_invalid_mode);
+
+     end VALIDATE_MODE;
+
+/*  Internal Procedure to get a pointer to a lock object, specified by
+    UID and CI number.  */
+
+FIND_LOCK:
+     proc (fl_p_f_uid, fl_p_ci_number) returns (ptr);
+
+dcl	fl_p_f_uid		bit (36) aligned;
+dcl	fl_p_ci_number		fixed bin (27);
+
+dcl	fl_lock_object_ptr		ptr;
+
+	call lm_hash_$search (fl_p_f_uid, fl_p_ci_number, fl_lock_object_ptr);
+	if fl_lock_object_ptr = null ()
+	then call ERROR_RETURN (dm_error_$lock_not_found);
+
+	return (fl_lock_object_ptr);
+
+     end FIND_LOCK;
+
+
+/*  Internal Procedure to get a pointer to a lock object, specified by PF UID
+    and CI number. One is created if it does not exist.  */
+
+FIND_OR_ALLOCATE_LOCK:
+     proc (fal_p_f_uid, fal_p_ci_number) returns (ptr);
+
+dcl	fal_p_f_uid		bit (36) aligned;
+dcl	fal_p_ci_number		fixed bin (27);
+
+dcl	fal_lock_object_ptr		ptr;
+
+dcl	1 fal_lock_object		aligned like lock_object based (fal_lock_object_ptr);
+
+	call lm_hash_$search (fal_p_f_uid, fal_p_ci_number, fal_lock_object_ptr);
+	if fal_lock_object_ptr ^= null ()
+	then return (fal_lock_object_ptr);
+
+	fal_lock_object_ptr = GET_FREE ();
+	if fal_lock_object_ptr = null ()
+	then call ERROR_RETURN (dm_error_$lock_table_overflow);
+
+	fal_lock_object.uid = fal_p_f_uid;
+	fal_lock_object.ci_no = fal_p_ci_number;
+	fal_lock_object.type = TYPE_OBJECT;
+	fal_lock_object.owners_ptr = NULL_VPTR;
+	fal_lock_object.waiters_ptr = NULL_VPTR;
+	call lm_hash_$hash_in (fal_lock_object_ptr);
+
+	return (fal_lock_object_ptr);
+
+     end FIND_OR_ALLOCATE_LOCK;
+
+/*  Internal Procedures to allocate and free lock blocks  */
+
+GET_FREE:
+     proc returns (ptr);
+
+dcl	gf_code			fixed bin (35);
+
+
+	lock_seg.meters.allocates = lock_seg.meters.allocates + 1;
+	if unspec (lock_seg.free_list_ptr) = unspec (NULL_VPTR)
+	then do;
+		call lm_expand_lock_seg_ (gf_code);
+		if gf_code ^= 0
+		then return (null ());
+		call SYNCH_LOCK_SEGMENTS ();
+		if unspec (lock_seg.free_list_ptr) = unspec (NULL_VPTR)
+		then return (null ());
+	     end;
+
+	lock_free_block_ptr = PTR (lock_seg.free_list_ptr);
+	lock_seg.free_list_ptr = lock_free_block.free_fp;
+	unspec (lock_free_block.pad) = ""b;
+	return (lock_free_block_ptr);
+
+
+     end GET_FREE;
+
+
+RETURN_FREE:
+     proc (rf_lock_free_block_ptr);
+
+dcl	rf_lock_free_block_ptr	ptr;
+
+dcl	1 rf_lock_free_block	aligned like lock_free_block based (rf_lock_free_block_ptr);
+
+	lock_seg.meters.frees = lock_seg.meters.frees + 1;
+	unspec (rf_lock_free_block.pad) = ""b;
+	rf_lock_free_block.type = TYPE_FREE;
+	rf_lock_free_block.free_fp = lock_seg.free_list_ptr;
+	lock_seg.free_list_ptr = VPTR (rf_lock_free_block_ptr);
+
+     end RETURN_FREE;
+
+/*  Internal Procedure to attempt to acquire a lock, waiting if necessary.  */
+
+LOCK_OBJECT:
+     proc (lo_p_give_up_time, lo_p_f_uid, lo_p_ci_number, lo_p_mode_req, lo_p_mode_obtained, lo_p_code);
+
+dcl	lo_p_f_uid		bit (36) aligned;
+dcl	lo_p_give_up_time		fixed bin (71);
+dcl	lo_p_ci_number		fixed bin (27);
+dcl	lo_p_mode_req		fixed bin;
+dcl	lo_p_mode_obtained		fixed bin;
+dcl	lo_p_code			fixed bin (35);
+
+dcl	lo_lock_object_ptr		ptr;
+
+dcl	1 lo_lock_object		aligned like lock_object based (lo_lock_object_ptr);
+
+
+
+	lock_seg.meters.lock_calls = lock_seg.meters.lock_calls + 1;
+	if lo_p_ci_number = LOCK_ENTIRE_FILE
+	then lock_seg.meters.file_locks_by_mode (lo_p_mode_req) =
+		lock_seg.meters.file_locks_by_mode (lo_p_mode_req) + 1;
+	else lock_seg.meters.ci_locks_by_mode (lo_p_mode_req) = lock_seg.meters.ci_locks_by_mode (lo_p_mode_req) + 1;
+LOCK_LOOP:
+	do while ("1"b);
+	     lo_lock_object_ptr = FIND_OR_ALLOCATE_LOCK (lo_p_f_uid, lo_p_ci_number);
+
+	     call TRY_TO_LOCK (lo_lock_object_ptr, lo_p_mode_req, lo_p_mode_obtained);
+	     if lo_p_mode_obtained ^= 0
+	     then return;
+
+	     if lo_p_give_up_time < clock ()
+	     then call lm_signal_$timeout (lock_transaction_table.txn_id, lo_p_f_uid, (lo_p_ci_number), lo_p_mode_req,
+		     lo_p_give_up_time);
+
+	     call CHECK_DEADLOCK (lo_lock_object_ptr);
+	     if lo_lock_object.uid ^= lo_p_f_uid | lo_lock_object.ci_no ^= lo_p_ci_number
+	     then lo_lock_object_ptr = FIND_OR_ALLOCATE_LOCK (lo_p_f_uid, lo_p_ci_number);
+						/* CHECK_DEADLOCK unlocks */
+
+	     call WAIT (lo_p_give_up_time, lo_lock_object_ptr, lo_p_mode_req);
+	end LOCK_LOOP;
+
+     end LOCK_OBJECT;
+
+/*  Internal Procedure to attempt to obtain a lock without waiting  */
+
+TRY_TO_LOCK:
+     proc (tl_p_lock_object_ptr, tl_p_mode_req, tl_p_mode_obtained);
+
+dcl	tl_p_lock_object_ptr	ptr;
+dcl	tl_p_mode_req		fixed bin;
+dcl	tl_p_mode_obtained		fixed bin;
+
+dcl	tl_lock_owner_ptr		ptr;
+dcl	tl_mode_needed		fixed bin;
+dcl	tl_mode_req		fixed bin;
+dcl	tl_my_lock_owner_ptr	ptr;
+dcl	tl_owners_transaction_table_ptr
+				ptr;
+dcl	1 tl_owners_ptr		aligned like lock_virtual_ptr;
+
+dcl	1 tl_lock_object		aligned like lock_object based (tl_p_lock_object_ptr);
+dcl	1 tl_my_lock_owner		aligned like lock_owner based (tl_my_lock_owner_ptr);
+dcl	1 tl_lock_owner		aligned like lock_owner based (tl_lock_owner_ptr);
+
+
+
+	tl_p_mode_obtained = 0;
+	tl_mode_req = tl_p_mode_req;
+
+RETRY:
+	tl_my_lock_owner_ptr = null ();
+	tl_owners_ptr = tl_lock_object.owners_ptr;
+	do while (tl_owners_ptr.seg_inx ^= -1);
+	     tl_lock_owner_ptr = PTR (tl_owners_ptr);
+	     tl_owners_transaction_table_ptr = PTR (tl_lock_owner.transaction_ptr);
+	     if tl_owners_transaction_table_ptr = lock_transaction_table_ptr
+						/* This transaction */
+	     then do;
+		     tl_my_lock_owner_ptr = tl_lock_owner_ptr;
+		     tl_mode_needed = COMMON_MODE (tl_mode_req, tl_lock_owner.mode);
+		     if tl_mode_needed = tl_lock_owner.mode
+		     then do;
+			     tl_p_mode_obtained = tl_mode_needed;
+			     if tl_lock_object.ci_no = LOCK_ENTIRE_FILE
+			     then lock_seg.meters.dup_file_locks_by_mode (tl_mode_needed) =
+				     lock_seg.meters.dup_file_locks_by_mode (tl_mode_req) + 1;
+			     else lock_seg.meters.dup_ci_locks_by_mode (tl_mode_req) =
+				     lock_seg.meters.dup_ci_locks_by_mode (tl_mode_req) + 1;
+			     return;
+			end;
+		     if tl_mode_needed ^= tl_mode_req
+		     then do;
+			     tl_mode_req = tl_mode_needed;
+			     goto RETRY;
+			end;
+		end;
+	     else /* Other transaction */
+		if CONFLICT (tl_mode_req, tl_lock_owner.mode)
+	     then return;
+
+	     tl_owners_ptr = tl_lock_owner.owners_fp;
+	end;
+
+	if tl_my_lock_owner_ptr ^= null ()
+	then do;
+		tl_lock_owner_ptr = tl_my_lock_owner_ptr;
+		tl_lock_owner.mode = tl_mode_req;
+		tl_p_mode_obtained = tl_mode_req;
+		return;
+	     end;
+
+	tl_lock_owner_ptr = GET_FREE ();
+	if tl_lock_owner_ptr = null ()
+	then call ERROR_RETURN (dm_error_$lock_table_overflow);
+
+	tl_lock_owner.type = TYPE_OWNER;
+	tl_lock_owner.lock_ptr = VPTR (tl_p_lock_object_ptr);
+	tl_lock_owner.mode = tl_mode_req;
+	tl_lock_owner.transaction_ptr.seg_inx = 1;
+	tl_lock_owner.transaction_ptr.offset = wordno (lock_transaction_table_ptr);
+	tl_lock_owner.transaction_fp = lock_transaction_table.own_ptr;
+	lock_transaction_table.own_ptr = VPTR (tl_lock_owner_ptr);
+	tl_lock_owner.owners_fp = tl_lock_object.owners_ptr;
+	tl_lock_object.owners_ptr = VPTR (tl_lock_owner_ptr);
+
+	tl_p_mode_obtained = tl_mode_req;
+
+	return;
+
+     end TRY_TO_LOCK;
+
+/*  Internal Procedure to wait for a lock. Returns after the lock is
+    notified to this transaction or after a timeout, whichever comes first.
+*/
+WAIT:
+     proc (w_p_give_up_time, w_p_lock_object_ptr, w_p_mode_req);
+
+dcl	w_p_lock_object_ptr		ptr;
+dcl	w_p_mode_req		fixed bin;
+dcl	w_p_give_up_time		fixed bin (71);
+
+dcl	w_lock_waiter_ptr		ptr;
+dcl	w_prev_lock_waiter_ptr	ptr;
+dcl	1 w_waiters_ptr		aligned like lock_virtual_ptr;
+
+dcl	1 w_lock_object		aligned like lock_object based (w_p_lock_object_ptr);
+dcl	1 w_lock_waiter		aligned like lock_waiter based (w_lock_waiter_ptr);
+dcl	1 w_prev_lock_waiter	aligned like lock_waiter based (w_prev_lock_waiter_ptr);
+
+
+/*  Thread in a wait block for this transaction */
+
+	lock_seg.meters.waits = lock_seg.meters.waits + 1;
+	w_lock_waiter_ptr = GET_FREE ();
+	if w_lock_waiter_ptr = null ()
+	then call ERROR_RETURN (dm_error_$lock_table_overflow);
+
+	w_lock_waiter.type = TYPE_WAITER;
+	w_lock_waiter.lock_ptr = VPTR (w_p_lock_object_ptr);
+	w_lock_waiter.mode = w_p_mode_req;
+	w_lock_waiter.transaction_ptr.seg_inx = 1;
+	w_lock_waiter.transaction_ptr.offset = wordno (lock_transaction_table_ptr);
+	w_lock_waiter.waiters_fp = NULL_VPTR;
+	lock_transaction_table.wait_ptr = VPTR (w_lock_waiter_ptr);
+
+
+/* Thread block to object, FIFO */
+
+	if w_lock_object.waiters_ptr.seg_inx = -1
+	then w_lock_object.waiters_ptr = VPTR (w_lock_waiter_ptr);
+	else do;
+		w_waiters_ptr = w_lock_object.waiters_ptr;
+		do while (w_waiters_ptr.seg_inx ^= -1);
+		     w_prev_lock_waiter_ptr = PTR (w_waiters_ptr);
+		     w_waiters_ptr = w_prev_lock_waiter.waiters_fp;
+		end;
+		w_prev_lock_waiter.waiters_fp = VPTR (w_lock_waiter_ptr);
+	     end;
+
+/*  Unlock and wait for something to happen  */
+
+	call UNLOCK;
+
+	call REALLY_WAIT (w_p_give_up_time);
+
+/*  Relock and unthread the wait block, if it's still here (it will be if
+    we timed out)  */
+
+	call LOCK ();
+
+	call UNWAIT_ME;
+	return;
+
+/*  Internal Procedure to do wait. Separated from WAIT to isolate it from
+    other internal procedures, since this must be non-quick (due to cleanup
+    condition handler).
+*/
+
+REALLY_WAIT:
+     proc (rw_p_give_up_time);
+
+dcl	rw_p_give_up_time		fixed bin (71) parameter;
+
+dcl	rw_intermediate_give_up_time	fixed bin (71) init (0);
+dcl	1 rw_event_info		aligned,
+	  2 channel_id		fixed bin (71),
+	  2 message		fixed bin (71),
+	  2 sender		bit (36) aligned,
+	  2 origin,
+	    3 dev_signal		bit (18) unaligned,
+	    3 ring		bit (18) unaligned,
+	  2 channel_index		fixed bin;
+dcl	rw_saved_channel		fixed bin (71);
+dcl	rw_saved_ips_mask		bit (36) aligned;
+dcl	rw_saved_timer		fixed bin (71);
+dcl	1 rw_wait_list		aligned,
+	  2 n_chan		fixed bin,
+	  2 pad			fixed bin,
+	  2 channel_id		(1) fixed bin (71);
+
+	rw_saved_ips_mask = ""b;
+	rw_saved_channel = -1;
+
+	on cleanup
+	     begin;
+		if substr (rw_saved_ips_mask, 36, 1) = "1"b
+		then call hcs_$reset_ips_mask (rw_saved_ips_mask, rw_saved_ips_mask);
+		if rw_saved_channel ^= -1
+		then call hcs_$set_alarm_timer (rw_saved_timer, TIME_IS_ABSOLUTE, rw_saved_channel);
+	     end;
+
+	rw_wait_list.n_chan = 1;
+	if lock_transaction_table.ev_channel = 0
+	then do;
+		if lm_data_$ev_channel = 0
+		then call ipc_$create_ev_chn (lm_data_$ev_channel, (0));
+		lock_transaction_table.ev_channel = lm_data_$ev_channel;
+	     end;
+	rw_wait_list.channel_id (1) = lock_transaction_table.ev_channel;
+
+	rw_intermediate_give_up_time = clock () + INTERMEDIATE_WAIT_INTERVAL;
+
+	call hcs_$set_ips_mask (dm_system_data_$lock_ips_mask, rw_saved_ips_mask);
+	call hcs_$get_alarm_timer (rw_saved_timer, rw_saved_channel);
+	call hcs_$set_alarm_timer (min (rw_p_give_up_time, rw_intermediate_give_up_time), TIME_IS_ABSOLUTE,
+	     lock_transaction_table.ev_channel);
+
+	call ipc_$block (addr (rw_wait_list), addr (rw_event_info), (0));
+
+	call hcs_$set_alarm_timer (rw_saved_timer, TIME_IS_ABSOLUTE, rw_saved_channel);
+	call hcs_$reset_ips_mask (rw_saved_ips_mask, rw_saved_ips_mask);
+
+	if rw_event_info.message = LOCK_MESSAGE_DEADLOCK
+	then do;
+		call LOCK ();
+		call UNWAIT_ME ();
+		call UNLOCK ();
+		call lm_signal_$deadlock (lock_transaction_table.txn_id, f_uid, (ci_number), mode_req);
+	     end;
+
+     end REALLY_WAIT;
+
+     end WAIT;
+
+/*  Internal Procedure to see whether this transaction would cause a deadlock
+    if it waited. This procedure builds the data structure for the external
+    routine which checks for the deadlock.
+*/
+
+CHECK_DEADLOCK:
+     proc (cd_p_lock_object_ptr);
+
+dcl	cd_p_lock_object_ptr	ptr;
+
+dcl	cd_code			fixed bin (35);
+dcl	cd_lock_txn_table_ptr	ptr;
+dcl	cd_txn_idx		fixed bin;
+
+dcl	1 cd_lock_object		aligned like lock_object based (cd_p_lock_object_ptr);
+dcl	1 cd_lock_txn_table		aligned like lock_transaction_table based (cd_lock_txn_table_ptr);
+dcl	1 cd_lock_deadlock_36	aligned like lock_deadlock_36;
+dcl	1 cd_lock_deadlock_72	aligned like lock_deadlock_72;
+dcl	(cd_call_36, cd_call_72)	bit (1) aligned;
+dcl	cd_small_txn_ids		(72) bit (36) aligned;
+dcl	cd_auto_txn_ids		bit (1) aligned;
+dcl	cd_txn_to_notify		bit (36) aligned;
+
+	p_code = 0;
+	n_lock_deadlock = 1;
+	do cd_txn_idx = 1 to dm_system_data_$max_n_transactions;
+	     cd_lock_txn_table_ptr = addr (lock_seg.transaction_table (cd_txn_idx));
+	     if VALID_TXN (cd_lock_txn_table.txn_id)
+	     then do;
+		     if cd_lock_txn_table_ptr = lock_transaction_table_ptr
+						/* This transaction */
+		     then cd_lock_txn_table.deadlock_inx = 1;
+		     else if cd_lock_txn_table.wait_ptr.seg_inx = -1
+						/* Not waiting */
+		     then cd_lock_txn_table.deadlock_inx = 0;
+		     else do;
+			     n_lock_deadlock = n_lock_deadlock + 1;
+			     cd_lock_txn_table.deadlock_inx = n_lock_deadlock;
+			end;
+		end;
+	     else cd_lock_txn_table.deadlock_inx = 0;
+	end;
+	lock_seg.meters.deadlock_checks = lock_seg.meters.deadlock_checks + 1;
+	if n_lock_deadlock <= 1
+	then return;
+	lock_seg.meters.real_deadlock_checks = lock_seg.meters.real_deadlock_checks + 1;
+
+	cd_call_36, cd_call_72 = "0"b;
+	if n_lock_deadlock <= 36
+	then do;
+		lock_seg.meters.deadlock_checks_36 = lock_seg.meters.deadlock_checks_36 + 1;
+		lock_deadlock_ptr = addr (cd_lock_deadlock_36);
+		n_lock_deadlock = 36;
+		cd_call_36 = "1"b;
+	     end;
+	else if n_lock_deadlock <= 72
+	then do;
+		lock_seg.meters.deadlock_checks_72 = lock_seg.meters.deadlock_checks_72 + 1;
+		lock_deadlock_ptr = addr (cd_lock_deadlock_72);
+		n_lock_deadlock = 72;
+		cd_call_72 = "1"b;
+	     end;
+	else allocate lock_deadlock in (dm_area) set (lock_deadlock_ptr);
+	unspec (lock_deadlock) = ""b;
+	if n_lock_deadlock <= 72
+	then do;
+		cd_auto_txn_ids = "1"b;
+		lock_deadlock_txn_ids_ptr = addr (cd_small_txn_ids);
+	     end;
+	else do;
+		cd_auto_txn_ids = "0"b;
+		allocate lock_deadlock_txn_ids in (dm_area) set (lock_deadlock_txn_ids_ptr);
+	     end;					/* We could use automatic arrays for this as well ... */
+
+	lock_deadlock_txn_ids = ""b;
+	lock_deadlock_txn_ids (1) = dm_data_$current_txn_id;
+	call SET_WAIT_OWN (1, cd_p_lock_object_ptr);
+	do cd_txn_idx = 1 to dm_system_data_$max_n_transactions;
+	     cd_lock_txn_table_ptr = addr (lock_seg.transaction_table (cd_txn_idx));
+	     if cd_lock_txn_table.deadlock_inx > 1
+	     then do;
+		     lock_deadlock_txn_ids (cd_lock_txn_table.deadlock_inx) = cd_lock_txn_table.txn_id;
+		     call SET_WAIT_OWN (cd_lock_txn_table.deadlock_inx,
+			PTR (PTR (cd_lock_txn_table.wait_ptr) -> lock_waiter.lock_ptr));
+		end;
+	end;
+
+	call UNLOCK;
+	call lm_check_for_deadlock_ (lock_deadlock_ptr, lock_deadlock_txn_ids_ptr, n_lock_deadlock, cd_txn_to_notify,
+	     cd_code);				/* This will special case 36 and 72 */
+	if ^(cd_call_36 | cd_call_72)
+	then free lock_deadlock;
+	if ^cd_auto_txn_ids
+	then free lock_deadlock_txn_ids;
+	call LOCK ();
+	if cd_code = 0 & cd_txn_to_notify = ""b
+	then return;				/* No deadlock was found. */
+	else if cd_code ^= 0			/* we are it */
+	then do;
+		lock_seg.meters.deadlock_self_youngest = lock_seg.meters.deadlock_self_youngest + 1;
+		call UNLOCK ();
+		call lm_signal_$deadlock (lock_transaction_table.txn_id, f_uid, (ci_number), mode_req);
+	     end;
+	else /* if cd_txn_to_notify ^= ""b then */
+	     do;
+		lock_seg.meters.deadlock_other_youngest = lock_seg.meters.deadlock_other_youngest + 1;
+		call NOTIFY_TXN (cd_txn_to_notify);
+	     end;
+
+	return;
+
+
+/* Internal Procedure to send a DEADLOCK wakeup to a transaction */
+
+NOTIFY_TXN:
+     procedure (nt_p_txn_id);
+
+declare	nt_p_txn_id		bit (36) aligned;
+declare	nt_txn_idx		fixed bin;
+declare	1 nt_lock_txn_table		aligned like lock_transaction_table based (nt_lock_txn_table_ptr);
+declare	nt_lock_txn_table_ptr	ptr;
+declare	nt_code			fixed bin (35);
+declare	transaction_manager_$get_txn_index
+				entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+
+	nt_txn_idx = transaction_manager_$get_txn_index (nt_p_txn_id, nt_code);
+	if nt_code ^= 0
+	then return;				/* Something is different, perhaps the transaction has dies and will unlock */
+	nt_lock_txn_table_ptr = addr (lock_seg.transaction_table (nt_txn_idx));
+
+	call SEND_WAKEUP ("a deadlock notification", nt_lock_txn_table.process_id, nt_lock_txn_table.ev_channel,
+	     LOCK_MESSAGE_DEADLOCK);
+
+	return;
+     end NOTIFY_TXN;
+
+
+
+
+
+/*  Internal Procedure to set all bits in the lock_deadlock array corresponding
+    to the supplied index and the indices of all waiters for the supplied
+    lock.
+*/
+
+SET_WAIT_OWN:
+     proc (sw_p_deadlock_inx, sw_p_lock_object_ptr);
+
+dcl	sw_p_deadlock_inx		fixed bin;
+dcl	sw_p_lock_object_ptr	ptr;
+
+dcl	sw_lock_owner_ptr		ptr;
+dcl	1 sw_owners_ptr		aligned like lock_virtual_ptr;
+dcl	sw_owner_deadlock_inx	fixed bin;
+
+dcl	1 sw_lock_object		aligned like lock_object based (sw_p_lock_object_ptr);
+dcl	1 sw_lock_owner		aligned like lock_owner based (sw_lock_owner_ptr);
+
+	sw_owners_ptr = sw_lock_object.owners_ptr;
+	do while (sw_owners_ptr.seg_inx ^= -1);
+	     sw_lock_owner_ptr = PTR (sw_owners_ptr);
+	     sw_owner_deadlock_inx = PTR (sw_lock_owner.transaction_ptr) -> lock_transaction_table.deadlock_inx;
+	     if sw_owner_deadlock_inx > 0
+	     then lock_deadlock.wait_own (sw_p_deadlock_inx, sw_owner_deadlock_inx) = "1"b;
+	     sw_owners_ptr = sw_lock_owner.owners_fp;
+	end;
+
+     end SET_WAIT_OWN;
+
+
+     end CHECK_DEADLOCK;
+
+/* Internal Procedure to unthread the transaction whose table is defined by 
+   lock_transaction_table_ptr as a waiter for any lock. */
+
+UNWAIT_ME:
+     proc;
+
+dcl	um_lock_object_ptr		ptr;
+dcl	um_lock_waiter_ptr		ptr;
+dcl	um_prev_lock_waiter_ptr	ptr;
+dcl	1 um_waiters_ptr		aligned like lock_virtual_ptr;
+
+dcl	1 um_lock_object		aligned like lock_object based (um_lock_object_ptr);
+dcl	1 um_lock_waiter		aligned like lock_waiter based (um_lock_waiter_ptr);
+dcl	1 um_prev_lock_waiter	aligned like lock_waiter based (um_prev_lock_waiter_ptr);
+
+
+
+
+	if lock_transaction_table.wait_ptr.seg_inx ^= -1
+	then do;
+		um_lock_waiter_ptr = PTR (lock_transaction_table.wait_ptr);
+		um_lock_object_ptr = PTR (um_lock_waiter.lock_ptr);
+		if unspec (um_lock_object.waiters_ptr) = unspec (lock_transaction_table.wait_ptr)
+		then um_lock_object.waiters_ptr = um_lock_waiter.waiters_fp;
+		else do;
+			um_waiters_ptr = um_lock_object.waiters_ptr;
+			do while (um_waiters_ptr.seg_inx ^= -1);
+			     um_prev_lock_waiter_ptr = PTR (um_waiters_ptr);
+			     if unspec (um_prev_lock_waiter.waiters_fp) = unspec (lock_transaction_table.wait_ptr)
+			     then do;
+				     um_prev_lock_waiter.waiters_fp = um_lock_waiter.waiters_fp;
+				     um_waiters_ptr = NULL_VPTR;
+				end;
+			     else um_waiters_ptr = um_prev_lock_waiter.waiters_fp;
+			end;
+		     end;
+		call RETURN_FREE (um_lock_waiter_ptr);
+		lock_transaction_table.wait_ptr = NULL_VPTR;
+	     end;
+
+     end UNWAIT_ME;
+
+/* Internal Procedure to unlock an object and notify anybody waiting for it,
+   unthreading their wait blocks in the transaction */
+
+UNLOCK_OBJECT:
+     proc (uo_p_lock_object_ptr, uo_p_code);
+
+dcl	uo_p_lock_object_ptr	ptr;
+dcl	uo_p_code			fixed bin (35);
+
+dcl	uo_found			bit (1) aligned;
+dcl	uo_lock_owner_ptr		ptr;
+dcl	uo_lock_waiter_ptr		ptr;
+dcl	1 uo_owner_ptr		aligned like lock_virtual_ptr;
+dcl	uo_prev_lock_owner_ptr	ptr;
+dcl	1 uo_temp_ptr		aligned like lock_virtual_ptr;
+						/* Silly compiler */
+dcl	uo_waiter_transaction_table_ptr
+				ptr;
+dcl	1 uo_waiter_ptr		aligned like lock_virtual_ptr;
+
+dcl	1 uo_lock_object		aligned like lock_object based (uo_p_lock_object_ptr);
+dcl	1 uo_lock_owner		aligned like lock_owner based (uo_lock_owner_ptr);
+dcl	1 uo_lock_waiter		aligned like lock_waiter based (uo_lock_waiter_ptr);
+dcl	1 uo_prev_lock_owner	aligned like lock_owner based (uo_prev_lock_owner_ptr);
+dcl	1 uo_waiter_transaction_table aligned like lock_transaction_table based (uo_waiter_transaction_table_ptr);
+
+
+/*  Unthread this transaction from list of owners  */
+
+	uo_p_code = 0;
+	uo_found = "0"b;
+	uo_prev_lock_owner_ptr = null ();
+	uo_owner_ptr = uo_lock_object.owners_ptr;
+	do while (^uo_found & (uo_owner_ptr.seg_inx ^= -1));
+	     uo_lock_owner_ptr = PTR (uo_owner_ptr);
+	     if uo_lock_owner.transaction_ptr.offset = wordno (lock_transaction_table_ptr)
+	     then uo_found = "1"b;
+	     else uo_prev_lock_owner_ptr = uo_lock_owner_ptr;
+	     uo_owner_ptr = uo_lock_owner.owners_fp;
+	end;
+	if ^uo_found
+	then do;
+		uo_p_code = dm_error_$lock_not_found;
+		return;
+	     end;
+
+	if uo_prev_lock_owner_ptr = null ()
+	then uo_lock_object.owners_ptr = uo_lock_owner.owners_fp;
+	else uo_prev_lock_owner.owners_fp = uo_lock_owner.owners_fp;
+
+
+/*  Unthread owner from this transaction list of locks  */
+
+	uo_temp_ptr = VPTR (uo_lock_owner_ptr);
+	if unspec (lock_transaction_table.own_ptr) = unspec (uo_temp_ptr)
+	then lock_transaction_table.own_ptr = uo_lock_owner.transaction_fp;
+	else do;
+		uo_found = "0"b;
+		uo_owner_ptr = lock_transaction_table.own_ptr;
+		do while (^uo_found & (uo_owner_ptr.seg_inx ^= -1));
+		     uo_prev_lock_owner_ptr = PTR (uo_owner_ptr);
+		     if unspec (uo_prev_lock_owner.transaction_fp) = unspec (uo_temp_ptr)
+		     then uo_found = "1"b;
+		     else uo_owner_ptr = uo_prev_lock_owner.transaction_fp;
+		end;
+		if ^uo_found
+		then do;
+			uo_p_code = dm_error_$lock_not_found;
+			return;
+		     end;
+		uo_prev_lock_owner.transaction_fp = uo_lock_owner.transaction_fp;
+	     end;
+
+	call RETURN_FREE (uo_lock_owner_ptr);
+
+/*  Free the lock object if there are no owners or waiters (if there are waiters,
+    one, at least, will soon become an owner; so it pays to leave the object around).
+    If there are waiters, notify all of them and remove their wait blocks.
+*/
+
+	if uo_lock_object.owners_ptr.seg_inx = -1 & uo_lock_object.waiters_ptr.seg_inx = -1
+	then do;
+		call lm_hash_$hash_out (uo_p_lock_object_ptr);
+		call RETURN_FREE (uo_p_lock_object_ptr);
+	     end;
+	else do;
+		uo_waiter_ptr = uo_lock_object.waiters_ptr;
+		do while (uo_waiter_ptr.seg_inx ^= -1);
+		     uo_lock_waiter_ptr = PTR (uo_waiter_ptr);
+		     uo_waiter_transaction_table_ptr = PTR (uo_lock_waiter.transaction_ptr);
+		     uo_waiter_transaction_table.wait_ptr = NULL_VPTR;
+		     call SEND_WAKEUP ("an unlock notification", uo_waiter_transaction_table.process_id,
+			uo_waiter_transaction_table.ev_channel, 0);
+		     uo_waiter_ptr = uo_lock_waiter.waiters_fp;
+		     call RETURN_FREE (uo_lock_waiter_ptr);
+		end;
+
+		uo_lock_object.waiters_ptr = NULL_VPTR;
+	     end;
+
+     end UNLOCK_OBJECT;
+
+SEND_WAKEUP:
+     proc (sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, sw_p_message);
+dcl	sw_p_wakeup_description	char (*) parm;
+dcl	sw_p_process_id		bit (36) aligned parm;
+dcl	sw_p_ev_channel		fixed bin (71) parm;
+dcl	sw_p_message		fixed bin (71) parm;
+
+dcl	sw_code			fixed bin (35) init (0);
+dcl	sw_try_wakeup		bit (1) aligned init (YES);
+dcl	sw_wakeup_attempt_count	fixed bin init (0);
+
+	do sw_wakeup_attempt_count = 1 to MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS while (sw_try_wakeup = YES);
+	     call hcs_$wakeup (sw_p_process_id, sw_p_ev_channel, sw_p_message, sw_code);
+	     if sw_code = 0 | (sw_code = error_table_$process_unknown & sw_p_process_id ^= "0"b)
+						/* Probably a process_id for a now-dead process. */
+	     then sw_try_wakeup = NO;
+	     else if sw_code = error_table_$itt_overflow
+	     then call timer_manager_$sleep (ITT_OVERFLOW_WAIT_TIME, RELATIVE_SECONDS);
+	     else do;
+		     call dm_misc_util_$log (ERROR_SV, sw_code, ME, "^/Unable to send ^a for process ^w on event channel ^o.",
+			sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel);
+		     sw_try_wakeup = NO;
+		end;
+	end;
+	if sw_wakeup_attempt_count > MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+	then call dm_misc_util_$log (ERROR_SV, error_table_$itt_overflow, ME,
+		"^/Unable to send a ^a for process ^w on event channel ^w, after ^d attempts.",
+		sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS);
+     end SEND_WAKEUP;
+
+
+
+/*  Internal Procedures to translate between pointers and lock virtual pointers.
+
+    PTR - turns a virtual pointer into a pointer
+
+    VPTR - turns a pointer to a lock block (only) into a virtual pointer
+*/
+
+PTR:
+     proc (ptr_lock_virtual_ptr) returns (ptr);
+
+dcl	1 ptr_lock_virtual_ptr	aligned like lock_virtual_ptr;
+
+	return (ptr (lock_segments.seg_baseptr (ptr_lock_virtual_ptr.seg_inx), ptr_lock_virtual_ptr.offset));
+
+     end PTR;
+
+
+
+
+
+VPTR:
+     proc (vptr_lock_block_ptr) returns (1 aligned like lock_virtual_ptr);
+
+dcl	vptr_lock_block_ptr		ptr;
+
+dcl	1 vptr_lock_virtual_ptr	aligned like lock_virtual_ptr;
+
+dcl	1 vptr_lock_block		aligned like lock_block based (vptr_lock_block_ptr);
+
+	vptr_lock_virtual_ptr.seg_inx = vptr_lock_block.seg_inx;
+	vptr_lock_virtual_ptr.offset = wordno (vptr_lock_block_ptr);
+
+	return (vptr_lock_virtual_ptr);
+
+     end VPTR;
+
+VALID_TXN:
+     procedure (vt_txid) returns (bit (1) aligned);
+
+/* This internal procedure determines if there is an active transaction
+associated with the identifier TXID.  If the TXID is "0"b, then there is no
+transaction associated with the transaction_table_entry which the TXID was
+taken from and a ID_IS_INVALID is returned.  Otherwise, the
+transaction_manager_ is asked about TXID.
+*/
+
+declare	vt_txid			bit (36) aligned;
+declare	vt_code			fixed bin (35);
+declare	vt_txix			fixed bin;
+
+	if vt_txid = "0"b
+	then return (ID_IS_INVALID);
+	else do;
+		vt_txix = transaction_manager_$get_txn_index (vt_txid, vt_code);
+		return (vt_code = 0);
+	     end;
+     end VALID_TXN;
+
+
+CLEAN_LOCK:
+     procedure;
+
+	call lock_manager_$unlock_fast (addr (lock_seg.lock), (0));
+     end CLEAN_LOCK;				/* format: off */
+
+CHECK_VERSION:
+   proc (cv_p_expected_version, cv_p_received_version, cv_p_structure_name);
+
+dcl	cv_p_expected_version
+			char (8) aligned parameter;
+dcl	cv_p_received_version
+			char (8) aligned parameter;
+dcl	cv_p_structure_name char (32) aligned parameter;
+
+      if cv_p_expected_version ^= cv_p_received_version
+      then call sub_err_ (error_table_$unimplemented_version, ME, ACTION_CANT_RESTART, null (), 0,
+	      "^/Expected version ^a of the ^a structure." || "^/Received version ^a instead.", cv_p_expected_version,
+	      cv_p_structure_name, cv_p_received_version);
+   end CHECK_VERSION;
+
+
+%page;  %include dm_lock_modes;
+%page;  %include dm_log_sv_codes;
+%page;  %include dm_lm_system_data;
+%page;  %include dm_lm_meters;
+%page;  %include sub_err_flags;
+
+     end lm_per_system_$lock;

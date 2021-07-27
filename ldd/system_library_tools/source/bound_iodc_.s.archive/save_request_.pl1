@@ -1,0 +1,224 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+save_request_: proc (descr_ptr, dev_class_ptr);
+
+/* This procedure is used to thread a completed request onto the end of the "saved"
+   *  list, and delete the request message from the appropriate queue.
+   *  If it happens to be the one most recently read from that queue, we will have to update
+   *  that information before deleting it.
+*/
+
+
+/* Coded August 1973 by Robert S. Coren */
+/* Modified by J. Stern, 12/27/74 */
+/* Modified by J. Stern, 11/25/75 */
+/* Modified by J. C. Whitmore, 4/78, to use the keep_in_queue flag */
+/* Modified by J. C. Whitmore, 7/78, to mark deferred requests in the queue */
+/* Modified by J. C. Whitmore, 5/80, to not add user deleted requests to the saved list */
+/* Modified by C. Marker, 02/23/85, to use version 5 message segments */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-06-03,Brunelle), approve(88-06-03,MCR7911),
+     audit(88-10-18,Wallman), install(88-10-28,MR12.2-1199):
+     Upgraded to handle version 5 I/O daemon tables.
+                                                   END HISTORY COMMENTS */
+
+
+	dcl     descr_ptr		 ptr;		/* pointer to descriptor being threaded */
+	dcl     dev_class_ptr	 ptr;		/* pointer to entry for this request's device class */
+
+	dcl     code		 fixed bin (35);
+	dcl     desc_p		 ptr;
+	dcl     desc_off		 fixed bin (18);
+	dcl     rest_p		 ptr;
+
+	dcl     err_msg		 char (64);
+	dcl     err_len		 fixed bin;
+	dcl     last_ptr		 ptr;		/* pointer to previous descriptor in list */
+	dcl     mseg_idx		 fixed bin;
+	dcl     q			 fixed bin;
+	dcl     retry		 fixed bin;
+
+	dcl     msg_id		 bit (72) aligned;	/* id of message from the current descr */
+	dcl     msg_p		 ptr;		/* pointer to the message text in request area */
+	dcl     msg_len		 fixed bin (18);
+
+	dcl     based_offset	 fixed bin (18) based;
+
+	dcl     deferred		 fixed bin int static options (constant) init (1);
+
+	dcl     error_table_$bad_segment fixed bin (35) ext;
+	dcl     error_table_$no_message fixed bin (35) ext;
+
+	dcl     (addr, fixed, ptr, rel, divide) builtin;
+
+
+	dcl     clock_		 entry returns (fixed bin (71));
+	dcl     ioa_$rsnnl		 entry options (variable);
+	dcl     iodc_message_	 entry (bit (3) aligned, fixed bin (35), char (*));
+	dcl     message_segment_$delete_index entry (fixed bin, bit (72) aligned, fixed bin (35));
+	dcl     message_segment_$update_message_index entry (fixed bin, fixed bin (18), bit (72) aligned, ptr, fixed bin (35));
+	dcl     timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2) aligned, fixed bin (71));
+%page;
+
+	dctep = dev_class_ptr;			/* copy pointer args */
+	desc_p = descr_ptr;
+	desc_off = fixed (rel (desc_p), 18);
+
+	qgtep = addr (iodc_static.qgtp -> q_group_tab.entries (dcte.qgte_index));
+	q = desc_p -> request_descriptor.q;
+	mseg_idx = qgte.mseg_index (q);
+	msg_p = desc_p -> request_descriptor.ms_ptr;
+	msg_len = desc_p -> request_descriptor.ms_len;
+	msg_id = desc_p -> request_descriptor.ms_id;
+
+	if desc_p -> request_descriptor.keep_in_queue then do; /* this is highest priority action */
+		msg_p -> queue_msg_hdr.state = deferred;/* mark the request as deferred */
+
+		retry = 0;
+update:		call message_segment_$update_message_index (mseg_idx, msg_len, msg_id, msg_p, code);
+		if code ^= 0 then
+		     if code ^= error_table_$no_message
+		     then if code = error_table_$bad_segment /* message seg was salvaged */
+			then do;
+				if retry = 0 then do; /* try once more */
+					retry = 1;
+					go to update;
+				     end;
+				go to no_update;
+			     end;
+			else do;
+no_update:			call ioa_$rsnnl ("Could not update message in queue ^d of request type ^a.",
+				     err_msg, err_len, q, qgte.name);
+				call iodc_message_ ("101"b, code, err_msg);
+			     end;
+		free msg_p -> queue_msg_hdr in (req_area);
+		free desc_p -> request_descriptor in (req_desc_seg.descr_area);
+		return;				/* this one is done, like we never saw it */
+	     end;
+
+	else if desc_p -> request_descriptor.cancelled then do;
+
+/* if it was "cancelled", we will not really save it, rather the reverse */
+
+		call delete_from_queue (code);
+
+		free msg_p -> queue_msg_hdr in (req_area);
+		free desc_p -> request_descriptor in (req_desc_seg.descr_area);
+	     end;
+
+	else do;
+
+/* If not deferred or cancelled, we must add it to the saved list */
+
+		desc_p -> request_descriptor.finished = "1"b; /* be sure the descriptor is right */
+		desc_p -> request_descriptor.continued = "0"b;
+		desc_p -> request_descriptor.series_restart = "0"b;
+		desc_p -> request_descriptor.priority_request = "0"b;
+
+		if dcte.restart_req ^= 0 then do;	/* restart in progress */
+						/* see if this request should be added to series */
+			rest_p = ptr (iodc_static.descr_seg_ptr, dcte.restart_req);
+			if rest_p -> request_descriptor.series_restart then do; /* it was a series, check more */
+				if divide (rest_p -> request_descriptor.seq_id, 10000, 35, 0) =
+				     divide (desc_p -> request_descriptor.seq_id, 10000, 35, 0) then do; /* same series */
+					desc_p -> request_descriptor.saved = "1"b; /* make sure it stays around */
+					desc_p -> request_descriptor.series_restart = "1"b; /* mark as part of series */
+				     end;
+			     end;
+		     end;
+
+/* remove the message from the queue, indicating that from the users view it is done */
+
+		call delete_from_queue (code);
+		if code ^= 0 then
+		     if code = error_table_$no_message then do; /* already gone? Maybe the user deleted it. */
+			     if ^desc_p -> request_descriptor.restarted then do; /* if restarted, we deleted it earlier */
+						/* otherwise, assume the user deleted the message and flush it */
+				     free msg_p -> queue_msg_hdr in (req_area);
+				     free desc_p -> request_descriptor in (req_desc_seg.descr_area);
+				     return;
+				end;
+			end;
+
+/* set time done and set up alarm to delete it later */
+
+		desc_p -> request_descriptor.time_done = clock_ ();
+		if ^(desc_p -> request_descriptor.saved) then
+		     call timer_manager_$alarm_wakeup (iodc_static.time_interval, "10"b, iodc_static.timer_chan);
+
+		if iodc_static.last_req_done = 0 then do; /* if no requests in the list, point head of list at this one */
+			desc_p -> request_descriptor.prev_done,
+			     desc_p -> request_descriptor.next_done = 0;
+			iodc_static.first_req_done = desc_off;
+			iodc_static.save_first_req_p -> based_offset = desc_off; /* also store in req_desc_seg for reinit */
+		     end;
+		else do;				/* Yes, chain them together */
+			desc_p -> request_descriptor.next_done = 0; /* this is the end of the chain */
+			desc_p -> request_descriptor.prev_done = last_req_done;
+			last_ptr = ptr (iodc_static.descr_seg_ptr, iodc_static.last_req_done); /* get ptr to previous descr */
+			last_ptr -> request_descriptor.next_done = desc_off; /* make it point to this one */
+		     end;
+		iodc_static.last_req_done = desc_off;
+	     end;
+
+	return;
+%page;
+
+delete_from_queue: proc (code);
+
+	dcl     code		 fixed bin (35);
+
+	retry = 0;
+delete:	call message_segment_$delete_index (mseg_idx, msg_id, code);
+	if code ^= 0
+	then if code ^= error_table_$no_message
+	     then if code = error_table_$bad_segment	/* message seg was salvaged */
+		then do;
+			if retry = 0 then do;	/* try once more */
+				retry = 1;
+				go to delete;
+			     end;
+			go to fatal_err2;
+		     end;
+		else do;
+
+/* trouble deleting from queue; to avoid further problems, */
+/* drop the queue */
+
+fatal_err2:		call ioa_$rsnnl ("Could not delete message from queue ^d of request type ^a. Queue will be dropped",
+			     err_msg, err_len, q, qgte.name);
+			call iodc_message_ ("101"b, code, err_msg);
+			qgte.mseg_index (q) = 0;
+		     end;
+
+	return;
+
+     end delete_from_queue;
+
+
+init: entry (a_ptr);
+
+	dcl     a_ptr		 ptr;
+
+	stat_p = a_ptr;
+	return;
+%page; %include device_class;
+%page; %include iod_tables_hdr;
+%page; %include iodc_static;
+%page; %include mseg_message_info;
+%page; %include q_group_tab;
+%page; %include queue_msg_hdr;
+%page; %include request_descriptor;
+
+     end save_request_;

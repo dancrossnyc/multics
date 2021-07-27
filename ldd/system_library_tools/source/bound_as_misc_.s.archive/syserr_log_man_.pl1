@@ -1,0 +1,1154 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-05,GJohnson), approve(86-06-05,MCR7387),
+     audit(86-06-10,Martinson), install(86-07-11,MR12.0-1092):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+/* *	SYSERR_LOG_MAN_
+   *
+   *	Entry points to manage automatic copying of syserr log
+   *	into ring 4 by Initializer process.
+   *
+   *	Modification history:
+   *	75-10-28, LJS: Rewritten to use iox_/vfile_
+   *	76-04-15, LJS: Modified for minor bugs
+   *	79-02-01, T. Casey: Modified to print bad args if ring 0 rejects them
+   *	79-05-06, T. Casey: Modified to check for message time in future when copying from LOG partition.
+   *	81-06-15, T. Casey: Modified for MR9.0 for new wakeup priorities.
+   *	81-11-20, E. N. Kittlitz:  Modified for user_table_entry conversion.
+   *	82-05-02, E. N. Kittlitz: New AS initialization
+   *	82-09-14, E. N. Kittlitz: Quick fix: allow init after startup
+   *	82-10-28, E. N. Kittlitz: Fixup ucs.
+   *	84-10-15, W. Olin Sibert: Rewritten for new log management
+   *	84-10-16, WOS: Changed to create >sc1>syserr_log if not there already
+   *	84-11-11, WOS: Changed to do syserr message recovery for mc_con_rec_
+   *	84-11-11, WOS: Changed to do syserrlog_segdamage_scan_ work, too.
+   *	84-12-14, WOS: Changed to be more polite about announcing thresholds
+   *	85-02-20, EJ Sharpe: changed segdamage scan code to use real data class
+   *		instead of first word of binary.  Also fix references to (write alarm)_flags masks.
+   *	85-03-01, EJ Sharpe: fix as_copy_log to set new timer only when invoked by a timer
+   *		also insert "verify_sequence" subroutine
+*/
+
+/* format: style4 */
+
+syserr_log_man_:
+     procedure ();
+
+declare  P_log_name char (*) parameter;			/* OBSOLETE */
+declare  P_page_threshold fixed bin parameter;		/* Pages outstanding */
+declare  P_copy_interval fixed bin (71) parameter;	/* Microseconds */
+declare  P_recovery_flag bit (1) aligned parameter;	/* For turning syserr recovery on/off */
+declare  P_recovery_limit fixed bin (35) parameter;	/* First message we have to recover */
+
+declare  1 copy_start aligned automatic,		/* Metering info structure */
+	 2 time fixed bin (71),
+	 2 vcpu fixed bin (71),
+	 2 pf fixed bin (35);
+declare  1 copy_finish aligned automatic like copy_start;
+
+
+declare  1 static aligned internal static,		/* Static info for copying */
+	 2 initialized bit (1) aligned init ("0"b),	/* Set after parameters initialized */
+	 2 disabled bit (1) aligned init ("0"b),	/* If true, an error occurred, and copying was disabled */
+
+	 2 channel fixed bin (71) init (0),		/* Event channel for signalling copies */
+	 2 interval fixed bin (71) init (0),		/* Number of seconds between timed copies (or zero) */
+	 2 threshold fixed bin init (0),		/* Number of pages filled between signals from ring 0 */
+
+	 2 total_copies fixed bin (35) init (0),	/* Total number of calls to $as_copy_log */
+	 2 null_copies fixed bin (35) init (0),		/* Total number of copy attempts where the log was empty */
+	 2 timed_copies fixed bin (35) init (0),	/* Total number of copys invoked by alarm timer */
+	 2 total_messages fixed bin (35) init (0),	/* Total number of messages copied */
+	 2 meters aligned like copy_start;		/* Time & PF meters for copying */
+
+
+/* NOTE: This flag is declared separately, so it will not be reset if AS log
+   copying is restarted while console recovery is active. */
+
+declare  static_recovery_flag bit (1) aligned internal static init ("0"b);
+declare  static_recovery_limit fixed bin (35) internal static init (0);
+
+
+declare  argl fixed bin (21);
+declare  argp pointer;
+declare  code fixed bin (35);
+declare  current_log_empty bit (1) aligned;
+declare  log_write_data_ptr pointer;
+declare  n_args fixed bin;
+
+declare  based_char8 char (8) based;
+declare  based_ptr pointer based;
+
+declare  error_table_$no_m_permission fixed bin (35) external static;
+declare  error_table_$noentry fixed bin (35) external static;
+declare  error_table_$notadir fixed bin (35) external static;
+
+declare  log_data_$syserr_log_dir char (168) external static;
+declare  log_data_$syserr_log_history_dir char (168) external static;
+declare  log_data_$syserr_log_name char (32) external static;
+
+declare  arg_count_ entry options (variable);
+declare  as_any_other_handler_ entry (char (*), entry, label, label);
+declare  as_any_other_handler_$no_cleanup entry (char (*), label);
+declare  as_dump_ entry (char (*));
+declare  binary_segmsg_util_ entry (pointer) returns (char (250));
+declare  binary_segmsg_util_$interpret_pvname entry (pointer) returns (char (32));
+declare  cpu_time_and_paging_ entry (fixed bin (35), fixed bin (71), fixed bin (35));
+declare  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+declare  cu_$level_get entry (fixed bin (3));
+declare  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+declare  get_group_id_$tag_star entry () returns (char (32));
+declare  get_system_free_area_ entry () returns (ptr);
+declare  hcs_$append_branchx entry (char (*), char (*),
+	    fixed bin (5), (3) fixed bin (3), char (*), fixed bin (1), fixed bin (1), fixed bin (24), fixed bin (35));
+declare  hcs_$chname_file entry (char (*), char (*), char (*), char (*), fixed bin (35));
+declare  hcs_$get_user_access_modes entry (char (*), char (*), char (*), fixed bin (3), bit (36) aligned, bit (36) aligned, fixed bin (35));
+declare  hcs_$replace_dir_acl entry (char (*), char (*), pointer, fixed bin, bit (1), fixed bin (35));
+declare  hcs_$replace_inacl entry (char (*), char (*), pointer, fixed bin, bit (1), fixed bin (3), fixed bin (35));
+declare  hcs_$status_minf entry (char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24), fixed bin (35));
+declare  hcs_$terminate_noname entry (pointer, fixed bin (35));
+dcl  initiate_file_ entry (char (*), char (*), bit (*), ptr, fixed bin (24), fixed bin (35));
+declare  ioa_ entry options (variable);
+declare  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+declare  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, pointer, fixed bin, fixed bin (35));
+declare  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+declare  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+declare  log_initiate_ entry (char (*), char (*), fixed bin, pointer, fixed bin (35));
+declare  log_list_history_$single_dir entry (char (*), char (*), pointer, fixed bin (35));
+declare  log_move_$message entry (pointer, pointer, pointer, fixed bin (35));
+declare  log_name_$name entry (char (*), fixed bin (71)) returns (char (32));
+declare  log_position_$next_message entry (pointer, pointer, bit (1) aligned);
+declare  log_write_$close entry (pointer, fixed bin (35));
+declare  log_write_$open_for_migrate entry (char (*), char (*), bit (1) aligned, pointer, fixed bin (35));
+declare  mc_con_rec_$queue_log_message entry (pointer, bit (1) aligned);
+declare  sys_log_ entry () options (variable);
+declare  sys_log_$error_log entry () options (variable);
+declare  syserr_log_man_$as_copy_log entry ();
+declare  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+declare  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+declare  unique_chars_ entry (bit (*)) returns (char (15));
+
+declare  hphcs_$new_syserr_copy_init entry (fixed bin (71), fixed bin);
+declare  hphcs_$new_syserr_info entry (fixed bin (71), bit (1) aligned);
+declare  hphcs_$new_syserr_swap_logs entry (fixed bin (35));
+declare  hphcs_$new_syserr_reuse_log entry (fixed bin (35));
+declare  hphcs_$new_syserr_recovery entry (bit (1) aligned);
+declare  hphcs_$new_syserr_verify_sequence entry (fixed bin (35), fixed bin (35), fixed bin (35));
+declare  WHOAMI char (32) internal static options (constant) init ("syserr_log_man_");
+declare  RELATIVE_SECONDS bit (2) internal static options (constant) init ("11"b);
+declare  ONE_MINUTE fixed bin (35) internal static options (constant) init (60);
+declare  ONE_DAY fixed bin (35) internal static options (constant) init (86400);
+declare  DEFAULT_PAGE_THRESHOLD fixed bin internal static options (constant) init (10);
+declare  DEFAULT_COPY_INTERVAL fixed bin (35) internal static options (constant) init (3600); /* One hour */
+
+declare  any_other condition;
+declare  cleanup condition;
+
+declare  (addr, binary, clock, dimension, float, mod, null, substr, unspec) builtin;
+%page;
+
+syserr_log_man_$as_copy_init:
+     entry (P_log_name, P_page_threshold);
+
+/* COMPATIBILITY ENTRYPOINT: Supplies default value for time interval */
+
+	call syserr_log_man_$start_copying (P_page_threshold, (60 * 60));
+	return;
+
+
+
+syserr_log_man_$restart_copying:
+     entry ();
+
+/* Entrypoint to restart after errors */
+
+	call syserr_log_man_$start_copying ((static.threshold), (static.interval));
+	return;
+
+
+
+syserr_log_man_$console_recovery:
+     entry (P_recovery_flag, P_recovery_limit);
+
+/* This entrypoint, called only by mc_con_rec_, is called to turn on the
+   syserr_log_man_ message printing/routing mechanism */
+
+	static_recovery_flag = P_recovery_flag;
+	static_recovery_limit = P_recovery_limit;
+
+	call hphcs_$new_syserr_recovery (static_recovery_flag);
+
+	return;
+%page;
+
+syserr_log_man_$start_copying:
+     entry (P_page_threshold, P_copy_interval);
+
+/* This entrypoint initializes the log copying mechanism, setting up the
+   static channel name and other information */
+
+
+	if ^sc_stat_$Multics_typed then do;
+	     call sys_log_ (SL_LOG_BEEP, "^a: Called too early.", WHOAMI);
+	     return;
+	end;
+
+	on condition (any_other)
+	     call as_any_other_handler_$no_cleanup (WHOAMI, INIT_ERROR_EXIT);
+
+	static.disabled = "1"b;			/* Make it appear off */
+
+	if (static.channel ^= 0) then			/* Stop it if it's happening now */
+	     call stop_copying ("0"b);
+
+	call create_ipc_channel ();
+
+	call set_threshold_values ();
+
+	call get_history_dir ();
+
+	call verify_sequence ();
+
+	static.disabled = "0"b;			/* Nothing has gone wrong */
+
+	call syserr_log_man_$as_copy_log ();		/* Get the copying started */
+
+	if (static.threshold ^= 0) then		/* This signal comes from ring zero */
+	     call hphcs_$new_syserr_copy_init (static.channel, static.threshold);
+
+	if (static.interval ^= 0) then
+	     call timer_manager_$alarm_wakeup (static.interval, RELATIVE_SECONDS, static.channel);
+
+	static.initialized = "1"b;			/* OK to copy now */
+
+INIT_ERROR_EXIT:
+	return;
+%page;
+
+create_ipc_channel:
+     procedure ();
+
+	call ipc_$create_ev_chn (static.channel, code);	/* Create copying event channel */
+	if (code ^= 0) then do;
+INIT_IPC_CHANNEL_ERROR:
+	     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		"Could not create event channel.^/Automatic syserr log copying not initialized.");
+	     call as_dump_ (WHOAMI);
+	     call stop_copying ("1"b);
+	     goto INIT_ERROR_EXIT;
+	end;
+
+	call ipc_$decl_ev_call_chn (static.channel,
+	     syserr_log_man_$as_copy_log, null (), SYSERR_COPY_PRIO, code);
+	if (code ^= 0) then
+	     goto INIT_IPC_CHANNEL_ERROR;
+
+	return;
+     end create_ipc_channel;
+%page;
+
+set_threshold_values:
+     procedure ();
+
+declare  threshold_comment char (40) varying;
+declare  interval_comment char (40) varying;
+
+
+	if (P_page_threshold > 0) & (P_page_threshold < 128) then do;
+	     static.threshold = P_page_threshold;
+	     threshold_comment = "";
+	end;
+
+	else if (P_page_threshold = -1) then do;	/* No copying */
+	     static.threshold = 0;
+	     threshold_comment = " (disabled)";
+	end;
+
+	else do;
+	     static.threshold = DEFAULT_PAGE_THRESHOLD;
+	     if (P_page_threshold = 0) then
+		threshold_comment = " (default)";
+	     else threshold_comment = " (installation_parm value invalid)";
+	end;
+
+	if (P_copy_interval >= ONE_MINUTE) & (P_copy_interval <= ONE_DAY) then do;
+	     static.interval = P_copy_interval;
+	     interval_comment = "";
+	end;
+
+	else if (P_copy_interval = -1) then do;		/* No timers in use */
+	     static.interval = 0;
+	     interval_comment = " (disabled)";
+	end;
+
+	else do;
+	     static.interval = DEFAULT_COPY_INTERVAL;
+	     if (P_page_threshold = 0) then
+		interval_comment = " (default)";
+	     else interval_comment = " (installation_parm value invalid)";
+	end;
+
+	call sys_log_ (SL_LOG_SILENT,
+	     "^a: Syserr thresholds: ^d page^[s^]^a, ^d second^[s^]^a",
+	     WHOAMI, static.threshold, (static.threshold ^= 1),
+	     threshold_comment, static.interval, (static.interval ^= 1),
+	     interval_comment);
+
+	return;
+     end set_threshold_values;
+%page;
+
+get_history_dir:
+     procedure ();
+
+declare  my_ring fixed bin (3);
+declare  dir_type fixed bin (2);
+declare  dir_mode bit (36) aligned;
+declare  history_dname char (168);
+declare  history_ename char (32);
+declare  new_ename char (32);
+declare  history_rings (3) fixed bin (3);
+
+declare  1 history_acl (4) aligned like directory_acl_entry;
+declare  1 history_inacl (4) aligned like segment_acl_entry;
+
+
+	call expand_pathname_ (log_data_$syserr_log_history_dir,
+	     history_dname, history_ename, (0));	/* Guaranteed to work */
+	call cu_$level_get (my_ring);
+
+	call hcs_$status_minf (history_dname, history_ename, 1, dir_type, (0), code);
+	if (code = error_table_$noentry) then
+	     goto CREATE_HISTORY_DIR;
+	else if (code ^= 0) then
+	     goto REPLACE_HISTORY_DIR;
+	else if (dir_type ^= 2) then do;		/* DIRECTORY */
+	     code = error_table_$notadir;
+	     goto REPLACE_HISTORY_DIR;
+	end;
+
+	call hcs_$get_user_access_modes (history_dname, history_ename, "", my_ring, dir_mode, (""b), code);
+	if (code ^= 0) then
+	     goto REPLACE_HISTORY_DIR;
+	else if (dir_mode ^= SMA_ACCESS) then do;
+	     code = error_table_$no_m_permission;
+	     goto REPLACE_HISTORY_DIR;
+	end;
+
+	else return;				/* All is OK: History dir exists, and we have SMA */
+
+
+REPLACE_HISTORY_DIR:
+	call sys_log_$error_log (SL_LOG, code, WHOAMI,
+	     "Could not use old syserr history dir:^3x^a>^a",
+	     history_dname, history_ename);
+
+	new_ename = "syserr_log." || unique_chars_ (""b);
+	call hcs_$chname_file (history_dname, history_ename, history_ename, new_ename, code);
+	if (code = 0) then
+	     call sys_log_ (SL_LOG, "^a: Renamed ^a>^a to ^a",
+		WHOAMI, history_dname, history_ename, new_ename);
+	else
+	     call sys_log_$error_log (SL_LOG_BEEP, code, WHOAMI,
+		"Cannot rename ^a>^a to ^a", history_dname, history_ename, new_ename);
+
+
+CREATE_HISTORY_DIR:
+	history_rings (*) = my_ring;
+	unspec (history_acl) = ""b;
+	history_acl (1).access_name = get_group_id_$tag_star ();
+	history_acl (1).mode = SMA_ACCESS;
+	history_acl (2).access_name = "*.SysDaemon.*";
+	history_acl (2).mode = S_ACCESS;
+	history_acl (3).access_name = "*.SysMaint.*";
+	history_acl (3).mode = S_ACCESS;
+	history_acl (4).access_name = "*.SysAdmin.*";
+	history_acl (4).mode = S_ACCESS;
+
+	unspec (history_inacl) = ""b;
+	history_inacl (*).access_name = history_acl (*).access_name;
+	history_inacl (*).mode = R_ACCESS;
+	history_inacl (1).mode = RW_ACCESS;
+
+	call hcs_$append_branchx (history_dname, history_ename,
+	     SMA_ACCESS_BIN, history_rings, (get_group_id_$tag_star ()), 1, 0, 0, code);
+	if (code ^= 0) then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, code, WHOAMI,
+		"Could not create ^a>^a.^/Automatic syserr log copying not initialized.",
+		history_dname, history_ename);
+	     call as_dump_ (WHOAMI);
+	     call stop_copying ("1"b);
+	     goto INIT_ERROR_EXIT;
+	end;
+
+	else call sys_log_ (SL_LOG, "^a: Created ^a>^a", WHOAMI, history_dname, history_ename);
+
+	call hcs_$replace_dir_acl (history_dname, history_ename,
+	     addr (history_acl), dimension (history_acl, 1), "0"b, code);
+	if (code ^= 0) then
+	     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		"Cannot replace ACL on ^a>^a", history_dname, history_ename);
+
+	call hcs_$replace_inacl (history_dname, history_ename,
+	     addr (history_inacl), dimension (history_inacl, 1), "0"b, my_ring, code);
+	if (code ^= 0) then
+	     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		"Cannot replace initial ACL on ^a>^a", history_dname, history_ename);
+
+	return;
+     end get_history_dir;
+%page;
+
+verify_sequence:
+     procedure ();
+
+/* This procedure functions only once per bootload.  It ensures that
+   the sequence numbers in the log partition (paged ring 0 log) are larger
+   than those already in the history log segments.  (The sequence may have
+   been reset to 1000000 due to a clearing of the partition). */
+
+declare  new_sequence_start fixed bin (35);
+declare  bit_count fixed bin (24);
+declare  log_idx fixed bin;
+declare  system_area_ptr pointer;
+declare  system_area area based (system_area_ptr);
+
+	if static.initialized then			/* one time only */
+	     return;
+
+	log_segment_ptr = null ();
+	log_read_data_ptr = null ();
+	call log_list_history_$single_dir (log_data_$syserr_log_history_dir, log_data_$syserr_log_name, log_read_data_ptr, code);
+
+	if (code ^= 0) then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, code, WHOAMI, "Error obtaining syserr log history.");
+	     call stop_copying ("1"b);
+	     goto INIT_ERROR_EXIT;
+	end;
+
+	if (log_read_data_ptr = null ()) then
+	     return;				/* no history, any sequence OK */
+	if log_read_data.n_segments < 1 then
+	     goto EXIT;
+
+	do log_idx = 1 to log_read_data.n_segments;
+	     call initiate_file_ (log_data_$syserr_log_history_dir, log_read_data.ename (log_idx), R_ACCESS, log_segment_ptr, bit_count, code);
+	     if code = 0 then goto log_initiated;
+	end;
+
+/* drop through to here if we can't initiate any log segments */
+	call sys_log_ (SL_LOG_BEEP, "^a: Unable to open syserr log in ^a.", WHOAMI, log_data_$syserr_log_history_dir);
+	call stop_copying ("1"b);
+	goto ERROR_RETURN;
+
+/* arrive here when we find a log history initiated */
+log_initiated:
+	new_sequence_start = (log_idx * 100000) + log_segment.last_sequence;
+						/* new starting point if we need to adjust sequence numbers */
+						/* 100000 is number we'll allow per log segment */
+
+	call hphcs_$new_syserr_verify_sequence (log_segment.last_sequence, new_sequence_start, code);
+	if (code ^= 0) then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, code, WHOAMI, "Error verifying log partition sequence numbers.");
+	     call stop_copying ("1"b);
+	     goto ERROR_RETURN;
+	end;
+
+EXIT:
+	system_area_ptr = get_system_free_area_ ();
+	free log_read_data in (system_area);
+	return;
+
+ERROR_RETURN:
+	system_area_ptr = get_system_free_area_ ();
+	free log_read_data in (system_area);
+	goto INIT_ERROR_EXIT;
+
+     end verify_sequence;
+%page;
+
+syserr_log_man_$as_copy_log:
+     entry ();
+
+/* Entry point called either via a wakeup from ring 0 or a call from the Initializer process (as a command) */
+
+	if ^static.initialized then			/* Out of sequence, Jack */
+	     return;
+
+	log_segment_ptr = null ();			/* Initialize for cleanup handler */
+	log_write_data_ptr = null ();
+
+	on condition (any_other)
+	     call as_any_other_handler_ (WHOAMI,
+		copy_error_cleanup, COPY_FINISHED, COPY_ERROR_EXIT);
+
+	on condition (cleanup)
+	     call copy_cleanup ();
+
+	if static.disabled then do;			/* Make sure it's disabled */
+	     call stop_copying ("0"b);
+	     return;
+	end;
+
+	static.total_copies = static.total_copies + 1;
+
+	copy_start.time = clock ();			/* Set up for metering */
+	call cpu_time_and_paging_ (copy_start.pf, copy_start.vcpu, (0));
+
+	call copy_syserr_once ();			/* If there's a leftover one waiting, copy it out */
+
+	call hphcs_$new_syserr_info ((0), current_log_empty);
+
+	if current_log_empty then
+	     static.null_copies = static.null_copies + 1; /* Meter the event */
+
+	else do;					/* If there's anything in the current log, */
+	     call hphcs_$new_syserr_swap_logs (code);	/* swap it with the empty one, and copy */
+	     if (code = 0) then
+		call copy_syserr_once ();
+
+	     else call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		     "Attempting to swap syserr log segments.");
+	end;
+
+	call ipc_$drain_chn (static.channel, (0));	/* Drain anything that's left */
+
+	call arg_count_ (n_args);
+	if (static.interval ^= 0) & (n_args = 1) then do; /* If timed, and got possible event_call_info, reschedule */
+	     call cu_$arg_ptr (1, argp, argl, code);
+	     if code ^= 0 then goto COPY_FINISHED;
+	     begin;				/* new frame to establish new any_other handler */
+		on any_other goto COPY_FINISHED;
+		event_call_info_ptr = argp -> based_ptr;
+		if addr (event_call_info.message) -> based_char8 = "alarm___"
+		then do;
+		     static.timed_copies = static.timed_copies + 1;
+		     call timer_manager_$alarm_wakeup (static.interval, RELATIVE_SECONDS, static.channel);
+		end;
+	     end;					/* begin block */
+	end;
+
+COPY_FINISHED:
+	call copy_cleanup ();
+
+	copy_finish.time = clock ();			/* Collect final metering numbers */
+	call cpu_time_and_paging_ (copy_finish.pf, copy_finish.vcpu, (0));
+	static.meters = static.meters + (copy_finish - copy_start); /* And add them in */
+
+	return;
+
+
+
+COPY_ERROR_EXIT:
+	call copy_error_cleanup ();
+	return;
+%page;
+
+copy_syserr_once:
+     procedure ();
+
+declare  log_swap_time fixed bin (71);
+declare  old_log_name char (32);
+declare  segment_finished bit (1) aligned;
+
+
+	call hphcs_$new_syserr_info (log_swap_time, ("0"b));
+	if (log_swap_time = 0) then			/* Nothing for us to copy */
+	     return;
+
+	old_log_name = log_name_$name (log_data_$syserr_log_name, log_swap_time);
+
+	call log_initiate_ (log_data_$syserr_log_dir, old_log_name, 10, log_segment_ptr, code);
+	if (code ^= 0) then do;
+	     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		"Cannot initiate log ^a>^a", log_data_$syserr_log_dir, old_log_name);
+	     call stop_copying ("1"b);
+	     return;
+	end;
+
+	call log_write_$open_for_migrate
+	     (log_data_$syserr_log_history_dir, log_data_$syserr_log_name,
+	     "1"b, log_write_data_ptr, code);
+
+	if (code ^= 0) then do;
+	     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		"Cannot open history log ^a>^a",
+		log_data_$syserr_log_history_dir, log_data_$syserr_log_name);
+	     call stop_copying ("1"b);
+	     return;
+	end;
+
+	segment_finished = "0"b;
+	log_message_ptr = null ();			/* Start at the first message */
+	do while (^segment_finished);
+	     call log_position_$next_message (log_segment_ptr, log_message_ptr, ("0"b));
+
+	     if (log_message_ptr ^= null ()) then do;
+		call route_syserr_message ();		/* For our friends in the recovery room */
+
+		call log_move_$message (log_write_data_ptr,
+		     log_message_ptr, (null ()), code);
+
+		if (code ^= 0) then do;
+		     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+			"Cannot migrate message #^d", log_message.sequence);
+		     call stop_copying ("1"b);
+		     return;
+		end;
+
+		static.total_messages = static.total_messages + 1;
+	     end;
+
+	     else segment_finished = "1"b;		/* Quit if no next message */
+	end;
+
+	call hphcs_$new_syserr_reuse_log (code);	/* Return the one we just copied */
+	if (code ^= 0) then
+	     call sys_log_$error_log (SL_LOG, code, WHOAMI,
+		"Calling hphcs_$new_syserr_reuse_log.");
+
+	return;
+     end copy_syserr_once;
+%page;
+
+route_syserr_message:
+     procedure ();
+
+declare  data_code fixed bin;
+
+/* This procedure is responsible for sending syserr messages out to another
+   destination if console recovery is happening. It also handles special
+   routing for messages sacred to the Answering Service, replacing the
+   syserrlog_segdamage_scan_. */
+
+/* Additionally, this guy could take care of all RCP messages, if only
+   it knew how... */
+
+
+	if (dimension (log_message.data, 1) = 0) then	/* No binary info */
+	     goto NO_BINARY_DATA;
+
+	if log_message.data_class = "syserr"
+	then do;
+	     data_code = binary (log_message.data (1), 36); /* See whether it's one we recognize */
+	     if (data_code < 1) | (data_code >= SB_end_of_table) then
+		goto NO_BINARY_DATA;
+
+/* Check first for segment damage messages */
+
+	     if (substr (syserr_binary_seg_damage_mask, data_code, 1)) then do;
+		call sys_log_ (SL_LOG, "Syserr msg #^d: ^a",
+		     log_message.sequence, log_message.text);
+		call sys_log_ (SL_LOG, "^3xSegment: ^a",
+		     binary_segmsg_util_ (addr (log_message.data (2))));
+	     end;
+
+/* Then check for volume damage messages */
+
+	     else if (substr (syserr_binary_vol_damage_mask, data_code, 1)) then do;
+		call sys_log_ (SL_LOG, "Syserr msg #^d: ^a",
+		     log_message.sequence, log_message.text);
+		call sys_log_ (SL_LOG, "^3xVolume: ^a",
+		     binary_segmsg_util_$interpret_pvname (addr (log_message.data (2))));
+	     end;
+
+	     else goto NO_BINARY_DATA;
+
+	end;
+
+	else if log_message.data_class = SB_segdamage_data_class then do;
+	     call sys_log_ (SL_LOG, "Syserr msg #^d: ^a",
+		log_message.sequence, log_message.text);
+	     call sys_log_ (SL_LOG, "^3xSegment: ^a",
+		binary_segmsg_util_ (addr (log_message.data (1))));
+	end;
+
+	else if log_message.data_class = SB_voldamage_data_class then do;
+	     call sys_log_ (SL_LOG, "Syserr msg #^d: ^a",
+		log_message.sequence, log_message.text);
+	     call sys_log_ (SL_LOG, "^3xVolume: ^a",
+		binary_segmsg_util_$interpret_pvname (addr (log_message.data (1))));
+	end;
+
+
+NO_BINARY_DATA:
+	if ^static_recovery_flag then			/* Not in recovery mode */
+	     return;
+
+	if (log_message.sequence < static_recovery_limit) then /* Not yet a message we care about */
+	     return;
+
+	if ^write_flags (mod (log_message.severity, 10)) then /* Not a printable message */
+	     return;
+
+	call mc_con_rec_$queue_log_message		/* If it passes all the tests, send it back */
+	     (log_message_ptr, (alarm_flags (mod (log_message.severity, 10))));
+
+	return;
+     end route_syserr_message;
+%page;
+
+syserr_log_man_$print_meters:
+     entry ();
+
+	call ioa_ ("Syserr copy information:");
+	call ioa_ ("^3xTotal copies:^31t^7d (^d null) (^d timed)",
+	     static.total_copies, static.null_copies, static.timed_copies);
+	call ioa_ ("^3xMessages copied:^31t^7d", static.total_messages);
+	call ioa_ ("^3xCopy channel:^31t^24.3b", unspec (static.channel));
+	call ioa_ ("^3xCopying is:^31t^[dis^;en^]abled", static.disabled);
+	call ioa_ ("^3xCopy interval:^31t^[^7d seconds^;[disabled]^]",
+	     (static.interval ^= 0), static.interval);
+	call ioa_ ("^3xCopy threshold:^31t^[^7d pages^;[disabled]^]",
+	     (static.threshold ^= 0), static.threshold);
+
+	call ioa_ ("^3xSyserr recovery is:^31t^[dis^;en^]abled",
+	     static_recovery_flag);
+
+	call ioa_ ("^/Syserr copying meters:");
+	call ioa_ ("^24t	 Real time     VCPU time   Page faults");
+
+	call ioa_ ("^3xTotal:^24t^14.4f^14.4f^14.4f",
+	     seconds_per (static.meters.time, 1),
+	     seconds_per (static.meters.vcpu, 1),
+	     instances_per (static.meters.pf, 1));
+	call ioa_ ("^3xAve/copy:^24t^14.4f^14.4f^14.4f",
+	     seconds_per (static.meters.time, static.total_copies),
+	     seconds_per (static.meters.vcpu, static.total_copies),
+	     instances_per (static.meters.pf, static.total_copies));
+	call ioa_ ("^3xAve/message:^24t^14.4f^14.4f^14.4f",
+	     seconds_per (static.meters.time, static.total_messages),
+	     seconds_per (static.meters.vcpu, static.total_messages),
+	     instances_per (static.meters.pf, static.total_messages));
+	call ioa_ ("");
+
+	return;
+
+
+
+seconds_per:
+     procedure (P_time, P_count) returns (float bin);
+
+declare  P_time fixed bin (71) parameter;
+declare  P_instances fixed bin (35) parameter;
+declare  P_count fixed bin (35) parameter;
+
+	if (P_count = 0) then
+	     return (0.0e0);
+	else return (float (P_time) / (1.0e6 * float (P_count)));
+
+
+instances_per:
+     entry (P_instances, P_count) returns (float bin);
+
+	if (P_count = 0) then
+	     return (0.0e0);
+	else return (float (P_instances) / float (P_count));
+
+     end seconds_per;
+%page;
+
+copy_error_cleanup:
+     procedure ();
+
+	call stop_copying ("1"b);
+
+	call copy_cleanup ();
+
+	return;
+     end copy_error_cleanup;
+
+
+
+copy_cleanup:
+     procedure ();
+
+	if (log_segment_ptr ^= null ()) then
+	     call hcs_$terminate_noname (log_segment_ptr, (0));
+	log_segment_ptr = null ();
+
+	if (log_write_data_ptr ^= null ()) then
+	     call log_write_$close (log_write_data_ptr, (0));
+	log_write_data_ptr = null ();
+
+	return;
+     end copy_cleanup;
+%page;
+
+/* Internal procedure to disable log copying should it be necessary */
+
+stop_copying:
+     procedure (give_message);
+
+declare  give_message bit (1) parameter;		/* If ON, Put message in sys_log_ */
+
+
+	if give_message then
+	     call sys_log_$error_log (SL_LOG, 0, WHOAMI,
+		"Automatic syserr log copying disabled.");
+
+	call hphcs_$new_syserr_copy_init (0, 0);
+
+	if (static.interval ^= 0) then
+	     call timer_manager_$reset_alarm_wakeup (static.channel);
+
+	call ipc_$delete_ev_chn (static.channel, (0));
+
+	static.channel = 0;
+	static.interval = 0;
+	static.threshold = 0;
+	static.disabled = "1"b;			/* Mark it as turned off */
+
+	return;
+     end stop_copying;
+
+/* format: off */
+
+%page; %include access_mode_values;
+%page; %include acl_structures;
+%page; %include sys_log_constants;
+%page; %include as_data_;
+%page; %include as_data_definitions_;
+%page; %include as_wakeup_priorities;
+%page; %include sc_stat_;
+%page; %include syserr_actions;
+%page; %include syserr_binary_def;
+%page; %include log_segment;
+%page; %include log_message;
+%page; %include log_read_data;
+%page; %include event_call_info;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   Syserr msg #NNNNN: MESSAGE-TEXT
+   .br
+   Segment: PATHNAME
+   .br
+   Volume: VOLUME-NAME
+
+   S:     as (severity0)
+
+   T:     $run
+
+   M:     This message is a repetition of a syserr log message which reported
+   damage to a segment or a physical volume.  There will always be two
+   such messages in sequence, a "Syserr msg. #XXX" message and either
+   a "Volume:" or "Segment:" message. The first message is a copy of the
+   logged syserr message of the given number;  the second message identifies
+   the volume or segment mentioned.  This allows segments damaged by system
+   action, or segments in which the physical volume salvager observed damage,
+   to be identified unambiguously.  These messages are logged in the Answering
+   Service log at answering service startup time and every accounting update.
+
+   A:     Correlate volume salvager messages with previous printed volume
+   salvager output to obtain more information about segment damage detected
+   by the volume salvager. For those segments which are mentioned, which have
+   not been deleted, or are not in deleted directories (the "Segment:" message 
+   says if this is the case) contact persons  responsible for the ownership
+   of that segment, and undertake recovery procedures if needed.
+
+
+   Message:
+   syserr_log_man_: Called too early.
+
+   S:     as (severity2)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Could not create event channel.  Automatic syserr
+   log copying not initialized.  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Automatic syserr log copying disabled.
+
+   S:     as (severity1)
+
+   T:     $run
+
+   M:     Automatic copying of syserr messages into >sc1>syserr_log has
+   been stopped, due to an error in the copying process. Another message will
+   have been printed prior to this one, describing the problem.
+   An Answering Service dump usually will have been created, as well.
+
+   A:     If the error is recoverable (temporary disk error, record quota
+   overflow, etc.-- see the previous message(s) to make that decision), syserr
+   copying can be restarted by issuing the following command in admin mode
+   (ur using send_admin_command):
+.in +5
+
+syserr_log_man_$restart_copying
+.in -5
+
+   If the problem persists, delete the first segment (first in the list
+   produced by the list command) in >sc1>syserr_log, and restart copying.
+   If the problem still persists, rename or delete >sc1>syserr_log and
+   reboot; the directory will be re-created automatically.
+
+   The display_log_segment command can be used to examine individual log
+   segments for damage.
+
+
+   Message:
+   syserr_log_man_: Syserr thresholds: NNN pages (COMMENT), NNN seconds (COMMENT)
+
+   S:     as (severity0)
+
+   T:     $init
+
+   M:     These are the thresholds for when Answering Service syserr copying
+   will be performed.  Each value may be followed by a comment; the comment 
+   "(default)" indicates that the installation_parms value was zero, indicating
+   that a default value is used. The comment "(disabled)" indicates that the 
+   installation_parms value was set to disable this log copying mechanism. 
+   The comment "(installation_parms value invalid)" means just that; the value
+   in installation_parms must be updated, and meantime, a default is applied.
+
+   A:     $note
+
+
+   Message:
+   syserr_log_man_: Bad syserr_copy_interval value NNN seconds, using 3600 seconds instead.
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     The syserr copy interval in installation_parms is invalid.
+
+   A:     Use ed_installation_parms to correct it. A default will be used
+   until then.
+
+
+   Message:
+   syserr_log_man_: Could not use old syserr history dir:  >sc1>syserr_log  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     The syserr log history directory (>sc1>syserr_log) cannot be used;
+   the reason is indicated by the error message. The system will attempt to
+   rename it and create a new one; any existing log segments may be moved
+   from the old directory into the new (current) one once the system comes
+   up if the renaming is successful.
+
+   A:     $notify
+   The condition causing the error should be corrected, and the system re-booted.
+
+
+   Message:
+   syserr_log_man_: Renamed >sc1>syserr_log to NEW-NAME
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     Indicates that the history directory has been renamed after an error
+   in attempting to use it. Old log segments can be moved from here back into
+   >sc1>syserr_log.
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Cannot rename PATHNAME to NEW-NAME. ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Created >sc1>syserr_log
+
+   S:     as (severity0)
+
+   T:     $init
+
+   M:     The syserr history directory, >sc1>syserr_log, was created
+   automatically when it was found missing during initialization. This
+   is normal during a cold boot, but an error at all other times, since
+   it indicates that the directory was missing.
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Could not create >sc1>syserr_log. Automatic syserr
+   log copying not initialized. ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     The syserr history directory was found to be missing during initialization,
+   and a new one could not be created; this probably indicates file system damage.
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Cannot replace ACL on >sc1>syserr_log. ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Cannot replace initial ACL on >sc1>syserr_log.  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Attempting to swap syserr log segments.  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Cannot initiate log LOG-PATHNAME.  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Cannot open history log LOG-PATHNAME.  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message: syserr_log_man_: Cannot migrate message #NNNNNNN
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Calling hphcs_$new_syserr_reuse_log  ERROR MESSAGE
+
+   S:     as (severity1)
+
+   T:     $init
+
+   M:     $err
+
+   A:     $notify
+
+
+   Message:
+   syserr_log_man_: Error obtaining syserr log history.  MESSAGE
+
+   S:	as (severity2)
+
+   T:	$init
+
+   M:	To verify syserr message sequence numbers will continue to increase
+   despite clearing of the log partition, the AS must look at the
+   existing log segments.  However, some inconsistancy in the first
+   history directory prevented this. (>sc1>syserr_log).
+
+   A:	Fix any problems and issue the command "syserr_log_man_$restart_copying"
+   from admin mode in the initializer process.
+
+
+   Message:
+   syserr_log_man_: Unable to open syserr log in PATH.
+
+   S:	as (severity2)
+
+   T:	$init
+
+   M:	To verify syserr message sequence numbers will continue to increase
+   despite clearing of the log partition, the AS must look at the
+   existing log segments.  However, some inconsistancy in the first
+   history directory prevented this. (>sc1>syserr_log).
+
+   A:	$notify
+   Fix any problems in the syserr log history dir and issue the
+   command "syserr_log_man_$restart_copying" from admin mode in the
+   initializer process.
+
+
+   Message:
+   syserr_log_man_: Error verifying log partition sequence numbers.
+
+   S:	as (severity2)
+
+   T:	$init
+
+   M:	$err
+   There is some error in the log partition which prevents adjustment of
+   the sequence numbers.
+
+   A:	$notify
+
+   END MESSAGE DOCUMENTATION
+   */
+
+     end syserr_log_man_;

@@ -1,0 +1,259 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-21,Wallman), install(88-10-28,MR12.2-1199):
+     Ancient History
+     Modified in March 1975 by J. C. Whitmore for driver restructure
+     Modified June 1976 by J. L. Homan to charge by line count instead of block count.
+     Modified Sept. 1977 by J. C. Whitmore to pass ordatap to user accounting proc (MCR 2934)
+     Modified by J. C. Whitmore, 5/78, to use new per rqt per queue price names
+     Modified by J. C. Whitmore, 8/78, to separate the charge queue from the request queue
+     Modified Feb 1980 by M. B. Armstrong to implement multiple rate structures. (UNCA)
+     Modified by R. McDonald May 1980 to include page charges. (UNCA)
+     Modified by E. N. Kittlitz June 1981 for UNCA page charges
+     Modified by E. N. Kittlitz January 1982 to change null accounting pointer to
+      indicate accounting: nothing; and use a valid pointer for accounting: system;
+     Modified by C. Marker February 23, 1985 to use version 5 message segments
+  2) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-18,Wallman), install(88-10-28,MR12.2-1199):
+     Upgraded to version 5 iod tables.  Changed to use entry variable to
+     accounting routine, not pointer.
+                                                   END HISTORY COMMENTS */
+
+/* format: style4 */
+
+io_daemon_account_: proc (account_entry, argp);
+
+/* Accounting routine for I/O daemon, which will put appropriate a values in a
+   dummy pdt entry and call the routine pointed to by account_entry.
+*/
+
+/* Parameters */
+
+dcl  account_entry entry (char (*), char (*), ptr, fixed bin (35)) variable; /* entry variable to accounting routine */
+dcl  argp ptr;
+
+/* External Procedures & Variables */
+
+dcl  continue_to_signal_ entry (fixed bin (35));
+dcl  error_table_$action_not_performed fixed bin (35) ext static;
+dcl  error_table_$noentry fixed bin (35) ext static;
+dcl  hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned);
+dcl  iodd_msg_ entry options (variable);
+dcl  iodd_stat_p ptr ext;				/* an easy way to get the value for stat_p */
+dcl  search_sat_$rs_number entry (char (*), fixed bin, fixed bin (35));
+dcl  system_info_$io_prices_rs entry (fixed bin, (4) float bin);
+dcl  system_info_$max_rs_number entry (fixed bin);
+dcl  system_info_$resource_price_rs entry (fixed bin, char (*) aligned, float bin, fixed bin (35));
+
+dcl  (addr, before, after, null, hbound, unspec) builtin;
+
+dcl  (any_other, cleanup) condition;
+
+/* Internal Static */
+
+dcl  both fixed bin int static options (constant) init (0);
+dcl  default_prices (0:9, 4) float bin aligned int static;	/* one set for each rate structure for efficiency */
+dcl  error fixed bin int static options (constant) init (2);
+dcl  max_rs_number fixed bin static init (0);
+dcl  not_initialized bit (1) aligned int static init ("1"b);
+dcl  whoami char (32) int static options (constant) init ("io_daemon_account_");
+
+dcl  1 lines_price (0:9) aligned int static,		/* ditto */
+       2 driver (30),
+         3 q (4) float bin;
+
+dcl  1 pages_price (0:9) aligned int static,		/* one set for each rate structure for effieiency  */
+       2 driver (30),
+         3 q (4) float bin;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  driver_index fixed bin;				/* index of logical driver in driver_ptr_list */
+dcl  (i, j) fixed bin;
+dcl  old_mask bit (36) aligned;
+dcl  pdtp ptr;					/* this is just to make this thing compile */
+dcl  pdtep ptr;
+dcl  pers char (32);
+dcl  proj char (12);
+dcl  q fixed bin;
+dcl  rs_number fixed bin;				/* rate structure number */
+
+dcl  1 dummy aligned like user;			/* place to hold template user PDT entry */
+%page;
+	stat_p = iodd_stat_p;			/* just to be sure */
+	pdtp = null;				/* makes compiler happy */
+
+	if not_initialized then do;
+	     call system_info_$max_rs_number (max_rs_number);
+	     do j = 0 to hbound (lines_price, 1);	/* this should never be necessary any more */
+		if j > max_rs_number then
+		     rs_number = 0;
+		else rs_number = j;
+		call system_info_$io_prices_rs (rs_number, default_prices (j, *));
+		do i = 1 to hbound (lines_price.driver, 2); /* set all lines prices to the default */
+		     lines_price (j).driver (i).q (*) = default_prices (j, *);
+		end;
+	     end;
+	     call iodd_msg_ (error, both, 0, whoami, "Initialization error.  Using io_prices rather than resource_prices.");
+	     not_initialized = "0"b;
+	end;
+
+	ordatap = argp;
+	ordata.charge = 0e0;			/* show no charge in case of error */
+	q = ordata.charge_queue;			/* the driver_index and q define the price */
+	driver_index = iodd_static.driver_ptr -> driver_status.list_index; /* see which driver this is */
+	if driver_index < 1 | driver_index > iodd_static.assigned_devices then do; /* got clobbered? */
+	     iodd_static.master_hold = "1"b;		/* force command level */
+	     call iodd_msg_ (error, both, 0, whoami, "Invalid driver index. Check with administrator before continuing.");
+	     return;
+	end;
+
+/* mask interrupts, and set default handler to unmask them */
+
+	old_mask = ""b;				/* initialize the old mask to null */
+	on any_other call unmask;
+	on cleanup call unmask;
+	call hcs_$set_ips_mask (""b, old_mask);		/* save the old mask and restore it later */
+
+	pers = before (ordata.requestor, ".");		/* get person and project we will charge */
+	proj = before (after (ordata.requestor, "."), ".");
+	if pers = "anonymous" then pers = "*";		/* special case the anonymous user name */
+
+
+	ordata.rs_unavailable, ordata.no_accounting = "0"b;
+	if max_rs_number = 0 then
+	     rs_number = 0;
+	else do;
+	     call search_sat_$rs_number ((proj), rs_number, code); /* get rate index */
+	     if code ^= 0 then do;
+		if code = error_table_$noentry then
+		     call iodd_msg_ (error, both, code, whoami,
+			"Trying to locate project ""^a"".  Default rates will be used.", proj);
+		else call iodd_msg_ (error, both, code, whoami, "Accessing the sat.  Default rates will be used");
+		rs_number = 0;
+		ordata.rs_unavailable = "1"b;		/* remember that we faked this */
+	     end;
+	end;
+	ordata.price_per_n_lines = lines_price (rs_number).driver (driver_index).q (q); /* how we computed the charge */
+	ordata.rs_number = rs_number;			/* remember which rate_structure */
+	ordata.n_lines_for_price = 1000;
+	ordata.price_per_n_pages = pages_price (rs_number).driver (driver_index).q (q); /* how we conputed the charge */
+	ordata.n_pages_for_price = 1000;
+
+	ordata.charge = ordata.price_per_n_lines * ordata.line_count / ordata.n_lines_for_price;
+	ordata.charge = ordata.charge + ordata.price_per_n_pages * ordata.page_count / ordata.n_pages_for_price;
+
+/* put values in pdt template entry for updating */
+
+	unspec (dummy) = ""b;			/* be sure there is no garbage */
+	pdtep = addr (dummy);
+	q = ordata.queue;				/* this is the queue request came from */
+	user.iod (q).charge,
+	     user.dollar_charge,
+	     user.absolute_spent = ordata.charge;
+
+	user.iod (q).pieces = 1;
+	user.iod (q).lines = ordata.line_count;
+	user.iod (q).pages = ordata.page_count;
+
+	code = 0;					/* set to zero in case user proc just returns */
+
+	call account_entry (pers, proj, pdtep, code);
+
+	call unmask;				/* now we can allow ips signals */
+	if code ^= 0 then call iodd_msg_ (error, both, code, whoami, "From accounting for ^a.^a", pers, proj);
+	return;
+
+set_line_prices: entry (a_driver_index, qgtep, a_code);
+
+dcl  a_code fixed bin (35);				/* error code */
+dcl  a_driver_index fixed bin;
+
+	a_code = 0;
+	driver_index = a_driver_index;		/* copy the index */
+	if driver_index < 0 | driver_index > hbound (lines_price.driver, 2) then do; /* out of range ? */
+	     a_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	if not_initialized | driver_index = 0 then do;
+	     call system_info_$max_rs_number (max_rs_number);
+	     stat_p = iodd_stat_p;			/* set this only once, we hope */
+	     do j = 0 to hbound (lines_price, 1);
+		if j > max_rs_number then rs_number = 0;/* use the default */
+		else rs_number = j;
+		call system_info_$io_prices_rs (rs_number, default_prices (j, *));
+		do i = 1 to hbound (lines_price.driver, 2); /* set all lines prices to the default */
+		     lines_price (j).driver (i).q (*) = default_prices (j, *);
+		end;
+	     end;
+	     not_initialized = "0"b;
+	     if driver_index = 0 then return;		/* don't assume index is good further on */
+	end;
+
+	lines_price (*).driver (driver_index).q (*) = 0.0e0; /* clear old prices */
+	if qgtep = null | qgte.line_charge.queue (1) = ""
+	then do rs_number = 0 to hbound (lines_price, 1); /* use default prices if there are no names */
+	     lines_price (rs_number).driver (driver_index).q (*) = default_prices (rs_number, *);
+	end;
+	else do i = 1 to qgte.max_queues;		/* get the price for each possible queue */
+	     do j = 0 to hbound (lines_price, 1);	/* all rates */
+		if j > max_rs_number then rs_number = 0;/* use the default */
+		else rs_number = j;
+		call system_info_$resource_price_rs (rs_number, qgte.line_charge.queue (i),
+		     lines_price (j).driver (driver_index).q (i), a_code);
+		if a_code ^= 0 then return;
+	     end;
+	end;
+
+
+	pages_price (*).driver (driver_index).q (*) = 0.0e0; /* clear old prices  */
+	if qgtep = null | qgte.page_charge.queue (1) = "" then ; /*  uses zero default prices if there are no names  */
+	else do i = 1 to qgte.max_queues;		/* get the price for each possible queue  */
+	     do j = 0 to hbound (pages_price, 1);	/* all rates  */
+		if j > max_rs_number then rs_number = 0;/* use the default */
+		else rs_number = j;
+		call system_info_$resource_price_rs (rs_number, qgte.page_charge.queue (i),
+		     pages_price (j).driver (driver_index).q (i), a_code);
+		if a_code ^= 0 then return;
+	     end;
+	end;
+
+	return;
+
+
+unmask: proc;
+
+	if old_mask then do;			/* if the old mask had some bits on, restore it */
+	     call hcs_$set_ips_mask (old_mask, (""b));
+	     old_mask = ""b;
+	end;
+
+	call continue_to_signal_ ((0));		/* in case this was from a handler */
+
+	return;
+
+     end unmask;
+%page; %include driver_status;
+%page; %include iod_tables_hdr;
+%page; %include iodd_static;
+%page; %include mseg_message_info;
+%page; %include output_request_data;
+%page; %include pdt;
+%page; %include q_group_tab;
+%page; %include request_descriptor;
+%page; %include user_attributes;
+
+     end io_daemon_account_;

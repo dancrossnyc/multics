@@ -1,0 +1,674 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1987 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+
+sty_mpx:
+     procedure;
+
+/* Ring 0 multiplexer module for pseudo-TTY's. */
+/* Written by C. Hornig, March 1979. */
+/* Rewritten by C. Hornig, July 1981 */
+/* Fixed bug in answerback string mechanism, March 8, 1982 by Richard Lamson */
+/* Fixed bug in line_control control order, 22 April 1982 by Richard Lamson */
+/* Fixed EOP processing 24 April 1982 by Richard Lamson */
+/* Removed "standard" tty modes from the string retured as tty modes
+   1 May 1982 by Richard Lamson */
+/* Fixed lost wakeup bug, December, 1982 by C. Hornig */
+/* Made to accept and ignore orders made by set_terminal_data so
+   set_term_type will work properly, December 1982 by J. Spencer Love */
+/* Made to handle (set get)_required_access_class orders, April 1983 by Robert Coren */
+/* Changed to free any allocated mode_info structures on hangup order, September 1984 by Robert Coren */
+/* Changed to use tty_area_manager entries to prevent collision of allocates and frees, November 1984 by Robert Coren */
+
+dcl  (
+     (Dp, Infop, Chainp, Miip) ptr,
+     Code fixed bin (35),
+     (Subchan, Devx) fixed bin,
+     More_sw bit aligned,
+     Mode_list ptr,
+     Modes character (*),
+     Order character (*)
+     ) parameter;
+
+dcl  (my_pdep, her_pdep) ptr;
+dcl  1 my_pde aligned like pde based (my_pdep);
+dcl  1 her_pde aligned like pde based (her_pdep);
+
+dcl  based_area area based;
+dcl  based_ev_chn fixed bin (71) based;
+dcl  based_access_class bit (72) aligned based;
+
+dcl  based_modes (currentsize (her_pde.mode_ptr -> mode_string_info)) fixed bin (35) based;
+
+dcl  infop pointer;
+
+dcl  1 dial_out_info aligned based (infop),
+       2 len fixed bin (21),
+       2 destination char (dial_out_info.len);
+
+dcl  1 rw_abort aligned based (infop),
+       2 (w, r) bit unaligned;
+
+dcl  1 write_status aligned based (infop),
+       2 ev_chn fixed bin (71),
+       2 output_pending bit (1);
+
+dcl  based_line_status bit (72) aligned based (infop);
+dcl  line_status bit (72) aligned;
+
+dcl  (
+     error_table_$undefined_order_request,
+     error_table_$inconsistent,
+     error_table_$null_info_ptr,
+     error_table_$unimplemented_version,
+     error_table_$bad_mode,
+     error_table_$ai_already_set,
+     error_table_$noalloc
+     ) fixed bin (35) external;
+
+dcl  tty_area$ area external;
+
+dcl  formline_ entry (fixed bin, fixed bin, ptr, fixed bin (21), fixed bin (1));
+dcl  mode_string_$combine entry (ptr, ptr, char (*), fixed bin (35));
+dcl  mode_string_$delete entry (ptr, (*) char (*), char (*), fixed bin (35));
+dcl  mode_string_$parse entry (char (*), ptr, ptr, fixed bin (35));
+dcl  tty_area_manager$allocate entry (fixed bin, ptr);
+dcl  tty_area_manager$free entry (fixed bin, ptr);
+dcl  tty_area_manager$lock_area entry ();
+dcl  tty_area_manager$unlock_area entry ();
+
+dcl  (sc, i) fixed;
+dcl  mode_error bit (1) aligned;
+dcl  blocko uns fixed bin (18);
+dcl  code fixed bin (35);
+
+dcl  FF_CR_LF char (3) static options (constant) init ("
+");						/* FF, CR, LF */
+
+dcl  (addr, binary, currentsize, divide, length, mod, null, pointer, rel, rtrim, size, substr, unspec) builtin;
+
+dcl  (area, cleanup) condition;
+%page;
+/* * * * * * * * * * CONTROL * * * * * * * * * */
+
+control:
+     entry (Dp, Subchan, Order, Infop, Code);
+
+	Code = 0;
+	infop = Infop;
+	call setup_subchan;
+
+	if /* case */ Order = "listen" then do;
+	     my_pde.location = "";
+	     call bring_up_keep_ac;
+	     end;
+
+	else if Order = "dial_out" then do;
+	     if infop ^= null () then do;
+		call bring_up_keep_ac;
+		my_pde.location = dial_out_info.destination;
+		end;
+	     else Code = error_table_$null_info_ptr;
+	     end;
+
+	else if Order = "hangup" then do;
+	     call channel_manager$interrupt_later (her_pde.devx, HANGUP, ""b);
+	     call channel_manager$interrupt_later (my_pde.devx, HANGUP, ""b);
+	     my_pde.access_class_set,			/* clear out all access_class information */
+		her_pde.access_class_set = "0"b;
+	     my_pde.access_class, her_pde.access_class = "0"b;
+	     call abort (my_pde);			/* free buffers */
+	     call abort (her_pde);
+	     if my_pde.mode_ptr ^= null () then call tty_area_manager$free (currentsize (my_pde.mode_ptr -> mode_string_info), my_pde.mode_ptr);
+	     if her_pde.mode_ptr ^= null () then call tty_area_manager$free (currentsize (her_pde.mode_ptr -> mode_string_info), her_pde.mode_ptr);
+	     my_pde.mode_ptr, her_pde.mode_ptr = null ();
+	     my_pde.flags.listen, her_pde.flags.listen = "0"b;
+	     end;
+
+	else if Order = "wru" then do;
+	     my_pde.flags.wru = "1"b;
+	     if her_pde.head = 0 then call channel_manager$interrupt_later (my_pde.devx, INPUT_AVAILABLE, ""b);
+	     end;
+
+	else if Order = "abort" then do;
+	     if infop ^= null () then do;
+		if rw_abort.w then call abort (my_pde); /* free chained buffers */
+		if rw_abort.r then call abort (her_pde);
+		end;
+	     else Code = error_table_$null_info_ptr;
+	     end;
+
+	else if Order = "write_status" then do;
+	     if infop ^= null ()
+	     then write_status.output_pending = (my_pde.head ^= 0);
+						/* anything on list? */
+	     else Code = error_table_$null_info_ptr;
+	     end;
+
+	else if Order = "interrupt" then do;
+	     her_pde.end_of_page = "0"b;
+	     call channel_manager$interrupt_later (her_pde.devx, QUIT, ""b);
+	     call send_output (her_pde);
+	     end;
+
+	else if Order = "line_control" then do;
+	     if infop = null () then do;
+		Code = error_table_$null_info_ptr;
+		return;
+		end;
+	     line_status = based_line_status;
+	     call channel_manager$interrupt_later (her_pde.devx, LINE_STATUS, line_status);
+	     end;
+
+	else if Order = "printer_on" then call new_mode ("echo");
+
+	else if Order = "printer_off" then call new_mode ("^echo");
+
+	else if Order = "get_foreign_terminal_data" then do;
+	     foreign_terminal_data_ptr = infop;
+	     if foreign_terminal_data_ptr = null () then do;
+		Code = error_table_$null_info_ptr;
+		return;
+		end;
+	     if foreign_terminal_data.version ^= FOREIGN_TERMINAL_DATA_VERSION_1 then do;
+		Code = error_table_$unimplemented_version;
+		return;
+		end;
+	     foreign_terminal_data.mode_string_info_ptr = null ();
+	     if her_pde.mode_ptr ^= null () then do;
+		on area goto noalloc;
+		allocate based_modes in (foreign_terminal_data.area_ptr -> based_area)
+		     set (foreign_terminal_data.mode_string_info_ptr);
+		foreign_terminal_data.mode_string_info_ptr -> based_modes = her_pde.mode_ptr -> based_modes;
+		end;
+	     her_pde.flags.notify_modes = "1"b;
+	     end;
+
+	else if Order = "set_required_access_class" then do;
+	     if infop = null () then Code = error_table_$null_info_ptr;
+	     else if my_pde.access_class_set		/* it's already been set */
+	     then if my_pde.access_class = infop -> based_access_class
+						/* but to the same thing */
+		then Code = 0;			/* so it's OK */
+		else Code = error_table_$ai_already_set;
+
+	     else do;				/* not already set, do it now */
+		my_pde.access_class, her_pde.access_class = infop -> based_access_class;
+		my_pde.access_class_set, her_pde.access_class_set = "1"b;
+		Code = 0;
+		end;
+	     end;
+
+	else if Order = "get_required_access_class" then do;
+	     if infop = null ()
+	     then Code = error_table_$null_info_ptr;
+	     else do;
+		infop -> tty_access_class.access_class_set = my_pde.access_class_set;
+		if my_pde.access_class_set
+		then infop -> tty_access_class.access_class = my_pde.access_class;
+		else infop -> tty_access_class.access_class = "0"b;
+						/* for cleanliness */
+		Code = 0;
+		end;
+	     end;
+
+	else if Order = "input_flow_control_chars" then ;
+	else if Order = "output_flow_control_chars" then ;
+	else if Order = "set_delay" then ;
+	else if Order = "set_framing_chars" then ;
+
+	else Code = error_table_$undefined_order_request;
+
+	return;
+%page;
+/* * * * * * * * * * WRITE * * * * * * * * * */
+
+write:
+     entry (Dp, Subchan, Chainp, Code);
+
+	Code = 0;
+	call setup_subchan;
+
+	my_pde.flags.output_ready = "0"b;
+
+	if Chainp = null () then return;
+
+	if my_pde.end_of_page then return;		/* No, No, you can't write right now... */
+
+	if her_pde.end_of_page then do;		/* Let other end send more output. */
+	     her_pde.end_of_page = "0"b;		/* and take it out of EOP */
+	     call send_output (her_pde);
+	     blockp = Chainp;
+	     if (buffer.next = 0)			/* only one buffer */
+		& (buffer.tally <= 2)		/* with not much in it */
+		& (verify (substr (string (buffer.chars), 1, buffer.tally), FF_CR_LF) = 0) then do;
+						/* consisting exclusively of line-terminators */
+		call tty_space_man$free_buffer (my_pde.devx, OUTPUT, Chainp);
+						/* throw it away */
+		call send_output (my_pde);		/* and send more */
+		Chainp = null ();
+		return;
+		end;
+	     end;
+
+	blockp = Chainp;
+	blocko = buffer.next;
+	do while (blocko ^= 0 & ^buffer.end_of_page);	/* walk chain looking for EOP */
+	     blockp = pointer (addr (tty_buf$), blocko);
+	     blocko = buffer.next;
+	end;
+
+	buffer.next = 0;				/* Remove tail of this chain now. */
+	buffer.flags.break = "1"b;			/* set break flag in last buffer */
+	my_pde.flags.end_of_page = buffer.end_of_page;	/* note if we are at page break */
+	if my_pde.head = 0				/* chain in the buffers */
+	then do;					/* new chain */
+	     my_pde.head = binary (rel (Chainp), 18);
+	     my_pde.tail = binary (rel (blockp), 18);
+	     call channel_manager$interrupt_later (her_pde.devx, INPUT_AVAILABLE, ""b);
+						/* and tell the other side */
+	     end;
+
+	else do;					/* add to existing chain */
+	     pointer (addr (tty_buf$), my_pde.tail) -> buffer.next = binary (rel (Chainp), 18);
+	     my_pde.tail = binary (rel (blockp), 18);
+	     end;
+
+	if blocko = 0
+	then					/* Are there any buffers after EOP? */
+	     Chainp = null ();			/* No, we took it all */
+	else Chainp = pointer (addr (tty_buf$), blocko);	/* Get later buffers after clear EOP */
+	return;
+%page;
+/* * * * * * * * * * READ * * * * * * * * * */
+
+read:
+     entry (Dp, Subchan, Chainp, More_sw, Code);
+
+	Code = 0;
+	Chainp = null ();
+	More_sw = "0"b;
+	call setup_subchan;
+
+	if /* case */ her_pde.head ^= 0 then do;	/* if there is any data */
+	     Chainp = pointer (addr (tty_buf$), her_pde.head);
+						/* give it away */
+	     her_pde.head, her_pde.tail = 0;		/* and forget it */
+	     call tty_space_man$switch_chain (her_pde.devx, my_pde.devx, OUTPUT, INPUT, Chainp);
+	     call send_output (her_pde);		/* solicit more */
+	     end;
+
+	else if my_pde.flags.wru then do;
+	     call tty_space_man$get_buffer (my_pde.devx, 16, INPUT, blockp);
+	     if blockp ^= null () then do;
+		my_pde.flags.wru = "0"b;
+		string (buffer.chars) = rtrim (her_pde.location) || "
+" /* NL */;
+		buffer.tally = length (rtrim (string (buffer.chars)));
+		string (buffer.flags) = ""b;
+		buffer.flags.break = "1"b;
+		buffer.next = 0;
+
+		Chainp = blockp;
+		end;
+	     end;
+
+	return;
+%page;
+/* * * * * * * * * * CHECK_MODES * * * * * * * * * */
+
+check_modes:
+     entry (Dp, Subchan, Mode_list, Code);
+
+	Code = 0;
+	call setup_subchan;
+
+	mclp = Mode_list;
+	if mcl.version ^= mcl_version_2 then do;
+	     Code = error_table_$unimplemented_version;
+	     return;
+	     end;
+
+	mcl.ll_error, mcl.pl_error, mcl.can_type_error = "0"b;
+
+	do i = 1 to mcl.n_entries;
+	     mcl.entries (i).flags.mpx_mode = "1"b;
+	     mcl.entries (i).flags.error = "0"b;
+	end;
+
+	return;
+
+/* * * * * * * * * * SET_MODES * * * * * * * * * */
+
+set_modes:
+     entry (Dp, Subchan, Mode_list, Code);
+
+	Code = 0;
+	call setup_subchan;
+
+	mclp = Mode_list;
+	if mcl.version ^= mcl_version_2 then do;
+	     Code = error_table_$unimplemented_version;
+	     return;
+	     end;
+
+	if mcl.flags.init & (my_pde.mode_ptr ^= null ()) then do;
+	     call tty_area_manager$free (currentsize (my_pde.mode_ptr -> mode_string_info), my_pde.mode_ptr);
+	     my_pde.mode_ptr = null ();
+	     end;
+
+	mcl.ll_error, mcl.pl_error, mcl.can_type_error = "0"b;
+
+	if mcl.line_len ^= -1 then do;
+	     call new_mode ("ll=^d", mcl.line_len);
+	     mcl.ll_error = mode_error;
+	     end;
+	if mcl.page_len ^= -1 then do;
+	     call new_mode ("pl=^d", mcl.page_len);
+	     mcl.pl_error = mode_error;
+	     end;
+	if mcl.can_type ^= -1 then do;
+	     call new_mode ("can_type=^[overstrike^;replace^]", mcl.can_type);
+	     mcl.can_type_error = mode_error;
+	     end;
+
+	do i = 1 to mcl.n_entries;
+	     if mcl.entries (i).mpx_mode then do;
+		call new_mode ("^[^^^]^a", ^mcl.entries (i).flags.mode_switch, mcl.entries (i).mode_name);
+		mcl.entries (i).flags.error = mode_error;
+		end;
+	end;
+
+	return;
+
+/* * * * * * * * * * * * GET_MODES * * * * * * * * * */
+
+get_modes:
+     entry (Dp, Subchan, Modes, Code);
+
+	Code = 0;
+	Modes = "";
+	call setup_subchan;
+
+	if my_pde.mode_ptr ^= null () then call mode_string_$delete (my_pde.mode_ptr, MODE_NAME, Modes, Code);
+	if substr (Modes, length (rtrim (Modes)), 1) = "." then substr (Modes, length (rtrim (Modes)), 1) = " ";
+
+	return;
+%page;
+/* * * * * * * * * * INIT_MULTIPLEXER * * * * * * * * * * */
+
+init_multiplexer:
+     entry (Devx, Miip, Dp, Code);
+
+	Code = 0;
+	lctp = addr (tty_buf$) -> tty_buf.lct_ptr;
+
+	miip = Miip;
+	sty_mpx_data_nchan = mux_init_info.no_channels;
+	if mod (sty_mpx_data_nchan, 2) ^= 0 then do;	/* must come in pairs */
+	     Code = error_table_$inconsistent;
+	     return;
+	     end;
+
+	sty_mpx_data_ptr = null ();
+	on cleanup
+	     begin;
+	     if sty_mpx_data_ptr ^= null () then call tty_area_manager$free (currentsize (sty_mpx_data), sty_mpx_data_ptr);
+	end;
+	on area goto noalloc;
+
+	call tty_area_manager$allocate (size (sty_mpx_data), sty_mpx_data_ptr);
+
+	sty_mpx_data.n_channels = sty_mpx_data_nchan;	/* tty_area_manager can't know to do this */
+	sty_mpx_data.devx = Devx;
+	sty_mpx_data.n_pairs = divide (sty_mpx_data.n_channels, 2, 17, 0);
+	do sc = 1 to sty_mpx_data.n_channels;
+	     my_pdep = addr (sty_mpx_data.pdes (sc));
+	     call reset (my_pde, "1"b);
+	     my_pde.head, my_pde.tail = 0;
+	     my_pde.devx = mux_init_info.devx (sc);
+	     my_pde.mode_ptr = null ();
+
+	     lct.lcte_array (my_pde.devx).subchannel = sc;
+	     lct.lcte_array (my_pde.devx).physical_channel_devx = my_pde.devx;
+	end;
+
+	Dp = sty_mpx_data_ptr;
+	return;
+
+noalloc:
+	Code = error_table_$noalloc;
+	return;
+
+/* * * * * * * * * * * START * * * * * * * * * */
+
+start:
+     entry (Dp, Code);
+
+	Code = 0;
+	sty_mpx_data_ptr = Dp;
+
+	sty_mpx_data.flags.started = "1"b;
+
+	do i = 1 to sty_mpx_data.n_pairs;
+	     my_pdep = addr (sty_mpx_data.pdes (i));
+	     if my_pde.flags.listen then do;
+		her_pdep = addr (sty_mpx_data.pdes (i + sty_mpx_data.n_pairs));
+		call bring_up;
+		end;
+	end;
+
+	return;
+
+/* * * * * * * * ** * STOP * * * * * * * * * */
+
+stop:
+     entry (Dp, Code);
+
+	Code = 0;
+	sty_mpx_data_ptr = Dp;
+
+	sty_mpx_data.flags.started = "0"b;
+	return;
+
+/* * * * * * * * * * SHUTDOWN * * * * * * * * * * */
+
+shutdown:
+     entry (Dp, Code);
+
+	Code = 0;
+	sty_mpx_data_ptr = Dp;
+
+	do sc = 1 to sty_mpx_data.n_channels;
+	     call channel_manager$interrupt_later (sty_mpx_data.pdes (sc).devx, CRASH, ""b);
+	     sty_mpx_data.pdes (sc).listen = "0"b;
+	end;
+
+	return;
+
+/* * * * * * * * * * * TERMINATE_MULTIPLEXER * * * * * * * * * */
+
+terminate_multiplexer:
+     entry (Dp, Code);
+
+	Code = 0;
+	sty_mpx_data_ptr = Dp;
+
+	do i = 1 to sty_mpx_data.n_channels;
+	     my_pdep = addr (sty_mpx_data.pdes (i));
+	     call abort (my_pde);
+	     if my_pde.mode_ptr ^= null () then call tty_area_manager$free (currentsize (my_pde.mode_ptr -> mode_string_info), my_pde.mode_ptr);
+	end;
+
+	call tty_area_manager$free (currentsize (sty_mpx_data), sty_mpx_data_ptr);
+
+	Dp = null ();
+	return;
+%page;
+/* * * * * * * * * * SETUP_SUBCHAN * * * * * * * * * */
+
+setup_subchan:
+     procedure;
+
+	sty_mpx_data_ptr = Dp;
+
+	my_pdep = addr (sty_mpx_data.pdes (Subchan));
+	her_pdep = addr (sty_mpx_data.pdes (mod (Subchan - 1 + sty_mpx_data.n_pairs, sty_mpx_data.n_channels) + 1));
+	return;
+     end setup_subchan;
+
+/* * * * * * * * * ABORT * * * * * * * * * */
+
+abort:
+     procedure (Pde);
+dcl  1 Pde aligned like pde;
+
+	Pde.end_of_page = "0"b;
+	if Pde.head ^= 0 then do;
+	     call tty_space_man$free_chain (Pde.devx, OUTPUT, pointer (addr (tty_buf$), Pde.head));
+	     Pde.head, Pde.tail = 0;
+	     end;
+	call send_output (Pde);
+	return;
+     end abort;
+
+/* * * * * * * * * * NEW_MODE * * * * * * * * * */
+
+new_mode:
+     procedure options (variable);
+
+dcl  old_mode_ptr ptr;
+dcl  code fixed bin (35);
+dcl  this_mode char (32);
+dcl  combined_modes char (512);
+
+	mode_string_info_ptr = null ();
+
+	call formline_ (1, 2, addr (this_mode), length (this_mode), 1);
+
+	call tty_area_manager$lock_area ();
+	on cleanup call tty_area_manager$unlock_area ();
+
+	call mode_string_$parse (this_mode, addr (tty_area$), mode_string_info_ptr, code);
+	if code ^= 0 then goto bad_mode;
+
+	call mode_string_$combine (my_pde.mode_ptr, mode_string_info_ptr, combined_modes, code);
+	if code ^= 0 then goto bad_mode;
+
+	free mode_string_info in (tty_area$);
+	mode_string_info_ptr = null ();
+
+	call mode_string_$parse (combined_modes, addr (tty_area$), mode_string_info_ptr, code);
+	if code ^= 0 then goto bad_mode;
+
+	old_mode_ptr = my_pde.mode_ptr;
+	my_pde.mode_ptr = mode_string_info_ptr;
+	if old_mode_ptr ^= null () then free old_mode_ptr -> mode_string_info in (tty_area$);
+	call tty_area_manager$unlock_area ();
+
+	if my_pde.flags.notify_modes then do;
+	     call channel_manager$interrupt_later (her_pde.devx, LINE_STATUS, ""b);
+	     my_pde.flags.notify_modes = "0"b;
+	     end;
+
+	mode_error = "0"b;
+	return;
+
+bad_mode:
+	call tty_area_manager$unlock_area ();
+	mode_error = "1"b;
+	return;
+     end new_mode;
+
+/* * * * * * * * * * BRING_UP * * * * * * * * * */
+
+bring_up:
+     procedure;
+
+dcl  reset_ac bit (1);
+
+	reset_ac = "1"b;
+	go to bring_up_join;
+
+bring_up_keep_ac:
+     entry;
+
+	reset_ac = "0"b;
+
+bring_up_join:
+	if sty_mpx_data.flags.started & her_pde.flags.listen then do;
+						/* is other side ready? */
+	     unspec (dialup_info) = ""b;		/* yes, dial up */
+	     dialup_info.line_type = LINE_ASCII;
+	     dialup_info.max_buf_size = 128;
+	     call channel_manager$interrupt_later (her_pde.devx, DIALUP, unspec (dialup_info));
+	     call channel_manager$interrupt_later (my_pde.devx, DIALUP, unspec (dialup_info));
+
+	     call reset (her_pde, reset_ac);
+	     call reset (my_pde, reset_ac);
+	     call send_output (her_pde);
+	     call send_output (my_pde);
+	     end;
+
+	else my_pde.flags.listen = "1"b;		/* maybe later */
+
+	return;
+     end bring_up;
+
+/* * * * * * * * * * RESET * * * * * * * * * */
+
+reset:
+     procedure (Pde, Reset_ac);
+dcl  1 Pde aligned like pde;
+dcl  Reset_ac bit (1);
+
+dcl  old_ac_flag bit (1);
+
+	if ^Reset_ac then old_ac_flag = Pde.access_class_set;
+	string (Pde.flags) = ""b;
+	if ^Reset_ac then Pde.access_class_set = old_ac_flag;
+	Pde.location = "";
+	if Reset_ac then Pde.access_class = "0"b;
+
+	return;
+     end reset;
+
+/* * * * * * * * * * SEND_OUTPUT * * * * * * * * * */
+
+send_output:
+     procedure (Pde);
+dcl  1 Pde aligned like pde;
+
+	if ^Pde.flags.output_ready & ^Pde.flags.end_of_page & (Pde.head = 0) then do;
+	     Pde.flags.output_ready = "1"b;
+	     call channel_manager$interrupt_later (Pde.devx, SEND_OUTPUT, ""b);
+	     end;
+	return;
+     end send_output;
+%page;
+%include sty_mpx_data;
+%include foreign_terminal_data;
+%include mcs_interrupt_info;
+%include tty_buffer_block;
+%include channel_manager_dcls;
+%include mux_init_info;
+%include lct;
+%include tty_buf;
+%include tty_space_man_dcls;
+%include line_types;
+%include mcs_modes_change_list;
+%include mode_string_info;
+%include tty_mode_names;
+%include tty_access_class;
+
+     end sty_mpx;

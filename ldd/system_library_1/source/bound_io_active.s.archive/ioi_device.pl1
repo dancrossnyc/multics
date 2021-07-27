@@ -1,0 +1,205 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+
+ioi_device:
+     procedure;
+
+/* Written May 1982 by C. Hornig for new ioi_ */
+/* Finished March 1983 by Chris Jones */
+/* Modified April 1984 by Chris Jones to fix bug when unlocking after a dead process. */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+     audit(85-11-26,CLJones), install(86-03-21,MR12.0-1033):
+     Add support for FIPS.
+  2) change(86-02-03,Farley), approve(86-07-18,MCR7439),
+     audit(86-08-18,Fawcett), install(86-10-20,MR12.0-1189):
+     Changed to execute in the BCE environment.
+  3) change(86-11-18,Farley), approve(86-11-20,MECR0002),
+     audit(86-11-19,Fawcett), install(86-11-20,MR12.0-1222):
+     Corrected a race condition with the setting of dte.lock by validating that
+     the device is still assigned to the process AFTER getting the lock. (e.g.
+     the Initializer had the lock as part of doing a force unassignment of the
+     device and now the device table entry is initialized.)
+  4) change(86-12-19,Farley), approve(86-12-19,MCR7587),
+     audit(86-12-19,Fawcett), install(87-01-05,MR12.0-1253):
+     Formal installation to close out above MECR0002.
+                                                   END HISTORY COMMENTS */
+
+dcl	p_code		   fixed bin (35) parameter;
+dcl	p_device		   bit (6) aligned parameter;
+dcl	p_controller	   bit (1) aligned parameter;
+dcl	p_devx		   fixed bin parameter;
+dcl	p_dtep		   ptr parameter;
+dcl	p_gtep		   ptr parameter;
+
+dcl	code		   fixed bin (35);
+dcl	device		   bit (6) aligned;
+dcl	controller	   bit (1) aligned;
+dcl	devx		   fixed bin;
+dcl	force_flag	   bit (1) aligned;
+dcl	test_processid	   bit (36) aligned;
+
+dcl	ioi_assignment$unassign
+			   entry (fixed bin, fixed bin (35));
+dcl	lock$lock_fast	   entry (ptr);
+dcl	lock$unlock_fast	   entry (ptr);
+dcl	tc_util$validate_processid
+			   entry (bit (36) aligned, fixed bin (35));
+
+dcl	error_table_$already_assigned
+			   fixed bin (35) ext static;
+dcl	error_table_$bad_index fixed bin (35) ext static;
+dcl	error_table_$bad_ring_brackets
+			   fixed bin (35) ext static;
+dcl	error_table_$dev_nt_assnd
+			   fixed bin (35) ext static;
+dcl	error_table_$invalid_device
+			   fixed bin (35) ext static;
+dcl	error_table_$process_unknown
+			   fixed bin (35) ext static;
+
+dcl	pds$process_id	   bit (36) aligned external;
+dcl	pds$validation_level   fixed bin (3) external;
+
+dcl	sys_info$service_system
+			   bit (1) aligned external static;
+
+dcl	(addr, hbound, lbound, null, ptr, rel, stac, stacq)
+			   builtin;
+
+/* * * * * * * * * * GET_DTEP * * * * * * * * * */
+
+get_dtep:
+     entry (p_devx, p_dtep, p_code);
+
+	force_flag = "0"b;
+	goto get_dtep_join;
+
+get_dtep_force:
+     entry (p_devx, p_dtep, p_code);
+
+	force_flag = "1"b;
+get_dtep_join:
+	devx = p_devx;
+	p_dtep = null ();
+	p_code = 0;
+
+	idp = addr (ioi_data$);
+	if (devx < lbound (ioi_data.dt, 1)) | (devx > hbound (ioi_data.dt, 1)) then do;
+	     p_code = error_table_$bad_index;
+	     return;
+	end;
+
+	dtep, p_dtep = addr (ioi_data.dt (devx));
+
+	if ^force_flag & (dte.process_id ^= pds$process_id) then do;
+	     p_code = error_table_$dev_nt_assnd;
+	     return;
+	end;
+
+	if ^force_flag & (dte.ring < pds$validation_level) then do;
+	     p_code = error_table_$bad_ring_brackets;
+	     return;
+	end;
+
+	if sys_info$service_system then do;
+	     call lock$lock_fast (addr (dte.lock));
+	     if ^force_flag & (dte.process_id ^= pds$process_id) then do;
+		p_code = error_table_$dev_nt_assnd;	/* lost the race */
+		call lock$unlock_fast (addr (dte.lock));
+		return;
+	     end;
+	end;
+	return;
+
+/* * * * * * * * * * UNLOCK * * * * * * * * * */
+
+unlock:
+     entry (p_dtep);
+
+	dtep = p_dtep;
+	if sys_info$service_system then
+	     call lock$unlock_fast (addr (dte.lock));
+	return;
+
+/* * * * * * * * * * ASSIGN * * * * * * * * * */
+
+assign:
+     entry (p_gtep, p_device, p_controller, p_devx, p_code);
+
+	gtep = p_gtep;
+	device = p_device;
+	controller = p_controller;
+	idp = addr (ioi_data$);
+	call find_dte;
+	if dtep = null () then do;
+	     p_code = error_table_$invalid_device;
+	     return;
+	end;
+
+/**** We now try to get control of this device by placing our process_id (PID) in the dte.  If the PID is zero,
+      no one else has the device and we will be successful.  If the PID in the dte is non-zero, we check to
+      see if the process which controls the device is still alive.  If it is, we give up; the device is under the
+      control of that process.  If the PID in the dte is for a non-existant process, we slam our PID on top
+      of it.  We use gating instructions (stac and stacq) for all of this since another process on another
+      processor may be trying to do the same thing. ****/
+
+	if ^sys_info$service_system then
+	     dte.process_id = pds$process_id;		/* If not UP force setting */
+	else do while (^stac (addr (dte.process_id), pds$process_id));
+	     test_processid = dte.process_id;
+	     call tc_util$validate_processid (test_processid, code);
+	     if code ^= error_table_$process_unknown then do;
+		p_code = error_table_$already_assigned;
+		return;
+	     end;
+	     if stacq (dte.process_id, pds$process_id, test_processid) then do;
+						/* grab the device */
+		call ioi_assignment$unassign (devx, code);
+		if code ^= 0 then do;
+		     dte.process_id = ""b;		/* could use stacq, but what if it fails? */
+		     p_code = code;
+		     return;
+		end;
+	     end;
+	end;
+
+	dte.ring = pds$validation_level;
+	p_devx = devx;
+	p_code = 0;
+	return;
+
+/* * * * * * * * * * UNASSIGN * * * * * * * * * */
+
+unassign:
+     entry (p_dtep);
+
+	dtep = p_dtep;
+	gtep = ptr (dtep, dte.gtep);
+	dte.process_id = ""b;			/* all necessary validation has already been done */
+	return;
+
+find_dte:
+     proc;
+
+	do devx = 1 to ioi_data.ndt;
+	     dtep = addr (ioi_data.dt (devx));
+	     if dte.in_use & (rel (gtep) = dte.gtep) & (dte.device = device) & (dte.controller = controller) then
+		return;
+	end;
+	dtep = null ();				/* couldn't find it */
+	return;
+
+     end find_dte;
+
+%include ioi_data;
+
+     end ioi_device;

@@ -1,0 +1,425 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+find_dict_word_: proc (pm_word, pm_control, pm_word_found, pm_descrip, pm_dict_path, pm_err_p, pm_code);
+
+/* This procedure finds a specified word in the sequence of
+   dictionaries defined by the "dict" search list.
+*/
+
+/* Coded 10/17/77 by J. Stern */
+/* Modified 07/07/81 by PWB to allow option of whether or not a bad dict in 
+		        search list will cause processing to halt, and 
+		        provide a mechanism to report those errors.
+*/
+
+/* Parameters */
+
+dcl  pm_word char (*);
+dcl  pm_control bit (36) aligned;
+dcl  pm_word_found char (256);
+dcl  pm_descrip bit (36) aligned;
+dcl  pm_dict_path char (168);
+dcl  pm_err_p ptr;					/* input -> null = abort if invalid dict found */
+dcl  pm_code fixed bin (35);
+
+
+/* Automatic */
+
+dcl  aborting bit (1);
+dcl  ndict fixed bin;
+dcl  dictx fixed bin;
+dcl  prev_level fixed bin;
+dcl  forget_sw bit (1) aligned;
+dcl  dict_iocbps_p ptr;
+dcl  good_dicts_p ptr;
+dcl  switch char (32);
+dcl  atd char (256);
+dcl  word char (256) varying;
+dcl  info_ptr ptr;
+
+dcl 1 fdw_control aligned,
+    2 exact_match bit (1) unal,
+    2 mbz bit (35) unal;
+
+dcl 1 get_key_info aligned,
+    2 flags like gk_header.flags,
+    2 descrip bit (36) aligned,
+    2 key_len fixed bin,
+    2 key char (256);
+
+
+/* Based */
+
+dcl  current_sl_index fixed bin (71) based (sl_info.change_index_p);
+dcl  system_area area based (system_area_p);
+dcl  dict_iocbps (ndict) ptr based (dict_iocbps_p);
+dcl  good_dicts (ndict) bit (1) unal based (good_dicts_p);
+	       
+dcl 1 bad_dicts aligned based (pm_err_p),
+      2 n fixed bin,
+      2 entry (0 refer (bad_dicts.n)),
+        3 ecode fixed bin (35),
+        3 path char (168) unal;
+
+/* Static */
+
+dcl  system_area_p ptr int static init (null);
+dcl  level fixed bin int static init (0);
+dcl  have_dictionaries bit (1) aligned int static init ("0"b);
+dcl  static_sl_info_p ptr int static;
+dcl  static_dict_iocbps_p ptr int static;
+dcl  static_good_dicts_p ptr int static init (null);
+	       
+dcl  keyed_sequential_input fixed bin int static options (constant) init (8);
+dcl  capital_letters char (26) int static options (constant) init ("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+dcl  small_letters char (26) int static options (constant) init ("abcdefghijklmnopqrstuvwxyz");
+
+dcl  error_table_$no_record fixed bin (35) ext static;
+dcl  error_table_$no_key fixed bin (35) ext static;
+dcl  error_table_$id_not_found fixed bin (35) ext static;
+dcl  error_table_$no_search_list fixed bin (35) ext static;
+dcl  error_table_$fatal_error	fixed bin(35) ext static;
+dcl  error_table_$recoverable_error fixed bin(35) ext static;
+
+dcl  search_list_defaults_$dict ext static;
+
+
+/* Conditions */
+
+dcl  cleanup condition;
+
+
+/* Builtins */
+
+dcl (null, rtrim, unspec, verify, search, translate, length, bit, bin, addr, substr, string) builtin;
+
+
+/* Entries */
+
+dcl  get_system_free_area_ entry (ptr);
+dcl  search_paths_$get entry (char (*), bit (36), char (*),
+     ptr, ptr, fixed bin, ptr, fixed bin (35));
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+dcl  iox_$attach_name entry (char (*), ptr, char (*), entry, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  iox_$control entry (ptr, char (*), ptr, fixed bin (35));
+dcl  sub_err_ entry options (variable);
+
+/* include files */
+
+
+%include sl_info;
+
+%include ak_info;
+
+/* initialize */
+
+	pm_code = 0;
+	pm_dict_path = "";
+	aborting = (pm_err_p = null());
+	if ^aborting
+	     then bad_dicts.n = 0;
+	
+	if system_area_p = null
+	then call get_system_free_area_ (system_area_p);
+
+	forget_sw = "0"b;
+	prev_level = level;
+	on cleanup call cleaner;
+	level = level + 1;
+
+/* open dictionaries from search list if not already open */
+
+	if ^have_dictionaries
+	then do;
+	     if prev_level > 0
+	     then go to cant_do;
+
+	     sl_info_p, dict_iocbps_p = null;
+	     forget_sw = "1"b;
+	     call get_dictionaries;
+	     forget_sw = "0"b;
+	end;
+	else do;
+	     sl_info_p = static_sl_info_p;
+	     ndict = sl_info.num_paths;
+	     dict_iocbps_p = static_dict_iocbps_p;
+	     good_dicts_p = static_good_dicts_p;
+	     do dictx = 1 to ndict;
+		if ^(good_dicts (dictx))		/* if dict was flagged as bad */
+		     then do;			/* in last invocation */
+		     forget_sw = "1"b;
+		     call retry_bad_dict;		/* then see if it works now */
+		     forget_sw = "0"b;
+		end;
+	     end;
+	end;
+
+/* reopen dictionaries if search list has changed */
+
+	if current_sl_index ^= sl_info.change_index
+	then do;
+	     if prev_level > 0
+	     then go to cant_do;
+
+	     if ^aborting
+		then bad_dicts.n = 0;
+	     forget_sw = "1"b;
+	     call forget_dictionaries;
+	     call get_dictionaries;
+	     forget_sw = "0"b;
+	end;
+
+/* scan the dictionaries in order for the specified word */
+
+	if length (rtrim (pm_word)) > 256		/* max word size = 256 */
+	then go to not_found;
+	word = substr (pm_word, 1, length (rtrim (pm_word)));
+	unspec (fdw_control) = pm_control;
+
+	get_key_info.flags.input_key = "1"b;
+	get_key_info.input_desc = "0"b;
+	get_key_info.desc_code = 0;
+	get_key_info.rel_type = 0;
+	get_key_info.head_size = 256;
+	get_key_info.reset_pos = "0"b;
+	get_key_info.pad = ""b;
+	get_key_info.version = gk_info_version_0;
+
+	do dictx = 1 to ndict;
+	     pm_dict_path = sl_info.pathname (dictx);
+	     if word_found ()
+	     then go to finish;
+	end;
+
+	pm_dict_path = "";
+
+not_found: pm_code = error_table_$id_not_found;
+
+finish:	if pm_code = 0 & ^aborting
+	     then if bad_dicts.n ^= 0
+	     then pm_code = error_table_$recoverable_error;
+	call cleaner;
+	return;
+
+cant_do:	call sub_err_ (0, "find_dict_word_", "s", null, (0),
+	     "Cannot proceed without harm to prior activation. Please restart or release level ^d.", prev_level);
+	go to cant_do;				/* should never get here, but just in case */
+
+cleaner:	proc;					/* cleanup procedure */
+
+	     level = prev_level;
+	     if forget_sw
+	     then call forget_dictionaries;
+
+	end cleaner;
+
+/* This procedure opens the dictionaries defined in the "dict" search list. */
+
+get_dictionaries: proc;
+
+dcl  i fixed bin;
+
+
+	     call search_paths_$get ("dict", "111111"b, "", null, system_area_p,
+		sl_info_version_1, sl_info_p, pm_code);
+	     if pm_code ^= 0
+	     then go to finish;
+
+	     ndict = sl_info.num_paths;
+	     allocate dict_iocbps in (system_area);
+	     allocate good_dicts in (system_area);
+	     dict_iocbps (*) = null;
+	     good_dicts (*) = "0"b;
+	     
+	     do i = 1 to ndict;
+		pm_dict_path = sl_info.pathname (i);
+		switch = unique_chars_ (""b);		/* use unique I/O switch name */
+		atd = "vfile_ " || rtrim (sl_info.pathname (i)) || " -share"; /* build attach description */
+		call iox_$attach_name (switch, dict_iocbps (i), atd, find_dict_word_, pm_code);
+		if pm_code ^= 0
+		     then if aborting		/* abort if that's what he wants */
+		     then goto finish;
+		else call log_bad_dict (i);		/* or just record the bad one */
+		else do;
+		     call iox_$open (dict_iocbps (i), keyed_sequential_input, "0"b, pm_code);
+		     if pm_code ^= 0
+			then if aborting		/* same here */
+			then goto finish;
+		     else do;
+			call log_bad_dict (i);	/* and here */
+			call iox_$detach_iocb (dict_iocbps (i), pm_code);
+		     end;
+		     else good_dicts (i) = "1"b;	/* everybody's happy */
+		end;
+	     end;
+
+	     if (string (good_dicts) = "0"b)		/* he told us not to abort */
+		then do;				/* but ALL the dictionaries */
+		pm_code = error_table_$fatal_error;	/* are bad */
+		goto finish;			/* so abort anyway */
+	     end;
+	     	     
+	     pm_dict_path = "";
+
+	     static_sl_info_p = sl_info_p;
+	     static_dict_iocbps_p = dict_iocbps_p;
+	     static_good_dicts_p = good_dicts_p;
+	     have_dictionaries = "1"b;
+
+	end get_dictionaries;
+
+/* This procedure closes any previously opened dictionaries */
+
+forget_dictionaries: proc;
+
+dcl  i fixed bin;
+dcl  code fixed bin (35);
+
+
+	     have_dictionaries = "0"b;
+
+	     if dict_iocbps_p ^= null
+	     then do;
+		do i = 1 to ndict;
+		     if dict_iocbps (i) ^= null 
+		     then do;
+			call iox_$close (dict_iocbps (i), code);
+			call iox_$detach_iocb (dict_iocbps (i), code);
+			dict_iocbps (i) = null;
+		     end;
+		end;
+		free dict_iocbps in (system_area);
+		dict_iocbps_p = null;
+		free good_dicts in (system_area);
+		good_dicts_p = null;
+	     end;
+
+	     if sl_info_p ^= null
+	     then do;
+		free sl_info in (system_area);
+		sl_info_p = null;
+	     end;
+
+	end forget_dictionaries;
+
+/* This procedure attempts to open a dictionary that was previously flagged as
+   bad (probably non-existent).
+*/
+
+retry_bad_dict:
+	proc;
+	
+		pm_dict_path = sl_info.pathname (dictx);
+		switch = unique_chars_ (""b);		/* use unique I/O switch name */
+		atd = "vfile_ " || rtrim (sl_info.pathname (dictx)) || " -share"; /* build attach description */
+		call iox_$attach_name (switch, dict_iocbps (dictx), atd, find_dict_word_, pm_code);
+		if pm_code = 0
+		     then do;
+		     call iox_$open (dict_iocbps (dictx), keyed_sequential_input, "0"b, pm_code);
+		     if pm_code = 0
+			then good_dicts (dictx) = "1"b;
+		     else do;
+			if aborting 
+			     then goto finish;
+			call log_bad_dict (dictx);
+			call iox_$detach_iocb (dict_iocbps (dictx), pm_code);
+		     end;
+		end;
+		else if aborting
+		     then goto finish;
+		else call log_bad_dict (dictx);
+							
+		pm_dict_path = "";
+
+	     end retry_bad_dict;
+
+/* This procedure puts the error code and associated pathname for a bad
+   dictionary in the structure bad_dicts so that the calling procedure
+   can report the errors. */
+
+log_bad_dict:  proc (which);
+
+dcl which fixed bin parameter;
+
+	     bad_dicts.n = bad_dicts.n + 1;
+	     bad_dicts.entry.ecode (bad_dicts.n) = pm_code;
+	     bad_dicts.entry.path (bad_dicts.n) = sl_info.pathname (which);
+	     pm_code = 0;
+
+	end log_bad_dict;
+
+/* This procedure finds the specified word in the current dictionary.
+   If the word does not exist and the exact_match option was not specified,
+   the word is checked for standard capitalization.  If standard capitalization
+   is found, then the dictionary is consulted again for decapitalized
+   forms of the same word.
+*/
+
+word_found: proc returns (bit (1) aligned);
+
+	     if ^(good_dicts (dictx))			/* ignore bad dictionary */
+		then return ("0"b);
+
+	     get_key_info.key = word;
+	     if known_word ()
+	     then return ("1"b);
+
+	     if fdw_control.exact_match
+	     then return ("0"b);
+
+	     if verify (word, capital_letters) = 0
+	     then do;
+		if length (word) > 1
+		then do;
+		     substr (get_key_info.key, 2) = translate (substr (word, 2), small_letters, capital_letters);
+		     if known_word ()
+		     then return ("1"b);
+		end;
+check_no_cap:
+		get_key_info.key = translate (word, small_letters, capital_letters);
+		if known_word ()
+		then return ("1"b);
+	     end;
+	     else if length (word) > 1
+	     then if search (substr (word, 1, 1), capital_letters) = 1
+		& verify (substr (word, 2), small_letters) = 0
+		then go to check_no_cap;
+
+	     return ("0"b);
+
+	end word_found;
+
+/* This procedure determines whether or not a specified word is "known",
+   i.e., whether or not the word is defined in the current dictionary.
+*/
+
+known_word: proc returns (bit (1) aligned);
+
+
+	     get_key_info.key_len = 256;
+	     call iox_$control (dict_iocbps (dictx), "get_key", addr (get_key_info), pm_code);
+	     if pm_code ^= 0
+	     then if pm_code = error_table_$no_record | pm_code = error_table_$no_key
+		then return ("0"b);
+		else go to finish;
+
+	     pm_word_found = get_key_info.key;
+	     pm_descrip = get_key_info.descrip;
+
+	     return ("1"b);
+
+	end known_word;
+
+
+     end find_dict_word_;

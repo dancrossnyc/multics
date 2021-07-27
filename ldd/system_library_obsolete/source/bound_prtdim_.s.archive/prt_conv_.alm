@@ -1,0 +1,1040 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+" *                                                         *
+" * Copyright (c) 1972 by Massachusetts Institute of        *
+" * Technology and Honeywell Information Systems, Inc.      *
+" *                                                         *
+" ***********************************************************
+
+
+" Code conversion module for line printers
+
+" Created:  24 October 1974 by N. Morris
+" Modified: 6 June 1975 by N. Morris and D. Hunt to support printing page labels
+" Modified: 29 March 1977 by N. Morris to incorporate DCC improvements
+" Modified: 18 September 1980 by G. Palter to ignore a FF character immediately
+"      after a generated FF is output at page overflow time
+" Modified: 17 November 1981 by G. Palter to fix several bugs from the io_daemon error list:
+"      0005: phx08986
+"	In prt_conv_, the dispatch entry for the NUL character is incorrect causing it to
+"	be treated as an ordinary control character rather than always being ignored.
+"      0006: phx08986
+"	Enabling pci.ctl_char mode causes prt_conv_ to go into a loop which eventually
+"	can cause fatal process errors. 
+"      0012: phx09251 phx03749 phx04015
+"	-no_endpage does not really work.  When the daemon prints what should be the last
+"	line of the logical page (line 3 of a real page), it issues a form-feed to get to
+"	the next line which is the top of the next logical page.  However, if the paper
+"	info or printer alignment (for remotes) is incorrect, this form-feed will cause
+"	extra blank paper.  The daemon should never print a form-feed in this mode except
+"	when one appears in the user's print file.
+"      0031: phx10074
+"	When given a very, very long input line (>131071 characters) with no embedded
+"	whitespace, prt_conv_ will place too many characters into the caller's output
+"	buffer overwriting whatever comes after the buffer.  This problem will normally
+"	cause the driver to take a fatal process error and may also destroy data trusted
+"	by the coordinator.
+"      0035: phx11995
+"         If a print file contains the sequence "ESC c" which is the start of the skip to
+"         logical channel printer escape sequence, the I/O daemon will scan without printing
+"         all subsequent print data looking for the ETX character which terminates the
+"         sequence even though non-numeric characters are encountered before the ETX.  (This
+"         sequence consists of "ESC c" followed by a number from 1 to 16 followed by the
+"         ETX).  The daemon continues looking for the ETX across requests causing an unknown
+"         amount of printed output to be lost.
+
+" 
+" This module scans character strings containing lines to be printed
+" on a line printer.  It produces printer line images, taking into
+" account overstrikes, lines that are too long, etc.
+"
+" Calling sequence:
+"	call prt_conv_ (wksp, nelem, outstr, outlen, p);
+"
+" Where:
+"	wksp	is a pointer to the input string
+"	nelem	is the number of characters in the input string
+"	outstr	is a pointer to a character string long enough to hold a line image
+"	outlen	is the length (in 9-bit chars) of the converted output
+"	p	is a pointer to the info structure described below
+"
+" The following registers are used by this program:
+"	bp	pointer to input string
+"	bb	pointer to output string
+"	lp	pointer to tab table
+"	lb	pointer to info structure
+"	ab	pointer to conversion procedure
+"	sb	return from conversion procedure call
+"	X1	count of characters remaining in output line
+"	X2	count of white space skipped in output
+"	X7	return from internal calls
+"
+" Note:
+"	The actual transmittal of converted print lines to the output buffer
+"	is not done by this routine.  Four entries must be provided in
+"	an output conversion procedure.  The output procedure is found
+"	by using a pointer provided in the info structure.  The entries
+"	and their calling sequences are described below.  They must reside
+"	at locations 0, 1, 2, and 3 of the output procedure, and they
+"	are called using a TSPSB instruction.  The output procedure shares
+"	the stack frame belonging to prt_conv_.  The first 20(8) words
+"	of automatic storage are reserved for use by the output procedure.
+"
+"	cv_send_init (location 0 of the output procedure) is called before
+"	any conversion is performed.  At this time, a carriage control
+"	character (or any other necessary control character) can be
+"	inserted at the beginning of the output line.  In addition,
+"	any stack variables used by the output procedure can be
+"	initialized.
+"
+"	cv_send_chars (location 1) is called each time white space
+"	followed by characters is to be added to the output line.
+"	bp will point to the characters to be output.  The number
+"	of characters to output will be found in AU.  X2 will contain
+"	the amount of white space to be inserted before the output
+"	characters.  cv_send_chars is expected to modify bp and bb
+"	to point after the characters input and output respectively.
+"	It is expected to set X2 to zero after inserting the appropriate
+"	white space.
+"
+"	cv_send_slew_pattern (location 2) is called at the end of a line
+"	to cause a slew to a VFU tape pattern.  The pattern is supplied
+"	in the A register.  Currently, only 3 patterns are generated:
+"	slew to top of page, top of inside page, and top of outside page.
+"	cv_send_slew_pattern is expected to modify bb to point
+"	after the last character to be output.
+"
+"	cv_send_slew_count (location 3) is called at the end of a line
+"	to cause a given number of lines to be slewed.  The number is
+"	supplied in the A register.  If the requested number of lines
+"	cannot be slewed in one printer operation, the remaining line
+"	count should be returned in the A.  Otherwise, the A should be
+"	set to zero.  cv_send_slew_count is expected to modify bb to
+"	point after the last character to be output.
+"
+"	A cell in the conversion control structure (pci.temp)
+"	is reserved for use the the output procedure.  This cell may
+"	be used to save variables between successive calls to  prt_conv_.
+"
+" 
+
+	name	prt_conv_
+
+	entry	prt_conv_
+
+
+	temp8	conv_stor(2)	reserved for use by conversion procedure
+	tempd	save_bp		for saving bp
+	temp	overstrike	overstrike encountered flag
+	temp	overflow		line overflow encountered flag
+	temp	endline		end of line char encountered flag
+	temp	labelsw		label being processed flag
+	temp	inrem		-count of charaters remaining in input
+	temp	cur_level		current overstrike level
+	temp	outoff		output pointer offset
+	temp	savpos		saved position for long lines
+	temp	savfunc		saved function code for labels
+	temp	char		character temporary
+	temp	tctally		tally from tct instruction
+	temp	sctally		tally from scd instruction
+	temp	bltally		tally from tct for blanks
+	temp	count		character count
+	temp	numb		count of blanks
+	temp	numc		non-blank character count
+	temp	instr		temporary for modified SCM instruction
+	temp	save_a_temp
+
+
+" 
+
+	equ	cv_send_init,0		entry in cv_proc to initialize conversion
+	equ	cv_send_chars,1		entry in cv_proc to output characters
+	equ	cv_send_slew_pattern,2	entry in cv_proc to slew to pattern
+	equ	cv_send_slew_count,3	entry in cv_proc to slew by count
+
+	include	prt_conv_info
+
+
+" 
+" Conversion Initialization.
+
+prt_conv_:push
+
+	epplb	ap|10,*		lb -> info structure
+	epplb	lb|0,*		..
+
+	stz	labelsw		clear label flag
+	lda	lb|pci.label_nelem	any label being processed?
+	tnz	do_label		if so, process label
+
+	eppbp	ap|2,*		bp -> input string
+	eppbp	bp|0,*		..
+	lda	ap|4,*		get length of input string
+	tra	do_input		and continue
+
+do_label:	eppbp	lb|pci.label_wksp,*	bp -> label
+	stc2	labelsw		set flag
+
+do_input:	neg	0		negate remaining length
+	sta	inrem		save -remaining length of input string
+
+	eppbb	ap|6,*		bb -> output string
+	eppbb	bb|0,*		..
+	stz	outoff		clear word
+	sarbb	outoff		save pointer offset for computation later
+
+	stz	cur_level		clear current level
+	stz	overstrike	clear overstrike flag
+	stz	overflow		clear line overflow flag
+	stz	endline		clear end of line flag
+	stz	savfunc		clear saved function code
+
+	ldac	lb|pci.pos	get previous position of incomplete line
+	sta	savpos		save in case it's needed later
+	tnz	*+2		if zero,
+	lda	lb|pci.lmarg	use left margin
+	eax2	0,al		set initial white space
+	neg	0		negate
+	ada	lb|pci.rmarg	compute characters remaining on line
+	eax1	0,al		in X1
+
+	eppab	lb|pci.cv_proc,*	ab -> conversion proc
+	tspsb	ab|cv_send_init	initialize conversion proc
+
+	ldac	lb|pci.slew_residue	any more lines to slew?
+	tpnz	slew_more		if so, go do them
+
+	szn	labelsw		doing label?
+	tnz	loop		if so, don't look at ESC processing
+	lda	lb|pci.esc_state	get state of ESC processing
+	tnz	resume_esc-1,al*	if ESC processing, go back to proper place
+
+" 
+" Main Character Processing Loop.
+
+loop:	tsx7	scan		scan input characters
+	sta	count		save count
+
+	cmpx1	count		too many characters for line?
+	tpl	*+3		if so,
+	stx1	count		take as many as will fit
+	stc1	overflow		set line overflow switch
+
+	lda	count		character count in AU
+	tze	zerc		if no characters, skip following
+	szn	lb|pci.level	at zero overstrike level?
+	tnz	skip		if not, don't output anything
+
+	arl	18		length in AL
+loop2:	ldq	0,dl		clear Q (offset from bp)
+
+loop1:	cmpa	2,dl		if 2 or fewer characters
+	tmoz	twoleft		don't bother looking for blanks
+
+	scd	(pr,rl,ql),(du)	search for blanks
+	desc9a	bp|0,al		..
+	aci	"  "		..
+	arg	sctally		..
+
+	adq	sctally		add offset of start of blanks
+	sba	sctally		subtract from length in A
+	ttn	noblanks		if no blanks, just output line
+
+	tct	(pr,rl,ql)	now search for non-blanks
+	desc9a	bp|0,al		..
+	arg	bltable		..
+	arg	bltally		..
+
+	lxl7	bltally		get count of blanks in X7
+	stx7	numb		save blank count
+	cmpx7	2,du		only 2?
+	tpnz	outfore		if more than 2, output text before blanks
+	sba	2,dl		decrease length by 2
+	adq	2,dl		and bump offset past blanks
+	ttf	loop1		continue if we're not at end of string
+	tra	endblanks		output everything
+
+outfore:	sta	numc		save remaining length
+	lls	36+18		blank offset is non-blank count
+	tze	*+2		don't output zero characters
+	tsx7	call_send_chars	output the non-blanks
+
+	adx2	numb		add to white space count
+	lda	bltally		get count of blanks
+	a9bd	bp|0,al		bump bp past blanks
+	ana	=o77777777	mask tally
+	neg	0		negate
+	ada	numc		subtract from remaining length
+	tnz	loop2		if more characters, continue search
+	tra	add		if not, bump pointers
+
+" 
+
+skip:	adx2	count		add these characters to white space count
+	a9bd	bp|0,au		and step input pointer over them
+	tra	add		now add to indices and continue
+
+twoleft:	stq	numc		save offset
+	ada	numc		add to remaining length to get count
+	tra	outaft		and output characters
+
+noblanks:	adq	1,dl		SCD examined n-1 characters
+endblanks:lls	36		character count in A
+
+outaft:	als	18		count in AU
+	tsx7	call_send_chars	output text
+
+add:	lda	count		get count of characters
+	arl	18		in AL
+	asa	inrem		decrement -count of characters remaining
+	sbx1	count		decrement space left on output line
+
+zerc:	szn	overflow		did line overflow?
+	tnz	endout		if so, stop here
+
+null:	lda	tctally		get character type code
+	arl	27		in AL
+	tra	dispatch,al	dispatch on it
+
+
+dispatch:	tra	loop		0: normal character
+	tra	bs		1: backspace
+	tra	ht		2: horizontal tab
+	tra	nl		3: new line
+	tra	cr		4: carriage return
+	tra	vt		5: vertical tab
+	tra	ff		6: form feed
+	tra	ignore		7: non-printable character
+	tra	ignored		8: ASCII null character
+	tra	esc		9: ESC character
+
+" 
+" Non-graphic Character Processor.
+
+ignore:	lda	lb|pci.modes	get conversion flags
+	cana	pci.ctl_char,du	output control characters?
+	tnz	ctl_char		if so, do it
+	cana	pci.non_edited,du	edited mode?
+	tze	ignored		if edited, ignore this character
+
+	eax1	-4,1		is there enough space left on line?
+	tpl	ignore1		if so, continue
+	eax1	0		set remaining space to 0
+	tra	endout		and force new line
+
+ignore1:	mlr	(pr),(pr)		grab the character
+	desc9a	bp|0,1		..
+	desc9a	char,1		..
+
+	ldq	char		character in Q(0-8)
+	lda	0,dl		clear the A
+	lls	3		take character 3 bits at a time
+	als	6		with 6 bits of zeroes in between
+	lls	3		..
+	als	6		..
+	lls	3		..
+	ora	=a\000		make into legal ASCII
+	sta	char		and save
+
+	spribp	save_bp		save input pointer
+	eppbp	char		make bp pointer to characters to output
+	lda	4,du		set AU to count of 4
+	tsx7	call_send_chars	and output the chars
+	eppbp	save_bp,*		now restore bp
+
+ignored:	tsx7	stepin1		step input pointer over character
+	tra	loop		and continue
+
+ctl_char:	lda	1,du		emit single character
+	tsx7	call_send_chars	..
+	aos	inrem		.. one less input character now 
+	tra	loop		.. and continue
+
+" 
+" ESC Character Processor.
+
+esc:	lda	lb|pci.modes	get mode flags
+	cana	pci.esc,du	in ESC processing mode?
+	tze	ignore		if not, ignore this character
+
+	stz	lb|pci.esc_num	initialize number
+	aos	lb|pci.esc_state	set state to 1
+	tsx7	stepin1		step to character following ESC
+	tze	endin		check for end of input
+
+esc1:	mrl	(pr),(pr),fill(0)	grab the next character
+	desc9a	bp|0,1
+	desc9a	char,4
+
+	scm	(),(pr)		examine table of ESC functions
+	desc9a	esc_functions,1
+	desc9a	char(3),1
+	arg	sctally
+	ttn	bad_esc		if not found, ignore ESC sequence
+
+	aos	lb|pci.esc_state	set state to 2
+	lda	sctally		get function code
+	als	18		in AU
+	stca	lb|pci.esc_state,70	save in state variable
+
+	tsx7	stepin1		step over character
+	tze	endin		..
+
+esc2:	mrl	(pr),(pr),fill(0)	grab a character
+	desc9a	bp|0,1
+	desc9a	char,4
+
+	lda	char		character in A
+	cmpa	=o003,dl		ETX?
+	tze	esc3		if so, stop gathering digits
+
+	cmpa	=o060,dl		check that it's a numeric character
+	tmi	bad_esc		... nope
+	cmpa	=o071,dl		...
+	tpl	bad_esc		... nope
+
+	ana	=o17,dl		mask to make it a digit
+	sta	char		and store
+	ldq	lb|pci.esc_num	get number
+	mpy	10,dl		insert new digit
+	adq	char		..
+	stq	lb|pci.esc_num	..
+
+	tsx7	stepin1		step input pointer
+	tze	endin		..
+	tra	esc2		continue gathering digits
+
+esc3:	tsx7	stepin1		step over ETX
+
+	ldac	lb|pci.esc_state	get and clear state variable
+	tra	esc_proc,au*	dispatch on function code
+
+bad_esc:	stz	lb|pci.esc_state	restate state variable
+	tra	loop		go back to normal character processing
+
+" 
+
+esc_functions:
+	aci	"c"
+
+esc_proc:	arg	skip_to_channel
+
+resume_esc:
+	arg	esc1
+	arg	esc2
+	arg	resume_channel_skip
+
+" 
+" Skip to Logical Forms Image Channel.
+
+skip_to_channel:
+	lda	lb|pci.esc_num	get number
+	sba	1,dl		minus 1
+	ldq	=o777000,du	character with all ones in Q
+	cana	=o10,dl		if channel <= 8
+	tnz	*+2		..
+	erq	=o400000,du	test for high-order bit zero
+	stq	char		save character for testing
+
+	ana	=o7,dl		take number 0 mod 8
+	ldq	=o200000,du	get bit in Q
+	qrl	0,al		shift to position
+	erq	=o377000,du	complement to make SCM mask
+	orq	scm_inst		OR mask into SCM instruction
+	stq	instr		save instruction
+
+	lda	lb|pci.line	get current line number in A
+	ldq	lb|pci.phys_page_length  remaining lines in Q
+	sbq	lb|pci.line	..
+	tmi	nl1		this shouldn't happen
+
+scan_lfi:	lls	1		compute character count and offset
+	xec	instr		do the SCM
+	desc9a	lb|pci.form_stops,ql
+	desc9a	char,1
+	arg	sctally
+	ttf	channel_found	tra if we found channel
+
+	cmpa	0,dl		second scan?
+	tze	nl1		if so, cannot find channel
+	lda	0,dl		scan first part of image now
+	ldq	lb|pci.line	only up to current line
+	tra	scan_lfi		..
+
+channel_found:
+	ada	sctally		add line offset of discovered channel
+	arl	1		compute target line number
+	ada	1,dl		..
+	cmpa	lb|pci.line	are we too far?
+	tpnz	slew_to_line	if not, move paper to there
+
+	cmpa	1,dl		going to top of page?
+	tze	ff1		do it
+	sta	lb|pci.esc_num	save target line number
+	lda	3,dl		set state of 3
+	sta	lb|pci.esc_state	..
+	tra	ff1		emit FF before slewing to correct line
+"		(needn't set ignore_next_ff because this operation isn't done)
+
+resume_channel_skip:
+	lda	lb|pci.esc_num	get target line
+	stz	lb|pci.esc_state	clear ESC state variable
+	tra	slew_to_line	perform slew
+
+scm_inst:	scm	(pr,al,rl),(pr)	SCM for finding logical channel stop
+
+" 
+" Backspace Processor.
+
+bs:	aos	cur_level		bump current overstrike level
+	lda	cur_level		get in in A
+	cmpa	lb|pci.level	is level higher than before?
+	tmoz	*+2		if so,
+	stc1	overstrike	set overstrike flag
+
+	tsx7	stepin1		step input pointer over BS character
+	tsx7	scan		scan more input
+	tze	null		if no characters skipped, process special
+
+	eax2	-1,2		decrease count of white space
+
+	lda	cur_level		get current level again
+	cmpa	lb|pci.level	is it same?
+	tnz	nobs		if not, don't output character
+
+	lda	1,du		output 1 character
+	tsx7	call_send_chars	..
+
+	aos	inrem		decrement count of characters remaining
+	tra	bsahead		and continue
+
+nobs:	eax2	1,2		count this as white space
+	tsx7	stepin1		step over this character
+
+bsahead:	lda	tctally		get tally word from scan
+	cmpa	=o001000000001	is character followed by another BS?
+	tze	bs		if so, handle next BS
+	stz	cur_level		if not, set level back to zero
+	tra	loop		and continue
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" Horizontal Tab Processor.
+
+ht:	tsx7	stepin1		step over HT character
+
+	eaa	0,1		Get count of white space remaining
+	neg	0		..
+	lrs	18+36
+	adq	lb|pci.rmarg	add right margin
+	sbq	lb|pci.lmarg	now have number of chars from left mrgin
+	div	10,dl		Compute tab motion
+	sba	10,dl		Compute no of chars to go
+	als	18
+	sta	numb
+	sbx2	numb		increase white space count
+	adx1	numb		decrease count of room remaining
+	tmi	endout		exit if output line has overflowed
+	tra	loop		and continue
+
+" 
+" Newline Processor
+
+nl:	tsx7	stepin1		step over NL
+	stc2	endline		set end of line flag
+	szn	overstrike	check for overstrike
+	tnz	strike		..
+
+nl0:	szn	labelsw		processing a label?
+	tnz	endlabel		if so, finish up with label
+
+	ldac	lb|pci.func	get function code
+	sta	savfunc		save it temporarily
+	tra	functbl,al	dispatch on it
+
+functbl:	tra	nl1		0: normal new line
+	tra	ff2		1: change NL to FF
+	tra	toip		2: change NL to top of inside page
+	tra	eop		3: change NL to end of page
+	tra	toop		4: change NL to top of outside page
+
+
+nl1:	ldx7	lb|pci.modes	page overflow suppression mode?
+	canx7	pci.overflow_off,du
+	tze	nl2		... no
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+" Handle a newline character in -no_endpage mode
+
+	lda	lb|pci.phys_page_length  ... yes
+	sba	lb|pci.line	compute lines left on real page
+
+	tsx7	compute_slew_count	see how much we can slew
+	tsx6	count_page	... it decided we should eject: just count the page
+	tra	slew_by_count	do the slewing
+
+count_page:			" count a page eject
+	sta	save_a_temp
+	tsx7	bump_page		count going to the next page
+	lda	1,dl		1 - slew_count -> pci.line: slew_by_count label will
+	sba	save_a_temp	... add the slew_count back causing pci.line to be
+	sta	lb|pci.line	... normalized to 1
+	lda	save_a_temp
+	tra	0,x6
+
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+" Handle a newline character when not in -no_endpage mode
+
+nl2:	lda	lb|pci.page_length	compute lines left on logical page
+	sba	lb|pci.line	...
+	
+	tsx7	compute_slew_count	see how much we can slew
+	tra	ff2		... it decided we should eject
+	tra	slew_by_count	... do the slewing
+
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+" Compute the number of lines we can slew on this page: check for consecutive newlines and
+"   page overflow;" if a page overflow is not detected, skip return
+
+compute_slew_count:
+	sta	numb		save count of lines left on page
+	tmoz	cslret		... no more lines: eject the page
+
+	lca	inrem		get count of remaining input chars
+	tmoz	cslret		... end of input -- send one NL
+
+	cmpa	numb		possibly more NLs than would fit on the page?
+	tmoz	*+2		... no
+	lda	numb		... yes: just check for enough to finish the page
+
+	tct	(pr,rl)		look for consecutive NLs
+	desc9a	bp|0,al
+	arg	nltable
+	arg	bltally
+
+	lda	bltally		get result of the verify (input, NL)
+	ana	=o77777777	
+	tze	cslret		... no consecutive NLs: skip just one
+
+	a9bd	bp|0,al		move past the NLs we are processing now
+	asa	inrem		... and note we've done them
+
+cslret:	cmpa	numb		rest of page taken up by NLs?
+	tze	*+2		... yes: let caller handle it
+	eax7	1,x7		... no: skip return
+
+	ada	1,dl		account for original NL
+	tra	0,x7
+
+" 
+" Special Function Processors.
+
+toip:	tsx7	bump_page		bump counters to new page
+
+	lda	1,dl		set line number back to 1
+	sta	lb|pci.line	..
+
+	lda	toip_pattern,dl	get slew pattern character
+	tra	slew_to_pattern	and go do slewing
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+toop:	tsx7	bump_page		bump counters to new page
+
+	lda	1,dl		set line number back to 1
+	sta	lb|pci.line	..
+
+	lda	toop_pattern,dl	get slew pattern character
+	tra	slew_to_pattern	and do it
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+eop:	tsx7	check_bot_label	see if bottom label should be printed
+
+	ldq	lb|pci.phys_page_length  get paper length
+	mpy	lb|pci.sheets_per_page  times number of sheets per page
+	lls	36		in A
+	sba	4,dl		go 4 lines back
+	tra	slew_to_line	will slew to this position
+
+"
+" Form Feed Processor.
+
+ff:	tsx7	stepin1		step over FF
+	stc2	endline		set end of line flag
+	szn	overstrike	check for overstrike
+	tnz	strike		..
+
+	ldx7	lb|pci.modes	is single spacing forced?
+	canx7	pci.single_space,du  ..
+	tnz	nl1		if so, force NL
+
+	canx7	pci.ignore_next_ff,du (pci.modes and pci.flags in same halfword)
+	tze	ff1		do the FF if not suppressed
+
+	lda	pci.ignore_next_ff,du
+	ana	lb|pci.flags	clear the flags so two FFs
+	ersa	lb|pci.flags	...  in a row work properly
+	tra	loop		and continue processing (nothing has been output here)
+
+ff1:	tsx7	check_bot_label	see if bottom label should be printed
+	tsx7	check_top_label	likewise for top label
+
+	tsx7	bump_page		bump counters to next page
+	lda	1,dl		set line # back to 1
+	sta	lb|pci.line	..
+
+	lda	ff_pattern,dl	get slew pattern for FF
+	tra	slew_to_pattern	and do it
+
+ff2:	lda	pci.ignore_next_ff,du
+	orsa	lb|pci.flags	this FF suppresses next one
+	tra	ff1
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" Vertical Tab Processor.
+
+vt:	tsx7	stepin1		step over VT
+	stc2	endline		set end of line flag
+	szn	overstrike	check for overstrike
+	tnz	strike		..
+
+	ldx7	lb|pci.modes	is single spacing forced?
+	canx7	pci.single_space,du  ..
+	tnz	nl1		if so, force NL
+
+	ldq	lb|pci.line	bump line # to next vertical tab stop
+	adq	9,dl		..
+	div	10,dl		..
+	mpy	10,dl		..
+	adq	1,dl		..
+	lls	36		place in A
+
+	cmpa	lb|pci.page_length	check for page overflow
+	tpl	ff1		if overflow, generate FF instead
+	tra	slew_to_line	slew to desired line
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" Process Carriage Return.
+
+cr:	tsx7	stepin1		step over CR
+	stc2	endline		set end of line flag
+	szn	overstrike	check for overstrike
+	tnz	strike		..
+
+cr1:	lda	0,dl		space zero lines
+	tra	slew_by_count	..
+
+" 
+" Label Processors.
+
+check_bot_label:
+	lda	lb|pci.page_length	are we past bottom label?
+	ada	2,dl		..
+	cmpa	lb|pci.line	..
+	tmoz	0,7		if so, just return
+
+	ldq	lb|pci.bot_label_length	get length of bottom label
+	tze	0,7		return if no label
+
+	eppsb	lb|pci.bot_label_line	sb -> label_line
+	tra	setlabel		set up for bottom label
+
+
+check_top_label:
+	ldq	lb|pci.phys_page_length  are we in position for top?
+	mpy	lb|pci.sheets_per_page  ..
+	lls	36		..
+	sba	1,dl		..
+	cmpa	lb|pci.line	..
+	tmoz	0,7		if not, just return
+
+	ldq	lb|pci.top_label_length	get length of top label
+	tze	0,7		return if no label
+
+	eppsb	lb|pci.top_label_line	sb -> label_line
+	tra	setlabel		set up for top label
+
+
+setlabel:	stq	lb|pci.label_nelem	save length of label
+	sprisb	lb|pci.label_wksp	save pointer to label
+
+	ldqc	lb|pci.pos	save line position
+	stq	lb|pci.sav_pos	..
+
+	ldq	savfunc		get saved function code
+	stq	lb|pci.func	and restore it
+
+	sznc	endline		end of line char encountered?
+	tze	slew_to_line	if not, go do label
+
+" N.B.:	The following code causes the caller to believe that we have not
+"	processed all the input yet.  This prevents him from prematurely
+"	returning before prt_conv_ has emitted the label.
+
+	lcq	1,dl		reverse pointer and length
+	a9bd	bp|0,ql		..
+	asq	inrem		..
+	stcq	lb|pci.sav_pos,70	set flag in saved position
+	tra	slew_to_line	now slew to correct position
+
+" 
+" Overstrike Processor.
+
+strike:	aos	lb|pci.level	bump level up by 1
+	lda	savpos		get saved position
+	sta	lb|pci.pos	and restore it
+	lda	0,dl		slew zero lines
+	tspsb	ab|cv_send_slew_count  ..
+	lda	pci.ignore_next_ff,du
+	ana	lb|pci.flags
+	ersa	lb|pci.flags	next user's FF is for real
+
+	tra	exit1		and exit
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" End of Input Processor.
+
+endin:	szn	overstrike	check for overstrike
+	tnz	strike		..
+
+	szn	labelsw		label processing?
+	tnz	endlabel		if so, handle end of label
+
+	eaa	0,1		get # of spaces remaining on line
+	arl	18		in AL
+	neg	0		subtract from length of line
+	ada	lb|pci.rmarg	..
+	sta	lb|pci.pos	and save current position
+
+	tra	cr1		force a carriage return
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" End of Label Processor.
+
+endlabel:	stz	labelsw		turn off label flag
+	stz	endline	clear end of line char switch
+	stz	lb|pci.label_nelem	zero characters remaining in label
+
+	lda	lb|pci.sav_pos	restore saved line position
+	ana	=o777777,dl	..
+	sta	lb|pci.pos	..
+
+	eppbp	ap|2,*		set bp -> user's data
+	eppbp	bp|0,*		..
+	lca	ap|4,*		and get user's character length
+	sta	inrem		..
+
+	szn	lb|pci.sav_pos	test for retained last character
+	tpl	*+3		if we backed up
+	tsx7	stepin1		step over character previously backed over
+	stc2	endline		and set flag again
+
+	tra	nl0		go back and process newline char
+
+" 
+" Line Overflow Processor.
+
+endout:	szn	overstrike	check for overstrike
+	tnz	strike		..
+
+	szn	labelsw		overflow while processing a label?
+	tnz	endlabel		if so, force end of label
+
+	ldx7	lb|pci.modes	using truncate mode?
+	canx7	pci.truncate,du	..
+	tze	endout1		if not, skip following code
+
+truncl:	tsx7	scan		scan some more input
+	a9bd	bp|0,au		bump input pointer
+	arl	18		and decrement remaining characters
+	asa	inrem		..
+
+	lda	tctally		get tally from TCT
+	arl	27		character type code in AL
+	tra	tdisp,al		dispatch on it
+
+
+tdisp:	tra	truncl		0: normal character
+	tra	endskip		1: backspace
+	tra	endskip		2: horizontal tab
+	tra	nl		3: new line
+	tra	cr		4: carriage return
+	tra	vt		5: vertical tab
+	tra	ff		6: form feed
+	tra	endskip		7: non-printable character
+	tra	endskip		8: ASCII null character
+
+
+endskip:	tsx7	stepin1		step over character
+	tra	truncl		and loop, discarding characters
+
+endout1:	eaa	0,1		count of characters remaining in AU
+	ars	18		either zero or negative
+	neg	0		negate to get indentation on next line
+	ada	lb|pci.lmarg	add left margin
+	sta	lb|pci.pos	and set position for next call
+
+	tra	nl1		force a new line
+
+"
+" Pattern Slew Processor.
+
+slew_to_pattern:
+	tspsb	ab|cv_send_slew_pattern  perform slew to VFU pattern
+	tra	exit		and exit
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" Count Slew Processor.
+
+slew_to_line:
+	sba	lb|pci.line	compute number of lines to slew
+	tpl	*+2		make sure it is positive
+	lda	0,dl		if negative, make it zero
+
+slew_by_count:
+	asa	lb|pci.line	bump current line number
+slew_more:tspsb	ab|cv_send_slew_count  slew desired number of lines
+	sta	lb|pci.slew_residue	save residue
+	lda	pci.ignore_next_ff,du
+	ana	lb|pci.flags
+	ersa	lb|pci.flags
+	tra	exit		and exit
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" End of Line Processor.
+
+exit:	stz	lb|pci.level	set level back to zero
+	szn	lb|pci.slew_residue
+	tpnz	*+2
+	aos	lb|pci.line_count	count one line
+
+	lca	inrem		remaining count of input chars
+	szn	labelsw		processing a label?
+	tnz	exlabel		if so, don't return pointer and length
+
+	spribp	ap|2,*		return new input pointer
+	sta	ap|4,*		and new remaining length
+	tra	exit1		..
+
+exlabel:	spribp	lb|pci.label_wksp	save pointer to label
+	sta	lb|pci.label_nelem	save remaining length of label
+
+exit1:	sarbb	count		save bb temporarily
+	lda	count		get it in A
+	sbla	outoff		subtract original offset
+	arl	16		number of characters transmitted in AL
+	sta	ap|8,*		and return it
+
+	epbpsb	sp|0		restore sb
+	return
+
+" 
+" Miscellaneous Subroutines.
+
+scan:	lca	inrem		get count of input characters remaining
+	tmoz	endin		if zero, input exhausted
+
+	cmpa	131071,dl		use 18-bit arithmetic in many places
+	tmoz	*+2		...
+	lda	131071,dl		... so never scan too many characters
+
+	tct	(pr,rl)		scan the input
+	desc9a	bp|0,al		..
+	arg	tctable		..
+	arg	tctally		..
+
+	lda	tctally		tally in A
+	als	18		place in AU
+
+	tra	0,7		return to caller
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+stepin1:	lda	1,dl		step input pointer by 1
+	a9bd	bp|0,al		..
+	aos	inrem		and decrement -characters remaining
+
+	tra	0,7		return to caller
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+call_send_chars:			" send chars and reset ignore_next_ff
+	tspsb	ab|cv_send_chars	send them
+	sta	save_a_temp
+	lda	pci.ignore_next_ff,du
+	ana	lb|pci.flags
+	ersa	lb|pci.flags	reset the flag
+	lda	save_a_temp
+
+	tra	0,7		return to caller
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+bump_page:ldq	lb|pci.line	get line #
+	adq	lb|pci.phys_page_length  normalize to next page
+	sbq	1,dl		..
+	div	lb|pci.phys_page_length  compute number of pages
+	asq	lb|pci.page_count	and add to page counter
+
+	tra	0,7		return to caller
+
+" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+" Slew Patterns.
+
+	bool	ff_pattern,0	slew pattern for FF
+	bool	toip_pattern,13	slew pattern for top inside page
+	bool	toop_pattern,11	slew pattern for top outside page
+
+" 
+" Character Type Table
+
+tctable:	vfd	9/8,9/7,9/7,9/7,9/7,9/7,9/7,9/7    " 000 - 007
+	vfd	9/1,9/2,9/3,9/5,9/6,9/4,9/7,9/7    " 010 - 017
+	vfd	9/7,9/7,9/7,9/7,9/7,9/7,9/7,9/7    " 020 - 027
+	vfd	9/7,9/7,9/7,9/9,9/7,9/7,9/7,9/7    " 030 - 037
+
+	dup	11			     " 040 - 167
+	vfd	9/0,9/0,9/0,9/0,9/0,9/0,9/0,9/0
+	dupend
+
+	vfd	9/0,9/0,9/0,9/0,9/0,9/0,9/0,9/8    " 170 - 177
+
+	dup	64-16			     " 200 - 777
+	vfd	9/7,9/7,9/7,9/7,9/7,9/7,9/7,9/7
+	dupend
+
+" 
+" Blank Search Table / Non-blank Verify Table
+
+bltable:	dup	4			     " 000 - 037
+	vfd	9/1,9/1,9/1,9/1,9/1,9/1,9/1,9/1
+	dupend
+
+	vfd	9/0,9/1,9/1,9/1,9/1,9/1,9/1,9/1    " 040 - 047
+
+	dup	64-4-1			     " 050 - 777
+	vfd	9/1,9/1,9/1,9/1,9/1,9/1,9/1,9/1
+	dupend
+
+" 
+" Newline Search Table
+
+nltable:	vfd	9/1,9/1,9/1,9/1,9/1,9/1,9/1,9/1    " 000 - 007
+	vfd	9/1,9/1,9/0,9/1,9/1,9/1,9/1,9/1    " 010 - 017
+
+	dup	64-2			     " 020 - 777
+	vfd	9/1,9/1,9/1,9/1,9/1,9/1,9/1,9/1
+	dupend
+
+	end

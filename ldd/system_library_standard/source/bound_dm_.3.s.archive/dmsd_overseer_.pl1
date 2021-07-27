@@ -1,0 +1,982 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+This is the main procedure for the Data Management Daemon.  The Daemon runs
+as a caretaker process for a Data Management system.  The Daemon creates an
+IPC channel to receive requests from user's processes to perform various
+functions on behalf of the users.  The Daemon handles abandoned transactions
+and system recovery.  The Daemon initializes and controls the Data Management
+system and schedules DM system shutdowns.  The Daemon requests the Answering
+Service to send it notifications of process terminations over the Daemon's
+request channel and the Daemon maintains an idle timer that also sends a
+wakeup over the Daemon's request channel to periodically adjust the
+transaction table.
+
+This program has two entry points.
+1. dmsd_overseer_ is the main entry point and is called by
+   initialize_process_ when the daemon is to function in its normal capacity
+   as a process overseer.  This entry never returns, QUITS are not allowed,
+   Multics command level can not be reached, and the Daemon sits in a
+   limited subsystem that only allows the commands new_proc and shutdown.
+
+2. dmsd_overseer_$test is the command entry point used when a user wants
+   to set up a test DM system with the user's current process as its Daemon.
+   The limited subsystem listener of this entry points allows (..) escapes
+   to Multics command level and the quit command.  QUITS are allowed and the
+   command cleans up after itself when exited or released.
+
+Since there are several steps that must be taken to set up a process
+as a Daemon, and since the process may be interrupted at any point when the
+Daemon is invoked as a command, the Daemon uses a system_state structure of
+flags to record just how far the process has gone so that the FINISH routine
+can know just what needs to be undane at clean up time.
+*/
+
+/* HISTORY:
+Written by R. Michael Tague, 11/23/84.
+Modified:
+12/06/84 by R. Michael Tague: Changed dmsd_util_$* to dm_daemon_util_$* and
+            call to dm_daemon_util_$unset_shutdown_timers.
+12/09/84 by Lindsey Spratt: Changed to call dm_daemon_util_$log correctly.
+            This subr requires that its first argument be a severity.
+12/12/84 by R. Michael Tague: Fixed up in response to auditing comments.
+12/13/84 by R. Michael Tague: Added SCHEDULE_SHUTDOWN ().
+12/13/84 by R. Michael Tague: Changed name of dm_system_init_info.incl.pl1.
+01/08/85 by Steve Herbst: Eliminated log initialization, values to be set
+	  via dm_system_data_template_; fixed ring bracket in "Initializing
+	  Data Management" message.
+03/06/85 by Lee A. Newcomb:  Fixed the testing entry to reset the system
+            directory to what it was when dmsd_overseer_ was invoked, not the
+            constant >site>dm.  Removed unused variables and includes.
+03/07/85 by Lee A. Newcomb:  Fixed so previous_system_dir is automatic, not
+            internal static as I mistakenly made it in previous change.
+03/07/85 by R. Michael Tague:  Fixed the ERROR_RETURN procedure to correctly
+	  call com_err_ and sub_err_.
+03/19/85 by R. Michael Tague:  Changed ssu name for process overseer to 
+	  DM_Daemon_overseer instead of Daemon_no_prompt.
+03/28/85 by Steve Herbst: Changed in response to audit, fixed calling
+	  sequence of dm_daemon_util_$log.
+04/02/85 by Lee A. Newcomb:  Fixed to set dm_daemon_util_$logout as the cl
+            intermediary, the old practice of new_proc'ing led to new_proc
+            looping.
+04/09/85 by Lee A. Newcomb:  To use convert_access_class_ and not the obsolete
+            convert_authorization_.
+*/
+/* format: style5,^indcomtxt */
+%page;
+dmsd_overseer_:
+        proc (p_pit_pointer, p_call_listener_upon_return,
+	  p_listener_command_line);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+        dcl     p_pit_pointer		ptr;
+        dcl     p_call_listener_upon_return
+				bit (1) aligned;
+        dcl     p_listener_command_line char (*) varying;
+
+/* Automatic */
+
+        dcl     myname		char (32);
+        dcl     previous_dm_system_dir	char (168) init ("");
+					      /* must be set via a subr call */
+        dcl     request_channel	fixed bin (71) init (0);
+        dcl     saved_ips_mask	bit (36) aligned;
+        dcl     saved_system_shutdown_handler
+				ptr;
+        dcl     ssu_system_ptr	ptr init (null ());
+        dcl     system_dir_pathname	char (168);
+        dcl     1 system_state	unaligned,
+	        2 testing_error_return
+				bit (1) init ("0"b),
+	        2 system_dir_set	bit (1) init ("0"b),
+	        2 shutdown_handler_set
+				bit (1) init ("0"b),
+	        2 dm_initialized	bit (1) init ("0"b);
+
+/* Based */
+/* Builtin */
+
+        dcl     (addr, codeptr, fixed, min, null, size, unspec)
+				builtin;
+
+/* Condition */
+
+        dcl     (cleanup, error, finish)
+				condition;
+
+/* Constant */
+
+        dcl     BITS_PER_WORD		init (36) fixed bin internal
+				static options (constant);
+        dcl     DM_DAEMON_VERSION_1	init ("1") char (1) internal
+				static options (constant);
+        dcl     NOT_TESTING		init ("0"b) bit (1) internal
+				static options (constant);
+        dcl     TESTING		init ("1"b) bit (1) internal
+				static options (constant);
+        dcl     (NO_PAD, NO_NL)	init ("0"b) bit (1) aligned
+				internal static options (constant);
+
+
+/* Entry */
+
+        dcl     com_err_		entry () options (variable);
+        dcl     continue_to_signal_	entry (fixed bin (35));
+        dcl     convert_access_class_$to_string
+				entry (bit (72) aligned, char (*),
+				fixed bin (35));
+        dcl     create_ips_mask_	entry (ptr, fixed bin, bit (36) aligned)
+				;
+        dcl     cu_$arg_list_ptr	entry (ptr);
+        dcl     cu_$arg_ptr		entry (fixed bin, ptr, fixed bin (21),
+				fixed bin (35));
+        dcl     cu_$generate_call	entry (entry, ptr);
+        dcl     cu_$set_cl_intermediary entry (entry);
+        dcl     dmsd_ssu_request_tables_$daemon_requests
+				entry;
+        dcl     dmsd_ssu_request_tables_$test_daemon_requests
+				entry;
+        dcl     dm_daemon_util_$log	entry () options (variable);
+        dcl     dm_daemon_util_$logout	entry ();
+        dcl     dm_daemon_util_$new_proc
+				entry ();
+        dcl     dm_daemon_util_$request entry;
+        dcl     dm_daemon_util_$unset_shutdown_timers
+				entry ();
+        dcl     dm_daemon_util_$get_daemon_info
+				entry (ptr);
+        dcl     dm_daemon_util_$initialize_system
+				entry (ptr);
+        dcl     dm_daemon_util_$schedule_shutdown
+				entry ();
+        dcl     dm_misc_util_$get_system_dir
+				entry (char (*));
+        dcl     dm_misc_util_$is_process_using_dm
+				entry () returns (bit (1) aligned);
+        dcl     dm_misc_util_$set_system_dir
+				entry (char (*));
+        dcl     get_ring_		entry () returns (fixed bin (3));
+        dcl     get_system_free_area_	entry () returns (ptr);
+        dcl     get_authorization_	entry () returns (bit (72) aligned);
+        dcl     hcs_$fs_get_path_name	entry (ptr, char (*), fixed bin,
+				char (*), fixed bin (35));
+        dcl     hcs_$get_ring_brackets	entry (char (*), char (*),
+				(3) fixed bin (3), fixed bin (35));
+        dcl     hcs_$make_ptr		entry (ptr, char (*), char (*), ptr,
+				fixed bin (35));
+        dcl     hcs_$reset_ips_mask	entry (bit (36) aligned,
+				bit (36) aligned);
+        dcl     hcs_$set_ips_mask	entry (bit (36) aligned,
+				bit (36) aligned);
+        dcl     hcs_$wakeup		entry (bit (36) aligned, fixed bin (71),
+				fixed bin (71), fixed bin (35));
+
+        dcl     ioa_		entry options (variable);
+        dcl     ioa_$rsnnl		entry options (variable);
+        dcl     ioa_$general_rs	entry (ptr, fixed bin, fixed bin,
+				char (*), fixed bin (21),
+				bit (1) aligned, bit (1) aligned);
+        dcl     ipc_$create_ev_chn	entry (fixed bin (71), fixed bin (35));
+        dcl     ipc_$decl_ev_call_chn	entry (fixed bin (71), entry, ptr,
+				fixed bin, fixed bin (35));
+        dcl     ipc_$delete_ev_chn	entry (fixed bin (71), fixed bin (35));
+        dcl     message_segment_$add_file
+				entry (char (*), char (*), ptr,
+				fixed bin (18), bit (72) aligned,
+				fixed bin (35));
+        dcl     sct_manager_$get	entry (fixed bin, ptr, fixed bin (35));
+        dcl     sct_manager_$set	entry (fixed bin, ptr, fixed bin (35));
+
+        dcl     ssu_$cpescape_disabled	entry;
+        dcl     ssu_$create_invocation	entry (char (*), char (*), ptr, ptr,
+				char (*), ptr, fixed bin (35));
+        dcl     ssu_$destroy_invocation entry (ptr);
+        dcl     ssu_$listen		entry (ptr, ptr, fixed bin (35));
+        dcl     ssu_$set_prompt_mode	entry (ptr, bit (*));
+        dcl     ssu_$set_procedure	entry (ptr, char (*), entry,
+				fixed bin (35));
+        dcl     sub_err_		entry () options (variable);
+        dcl     system_info_$request_chn
+				entry (bit (36) aligned, fixed bin (71),
+				char (*), char (*));
+        dcl     timer_manager_$alarm_wakeup
+				entry (fixed bin (71), bit (2),
+				fixed bin (71));
+        dcl     timer_manager_$reset_alarm_wakeup
+				entry (fixed bin (71));
+        dcl     transaction_manager_$user_shutdown
+				entry (ptr, ptr, fixed bin (35));
+
+/* External */
+        dcl     dm_request_action_$adjust_process_id
+				fixed bin (17) ext;
+        dcl     error_table_$noarg	fixed bin (35) ext;
+        dcl     error_table_$smallarg	fixed bin (35) ext;
+        dcl     ssu_et_$subsystem_aborted
+				fixed bin (35) ext;
+
+/* Static */
+
+/* END OF DECLARATIONS */
+%page;
+/* ************************************************************************
+   * dmsd_overseer_ - This entry is called by initialize_process_ to act  *
+   * as the process overseer for the Data Management Daemon.  A process   *
+   * overseer is called with three parameters.  The local names and the   *
+   * the functions of these paramenters follow:			    *
+   * p_pit_pointer (input) - A pointer to the pit which is not used by    *
+   *    this overseer.					    *
+   * p_call_listener_upon_return (output) - A flag which if set to "1"b   *
+   *    will cause initialize_process_ to call the listener_ should the   *
+   *    overseer return.  If set to "0"b, a fatal process error will      *
+   *    occur if the overseer returns.  Here this flag is set to "0"b,    *
+   *    this overseer should never return.			    *
+   * p_listener_command_line (output) - The command line that	    *
+   *    initialize_process should pass to the listener if the overseer    *
+   *    returns and p_call_listener_upon_return is set.		    *
+   ************************************************************************ */
+
+        call SET_CL_INTERMEDIARY;
+        myname = "dmsd_overseer_";
+        call SET_ERROR_RETURN (NOT_TESTING);
+
+        call SET_UP_DAEMON ();
+        on finish call FINISH_CONDITION_HANDLER;
+
+        call COMMAND_LISTEN ();
+        call ERROR_RETURN ();
+%page;
+/* *************************************************************************
+   * dmsd_overseer_$test - This entry is a command entry for setting up    *
+   * a Data Management Daemon in a user's process.  This command is used   *
+   * for DM system and DM Daemon testing.  This command expects one	     *
+   * argument which is the pathname of a directory that will become the    *
+   * Data Management System directory.  The user should not be using DM    *
+   * when this command is called.  If the user is using a DM system, he or *
+   * she should use the dm_user_shutdown command first.		     *
+   *     After establishing a DM system, this command enters a limited     *
+   * subsystem enviornment.  This limited subsystem allows (..)  escapes   *
+   * to Multics command level and the quit command.  Type: list_requests   *
+   * while in the subsystem for a list of commands.		     *
+   ************************************************************************ */
+
+test:
+        entry () options (variable);
+        myname = "dmsd_overseer_$test";
+        call SET_ERROR_RETURN (TESTING);
+        call GET_ARGUMENT_PATHNAME (system_dir_pathname);
+        call SET_SYSTEM_DIRECTORY (system_dir_pathname);
+        on cleanup call FINISH ();
+
+        call SET_UP_DAEMON ();
+
+        call TEST_COMMAND_LISTEN ();
+        call RETURN ();
+
+MAIN_RETURN:
+        return;
+%page;
+/* *************************************************************************
+   * COMMAND_LISTEN - This is the ssu_ command listener for the normal     *
+   * Daemon process overseer.  Except for a few standard subsystem	     *
+   * commands, the only commands allowed are new_proc and shutdown.  	     *
+   * Command processor escapes are not allowed and QUIT signals remain     *
+   * masked.						     *
+   ************************************************************************* */
+
+COMMAND_LISTEN:
+        proc ();
+        dcl     cl_code		fixed bin (35);
+        dcl     cl_version_str	char (10);
+
+        call ioa_$rsnnl ("^i", cl_version_str, (0), DM_DAEMON_VERSION_1);
+        call ssu_$create_invocation ("DM_Daemon_overseer", cl_version_str,
+	  null (), codeptr (dmsd_ssu_request_tables_$daemon_requests), "",
+	  ssu_system_ptr, cl_code);
+        if cl_code ^= 0 then
+	      call ERROR_RETURN (cl_code,
+		"^/Cannot create a command listener subsystem.");
+        else
+	      do;
+	      call ssu_$set_prompt_mode (ssu_system_ptr, DONT_PROMPT);
+	      call ssu_$set_procedure (ssu_system_ptr, "cpescape",
+		ssu_$cpescape_disabled, cl_code);
+	      if cl_code ^= 0 then
+		    call ERROR_RETURN (cl_code,
+		        "^/Unable to disable (..) command processor escapes."
+		        );
+	      else
+		    do;
+		    call ssu_$listen (ssu_system_ptr, null (), cl_code);
+		    call ERROR_RETURN (cl_code,
+		        "^/Program Error.  Subsystem listener returned.");
+		    end;
+	      end;
+        end COMMAND_LISTEN;
+%page;
+/* *************************************************************************
+   * DESTROY_REQUEST_CHANNEL - This procedure is called to destroy the     *
+   * Daemon request channel if one exits.  This only happens during FINISH *
+   * for the $test command entry.				     *
+   ************************************************************************* */
+
+DESTROY_REQUEST_CHANNEL:
+        proc ();
+        dcl     drc_code		fixed bin (35);
+        if request_channel ^= 0 then
+	      call ipc_$delete_ev_chn (request_channel, drc_code);
+        end DESTROY_REQUEST_CHANNEL;
+%page;
+/* *************************************************************************
+   * DESTROY_SSU_INVOCATION - This procedure is called during FINISH for   *
+   * the $test command entry to destroy the subsystem command invocation   *
+   * if one exists.						     *
+   ************************************************************************* */
+
+DESTROY_SSU_INVOCATION:
+        proc ();
+
+        if ssu_system_ptr ^= null () then
+	      call ssu_$destroy_invocation (ssu_system_ptr);
+        end DESTROY_SSU_INVOCATION;
+%page;
+/* *************************************************************************
+   * ERROR_RETURN -	This return is called only when when an error has	     *
+   * occured and the Daemon cannot continue.  The procedure operates	     *
+   * differently depending on the value of			     *
+   * system_state.testing_error_return.  If the value is NOT_TESTING, the  *
+   * normal value, then the error is reported via the DM log and sub_err_  *
+   * and then the Daemon calls dm_daemon_util_$logout to logout the	     *
+   * Daemon's process.  If the value is TESTING, then the error is	     *
+   * reported via the DM log and com_err_ since the testing entry point is *
+   * a command and then the Daemon executes FINISH and returns to the      *
+   * user's command level.  The value of system_state.testing_error_return *
+   * is set with a call to SET_ERROR_RETURN.			     *
+   ************************************************************************* */
+
+ERROR_RETURN:
+        proc () options (variable);
+
+        dcl     er_arg_list_ptr	ptr;
+        dcl     er_based_error_code	fixed bin (35) based;
+        dcl     1 er_err_msg_struc,
+	        2 length		fixed bin (21),
+	        2 string		char (1024);
+        dcl     er_err_msg		varying char (1024)
+				based (addr (er_err_msg_struc));
+
+        call cu_$arg_list_ptr (er_arg_list_ptr);
+        if er_arg_list_ptr -> arg_list.arg_count > 0 then
+	      do;
+	      if er_arg_list_ptr -> arg_list.arg_count > 1 then
+		    call ioa_$general_rs (er_arg_list_ptr, 2, 3,
+		        er_err_msg_struc.string, er_err_msg_struc.length,
+		        NO_PAD, NO_NL);
+	      else
+		    er_err_msg = "";
+	      call LOG_MESSAGE (ERROR_SV,
+		er_arg_list_ptr -> arg_list.arg_ptrs (1)
+		-> er_based_error_code, myname, er_err_msg);
+	      end;
+        if system_state.testing_error_return then
+	      do;
+	      call com_err_ (er_arg_list_ptr -> arg_list.arg_ptrs (1)
+		-> er_based_error_code, myname, er_err_msg);
+	      call FINISH;
+	      end;
+        else
+	      do;
+	      call sub_err_ (er_arg_list_ptr -> arg_list.arg_ptrs (1)
+		-> er_based_error_code, myname, ACTION_CANT_RESTART, null,
+		0, er_err_msg);
+	      call dm_daemon_util_$logout;
+	      end;
+        goto MAIN_RETURN;
+        end ERROR_RETURN;
+
+LOG_MESSAGE:
+        proc options (variable);
+        dcl     lm_arg_list_ptr	ptr init (null);
+        call cu_$arg_list_ptr (lm_arg_list_ptr);
+        call cu_$generate_call (dm_daemon_util_$log, lm_arg_list_ptr);
+        end LOG_MESSAGE;
+%page;
+/* *************************************************************************
+   * FINISH - This procedure is called to finish up when the $test command *
+   * exited normally of during an error return.  FINISH is also called as  *
+   * a cleanup handler for the $test command.  FINISH is never called	     *
+   * if we have entered through the normal Daemon overseer entry.	     *
+   * Interrupts are	masked to prevent a QUIT during cleanup.  Anything     *
+   * that was set up during  the execution of the command should be	     *
+   * cleaned up after this by FINISH.  The values of flags in	     *
+   * system_state controls just what needs to be cleaned up.	     *
+   ************************************************************************* */
+
+FINISH:
+        proc ();
+        dcl     f_code		fixed bin (35);
+
+        call MASK_INTERRUPTS ();
+        on error
+	      begin;
+	      call UNMASK_INTERRUPTS ();
+	      call continue_to_signal_ (f_code);
+	      if f_code ^= 0 then
+		    call dm_daemon_util_$log (ERROR_SV, f_code, myname,
+		        "continue_to_signal_ error in FINISH on unit.");
+	      end;
+        call dm_daemon_util_$unset_shutdown_timers ();
+        call DESTROY_SSU_INVOCATION ();
+        call UNSET_IDLE_TIMER ();
+        call RESET_SYSTEM_SHUTDOWN_HANDLER ();
+        call SHUTDOWN_DM_SYSTEM ();
+        call DESTROY_REQUEST_CHANNEL ();
+        call RESET_SYSTEM_DIRECTORY ();
+        call UNMASK_INTERRUPTS ();
+        end FINISH;
+%page;
+/* *************************************************************************
+   * FINISH_CONDITION_HANDLER - This procedure is called from the main     *
+   * Daemon as overseer entry point when a finish condition is signaled.   *
+   * We simply log the fact that the Daemon is logging out and continue    *
+   * the signal.						     *
+   ************************************************************************* */
+
+FINISH_CONDITION_HANDLER:
+        proc ();
+        dcl     fch_code		fixed bin (35);
+
+        call ioa_ ("Data Management System Daemon logout.");
+        call dm_daemon_util_$log (INFORM_SV,
+	  "Data Management System Daemon logout.");
+        call continue_to_signal_ (fch_code);
+        if fch_code ^= 0 then
+	      call ERROR_RETURN (fch_code,
+		"^/Unable to continue to signal finish condition.");
+        end FINISH_CONDITION_HANDLER;
+%page;
+/* *************************************************************************
+   * GET_ARGUMENT_PATHNAME - Called by the $test entry to get the system   *
+   * directory pathname argument that must be supplied to the command.     *
+   ************************************************************************* */
+
+GET_ARGUMENT_PATHNAME:
+        proc (gap_pathname);
+        dcl     gap_pathname		char (168);
+        dcl     gap_arg_ptr		ptr;
+        dcl     gap_arg_length	fixed bin (21);
+        dcl     gap_argument		char (gap_arg_length)
+				based (gap_arg_ptr);
+        dcl     gap_code		fixed bin (35);
+
+        call cu_$arg_ptr (1, gap_arg_ptr, gap_arg_length, gap_code);
+        if gap_code ^= 0 then
+	      call ERROR_RETURN (error_table_$noarg, "^/Syntax: ^a pathname",
+		myname);
+        else
+	      gap_pathname = gap_argument;
+        end GET_ARGUMENT_PATHNAME;
+%page;
+/* *************************************************************************
+   * IDLE_TIME_IN_SECONDS - This function returns the the value of the DM  *
+   * system parameter that specifies the amount of time between idle	     *
+   * timeouts for the Daemon.  The time is converted from minutes to	     *
+   * seconds and returned.					     *
+   ************************************************************************* */
+
+IDLE_TIME_IN_SECONDS:
+        proc () returns (fixed bin);
+        dcl     1 itis_daemon_info	aligned like dm_daemon_info;
+
+        itis_daemon_info.version = DM_DAEMON_INFO_VERSION_1;
+        call dm_daemon_util_$get_daemon_info (addr (itis_daemon_info));
+        return (60 * itis_daemon_info.wakeup_increment);
+        end IDLE_TIME_IN_SECONDS;
+%page;
+/* *************************************************************************
+   * INITIALIZE_DM_SYSTEM - This procedure is called to initialize the DM  *
+   * system.  After this call, the Data Management system is live.	     *
+   * system_state.dm_initialized is set in this procedure.                 *
+   ************************************************************************* */
+
+INITIALIZE_DM_SYSTEM:
+        proc ();
+        dcl     1 ids_init_info	aligned like dm_system_init_info;
+
+        ids_init_info.version = DM_SYSTEM_INIT_INFO_VERSION_1;
+        ids_init_info.event_channel = request_channel;
+        system_state.dm_initialized = "1"b;
+        call dm_daemon_util_$initialize_system (addr (ids_init_info));
+        end INITIALIZE_DM_SYSTEM;
+%page;
+/* *************************************************************************
+   * LOG_DM_INITIALIZED - This procedure logs the fact that the DM system  *
+   * has been initialized on the output channel and the DM system log.     *
+   ************************************************************************* */
+
+LOG_DM_INITIALIZED:
+        proc ();
+
+        call ioa_ ("Data Management System initialized.");
+        call dm_daemon_util_$log (INFORM_SV,
+	  "Data Management System initialized.");
+        end LOG_DM_INITIALIZED;
+%page;
+/* *************************************************************************
+   * LOG_DM_INITIALIZING - This procedure logs on the Daemon console log   *
+   * that the Data Management system is about to be created.  We also      *
+   * display what ring is the DM ring and the AIM classification.  We get  *
+   * the ring number by getting a pointer to dm_daemon_gate_, converting   *
+   * this pointer to a pathname, and then getting the write ring bracket   *
+   * of dm_dameon_gate_.  The AIM classification string is displayed up to *
+   * the first 100 characters.  Ellipsis is used to denote a longer	     *
+   * classification string.					     *
+   ************************************************************************* */
+
+LOG_DM_INITIALIZING:
+        proc ();
+
+        dcl     ldi_classification_string
+				char (100);
+        dcl     ldi_code		fixed bin (35);
+        dcl     ldi_daemon_gate_dir	char (168);
+        dcl     ldi_daemon_gate_ptr	ptr;
+        dcl     ldi_daemon_gate_seg	char (32);
+        dcl     ldi_ring_brackets	(3) fixed bin (3);
+
+        call hcs_$make_ptr (codeptr (dmsd_overseer_), "dm_daemon_gate_", "",
+	  ldi_daemon_gate_ptr, ldi_code);
+        if ldi_code ^= 0 then
+	      call ERROR_RETURN (ldi_code,
+		"^/Cannot get a pointer to dm_daemon_gate_.");
+        call hcs_$fs_get_path_name (ldi_daemon_gate_ptr, ldi_daemon_gate_dir,
+	  (0), ldi_daemon_gate_seg, ldi_code);
+        if ldi_code ^= 0 then
+	      call ERROR_RETURN (ldi_code,
+		"^/Cannot get the pathname for dm_daemon_gate_.");
+        call hcs_$get_ring_brackets (ldi_daemon_gate_dir, ldi_daemon_gate_seg,
+	  ldi_ring_brackets, ldi_code);
+        if ldi_code ^= 0 then
+	      call ERROR_RETURN (ldi_code,
+		"^/Cannot get the ring brackets of dm_daemon_gate_.");
+        call convert_access_class_$to_string (get_authorization_ (),
+	  ldi_classification_string, ldi_code);
+        if ldi_code = error_table_$smallarg then
+	      call ioa_ (
+		"Initializing Data Management in ring ^i at^/^a . . .",
+		min (ldi_ring_brackets (2), get_ring_ ()),
+		ldi_classification_string);
+        else if ldi_code = 0 then
+	      call ioa_ (
+		"Initializing Data Management in ring ^i^[^; at ^a^].",
+		min (ldi_ring_brackets (2), get_ring_ ()),
+		(ldi_classification_string = ""), ldi_classification_string)
+		;
+        else
+	      call ERROR_RETURN (ldi_code,
+		"^/Unable to get AIM classificaton.");
+        end LOG_DM_INITIALIZING;
+%page;
+/* *************************************************************************
+   * MAKE_REQUEST_CHANNEL_RECEIVER - This procedure creates an event call  *
+   * channel so that DM users may make requests of the Daemon.  This	     *
+   * channel is also used to receive idle timout wakeups and notifications *
+   * of process terminations, both in the form of requests.		     *
+   ************************************************************************* */
+
+MAKE_REQUEST_CHANNEL_RECEIVER:
+        proc ();
+        dcl     mrcr_code		fixed bin (35);
+
+        call ipc_$create_ev_chn (request_channel, mrcr_code);
+        if mrcr_code ^= 0 then
+	      call ERROR_RETURN (mrcr_code,
+		"^/Cannot create request channel.");
+        else
+	      do;
+	      call ipc_$decl_ev_call_chn (request_channel,
+		dm_daemon_util_$request, null (), 0, mrcr_code);
+	      if mrcr_code ^= 0 then
+		    call ERROR_RETURN (mrcr_code,
+		        "^/Cannot create request call channel.");
+	      end;
+        end MAKE_REQUEST_CHANNEL_RECEIVER;
+%page;
+/* *************************************************************************
+   * MASK_INTERRUPTS - This routines masks all IPS interrupts and saves    *
+   * the previous IPS mask in saved_ips_mask.			     *
+   ************************************************************************* */
+
+MASK_INTERRUPTS:
+        proc ();
+        dcl     mi_mask_names		(1) char (32);
+        dcl     mi_mask		bit (36) aligned;
+
+        mi_mask_names (1) = "-all";
+        call create_ips_mask_ (addr (mi_mask_names), 1, mi_mask);
+        call hcs_$set_ips_mask (mi_mask, saved_ips_mask);
+        end MASK_INTERRUPTS;
+%page;
+/* *************************************************************************
+   * REGISTER_FOR_PROC_TERM_NOTIFY - This procedure sends a message to the *
+   * Answering Service over its request channel requesting that this	     *
+   * process be registered to receive notifications upon the termination   *
+   * of any process.  This is used so that the Daemon can abort any	     *
+   * transaction that that process may have held when the process was      *
+   * terminated.  The notifications from the Answering Service are sent as *
+   * requests on the DM Daemon's request channel.			     *
+   ************************************************************************* */
+
+REGISTER_FOR_PROC_TERM_NOTIFY:
+        proc ();
+        dcl     mptr_code		fixed bin (35);
+        dcl     1 mptr_proc_term_info	aligned like asr_buzzard_info;
+        dcl     mptr_as_request_channel fixed bin (71);
+        dcl     mptr_as_request_dir	char (168);
+        dcl     1 mptr_as_request_message
+				aligned
+				like dm_adjust_process_id_word_1;
+        dcl     mptr_as_request_proc	bit (36) aligned;
+        dcl     mptr_as_request_seg	char (32);
+        dcl     mptr_as_request_uid	bit (72) aligned;
+
+
+        mptr_proc_term_info.header.version = as_request_version_1;
+        mptr_proc_term_info.header.type = ASR_PROC_TERM_NOTIFY;
+        mptr_proc_term_info.header.reply_channel = 0;
+        mptr_proc_term_info.version = asr_buzzard_info_version_1;
+        mptr_proc_term_info.info_channel = request_channel;
+        mptr_as_request_message.action_type =
+	  dm_request_action_$adjust_process_id;
+        mptr_as_request_message.pad = 0;
+        mptr_proc_term_info.my_reference_id = unspec (mptr_as_request_message);
+        call system_info_$request_chn (mptr_as_request_proc,
+	  mptr_as_request_channel, mptr_as_request_dir, mptr_as_request_seg);
+        call message_segment_$add_file (mptr_as_request_dir,
+	  mptr_as_request_seg, addr (mptr_proc_term_info),
+	  BITS_PER_WORD * size (mptr_proc_term_info), mptr_as_request_uid,
+	  mptr_code);
+        if mptr_code ^= 0 then
+	      call dm_daemon_util_$log (ERROR_SV, mptr_code, myname,
+		"^/Cannot add to Answering Servce request message segment.^/Cannot receive process termination notifications."
+		);
+        else
+	      do;
+	      call hcs_$wakeup (mptr_as_request_proc, mptr_as_request_channel,
+		fixed (mptr_as_request_uid), mptr_code);
+	      if mptr_code ^= 0 then
+		    call dm_daemon_util_$log (ERROR_SV, mptr_code, myname,
+		        "^/Cannot send IPC wakeup to Answering Service.^/Cannot receive process termination notifications."
+		        );
+	      end;
+        end REGISTER_FOR_PROC_TERM_NOTIFY;
+%page;
+/* *************************************************************************
+   * RESET_SYSTEM_DIRECTORY - This procedure sets the DM system directory  *
+   * to its default value.  If system_state.system_dir_set is true and     *
+   * system_state.dm_initialized is false.  The system directory can only  *
+   * be set if the DM system has been shutdown.  This procedure is called  *
+   * during FINISH for the $test command.  The system directory is not     *
+   * reset to its original value since it was not possible to get the	     *
+   * previous value of the system directoy without risking an error.	     *
+   *							     *
+   * system_state.system_dir_set is reset in this procedure.	     *
+   ************************************************************************* */
+
+RESET_SYSTEM_DIRECTORY:
+        proc ();
+        if system_state.system_dir_set & ^system_state.dm_initialized then
+	      do;
+	      call dm_misc_util_$set_system_dir (previous_dm_system_dir);
+	      system_state.system_dir_set = "0"b;
+	      end;
+        end RESET_SYSTEM_DIRECTORY;
+%page;
+/* *************************************************************************
+   * RETURN - This is the normal return procedure for the $test command.   *
+   * The Daemon as an overseer does not have a valid return, it should     *
+   * never return.  A non-local goto MAIN_RETURN is performed to unwind    *
+   * the stack.						     *
+   ************************************************************************* */
+
+RETURN:
+        proc ();
+
+        call FINISH ();
+        goto MAIN_RETURN;
+        end RETURN;
+%page;
+/* *************************************************************************
+   * SCHEDULE_SHUTDOWN - This routine is called after the DM system has    *
+   * been initialized.  It causes a DM system shutdown to be scheduled.    *
+   ************************************************************************* */
+
+SCHEDULE_SHUTDOWN:
+        proc ();
+
+        call dm_daemon_util_$schedule_shutdown ();
+        end SCHEDULE_SHUTDOWN;
+%page;
+/* *************************************************************************
+   * SET_CL_INTERMEDIARY - This procedure sets the system cl_intermediary  *
+   * which is the default error handler called after printing the error    *
+   * information.  This entry is used from the Daemon an overseer entry    *
+   * point.  It is the setting of this procedure that prevents the	     *
+   * Daemon's process from ever reaching Multics command level.  We handle *
+   * this error by causing the Daemon to new_proc.		     *
+   ************************************************************************* */
+
+SET_CL_INTERMEDIARY:
+        proc ();
+
+        call cu_$set_cl_intermediary (dm_daemon_util_$logout);
+        end SET_CL_INTERMEDIARY;
+%page;
+/* *************************************************************************
+   * SET_ERROR_RETURN - This procedure sets the			     *
+   * system_state.testing_error_return flag which controls what	     *
+   * ERROR_RETURN does if it should be called.  The constants TESTING and  *
+   * NOT_TESTING should be used when making the call to this routine.	     *
+   ************************************************************************* */
+
+SET_ERROR_RETURN:
+        proc (ser_testing);
+        dcl     ser_testing		bit (1);
+        system_state.testing_error_return = ser_testing;
+        end SET_ERROR_RETURN;
+%page;
+/* *************************************************************************
+   * SET_IDLE_TIMER - This procedure is called to set a timeout wakeup to  *
+   * go off sit_time_interval_seconds in the future.  This time interval   *
+   * is set by the caller to the DM system parameter idle time.  When the  *
+   * timer goes off it will send an alarm wakeup over the Daemon's request *
+   * channel.						     *
+   ************************************************************************* */
+
+SET_IDLE_TIMER:
+        proc (sit_time_interval_seconds);
+        dcl     sit_time_interval_seconds
+				fixed bin (71);
+        dcl     SIT_RELATIVE_SECONDS_REQUEST
+				bit (2) init ("11"b);
+
+        call timer_manager_$alarm_wakeup (sit_time_interval_seconds,
+	  SIT_RELATIVE_SECONDS_REQUEST, request_channel);
+        end SET_IDLE_TIMER;
+%page;
+/* *************************************************************************
+   * SET_SYSTEM_DIRECTORY - The procedure is called to set the DM system   *
+   * directory to a specified pathname. We check to see if the user is     *
+   * currently using a Data Management system before trying to set the     *
+   * system directory.  dm_misc_util_$set_system_dir will not set the	     *
+   * system directory if the process is currenty using DM.  This is only   *
+   * called from the $test command entry point.			     *
+   *							     *
+   * The system_state.system_dir_set flag is set in this procedure.	     *
+   ************************************************************************* */
+
+SET_SYSTEM_DIRECTORY:
+        proc (ssd_pathname);
+        dcl     ssd_pathname		char (168);
+
+        if dm_misc_util_$is_process_using_dm () then
+	      call ERROR_RETURN (0,
+		"^/User must execute dm_user_shutdown before trying to^/create another DM system."
+		);
+        else
+	      do;
+	      call dm_misc_util_$get_system_dir (previous_dm_system_dir);
+	      system_state.system_dir_set = "1"b;
+	      call dm_misc_util_$set_system_dir (ssd_pathname);
+	      end;
+        end SET_SYSTEM_DIRECTORY;
+%page;
+/* *************************************************************************
+   * SET_SYSTEM_SHUTDOWN_HANDLER - This procedure saves the current	     *
+   * system_shutdown_scheduled_ IPS signal handler in the global variable  *
+   * saved_system_shutdown_handler and then changes the current handler to *
+   * be the handler appropriate for the DM daemon.  The DM Daemon handler  *
+   * will reschedule DM shutdown whenever it receives a		     *
+   * system_shutdown_scheduled_ IPS from the Answering Service.	     *
+   * The system_state.shutdown_handler_set flag is set here.	     *
+   ************************************************************************* */
+
+SET_SYSTEM_SHUTDOWN_HANDLER:
+        proc ();
+        dcl     sssh_code		fixed bin (35);
+
+        call sct_manager_$get (system_shutdown_scheduled_sct_index,
+	  saved_system_shutdown_handler, sssh_code);
+        if sssh_code ^= 0 then
+	      call ERROR_RETURN (sssh_code,
+		"^/Cannot get the current system_shutdown_scheduled_ handler."
+		);
+        else
+	      do;
+	      system_state.shutdown_handler_set = "1"b;
+	      call sct_manager_$set (system_shutdown_scheduled_sct_index,
+		codeptr (dm_daemon_util_$schedule_shutdown), sssh_code);
+	      if sssh_code ^= 0 then
+		    call ERROR_RETURN (sssh_code,
+		        "^/Cannot set the system_shutdown_scheduled_ handler."
+		        );
+	      end;
+        end SET_SYSTEM_SHUTDOWN_HANDLER;
+%page;
+/* *************************************************************************
+   * SET_UP_DAEMON - This procedure does all that is necessary to set up   *
+   * as a Data Management system and Daemon.			     *
+   ************************************************************************* */
+
+SET_UP_DAEMON:
+        proc ();
+
+        call LOG_DM_INITIALIZING ();
+        call MAKE_REQUEST_CHANNEL_RECEIVER ();
+        call INITIALIZE_DM_SYSTEM ();
+        call SET_SYSTEM_SHUTDOWN_HANDLER ();
+        call SCHEDULE_SHUTDOWN ();
+        call REGISTER_FOR_PROC_TERM_NOTIFY ();
+        call SET_IDLE_TIMER (IDLE_TIME_IN_SECONDS ());
+        call LOG_DM_INITIALIZED ();
+        end SET_UP_DAEMON;
+%page;
+/* *************************************************************************
+   * SHUTDOWN_DM_SYSTEM - This procedure is called by FINISH to close down *
+   * the DM system if there is one.  This only happens in the $test	     *
+   * command entry.  This procedure must get and free an area because the  *
+   * transaction_manager_$user_shutdown procedure needs an area pointer to *
+   * allocate a structure in that we do not use.  If the		     *
+   * system_state.dm_initialized flag is set, then shutdown is performed   *
+   * and the flag is reset.					     *
+   ************************************************************************* */
+
+SHUTDOWN_DM_SYSTEM:
+        proc ();
+        dcl     1 sds_shutdown_info	aligned like tm_shutdown_info
+				based (tm_shutdown_info_ptr);
+        dcl     sds_code		fixed bin (35);
+
+        if system_state.dm_initialized then
+	      do;
+	      call transaction_manager_$user_shutdown (
+		get_system_free_area_ (), tm_shutdown_info_ptr, sds_code);
+	      if sds_code ^= 0 then
+		    call com_err_ (sds_code, myname,
+		        "^/Cannot shutdown test DM system.");
+	      else
+		    do;
+		    free sds_shutdown_info;
+		    system_state.dm_initialized = "0"b;
+		    end;
+	      end;
+        end SHUTDOWN_DM_SYSTEM;
+%page;
+/* *************************************************************************
+   * TEST_COMMAND_LISTEN - This is the ssu_ listener for the Daemon when   *
+   * invoked as a test command through the $test entry.  This command      *
+   * listener differers from the Daemon as overseer command listener in    *
+   * that it allow (..) escapes to Multics command level, and has a quit   *
+   * command.  QUITS are allowed because they are allowed anytime during   *
+   * the execution of the $test command entry.  The error code	     *
+   * ssu_et_$subsystem_aborted is the normal error code return from	     *
+   * ssu_$listen when a quit command has been typed.  The subsystem	     *
+   * invocation has to be destroyed in the FINISH procedure.	     *
+   ************************************************************************* */
+
+TEST_COMMAND_LISTEN:
+        proc ();
+        dcl     tcl_code		fixed bin (35);
+        dcl     tcl_version_str	char (10);
+
+        call ioa_$rsnnl ("^i", tcl_version_str, (0), DM_DAEMON_VERSION_1);
+        call ssu_$create_invocation ("DM_Daemon", tcl_version_str, null (),
+	  codeptr (dmsd_ssu_request_tables_$test_daemon_requests), "",
+	  ssu_system_ptr, tcl_code);
+        if tcl_code ^= 0 then
+	      call ERROR_RETURN (tcl_code,
+		"^/Cannot create a command listener subsystem.");
+        else
+	      do;
+	      call ssu_$listen (ssu_system_ptr, null (), tcl_code);
+	      if tcl_code ^= ssu_et_$subsystem_aborted then
+		    call ERROR_RETURN (tcl_code,
+		        "^/Subsystem listener returned with error.");
+	      end;
+        end TEST_COMMAND_LISTEN;
+%page;
+/* *************************************************************************
+   * UNMASK_INTERRUPTS - This procedure restores the IPS mask to its saved *
+   * value.						     *
+   ************************************************************************* */
+
+UNMASK_INTERRUPTS:
+        proc ();
+
+        call hcs_$reset_ips_mask (saved_ips_mask, (""b));
+        end UNMASK_INTERRUPTS;
+%page;
+/* *************************************************************************
+   * UNSET_IDLE_TIMER - Eliminates any idle timout that may be pending.    *
+   ************************************************************************* */
+
+UNSET_IDLE_TIMER:
+        proc ();
+
+        if request_channel ^= 0 then
+	      call timer_manager_$reset_alarm_wakeup (request_channel);
+        end UNSET_IDLE_TIMER;
+%page;
+/* *************************************************************************
+   * RESET_SYSTEM_SHUTDOWN_HANDLER  If system_state.shutdown_handler_set   *
+   * indicated that the system_shutdown_scheduled_ IPS handler was set,    *
+   * this procedure resets it to its previous value and resets the	     *
+   * system_state flag.					     *
+   ************************************************************************* */
+
+RESET_SYSTEM_SHUTDOWN_HANDLER:
+        proc ();
+        dcl     ussh_code		fixed bin (35);
+
+        if system_state.shutdown_handler_set then
+	      do;
+	      call sct_manager_$set (system_shutdown_scheduled_sct_index,
+		saved_system_shutdown_handler, ussh_code);
+	      if ussh_code ^= 0 then
+		    call com_err_ (ussh_code, myname,
+		        "^/Cannot reset the system_shutdown_shceduled_ IPS handler."
+		        );
+	      else
+		    system_state.shutdown_handler_set = "0"b;
+	      end;
+        end RESET_SYSTEM_SHUTDOWN_HANDLER;
+%page;
+%include arg_list;
+%page;
+%include as_request_header;
+%page;
+%include as_requests;
+%page;
+%include dm_log_sv_codes;
+%page;
+%include dm_request_message;
+%page;
+%include dm_system_init_info;
+%page;
+%include dm_tm_shutdown_info;
+%page;
+%include dm_daemon_info;
+%page;
+%include ssu_prompt_modes;
+%page;
+%include static_handlers;
+%page;
+%include sub_err_flags;
+
+        end dmsd_overseer_;

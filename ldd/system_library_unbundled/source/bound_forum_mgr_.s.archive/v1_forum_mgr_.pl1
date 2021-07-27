@@ -1,0 +1,1700 @@
+/* ***************************************************************
+   *                                                             *
+   * Copyright (c) 1982 by Massachusetts Institute of Technology *
+   *                                                             *
+   *************************************************************** */
+
+
+
+/* This module is part of the forum inner ring side.  It maintains the correspondence between forum pathnames
+   (from the user ring), forum indexes (for the user ring) and pointers to the forum segments which are used only
+   in the inner ring.  It also implements locking the forums.
+
+   Original Coding 14 June 1981 by J. Spencer Love
+   Modified 01/12/82 Jay Pattin to add get_forum_path and change_chairman
+   Modified 01/16/82 Jay Pattin to add list_users (was in trans_mgr_)
+   renamed v1_forum_mgr_ with associated editing 01/21/82 Jay Pattin
+   Modified 02/16/82 Jay Pattin added listening and set_event_channel
+   Modified 03/29/82 Jay Pattin added priv_change_chairman
+   Modified 05/05/82 Jay Pattin added read only support
+   Modified 05/21/82 Jay Pattin added eligibility hacking
+   Modified 06/23/82 Jay Pattin garbage collection
+   Modified 06/23/82 Jay Pattin check for anonymous users
+   Modified 9/25/82 Jay Pattin add adjourned switch, AIM support */
+%page;
+/* THIS IS DOCUMENTATION FOR THE INTERNAL INNER RING INTERFACES
+
+They are to be called by other ring 3 procedures only.  The caller needn't change the validation level,
+since all necessary validation level changes for initiating and terminating forum segments and determining
+access are performed by these entrypoints.
+
+Name:  v1_forum_mgr_$get_ptrs
+
+Most inner ring forum interfaces should use a forum index to identify the forum.  The correspondence
+between these identifiers and useful pointers is mapped by this entrypoint.  Pass the index by
+reference; no need to copy, and get back the information you need to do your work.  The forum is also locked by
+this entrypoint.  To unlock the forum, call v1_forum_mgr_$unlock.  You should have a cleanup handler to do
+this in case of random lossage, and also check all exit points in your program, because it is very important that
+the forum never be left locked when control is returned to the user ring.  You should also never return
+pointers to the forum to the user ring, or other information like other processes' event channels or
+process_ids.  Please also DO NOT TERMINATE THE POINTERS RETURNED BY THIS INTERFACE.
+
+
+Name: v1_forum_mgr_$unlock
+
+The following entrypoint is for cleaning up after v1_forum_mgr_$get_ptrs.  The following sequence or an
+equivalent should be used in all code that accepts forum indexes as input:
+
+forum_control_ptr = null ();
+on cleanup call v1_forum_mgr_$unlock (forum_control_ptr);
+call v1_forum_mgr_$get_ptrs (P_forum_idx, forum_control_ptr,
+     proceedings_ptr, attendee_idx, status);
+if status ^= 0 then do;
+     P_status = status;
+     return;
+end;
+
+It accepts a null pointer.  It traps faults.  There is no error code because nothing can go wrong that doesn't
+kill your process, and that would be due to random damage in the environment, not this module.
+
+Name:  v1_forum_mgr_$initiate
+
+There is also an interface for dealing with forums that are not already open.  It optionally locks the forum.
+Otherwise it performs essentially all the checks that forum_$open provides.  However, it can return with
+a zero code and proceedings pointer = null.  In this case, the user has sufficient access to find out the name of
+the chairman and the names of the participants.  Absolutely no information whatsoever should be returned about the
+transactions.  Entrypoints that return no or partial information in this case should return
+forum_error_table_$not_eligible after calling v1_forum_mgr_$terminate.  This interface is intended to be called
+with a user ring validation level.  It can be called at the forum ring validation level, but the caller
+probably shouldn't have its privileges enabled.  It is also intended that you pass the character string
+arguments from the user ring by reference without copying so that truncation can be detected.
+
+
+Name:  v1_forum_mgr_$terminate
+
+The following is for cleaning up after v1_forum_mgr_$initiate.  It unlocks the forum if it is locked.  It
+traps faults.  It eats null pointers.  It hacks its own validation level.  In nulls its arguments.  There is no
+error code because nothing can go wrong that doesn't kill your process, and that is an act of God and the
+initializer, not this module. */
+%page;
+v1_forum_mgr_$open_forum:
+     procedure (P_forum_dir, P_forum_entry, P_forum_idx, P_status);
+
+declare	P_forum_dir		char (*) parameter,
+	P_forum_entry		char (*) parameter,
+	P_forum_idx		fixed bin parameter,
+	P_lock_switch		bit (1) aligned parameter,
+	P_forum_control_ptr		ptr parameter,
+	P_proceedings_ptr		ptr parameter,
+	P_attendee_idx		fixed bin parameter,
+	P_user_name		char (*) parameter,
+	P_switch_name		char (*) parameter,
+	P_switch_setting		bit (1) aligned parameter,
+	P_event_channel		fixed bin (71) parameter,
+	P_access_name		char (*) parameter,
+	P_access_time		fixed bin (71) parameter,
+	P_forum_info_ptr		ptr parameter,
+	P_area_ptr		ptr parameter,
+	P_user_list_ptr		ptr parameter,
+	P_last_seen_trans_idx	fixed bin parameter,
+	P_force_switch		bit (1) aligned parameter,
+	P_chairman		char (*) parameter,
+	P_write_allowed		bit (1) aligned parameter,
+	P_status			fixed bin (35) parameter;
+
+declare	(addr, after, before, clock, hbound, index, length, max, maxlength, min, null, rtrim, substr, unspec)
+				builtin;
+
+declare	(any_other, area, cleanup, no_read_permission, no_write_permission, seg_fault_error)
+				condition;
+
+declare	attendee_idx		fixed bin,	/* The users slot in the array forum_control.attendee	*/
+	caller_validation		fixed bin (3),	/* The validation level to exit with.  Set by initialize.	*/
+	dirname_buffer		char (168),	/* The REAL directory containing the forum		*/
+	dirname_len		fixed bin,	/* The length returned by hcs_$fs_get_path_name		*/
+	egress			label variable,	/* BAIL OUT AT 30,000 FEET.  Set by initialize.		*/
+	force_switch		bit (1) aligned,	/* To max or not to max, for set_last_seen_trans_idx	*/
+	last_seen_trans_idx		fixed bin,	/* copy of P_last_seen_trans_idx		          */
+	forum_control_entry		char (32),	/* The REAL entryname of the control segment.		*/
+	forum_name_len		fixed bin,	/* The length of the forum name without a suffix	*/
+	forum_data_ptr		ptr,		/* If this ptr is nonnull the forum is open		*/
+	forum_dir			char (168),	/* The copied directory input parameter			*/
+	no_w_access		bit (1) aligned,
+	privileged		bit (1) aligned,
+	switch_name		char (32),
+	switch_setting		bit (1) aligned,
+	write_allowed		bit (1) aligned,
+	status			fixed bin (35);	/* What went wrong */
+
+declare	1 segment_acl		aligned,
+	2 access_name		char (32),
+	2 modes			bit (36),
+	2 xmodes			bit (36),
+	2 status			fixed bin (35);
+
+declare	1 delete_acl		aligned,
+	2 access_name		char (32),
+	2 status			fixed bin (35);
+
+/* The following is used by get_forum_info to accumulate data.  Automatic storage is safe and secure.		*/
+
+declare	1 fmi			aligned like forum_info;
+
+/* The following is used by find_forum_data and maintained by open_forum and close_forum to find openings.	*/
+
+declare	first_forum_data_ptr	ptr static initial (null ());
+
+/* The following are global static constants set by initialize the first time we are called.			*/
+
+declare	static_initialized		bit (1) aligned static initial ("0"b),
+	anon_switch		bit (1) aligned static initial ("0"b),
+	my_authorization		bit (72) aligned static initial ("0"b),
+          full_authorization		bit (72) aligned static initial ("0"b),
+	my_process_id		bit (36) aligned static initial (""b),
+	my_lock_id		bit (36) aligned static initial (""b),
+	my_validation		fixed bin (3) static initial (5),
+	project			char (9) static initial (""),
+	user_name			char (22) static initial ("");
+
+declare	directory			char (dirname_len) based (addr (dirname_buffer)),
+	system_area		area based (get_system_free_area_ ()),
+	P_area			area based (P_area_ptr);
+
+declare   1 aim_bits aligned like aim_template based (addr (full_authorization));
+
+declare	1 forum_data		aligned based (forum_data_ptr),
+	  2 next_ptr		ptr,		/* Thread.  Used for searching.			*/
+	  2 prev_ptr		ptr,		/* Thread.  Used for unthreading.			*/
+	  2 name			char (24) unaligned,/* For debugging only.  Unsuffixed forum name.		*/
+	  2 forum_control_ptr	ptr,		/* The control segment				*/
+	  2 proceedings_ptr		ptr,		/* The proceedings segment				*/
+	  2 forum_control_uid	bit (36),		/* The UID of the control segment.  For comparison.	*/
+	  2 forum_idx		fixed bin,	/* The index of this opening.  For lookup.		*/
+	  2 attendee_idx		fixed bin,	/* The slot in the attendee array.  For efficiency	*/
+	  2 opening_count		fixed bin;	/* Don't initiate more than once.  See UID.		*/
+
+declare	(forum_error_table_$cant_stop_msg_admin,
+	forum_error_table_$cant_stop_msg_site,
+	forum_error_table_$chairman_only,
+	forum_error_table_$invalid_forum_idx,
+	forum_error_table_$invalid_switch_name,
+	forum_error_table_$invalid_trans_idx,
+	forum_error_table_$long_forum_name,
+	forum_error_table_$forum_deleted,
+	forum_error_table_$meeting_adjourned,
+	forum_error_table_$no_control_suffix,
+	forum_error_table_$no_such_forum,
+	forum_error_table_$no_such_user,
+	forum_error_table_$not_a_forum,
+	forum_error_table_$not_eligible,
+	forum_error_table_$roster_full,
+	forum_error_table_$switch_not_changed,
+	forum_error_table_$unexpected_fault,
+	forum_error_table_$you_twit,
+	error_table_$ai_restricted,
+	error_table_$bad_arg,
+	error_table_$dirlong,
+	error_table_$invalid_lock_reset,
+	error_table_$lock_wait_time_exceeded,
+	error_table_$locked_by_this_process,
+	error_table_$moderr,
+	error_table_$noalloc,
+	error_table_$noentry,
+	error_table_$null_info_ptr,
+	error_table_$seg_busted,
+	error_table_$unimplemented_version
+	)			fixed bin (35) external;
+
+declare	(forum_data_$print_eligibility_messages,
+	forum_data_$chairman_override)
+				bit (1) aligned external;
+
+declare	get_authorization_		entry returns (bit (72) aligned),
+	get_group_id_$tag_star	entry returns (char (32)),
+	get_lock_id_		entry (bit(36) aligned),
+	get_process_id_		entry returns (bit (36)),
+	get_ring_			entry returns (fixed bin (3)),
+	get_system_free_area_	entry returns (ptr),
+	hcs_$add_acl_entries	entry (char (*), char (*), ptr, fixed bin, fixed bin (35)),
+	hcs_$delete_acl_entries	entry (char(*), char(*), ptr, fixed bin, fixed bin(35)),
+	hcs_$fs_get_brackets	entry (ptr, fixed bin (5), (3) fixed bin (3), fixed bin (35)),
+	hcs_$fs_get_path_name	entry (ptr, char (*), fixed bin, char (*), fixed bin (35)),
+	hcs_$get_access_class	entry (char(*), char(*), bit (72) aligned, fixed bin (35)),
+          hcs_$get_authorization	entry (bit (72) aligned, bit (72) aligned),
+	hcs_$get_uid_seg		entry (ptr, bit (36) aligned, fixed bin (35)),
+	hcs_$get_user_effmode	entry (char (*), char (*), char (*), fixed bin (3), fixed bin (5), fixed bin (35)),
+	hcs_$initiate		entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr,
+				fixed bin (35)),
+	hcs_$level_get		entry () returns (fixed bin (3)),
+	hcs_$level_set		entry (fixed bin (3)),
+	hcs_$terminate_noname	entry (ptr, fixed bin (35)),
+	read_write_allowed_		entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned),
+	set_lock_$lock		entry (bit (36) aligned, fixed bin, fixed bin (35)),
+	set_lock_$unlock		entry (bit (36) aligned, fixed bin (35)),
+	user_info_$login_data	entry (char (*), char (*), char (*), fixed bin, fixed bin, fixed bin,
+				fixed bin (71), char (*));
+%page;
+%include v1_forum_structures;
+%page;
+%include forum_info;
+%page;
+%include forum_user_list;
+%page;
+%include aim_template;
+%page;
+%include access_mode_values;
+%page;
+/* This is the primary user ring interface to forum.  To enter a forum and read or enter transactions, the
+   forum must first be opened.  This sets the attending flag and returns an integer to identify the opening.	*/
+
+/* v1_forum_mgr_$open:  procedure (P_forum_dir, P_forum_entry, P_forum_idx, P_status);			*/
+
+	call initialize (OPEN_EXIT);			/* Set up for "error" procedure and cleanup handler.	*/
+
+	call copy_pathname_args ();			/* P_forum_dir and P_forum_entry			*/
+
+	on cleanup call close_forum ();		/* If (heaven forbid) we should crawl out, die gracefully.	*/
+
+	call initiate_forum ("1"b);			/* Set forum_control_ptr and proceedings_ptr.		*/
+
+	if no_w_access then call error (forum_error_table_$not_eligible);
+
+	call lock_forum ();				/* Lock out anyone else during update.			*/
+
+	call open_forum ();				/* Find or allocate forum_data.			*/
+
+	if forum_control.flags.adjourned then
+	     if anon_switch | user_name ^= forum_control.chairman.person_id then
+		call error (forum_error_table_$meeting_adjourned);
+
+	call fill_attendee_slot ();			/* Update control segment.				*/
+	forum_control.attendee (attendee_idx).public_wakeup_chan = 0;
+	forum_control.attendee (attendee_idx).write_allowed = write_allowed;
+
+	call unlock_forum ();			/* Finished updating, unlock.				*/
+
+	P_forum_idx = forum_data.forum_idx;		/* Tell user how to access this forum in the future.	*/
+	P_status = 0;				/* If we got this far there was no error.		*/
+
+	return;
+
+OPEN_EXIT:
+	call close_forum ();			/* Clean up the mess, we didn't make it.		*/
+
+	P_forum_idx = 0;				/* Lowest valid forum index is 1, so this won't be back.	*/
+	P_status = status;				/* Tell user what went wrong.				*/
+
+	return;
+%page;
+/* This performs the actual forum opening.  It requires that the forum be initiated and locked.  It sets
+   forum_data_ptr.  If the forum was not previously opened, it changes first_forum_data_ptr; otherwise
+   it sets attendee_idx.  It detects duplicate openings by comparing UIDs to avoid reused segment number bugs.	*/
+
+open_forum:
+     procedure ();
+
+declare	forum_control_uid		bit (36) aligned;
+
+	on cleanup forum_data_ptr = null ();
+
+	call hcs_$get_uid_seg (forum_control_ptr, forum_control_uid, status);
+	if status ^= 0 then call error (status);
+
+	do forum_data_ptr = first_forum_data_ptr repeat (forum_data.next_ptr) while (forum_data_ptr ^= null ());
+
+	     if forum_data.forum_control_uid = forum_control_uid
+	     then do;
+		     call terminate_forum ();	/* Initiated too many times.  Once is sufficient.		*/
+
+		     forum_data.opening_count = forum_data.opening_count + 1;
+		     forum_control_ptr = forum_data.forum_control_ptr;
+		     proceedings_ptr = forum_data.proceedings_ptr;
+		     attendee_idx = forum_data.attendee_idx;
+
+		     return;
+		end;
+	end;
+
+/* If we are here, forum was not previously opened, so we must allocate and fill in a forum_data block		*/
+
+	call allocate_forum_data ();
+
+	forum_data.name = substr (forum_control_entry, 1, forum_name_len);
+	forum_data.forum_control_ptr = forum_control_ptr;
+	forum_data.proceedings_ptr = proceedings_ptr;
+	forum_data.forum_control_uid = forum_control_uid;
+	forum_data.opening_count = 1;
+
+	forum_data.prev_ptr = null ();		/* Thread the forum_data block into the list so we can	*/
+	forum_data.next_ptr = first_forum_data_ptr;	/* find it later.  Bidirectional threads to unthread later	*/
+
+	if forum_data.next_ptr = null ()
+	then forum_data.forum_idx = 1;		/* Meeting index must have no duplications.		*/
+	else do;
+		forum_data.forum_idx = forum_data.next_ptr -> forum_data.forum_idx + 1;
+		forum_data.next_ptr -> forum_data.prev_ptr = forum_data_ptr;
+	     end;
+
+	first_forum_data_ptr = forum_data_ptr;	/* Threads are OK, so now make him official		*/
+
+	return;
+
+     end open_forum;
+%page;
+/* We must set our validation level to 3 before allocating forum_data because forum_data is allocated in the
+   inner ring's system free area.  If this area is extended by this allocation, a bug in get_next_area_component_
+   creates the new component with brackets of validation level rather than copying the ring brackets from the
+   first component of the area.  This is in its own procedure to satisfy my warped sense of esthetics.		*/
+
+allocate_forum_data:
+     procedure ();
+
+	on any_other call error (forum_error_table_$unexpected_fault);
+	on area call error (error_table_$noalloc);	/* Deal with inability to allocate gracefully.		*/
+	on cleanup call hcs_$level_set (caller_validation);
+
+	call hcs_$level_set (my_validation);
+
+	allocate forum_data in (system_area);
+
+	call hcs_$level_set (caller_validation);
+
+	return;
+
+     end allocate_forum_data;
+%page;
+/* This undoes the work of v1_forum_mgr_$close.  It zeros its first argument so you won't close the forum more
+   times than you open it.										*/
+
+v1_forum_mgr_$close_forum:
+     entry (P_forum_idx, P_status);
+
+	call initialize (CLOSE_EXIT);			/* Set up for "error" procedure and cleanup handler.	*/
+
+	call lookup_forum_idx ();			/* Find forum_data node from P_forum_idx.		*/
+
+	on cleanup call unlock_forum ();		/* Now I lay me down to crunch, if I should fault...	*/
+
+	call lock_forum ();			/* Don't let anyone else see the forum while we frob it.	*/
+
+	call check_attendee_idx ();			/* Just in case forum was garbage collected.		*/
+
+	P_forum_idx = 0;				/* Make sure caller doesn't close this one twice.		*/
+
+	call close_forum ();			/* Clean up forum opening, unlock, terminate		*/
+
+	P_status = 0;				/* If we got this far then there is no error.		*/
+
+	return;
+
+CLOSE_EXIT:
+	call unlock_forum ();			/* Clean up the mess, we didn't make it.		*/
+
+	P_status = status;				/* Tell then use what went wrong.			*/
+
+	return;
+%page;
+/* This procedure closes a forum.  It assumes that the forum is initiated (forum_control_ptr ^= null ()), that
+   the forum is open (forum_data_ptr ^= null ()), that the forum is locked, and that attendee_idx is valid.
+   However, it is also used as a cleanup handler for open relation, so it hedges each assumption with a check.	*/
+
+close_forum:
+     procedure ();
+
+	if forum_data_ptr ^= null ()
+	then do;
+		forum_data.opening_count = forum_data.opening_count - 1;
+		if forum_data.opening_count > 0
+		then do;
+			call unlock_forum ();
+			return;
+		     end;
+
+/* If we get here, we are really closing a forum, so unthread the forum_data node and free it.  We check that
+   first_forum_data_ptr = forum_data_ptr instead of prev_ptr = null as last ditch protection against inconsistency.	*/
+
+		if first_forum_data_ptr = forum_data_ptr then first_forum_data_ptr = forum_data.next_ptr;
+
+		if forum_data.prev_ptr ^= null ()
+		then forum_data.prev_ptr -> forum_data.next_ptr = forum_data.next_ptr;
+
+		if forum_data.next_ptr ^= null ()
+		then forum_data.next_ptr -> forum_data.prev_ptr = forum_data.prev_ptr;
+
+		free forum_data;
+	     end;
+
+/* See if we actually own an attendee slot.  If we do, then clear it out.  But if we don't have forum_control_ptr
+   valid, or attendee_idx is zero, or some other process claims to own the slot, then we leave it alone.  We are
+   protected from trying to modify the forum if it is not locked because attendee_idx is zero until after the
+   forum has been locked, and unlock_forum zeros it again before unlocking.					*/
+
+	if forum_control_ptr ^= null () & attendee_idx > 0 then
+	   if forum_control.attendee (attendee_idx).process_id = my_process_id then do;
+		forum_control.attendee (attendee_idx).project_id = project;
+		forum_control.attendee (attendee_idx).last_time_attended = clock ();
+		forum_control.attendee (attendee_idx).public_wakeup_chan = 0;
+		forum_control.attendee (attendee_idx).attending = "0"b;
+	     end;
+
+	call unlock_forum ();
+
+	call terminate_forum ();
+
+	return;
+
+     end close_forum;
+%page;
+/* This is an internal ring 3 interface.  A ring three entrypoint which accepts a forum index should call here
+   to translate the forum index into pointers to the two segments and get the index of the current user's
+   slot on the attendee array, which is a speed optimization.  If you get back a nonzero code, PUNT.  Return
+   the code to the user ring.  Otherwise, you have the forum LOCKED, and you must call v1_forum_mgr_$unlock
+   before returning to the user ring.  It is perfectly OK to call this entrypoint with a null pointer or an
+   unlocked database, so put it in your cleanup handler.  DO NOT TERMINATE THESE POINTERS!			*/
+
+v1_forum_mgr_$get_ptrs:
+     entry (P_forum_idx, P_forum_control_ptr, P_proceedings_ptr, P_attendee_idx, P_write_allowed, P_status);
+
+	call initialize (GET_PTRS_EXIT);		/* Set up for "error" procedure and cleanup handler. */
+
+	call lookup_forum_idx ();			/* Find forum_data node from P_forum_idx. */
+
+	on cleanup call unlock_forum ();		/* In case of crawlout, for whatever reason... */
+
+	call lock_forum ();				/* We want the whole thing to ourselves for a while. */
+
+	call fill_attendee_slot ();			/* Make sure that last_time_attended is updated. */
+
+	P_forum_control_ptr = forum_control_ptr;
+	P_proceedings_ptr = proceedings_ptr;
+	P_attendee_idx = attendee_idx;		/* Tell caller this for efficiency. */
+	P_write_allowed = forum_control.attendee (attendee_idx).write_allowed;
+	P_status = 0;
+
+	return;
+
+GET_PTRS_EXIT:
+	call unlock_forum ();			/* Clean up the mess, we didn't make it.		*/
+
+	P_forum_control_ptr = null ();
+	P_proceedings_ptr = null ();
+	P_attendee_idx = 0;				/* This means that the slot number is unknown.		*/
+	P_status = status;				/* Tell the caller what went wrong.			*/
+
+	return;
+%page;
+/* The procedure looks up a forum index of the sort that passes for a forum pointer in the user ring.  Rather than
+   have an array and hence a maximum number of forums that can easily be concurrently open, a linked list is
+   employed.  It is expected that rarely will more than two forums be open in the same process, so search time
+   should normally not be significant.  If the search is successful, we set forum_data_ptr, forum_control_ptr,
+   proceedings_ptr and attendee_idx.  Otherwise, we set the error code and bail out.				*/
+
+lookup_forum_idx:
+     procedure ();
+
+declare	forum_control_uid		bit (36) aligned,
+	forum_idx		fixed bin;
+
+	on cleanup forum_data_ptr = null ();		/* This ptr may be used be our callers' cleanup handlers.	*/
+
+	forum_idx = P_forum_idx;			/* Copy the parameter in case it uses tally modifiers.	*/
+
+	if forum_idx < 1 then call error (forum_error_table_$invalid_forum_idx);
+
+/* So try to find the right forum_data node.  If we return out of the loop, forum_data_ptr will be correctly set.	*/
+
+	do forum_data_ptr = first_forum_data_ptr repeat (forum_data.next_ptr) while (forum_data_ptr ^= null ());
+
+	     if forum_data.forum_idx = forum_idx
+	     then do;
+		     call hcs_$get_uid_seg (forum_data.forum_control_ptr, forum_control_uid, status);
+		     if status ^= 0 then call error (status);
+
+		     if forum_data.forum_control_uid ^= forum_control_uid
+		     then call error (forum_error_table_$forum_deleted);
+
+		     forum_control_ptr = forum_data.forum_control_ptr;
+		     proceedings_ptr = forum_data.proceedings_ptr;
+		     attendee_idx = forum_data.attendee_idx;
+
+		     return;
+		end;
+	end;
+
+/* If we get here. forum_data_ptr is null, so we don't have the cleanup handler null it and save microseconds.	*/
+
+	revert cleanup;
+
+	call error (forum_error_table_$invalid_forum_idx);
+
+     end lookup_forum_idx;
+%page;
+/* The contract of this procedure is to try very hard to lock the forum.  We assume that forum_control_ptr is
+   valid.  Since it makes the first reference to the control segment for some pathways, and the first write to the
+   segment for others, it has lots of handlers.  Once the forum is locked, the ACL cannot be changed by the
+   forum primitives, nor the forum be deleted, so these handlers are not needed throughout the rest of the
+   forum inner ring.										*/
+
+lock_forum:
+     procedure ();
+
+declare	count			fixed bin,
+	not_locked		bit (1) aligned;
+
+	on any_other call error (forum_error_table_$unexpected_fault);
+	on no_read_permission call error (error_table_$moderr);
+	on no_write_permission call error (error_table_$moderr);
+	on seg_fault_error call error (error_table_$seg_busted);
+
+	not_locked = "1"b;
+	do count = 1 to 10 while (not_locked);
+
+	     call set_lock_$lock (forum_control.forum_lock, 2, status);
+	     if status = 0 then not_locked = "0"b;
+	     else if status ^= error_table_$lock_wait_time_exceeded then not_locked = "0"b;
+	end;
+
+	if status ^= 0
+	then if status ^= error_table_$invalid_lock_reset then call error (status);
+
+	return;					/* This implicitly reverts the handlers			*/
+
+     end lock_forum;
+%page;
+/* This routine keeps the attendee slot for the current user up to date in the control segment.  Of particular
+   interest is the last_time_attended field.  Meeting_control_ptr is assumed valid.  No variables are set.		*/
+
+fill_attendee_slot:
+     procedure ();
+
+	call check_attendee_idx ();			/* Check this in case forum was garbage collected.	*/
+
+/* The clock value is put in forum_control.last_time_attended every time we reference the forum.		*/
+
+	forum_control.attendee (attendee_idx).last_time_attended = clock ();
+
+/* Since we're changing the page anyway, we might as well always write out this info which must be written out when the
+   forum is opened and which might be smashed if two processes for the same user both have the same forum open.	*/
+
+	forum_control.attendee (attendee_idx).project_id = project;
+	forum_control.attendee (attendee_idx).attending = "1"b;
+	forum_control.attendee (attendee_idx).removed = "0"b;
+	forum_control.attendee (attendee_idx).process_id = my_process_id;
+	forum_control.attendee (attendee_idx).lock_id = my_lock_id;
+
+	return;
+
+     end fill_attendee_slot;
+%page;
+/* This procedure makes sure that the saved attendee_idx is still valid.  When opening, attendee_idx = 0, which means
+   there is no saved index.  If it isn't, make it so, adding a new participant if necessary. */
+
+check_attendee_idx:
+     procedure ();
+
+declare	idx			fixed bin;
+
+/* If attendee_idx is nonzero, we must think the forum is locked and open.  See if the user's slot has moved, which
+   could happen if the forum is garbage collected.  If it hasn't moved, then we can just return, saving lots of work. */
+
+	if forum_data_ptr ^= null & attendee_idx > 0
+	then if forum_control.attendee (attendee_idx).person_id = user_name then return;
+
+/* See if there is a slot for the person.  If there is, we will set attendee_idx.				*/
+
+	attendee_idx = 0;
+	do idx = 1 to forum_control.no_attendees while (attendee_idx = 0);
+
+	     if forum_control.attendee (idx).person_id = user_name then attendee_idx = idx;
+	end;
+
+/* If attendee_idx is still not set, then the person isn't currently participating.  Allocate her a slot.		*/
+
+	if attendee_idx = 0	then do;
+	     attendee_idx = forum_control.no_attendees + 1;
+	     if attendee_idx > hbound (forum_control.attendee, 1) then call error (forum_error_table_$roster_full);
+
+	     forum_control.no_attendees = attendee_idx;
+
+	     forum_control.attendee (attendee_idx).person_id = user_name;
+	     forum_control.attendee (attendee_idx).project_id = "";
+	     forum_control.attendee (attendee_idx).message_changed = "1"b;	/* Well, sort of */
+	end;
+
+/* If the forum is open, then update this information in the forum_data node.				*/
+
+	if forum_data_ptr ^= null () then forum_data.attendee_idx = attendee_idx;
+	forum_control.attendee (attendee_idx).deleted = "0"b;
+	return;
+
+     end check_attendee_idx;
+
+lookup_attendee:
+     procedure (person_name);
+
+declare	person_name		char (*),
+	idx			fixed bin;
+
+	attendee_idx = 0;
+	do idx = 1 to forum_control.no_attendees while (attendee_idx = 0);
+	     if forum_control.attendee (idx).person_id = person_name then attendee_idx = idx;
+	end;
+
+	if attendee_idx = 0 then
+	     call error (forum_error_table_$no_such_user);
+
+	return;
+     end lookup_attendee;
+%page;
+/* This is an internal ring 3 interface.  Call it to clean up after calling v1_forum_mgr_$get_ptrs.  It accepts a
+   null input argument so don't hesitate to put it in your cleanup handlers.					*/
+
+v1_forum_mgr_$unlock:
+     entry (P_forum_control_ptr);
+
+	forum_control_ptr = P_forum_control_ptr;	/* Copy parameter for internal procedure.		*/
+
+	if ^static_initialized then return;		/* If this isn't set, we have no business here.		*/
+
+	call unlock_forum ();			/* ZAP.  We don't care about this forum anymore anyway.	*/
+
+	return;
+
+
+
+/* This procedure cleans up after lock_forum.  It goes in cleanup handlers so it has its own handlers.		*/
+
+unlock_forum:
+     procedure ();
+
+	attendee_idx = 0;				/* This being nonzero implies that the forum is locked.	*/
+
+	if forum_control_ptr = null () then return;	/* If we don't even have this, we can't be locked.	*/
+
+	on any_other go to PUNT_UNLOCK;		/* If anything goes wrong, we can't unlock, so give up.	*/
+
+	call set_lock_$unlock (forum_control.forum_lock, (0));
+
+PUNT_UNLOCK:
+	return;
+
+     end unlock_forum;
+%page;
+/* This is an internal ring 3 interface.  It should be called by anyone wishing to initiate a forum forum
+   given a dirname and entryname from the user ring.  Pass the dirname and entryname by reference that came from
+   the calling ring so their lengths can be checked.  If a nonzero code is returned, pass it back to the caller.
+   If proceedings_ptr is null, you have only "r" access to the ".control" segment and should not return any
+   information to the user ring about transactions.  Otherwise, you have "rw" access to both segment.  You should call
+   v1_forum_mgr_$terminate to terminate the pointers.  It doesn't mind getting null pointers so put it in your
+   cleanup handler.  If you don't take kindly to a null proceedings_ptr, terminate and then return the code
+   forum_error_table_$not_eligible.  It locks the forum if asked nicely.					*/
+
+v1_forum_mgr_$initiate:
+     entry (P_forum_dir, P_forum_entry, P_lock_switch, P_forum_control_ptr, P_proceedings_ptr, P_status);
+
+	call initialize (INITIATE_EXIT);		/* set up for "error" procedure and cleanup handler	*/
+
+	call copy_pathname_args ();			/* P_forum_dir and P_forum_entry			*/
+
+	on cleanup call close_forum ();		/* Just unlock and terminate.  forum_data_ptr is null.	*/
+
+	call initiate_forum ("1"b);			/* This is what we are here for.			*/
+
+	if P_lock_switch then call lock_forum ();	/* If user asked for this, give it to him.		*/
+
+	P_forum_control_ptr = forum_control_ptr;
+	P_proceedings_ptr = proceedings_ptr;
+	P_status = 0;				/* If we got this far there is no error.		*/
+
+	return;
+
+INITIATE_EXIT:
+	call close_forum ();			/* Just unlock and terminate.  forum_data_ptr is null.	*/
+
+	P_forum_control_ptr = null ();
+	P_proceedings_ptr = null ();
+	P_status = status;				/* Tell user what went wrong.				*/
+
+	return;
+%page;
+/* See that the split pathname passed to us is plausible.  Ring zero will pass on the directory name later, so all
+   we have to do is make sure it isn't truncated.  The entryname must end in the ".control" suffix.
+   The rest of the checking we leave until later.  No global variables are referenced.				*/
+
+copy_pathname_args:
+     procedure ();
+
+declare	forum_name_len		fixed bin;
+
+	if length (rtrim (P_forum_dir)) > maxlength (forum_dir)
+	then call error (error_table_$dirlong);
+	else forum_dir = P_forum_dir;
+
+	if length (rtrim (P_forum_entry)) > maxlength (forum_control_entry)
+	then call error (forum_error_table_$long_forum_name);
+	else forum_control_entry = P_forum_entry;
+
+	forum_name_len = length (rtrim (forum_control_entry)) - length (".control");
+	if forum_name_len < 1 then call error (forum_error_table_$no_control_suffix);
+
+	if substr (forum_control_entry, forum_name_len + 1) ^= ".control"
+	then call error (forum_error_table_$no_control_suffix);
+
+	return;
+
+     end copy_pathname_args;
+%page;
+/* This routine is the arbiter of acceptable forum format.  Since the pathname passed in could be a link, paranoia
+   is indicated.  The name on the link needn't be on the forum, but the name on the forum must be on both
+   forum segments.  If we only have "r" on the control segment, we don't bother to check the proceedings.		*/
+
+initiate_forum:
+     procedure (initiate_proceedings);
+
+declare	initiate_proceedings	bit (1) aligned,
+	access_class		bit (72) aligned,
+	modes			fixed bin (5),
+	proceedings_entry		char (32),
+	rings			(3) fixed bin (3);
+
+/* Handle unexpected errors.  We don't have the forum locked, so anything can happen.				*/
+
+	on any_other call error (forum_error_table_$unexpected_fault);
+	on cleanup call terminate_forum ();
+	on no_read_permission call error (error_table_$moderr);
+	on seg_fault_error call error (error_table_$seg_busted);
+
+/* We have to initiate at the inner ring validation level, since the segments aren't accessible from the outer ring.	*/
+
+	call hcs_$level_set (my_validation);
+
+	call hcs_$get_access_class (forum_dir, forum_control_entry, access_class, status);
+	if status ^= 0 then
+	     if status = error_table_$noentry then call error (forum_error_table_$no_such_forum);
+	     else call error (status);
+
+	if ^read_write_allowed_ (my_authorization, access_class) then do;
+	     call hcs_$get_authorization (full_authorization, (""b));
+	     if ^aim_bits.privileges.ipc |
+		^aim_bits.privileges.seg |
+		^aim_bits.privileges.dir then
+	     call error (error_table_$ai_restricted);
+	end;
+
+	call hcs_$initiate (forum_dir, forum_control_entry, "", 0, 0, forum_control_ptr, status);
+	if forum_control_ptr = null () then call error (status);
+
+/* Verify the access mode and ring brackets, which must be correct on a valid forum.  "r" access is OK.		*/
+
+	call hcs_$fs_get_brackets (forum_control_ptr, modes, rings, status);
+	if status ^= 0 then call error (status);
+
+	if modes = RW_ACCESS_BIN then no_w_access = "0"b;
+	else if modes = R_ACCESS_BIN then no_w_access = "1"b;
+	else call error (forum_error_table_$not_a_forum);
+
+	if (rings (1) ^= my_validation) | (rings (2) ^= rings (3)) then call error (forum_error_table_$not_a_forum);
+
+/* Now, refer to the segment.  Faults may be taken here.  The attendee count must be plausible.			*/
+
+	if forum_control.no_attendees < 0 | forum_control.no_attendees > hbound (forum_control.attendee, 1)
+	then call error (forum_error_table_$not_a_forum);
+
+/* The attendee count can be zero.  So check something that can't be, to eliminate uninitialized segments.		*/
+
+	if unspec (forum_control.chairman) = ""b then call error (forum_error_table_$not_a_forum);
+
+/* We don't trust the pathname the user gave us.  It might be a link.  Get one we can trust.			*/
+
+	call hcs_$fs_get_path_name (forum_control_ptr, dirname_buffer, dirname_len, forum_control_entry, status);
+	if status ^= 0 then call error (status);
+
+/* If the primary name of the segment doesn't have the suffix, this can't be a forum.				*/
+
+	forum_name_len = length (rtrim (forum_control_entry)) - length (".control");
+	if forum_name_len < 1 | forum_name_len > 20 then call error (forum_error_table_$not_a_forum);
+
+	if substr (forum_control_entry, forum_name_len + 1) ^= ".control"
+	then call error (forum_error_table_$not_a_forum);
+
+/* Leave forum_name_len set for open_forum.  If we have "rw" access on the ".control" segment, then we also
+   initiate the ".proceedings" segment. */
+
+	if modes = RW_ACCESS_BIN & initiate_proceedings then do;
+		proceedings_entry = substr (forum_control_entry, 1, forum_name_len) || ".proceedings";
+
+		call hcs_$initiate (directory, proceedings_entry, "", 0, 0, proceedings_ptr, status);
+		if proceedings_ptr = null ()
+		then if status = error_table_$noentry | status = error_table_$moderr
+		     then call error (forum_error_table_$not_a_forum);
+		     else call error (status);
+
+		call hcs_$fs_get_brackets (proceedings_ptr, modes, rings, status);
+		if status ^= 0 then call error (status);
+
+		if modes ^= RW_ACCESS_BIN & modes ^= R_ACCESS_BIN then call error (forum_error_table_$not_a_forum);
+		write_allowed = (modes = RW_ACCESS_BIN);
+
+		if (rings (1) ^= my_validation) | (rings (2) ^= rings (3))
+		then call error (forum_error_table_$not_a_forum);
+	     end;
+
+	call hcs_$level_set (caller_validation);	/* Close barn door behind.				*/
+
+	return;
+
+     end initiate_forum;
+%page;
+/* This is an internal ring 3 interface to clean up after v1_forum_mgr_$initiate.  It nulls its arguments if they
+   aren't already, so put it in your cleanup handlers.							*/
+
+v1_forum_mgr_$terminate:
+     entry (P_forum_control_ptr, P_proceedings_ptr);
+
+	forum_control_ptr = P_forum_control_ptr;	/* Copy parameters for internal procedures.		*/
+	proceedings_ptr = P_proceedings_ptr;
+
+	if ^static_initialized then return;		/* The static variable "my_validation" must be set.	*/
+
+	caller_validation = hcs_$level_get ();		/* We will need this to revert after terminating.		*/
+
+	P_forum_control_ptr = null ();		/* Make sure caller does not terminate these twice.	*/
+	P_proceedings_ptr = null ();
+
+	call unlock_forum ();			/* In case we locked it before, unlock it now.		*/
+
+	call terminate_forum ();			/* This is what we are here for, so do it.		*/
+
+	return;
+
+
+
+/* This procedure cleans up after initiate forum.  It must affect the ring 3 address space.  It is robust.		*/
+
+terminate_forum:
+     procedure ();
+
+declare	p			ptr;
+
+	on cleanup call hcs_$level_set (caller_validation);
+
+	call hcs_$level_set (my_validation);		/* Here we go.....					*/
+
+	on any_other go to PUNT_TERMINATE;		/* Handle any unexpected faults.			*/
+
+	p = proceedings_ptr;			/* Make SURE pointers aren't terminated twice.		*/
+	proceedings_ptr = null ();
+	if p ^= null () then call hcs_$terminate_noname (p, (0));
+
+	p = forum_control_ptr;			/* Make SURE pointers aren't terminated twice.		*/
+	forum_control_ptr = null ();
+	if p ^= null () then call hcs_$terminate_noname (p, (0));
+
+PUNT_TERMINATE:
+	call hcs_$level_set (caller_validation);
+
+	return;
+
+     end terminate_forum;
+%page;
+/* This interface allows the attending switch to be turned off, and the notify and removed switches to be frobbed,
+   by either the chairman or the user on his own entry. */
+
+v1_forum_mgr_$priv_set_switch:
+     entry (P_forum_dir, P_forum_entry, P_user_name, P_switch_name, P_switch_setting, P_status);
+
+	privileged = "1"b;
+	goto SS_COMMON;
+
+v1_forum_mgr_$set_switch:
+     entry (P_forum_dir, P_forum_entry, P_user_name, P_switch_name, P_switch_setting, P_status);
+
+	privileged = "0"b;
+
+SS_COMMON:
+	call initialize (SET_SWITCH_EXIT);		/* set up for "error" procedure and cleanup handler	*/
+
+	call copy_pathname_args ();			/* P_forum_dir and P_forum_entry			*/
+
+	on cleanup call terminate_forum ();
+
+	call initiate_forum ("1"b);			/* Get pointers to forum				*/
+	if ^privileged & no_w_access then call error (forum_error_table_$not_eligible);
+
+	call set_switch ();				/* Do the work					*/
+
+	call terminate_forum ();			/* Clean up shop and go home				*/
+
+	P_status = status;				/* If we got this far there was no error		*/
+
+	return;
+
+SET_SWITCH_EXIT:
+	call terminate_forum ();			/* Clean up the mess, we couldn't do it.		*/
+
+	P_status = status;				/* Tell the use what went wrong.			*/
+
+	return;
+%page;
+/* This consolidates the interface to turn the various per-user flags on and off				*/
+
+v1_forum_mgr_$set_switch_idx:
+     entry (P_forum_idx, P_user_name, P_switch_name, P_switch_setting, P_status);
+
+	privileged = "0"b;
+	call initialize (SET_SWITCH_IDX_EXIT);		/* set up for "error" procedure and cleanup handler	*/
+
+	call lookup_forum_idx ();			/* Find forum_data node from P_forum_idx		*/
+
+	call set_switch ();				/* Do the work.					*/
+
+	P_status = status;				/* If we get this far there was no error.		*/
+
+	return;
+
+SET_SWITCH_IDX_EXIT:
+	P_status = status;				/* Tell the user what went wrong.			*/
+
+	return;
+%page;
+/* Do all the work of setting a switch.  We have to copy and check all the arguments from the user ring, and
+   decide whether to permit the operation.  Only the chairman can mess with other people's switches.		*/
+
+set_switch:
+     procedure ();
+
+declare	person_name		char (20);
+
+	if length (rtrim (P_user_name)) > maxlength (person_name)
+	then call error (error_table_$bad_arg);
+	else person_name = P_user_name;
+
+	if person_name = "" then person_name = user_name;
+	else if person_name ^= user_name
+	then if anon_switch | user_name ^= forum_control.chairman.person_id
+	     then call error (forum_error_table_$chairman_only);
+	     else forum_data_ptr = null ();
+
+	if length (rtrim (P_switch_name)) > maxlength (switch_name)
+	then call error (forum_error_table_$invalid_switch_name);
+	else switch_name = P_switch_name;
+
+	switch_setting = P_switch_setting;
+
+	on cleanup begin;
+	     call unlock_forum ();
+	     call hcs_$level_set (caller_validation);
+	end;
+
+	if privileged & no_w_access then do;
+	     call hcs_$level_set (my_validation);
+	     call force_access ();
+	end;
+
+	call lock_forum ();
+
+	call lookup_attendee (person_name);
+
+	if switch_name = "participating" | switch_name = "part" then
+	     call set_the_switch (forum_control.attendee (attendee_idx).removed, ^switch_setting);
+	else if switch_name = "notify" | switch_name = "nt" then
+	     call set_the_switch (forum_control.attendee (attendee_idx).notify, switch_setting);
+	else if switch_name = "message_seen" then
+	     call set_the_switch (forum_control.attendee (attendee_idx).message_changed, ^switch_setting);
+	else if switch_name = "access_changed" then
+	     call set_the_switch (forum_control.attendee (attendee_idx).acl_change_pending, switch_setting);
+
+						/* rest of switches may only be changed by the chairman */
+	else if switch_name = "deleted" then do;
+	     if ^privileged & (anon_switch | user_name ^= forum_control.chairman.person_id) then
+		call error (forum_error_table_$chairman_only);
+	     if user_name = person_name then call error (forum_error_table_$you_twit);	/* chairman can't delete himself */
+	     call set_the_switch (forum_control.attendee (attendee_idx).deleted, switch_setting);
+	end;
+	else if switch_name = "adjourned" | switch_name = "adj" then do;
+	     if ^privileged & (anon_switch | user_name ^= forum_control.chairman.person_id) then
+		call error (forum_error_table_$chairman_only);
+	     call set_the_switch (forum_control.flags.adjourned, switch_setting);
+	end;
+	else if switch_name = "meeting_eligibility_messages" | switch_name = "mtg_emsg" then do;
+	     if ^privileged then do;
+		if anon_switch | user_name ^= forum_control.chairman.person_id then call error (forum_error_table_$chairman_only);
+		if ^switch_setting then do;
+		     if ^forum_data_$chairman_override & forum_data_$print_eligibility_messages then
+			call error (forum_error_table_$cant_stop_msg_site);
+		     if forum_control.am_init & forum_control.am_print_acl_msg then
+			call error (forum_error_table_$cant_stop_msg_admin);
+		end;
+		call set_the_switch (forum_control.cm_print_acl_msg, switch_setting);
+		if ^forum_control.cm_init & status = forum_error_table_$switch_not_changed then status = 0;
+		forum_control.cm_init = "1"b;
+	     end;
+	     else do;
+		call set_the_switch (forum_control.am_print_acl_msg, switch_setting);
+		if ^forum_control.am_init & status = forum_error_table_$switch_not_changed then status = 0;
+		forum_control.am_init = "1"b;
+	     end;
+	end;
+	else call error (forum_error_table_$invalid_switch_name);
+
+	call unlock_forum ();
+
+	if privileged & no_w_access then do;
+	     call delete_access ();
+	     call hcs_$level_set (caller_validation);
+	end;
+
+	return;
+
+set_the_switch:
+	proc (switch, value);
+
+declare switch bit (1) unaligned;
+declare value bit (1) aligned;
+
+	if switch = value then status = forum_error_table_$switch_not_changed;
+	else switch = value;
+
+	return;
+	end set_the_switch;
+
+     end set_switch;
+%page;
+v1_forum_mgr_$set_global_switch:
+     entry (P_switch_name, P_switch_setting, P_status);
+
+	call initialize (SET_GLOBAL_EXIT);
+
+	if length (rtrim (P_switch_name)) > maxlength (switch_name)
+	then call error (forum_error_table_$invalid_switch_name);
+	else switch_name = P_switch_name;
+
+	switch_setting = P_switch_setting;
+
+	on no_write_permission call error (error_table_$moderr);
+
+	if switch_name = "print_eligibility_messages" | switch_name = "pemsg" then
+	     forum_data_$print_eligibility_messages = switch_setting;
+	else if switch_name = "chairman_set_eligibility_msg" | switch_name = "cm_set_emsg" then
+	     forum_data_$chairman_override = switch_setting;
+	else call error (forum_error_table_$invalid_switch_name);
+
+	P_status = 0;
+	return;
+
+SET_GLOBAL_EXIT:
+	P_status = status;
+	return;
+%page;
+/* If you want to be told when a new transaction arrives in a forum you are attending, you gotta tell the guy where
+   to send the wakeup.										*/
+v1_forum_mgr_$set_event_channel:
+     entry (P_forum_dir, P_forum_entry, P_event_channel, P_status);
+
+	call initialize (SET_EVENT_CHANNEL_EXIT);
+
+	call copy_pathname_args ();
+
+	on cleanup begin;
+	     call unlock_forum ();
+	     call terminate_forum ();
+	end;
+
+	call initiate_forum ("0"b);
+	if no_w_access then call error (forum_error_table_$not_eligible);
+
+	call lookup_attendee (user_name);
+
+	call lock_forum ();
+
+	forum_control.attendee (attendee_idx).public_wakeup_chan = P_event_channel;
+	forum_control.attendee (attendee_idx).process_id = my_process_id;
+
+	call unlock_forum ();
+	call terminate_forum ();
+	P_status = 0;
+	return;
+
+SET_EVENT_CHANNEL_EXIT:
+	call unlock_forum ();
+	call terminate_forum ();
+	P_status = status;
+	return;
+%page;
+v1_forum_mgr_$set_event_channel_idx:
+     entry (P_forum_idx, P_event_channel, P_status);
+
+	call initialize (SET_EVENT_CHANNEL_IDX_EXIT);	/* set up for "error" procedure and cleanup handler	*/
+
+	call lookup_forum_idx ();			/* Find forum_data node from P_forum_idx		*/
+
+	on cleanup call unlock_forum ();
+
+	call lock_forum ();
+
+	forum_control.attendee (attendee_idx).public_wakeup_chan = P_event_channel;
+	forum_control.attendee (attendee_idx).process_id = my_process_id;
+
+	call unlock_forum ();
+
+	P_status = 0;
+
+	return;
+
+SET_EVENT_CHANNEL_IDX_EXIT:
+	call unlock_forum ();
+
+	P_status = status;
+
+	return;
+%page;
+/* Note:  This interface does not lock the forum so occasional rare lossages can occur.  It can return the code
+   forum_error_table_$not_eligible to indicate that the caller or specified access name lacks access to open the
+   forum.  Partial info is returned in this case.							*/
+
+v1_forum_mgr_$forum_info:
+     entry (P_forum_dir, P_forum_entry, P_access_name, P_access_time, P_forum_info_ptr, P_status);
+
+	call initialize (FORUM_INFO_EXIT);		/* set up for "error" procedure and cleanup handler	*/
+
+	call copy_pathname_args ();			/* P_forum_dir and P_forum_entry			*/
+
+	on cleanup call terminate_forum ();
+	on no_read_permission call error (error_table_$moderr);
+
+	call initiate_forum ("0"b);
+
+	call get_forum_info (no_w_access);
+
+	if no_w_access then status = forum_error_table_$not_eligible;
+	else status = 0;
+
+	call terminate_forum ();
+
+	forum_info = fmi;
+
+	P_status = status;
+
+	return;
+
+FORUM_INFO_EXIT:
+	call terminate_forum ();
+
+	P_status = status;
+
+	return;
+%page;
+/* This interface locks the database, since it must be openable to use it.  We assume that response time is not as
+   critical for the "current" forum (after all, you went to the trouble of opening it) as it is for the
+   dirname, entryname entrypoint which is used by the forum_list command.					*/
+
+v1_forum_mgr_$forum_info_idx:
+     entry (P_forum_idx, P_access_name, P_access_time, P_forum_info_ptr, P_status);
+
+	call initialize (MEETING_INFO_IDX_EXIT);	/* set up for "error" procedure and cleanup handler	*/
+
+	call lookup_forum_idx ();			/* Find forum_data node from P_forum_idx		*/
+
+	on cleanup call unlock_forum ();
+
+	call lock_forum ();
+
+	call fill_attendee_slot ();
+
+	call get_forum_info ("0"b);
+
+	call unlock_forum ();
+
+	forum_info = fmi;
+	P_status = 0;
+
+	return;
+
+MEETING_INFO_IDX_EXIT:
+	call unlock_forum ();
+
+	P_status = status;
+
+	return;
+%page;
+get_forum_info:
+     procedure (no_w_access);
+
+declare	no_w_access		bit (1) aligned,
+	access_name		char (32),
+	access_time		fixed bin (71),
+	idx			fixed bin,
+	person_name		char (20);
+
+	if length (rtrim (P_access_name)) > maxlength (access_name)
+	then call error (error_table_$bad_arg);
+	else access_name = P_access_name;
+
+	access_time = P_access_time;
+
+	forum_info_ptr = P_forum_info_ptr;
+	if forum_info_ptr = null () then call error (error_table_$null_info_ptr);
+
+	if forum_info.version ^= forum_info_version_1 then call error (error_table_$unimplemented_version);
+	unspec (fmi) = ""b;
+	fmi.version = forum_info_version_1;
+
+	fmi.chairman.username = forum_control.chairman.person_id;
+	fmi.chairman.project = forum_control.chairman.project_id;
+	fmi.chairman.pad = "";
+
+	fmi.attendee_count = forum_control.no_attendees;
+
+	do idx = 1 to forum_control.no_attendees;
+
+	     if forum_control.attendee (idx).removed then fmi.removal_count = fmi.removal_count + 1;
+	end;
+
+	if forum_data_ptr ^= null () then fmi.forum_uid = forum_data.forum_control_uid;
+	else do;
+	     call hcs_$get_uid_seg (forum_control_ptr, fmi.forum_uid, status);
+	     if status ^= 0 then call error (status);
+	end;
+
+	if access_name = "" then do;
+	     person_name = user_name;
+	     fmi.eligible = ^no_w_access;
+	end;
+	else do;
+	     person_name = before (access_name, ".");
+	     call check_eligible (access_name);
+	     attendee_idx = 0;
+	end;
+
+	if person_name = "*" then attendee_idx = 0;
+	else do idx = 1 to forum_control.no_attendees while (attendee_idx = 0);
+		if forum_control.attendee (idx).person_id = person_name then attendee_idx = idx;
+	     end;
+
+	if attendee_idx = 0 then return;
+
+	if ^no_w_access then forum_control.attendee (attendee_idx).lock_id = my_lock_id;
+	fmi.removed = forum_control.attendee (attendee_idx).removed | forum_control.attendee (attendee_idx).deleted;
+	fmi.last_time_attended = forum_control.attendee (attendee_idx).last_time_attended;
+	fmi.last_seen_trans_idx = get_highest_seen (forum_control.attendee (attendee_idx).highest_trans_seen,
+	     user_name);
+
+	if ^fmi.removed then do;
+	     fmi.notify = forum_control.attendee (attendee_idx).notify;
+	     fmi.attending = forum_control.attendee (attendee_idx).attending;
+	end;
+	fmi.adjourned = forum_control.flags.adjourned;
+
+	if no_w_access then return;
+
+	fmi.read_only = ^forum_control.attendee (attendee_idx).write_allowed;
+	do idx = forum_control.no_transactions by -1 to 1
+	     while (forum_control.transactions (idx).time > access_time);
+	end;
+
+	fmi.transaction_count = idx;
+	fmi.deletion_count = forum_control.no_deleted;
+
+	if person_name ^= "*" & person_name ^= ""
+	then do idx = min (fmi.transaction_count, forum_control.attendee (attendee_idx).highest_trans_seen) + 1
+		to forum_control.no_transactions;
+
+		if forum_control.transactions (idx).person_id ^= person_name
+		     & ^forum_control.transactions (idx).deleted
+		then fmi.changes_count = fmi.changes_count + 1;
+	     end;
+
+	idx = forum_control.no_transactions;
+	if idx < 1 then return;
+
+	do while (forum_control.transactions (idx).deleted | forum_control.transactions (idx).time > access_time);
+
+	     idx = idx - 1;
+	     if idx < 1 then return;
+	end;
+
+	fmi.last_time_changed = forum_control.transactions (idx).time;
+
+	return;
+
+     end get_forum_info;
+%page;
+/* This procedure checks if a person other than the caller is eligible to participate in a forum.  Since we
+   require as a condition for a valid forum that the proceedings must have "rw" access if the control
+   segment does, and we have already verified that the rings are correct on the control segment, we will
+   punt checking to see that access_name has "rw" on both segments.  In fact, we may not even know that the
+   second segment exists.  We make no attempt to use a saved pathname since we have a perfectly good pointer
+   and we are paranoid about renamings and the like.  We initiated it before it was locked, and only after
+   locking can we be sure that the name or ACL won't change.						*/
+
+check_eligible:
+     procedure (access_name);
+
+declare	access_name		char (32),
+	entryname			char (32),
+	modes			fixed bin (5);
+
+	on cleanup call hcs_$level_set (caller_validation);
+
+	call hcs_$level_set (my_validation);
+
+	call hcs_$fs_get_path_name (forum_control_ptr, dirname_buffer, dirname_len, entryname, status);
+	if status ^= 0 then call error (status);
+
+	call hcs_$get_user_effmode (directory, entryname, access_name, my_validation, modes, status);
+	if status ^= 0 then call error (status);
+
+	if modes = RW_ACCESS_BIN then fmi.eligible = "1"b;
+
+	call hcs_$level_set (caller_validation);
+
+	return;
+
+     end check_eligible;
+%page;
+v1_forum_mgr_$set_last_seen_idx:
+     entry (P_forum_idx, P_last_seen_trans_idx, P_force_switch, P_status);
+
+	call initialize (SET_LAST_SEEN_IDX_EXIT);
+
+	call lookup_forum_idx ();
+
+	last_seen_trans_idx = P_last_seen_trans_idx;
+	force_switch = P_force_switch;
+
+	on cleanup call unlock_forum ();
+
+	call lock_forum ();
+
+	if last_seen_trans_idx < 0 | last_seen_trans_idx > forum_control.no_transactions
+	then call error (forum_error_table_$invalid_trans_idx);
+
+	call fill_attendee_slot ();
+
+	if ^force_switch
+	then last_seen_trans_idx =
+		max (last_seen_trans_idx, forum_control.attendee (attendee_idx).highest_trans_seen);
+
+	forum_control.attendee (attendee_idx).highest_trans_seen = last_seen_trans_idx;
+
+	call unlock_forum ();
+
+	P_status = 0;
+
+	return;
+
+SET_LAST_SEEN_IDX_EXIT:
+	call unlock_forum ();
+
+	P_status = status;
+
+	return;
+%page;
+v1_forum_mgr_$list_users:
+     entry (P_forum_dir, P_forum_entry, P_area_ptr, P_user_list_ptr, P_status);
+
+	call initialize (LIST_USERS_EXIT);
+
+	call copy_pathname_args ();
+
+	on cleanup call terminate_forum ();
+
+	call initiate_forum ("0"b);
+	if no_w_access then call error (forum_error_table_$not_eligible);
+
+	call get_user_list ();
+
+	call terminate_forum ();
+
+	P_status = 0;
+	return;
+
+LIST_USERS_EXIT:
+	call terminate_forum ();
+
+	P_status = status;
+	return;
+%page;
+v1_forum_mgr_$list_users_idx:
+     entry (P_forum_idx, P_area_ptr, P_user_list_ptr, P_status);
+
+	call initialize (LIST_USERS_IDX_EXIT);
+
+	call lookup_forum_idx ();
+
+	on cleanup call unlock_forum ();
+
+	call lock_forum ();
+
+	call fill_attendee_slot ();
+
+	call get_user_list ();
+
+	call unlock_forum ();
+
+	P_status = 0;
+	return;
+
+LIST_USERS_IDX_EXIT:
+	call unlock_forum ();
+	P_status = status;
+	return;
+%page;
+get_user_list:
+     procedure;
+
+declare	(idx, jdx)		fixed bin;
+
+	user_list_no_attendees = forum_control.no_attendees;
+	allocate user_list in (P_area);
+
+	unspec (user_list) = ""b;
+	user_list.version = user_list_version_2;
+	user_list.chairman.person_id = forum_control.chairman.person_id;
+	user_list.chairman.project_id = forum_control.chairman.project_id;
+	user_list.transaction_count = forum_control.no_transactions;
+
+	jdx = 0;
+	do idx = 1 to forum_control.no_attendees;
+	     if ^forum_control.attendee (idx).deleted then do;
+		jdx = jdx + 1;
+		if forum_control.attendee (idx).attending then do;	/* check if he's really there */
+		     call set_lock_$lock ((forum_control.attendee (idx).lock_id), 0, status);
+		     if status ^= error_table_$lock_wait_time_exceeded & status ^= error_table_$locked_by_this_process then do;
+			forum_control.attendee (idx).attending = "0"b;
+			forum_control.attendee (idx).lock_id = "0"b;
+		     end;
+		end;
+
+		user_list.attendees (jdx).person_id = forum_control.attendee (idx).person_id;
+		user_list.attendees (jdx).project_id = forum_control.attendee (idx).project_id;
+		user_list.attendees (jdx).attending = forum_control.attendee (idx).attending;
+		user_list.attendees (jdx).notify = forum_control.attendee (idx).notify;
+		user_list.attendees (jdx).removed = forum_control.attendee (idx).removed;
+		user_list.attendees (jdx).read_only = ^forum_control.attendee (idx).write_allowed;
+		user_list.attendees (jdx).last_time_attended =
+		     forum_control.attendee (idx).last_time_attended;
+		user_list.attendees (jdx).highest_trans_seen =
+		     get_highest_seen (forum_control.attendee (idx).highest_trans_seen, forum_control.attendee (idx).person_id);
+	     end;
+	end;
+
+	user_list.no_attendees = jdx;
+	P_user_list_ptr = user_list_ptr;
+	return;
+
+     end get_user_list;
+
+
+get_highest_seen:
+     procedure (start, person) returns (fixed bin);
+
+declare	start			fixed bin,
+	person			char (22),
+	highest			fixed bin,
+	done			bit (1) aligned;
+
+	done = "0"b;
+	highest = start;
+	do while ((highest + 1) <= forum_control.no_transactions & ^done);
+	     if (forum_control.transactions (highest + 1).deleted | forum_control.transactions (highest + 1).person_id =
+		person) then highest = highest + 1;
+	     else done = "1"b;
+	end;
+
+	done = "0"b;
+	do while (^done & highest ^= 0);
+	     if forum_control.transactions (highest).deleted
+	     then highest = highest - 1;
+	     else done = "1"b;
+	end;
+
+	return (highest);
+     end get_highest_seen;
+%page;
+v1_forum_mgr_$change_chairman_idx:
+     entry (P_forum_idx, P_chairman, P_status);
+
+	call initialize (CHANGE_CHAIRMAN_IDX_EXIT);
+
+	call lookup_forum_idx ();
+
+	on cleanup call unlock_forum ();
+
+	call lock_forum ();
+
+	privileged = "0"b;
+	call change_the_chairman ();
+
+	call unlock_forum ();
+
+	P_status = 0;
+	return;
+
+CHANGE_CHAIRMAN_IDX_EXIT:
+	call unlock_forum ();
+	P_status = status;
+	return;
+%page;
+v1_forum_mgr_$priv_change_chairman:
+     entry (P_forum_dir, P_forum_entry, P_chairman, P_status);
+
+	privileged = "1"b;
+	goto CC_COMMON;
+
+v1_forum_mgr_$change_chairman:
+     entry (P_forum_dir, P_forum_entry, P_chairman, P_status);
+
+	privileged = "0"b;
+
+CC_COMMON:
+	call initialize (CHANGE_CHAIRMAN_EXIT);
+
+	call copy_pathname_args ();
+
+	on cleanup call terminate_forum ();
+
+	call initiate_forum ("0"b);
+
+	call change_the_chairman ();
+
+	call terminate_forum ();
+
+	P_status = 0;
+	return;
+
+CHANGE_CHAIRMAN_EXIT:
+	call terminate_forum ();
+	P_status = status;
+	return;
+%page;
+change_the_chairman:
+     procedure ();
+
+declare	chairman_name		char (32),
+	chairman_personid		char (22),
+	chairman_projectid		char (10),
+	entryname			char (32);
+
+	if ^privileged then
+	     if anon_switch | user_name ^= forum_control.chairman.person_id then
+		call error (forum_error_table_$chairman_only);
+
+	if length (rtrim (P_chairman)) > maxlength (chairman_name) then
+	     call error (error_table_$bad_arg);
+	else chairman_name = P_chairman;
+
+	if index (chairman_name, ".") = 0 |
+	     index (chairman_name, ".") > maxlength (chairman_personid) + 1 then
+	     call error (error_table_$bad_arg);
+
+	chairman_personid = before (chairman_name, ".");
+	chairman_projectid = rtrim (after (chairman_name, "."));
+
+	call lookup_attendee (chairman_personid);
+
+	on cleanup call hcs_$level_set (caller_validation);
+	call hcs_$level_set (my_validation);
+
+	if privileged & no_w_access then call force_access ();
+
+	call hcs_$fs_get_path_name (forum_control_ptr, dirname_buffer, dirname_len, entryname, status);
+	if status ^= 0 then call error (status);
+
+	segment_acl.access_name = chairman_personid || ".*.*";
+	segment_acl.modes = RW_ACCESS;
+	segment_acl.xmodes = "0"b;
+	segment_acl.status = 0;
+
+	call hcs_$add_acl_entries (directory, entryname, addr (segment_acl), 1, status);
+	if status ^= 0 then call error (status);
+
+	entryname = substr (entryname, 1, length (rtrim (entryname)) - length ("control")) || "proceedings";
+
+	call hcs_$add_acl_entries (directory, entryname, addr (segment_acl), 1, status);
+	if status ^= 0 then call error (status);
+
+	forum_control.chairman.person_id = chairman_personid;
+	forum_control.chairman.project_id = chairman_projectid;
+
+	if privileged & no_w_access then call delete_access ();
+
+	call hcs_$level_set (caller_validation);
+
+	return;
+     end change_the_chairman;
+%page;
+/* Most entrypoints call this procedure to set up for error handling.  The caller's validation level is obtained,
+   static "constants" are initialized, the emergency bailout at 30,000 feet label that the "error" procedure transfers
+   to is set, and all automatic variables used in cleanup handlers are initialized.				*/
+
+initialize:
+     procedure (P_egress);
+
+declare	P_egress			label variable,
+	anon			fixed bin;
+
+	egress = P_egress;
+
+	caller_validation = hcs_$level_get ();
+
+	if ^static_initialized then do;
+	     my_authorization = get_authorization_ ();
+	     my_validation = get_ring_ ();
+	     my_process_id = get_process_id_ ();
+	     call get_lock_id_ (my_lock_id);
+	     call user_info_$login_data (user_name, project, (""), anon, 0, 0, 0, (""));
+	     if anon = 1 then do;
+		anon_switch = "1"b;
+		user_name = "*" || user_name;
+	     end;
+
+	     static_initialized = "1"b;
+	end;
+
+	forum_control_ptr = null ();
+	proceedings_ptr = null ();
+	forum_data_ptr = null ();
+	attendee_idx = 0;
+
+	return;
+
+     end initialize;
+
+
+
+/* This is where we bail out at 30,000 feet by passing in an error code and knowing that this procedure never
+   returns.  The label variable "egress" is set in "initialize".						*/
+
+error:
+     procedure (P_status);
+
+declare	P_status			fixed bin (35) parameter;
+
+	status = P_status;
+
+	go to egress;
+
+     end error;
+
+force_access:
+     procedure ();
+
+	segment_acl.access_name = get_group_id_$tag_star ();
+	segment_acl.modes = RW_ACCESS;
+	segment_acl.xmodes = ""b;
+	call hcs_$add_acl_entries (directory, forum_control_entry, addr (segment_acl), 1, status);
+	if status ^= 0 then call error (status);
+
+	return;
+     end force_access;
+
+delete_access:
+     procedure ();
+
+	delete_acl.access_name = get_group_id_$tag_star ();
+	call hcs_$delete_acl_entries (directory, forum_control_entry, addr (delete_acl), 1, (0));
+
+     end delete_access;
+
+     end v1_forum_mgr_$open_forum;

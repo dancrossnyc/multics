@@ -1,0 +1,483 @@
+/****^  ********************************************
+        *                                          *
+        * Copyright, (C) Honeywell Bull Inc., 1987 *
+        *                                          *
+        ******************************************** */
+
+
+/*   The purpose of this program is to trap, handle, and report conditions
+     signalled while executing an exec_com, and resume execution with the
+     next line of the exec_com without aborting it. The callers of this program
+     may supply a varying number of arguments just as would be supplied to
+     exec_com itself.  A pointer to an argument list is provided for the
+     purpose of calling the exec_com_ subroutine which will subsequently
+     initiate the processing of the exec_com input lines.  If an error is
+     encountered while this interface is being called by a daemon process
+     all messages will be placed in the system logs via signal_io_ and
+     printed on the message coordinator terminal.  If an error is encountered
+     while running in an interactive user process the messages will be
+     printed on the user terminal via ioa_.  A temporary command_processor
+     and active_functon_processor are established here to determine whether
+     the condition error is resulting from a command or active function. The
+     process' command_processor and active_function_processor will be restored
+     to its original before exiting this program.  An asdump will be created
+     in the process' working directory for error conditions other than
+     command_error and/or active_function_error.
+*/
+     
+
+     
+
+/****^  HISTORY COMMENTS:
+  1) change(87-03-05,Parisek), approve(87-07-23,MCR7716),
+     audit(87-07-30,Fawcett), install(87-08-11,MR12.1-1079):
+     Program to handle condition errors encountered while executing an
+     exec_com. Display error data and continue execution after conditions
+     are encountered.
+  2) change(87-08-12,Parisek), approve(87-08-12,PBF7716),
+     audit(87-08-12,Fawcett), install(87-08-13,MR12.1-1085):
+     Changed call to trace_stack to call as_dump_ and only make this call for
+     unusual error conditions.
+  3) change(87-08-18,Parisek), approve(87-08-18,PBF7716),
+     audit(87-09-03,Farley), install(87-09-10,MR12.1-1104):
+     Define constant values and check pointer validity before referencing them.
+  4) change(87-09-18,Parisek), approve(87-09-18,PBF7716),
+     audit(87-09-18,Farley), install(87-09-21,MR12.1-1111):
+     Implement a counter that increments each time an error is reported and if
+     this counter reaches five, then return thus aborting the exec_com.
+                                                   END HISTORY COMMENTS */
+
+call_ec_:
+	proc options (variable);
+
+    dcl   argp                          ptr,
+          argl                          fixed bin(21),
+          arg                           char(argl) based(argp),
+          arg_count                     fixed bin,
+	arg_list_ptr                  ptr;
+
+    dcl	RETURN_FALSE_AF_VALUE	label variable,
+	code			fixed bin(35),
+	error_counter                 fixed bin,	/* Count number of reported errors */
+	ec_arg                        char(168),
+	ec_dir                        char(168),
+	ec_entry                      char(32),
+	ec_path                       char(168),
+	iop                           ptr,
+	last_active_string_len	fixed bin(21),
+	last_active_string_ptr	ptr,
+	last_command_line_len	fixed bin(21),
+	last_command_line_ptr	ptr,
+	lg_status                     char(100) aligned,
+	old_cp			entry (ptr, fixed bin(21), fixed bin(35)) variable,
+	old_eval			entry (ptr, char(*), fixed bin, char(*) var, fixed bin(35)) variable,
+         (seg_name, seg_name2, seg_name3)
+				char(500) aligned,
+	seg_ptr			ptr,
+	st_status                     char(8) aligned;
+
+    dcl	last_active_string		char(last_active_string_len)
+				based(last_active_string_ptr),
+	last_command_line		char(last_command_line_len)
+				based(last_command_line_ptr);
+
+    dcl  1 ec_info                      aligned like exec_com_info;
+
+    dcl  (addr, length, null, rtrim, substr)
+				builtin;
+
+    dcl  (any_other, cleanup, command_abort_, linkage_error, signal_io_)
+				condition;
+
+    dcl	com_err_                      entry options (variable),
+          condition_interpreter_	entry (ptr, ptr, fixed bin, fixed bin, ptr, char(*), ptr, ptr),
+	continue_to_signal_		entry (fixed bin(35)),
+	convert_status_code_          entry (fixed bin(35), char(8) aligned, char(100) aligned),
+	cu_$arg_count                 entry (fixed bin, fixed bin(35)),
+	cu_$arg_ptr_rel               entry (fixed bin, ptr, fixed bin(21), fixed bin(35), ptr),
+	cu_$arg_list_ptr              entry (ptr),
+	cu_$get_command_processor	entry (entry),
+	cu_$get_evaluate_active_string
+				entry (entry),
+	cu_$make_entry_value          entry (ptr, entry),
+	cu_$set_command_processor	entry (entry),
+	cu_$set_evaluate_active_string
+				entry (entry),
+	exec_com_			entry (char(*), char(*), char(*), ptr, fixed bin(35)),
+	expand_pathname_              entry (char(*), char(*), char(*), fixed bin(35)),
+	find_condition_frame_	entry (ptr) returns(ptr),
+	find_condition_info_	entry (ptr, ptr, fixed bin(35)),
+	get_ppr_			entry (fixed bin, ptr, ptr, char(500) aligned, char(500) aligned,
+				     char(500) aligned),
+	ioa_$ioa_switch               entry() options(variable),
+	ioa_$rsnnl		entry() options(variable),
+	pathname_			entry (char(*), char(*)) returns(char(168)),
+	sc_signal_io_handler_         entry (),
+	as_dump_                      entry (char (*));
+	
+	
+    dcl   FALSE			init("0"b) bit(1) int static options(constant),
+       	NL			char(1) int static options(constant) init("
+");
+
+/* External */
+
+    dcl   iox_$user_io                  ptr ext static;
+
+/* Constants */
+
+    dcl   ACTIVE_FUNCT_ERROR_TYPE       fixed bin int static options (constant) init (2),
+	ALL_OTHERS_TYPE               fixed bin int static options (constant) init (3),
+	COMMAND_ERROR_TYPE            fixed bin int static options (constant) init (1),
+	FIRST_EC_ARG                  fixed bin int static options (constant) init (2),
+	MAX_ERROR_CNT                 fixed bin int static options (constant) init (5),
+	MAX_ERROR_INFO                fixed bin int static options (constant) init (2);
+%page;
+
+	if iox_$user_io = null then do;
+	     call com_err_ (0, "call_ec_", "iox_$user_io is null");
+						/* Have caller handle this with an asdump */
+	     return;
+	end;
+	else iop = iox_$user_io;
+
+	call cu_$get_command_processor (old_cp);
+	call cu_$get_evaluate_active_string (old_eval);
+	on cleanup call janitor();
+
+	call cu_$arg_count (arg_count, code);		/* If we get any bad codes we'll signal command_error and get an asdump */
+	if code ^= 0 then do;
+	     call com_err_ (code, "call_ec_", "From cu_$arg_count.");
+	     return;
+	end;
+	call cu_$arg_list_ptr (arg_list_ptr);
+
+	ec_path, ec_arg = "";
+	call cu_$arg_ptr_rel (1, argp, argl, code, arg_list_ptr);
+	if code ^= 0 then do;
+	     call com_err_ (code, "call_ec_", "From cu_$arg_ptr_rel.");
+	     return;
+	end;
+	ec_path = (arg);
+	call expand_pathname_ (ec_path, ec_dir, ec_entry, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, "call_ec_", "From expand_pathname_.");
+	     return;
+	end;
+	ec_path = pathname_ (ec_dir, rtrim(ec_entry) || ".ec");
+
+	last_command_line_ptr, last_active_string_ptr = null;
+
+	on signal_io_ call sc_signal_io_handler_ ();
+
+	error_counter = 0;				/* Init */
+	on any_other begin;
+	     error_counter = error_counter + 1;
+	     call handle_ec_conditions ();
+	     if error_counter = MAX_ERROR_CNT then do;
+		call ioa_$ioa_switch (iop, "Aborting the exec_com due to too many error conditions.");
+		goto EXIT;
+	     end;
+	end;
+	
+
+
+	call cu_$set_command_processor (call_cp);
+	call cu_$set_evaluate_active_string (call_eval);
+	ec_info.version = exec_com_info_version_1;
+	ec_info.arg_list_ptr = arg_list_ptr;
+	ec_info.first_arg = FIRST_EC_ARG;
+	ec_info.execute_line = call_cp;
+	ec_info.eval_string = call_eval;
+	call cu_$make_entry_value (null (), ec_info.ready);
+	call cu_$make_entry_value (null (), ec_info.set_ready_mode);
+	call cu_$make_entry_value (null (), ec_info.error);
+
+	call exec_com_ (rtrim(ec_path), "", "call_ec_", addr (ec_info), code);
+	if code ^= 0 then
+	     call com_err_ (code, "call_ec_", "From exec_com_.");
+
+EXIT:	call janitor();
+	return;
+
+%page;
+handle_ec_conditions:
+          proc ();
+
+    dcl	type			fixed bin(2);
+
+	 call find_condition_info_ (null, addr(ci), code);
+	 if code = 0 then do;
+	      if ci.condition_name = "command_abort_" then do;
+		 call begin_error_message(type, "");
+		 call ioa_$ioa_switch (iop, "
+Error: command_abort_ signalled by call_ec_ not handled by command_processor_.
+******************************");
+	      end;
+	      else				/* Pass thru standard conditions which should be	*/
+		 if ci.condition_name = "alrm"	/* handled by the default error handler.	*/
+		 | ci.condition_name = "command_question"
+		 | ci.condition_name = "cput"
+		 | ci.condition_name = "dm_shutdown_scheduled_"
+		 | ci.condition_name = "dm_shutdown_warning_"
+		 | ci.condition_name = "dm_user_shutdown_"
+		 | ci.condition_name = "end_file"
+		 | ci.condition_name = "end_page"
+		 | ci.condition_name = "finish"
+		 | ci.condition_name = "mme2"
+		 | ci.condition_name = "storage"
+		 | ci.condition_name = "quit"
+		 | ci.condition_name = "sus_"
+		 | ci.condition_name = "system_shutdown_scheduled_"
+		 | ci.condition_name = "trm_" then
+		 call continue_to_signal_ (code);
+	      else
+		 if condition_default_restart() then do;
+						/* Don't signal command_abort_ for errors which	*/
+						/* are default_restartable.			*/
+		      if ci.condition_name = "command_error" then do;
+			 call begin_error_message(type, ci.condition_name);
+			 if ci.info_ptr ^= null then
+			      if ci.info_ptr->com_af_error_info.errmess_ptr ^= null then do;
+				 call ioa_$ioa_switch (iop, "^/^a",
+				      com_err_message);
+				 ci.info_ptr -> com_af_error_info.print_sw = FALSE;
+			      end;
+		      end;
+		      else do;
+			 call begin_error_message(type, ci.condition_name);
+			 if ci.info_ptr ^= null then
+			      call condition_interpreter_(null, null, 0, 3,
+				 ci.mc_ptr, (ci.condition_name),
+				 ci.wc_ptr, ci.info_ptr);
+		      end;
+		      call end_error_message (type, "continues");
+		 end;
+		 else do;				/* Diagnose all other, unexpected conditions.	*/
+		      if ci.condition_name = "active_function_error" then do;
+			 call begin_error_message(type, ci.condition_name);
+			 if ci.info_ptr ^= null then
+			      call ioa_$ioa_switch (iop, "^a",
+			      com_err_message);
+			 if type = ACTIVE_FUNCT_ERROR_TYPE then do;
+			      call end_error_message (type,
+				 "continues by returning ""false"" as the
+active function value");
+			      go to RETURN_FALSE_AF_VALUE;
+			 end;
+			 else do;
+			      if ci.info_ptr ^= null then 
+				 ci.info_ptr -> com_af_error_info.print_sw = FALSE;
+			      call end_error_message (type, "continues");
+			 end;
+		      end;
+		      else do;
+			 call as_dump_ (rtrim(ci.condition_name) || " condition encountered.");
+			 call begin_error_message(type, ci.condition_name);
+			 if condition_quiet_restart()	
+						/* Specially handle conditions that 		*/
+			      then do;		/* condition_interpreter_ is silent for.	*/
+			      if ci.loc_ptr ^= null then do;
+				 seg_ptr = ci.user_loc_ptr;
+				 on linkage_error begin;
+						/* get_ppr_ may call routines unavailable	*/
+				      call format_name (seg_ptr, seg_name);
+				      seg_name2, seg_name3 = "";
+						/* at the time.  If an error occurs, use 	*/
+				      go to QUIET_REVERT;
+						/* format_name as a backup name-getter.		*/
+				 end;
+				 call get_ppr_ (MAX_ERROR_INFO, find_condition_frame_(null),
+				      addr(ci), seg_name, seg_name2, seg_name3);
+QUIET_REVERT:			 revert linkage_error;
+				 call ioa_$ioa_switch (iop,  
+				      "^/Error: ^a at ^a ^a ^a",
+				      ci.condition_name, seg_name, seg_name2,
+				      seg_name3);
+			      end;
+			      else do;
+				 call ioa_$ioa_switch (iop,
+				      "Error: ^a at UNKNOWN LOCATION.",
+				      ci.condition_name);
+			      end;
+			       
+			      if ci.condition_name = "stringsize" then
+				 call end_error_message (type,
+				 "continues with truncation of the string");
+			      else
+				 call end_error_message (type, "continues");
+			 end;
+			 else do;
+			      call condition_interpreter_(null, null, 0, 3,
+				 ci.mc_ptr, (ci.condition_name),
+				 ci.wc_ptr, ci.info_ptr);
+			      call end_error_message (type,
+				 "continues with the next line of the exec_com");
+			      if last_command_line_ptr ^= null then
+				 signal command_abort_;
+						/* Then abort the current command line of the ec. */
+			 end;
+		      end;
+		 end;
+	      end;
+        end handle_ec_conditions;
+
+%page;
+begin_error_message:
+	proc (case, condition_name);
+	
+    dcl	case			fixed bin(2),
+	condition_name		char(*) varying;
+
+	if last_command_line_ptr ^= null then do;
+	   case = COMMAND_ERROR_TYPE;
+	   call ioa_$ioa_switch (iop, "
+******************************
+While executing the command line:
+   ^a^[^;
+^]in ^a.ec, an unexpected ^[^a condition^;error^s^] occurred:",
+	   last_command_line,
+	   substr(last_command_line,length(last_command_line),length(NL))=NL,
+	   ec_entry, condition_name^="", condition_name);
+	   end;
+	else
+	if last_active_string_ptr ^= null then do;
+	   case = ACTIVE_FUNCT_ERROR_TYPE;
+	   call ioa_$ioa_switch (iop, "
+******************************
+While evaluating the active string:
+   ^a^[^;
+^]in ^a.ec, an unexpected ^[^a condition^;error^s^] occurred:",
+	      last_active_string,
+	      substr(last_active_string,length(last_active_string),
+	          length(NL))=NL, ec_entry, condition_name^="",
+	      condition_name);
+	   end;
+	else do;
+	   case = ALL_OTHERS_TYPE;
+	   call ioa_$ioa_switch (iop, "
+******************************
+An unexpected ^[^a condition^;error^s^] occurred in ^a.ec:",
+	      condition_name^="", condition_name, ec_entry);
+	   end;
+	if ci.condition_name = "io_error" then do;
+	     call convert_status_code_ (ci.info_ptr -> io_error_info.status.code, st_status, lg_status);
+	     call ioa_$ioa_switch (iop, "Status returned by ""io_error"" condition is: ^a", rtrim(lg_status));
+	end;
+	return;
+
+end_error_message:
+	entry (case, further_action);
+	
+    dcl	further_action		char(*);
+	
+	call ioa_$ioa_switch (iop, "
+^[Execution of the command^;Evaluation of the active string^;Execution^] ^a.
+******************************^/", case, further_action);
+
+	end begin_error_message;
+
+%page;
+call_cp:	proc (Aline_ptr, Aline_len, Acode);
+
+    dcl	Aline_ptr			ptr,
+	Aline_len			fixed bin(21),
+	Acode			fixed bin(35);
+
+	last_command_line_ptr = Aline_ptr;
+	last_command_line_len = Aline_len;
+	call old_cp (Aline_ptr, Aline_len, Acode);
+	last_command_line_ptr = null;
+	end call_cp;
+
+%page;
+call_eval:
+       	proc (Ainfo_ptr, Aactive_string, Astring_type, Areturn_value, Acode);
+
+    dcl	Ainfo_ptr			ptr,
+	Aactive_string		char(*),
+	Astring_type		fixed bin,
+	Areturn_value		char(*) varying,
+	Acode			fixed bin(35);
+
+	last_active_string_ptr = addr(Aactive_string);
+	last_active_string_len = length(Aactive_string);
+	RETURN_FALSE_AF_VALUE = RETURN_FALSE;
+	call old_eval (Ainfo_ptr, Aactive_string, Astring_type,
+	   Areturn_value, Acode);
+	last_active_string_ptr = null;
+	return;
+RETURN_FALSE:
+	Areturn_value = "false";
+	Acode = 0;
+	last_active_string_ptr = null;
+	end call_eval;
+
+%page;
+condition_default_restart:
+	proc () returns(bit(1));
+	if ci.info_ptr ^= null then
+	   return (ci.info_ptr -> condition_info_header.default_restart);
+	else
+	   return (FALSE);
+
+condition_quiet_restart:
+	entry () returns(bit(1));
+	if ci.info_ptr ^= null then
+	   return (ci.info_ptr -> condition_info_header.quiet_restart);
+	else
+	   return (FALSE);
+	end condition_default_restart;
+       
+%page;
+format_name:
+     proc (p, name);
+
+	dcl     p			 ptr;
+	dcl     code		 fixed bin (35);
+	dcl     find_pathname_	 entry (ptr, ptr, fixed bin (35));
+	dcl     name		 char (500) aligned;
+	dcl     1 name_info		 aligned like find_pathname_info automatic;
+
+
+	call find_pathname_ (p, addr (name_info), code);
+
+	if name_info.component_ename ^= ""
+	then /* use name from bindmap */
+	     call ioa_$rsnnl ("^a^a (^a^a^a^a^a)^a", name, 0, name_info.component_ename, name_info.adjusted_offset,
+		name_info.dirname, name_info.gt_char, name_info.real_ename, name_info.real_offset,
+		name_info.pdir_string, name_info.offset_msg);
+	else call ioa_$rsnnl ("^a^a^a^a^a^a", name, 0, name_info.dirname, name_info.gt_char, name_info.real_ename,
+		name_info.real_offset, name_info.pdir_string, name_info.offset_msg);
+
+	return;
+     end format_name;
+
+%page;
+janitor:	proc;
+	call cu_$set_command_processor (old_cp);
+	call cu_$set_evaluate_active_string (old_eval);
+	end janitor;
+%page;
+%include com_af_error_info;
+
+    dcl	com_err_message		char(ci.info_ptr->com_af_error_info.errmess_lth)
+				based(ci.info_ptr->com_af_error_info.errmess_ptr);
+%page;
+%include condition_info;
+
+    dcl	1 ci			aligned like condition_info;
+
+%page;
+%include condition_info_header;
+%page;
+%include exec_com_info;
+%page;
+%include find_pathname_info;
+%page;
+%include io_error_info;
+%page;
+%include iox_modes;
+%page;
+
+	end call_ec_;

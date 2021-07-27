@@ -1,0 +1,595 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+verify_dump_volume: vdv: proc;
+
+/* This command utility can be used to verify the contents of a dump volume produced by the volume dumper.
+   In addition it can also be used to produce a long or short form of a map/table of contents of what
+   is written on the dump volume.
+*/
+/* Coded 11/4/77 by Dave Vinograd */
+/* Modified 5/79 by D. Vinograd to make program check error count befor detaching
+   so that proc does not go OOB. Also corrected logig that checked
+   pattern at beginning of logical record */
+/* Modified: 4/27/82 by GA Texada to change error handling on reads.	   */
+/* Modified: 8/82 by GA Texada to fix phx13702			   */
+/* Modified: 8/82 by GA Texada to fix phx13702			   */
+/* Modified 03/12/85 by Greg Texada to fix phx19165, don't give up so soon when resynching (D. Kitson)	*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-10-10,Farley), approve(88-10-10,MCR8005),
+     audit(88-10-15,Beattie), install(88-10-17,MR12.2-1173):
+     Added new read routine and associated surrounding code to support the
+     version 2 volume dump tapes.  These tapes have a pair of unique strings
+     that delimit the object data of vtoce_type records.
+                                                   END HISTORY COMMENTS */
+
+
+dcl input_volume_desc    char (256);
+dcl stop_vtocx	     fixed bin;
+dcl vtocx		     fixed bin;
+dcl resynch_retry_count  fixed bin;
+dcl resynching	     bit (1);
+dcl input_buf	     (divide (nelt, CHARS_PER_WORD, 17, 0)) bit (36) based (recordp);
+dcl pattern_match_label  label;
+dcl volname	     char (32);
+dcl att_desc	     char (256);
+dcl ignore	     fixed bin (35);
+dcl code		     fixed bin (35);
+dcl arg		     char (argl) based (argp);
+dcl argl		     fixed bin;
+dcl argp		     ptr;
+dcl brief		     bit (1);
+dcl long		     bit (1);
+dcl delimited	     bit (1) aligned;		/* ON = reading object data delimited by unique matching strings */
+dcl comment	     char (128) var;
+dcl type		     char (10) var;
+dcl name		     char (168) var;
+dcl i		     fixed bin;
+dcl iocbp		     ptr;
+dcl nelt		     fixed bin (21);
+dcl nel		     fixed bin (21);
+dcl objectp	     ptr;
+dcl input_buffer_ptr     ptr;
+dcl input_buffer_start   fixed bin;
+dcl input_buffer_len     fixed bin (21);
+dcl old_256K_switch	     bit (2) aligned;
+dcl tp		     (3) ptr;
+
+dcl cleanup	     condition;
+
+dcl word		     (size (backup_volume_header)) bit (36) based (recordp);
+dcl string	     bit (BITS_PER_WORD * size (backup_volume_header)) based (recordp);
+dcl words_skipped	     fixed bin;
+
+dcl (error_table_$improper_data_format,
+  error_table_$data_loss,
+  error_table_$device_end,
+  error_table_$end_of_info,
+  error_table_$bad_arg,
+  error_table_$badopt,
+  error_table_$inconsistent,
+  error_table_$root)     fixed bin (35) ext static;
+dcl sys_info$seg_size_256K fixed bin (19) ext static;
+dcl sys_info$max_seg_size fixed bin (18) ext static;
+
+dcl myname	     char (32) static init ("verify_dump_volume") options (constant);
+dcl DELIMITED	     bit (1) aligned internal static options (constant)
+		     init ("1"b);
+dcl FORWARD_CHAR_POSITIONING fixed bin int static init (3) options (constant);
+
+dcl com_err_	     entry options (variable);
+dcl cu_$arg_count	     entry returns (fixed bin);
+dcl cu_$arg_ptr	     entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl cv_oct_check_	     entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl debug		     entry;
+dcl get_temp_segments_   entry (char (*), (*) ptr, fixed bin (35));
+dcl hc_backup_$decode_uidpath entry ((0:15) bit (36), char (*), char (*), fixed bin (35));
+dcl hcs_$set_256K_switch entry (bit (2) aligned, bit (2) aligned, fixed bin (35));
+dcl hcs_$set_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl hcs_$truncate_seg    entry (ptr, fixed bin (19), fixed bin (35));
+dcl ioa_		     entry options (variable);
+dcl ioa_$rsnnl	     entry options (variable);
+dcl iox_$attach_ioname   entry (char (*), ptr, char (*), fixed bin (35));
+dcl release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+
+dcl (addcharno, addr, divide, index, length, min, null, ptr, rtrim, size, substr) builtin;
+
+/**** init local control variables */
+
+    stop_vtocx = -1;
+    brief, long = "0"b;
+    resynching = "0"b;
+    input_volume_desc = "";
+    old_256K_switch = ""b;
+    tp (*) = null;
+    iocbp = null;
+    code = 0;
+						/* set up cleanup handler */
+    on cleanup call finish_;
+						/* get name of volume log  - pvname */
+    call cu_$arg_ptr (1, argp, argl, code);
+    if code ^= 0 then do;
+        call ioa_ ("^a: USAGE: ^a volname [-input_volume_desc alternate_attach_description] [-brief|-bf] [-long|-lg] [-stop_vtocx vtocx]", myname, myname);
+        return;
+      end;
+    volname = arg;
+						/* get control args */
+    i = 2;
+    do while (i <= cu_$arg_count ());
+      call cu_$arg_ptr (i, argp, argl, code);
+      if code ^= 0 then goto err;
+      if arg = "-input_volume_desc" then do;
+	i = i + 1;
+	call cu_$arg_ptr (i, argp, argl, code);
+	if code ^= 0 then goto err;
+	input_volume_desc = arg;
+        end;
+      else if arg = "-brief" | arg = "-bf" then brief = "1"b;
+      else if arg = "-long" | arg = "-lg" then long = "1"b;
+      else if arg = "-stop_vtocx" then do;
+	i = i + 1;
+	call cu_$arg_ptr (i, argp, argl, code);
+	if code ^= 0 then goto err;
+	stop_vtocx = cv_oct_check_ (arg, code);
+	if code ^= 0 then goto bad_num;
+        end;
+      else do;
+badopt:	call com_err_ (error_table_$badopt, myname, "^a", arg);
+	goto finish;
+        end;
+      i = i + 1;
+    end;
+						/* create temp segs */
+    if brief & long then do;
+        call com_err_ (error_table_$inconsistent, myname, "-brief & -long");
+        return;
+      end;
+
+    call setup_data_segments;
+    if code ^= 0 then goto err;
+
+    call attach;
+    if code ^= 0 then goto err;
+
+/* The search loop  reads successive records from the dump volume until it encounters a volume log with the name
+   that matches pvname.  It then creates a segment, if one does not already exist and copies the data into it. The
+   dump volume is read until the end of tape is reached. */
+
+search_loop:
+    do while (code = 0);
+      call read_volume_record;
+    end;
+finish:
+    call finish_;
+    return;
+
+err:
+    call com_err_ (code, myname);
+    goto finish;
+bad_num:
+    call com_err_ (error_table_$bad_arg, myname, "^a is not an octal number.", arg);
+    goto finish;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+setup_data_segments: proc;
+
+/* This proc sets up the data segments used during the verify. */
+
+    call get_temp_segments_ (myname, tp, code);
+    if code ^= 0 then return;
+
+    recordp = tp (1);
+    objectp = tp (2);
+    input_buffer_ptr = tp (3);
+    call hcs_$set_256K_switch ("11"b, (""b), code);
+    if code ^= 0 then return;
+    call hcs_$set_max_length_seg (objectp, sys_info$seg_size_256K, code);
+    if code ^= 0 then return;
+    call hcs_$set_max_length_seg (input_buffer_ptr, sys_info$seg_size_256K, code);
+    if code ^= 0 then return;
+    input_buffer_start = 1;
+    input_buffer_len = 0;
+    return;
+
+  end setup_data_segments;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+attach: proc;
+
+/* This proc queries the caller for the dump volume name, attaches to it and opens it. */
+
+    if input_volume_desc ^= "" then
+      call ioa_$rsnnl (input_volume_desc, att_desc, (0), volname);
+    else call ioa_$rsnnl ("tape_mult_ ^a -system", att_desc, (0), volname);
+
+    call iox_$attach_ioname ("input_volume", iocbp, att_desc, code);
+    if code ^= 0 then return;
+
+    call iox_$open (iocbp, Stream_input, "0"b, code);
+    if code ^= 0 then return;
+
+  end attach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+detach: proc;
+
+/* This proc closes and detaches the dump volume. */
+
+
+    call iox_$close (iocbp, ignore);
+    call iox_$detach_iocb (iocbp, ignore);
+    iocbp = null;					/* be sure */
+
+  end detach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+resynch_volume: proc;
+
+/* This proc is used for error recovery. It reads the dump volume word by word looking for a match on the
+   3 words which are part of the header of the logical dump record. When it gets a match it returns to specified label.
+   While resynchronization is in progress , io error handling is suppressed except if we reach the end of a dump
+   volume. This code is freely adapted from the volume reloader. */
+
+    resynching = "1"b;
+    input_buf (*) = "0"b;
+    nel = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+
+    words_skipped = 0;
+    do while (^(word (1) = pattern1 & word (4) = pattern2 & word (7) = pattern3));
+
+      string = substr (string, 37, (size (backup_volume_header) - 1) * BITS_PER_WORD);
+      nel = CHARS_PER_WORD;
+      call read (addr (word (size (backup_volume_header))),
+	 nel, nelt, ^DELIMITED, code);
+      call check_input_error;
+
+      words_skipped = words_skipped + 1;
+      if words_skipped > 256 * WORDS_PER_PAGE then do;	/* put a limit on it */
+	call ioa_ ("^a: resynchronization failed", myname);
+	code = error_table_$end_of_info;
+	call check_input_error;
+        end;
+    end;
+    call ioa_ ("^a: synchronization completed ^d words skipped", myname,
+         words_skipped);
+    resynching = "0"b;
+    delimited = "0"b;
+    code = 0;
+    goto pattern_match_label;
+
+  end resynch_volume;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+skip_chars: proc;
+
+/* This proc skips forward on a dump volume. */
+
+    nelt = nel;
+    call read (objectp, nel, nelt, delimited, code);
+    call check_input_error;
+
+  end skip_chars;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+check_input_error: proc;
+
+/* This proc is used to check all io errors after a read request.  If no error we return.
+   If we are at the end of the dump volume, then it is detached. If a volume log has not been found, a new dump volume is
+   requested. Otherwise we are done. If the error is the result of a bad read we start resynchronization.
+   If it has already been started we just return. */
+
+    if nel ^= nelt | code ^= 0 then do;
+        if (code = error_table_$end_of_info | code = error_table_$device_end) then do;
+	  if resynching then call com_err_ (code, myname, "Resynching terminated.");
+	  call detach;
+	  goto finish;
+	end;
+        else if ^resynching then do;
+	  if nel ^= nelt then do;
+	      if code = error_table_$data_loss then
+	        call com_err_ (code, myname, "Incomplete object detected.");
+	      else do;
+		if code = 0 then call com_err_ (code, myname, "Read did not complete.");
+		else call com_err_ (code, myname, "Reading input volume");
+	        end;
+	    end;
+	  else call com_err_ (code, myname, "Reading input volume");
+	  call ioa_ ("^a: Resynching started", myname);
+	  resynch_retry_count = 0;
+	  call resynch_volume;
+	end;
+        else do;
+	  resynch_retry_count = resynch_retry_count + 1;	/* keep track so we don't do this forever	*/
+	  if resynch_retry_count > 64 then do;
+	      call com_err_ (code, myname, "I/O error during resynching.");
+	      call detach;
+	      goto finish;
+	    end;
+	end;
+      end;
+  end check_input_error;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+read_volume_record: proc;
+
+/* This proc reads volume dump records and interprets which type they are and
+   displays info about them if requested. */
+
+    pattern_match_label = pattern_match;
+    delimited = "0"b;
+    nel = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, nel, nelt, delimited, code);
+    call check_input_error;
+
+    if backup_volume_record.pattern1 ^= pattern1
+         | backup_volume_record.pattern2 ^= pattern2
+         | backup_volume_record.pattern3 ^= pattern3 then do;
+        code = error_table_$improper_data_format;
+        call check_input_error;
+      end;
+
+pattern_match:
+    nel = backup_volume_record.rec1_len - size (backup_volume_header) * CHARS_PER_WORD;
+    call read (ptr (recordp, size (backup_volume_header)),
+         nel, nelt, delimited, code);
+    call check_input_error;
+
+    if backup_volume_record.rec2_len > 0 then do;
+        if backup_volume_record.rec1_type ^= vtoce_type then do;
+	  call ioa_ ("Invalid record header");
+	  call debug_it ("Volume record at ^p", recordp);
+	end;
+      end;
+
+    comment = "";
+    vtocx = 0;
+    if backup_volume_record.rec1_type = vtoce_type then do;
+        vtocx = backup_volume_record.vtocx;
+        if stop_vtocx = vtocx then
+	call debug_it ("vtoce at ^p", addr (backup_volume_record.vtoce));
+        if (long | brief) then name = convert_puid_ ();
+        if backup_volume_record.dirsw then type = "dir";
+        else type = "seg";
+        if backup_volume_record.uid = "0"b then comment = "deleted";
+        if backup_volume_record.damaged then comment = comment || " damaged";
+        if backup_volume_record.version > backup_volume_record_version_1
+	   then delimited = "1"b;			/* object data is delimited */
+      end;
+    else if backup_volume_record.rec1_type = volume_log_type then do;
+        bvlp = recordp;
+        name = rtrim (backup_volume_log.pvname) || ".volog";
+        type = "volog";
+      end;
+    else if backup_volume_record.rec1_type = contents_type then do;
+        contentsp = recordp;
+        name = rtrim (backup_volume_contents.volname) || ".contents";
+        type = "contents";
+      end;
+    else if backup_volume_record.rec1_type = info_type then do;
+        infop = recordp;
+        name = rtrim (backup_info.dump_volname) || "[info data]";
+        type = "info_seg";
+      end;
+    else do;
+        call ioa_ ("Unknown record type ^d", backup_volume_record.rec1_type);
+        call debug_it ("Volume record at ^p", recordp);
+        goto skip;
+      end;
+
+    if brief then call ioa_ ("^a", name);
+    if long then call ioa_ ("^o ^80a^-^a^-^a", vtocx, name, type, comment);
+
+skip: nel = backup_volume_record.rec2_len;
+    call skip_chars;
+
+  end read_volume_record;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+read: proc (return_buffer_ptr,
+       Nrequested_chars,
+       Nreturned_chars,
+       Sdelimited,
+       code);
+
+dcl return_buffer_ptr    ptr,
+  Nrequested_chars	     fixed bin (21),
+  Nreturned_chars	     fixed bin (21),
+  Sdelimited	     bit (1) aligned,
+  code		     fixed bin (35);
+
+dcl input_buffer	     char (256 * CHARS_PER_PAGE)
+		     based (input_buffer_ptr);
+
+dcl return_string	     char (Nrequested_chars)
+		     based (return_buffer_ptr);
+
+dcl Nassign_chars	     fixed bin (21),
+  Nread_chars	     fixed bin (21),
+  end_of_record	     fixed bin,
+  tape_check1 /* bit (72) */ char (8),
+  tape_check2 /* bit (72) */ char (8);
+
+    Nreturned_chars, Nread_chars, code = 0;
+
+    do while (Nreturned_chars < Nrequested_chars & code = 0);
+      if input_buffer_len = 0 then do;
+	input_buffer_start = 1;
+
+	if Sdelimited & Nreturned_chars = 0 then do;
+	    call iox_$get_chars (iocbp,
+	         addr (tape_check1), length (tape_check1), Nread_chars, code);
+	    if code ^= 0 then return;
+	  end;
+
+	if return_buffer_ptr = null then do;
+	    call iox_$position (iocbp, FORWARD_CHAR_POSITIONING,
+	         Nrequested_chars - Nreturned_chars, code);
+	    Nreturned_chars = Nreturned_chars + Nrequested_chars;
+	  end;
+	else do;
+	    call iox_$get_chars (iocbp,
+	         addcharno (return_buffer_ptr, Nreturned_chars),
+	         Nrequested_chars - Nreturned_chars, Nread_chars, code);
+	    Nreturned_chars = Nreturned_chars + Nread_chars;
+	  end;
+	if code ^= 0 then return;
+
+	if Sdelimited then do;
+	    call iox_$get_chars (iocbp,
+	         addr (tape_check2), length (tape_check2), Nread_chars, code);
+	    if code ^= 0 then
+	      return;
+
+	    if tape_check1 ^= tape_check2 then do;
+						/* found a short segment, move       */
+						/* return string into the temp input */
+						/* buffer and start parsing          */
+	        input_buffer_len = Nreturned_chars;
+	        substr (input_buffer, 1, input_buffer_len) =
+		   return_string;
+	      end;
+	  end;
+        end;
+
+      else
+	 if Sdelimited then do;
+	tape_check1 = substr (input_buffer,
+	     input_buffer_start, length (tape_check1));
+	tape_check2 = "";
+	input_buffer_start =
+	     input_buffer_start + length (tape_check1);
+	input_buffer_len =
+	     input_buffer_len - length (tape_check1);
+        end;
+
+      if input_buffer_len > 0 then do;
+	Nassign_chars =
+	     min (input_buffer_len, Nrequested_chars);
+
+	if Sdelimited then do;
+	    if tape_check1 ^= tape_check2 then do;
+	        end_of_record = index (substr (input_buffer, input_buffer_start,
+		   input_buffer_len), tape_check1);
+	        if end_of_record > 0 then do;
+		  Nassign_chars = end_of_record - 1;
+		  if Nrequested_chars ^= Nassign_chars then
+		    code = error_table_$data_loss;
+		end;
+	      end;
+	  end;
+
+	if return_buffer_ptr ^= null then
+	  return_string = substr (input_buffer,
+	       input_buffer_start, Nassign_chars);
+	Nreturned_chars = Nassign_chars;
+
+	input_buffer_start =
+	     input_buffer_start + Nassign_chars;
+	input_buffer_len =
+	     input_buffer_len - Nassign_chars;
+
+	if Sdelimited & input_buffer_len > 0 then do;
+	    input_buffer_start =
+	         input_buffer_start + length (tape_check2);
+	    substr (input_buffer, 1, input_buffer_len) =
+	         substr (input_buffer, input_buffer_start,
+	         input_buffer_len - length (tape_check2))
+	         || tape_check2;
+	    input_buffer_start = 1;
+	  end;
+        end;
+    end;
+
+    return;
+  end read;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+finish_: proc;
+    if iocbp ^= null then call detach;
+    if tp (1) ^= null then do;
+        call hcs_$truncate_seg (objectp, 0, ignore);	/* clean up our 256K segs */
+        call hcs_$truncate_seg (input_buffer_ptr, 0, ignore);
+        call hcs_$set_max_length_seg (objectp, (sys_info$max_seg_size), ignore);
+        call hcs_$set_max_length_seg (input_buffer_ptr, (sys_info$max_seg_size), ignore);
+        call release_temp_segments_ (myname, tp, ignore);
+        call hcs_$set_256K_switch (old_256K_switch, (""b), ignore);
+      end;
+  end finish_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+convert_puid_: proc returns (char (168));
+
+/* This proc is used to convert a unique id pathname to an ascii pathname  */
+
+dcl dn		     char (168);
+dcl en		     char (32);
+dcl ret_dn	     char (168);
+dcl ec		     fixed bin (35);
+dcl seg_fault_error	     condition;
+    on seg_fault_error goto ret_unk;
+    call hc_backup_$decode_uidpath (backup_volume_record.uid_path, dn, en, ec);
+    if ec = error_table_$root then ;
+    else if ec ^= 0 then
+ret_unk: return ("UNKNOWN_PATH>" || rtrim (backup_volume_record.primary_name, "  "));
+    call ioa_$rsnnl ("^a^[>^]^[^a>^;^s^]^a", ret_dn, (0), dn, dn ^= ">", en ^= "", en, backup_volume_record.primary_name);
+    return (ret_dn);
+  end convert_puid_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+debug_it: proc (string, p);
+dcl string	     char (*);
+dcl p		     ptr;
+    call ioa_ (string, p);
+    call ioa_ ("in debug");
+    call debug;
+  end debug_it;
+%page; %include backup_info;
+%page; %include backup_pvol_info;
+%page; %include backup_static_variables;
+%page; %include backup_volume_contents;
+%page; %include backup_volume_header;
+%page; %include backup_volume_log;
+%page; %include backup_volume_record;
+%page; %include fs_vol_label;
+%page; %include iox_dcls;
+%page; %include iox_modes;
+%page; %include vtoce;
+%page; %include system_constants;
+
+  end verify_dump_volume;

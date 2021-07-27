@@ -1,0 +1,205 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+	This entry walks through the entire TDT adjusting any
+     transactions held by the calling process.  The tm_user_shutdown_info
+     structure is allocated and filled in by this procedure in an area
+     supplied by the calling process (see the dm_tm_shutdown_info.incl.pl1
+     include file).  This entry is only available in the DM ring for DM
+     user shutdown and assumes its caller (tm_user_shutdown) has guaranteed
+     TDT entries owned by the user process will not disappear out from
+     under it.  It does not free any TDT entries owned by the process, but
+     leaves them for transaction_manager_$user_shutdown_free in a later
+     part of user shutdown.  The program has the following steps:
+
+	1) loops through the TDT to find out how many TDT entries the
+     calling process owns to allocate the tm_shutdown_info structure.
+
+	2) For each user TDT entry, calls tm_cleanup$restart_error on the
+     transaction therein and fills in the shutdown info for that TDT entry.
+     If the tm_cleanup call fails, abandons the transaction.
+*/
+
+/* HISTORY:
+
+Written by Steve Herbst, 05/01/84.
+Modified:
+05/10/84 by Lee A. Newcomb:  to match on user process id instead of
+	  user name.project to prevent multi-process conflicts.
+05/16/84 by S. Herbst:  Changed to adjust TDT entry and add an element
+	  to tm_shutdown_info only when there's a transaction.
+	  Added "tm_shutdown_info.op_completed = ABANDONED".
+10/19/84 by Steve Herbst: Changed in response to audit comments.
+02/20/85 by Lee A. Newcomb:  Fixed to call transaction_manager_$get_state_info
+            instead of tm_=; the latter is in a different bound module.
+02/25/85 by Lee A. Newcomb:  Fixed to not be missing a ";" after the "do" in
+            the version check.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+*/
+/* format: style4,ifthenstmt,^indproc,^indcomtxt */
+%page;
+tm_user_shutdown_adjust:
+     proc (A_area_ptr, A_tm_shutdown_info_ptr, A_code);
+
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  (A_area_ptr, A_tm_shutdown_info_ptr) ptr parameter;
+dcl  A_code fixed bin (35);
+
+/* Constants */
+
+dcl  ME char (32) int static options (constant) init ("tm_user_shutdown_adjust");
+
+/* Based */
+
+dcl  based_area area based;
+
+/* Static */
+
+/* Automatic */
+dcl  (
+     code fixed bin (35) init (0),
+     my_process_id bit (36) init (""b),
+     op_name char (32) init (""),
+     (txn_index, tix_index, tix_count) fixed bin init (0)
+     ) automatic;
+
+/* External */
+
+dcl  dm_data_$tm_tdt_ptr ptr ext;
+dcl  error_table_$unimplemented_version fixed bin (35) ext;
+
+/* Entries */
+
+dcl  dm_misc_util_$log entry options (variable);
+dcl  get_process_id_ entry () returns (bit (36));
+dcl  tm_abandon entry (bit (36) aligned, fixed bin (35));
+dcl  tm_cleanup$restart_error entry (ptr, fixed bin);
+dcl  transaction_manager_$get_state_info entry (fixed bin, char (*), fixed bin (35));
+
+/* Builtins */
+
+dcl  (addr, null, unspec) builtin;
+
+/* Conditions */
+
+dcl  cleanup condition;
+
+/* END OF DECLARATIONS */
+%page;
+	A_code = 0;
+	A_tm_shutdown_info_ptr = null;
+
+	on cleanup call CLEAN_UP;
+
+	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+
+	if tm_tdt.version ^= TM_TDT_VERSION_3 then do;
+	     A_code = error_table_$unimplemented_version;
+	     return;
+	end;
+
+	my_process_id = get_process_id_ ();		/* to match our TDTE's */
+
+/* Walk through the TDT to see how many entries the user owns. */
+
+	tm_shutdown_alloc_count = 0;
+
+	do txn_index = 1 to tm_tdt.entry_count;
+	     if tm_tdt.process_id (txn_index) = my_process_id & ^tm_tdt.abandoned_sw (txn_index) then
+		tm_shutdown_alloc_count = tm_shutdown_alloc_count + 1;
+	end;
+
+/* Now get storage for the returned info and initialize it. */
+
+	allocate tm_shutdown_info in (A_area_ptr -> based_area) set (tm_shutdown_info_ptr);
+	unspec (tm_shutdown_info) = "0"b;
+	tm_shutdown_info.version = TM_SHUTDOWN_INFO_VERSION_1;
+
+/* This begin block allocates a temporary array of TDT indices to be */
+/* acted upon. This array, not the TDT itself, is looped through when */
+/* adjusting transactions since if we need to abandon a transaction, */
+/* we don't want to adjust and return shutdown_info about the new slot */
+/* created by the abandon. */
+
+ADJUST_USER_TRANSACTIONS: begin;
+
+dcl  tix_array (tm_shutdown_alloc_count) fixed bin;
+
+	     tix_count = 0;
+
+	     do txn_index = 1 to tm_tdt.entry_count;
+
+		tm_tdt_entry_ptr = addr (tm_tdt.entry (txn_index));
+
+		if tm_tdt_entry.process_id = my_process_id & tm_tdt_entry.txn_id ^= "0"b &
+		     ^tm_tdt_entry.abandoned_sw then do;
+		     tix_count = tix_count + 1;
+		     tix_array (tix_count) = txn_index;
+		end;
+	     end;
+
+	     tm_shutdown_info.count = 0;
+
+	     do tix_index = 1 to tix_count;
+
+		txn_index = tix_array (tix_index);
+		tm_tdt_entry_ptr = addr (tm_tdt.entry (txn_index));
+
+		tm_shutdown_info.count = tm_shutdown_info.count + 1;
+		tm_shutdown_info.txn_id (tm_shutdown_info.count) = tm_tdt.txn_id (txn_index);
+
+		call transaction_manager_$get_state_info ((tm_tdt_entry.state), op_name, (0));
+		if op_name = "commit" then
+		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = FINISHED_COMMIT;
+		else if op_name = "abort" then
+		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = FINISHED_ABORT;
+		else do;				/* convert all other unfinished ops and */
+						/* in-progress state into an abort */
+		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = ABORTED;
+		     tm_tdt_entry.state = TM_ABORT_FLUSHING_TXN_STATE;
+		end;
+
+		call tm_cleanup$restart_error (tm_tdt_ptr, txn_index);
+
+		tm_shutdown_info.state (tm_shutdown_info.count) = tm_tdt.state (txn_index);
+		tm_shutdown_info.error_code (tm_shutdown_info.count) = tm_tdt.error_code (txn_index);
+
+		if tm_tdt_entry.state ^= 0 then do;	/* could not adjust it; let the Daemon try */
+		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = ABANDONED;
+		     call tm_abandon (tm_tdt_entry.txn_id, code);
+		     if code ^= 0 then call dm_misc_util_$log (ERROR_SV, code, ME,
+			     "Abandoning TDT entry ^d for user ^a", txn_index, tm_tdt_entry.owner_name);
+		end;
+	     end;
+
+	end ADJUST_USER_TRANSACTIONS;			/* begin block */
+
+	A_tm_shutdown_info_ptr = tm_shutdown_info_ptr;
+
+	return;
+%page;
+CLEAN_UP: proc;
+
+	if tm_shutdown_info_ptr ^= null then
+	     free tm_shutdown_info in (A_area_ptr -> based_area);
+
+     end CLEAN_UP;
+%page;
+%include dm_tm_shutdown_info;
+%page;
+%include dm_tm_tdt;
+%page;
+%include dm_tm_states;
+%page;
+%include dm_log_sv_codes;
+
+
+     end tm_user_shutdown_adjust;

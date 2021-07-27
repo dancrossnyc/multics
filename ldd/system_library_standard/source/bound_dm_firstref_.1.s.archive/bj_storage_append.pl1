@@ -1,0 +1,636 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+	bj_storage_append:
+	This module actually writes to a before journal or the
+     journal's buffer.  It maintains the number of active transacitons
+     in the header of each record of the journal so crash recovery
+     "knows" how far to walk backwards to get the records needed for
+     recovery.  It makes sure there are enough free control intervals
+     to be able to abort or commit each currently active transaction
+     being journalized.  The per-transaction storage limit is enforced
+     by this module.
+
+	We try to use the BJ buffer, write the buffer to disk
+     when it full, and initialize the buffer with a new CI when the
+     buffer is on disk.
+
+	The bj_storage_append$adjust entry is provided to complete
+     an append operation that has been interrupted in the middle.
+
+	NOTE: bj_storage_append locks the pste, the $adjust entry
+     does not.
+*/
+
+/* HISTORY:
+Written  by Andre Bensoussan,  07/08/1982.
+Modified:
+08/16/82 by Andre Bensoussan: to maintain the value of
+            bj_ci.header2.first_rec_id and bj_pste.stamp_for_last_ci_put in the
+            internal proc PUT_BUFFERED_CI.
+11/01/82 by Andre Bensoussan: to guard against producing too many unsafe before
+            images, which would cause too many pages to be held in main memory;
+            if this happened, page control might not honor the contract it has
+            with before journal manager, and we might be in trouble with Bongo
+            too.
+11/18/82 by Andre Bensoussan: to reflect the change to the calling sequence to
+            bj_storage_recycle.
+12/19/82 by Andre Bensoussan: to not split record header across CI's.
+01/18/83 by Andre Bensoussan: to return bj_ix in the stamp.
+02/14/83 by Andre Bensoussan: to change the calling sequence.
+03/29/83 by Andre Bensoussan: to improve the adjust entry point.
+06/07/84 by Lee Baldwin:      Renamed dm_error_$bj_buffer_bad_address to
+            $bj_bad_buffer_address, $bj_buffer_bad_uid to $bj_bad_buffer_uid.
+11/05/84 by Matthew Pierret:  to allow for the possibility that an
+            fm_postcommit_handler or an fm_rollback_handler can be the first
+            bj record for a transaction, and to set delta_n_txn to +1 if
+            such is the case.
+11/12/84 by Maggie Sharpe:  to clean up dcls; to use addcharno instead of
+            substr (...)  = substr (...); to use ERROR_RETURN technology; to
+            replace two goto-implemented loops to do-whiles; to make
+            BUFFER_NEXT_CI more efficient by using fewer assignments to reset
+            bj_ci.header2.
+11/16/84 by Lindsey L. Spratt:  Changed the do-while loop to use the (new)
+            PUT_RECORD_IN_BUFFERED_CI internal proc.  Removed use of the
+            need_space_for_full_bj_rec_hdr flag and changed to reference
+            "next_bytes > 0" directly.
+03/14/85 by Lee A. Newcomb:  Added per-transaction storage limit support;
+            fixed to always use ERROR_RETURN to report errors, to use
+            dm_element_id.incl.pl1 instead of an auto declared structure, and
+            to declare all parameters and entries in one location; removed
+            unused dm_bj_static.incl.pl1; made a procedure to calculate the
+	  bj_txte_ptr; and fixed format.
+03/27/85 by Lee A. Newcomb:  Changed to meter the number of times transactions
+            hit a BJ's transaction storage limit.
+05/10/85 by R. Michael Tague:  Replaced based reference to dm_journal_seg with
+            explicit call to dm_hcs_$get_max_held_per_journal since
+	  dm_journal_seg is now ring 0 only.
+*/
+/* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+%page;
+bj_storage_append:
+   proc (p_bj_oid, p_ptr, p_bytes, p_delta_n_txn, p_delta_n_bi, p_rec_id,
+        p_stamp);
+
+/* START OF DECLARATIONS */
+
+/* Parameters */
+
+dcl  p_bj_oid			bit (36) aligned;	/* bj opening id. Input */
+dcl  p_bj_pste_ptr			ptr;		/* ptr to BJ pste for $adjust to use. Input */
+dcl  p_ptr			ptr;		/* ptr to logical record. Input */
+dcl  p_bytes			fixed bin;	/* number of bytes of logical record. Input */
+dcl  p_delta_n_txn			fixed bin;	/* -1, 0 or +1 . Input */
+dcl  p_delta_n_bi			fixed bin;	/* 0, 1 or n>1.  Input */
+dcl  p_rec_id			bit (36) aligned;	/* rec_id of the record appended. Output */
+dcl  p_stamp			fixed bin (71);	/* Time stamp - Output */
+
+/* Automatic */
+dcl  (
+     code				fixed bin (35) init (0),
+     curr_bytes			fixed bin init (0),
+     delta_n_txn			fixed bin init (0),
+     flush			bit (1) aligned init (DONT_FLUSH_BJ),
+     free_bytes			fixed bin init (0),
+     last_element_id		bit (36) aligned init (NO_RECORD),
+     myname			char (32)
+				init (BJ_STORAGE_APPEND_INVALID_ENTRY),
+     new_offset			fixed bin init (0),
+     new_record_ptr			ptr init (null),
+     next_bytes			fixed bin init (0),
+     number_of_slots		fixed bin init (0),
+     old_offset			fixed bin init (0),
+     prev_bytes			fixed bin init (0),
+     rec_was_stored			bit (1) aligned init (FALSE),
+     record_ptr			ptr init (null)
+     )				automatic;
+
+dcl  1 bj_ci_hdr2_template		aligned automatic,	/* see dm_bj_ci for detail */
+       2 n_slots			fixed bin (17) unaligned,
+       2 first_is_contn		bit (1) unaligned,
+       2 last_is_contd		bit (1) unaligned,
+       2 pad			bit (16) unaligned;
+
+/* Based */
+dcl  based_record			char (curr_bytes) based,
+     based_word			bit (36) aligned based;
+
+/* Builtin */
+dcl  (addcharno, addr, bin, null, ptr, rel, size, unspec)
+				builtin;
+
+/* Constant */
+dcl  (
+     APPE				char (4) init ("appe"),
+     BJ_STORAGE_APPEND_INVALID_ENTRY	char (32)
+				init (
+				"bj_storage_append ENTRY NOT SET"),
+     BJ_STORAGE_APPEND_MAIN_ENTRY	char (32) init ("bj_storage_append"),
+     BJ_STORAGE_APPEND_ADJUST_ENTRY	char (32)
+				init ("bj_storage_append$adjust"),
+     BYTES_PER_WORD			fixed bin init (4),
+     DONT_FLUSH_BJ			bit (1) aligned init (""b),
+     FALSE			bit (1) aligned init (""b),
+     FLUSH_BJ			bit (1) aligned init ("1"b),
+     NO_RECORD			bit (36) aligned init (""b),
+     TRUE				bit (1) aligned init ("1"b)
+     )				internal static options (constant);
+
+/* Entry */
+dcl  (
+     bj_oid_util$get_ptr		entry (bit (36) aligned) returns (ptr),
+     bj_pste_lock$lock		entry (ptr, bit (36) aligned),
+     bj_pste_lock$unlock		entry (ptr),
+     bj_report_err			entry (fixed bin (35), char (*)),
+     bj_storage_flush$threshold	entry (ptr),
+     bj_storage_put_buffered_ci	entry (bit (36) aligned, ptr),
+     bj_storage_recycle		entry (ptr, fixed bin (35)),
+     bj_storage_util$distance		entry (ptr, fixed bin (24) uns)
+				returns (fixed bin (24) uns),
+     clock_			entry returns (fixed bin (71)),
+     dm_hcs_$get_max_held_per_journal	entry returns (fixed bin)
+     )				external;
+
+/* External */
+dcl  (
+     dm_data_$bj_txt_ptr		ptr,
+     (
+     dm_error_$bj_bad_buffer_uid,
+     dm_error_$bj_bad_ci_no,
+     dm_error_$bj_journal_full,
+     dm_error_$bj_logic_err
+     )				fixed bin (35)
+     )				external static;
+
+/* END OF DECLARATIONS */
+%page;
+/* bj_storage_append:		repeat for reader	*/
+/*      proc (p_bj_oid, p_ptr, p_bytes, p_delta_n_txn,	*/
+/*      p_delta_n_bi, p_rec_id, p_stamp);		*/
+
+   myname = BJ_STORAGE_APPEND_MAIN_ENTRY;
+   bj_ppte_ptr = bj_oid_util$get_ptr (p_bj_oid);
+   bj_pste_ptr = bj_ppte.bj_pste_ptr;
+
+   next_bytes = p_bytes;
+
+   call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+
+
+/* Update the number of txn in the bj_rec_hdr.  This number is the	*/
+/* number of txn that actually have at least 1 record in this	*/
+/* journal; it is needed after a system crash to determine how far	*/
+/* back one should look for transactions that have to be rolled back.	*/
+/* This item cannot be maintained by the bjm_primitives themselves	*/
+/* because the bj_pste needs to be locked.			*/
+/*							*/
+/* Also, set the variable delta_n_txn to +1, -1 or 0 to indicate if	*/
+/* the number of txn has to be increased by 1, decreased by 1 or stay	*/
+/* the same.  This variable is used later to update bj_pste.n_txn.	*/
+/* It is used also by the internal proc NEXT_CI to determine if one	*/
+/* has enough free CI's for an ABORT mark for each transaction in	*/
+/* progress.						*/
+
+   bj_rec_hdr_ptr = p_ptr;
+
+   if bj_rec_hdr.type = BJ_RECORD_TYPE.BEFORE_IMAGE
+        | bj_rec_hdr.type = BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER
+        | bj_rec_hdr.type = BJ_RECORD_TYPE.FM_ROLLBACK_HANDLER then do;
+      call CHECK_TXN_STORAGE_LIMIT (rel (addr (p_rec_id)), next_bytes,
+	 bj_pste_ptr);
+      if bj_rec_hdr.prev_rec_id = NO_RECORD then
+         delta_n_txn = +1;
+      else delta_n_txn = 0;
+   end;
+   else if bj_rec_hdr.type = BJ_RECORD_TYPE.COMMITTED
+        | bj_rec_hdr.type = BJ_RECORD_TYPE.ABORTED then
+      delta_n_txn = -1;
+   else delta_n_txn = 0;
+
+   if delta_n_txn ^= p_delta_n_txn then
+      call ERROR_RETURN (dm_error_$bj_logic_err);
+
+
+   bj_rec_hdr.n_txn = bj_pste.n_txn + p_delta_n_txn;
+
+
+/* Set the pointer to the buffer and validate that the	*/
+/* buffer has the expected uid in it.  The header of the	*/
+/* buffer is supposed to contain the bj_uid.  Then resolve	*/
+/* any unstability that may be detected for that journal:	*/
+/*  - If the buffer should be put in the page file, put it.	*/
+/*  - If the buffer should be initialized with a new CI,	*/
+/*       do it.					*/
+
+   bj_ci_ptr = ptr (bj_pste_ptr, bj_pste.buffer_offset);
+
+   if bj_ci.header1.id.uid ^= bj_pste.bj_uid then
+      call ERROR_RETURN (dm_error_$bj_bad_buffer_uid);
+
+   if bj_pste.last_ci_put = bj_pste.last_ci_buffered then
+      call BUFFER_NEXT_CI;				/* Resolve unfinished "buffer_next"op */
+
+   if bj_ci.last_is_contd then
+      call PUT_BUFFERED_CI;				/* Resolve unfinished "put" op */
+%page;
+WRITE_BJ_RECORD_LOOP:
+   do while (next_bytes > 0);
+      number_of_slots = bj_ci.n_slots;
+
+      if number_of_slots = 0 then
+         old_offset =
+	    bj_pste.ci_size - 4 * (size (ci_header) + size (ci_trailer));
+
+      else old_offset = bj_ci.slot (number_of_slots).offset;
+
+      free_bytes = old_offset - 4 * (size (header2) + (number_of_slots + 1));
+
+      if next_bytes <= free_bytes then do;
+         curr_bytes = next_bytes;
+         next_bytes = 0;
+         call PUT_RECORD_IN_BUFFERED_CI ();
+      end;
+      else if 4 * size (bj_rec_hdr) <= free_bytes then do;
+         curr_bytes = free_bytes;
+         next_bytes = next_bytes - curr_bytes;
+         call PUT_RECORD_IN_BUFFERED_CI ();
+      end;
+      else do;
+         call PUT_BUFFERED_CI;			/* WOULD NOT BE NICE TO SPLIT THE HEADER */
+         call BUFFER_NEXT_CI;
+      end;
+
+   end WRITE_BJ_RECORD_LOOP;
+
+/* NOW, THE ENTIRE LOGICAL RECORD IS IN THE JOURNAL - IT IS IRREVERSIBLE */
+
+SYNC_BJ_PSTE_AND_TXTE:
+   do;
+      bj_pste.last_rec_id = bj_pste.append_state.pending_last_rec_id;
+      bj_pste.n_txn = bj_pste.append_state.pending_n_txn;
+      p_rec_id = bj_pste.append_state.pending_last_rec_id;
+      bj_pste.append_state.current_operation = "";
+   end SYNC_BJ_PSTE_AND_TXTE;
+%page;
+/* KEEP TRACK OF THE NUMBER OF DM PAGES HELD AND FLUSH BJ IF TOO MANY */
+
+   if p_delta_n_bi > 0 then do;			/* Decreased by bj_storage_flush */
+
+      bj_pste.n_bi_still_unsafe = bj_pste.n_bi_still_unsafe + p_delta_n_bi;
+      bj_ci.header2.n_bi = bj_ci.header2.n_bi + p_delta_n_bi;
+
+/* reset to 0 by BUFFER_NEXT_CI */
+
+      if bj_pste.n_bi_still_unsafe > dm_hcs_$get_max_held_per_journal () then
+         flush = FLUSH_BJ;
+      else flush = DONT_FLUSH_BJ;
+   end;
+
+   else flush = DONT_FLUSH_BJ;
+
+   call bj_pste_lock$unlock (bj_pste_ptr);
+
+   if flush then
+      call bj_storage_flush$threshold (bj_ppte_ptr);
+
+/*
+   Note - bj_storage_flush behaves as follows with respect to the pste lock:
+
+   LOCK; do some work; UNLOCK; wait for IO; RELOCK; do some work; UNLOCK;
+
+   It might save some overhead if we made the convention that
+   the caller of bj_storage_flush may already hold the lock;
+   upon return the lock would be in the same state as at the time
+   the call was made; however, the caller would have to understand
+   that bj_storage_flush does not keep the lock while waiting for I/O.
+*/
+
+
+/* p_rec_id has already been set. Set p_stamp before return */
+
+   unspec (p_stamp) = unspec (bj_ci.header1.stamp);
+
+   call RETURN ();
+
+/* end bj_storage_append; */
+%page;
+bj_storage_append$adjust:
+   entry (p_bj_pste_ptr);
+
+/* Complete an interrupted append operation */
+
+   bj_pste_ptr = p_bj_pste_ptr;
+   myname = BJ_STORAGE_APPEND_ADJUST_ENTRY;
+
+   if bj_pste.append_state.current_operation ^= APPE then
+      call ERROR_RETURN (dm_error_$bj_logic_err);
+
+   bj_ci_ptr = ptr (bj_pste_ptr, bj_pste.buffer_offset);
+
+   element_id.control_interval_id = bj_ci.header1.id.num;
+   element_id.index = bj_ci.header2.n_slots;
+
+   last_element_id = element_id_string;
+
+
+   if bj_pste.append_state.pending_last_element_id = NO_RECORD then
+      rec_was_stored = FALSE;
+   else if bj_pste.last_rec_id = bj_pste.append_state.pending_last_rec_id then
+      rec_was_stored = TRUE;
+   else if bj_pste.append_state.pending_last_element_id = last_element_id then
+      rec_was_stored = TRUE;
+   else rec_was_stored = FALSE;
+%page;
+   if rec_was_stored then
+FINISH_BJ_TABLE_UPDATES:
+      do;
+
+FINISH_BJ_PSTE_UPDATE:
+      do;
+         bj_pste.last_rec_id = bj_pste.append_state.pending_last_rec_id;
+         bj_pste.n_txn = bj_pste.append_state.pending_n_txn;
+      end FINISH_BJ_PSTE_UPDATE;
+
+FINISH_BJ_TXTE_UPDATE:				/* show record has been written */
+      do;
+         bj_txte_ptr = BJ_TXTE_PTR (bj_pste.append_state.txte_rec_id_relp);
+
+         bj_txte.append_state.pending_bj_rec_id = bj_pste.last_rec_id;
+
+         bj_txte.last_bj_rec_id = bj_pste.append_state.pending_last_rec_id;
+         bj_txte.n_rec_written = bj_txte.append_state.pending_n_rec_written;
+         bj_txte.n_bytes_written =
+	    bj_txte.append_state.pending_n_bytes_written;
+
+         if bj_txte.first_bj_rec_id = NO_RECORD then
+	  bj_txte.first_bj_rec_id = bj_txte.append_state.pending_bj_rec_id;
+
+      end FINISH_BJ_TXTE_UPDATE;
+
+   end FINISH_BJ_TABLE_UPDATES;
+
+   bj_pste.append_state.current_operation = "";
+
+   call RETURN ();
+
+/* end bj_storage_append$adjust; */
+%page;
+MAIN_RETURN:
+   return;
+%skip (4);
+RETURN:
+   proc ();
+
+/* central location for all entries to return if no errors */
+   go to MAIN_RETURN;
+
+   end RETURN;
+%skip (4);
+ERROR_RETURN:
+   proc (er_p_code);
+
+/* central location for ALL returns due to an error */
+
+dcl  er_p_code			fixed bin (35) parameter;
+
+   call bj_report_err (er_p_code, myname);		/* does not return */
+
+   end ERROR_RETURN;
+%skip (4);
+BJ_TXTE_PTR:
+   proc (btp_p_bj_txte_rec_id_relp) returns (ptr);
+
+/* Proc to calculate the txte pointer so we only need the logic in	*/
+/* one location.  This is done by using the TXT ptr in dm_data_ as	*/
+/* the starting point, adding in the offset to the pending record ID	*/
+/* (bj_pste.txte_rec_id_relp), and then using TXT entry 1 to adjust	*/
+/* the offset to the start of the entry.			*/
+
+dcl  btp_p_bj_txte_rec_id_relp	bit (18) aligned parameter;
+
+   return (
+        ptr (dm_data_$bj_txt_ptr,
+        bin (btp_p_bj_txte_rec_id_relp)
+        -
+        bin (
+        rel (
+        addr (dm_data_$bj_txt_ptr
+        -> bj_txt.entry (1).append_state.pending_bj_rec_id)))
+        + bin (rel (addr (dm_data_$bj_txt_ptr -> bj_txt.entry (1))))));
+
+   end BJ_TXTE_PTR;
+%skip (4);
+CHECK_TXN_STORAGE_LIMIT:
+   proc (ctsl_p_bj_txte_rec_id_relp, ctsl_p_next_bytes, ctsl_p_bj_pste_ptr);
+
+/* Cause a before journal full condition if the transaction would	*/
+/* exceed the per-transaction storage limit of the before journal.	*/
+
+dcl  (
+     ctsl_p_next_bytes		fixed bin,
+     ctsl_p_bj_txte_rec_id_relp	bit (18) aligned,
+     ctsl_p_bj_pste_ptr		ptr
+     )				parameter;
+dcl  ctsl_bj_txte_ptr		ptr init (null) automatic;
+
+   ctsl_bj_txte_ptr = BJ_TXTE_PTR (ctsl_p_bj_txte_rec_id_relp);
+   if ctsl_bj_txte_ptr -> bj_txte.n_bytes_written		/* curr. storage used */
+        + ctsl_p_next_bytes				/* plus requested storage */
+        > ctsl_p_bj_pste_ptr -> bj_pste.txn_storage_limit then
+TXN_AT_STORAGE_LIMIT_SO_SIGNAL_BJ_FULL:
+      do;
+      ctsl_p_bj_pste_ptr -> bj_pste.n_txn_storage_limit_hits =
+						/* meter it */
+	 ctsl_p_bj_pste_ptr -> bj_pste.n_txn_storage_limit_hits + 1;
+      call ERROR_RETURN (dm_error_$bj_journal_full);
+   end TXN_AT_STORAGE_LIMIT_SO_SIGNAL_BJ_FULL;
+   else ;						/* OK */
+
+   end CHECK_TXN_STORAGE_LIMIT;
+%page;
+PUT_RECORD_IN_BUFFERED_CI:
+   proc ();
+
+   new_offset = old_offset - curr_bytes;
+
+   new_record_ptr =
+        addcharno (bj_ci_ptr, BYTES_PER_WORD * size (ci_header) + new_offset);
+   record_ptr = addcharno (p_ptr, prev_bytes);
+
+   new_record_ptr -> based_record = record_ptr -> based_record;
+						/* STORE RECORD IN BUFFER */
+
+
+   number_of_slots = number_of_slots + 1;
+
+   bj_ci.slot (number_of_slots).offset = new_offset;
+   bj_ci.slot (number_of_slots).length = curr_bytes;
+
+   element_id.control_interval_id = bj_pste.last_ci_buffered;
+   element_id.index = number_of_slots;
+
+
+   if prev_bytes = 0 then				/* First element_id is rec_id */
+      do;
+      bj_pste.append_state.current_operation = "";
+
+      bj_pste.append_state.pending_n_txn = bj_pste.n_txn + p_delta_n_txn;
+      bj_pste.append_state.pending_last_rec_id = element_id_string;
+      bj_pste.append_state.pending_last_element_id = NO_RECORD;
+      bj_pste.append_state.txte_rec_id_relp = rel (addr (p_rec_id));
+
+      bj_pste.append_state.current_operation = APPE;
+   end;
+
+
+   if next_bytes = 0 then				/* Last element - Logical record is
+								   about to come into existence */
+      bj_pste.append_state.pending_last_element_id = element_id_string;
+
+   if curr_bytes = p_bytes				/* Implies prev_bytes = next_bytes = 0 */
+        then
+      bj_ci.n_slots = number_of_slots;			/* ATOMIC - Brings rec into existence */
+
+   else do;
+      addr (bj_ci_hdr2_template) -> based_word =
+	 addr (bj_ci.n_slots) -> based_word;
+
+      bj_ci_hdr2_template.n_slots = number_of_slots;
+      if next_bytes > 0 then
+         bj_ci_hdr2_template.last_is_contd = TRUE;
+      if prev_bytes > 0 then do;
+         bj_ci_hdr2_template.first_is_contn = TRUE;
+         bj_ci.header2.first_rec_id = bj_pste.append_state.pending_last_rec_id;
+      end;
+
+      addr (bj_ci.n_slots) -> based_word =
+	 addr (bj_ci_hdr2_template) -> based_word;	/* ATOMIC - Brings rec into existence if storing last element */
+   end;
+
+
+   bj_ci.header1.stamp.time_modified = clock_ ();
+   bj_ci.header1.stamp.bj_idx = bj_pste.bj_ix;
+
+   if next_bytes > 0 then do;
+      call PUT_BUFFERED_CI;
+      call BUFFER_NEXT_CI;
+
+      prev_bytes = prev_bytes + curr_bytes;
+   end;
+
+   end PUT_RECORD_IN_BUFFERED_CI;
+%page;
+PUT_BUFFERED_CI:
+   proc ();
+
+/* The code of bj_storage_put_buffered_ci is repeatable.		*/
+/*	Its point of non return is the instruction:		*/
+/*							*/
+/*	bj_pste.last_ci_put = bj_pste.last_ci_buffered		*/
+
+   call bj_storage_put_buffered_ci ((bj_ppte.pf_oid), bj_pste_ptr);
+
+   return;
+
+   end PUT_BUFFERED_CI;
+%page;
+BUFFER_NEXT_CI:
+   proc;
+
+/* This code is repeatable. It can be executed any number of times	*/
+/* without any effect as long as the instruction of non-return has	*/
+/* not been executed; that instruction is:			*/
+/*	bj_pste.last_ci_bufferd = bj_ci.header.id.num		*/
+
+dcl  temp_layout_type		bit (36) aligned;
+
+
+   bj_ci.header1.id.num = NEXT_CI (bj_pste.last_ci_buffered);
+
+   temp_layout_type = bj_ci.header2.layout_type;
+   unspec (bj_ci.header2) = "0"b;
+   bj_ci.header2.layout_type = temp_layout_type;
+
+   bj_pste.last_ci_buffered = bj_ci.header1.id.num;	/* Point of non-return */
+
+/*	Buffering a CI consists merely of restting the bj_ci header of the
+	existing ci buffer for this before_journal. The fact that it has
+	been reset is recorded in the pste.			     */
+
+   return;
+
+   end BUFFER_NEXT_CI;
+%page;
+NEXT_CI:
+   proc (current) returns (fixed bin (24) uns);
+
+dcl  current			fixed bin (24) uns;
+dcl  next				fixed bin (24) uns;
+dcl  n_ci_left			fixed bin (24) uns;
+dcl  recycle_called			bit (1) init (FALSE);
+
+
+   if current < bj_pste.cl.lowest_ci | current > bj_pste.cl.highest_ci then
+      call ERROR_RETURN (dm_error_$bj_bad_ci_no);
+
+   n_ci_left =
+        bj_pste.cl.number_ci
+        - (bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_buffered)
+        + 1);
+
+   do while (n_ci_left <= bj_pste.n_txn + p_delta_n_txn);
+
+      if recycle_called then
+         call ERROR_RETURN (dm_error_$bj_logic_err);
+
+      call bj_storage_recycle (bj_ppte_ptr, code);
+      if code ^= 0 then
+         call ERROR_RETURN (code);
+
+
+      recycle_called = TRUE;
+
+      n_ci_left =
+	 bj_pste.cl.number_ci
+	 - (bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_buffered)
+	 + 1);
+   end;
+
+
+   if current < bj_pste.cl.highest_ci then
+      next = current + 1;
+   else next = bj_pste.cl.lowest_ci;
+
+
+   if next = bj_pste.cl.origin_ci then
+      call ERROR_RETURN (dm_error_$bj_logic_err);
+
+   return (next);
+
+   end NEXT_CI;
+%page;
+%include dm_bj_ppt;
+%page;
+%include dm_bj_pst;
+%page;
+%include dm_bj_pste;
+%page;
+%include dm_bj_ci;
+%page;
+%include dm_ci_header;
+%page;
+%include dm_ci_parts;
+%page;
+%include dm_element_id;
+%page;
+%include dm_bj_records;
+%page;
+%include dm_bj_txt;
+
+
+   end bj_storage_append;

@@ -1,0 +1,755 @@
+/****^  ********************************************
+        *                                          *
+        * Copyright, (C) Honeywell Bull Inc., 1988 *
+        *                                          *
+        ******************************************** */
+
+/*
+   This I/O module is for data transfer between IMFT and a communications channel being managed by tty_.
+   It converts between IMFT logical records and stream data in 8-bit characters.
+*/
+
+/* Written January 1983 by Robert Coren */
+/* Modified:  June 1983 by Robert Coren to requote attach options when building attach description */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-11-15,Oke), approve(88-08-01,MCR7948), audit(88-10-11,Farley),
+     install(88-10-14,MR12.2-1165):
+     Add support for in_dial/out_dial drivers by adding
+     imft_tty_(get_line put_chars) entries.  Also add debug code.
+  2) change(88-11-10,Beattie), approve(88-08-01,PBF7948),
+     audit(88-11-14,Farley), install(88-11-14,MR12.2-1214):
+     Changed version check to be independent of debug_output to catch
+     unexpected IO traffic from causing trouble later on.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,^ifthendo */
+
+imft_tty_:
+     procedure;
+
+	return;					/* not an entry point */
+
+/* attach a switch for communication between imft and tty_ */
+
+imft_tty_attach:
+     entry (P_iocb_ptr, P_attach_options, P_loud_sw, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	loud_sw = P_loud_sw;
+	code = 0;
+
+	iad_ptr = null ();				/* avoid freeing garbage if I/O switch already attached */
+
+	if iocb_ptr -> iocb.attach_descrip_ptr ^= null ()
+	then do;
+	     P_code = error_table_$not_detached;
+	     if loud_sw
+	     then call com_err_ (P_code, IMFT_TTY_, "For switch ^a.", iocb_ptr -> iocb.name);
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	on condition (cleanup) call cleanup_attachment (ignore_code);
+
+	allocate iad in (system_area) set (iad_ptr);
+	iad.terminal_iocb_ptr = null ();		/* keeps cleanup handler happy */
+	iad.record_buffer_ptr = null ();
+
+	iad.attach_description = "";
+	iad.open_description = "";
+
+
+	do arg_index = lbound (P_attach_options, 1) to hbound (P_attach_options, 1);
+	     iad.attach_description = iad.attach_description || " " || requote_string_ ((P_attach_options (arg_index)));
+	end;
+
+	terminal_switch_name = "tty_" || "." || rtrim (iocb_ptr -> iocb.name);
+	terminal_attach_desc = "tty_" || iad.attach_description;
+						/* note that iad.attach_description already has leading space */
+
+	call iox_$attach_ioname (terminal_switch_name, iad.terminal_iocb_ptr, terminal_attach_desc, code);
+	if code ^= 0
+	then call abort_attachment (code, "Unable to attach channel via: ^a", terminal_attach_desc);
+
+	size_of_unpacked_header = divide (36 * size (imft_logical_record_header) + 7, 8, 17, 0);
+
+	max_record_length = 4 * size (imft_logical_record_header) + IMFT_MAX_RECORD_LENGTH;
+						/* this is maximum length of real record */
+	max_record_length = divide (9 * max_record_length + 7, 8, 21, 0);
+						/* this is unpacked maximum length as we might have to read or write it */
+
+	allocate record_buffer in (system_area) set (iad.record_buffer_ptr);
+						/* Mask and complete construction of the IOCB */
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.attach_descrip_ptr = addr (iad.attach_description);
+	iocb_ptr -> iocb.attach_data_ptr = iad_ptr;
+	iocb_ptr -> iocb.open = imft_tty_open;
+	iocb_ptr -> iocb.detach_iocb = imft_tty_detach;
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+RETURN_FROM_ATTACH:
+	P_code = code;
+	return;
+%page;
+/* Open an I/O switch for file transfer */
+
+imft_tty_open:
+     entry (P_iocb_ptr, P_open_mode, P_open_sw, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	if iocb_ptr -> iocb.open_descrip_ptr ^= null ()
+	then do;
+	     P_code = error_table_$not_closed;
+	     return;
+	end;
+
+	open_mode = P_open_mode;
+	input_allowed, output_allowed = "0"b;		/* we don't know about either yet */
+
+	if open_mode = Sequential_input
+	then do;
+	     tty_open_mode = Stream_input;
+	     input_allowed = "1"b;
+	end;
+
+	else if open_mode = Sequential_output
+	then do;
+	     tty_open_mode = Stream_output;
+	     output_allowed = "1"b;
+	end;
+
+	else if open_mode = Sequential_input_output
+	then do;
+	     tty_open_mode = Stream_input_output;
+	     input_allowed, output_allowed = "1"b;
+	end;
+
+	else do;
+	     P_code = error_table_$bad_mode;
+	     return;
+	end;
+
+	call iox_$open (iad.terminal_iocb_ptr, tty_open_mode, "0"b, P_code);
+	if P_code ^= 0
+	then return;
+
+	call iox_$modes (iad.terminal_iocb_ptr, "force,init,rawi,rawo,^blk_xfer,^breakall,^iflow,^oflow,^no_outp,8bit",
+	     old_modes, ignore_code);			/* This allows us to use 8-bit characters */
+
+	iad.open_description = rtrim (iox_modes (open_mode));
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.get_line = imft_tty_get_line;
+	iocb_ptr -> iocb.put_chars = imft_tty_put_chars;
+
+	if input_allowed
+	then iocb_ptr -> iocb.read_record = imft_tty_read_record;
+
+	if output_allowed
+	then iocb_ptr -> iocb.write_record = imft_tty_write_record;
+
+	iocb_ptr -> iocb.control = imft_tty_control;
+	iocb_ptr -> iocb.modes = imft_tty_modes;
+
+	iocb_ptr -> iocb.close = imft_tty_close;
+	iocb_ptr -> iocb.detach_iocb = imft_tty_detach;
+
+	iocb_ptr -> iocb.open_descrip_ptr = addr (iad.open_description);
+						/* it's now open */
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = 0;
+	return;
+%page;
+/* Close an I/O switch used for file transfer */
+
+imft_tty_close:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	code = 0;
+
+	if iocb_ptr -> iocb.open_descrip_ptr = null ()
+	then do;
+	     P_code = error_table_$not_open;
+	     return;
+	end;
+
+	call iox_$close (iad.terminal_iocb_ptr, code);
+	if (code = error_table_$not_open) | (code = error_table_$not_attached)
+	then code = 0;
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.open_descrip_ptr = null ();
+
+	iocb_ptr -> iocb.open = imft_tty_open;
+	iocb_ptr -> iocb.detach_iocb = imft_tty_detach;
+
+	iocb_ptr -> iocb.control, iocb_ptr -> iocb.modes, iocb_ptr -> iocb.read_record, iocb_ptr -> iocb.write_record =
+	     iox_$err_no_operation;
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = code;
+
+	return;
+%page;
+/* Detach an I/O switch from file transfer */
+
+imft_tty_detach:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	code = 0;
+
+	if iocb_ptr -> iocb.attach_descrip_ptr = null ()
+	then do;
+	     P_code = error_table_$not_attached;
+	     return;
+	end;
+
+	if iocb_ptr -> iocb.open_descrip_ptr ^= null ()
+	then do;
+	     P_code = error_table_$not_closed;
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	call cleanup_attachment (code);
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+
+	iocb_ptr -> iocb.attach_descrip_ptr = null ();	/* it's detached */
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = code;				/* in case trouble freeing the channel */
+	return;
+%page;
+/* Perform control operations on an I/O switch attached for file transfer */
+
+imft_tty_control:
+     entry (P_iocb_ptr, P_order, P_info_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$control (iad.terminal_iocb_ptr, P_order, P_info_ptr, P_code);
+						/* just pass all orders on */
+	return;
+%skip (10);
+/* Change modes: no modes are supported */
+
+imft_tty_modes:
+     entry (P_iocb_ptr, P_new_modes, P_old_modes, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	P_old_modes = "";				/* no modes are reflected to caller */
+
+	if P_new_modes = ""
+	then P_code = 0;
+	else P_code = error_table_$bad_mode;
+
+	return;
+%page;
+/*
+   Get a character line from the basic connection.  Used for protocol setup
+   in the out_dial connection.
+*/
+
+imft_tty_get_line:
+     entry (P_iocb_ptr, P_buffer_ptr, P_buffer_max_length, P_data_lth, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$get_line (iad.terminal_iocb_ptr, P_buffer_ptr, P_buffer_max_length, P_data_lth, P_code);
+	if debug_output
+	then call debug_out ("get_line", P_buffer_ptr, (P_data_lth));
+	return;
+%skip (10);
+/*
+   Put a character string to the basic connection.  Used for potocol setup
+   in the out_dial connection, and a prompt on the in_dial connection.
+*/
+
+imft_tty_put_chars:
+     entry (P_iocb_ptr, P_buffer_ptr, P_data_lth, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$put_chars (iad.terminal_iocb_ptr, P_buffer_ptr, P_data_lth, P_code);
+	if debug_output
+	then call debug_out ("put_chars", P_buffer_ptr, (P_data_lth));
+	return;
+%page;
+/* given an IMFT logical record, write it in stream mode, unpacked if necessary */
+
+imft_tty_write_record:
+     entry (P_iocb_ptr, P_record_ptr, P_record_length, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	ilr_ptr = P_record_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	buffer_ptr = iad.record_buffer_ptr;
+
+/* header first, which is always binary, and so needs to be unpacked */
+
+	call unpack (ilr_ptr, buffer_ptr, 4 * size (imft_logical_record_header), unpacked_bytes);
+
+	if imft_logical_record.version ^= IMFT_LOGICAL_RECORD_VERSION_1
+	then do;
+	     if debug_output
+	     then do;
+		call ioa_ ("Version Sent: ^a^/Version Desired: ^a", imft_logical_record.version,
+		     IMFT_LOGICAL_RECORD_VERSION_1);
+		call debug_out ("write_record (header)", ilr_ptr, 4 * size (imft_logical_record_header));
+		call debug_out ("unpacked header", buffer_ptr, (unpacked_bytes));
+	     end;
+	     P_code = error_table_$unimplemented_version;
+	     return;
+	end;
+
+	call iox_$put_chars (iad.terminal_iocb_ptr, buffer_ptr, unpacked_bytes, P_code);
+	if debug_output
+	then call debug_out ("write_record (header)", buffer_ptr, (unpacked_bytes));
+	if P_code ^= 0
+	then return;
+
+	if imft_logical_record.length > 0
+	then do;
+	     if imft_logical_record.binary
+	     then do;				/* have to unpack it */
+		call unpack (addr (imft_logical_record.contents), buffer_ptr, imft_logical_record.length,
+		     unpacked_bytes);
+		call iox_$put_chars (iad.terminal_iocb_ptr, buffer_ptr, unpacked_bytes, P_code);
+		if debug_output
+		then call debug_out ("write_record (binary body)", buffer_ptr, (unpacked_bytes));
+	     end;
+
+	     else do;
+		call iox_$put_chars (iad.terminal_iocb_ptr, addr (imft_logical_record.contents),
+		     imft_logical_record.length, P_code);
+		if debug_output
+		then call debug_out ("write_record (char body)", addr (imft_logical_record.contents),
+			(imft_logical_record.length));
+	     end;
+	end;
+
+	return;
+%page;
+/* read characters from the switch and put them into a logical record to return to the caller */
+
+imft_tty_read_record:
+     entry (P_iocb_ptr, P_record_ptr, P_max_length, P_record_length, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	ilr_ptr = P_record_ptr;
+	buffer_ptr = iad.record_buffer_ptr;
+
+	if P_max_length < 4 * size (imft_logical_record_header)
+	then do;					/* can't even hold header, this is absurd */
+	     code = error_table_$smallarg;		/* long_record would give the wrong idea */
+	     return;
+	end;
+
+/* read the header first -- it always has to be packed */
+
+	chars_read = 0;
+	do while (chars_read < size_of_unpacked_header);
+	     call iox_$get_chars (iad.terminal_iocb_ptr, addcharno (buffer_ptr, chars_read),
+		size_of_unpacked_header - chars_read, chars_read_this_time, P_code);
+	     if P_code ^= 0
+	     then return;
+
+	     chars_read = chars_read + chars_read_this_time;
+	end;
+
+	if debug_output
+	then call debug_out ("read_record (header)", buffer_ptr, (chars_read));
+	call pack (buffer_ptr, ilr_ptr, (size_of_unpacked_header), size_of_packed_header);
+
+	if imft_logical_record.version ^= IMFT_LOGICAL_RECORD_VERSION_1
+	then do;
+	     if debug_output
+	     then do;
+		call ioa_ ("Version Received: ^a^/Version Desired: ^a", imft_logical_record.version,
+		     IMFT_LOGICAL_RECORD_VERSION_1);
+		call debug_out ("read_record (header)", buffer_ptr, (chars_read));
+		call debug_out ("packed header", ilr_ptr, (chars_read / 8) * 9);
+	     end;
+	     P_code = error_table_$unimplemented_version;
+	     return;
+	end;
+
+	if imft_logical_record.length = 0
+	then do;					/* record consists of header only */
+	     P_record_length = 4 * size (imft_logical_record_header);
+	     return;
+	end;
+
+	room_left = P_max_length - size_of_packed_header;
+	chars_read = 0;
+
+	if imft_logical_record.binary
+	then do;					/* we'll have to pack the rest, too */
+	     raw_chars_read = 0;
+	     chars_to_read = divide (9 * imft_logical_record.length + 7, 8, 21, 0);
+	     max_unpacked_chars = divide (9 * room_left + 7, 8, 21, 0);
+	     actual_limit = min (chars_to_read, max_unpacked_chars);
+
+	     do while (raw_chars_read < actual_limit);
+		call iox_$get_chars (iad.terminal_iocb_ptr, addcharno (buffer_ptr, raw_chars_read),
+		     actual_limit - raw_chars_read, chars_read_this_time, P_code);
+		if P_code ^= 0
+		then return;
+
+		if raw_chars_read + chars_read_this_time > max_unpacked_chars
+		then do;
+		     chars_read_this_time = max_unpacked_chars - raw_chars_read;
+		     P_code = error_table_$long_record;
+		end;
+
+		raw_chars_read = raw_chars_read + chars_read_this_time;
+	     end;
+	     if debug_output
+	     then call debug_out ("read_record (binary body)", buffer_ptr, (raw_chars_read));
+	     call pack (buffer_ptr, addr (imft_logical_record.contents), raw_chars_read, chars_read);
+	end;
+
+	else do;					/* not binary data, doesn't need packing */
+	     chars_to_read = imft_logical_record.length;
+
+	     do while (chars_read < imft_logical_record.length & room_left > 0);
+		n_chars = min (chars_to_read, room_left);
+		call iox_$get_chars (iad.terminal_iocb_ptr,
+		     addcharno (addr (imft_logical_record.contents), chars_read), n_chars, chars_read_this_time,
+		     P_code);
+		if P_code ^= 0
+		then return;
+
+		chars_read = chars_read + chars_read_this_time;
+		chars_to_read = chars_to_read - chars_read_this_time;
+		room_left = room_left - chars_read_this_time;
+	     end;
+
+	     if chars_read < imft_logical_record.length
+	     then P_code = error_table_$long_record;
+	end;
+
+	if debug_output
+	then call debug_out ("read_record (char body)", addr (imft_logical_record.contents), (chars_read));
+	P_record_length = 4 * size (imft_logical_record_header) + chars_read;
+	return;
+%page;
+/* pair of subroutines for converting between 8 bits/byte and 9 bits/byte */
+
+pack_unpack:
+     procedure;
+
+	return;					/* not to be called */
+
+dcl  packed_byte_ptr pointer parameter;
+dcl  unpacked_byte_ptr pointer parameter;
+dcl  P_input_length fixed bin (21) parameter;
+dcl  P_output_length fixed bin (21) parameter;
+
+dcl  unpacked_length fixed bin;
+dcl  packed_bytes (unpacked_length) bit (8) unaligned based (packed_byte_ptr);
+dcl  unpacked_bytes (unpacked_length) bit (9) unaligned based (unpacked_byte_ptr);
+
+pack:
+     entry (unpacked_byte_ptr, packed_byte_ptr, P_input_length, P_output_length);
+
+/* input has high-order bit of every 9 off, + 8 data bits; pack it into binary */
+
+	unpacked_length = P_input_length;
+	P_output_length = divide (8 * unpacked_length, 9, 21, 0);
+	packed_bytes = substr (unpacked_bytes, 2);	/* simple as that! */
+	return;
+
+
+unpack:
+     entry (packed_byte_ptr, unpacked_byte_ptr, P_input_length, P_output_length);
+
+/* input is binary; unpack it so that high-order bit of every 9 is 0 */
+
+	P_output_length, unpacked_length = divide (9 * P_input_length + 7, 8, 21, 0);
+	string (unpacked_bytes) = ""b;
+	substr (unpacked_bytes, 2) = packed_bytes;	/* it works in this direction, too */
+	return;
+
+     end pack_unpack;
+%page;
+/* Cleanup whatever portion of an attachment exists */
+
+cleanup_attachment:
+     procedure (P_code);
+
+dcl  P_code fixed binary (35) parameter;		/* a parameter to allow callers to ignore it */
+
+	P_code = 0;
+
+	if iad_ptr ^= null ()
+	then do;					/* there is an I/O switch */
+
+	     if iad.terminal_iocb_ptr ^= null ()
+	     then do;
+		call iox_$close (iad.terminal_iocb_ptr, ignore_code);
+		call iox_$detach_iocb (iad.terminal_iocb_ptr, P_code);
+		call iox_$destroy_iocb (iad.terminal_iocb_ptr, ignore_code);
+		iad.terminal_iocb_ptr = null ();
+	     end;
+
+	     if iad.record_buffer_ptr ^= null ()
+	     then free iad.record_buffer_ptr -> record_buffer in (system_area);
+
+	     free iad in (system_area);
+	     iad_ptr = null ();
+
+	end;
+
+	return;
+
+     end cleanup_attachment;
+%page;
+/* Wrapper to protect against errors while IPS interrupts are masked */
+
+any_other_handler:
+     procedure () options (non_quick);
+
+	if ips_mask
+	then call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	ips_mask = ""b;
+
+	call continue_to_signal_ (ignore_code);		/* not interested, */
+
+	return;
+
+     end any_other_handler;
+
+
+
+/* Abort a call to the attach entry:  print an error message if requested */
+
+abort_attachment:
+     procedure () options (variable, non_quick);
+
+dcl  the_code fixed binary (35) based (the_code_ptr);
+dcl  the_code_ptr pointer;
+
+dcl  caller_message character (256);
+
+	call cu_$arg_ptr (1, the_code_ptr, ignore_fb21, ignore_code);
+
+	if loud_sw
+	then do;					/* an error message is requested */
+	     call ioa_$general_rs (cu_$arg_list_ptr (), 2, 3, caller_message, ignore_fb21, "1"b, "0"b);
+	     call com_err_ (the_code, IMFT_TTY_, "For switch ^a: ^a", iocb_ptr -> iocb.name, caller_message);
+	end;
+
+	call cleanup_attachment (ignore_code);		/* get rid of anything that was accomplished */
+
+	if the_code = 0
+	then code = error_table_$action_not_performed;
+	else code = the_code;			/* save the error code */
+
+	go to RETURN_FROM_ATTACH;
+
+     end abort_attachment;
+%page;
+
+debug_out:
+     proc (me, buf_ptr, buf_len);
+
+dcl  me char (*);
+dcl  buf_ptr ptr;
+dcl  buf_len fixed bin;
+dcl  str char (buf_len) unaligned based (buf_ptr);
+dcl  stb bit (buf_len * 9) unaligned based (buf_ptr);
+
+	call ioa_ ("^a(^i) ^p: ""^a""", me, buf_len, buf_ptr, str);
+	call ioa_ ("^vb", buf_len * 9, stb);
+
+     end debug_out;
+%skip (4);
+dcl  debug_output bit (1) static initial ("0"b);
+
+debug_list:
+     entry;
+
+	debug_output = "1"b;
+	return;
+%page;
+
+dcl  P_buffer_max_length fixed bin (21) parameter;	/* max length of IO */
+dcl  P_buffer_ptr pointer parameter;			/* -> buffer */
+dcl  P_data_lth fixed bin (21) parameter;		/* length of IO */
+dcl  P_iocb_ptr pointer parameter;			/* -> IOCB */
+dcl  P_attach_options (*) character (*) varying parameter;	/* attach: attachment arguments */
+dcl  P_loud_sw bit (1) parameter;			/* attach: ON => attachment errors should call com_err_ */
+
+dcl  P_open_mode fixed binary parameter;		/* open: opening mode */
+dcl  P_open_sw bit (1) parameter;			/* open: obsolete parameter */
+
+dcl  P_record_ptr pointer parameter;			/* (read write)_record: -> record */
+dcl  P_record_length fixed bin (21) parameter;		/* read_record: actual length of record read */
+						/* write_record: length of record to be written */
+
+dcl  P_max_length fixed bin (21) parameter;		/* read_record: length of caller-supplied buffer */
+dcl  P_code fixed bin (35);				/* status code */
+
+
+dcl  P_order character (*) parameter;			/* control: name of control order to be performed */
+dcl  P_info_ptr pointer parameter;			/* control: -> additional information required to execute the
+						   control order */
+
+dcl  P_new_modes character (*) parameter;		/* modes: new modes to be set */
+dcl  P_old_modes character (*) parameter;		/* modes: set to modes in effect before change */
+
+/* Local copies of parameters */
+
+dcl  iocb_ptr pointer;
+dcl  code fixed binary (35);
+dcl  ignore_code fixed binary (35);
+dcl  ignore_fb21 fixed binary (21);
+dcl  loud_sw bit (1) aligned;
+dcl  open_mode fixed binary;
+
+/* other declarations */
+
+/* AUTOMATIC */
+
+dcl  system_area area aligned based (system_area_ptr);
+dcl  system_area_ptr pointer;
+
+dcl  arg_index fixed binary;				/* # of attach option being processed */
+
+dcl  terminal_attach_desc character (512);
+dcl  terminal_switch_name character (32);
+dcl  iad_ptr pointer;
+dcl  max_record_length fixed bin (21);
+dcl  tty_open_mode fixed bin;
+dcl  input_allowed bit (1);
+dcl  output_allowed bit (1);
+dcl  old_modes char (256);
+
+dcl  unpacked_bytes fixed bin (21);
+dcl  chars_read fixed bin (21);
+dcl  chars_read_this_time fixed bin (21);
+dcl  size_of_packed_header fixed bin (21);
+dcl  room_left fixed bin (21);
+dcl  raw_chars_read fixed bin (21);
+dcl  chars_to_read fixed bin (21);
+dcl  max_unpacked_chars fixed bin (21);
+dcl  n_chars fixed bin (21);
+dcl  buffer_ptr pointer;
+dcl  actual_limit fixed bin;
+dcl  ips_mask bit (36);
+
+/* BASED */
+
+dcl  record_buffer char (max_record_length) based;
+
+dcl  1 iad based (iad_ptr) aligned,
+       2 attach_description char (1024) varying,
+       2 open_description char (24) varying,
+       2 terminal_iocb_ptr pointer,
+       2 record_buffer_ptr pointer;
+
+/* ENTRIES */
+
+dcl  com_err_ entry () options (variable);
+dcl  continue_to_signal_ entry (fixed binary (35));
+dcl  cu_$arg_list_ptr entry () returns (pointer);
+dcl  cu_$arg_ptr entry (fixed binary, pointer, fixed binary (21), fixed binary (35));
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  hcs_$reset_ips_mask entry (bit (36), bit (36));
+dcl  hcs_$set_ips_mask entry (bit (36), bit (36));
+dcl  ioa_ entry () options (variable);
+dcl  ioa_$general_rs entry (pointer, fixed binary, fixed binary, character (*), fixed binary (21), bit (1), bit (1));
+dcl  iox_$attach_ioname entry (character (*), pointer, character (*), fixed binary (35));
+dcl  iox_$control entry (pointer, character (*), pointer, fixed binary (35));
+dcl  iox_$close entry (pointer, fixed binary (35));
+dcl  iox_$destroy_iocb entry (pointer, fixed binary (35));
+dcl  iox_$detach_iocb entry (pointer, fixed binary (35));
+dcl  iox_$err_no_operation entry () options (variable);
+dcl  iox_$modes entry (ptr, char (*), char (*), fixed bin (35));
+dcl  iox_$open entry (pointer, fixed binary, bit (1) aligned, fixed binary (35));
+dcl  iox_$propagate entry (pointer);
+dcl  iox_$get_chars entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$get_line entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$put_chars entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl  requote_string_ entry (char (*)) returns (char (*));
+
+/* EXTERNAL STATIC */
+
+dcl  (
+     error_table_$action_not_performed,
+     error_table_$bad_mode,
+     error_table_$long_record,
+     error_table_$not_attached,
+     error_table_$not_closed,
+     error_table_$not_detached,
+     error_table_$not_open,
+     error_table_$smallarg,
+     error_table_$unimplemented_version
+     ) fixed bin (35) external static;
+
+/* INTERNAL STATIC */
+
+dcl  IMFT_TTY_ character (32) static options (constant) initial ("imft_tty_");
+dcl  MASK_OFF bit (36) init ((36)"0"b) internal static options (constant);
+dcl  size_of_unpacked_header fixed bin internal static;
+
+/* BUILTINS & CONDITIONS */
+
+dcl  (addcharno, addr, divide, hbound, lbound, min, null, rtrim, size, string, substr) builtin;
+
+dcl  (any_other, cleanup) condition;
+%page;
+%include iocb;
+%page;
+%include iox_modes;
+%page;
+%include imft_logical_record;
+     end imft_tty_;

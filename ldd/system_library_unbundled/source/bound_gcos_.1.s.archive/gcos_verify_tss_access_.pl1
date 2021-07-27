@@ -1,0 +1,467 @@
+/* *************************************************************
+   *                                                           *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982   *
+   *                                                           *
+   * Copyright (c) 1979 by Honeywell Information Systems, Inc. *
+   *                                                           *
+   ************************************************************* */
+
+gcos_verify_tss_access_: proc (dname, ename, permissions, buf_ptr, forced_acl_flag, fms_code);
+
+/* This program attempts to simulate the method in which GCOS propagates permissions
+   thru catalogs.  On each catalog created by gtss, the 10-bit permissions word passed
+   to filact is converted to a character string and placed in the person field of an acl.
+   The project field is either "*" for general permissions or an all upper-case project
+   name for specific permissions.  The tag field is always "g".  On files, filact puts
+   the permissions in a more typical Multics acl with *.*.* for general and *.project.*
+   for specific, project again being all upper case.  Because of the way GCOS does things,
+   and because of the way in which we have implemented this on Multics, it is possible
+   that a user may be able to access a file on which he does not have the appropriate
+   Multics access.  In such a case, the appropriate access is forced for that individual
+   (person.project.instance), a bit is returned to indicate that this has been done, and
+   at gtss_ios_$close time, a call is made to gtss_verify_access_$check_forced_access
+   who removes that forced access if it is there.
+
+   Author:  Paul W. Benjamin	12/14/79
+   Changed: Mel Wilson	01/08/80 to handle multi_segment files
+   and to lessen interference between an interactive user and an absentee run
+   Changed: Sandy Bartlet     01/26/80 to allow SysDaemon and SysSfwr
+   unlimited file access
+   Changed: Sandy Bartlet	02/21/80 to fix SysDaemon/SysSfwr unlimited
+   access and to fix so msf will be able to get forced acl
+   Changed: Dave Ward	07/30/81 provided gtss_filat_error_status_ as internal for 9.0.
+
+*/
+
+dcl (dname, ename) char (*) parm;
+dcl  permissions bit (6) parm;
+dcl  buf_ptr ptr parm;
+dcl  forced_acl_flag bit parm;
+dcl  fms_code bit (72) aligned parm;
+dcl 1 fms_overlay aligned based (addr (fms_code)),
+    2 gcos_status bit (12) unal,
+    2 pad bit (60) unal;
+
+	forced_acl_flag = "0"b;
+	call user_info_ (person, umc, acct);
+	UMC = translate (umc, "QWERTYUIOPASDFGHJKLZXCVBNM", "qwertyuiopasdfghjklzxcvbnm");
+
+	call msf_manager_$open (dname, ename, fcbptr, code);
+	if code ^= 0 then do;
+	     gcos_status = gtss_filact_error_status_ (code);
+	     return;
+	end;
+
+	call hcs_$get_author (dname, ename, 1b, originator, code);
+	if code ^= 0 then do;
+	     gcos_status = gtss_filact_error_status_ (code);
+	     goto bailout;
+	end;
+
+	originator = before (after (originator, "."), ".");
+	if originator = umc | umc = "SysDaemon" | umc = "SysSfwr" then do;
+	     a = empty ();
+	     call msf_manager_$acl_list (fcbptr, addr (a), sa_ptr, null (), sa_count, code);
+	     if code ^= 0 then do;
+		if code = error_table_$incorrect_access then do;
+		     sa_count = 0;
+		end;
+		else do;
+		     gcos_status = gtss_filact_error_status_ (code);
+		     goto bailout;
+		end;
+	     end;
+	     found_sp = "1"b;			/* give the originator any permissions wanted */
+	     sa_sp = "111"b;
+	     goto check_request (bin (permissions));
+	end;
+
+
+	if ^gcos_ext_stat_$skip_umc then		/* "-drm smc" in gtss terms */
+	     prefix_level = count ((gcos_ext_stat_$pathname_prefix), ">");
+	else prefix_level = 2;			/* "-drm umc" */
+
+	temp_dir = "";				/* trim the leading ">" */
+	temp_name = after (rtrim (dname), ">");
+	do i = 1 to prefix_level;			/* get the pathname prior to the umc into temp_dir */
+	     temp_dir = temp_dir || ">" || before (temp_name, ">");
+	     temp_name = after (temp_name, ">");
+	end;
+
+	do i = 1 to hbound (cat, 1) - 1
+		while (index (temp_name, ">") ^= 0);	/* Find levels betwixt umc and files */
+	     cat_dir (i) = temp_dir;
+	     cat_name (i) = before (temp_name, ">");
+	     temp_dir = temp_dir || ">" || before (temp_name, ">");
+	     temp_name = after (temp_name, ">");
+	end;
+
+	cat_dir (i) = temp_dir;
+	cat_name (i) = temp_name;
+	cat_num = i;
+	do i = 1 to cat_num;			/* Find propagation acls for general and specific at each level.  */
+	     a = empty ();
+	     call hcs_$list_dir_acl (cat_dir (i), cat_name (i), addr (a), da_ptr, null (), da_count, code);
+	     if code ^= 0 then do;
+		if code = error_table_$incorrect_access then
+		     da_count = 0;
+		else do;
+		     gcos_status = gtss_filact_error_status_ (code);
+		     goto bailout;
+		end;
+	     end;
+
+	     found_sp, found_gp = "0"b;
+	     cat.gp (i), cat.sp (i) = "NONE";
+	     do j = 1 to da_count while (^found_gp | ^found_sp);
+		if index (da_name (j), "."||rtrim (UMC)||".g") ^= 0 then do;
+		     cat.sp (i) = substr (da_name (j), 1, 10);
+		     found_sp = "1"b;
+		end;
+		else if index (da_name (j), ".*.g") ^= 0 then do;
+		     cat.gp (i) = substr (da_name (j), 1, 10);
+		     found_gp = "1"b;
+		end;
+	     end;
+	end;
+
+/* Accumulate permissions through each catalog */
+
+	have_sp = "0"b;
+	working_perm = "0"b;
+	do i = 1 to cat_num;
+	     if ^have_sp then do;			/* no specific perms encountered yet */
+		if cat.sp (i) ^= "NONE" then do;	/* just encountered first specific permissions */
+		     working_perm = bit (cat.sp (i));	/* replace (override) accumulated g.p. */
+		     have_sp = "1"b;		/* switch to spec. perm. */
+		end;
+		else if cat.gp (i) ^= "NONE" then
+		     working_perm = working_perm | bit (cat.gp (i)); /* accumulate g.p. */
+	     end;
+
+	     else do;				/* have previously switched to specific permissions */
+		if cat.sp (i) ^= "NONE" then
+		     working_perm = bit (cat.sp (i));	/* new s.p. override old */
+	     end;
+	end;
+
+	found_sp, found_gp, sa_sp, sa_gp = "0"b;
+	a = empty ();				/* Look at segment acl */
+	call msf_manager_$acl_list (fcbptr, addr (a), sa_ptr, null (), sa_count, code);
+	if code ^= 0 then do;
+	     if code = error_table_$incorrect_access then
+		sa_count = 0;
+	     else do;
+		gcos_status = gtss_filact_error_status_ (code);
+		goto bailout;
+	     end;
+	end;
+	do i = 1 to sa_count while (^found_gp | ^found_sp);
+	     if sa_name (i) = "*.*.*" then do;
+		sa_gp = substr (sa_modes (i), 1, 3);
+		found_gp = "1"b;
+	     end;
+	     else if sa_name (i) = "*."||rtrim (UMC)||".*" then do;
+		sa_sp = substr (sa_modes (i), 1, 3);
+		found_sp = "1"b;
+	     end;
+	end;
+
+	goto check_request (bin (permissions));		/* convert gcos to multics access */
+
+
+check_request (5): check_request (6): check_request (7):
+check_request (9): check_request (10): check_request (11): check_request (12): check_request (13): check_request (14): check_request (15):
+check_request (18): check_request (19):
+check_request (21): check_request (22): check_request (23): check_request (24): check_request (25): check_request (26): check_request (27): check_request (28): check_request (29): check_request (30): check_request (31):
+check_request (34): check_request (35): check_request (36): check_request (37): check_request (38): check_request (39):
+check_request (41): check_request (42): check_request (43):
+check_request (45): check_request (46): check_request (47):
+check_request (50): check_request (51): check_request (52): check_request (53): check_request (54): check_request (55): check_request (56): check_request (57): check_request (58): check_request (59):
+check_request (61): check_request (62): check_request (63):
+	gcos_status = "4044"b3;			/* Illegal options combination. */
+	goto bailout;
+
+
+check_request (0):
+check_request (1):
+check_request (2):
+check_request (3):
+check_request (32):
+check_request (33):
+check_request (44):
+	gc_need = "1000000000"b;			/* GCOS r, Multics r */
+	mu_need = "100"b;
+	goto check_end;
+
+
+check_request (4):
+	gc_need = "0001000000"b;			/* GCOS e, Multics r */
+	mu_need = "100"b;
+	goto check_end;
+
+
+check_request (8):
+	gc_need = "0010000000"b;			/* GCOS a, Multics r */
+	mu_need = "100"b;
+	goto check_end;
+
+
+check_request (16):
+check_request (17):
+check_request (20):
+check_request (48):
+check_request (49):
+	gc_need = "0100000000"b;			/* GCOS w, Multics rw */
+	mu_need = "101"b;
+	goto check_end;
+
+
+check_request (40):
+	gc_need = "1010000000"b;			/* GCOS ra, Multics r */
+	mu_need = "100"b;
+	goto check_end;
+
+
+check_request (60):
+	gc_need = "0000000001"b;			/* GCOS x, Multics rw */
+	mu_need = "101"b;
+
+
+check_end:
+
+/* Check requested permissions vs accumulated permissions */
+	if found_sp then do;			/* honour specific perms on file */
+	     if (^mu_need | sa_sp) ^= "111"b then
+		goto permission_denied;
+	end;
+	else if have_sp then do;			/* honour specific perms on containing catalog */
+	     if (^gc_need | working_perm) ^= (10)"1"b then
+		goto permission_denied;
+	end;
+	else if ((^mu_need | sa_gp) ^= "111"b)
+	& ((^gc_need | working_perm) ^= (10)"1"b) then
+	     goto permission_denied;			/* no general permissions */
+
+/* HAVE accumulated enough permissions thru catalogs. */
+	do i = 1 to sa_count;			/* check for relevant acl on file */
+	     call match_star_name_ (get_group_id_ (), sa_name (i), code);
+	     if code = 0 then
+		goto found_acl_match;
+	end;
+	goto force_access;				/* no matching acl - go force what we want */
+
+found_acl_match:
+	if (^mu_need | substr (sa_modes (i), 1, 3)) ^= "111"b then
+	     goto force_access;
+
+permission_granted:
+	gcos_status = "4000"b3;			/* Successful. */
+bailout:
+	call msf_manager_$close (fcbptr);
+	return;
+
+
+permission_denied:
+	call gcos_fms_error_ (gcos_et_$fms_perms_denied, buf_ptr, fms_code); /* Permissions denied. */
+	goto bailout;
+
+
+force_access:
+	force_name, force_dir_name = get_group_id_ ();
+	force_modes = mu_need;
+	force_dir_modes = "111"b;
+	call hcs_$add_dir_acl_entries (dname, ename, addr (force_dir_acl), 1, code);
+	if code ^= 0 then
+	     if code ^= error_table_$nondirseg then do;
+		gcos_status = gtss_filact_error_status_ (code);
+		goto bailout;
+	     end;
+	call msf_manager_$acl_add (fcbptr, addr (force_acl), 1, code);
+	if code ^= 0 then do;
+	     gcos_status = gtss_filact_error_status_ (code);
+	     goto bailout;
+	end;
+	forced_acl_flag = "1"b;
+	goto permission_granted;
+
+check_forced_access: entry (dname, ename, forced_acl_flag);
+
+/* Remove forced acl, if set. */
+
+	if forced_acl_flag then do;
+	     dl_name, force_dir_name = get_group_id_ ();
+	     force_dir_modes = "111"b;
+	     call hcs_$add_dir_acl_entries (dname, ename, addr (force_dir_acl), 1, code);
+	     call msf_manager_$open (dname, ename, fcbptr, code);
+	     if code ^= 0 then
+		return;
+	     call msf_manager_$acl_delete (fcbptr, addr (dl_array), 1, code);
+	     call msf_manager_$close (fcbptr);
+	     call hcs_$delete_dir_acl_entries (dname, ename, addr (dl_array), 1, code);
+	end;
+	return;
+
+count:	proc (in_string, target) returns (fixed bin);
+dcl (in_string, target) char (*) parm;
+
+	     j = 1;
+	     k = 0;
+	     do while (index (substr (in_string, j), target) ^= 0);
+		j = j + index (substr (in_string, j), target) + length (target) - 1;
+		k = k + 1;
+	     end;
+
+	     return (k);
+
+
+dcl (j, k) fixed bin(24);
+
+dcl (after, index, length, substr) builtin;
+	end count;
+%page;
+/* FOLLOWING PROCEDURE IS FROM gtss MODULES.
+   INCLUDED AS AN INTERNAL PROCEDURE TO RESOLVE
+   EXTERNAL REFERENCES FOR RELEASE 9.0. IN THE
+   FUTURE THIS SHOULD BE MADE AVAILABLE TO BOTH
+   SIMULATORS (dbw 07/30/81).
+*/
+gtss_filact_error_status_: proc (code) returns (bit (12));
+
+dcl  code fixed bin (35);
+
+	     if code = 0 then return ("4000"b3);	/* no error */
+
+	     if code = error_table_$bad_ring_brackets
+	     | code = error_table_$incorrect_access
+	     | code = error_table_$moderr
+	     | code = error_table_$no_s_permission
+	     | code = error_table_$no_info then return ("4003"b3); /* permissions denied */
+
+	     if code = error_table_$dirseg
+	     | code = error_table_$no_dir
+	     | code = error_table_$noentry
+	     | code = error_table_$nondirseg
+	     | code = error_table_$not_seg_type
+	     | code = error_table_$notadir then return ("4005"b3); /* incorrect cat/file description */
+
+	     if code = error_table_$namedup
+	     | code = error_table_$segnamedup then return ("4011"b3); /* duplicate name */
+
+	     if code = error_table_$logical_volume_not_connected
+	     | code = error_table_$pvid_not_found then return ("4025"b3); /* requested entry not on-line */
+
+	     return ("4047"b3);			/* unaccountable error */
+
+dcl (
+     error_table_$bad_ring_brackets,
+     error_table_$dirseg,
+     error_table_$incorrect_access,
+     error_table_$logical_volume_not_connected,
+     error_table_$moderr,
+     error_table_$namedup,
+     error_table_$no_dir,
+     error_table_$no_info,
+     error_table_$no_s_permission,
+     error_table_$noentry,
+     error_table_$nondirseg,
+     error_table_$not_seg_type,
+     error_table_$notadir,
+     error_table_$segnamedup,
+     error_table_$pvid_not_found
+     ) ext static fixed bin (35);
+
+	end gtss_filact_error_status_;
+
+dcl  a area (1000) ;
+dcl  acct char (32);
+dcl 1 cat (10),
+    2 cat_dir char (168),
+    2 cat_name char (32),
+    2 gp char (10),
+    2 sp char (10);
+dcl  cat_num fixed;
+dcl  code fixed bin(35);
+dcl 1 da_array (da_count) based (da_ptr),
+    2 da_name char (32),
+    2 da_modes bit (36),
+    2 da_code fixed bin(35);
+dcl  da_count fixed bin(24);
+dcl  da_ptr ptr;
+dcl 1 dl_array,
+    2 dl_name char (32),
+    2 dl_code fixed bin(35);
+dcl  drm_len fixed;
+dcl  exclude bit (1);
+dcl  fcbptr ptr init (null ());
+dcl 1 force_acl,
+    2 force_name char (32),
+    2 force_modes bit (36),
+    2 mbz bit (36) init ("0"b),
+    2 force_code fixed bin(35);
+dcl 1 force_dir_acl,
+    2 force_dir_name char (32),
+    2 force_dir_modes bit (36),
+    2 force_dir_code fixed bin(35);
+dcl (found_gp, found_sp) bit (1);
+dcl  gc_need bit (10);
+dcl  gp_result bit (10);
+dcl  have_sp bit;
+dcl (i, j) fixed bin(24);
+dcl  mu_need bit (3);
+dcl  originator char (32);
+dcl  person char (22);
+dcl  prefix_level fixed bin(24);
+dcl 1 sa_array (sa_count) based (sa_ptr),
+    2 sa_name char (32),
+    2 sa_modes bit (36),
+    2 sa_pad bit (36),
+    2 sa_code fixed bin(35);
+dcl  sa_count fixed bin(24);
+dcl  sa_gp bit (3);
+dcl  sa_ptr ptr;
+dcl  sa_sp bit (3);
+dcl  sp_result bit (10);
+dcl  temp_dir char (168) varying;
+dcl  temp_name char (168) varying;
+dcl (umc, UMC) char (9);
+dcl  working_perm bit (10);
+
+
+dcl  gcos_fms_error_ entry (fixed bin(35), ptr, bit (72) aligned);
+dcl  gcos_mme_bort_$system entry options (variable);
+
+dcl (
+     gcos_et_$fms_bad_cfdesc,
+     gcos_et_$fms_perms_denied,
+     gcos_et_$unimp_mme
+     ) fixed bin(35) ext;
+
+
+%include gcos_ext_stat_;
+
+
+
+dcl
+    (error_table_$incorrect_access,
+     error_table_$nondirseg
+     ) fixed bin(35) ext;
+
+dcl  get_group_id_ entry returns (char (32));
+dcl  hcs_$add_dir_acl_entries entry (char (*), char (*), ptr, fixed bin(24), fixed bin(35));
+dcl  hcs_$delete_acl_entries entry (char (*), char (*), ptr, fixed bin(24), fixed bin(35));
+dcl  hcs_$delete_dir_acl_entries entry (char (*), char (*), ptr, fixed bin(24), fixed bin(35));
+dcl  hcs_$get_author entry (char (*), char (*), fixed bin(1), char (*), fixed bin(35));
+dcl  hcs_$list_acl entry (char (*), char (*), ptr, ptr, ptr, fixed bin(24), fixed bin(35));
+dcl  hcs_$list_dir_acl entry (char (*), char (*), ptr, ptr, ptr, fixed bin(24), fixed bin(35));
+dcl  match_star_name_ entry (char (*), char (*), fixed bin(35));
+dcl  msf_manager_$acl_add entry (ptr, ptr, fixed bin(24), fixed bin(35));
+dcl  msf_manager_$acl_delete entry (ptr, ptr, fixed bin(24), fixed bin(35));
+dcl  msf_manager_$acl_list entry (ptr, ptr, ptr, ptr, fixed bin(24), fixed bin(35));
+dcl  msf_manager_$close entry (ptr);
+dcl  msf_manager_$open entry (char (*), char (*), ptr, fixed bin(35));
+dcl  user_info_ entry (char (*), char (*), char (*));
+
+
+dcl (after, before, bin, bit, empty, index, null, rtrim, substr, translate) builtin;
+     end gcos_verify_tss_access_;

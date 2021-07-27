@@ -1,0 +1,357 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+         This  module  frees  a single key from a node of the index.  It also
+     updates the key_tail_space_used_since_last_prefix_compaction and
+     key_range.last is decremented by 1.  If the node is a branch node, the
+     nodes pointed to by the keys between the one freed and the high end of
+     node have their parent_id_strings updated to point to the new locations
+     of the keys (which slide over one to close up the gap left by the freed
+     key).
+
+          This module does all of the modification to the control interval
+     (node) in which the key to be deleted exists necessary to delete it.
+     For reasons of efficiency, it makes these modifications by bypassing
+     the collection_manager_ and calling file_manager_ directly.  Again for
+     reasons of efficiency, it does so in one call to file_manager_ by 
+     consolidating all of the modifications in one ci_parts structure.
+
+          Because this module bypasses the collection_manager_, it must
+     understand the format of the control interval.  The format is described
+     by the basic_control_interval structure (dm_cm_basic_ci.incl.pl1).
+     Following is a diagram of a control interval accompanied with the names
+     of some of the structures which overlay it:
+     
+     basic_control_interval.header, bci_header
+     |          basic_control_interval.datum_position_table, slots
+     |          |
+     v          v
+      ------------------------------------------------------------------
+     |          | | | | | | | | |               |    | / / |    | / |   |
+     | 20 bytes | | four bytes| | un-used space |    |/ / /|    |/ /|   |
+     |          | | per  slot | |               |    | / / |    | / |   |
+      ------------------------------------------------------------------
+                                                  ^     ^         ^   ^
+                                                  |     |         |   |
+                                                  |     free space    |
+                                                  |                   |
+                                                  stored data - keys and
+                                                     index CI header
+     
+     This control interval is not modified in place. New values for parts
+     of the control interval are kept in local buffers.  Four modifications
+     are made: the bci_header is updated, part of the slots are shifted one
+     slot to the left, the last slot is made to zero and the element which
+     holds the index CI header is updated.  To make the first modification, a
+     local copy of bci_header is made, modified and identified as a new value
+     to be placed where the old bci_header was.  The shift is accomplished by
+     identifiying the slots to the right of the slot of the key being deleted
+     as a new part to be placed starting at the slot of the old key. Since the
+     values of the slots are not actually change, just moved, a local copy is
+     not necessary.  A one-word constant is used as the new value to be placed
+     on top of the last slot.  An automatic copy of the index CI header is
+     passed to this procedure, is updated and placed over its old location in
+     the control interval.
+     
+     The parameter p_node_ptr must point to a control interval in a file.
+     This pointer should have been set by calling
+     collection_manager_$get_control_interval_ptr or file_manager_$get_ci_ptr.
+     
+     The parameter p_common_ci_header_ptr points to the index CI header
+     (the structure common_ci_header and one of leaf_ci_header or
+     branch_ci_header).  This must not point directly into the control
+     interval but point to some local copy of the index CI header.  The index
+     CI header is stored as the first element in the control interval.
+     
+     The parameter p_key_id_string consists of two parts, the control interval
+     id of the control interval to which p_node_ptr points and the index in
+     the slot table (datum_position_table) of the key to be deleted.
+     
+     The parameter p_index_cursor_ptr points to an index cursor.
+*/
+
+/* HISTORY:
+
+Written by Lindsey L. Spratt, 08/06/82.
+Modified:
+10/18/82 by Matthew Pierret:  Corrected cm_$get_element calling sequence by
+            removing offset/length arguments.  Fixed call to sub_err_ in
+            check_version by adding '"s", null, 0' arguments.
+12/10/82 by Lindsey Spratt:  Fixed to leave the the key_range.first and
+	  key_range.last equal to 0 after deleting the last key in the
+	  control interval.
+02/28/83 by Lindsey Spratt:  Updated to use version 3 of the index_cursor.
+04/27/83 by Lindsey L. Spratt:  Fixed to update the parent_id_strings of the
+            branch nodes pointed to by keys which are moved as a result of the
+            deletion.
+11/08/83 by Lindsey L. Spratt:  Changed to use the "buffered" access method.
+            ALso changed to use the "call ERROR_RETURN (code)" protocol.
+03/28/84 by Matthew Pierret:  Changed to modify the control interval without
+            calling collection_manager_, but by setting up a ci_parts structure
+            on its own and calling file_manager_$put. p_node_ptr must now point
+            directly to the CI in the file instead of to a buffer because a
+            CI buffer would not be updated when the actual CI is updated by
+            file_manager_$put.
+10/12/84 by Matthew Pierret:  Changed to use the new dm_cm_basic_ci and
+            dm_cm_basic_ci_const include files.
+*/
+
+/* format: style2,ind3 */
+
+im_simple_delete:
+   proc (p_node_ptr, p_index_cursor_ptr, p_common_ci_header_ptr, p_key_id_string, p_code);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+      dcl	    p_node_ptr	       ptr parameter;
+      dcl	    p_index_cursor_ptr     ptr parameter;
+      dcl	    p_common_ci_header_ptr ptr parameter;
+      dcl	    p_key_id_string	       bit (36) aligned parameter;
+      dcl	    p_code	       fixed bin (35) parameter;
+
+/* Automatic */
+
+      dcl	    code		       fixed bin (35) init (0);
+      dcl	    file_opening_id	       bit (36) aligned;
+      dcl	    index_ci_header_slot_ptr
+			       ptr init (null);
+      dcl	    key_ci_id	       fixed bin (24) unsigned;
+      dcl	    key_index	       fixed bin (12) unsigned;
+      dcl	    key_length_in_bits     fixed bin (35);
+      dcl	    key_length_in_bytes    fixed bin;
+      dcl	    key_offset_in_bytes    fixed bin;
+      dcl	    key_slot_offset_in_bytes
+			       fixed bin;
+      dcl	    key_slot_ptr	       ptr init (null);
+      dcl	    1 local_bci_header     aligned like bci_header;
+      dcl	    local_ci_parts_buffer  (10) fixed bin (71) init ((10) 0);
+						/* Four parts */
+      dcl	    node_ptr	       ptr init (null);
+
+/* Based */
+
+      dcl	    1 p_key_id	       aligned like element_id based (addr (p_key_id_string));
+      dcl	    1 index_ci_header_slot aligned like datum_slot based (index_ci_header_slot_ptr);
+      dcl	    1 key_slot	       aligned like datum_slot based (key_slot_ptr);
+
+/* Builtin */
+
+      dcl	    (addcharno, addr, ceil, divide, max, null, size, unspec)
+			       builtin;
+
+/* Constant */
+
+      dcl	    myname	       init ("im_simple_delete") char (16) internal static options (constant);
+      dcl	    (
+	    BYTES_PER_WORD	       init (4),
+	    BITS_PER_BYTE	       init (9)
+	    )		       fixed bin internal static options (constant);
+      dcl	    ZERO_SLOT	       init (0) fixed bin (35) internal static options (constant);
+
+      dcl	    (
+	    BCI_HEADER_PART_IDX    init (1),
+	    INDEX_CI_HEADER_PART_IDX
+			       init (2),
+	    TRAILING_SLOTS_PART_IDX
+			       init (3),
+	    LAST_SLOT_PART_IDX     init (4),
+	    NUMBER_OF_PARTS	       init (4)
+	    )		       fixed bin internal static options (constant);
+
+/* Entry */
+
+      dcl	    file_manager_$put      entry (bit (36) aligned, fixed bin (27), ptr, fixed bin (35));
+      dcl	    im_update_branches     entry (ptr, bit (36) aligned, bit (36) aligned, ptr, uns fixed bin (24) unal,
+			       uns fixed bin (12) unal, fixed bin (35));
+      dcl	    sub_err_	       entry () options (variable);
+
+/* External */
+
+      dcl	    (
+	    error_table_$unimplemented_version,
+	    dm_error_$wrong_cursor_type
+	    )		       fixed bin (35) ext;
+
+/* END OF DECLARATIONS */
+
+/* format: indcomtxt,^indblkcom */
+
+      code = 0;
+
+/**** Copy paramters into local storage for efficiency. */
+
+      node_ptr = p_node_ptr;
+
+      index_cursor_ptr = p_index_cursor_ptr;
+      if index_cursor.type ^= INDEX_CURSOR_TYPE
+      then call sub_err_ (dm_error_$wrong_cursor_type, myname, "s", null, 0,
+	      "^/Expected an ""index"" type cursor (type ^d).^/Received a cursor of type ^d instead.",
+	      INDEX_CURSOR_TYPE, index_cursor.type);
+      call CHECK_VERSION ((index_cursor.version), (INDEX_CURSOR_VERSION_3), "index_cursor");
+      file_opening_id = index_cursor.file_opening_id;
+
+      common_ci_header_ptr, leaf_ci_header_ptr, branch_ci_header_ptr = p_common_ci_header_ptr;
+
+      key_ci_id = p_key_id.control_interval_id;
+      key_index = p_key_id.index;
+
+/**** Init local buffers. */
+
+      unspec (local_bci_header) = unspec (node_ptr -> bci_header);
+      ci_parts_ptr = addr (local_ci_parts_buffer);
+      ci_parts.number_of_parts = NUMBER_OF_PARTS;
+
+/**** Get length of key to be deleted. */
+
+      key_slot_offset_in_bytes = DATUM_POSITION_TABLE_OFFSET_IN_BYTES + (key_index - 1) * BYTES_PER_WORD;
+      key_slot_ptr = addcharno (node_ptr, key_slot_offset_in_bytes);
+
+      key_offset_in_bytes = key_slot.offset_in_bytes;
+      key_length_in_bits = key_slot.length_in_bits;
+
+      if common_ci_header.is_leaf
+      then common_ci_header.key_tail_space_used_since_last_prefix_compaction =
+	      max (common_ci_header.key_tail_space_used_since_last_prefix_compaction - key_length_in_bits, 0);
+      else common_ci_header.key_tail_space_used_since_last_prefix_compaction =
+	      max (common_ci_header.key_tail_space_used_since_last_prefix_compaction
+	      - (key_length_in_bits - BRANCH_KEY_HEADER_LENGTH_IN_BITS), 0);
+
+/**** Setup to free the key by setting the ci parts to trailing shift the
+      slots to the left (if there are any) and to zero out the last slot. */
+
+      if key_index >= local_bci_header.number_of_datums
+      then ci_parts.part (TRAILING_SLOTS_PART_IDX).length_in_bytes = 0;
+						/* No trailing slots. Skip this part. */
+      else
+         do;					/* Shift trailing slots */
+	  ci_parts.part (TRAILING_SLOTS_PART_IDX).offset_in_bytes = key_slot_offset_in_bytes;
+	  ci_parts.part (TRAILING_SLOTS_PART_IDX).length_in_bytes =
+	       BYTES_PER_WORD * (local_bci_header.number_of_datums - key_index);
+	  ci_parts.part (TRAILING_SLOTS_PART_IDX).local_ptr =
+	       addcharno (node_ptr, key_slot_offset_in_bytes + BYTES_PER_WORD);
+						/* Points to slot after slot being freed.  */
+         end;
+
+      ci_parts.part (LAST_SLOT_PART_IDX).offset_in_bytes =
+	 DATUM_POSITION_TABLE_OFFSET_IN_BYTES + BYTES_PER_WORD * (local_bci_header.number_of_datums - 1);
+      ci_parts.part (LAST_SLOT_PART_IDX).length_in_bytes = BYTES_PER_WORD;
+      ci_parts.part (LAST_SLOT_PART_IDX).local_ptr = addr (ZERO_SLOT);
+
+/**** Update the bci_header.  This includes decrementing the number of
+      datums (slots) in the control interval, adding the space taken up by
+      the key to be deleted to the count of scattered free bytes, and, if the
+      contents of the key was at the beginning of the used space, change the
+      value of the start of used space. */
+
+      local_bci_header.number_of_datums = local_bci_header.number_of_datums - 1;
+      key_length_in_bytes = ceil (divide (key_length_in_bits, BITS_PER_BYTE, 35, 18));
+
+      if local_bci_header.start_of_used_space = key_offset_in_bytes
+      then local_bci_header.start_of_used_space = local_bci_header.start_of_used_space + key_length_in_bytes;
+						/* The deletion increased the size of the un-used portion */
+      else local_bci_header.scattered_free_space = local_bci_header.scattered_free_space + key_length_in_bytes;
+						/* The deletion created more scattered free space */
+
+      ci_parts.part (BCI_HEADER_PART_IDX).offset_in_bytes = 0;
+						/* bci_header is at beginning of control interval */
+      ci_parts.part (BCI_HEADER_PART_IDX).length_in_bytes = BCI_HEADER_LENGTH_IN_BYTES;
+      ci_parts.part (BCI_HEADER_PART_IDX).local_ptr = addr (local_bci_header);
+
+/**** Update key range in common_ci_header to reflect fact that there is one less key. */
+
+      if common_ci_header.key_range.last = common_ci_header.key_range.first
+      then common_ci_header.key_range.last, common_ci_header.key_range.first = 0;
+      else common_ci_header.key_range.last = common_ci_header.key_range.last - 1;
+
+/**** Replace common_ci_header.  It is the datum described by the slot
+      with the index DEFAULT_INDEX_CONTROL_INTERVAL_HEADER_SLOT.  The slot does
+      not change so is not replaced. */
+
+      index_ci_header_slot_ptr =
+	 addcharno (node_ptr,
+	 DATUM_POSITION_TABLE_OFFSET_IN_BYTES + (DEFAULT_INDEX_CONTROL_INTERVAL_HEADER_SLOT - 1) * BYTES_PER_WORD);
+
+      ci_parts.part (INDEX_CI_HEADER_PART_IDX).offset_in_bytes = index_ci_header_slot.offset_in_bytes;
+      ci_parts.part (INDEX_CI_HEADER_PART_IDX).length_in_bytes =
+	 divide (index_ci_header_slot.length_in_bits, BITS_PER_BYTE, 17, 0);
+						/* The index ci header is always an integral number of bytes long. */
+      ci_parts.part (INDEX_CI_HEADER_PART_IDX).local_ptr = common_ci_header_ptr;
+
+/**** Actually modify the control interval in the file. */
+
+      call file_manager_$put (file_opening_id, (key_ci_id), ci_parts_ptr, code);
+      if code ^= 0
+      then call ERROR_RETURN (code);
+
+
+      if ^common_ci_header.is_leaf
+      then if common_ci_header.key_range.last >= key_index
+	 then
+	    do;
+
+	    /*** There are keys higher than the one deleted,
+	         whose branch nodes need to have their
+	         parent_id_strings updated. Note that the key at
+	         key_index is now the one which was next higher
+	         than the deleted key, hence the check is for ">="
+	         instead of just ">". */
+
+	       call im_update_branches (node_ptr, file_opening_id, index_cursor.collection_id, common_ci_header_ptr,
+		  (key_ci_id), (key_index), code);
+	       if code ^= 0
+	       then call ERROR_RETURN (code);
+	    end;
+
+      p_code = 0;
+MAIN_RETURN:
+      return;
+
+
+FINISH:
+   proc ();
+   end FINISH;
+
+
+ERROR_RETURN:
+   proc (er_p_code);
+      dcl	    er_p_code	       fixed bin (35);
+      call FINISH;
+      p_code = er_p_code;
+      goto MAIN_RETURN;
+   end ERROR_RETURN;
+%page;
+CHECK_VERSION:
+   proc (p_received_version, p_expected_version, p_structure_name);
+      dcl	    p_received_version     fixed bin (35);
+      dcl	    p_expected_version     fixed bin (35);
+      dcl	    p_structure_name       char (*);
+
+      if p_expected_version ^= p_received_version
+      then call sub_err_ (error_table_$unimplemented_version, myname, "s", null, 0,
+	      "^/Expected version ^d of the ^a structure. Received version ^d instead.", p_expected_version,
+	      p_structure_name, p_received_version);
+
+   end CHECK_VERSION;
+%page;
+%include dm_im_cursor;
+%page;
+%include dm_im_key;
+%page;
+%include dm_im_ci_header;
+%page;
+%include dm_element_id;
+%page;
+%include dm_cm_basic_ci;
+%page;
+%include dm_cm_basic_ci_const;
+%page;
+%include dm_ci_parts;
+%page;
+%include dm_collmgr_entry_dcls;
+   end im_simple_delete;

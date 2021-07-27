@@ -1,0 +1,682 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4 */
+cache_tester: procedure (mcp);
+
+/* cache_tester - module to test cpu cache memory.
+   This module is called from hardware_fault after a cache_store or cache_dir parity has been detected.
+   A  test  of  cache  memory  will be performed before cache is turned back on. If errors are found in
+   cache that part of cache memory (csh1 or csh2) is left in disabled state. A  diagnostic  message  is
+   output  determining  the cache board and chip in error. If a cache parity cannot be generated with a
+   data pattern test of cache, the data structure pds$cpar_info is looked at to determine  if  the  fim
+   captured  the active data from memory and cache when the cache parity occurred. If this is true and
+   if the contents of pds$cpar_mem_data and pds$cpar_err_data only differ by one bit, this  information
+   is  used  to  output  a  diagnostic  which gives the bad board and chip and states that error is non
+   repeatable.
+
+   Originally coded by J. A. Bush 1/15/80
+   Modified 8/80 by J. A. Bush for the DPS8/70M CPU (8k cache)
+   Modified September 1981 by J. Bongiovanni for set_procs_required
+   Modified March 1982 by C. Hornig for new pc_abs.
+   Modified 03/10/83 by GA Texada to announce transient parity error.
+   Modified 03/25/83 by J. A. Bush for 16/32K cache
+   Modified and reorganized Jul 1984 by R. A. Fawcett to:
+     - Prevent OOSB in cache_priv.
+     - Report the first three errors accumulated by cache_priv.
+     - Always display the fim diagnose data if valid.
+     - Report parity only problems.
+     - Always report the state of cache on or off
+     - Set the cache correctly before returning by calling pmut.
+*/
+
+/* external entries */
+
+dcl  pc_abs$remove_core_mod entry (fixed bin (16), fixed bin (16), fixed bin (26), fixed bin (35));
+dcl  cache_priv$csh1 entry (ptr, fixed bin, ptr, fixed bin (35));
+dcl  cache_priv$csh2 entry (ptr, fixed bin, ptr, fixed bin (35));
+dcl  syserr entry options (variable);
+dcl  syserr$error_code entry options (variable);
+dcl  privileged_mode_ut$swap_sdw entry (ptr, ptr);
+dcl  privileged_mode_ut$clear_cache entry;
+dcl  set_procs_required entry (bit (8) aligned, fixed bin (35));
+dcl  freecore entry (fixed bin);
+dcl  sdw_util_$construct entry (ptr, ptr);
+dcl  max_buf fixed bin;
+						/* External static */
+
+dcl  fim_abs_seg$ ext;
+dcl  pds$cpar_err_data bit (72) aligned ext;
+dcl  pds$cpar_mem_data bit (72) aligned ext;
+dcl  pds$cpar_info bit (36) aligned ext;
+dcl  prds$cache_luf_reg bit (36) aligned ext;
+
+/* builtins */
+
+dcl  (addr, addrel, binary, bool, divide, mod, string, substr) builtin;
+
+/* Automatic */
+
+dcl  (i, j, fwp, lwp, buf_size, fim_err_bit, buf_wds, pclv, clv, ccol, cache_size, cache_size_index) fixed bin;
+dcl  absaddr fixed bin (26);
+dcl  code fixed bin (35);
+dcl  (cache_error, test_called, fim_static_agree, diagnostic_displayed, fim_mult, csh1_off, csh2_off, csh_mem) bit (1) aligned;
+dcl  fimxord bit (72) aligned;
+dcl  (segptr, cptr, cpip) ptr;
+dcl  cpu fixed bin (3);
+dcl  cpu_tag char (1);
+dcl  cpu_mask bit (8) aligned;
+
+
+/* structures and based variables */
+
+dcl  1 cfim_info aligned based (cptr),			/* cache parity info from fim */
+       (2 diagnose bit (1),				/* = "1"b if diagnostic info available */
+       2 pad1 bit (7),
+       2 csh1 bit (1),				/* state of "csh1" programable switch at TOF */
+       2 csh2 bit (1),				/* state of "csh2" programable switch at TOF */
+       2 level fixed bin (2) unsigned,			/* cache level  that has parity */
+       2 absaddr bit (24)) unaligned;			/* abs address in mem of cache parity */
+
+dcl  1 cpriv_info aligned based (cpip),			/* structure returned from cache_priv */
+       2 err_data (3),				/* 3 possible error disagnostics */
+         3 cache_data bit (72),			/* data in error from cache */
+         3 ex_or_data bit (72),			/* exclusive or of cache and mem data */
+         3 fault_reg bit (72),			/* storage for fault reg at time of error */
+
+         3 cache_addr bit (36),			/* cache address in error */
+         3 ind_reg bit (36);				/* storage for indicator reg */
+
+
+dcl  tsdw fixed bin (71);
+dcl  1 sdwi aligned like sdw_info;
+dcl  c_data (0:buf_wds - 1) bit (36) based (segptr) aligned;
+
+/* constants */
+
+dcl  CPU_TAGS char (8) int static options (constant) init ("ABCDEFGH");
+dcl  csize (0:5) fixed bin static options (constant) init (0, 2, 8, 8, 16, 32);
+dcl  lv_ex (0:5) fixed bin static options (constant) init (0, 26, 24, 24, 23, 22);
+dcl  fim_col_ex (0:5) fixed bin static options (constant) init (0, 15, 13, 13, 12, 11);
+dcl  l68_cpar_chip char (12) static options (constant) init ("FEDCBAPQRSTU");
+dcl  cpar_wwb char (6) static options (constant) init ("345678");
+dcl  dps8_chip (0:11, 0:3) char (3) int static options (constant) init (
+	"36X", "45X", "55X", "65X",			/* Bit 0, levels 0 - 3 */
+	"33W", "42W", "51W", "60W",			/* Bit 1, levels 0 - 3 */
+	"36V", "45V", "55V", "65V",			/* Bit 2, levels 0 - 3 */
+	"31U", "40U", "49U", "56U",			/* Bit 3, levels 0 - 3 */
+	"36T", "45T", "55T", "65T",			/* Bit 4, levels 0 - 3 */
+	"36S", "45S", "55S", "65S",			/* Bit 5, levels 0 - 3 */
+	"32F", "41F", "50F", "59F",			/* Bit 36, levels 0 - 3 */
+	"32E", "41E", "50E", "59E",			/* Bit 37, levels 0 - 3 */
+	"32D", "41D", "50D", "59D",			/* Bit 38, levels 0 - 3 */
+	"32C", "41C", "50C", "59C",			/* Bit 39, levels 0 - 3 */
+	"32B", "41B", "50B", "59B",			/* Bit 40, levels 0 - 3 */
+	"32A", "41A", "50A", "59A");			/* Bit 41, levels 0 - 3 */
+dcl  vs_sc_chip (0:11, 0:3) char (3) int static options (constant) init (
+	"35S", "56Q", "39J", "55C",			/* Bit 0, levels 0 - 3 */
+	"55S", "16N", "59J", "35C",			/* Bit 1, levels 0 - 3 */
+	"36Q", "40P", "29G", "15C",			/* Bit 2, levels 0 - 3 */
+	"45S", "66Q", "49J", "45C",			/* Bit 3, levels 0 - 3 */
+	"65S", "26N", "19G", "25C",			/* Bit 4, levels 0 - 3 */
+	"46Q", "50L", "39G", "13A",			/* Bit 5, levels 0 - 3 */
+	"43W", "10L", "62E", "23A",			/* Bit 36, levels 0 - 3 */
+	"53U", "30L", "42E", "43A",			/* Bit 37, levels 0 - 3 */
+	"73U", "19J", "22E", "63A",			/* Bit 38, levels 0 - 3 */
+	"43U", "20L", "52E", "33A",			/* Bit 39, levels 0 - 3 */
+	"63U", "40L", "32E", "53A",			/* Bit 40, levels 0 - 3 */
+	"83U", "29J", "12E", "73A");			/* Bit 41, levels 0 - 3 */
+dcl  d_pattern (4) bit (36) static options (constant) init ("777777777777"b3, "0"b, "252525252525"b3, "525252525252"b3);
+%page;
+	scup = addr (mc.scu);			/* get our cpu number from SCU data */
+	cpu = binary (scu.cpu_no, 3);
+	cpu_tag = substr (CPU_TAGS, cpu + 1, 1);	/* save cpu tag for messages */
+	cpu_mask = "0"b;
+	substr (cpu_mask, cpu + 1, 1) = "1"b;		/* set the bitstring for set_procs_required */
+	cache_size_index = scs$processor_data (cpu).cache_size; /* get cache index */
+	cache_size = csize (cache_size_index);		/*  set cache size in 1024 word blocks */
+	buf_size = divide (cache_size, 2, 17, 0);	/* only testing half of cache at a time */
+	buf_wds = buf_size * 1024;			/* set up number of words */
+	cptr = addr (pds$cpar_info);			/* get ptr to cfim_info */
+	fim_static_agree, diagnostic_displayed = "0"b;	/* initialize display flags */
+	csh1_off, csh2_off = "0"b;			/* initialize cache disable flags */
+	test_called, cache_error = "0"b;		/* initialize test_flags */
+	call display_fimerror;			/* print the reason we were called */
+
+
+/* first a contiguous wired buffer that is modulo our cache size */
+	max_buf = 2 * buf_size;
+	call pc_abs$remove_core_mod ((max_buf), (cache_size), absaddr, code);
+	if code ^= 0 then do;			/* couln't get wired buffer */
+	     call syserr (ANNOUNCE, "cache_tester: Unable to allocate wired buffer");
+	     call enable_cache;			/* go reenable cache mode reg */
+	     return;
+	end;
+
+/* now set up sdw for fim_abs_seg and swap it for original */
+
+	segptr = addr (fim_abs_seg$);			/* get ptr to fim_abs_seg */
+
+	unspec (sdwi) = ""b;
+	sdwi.access.read, sdwi.access.write = "1"b;
+	sdwi.flags.cache = "1"b;
+	sdwi.address = absaddr;
+	sdwi.size = 1024 * max_buf;
+	call sdw_util_$construct (addr (tsdw), addr (sdwi));
+	call privileged_mode_ut$swap_sdw (segptr, addr (tsdw));
+						/* swap the sdw */
+
+/* set ptr to our wired down info structure */
+
+	cpip = addrel (segptr, buf_wds);		/* info struct at end of buffer */
+	unspec (cpriv_info) = ""b;			/* clear it out -- cache_priv uses sxl stores */
+
+/* now set up each of 4 data patterns in our wired buffer until we get a cache error */
+
+
+	call set_procs_required (cpu_mask, code);	/* run on CPU in error */
+	if code ^= 0 then do;
+	     call syserr$error_code (ANNOUNCE, code, "cache_tester: Unable to set CPU required to ^a cache is off",
+		substr (CPU_TAGS, cpu + 1, 1));
+	     goto return_buffer;
+	end;
+
+	cache_error = "0"b;				/* reset terminate condition */
+	do i = 1 to 4 while (^cache_error);
+	     do j = 0 to buf_wds - 1;			/* fill up cache buffer */
+		c_data (j) = d_pattern (i);
+	     end;
+	     call test_cache;
+	end;
+	if ^cache_error then do;
+						/* if there has not been an error try relative address pattern */
+	     do i = 0 to buf_wds - 1;
+		c_data (i) = unspec (i);
+	     end;
+	     call test_cache;
+	end;
+	call enable_cache;				/* go reenable cache mode reg */
+
+
+/* now reset sdw for fim_abs_seg and free up wired cache buffer core */
+
+return_buffer:
+	tsdw = 0;
+	call privileged_mode_ut$swap_sdw (segptr, addr (tsdw));
+						/* swap the sdw */
+	fwp = divide (absaddr, 1024, 17, 0);		/* get mod 1024 core slot */
+	lwp = fwp + max_buf - 1;			/* get last page address */
+	do i = fwp to lwp;				/* go through each core map entry */
+	     call freecore (i);			/* and give page back to paging pool */
+	end;
+
+	return;
+%page;
+
+/* display_fimerror - internal procedure to display cache error data captured in fim */
+
+display_fimerror: proc;
+
+	if cfim_info.diagnose then do;		/* if a valid data capture exits */
+	     fimxord = bool (pds$cpar_err_data, pds$cpar_mem_data, "0110"b); /* XOR data captured */
+	     call find_err_bit (fimxord, fim_err_bit, fim_mult); /* get bit in error */
+	     if fim_err_bit = -1 then fim_static_agree = "1"b; /* couldn't find an error parity only ?? 			*/
+
+	     call syserr (ANNOUNCE, "cache_tester: cache parity error detected on CPU ^a",
+		cpu_tag);
+	     
+	     if fim_err_bit = -1 then
+		call syserr (ANNOUNCE, "The cache data is equal to the memory data. Possible parity generation problem for level ^d",cfim_info.level);
+	     else if ^fim_mult then			/* if not multiple bit failure */
+		call get_bcx ((cfim_info.level), fim_err_bit);
+						/* go display board and chip */
+	     else do;				/* multiple bit failure go display multtiple  message */
+		ccol = bin (substr (cfim_info.absaddr, fim_col_ex (cache_size_index)));
+		ccol = divide (ccol, 4, 17, 0);
+		call mult_mess ((cfim_info.level), ccol, pds$cpar_err_data, pds$cpar_mem_data);
+						/* display multiple bit message */
+	     end;
+	end;
+	else fim_static_agree = "1"b;			/* not valid data captured, set flag */
+     end display_fimerror;
+%page;
+/* enable_cache - internal procedure to set up cache mode reg constant in prds */
+
+enable_cache: proc;
+
+dcl  1 c_mode_reg aligned,				/* program settable bits in cache_mode reg */
+       (2 pad1 bit (18),
+       2 csh1 bit (1),				/* lower half of cache mem enabled */
+       2 csh2 bit (1),				/* upper half of cache mem enabled */
+       2 opnd_on bit (1),				/* operands enabled in cache */
+       2 inst_on bit (1),				/* instructions enabled in cache */
+       2 csh_dump bit (1),				/* on if dumping cache */
+       2 pad2 bit (11),
+       2 luf_timer bit (2)) unaligned;			/* lockup fault timer */
+dcl  other_state bit (1);
+	string (c_mode_reg) = "0"b;			/* initialize template first */
+	c_mode_reg.opnd_on = "1"b;			/* set operand encachability enable */
+	c_mode_reg.inst_on = "1"b;			/* set instruction encachability enable */
+	c_mode_reg.luf_timer = "11"b;			/* set LUF timer to max value */
+	if ^csh1_off & cfim_info.csh1 then		/* if csh1 is not to be turned off */
+	     c_mode_reg.csh1 = "1"b;			/* enable it */
+	if ^csh2_off & cfim_info.csh2 then		/* if csh2 is not to be turned off */
+	     c_mode_reg.csh2 = "1"b;			/* enable it */
+	cpu_mask = "0"b;
+	substr (cpu_mask, cpu + 1, 1) = "1"b;
+	call set_procs_required (cpu_mask, code);	/* Make sure we run on the right CPU */
+	if code ^= 0 then do;
+	     call syserr$error_code (BEEP, code, "cache_tester: Unable to run on CPU ^a to ^[disable^;enable^] cache (cache is off)",
+		cpu_tag, (^(c_mode_reg.csh1 | c_mode_reg.csh2) | csh1_off | csh2_off));
+	     return;
+	end;
+
+	prds$cache_luf_reg = prds$cache_luf_reg | string (c_mode_reg);
+						/* set in value */
+	call set_procs_required ("0"b, code);		/* reset proc required */
+	pds$cpar_info = "0"b;			/* zero out info from fim */
+	if ^cache_error then
+	     call syserr (BEEP,
+		"cache_tester: ^[Error not reproducible in^;Could not test^] cache memory for CPU ^a^/^-^4xCache will remain as Lower ^[on^;off^] Upper ^[on^;off^]",
+		test_called, cpu_tag, c_mode_reg.csh1, c_mode_reg.csh2);
+
+	else if ^c_mode_reg.csh1 & ^c_mode_reg.csh2 then	/* if no cache enabled */
+	     call syserr (BEEP, "cache_tester: Entire cache memory for CPU ^a has been disabled", cpu_tag);
+	else if csh1_off | csh2_off then do;		/* if either half to be turned off */
+	     if csh1_off then do;
+		csh_mem = "1"b;			/* turn csh1 off */
+		other_state = c_mode_reg.csh2;
+	     end;
+	     else do;
+		csh_mem = "0"b;
+		other_state = c_mode_reg.csh1;
+	     end;
+	     call syserr (BEEP, "cache_tester: ^[Lower^;Upper^] cache memory (csh^[1^;2^]) for CPU ^a has been turned off^/^-^4x^[Upper^;Lower^] cache was ^[on^;off^] and has not been changed",
+		csh_mem, csh_mem, cpu_tag, csh_mem, other_state);
+	end;
+	call privileged_mode_ut$clear_cache;		/* set the cache correctly */
+     end enable_cache;
+%page;
+/* find_err_bit - internal procedure to find single bit in error given exclusive or input data */
+
+find_err_bit: proc (xord, err_bit, multiple);
+
+dcl  xord bit (72) aligned;				/* exclusive or input data */
+dcl  (err_bit, i, j) fixed bin;
+dcl  multiple bit (1) aligned;
+
+	multiple = "0"b;				/* initialize multiple failure flag */
+	j = 0;					/* initialize error bit count	*/
+	do i = 0 to 71;				/* go through each bit */
+	     if i = 0 | i = 36 then			/* if first bit of each word */
+		if substr (xord, i + 1, 36) = "0"b then do; /* skip entire word if 0 */
+		     i = i + 35;
+		     go to nxt_i;
+		end;
+	     if substr (xord, i + 1, 1) ^= "0"b then do;	/* found bit in error */
+		err_bit = i;			/* copy bit number */
+		j = j + 1;			/* increment error counter */
+	     end;
+nxt_i:
+	end;
+	if j > 1 then				/* if multiple bit failure, */
+	     multiple = "1"b;			/* set multiple flag */
+	else if j = 0 then err_bit = -1;		/* tell caller we couldn't find a bit in error	*/
+
+     end find_err_bit;
+%page;
+
+/* get_bcx - internal procedure to display board and chip diagnostic */
+
+get_bcx: proc (level, err_bit);
+
+dcl  (level, err_bit, bdx, cpx, i) fixed bin;
+dcl  odd_wd bit (1) aligned;
+
+	odd_wd = "0"b;
+	if err_bit > 35 then do;			/* if bit in second word of pair  */
+	     odd_wd = "1"b;				/* set indicator and subtract off */
+	     i = err_bit - 36;			/*  36 bits to get relative bit # */
+	end;
+	else i = err_bit;
+	bdx = divide (i, 6, 17, 0);			/* determine board index */
+	cpx = mod (i, 6);				/* and chip index */
+	if odd_wd then				/* if this was the odd word... */
+	     cpx = cpx + 6;				/* set index for second 6 chars */
+
+/* now display board and chip in error */
+
+	if cache_size_index = 1 then			/* if 2k cache ... */
+	     call syserr (ANNOUNCE, "^-at:^3xboard AB1^a, chip ^o^a", substr (cpar_wwb, bdx + 1, 1), level,
+		substr (l68_cpar_chip, cpx + 1, 1));
+	else if cache_size_index = 2 then		/* if old style DPS8.. */
+	     call syserr (ANNOUNCE, "^-at:^3xboard CD^d, chip ^a",
+		bdx + 1, dps8_chip (cpx, level));
+	else call syserr (ANNOUNCE, "^-at:^3xboard CD^d, chip ^a", /* VS&SC cache */
+		bdx + 1, vs_sc_chip (cpx, level));
+
+     end get_bcx;
+%page;
+
+/* mult_mess - internal procedure to display cache parity multiple bit failures */
+
+mult_mess: proc (lv, col, dwas, dsb);
+
+dcl  (lv, col) fixed bin;
+dcl  (dwas, dsb) bit (72) aligned;
+
+	call syserr (ANNOUNCE, "^2-multiple bit failures at level ^o, column ^d^/^2-^a^-^24.3b^/^2-^a^-^24.3b", lv, col,
+	     "data in cache:", dwas, "data in memory:", dsb);
+
+     end mult_mess;
+
+%page;
+/* static_err - internal procedure to display errors from static test */
+
+static_err: proc (err_cnt);
+
+dcl  (dpx, i, j) fixed bin;
+dcl  err_cnt fixed bin (35);
+dcl  bit_no (3) fixed bin;
+dcl  mult bit (1) aligned;
+
+	bit_no = 0;				/* initialize bit number error array */
+
+/* display header message first */
+	if ^diagnostic_displayed then do;
+	     diagnostic_displayed = "1"b;
+	     call syserr (ANNOUNCE, "cache_tester: repeatable cache parity error(s) detected on CPU ^a",
+		cpu_tag);
+	end;
+	
+
+	do i = 1 to err_cnt while (i <= 3);		/* display up to 3 board and chip messages */
+	     call find_err_bit (err_data (i).ex_or_data, j, mult);
+
+	     clv = bin (substr (cpriv_info (i).cache_addr, lv_ex (cache_size_index), 2));
+	     ccol = bin (substr (cpriv_info (i).cache_addr, lv_ex (cache_size_index) + 2));
+	     ccol = divide (ccol, 4, 17, 0);
+	     if j = -1 then do;
+						/* parity error only */
+		     call syserr (ANNOUNCE, "The cache data is equal to the memory data. Possible parity generation problem for level ^d", clv);
+
+	     end;
+	     else if ^mult then do;			/* if not multiple bit failure */
+		bit_no (i) = j;			/* save error bit number */
+		if i > 1 then			/* if more than 1 error */
+		     if j = bit_no (i - 1) & clv = pclv then
+			go to duplicate;		/* do not print out duplicate errors */
+
+		call get_bcx (clv, j);		/* display diagnostic */
+		if ^fim_static_agree then		/* if we havn't found match yet */
+		     if ^fim_mult then		/* and data  captured in fim not multple bit failure */
+			if j = fim_err_bit & clv = cfim_info.level then
+			     fim_static_agree = "1"b; /* set flag so we don't do this test again */
+	     end;
+	     else do;
+		dpx = fixed (err_data(i).cache_addr,17);
+		if dpx >= buf_wds then
+		     dpx = dpx - buf_wds;
+		call mult_mess (clv, ccol,		/* multiple bit failure */
+		     err_data (i).cache_data, c_data (dpx) || c_data (dpx + 1));
+	     end;
+duplicate:
+	     pclv = clv;				/* copy current level for duplicate comparisons */
+
+	end;
+
+     end static_err;
+
+%page;
+/* test_cache - this will cause cache to be tested if that half was on */
+
+test_cache:
+     proc;
+	if cfim_info.csh1 then do;			/* if lower cache was on... */
+	     test_called = "1"b;
+	     call cache_priv$csh1 (segptr, buf_wds, cpip, code); /* go test lower half of cache */
+
+	     if code ^= 0 then do;			/* if cache errors encountered */
+		cache_error = "1"b;			/* set terminate condition */
+		call static_err (code);		/* go display errors */
+		csh1_off = "1"b;			/* set flag to disable csh1 */
+	     end;
+	end;
+	if cfim_info.csh2 then do;			/* if upper cache was on ... */
+	     test_called = "1"b;
+	     call cache_priv$csh2 (segptr, buf_wds, cpip, code);
+						/* go test upper half of cache */
+	     if code ^= 0 then do;			/* if cache errors encountered */
+		cache_error = "1"b;			/* set terminate condition */
+		call static_err (code);		/* go display errors */
+		csh2_off = "1"b;			/* set flag to disable csh2 */
+	     end;
+	end;
+     end test_cache;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   cache_tester: Unable to allocate wired buffer.
+
+   S: $info
+
+   T: $run
+
+   M: Attempted to allocate wired contiguous buffer for cache testing and
+   pc_contig could not find enough pages available.
+
+   A: If cache error information was captured in the fim this information is
+   displayed. Cache memory is turned back on.
+
+   Message:
+   cache_tester: Unable to set CPU required to <TAG> cache is off ERRORMESSAGE.
+
+   S: $info
+
+   T: $run
+
+   M: Attempted to run on CPU <TAG> for cache testing and could not set CPU
+   required to that CPU.
+
+   A: Cache memory is turned back on.
+
+   Message:
+   cache_tester: Unable to run on CPU <TAG> to EEDD cache ERRORMESSAGE.
+
+   S: $beep
+
+   T: $run
+
+   M: The attempt to run on CPU <TAG> to either enable (EEDD - enable) or disable
+   (EEDD = disable) cache memory failed.
+
+   A: CPU <TAG> should be taken offline if the attempt was to disable cache
+   memory.
+
+   Message:
+   cache_tester: No errors found in cache memory for CPU <TAG>, cache will remain on.
+
+   S: $info
+
+   T: $run
+
+   M: The static test of cache memory for CPU <TAG> found no errors and no cache
+   error information was captured by the fim.
+
+   A: cache is turned back on
+
+   Message:
+   cache_tester: repeatable cache parity error(s) detected on CPU <TAG> at:
+board XXXX, chip YY.
+
+   S: $info
+
+   T: $run
+
+   M: The static test of cache memory for CPU <TAG> indicated a single bit error
+   between the contents of cache and the contents of the wired test buffer. The
+   single bit failure is further broken down to the failing wire wrapped board
+   (board XXXX) and integrated circuit chip (chip YY) that failed. Since it
+   happened during the static test of cache, it is assumed to be a solid failure
+   and that segment of cache memory (csh1 or csh2) is turned off. There could be up
+   to 3 board and chip callouts since diagnostic data for the first 3 cache errors
+   is captured. These additional board and chip callouts will only be displayed if
+   the single bit failure was a different bit or different
+   cache level than the board and chip diagnostic already displayed.
+
+   A: Contact Field Engineering personnel.
+
+   Message:
+   cache_tester: repeatable cache parity error detected on CPU <TAG>
+cache data is equal to the memory data. 
+parity generation problem for level <L>.
+
+   S: $info
+
+   T: $run
+
+   M: The static test of cache memory for CPU <TAG>  detected a cache failure, but the
+   data and its corresponding memory data are equal.
+
+   A: Contact field Engineering.
+
+   Message:
+   cache_tester: repeatable cache parity error(s) detected on CPU <TAG>
+bit failures at level W, column XXX
+in cache:	YYYYYYYYYYYYYYYYYYYYYYYY
+in memory:	ZZZZZZZZZZZZZZZZZZZZZZZZ.
+
+   S: $info
+
+   T: $run
+
+   M: The static test of cache memory for CPU <TAG> indicated a multiple bit error
+   between the contents of cache and the contents of the wired test buffer. The
+   multiple bit failure is further broken down to the failing cache level (W) (0 -
+   3) and column (XXX) address. The data read from cache (YYY...Y) and the expected
+   data (ZZZ...Z) is displayed as an aid for the field engineer. Since the failure
+   happened during the static test of cache, it is assumed to be a solid failure
+   and that segment of cache memory (csh1 or csh2) is turned off. There could be up
+   to 3 multiple messages or some combination of multiple bit error messages and
+   board and chip callouts, since diagnostic data for the first 3 cache errors is
+   captured.
+
+   A: Contact Field Engineering personnel.
+
+   Message:
+   cache_tester: cache parity error detected on CPU <TAG>
+at:   board XXXX, chip YY.
+
+   S: $info
+
+   T: $run
+
+   M: This message is the result of a single bit cache failure detected and cache
+   data and its corresponding memory data captured by the fim. This message will
+   be displayed if the diagnostic error data from the fim is valid. The board and
+   chip callout are as explained above.
+
+   A: Contact field Engineering.
+
+
+   Message:
+   cache_tester: cache parity error detected on CPU <TAG>
+cache data is equal to the memory data. 
+parity generation problem for level <L>.
+
+   S: $info
+
+   T: $run
+
+   M: This message is the result of a cache failure detected and cache
+   data and its corresponding memory data captured by the fim. This message will
+   be displayed if the diagnostic error data from the fim is valid.
+
+   A: Contact field Engineering.
+
+   Message:
+   cache_tester:  cache parity error detected on CPU <TAG>
+bit failures at level W, column XXX
+in cache:	YYYYYYYYYYYYYYYYYYYYYYYY
+in memory:	ZZZZZZZZZZZZZZZZZZZZZZZZ.
+
+   S: $info
+
+   T: $run
+
+   M: This message is the result of a multiple bit cache failure detected and cache
+   data and its corresponding memory data captured by the fim. It should be noted
+   that when a cache parity error is detected by the fim, there is a window of
+   time before the address in cache and in main store can be determined. Although
+   the cache error data is frozen (cache is turned off unconditionaly when the
+   parity retry of the fim is called), the corresponding address in main store
+   might have been changed through paging migration from other processors. This
+   message then might not be a multiple error but rather the result of this window
+   condition. If this message was the only diagnostic displayed (i.e. the static
+   test found no errors), the cache will be turned back on. The values of W, XXX,
+   YYY...Y, and ZZZ...Z are as explained above.
+
+   A: Contact Field Engineering
+
+   Message:
+   cache_tester: Entire cache memory for CPU <TAG> has been disabled.
+
+   S: $beep
+
+   T: $run
+
+   M: The static test of cache memory for CPU <TAG> detected repeatable errors in
+   both halfs of cache. or one half of cache had previously been disabled and the
+   static test of the other half detected repeatable errors.
+
+   A: Contact field Engineering
+
+   Message:
+   cache_tester: LLUU cache memory (csh<n>) for CPU <TAG> has been turned off
+OTHER was AA and has not been changed.
+
+   S: $beep
+
+   T: $run
+
+   M: Either the lower half (LLUU = Lower, <n> = 1) or the upper half (LLUU =
+   Upper, <n> = 2) of cache memory for CPU <TAG> has been turned off as the result of
+   the static cache test finding a repeatable cache failure. The OTHER (Upper or 
+   Lower) was in state AA. If AA is off this half of cache was not tested. If AA
+   is on this half of cache had no errors.
+
+   A: Contact Field Engineering
+
+
+   END MESSAGE DOCUMENTATION */
+%page;
+%include mc;
+%page;
+%include scs;
+%page;
+%include sdw_info;
+%include syserr_constants;
+
+     end cache_tester;

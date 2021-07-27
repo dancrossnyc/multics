@@ -1,0 +1,1430 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-04-15,Pierret), approve(86-04-15,MCR7279),
+     audit(86-07-30,Gilcrease), install(86-08-01,MR12.0-1113):
+     DM error 29: Changed to not look at all tm_tdt entries unless absolutely
+     necessary so that non-priviledged uses can use transaction status.
+  2) change(86-04-15,Pierret), approve(86-04-15,MCR7279),
+     audit(86-07-30,Gilcrease), install(86-08-01,MR12.0-1113):
+     DM error 30: Changed to reset handler_invoked_sw to off after the
+     return from transaction_manager_$handle_conditions in the processing
+     of the SUSPEND_ACTION.
+  3) change(86-04-15,Pierret), approve(86-04-15,MCR7279),
+     audit(86-07-30,Gilcrease), install(86-08-01,MR12.0-1113):
+     DM error 31:  Changed loop which calls PRINT_ENTRY to use tix_index
+     instead of tix_count, thereby printing all entries instead of the last
+     one repeatedly.
+  4) change(86-09-30,Blair), approve(86-10-22,MCR7567), audit(86-11-06,Dupuis),
+     install(86-11-10,MR12.0-1207):
+     Reset the handler_invoked_sw after signalling the condition so that we can
+     detect when a condition occurs more than once.  TR 19757.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,ifthenstmt,^indproc,^indcomtxt */
+/* --------------- */
+
+transaction: txn: proc;
+
+/* DESCRIPTION:
+
+   Command interface to the Data Management System.
+*/
+
+/* HISTORY:
+
+Written by Steve Herbst, 02/20/84.
+Modified:
+03/08/84 by Steve Herbst: Fixed general usage message.
+03/21/84 by Steve Herbst: Fixed bug in "txn execute" condition handling.
+03/21/84 by Steve Herbst: Changed "txn abandon" and "txn abort" to resume
+	suspended txn.
+11/08/84 by Steve Herbst: Changed in response to audit comments.
+04/02/84 by Lee A. Newcomb: Fixed dcl of tm_$get_state_description to be
+	char(*) as in called entry instead of char (64); called was reading
+	stack garbage when trying to decode descriptor.
+04/03/84 by Lee A. Newcomb: Fixed status' using the wrong buffer when
+	outputing a txn's state.
+04/19/84 by Lindsey L. Spratt: Corrected the calling sequence of the
+	transaction_manager_$rollback_txn entry to include the checkpoint id.
+04/23/84 by Lindsey L. Spratt: Fixed to only handle the
+	dm_error_$system_not_initialized sub_error_ in the sub_error_
+	handler.
+04/26/84 by Lindsey L. Spratt: Changed to always abort on the cleanup
+	condition, and to do a non-local goto RETURN when aborting or
+	abandoning any condition other than a cleanup.
+04/27/84 by Lindsey L. Spratt: Made all settings of severities use declared
+	constants.  Fixed to always set the severity in the execute
+	operation, regardless of the path of execution, if txn is invoked
+	as an active function.
+05/10/84 by S. Herbst: Fixed to get BJ path from oid if possible, without
+	(as for from_uid) requiring special gate access.
+05/16/84 by S. Herbst: Fixed "txn execute" to prompt for command_line if
+	given neither a command_line nor -command_level.
+05/21/84 by S. Herbst: Fixed "txn begin" error msg for bad control arg.
+11/08/84 by Steve Herbst: Changed in response to audit comments.
+11/27/84 by Steve Herbst: Changed further in response to audit comments.
+01/02/85 by Steve Herbst: Fixed "txn execute" to set transaction_severity_
+	external variable for use by severity command.
+01/22/85 by Steve Herbst: Fixed CURRENT_ID proc to set af value to "false"
+	rather than issue an error.
+01/29/85 by Steve Herbst: Fixed CURRENT_ID to return txn_id even if txn is
+	in an error state; changed to accept txn_id's as decimal integers.
+02/20/85 by Steve Herbst: Fixed to handle dm_not_available_.
+*/
+%page;
+/* DECLARATIONS */
+
+/* Constants */
+
+dcl  KEY_NAMES (8) char (32) int static options (constant)
+	init ("abandon", "abort", "begin", "commit", "execute", "kill", "rollback", "status");
+dcl  (
+     EXISTING_TXN_NOT_ALLOWED init (1),
+     EXISTING_TXN_ALLOWED init (2),
+     EXISTING_TXN_REQUIRED init (3)
+     ) fixed bin int static options (constant);
+dcl  (
+     ABANDON_ACTION init (1),
+     ABORT_ACTION init (2),
+     NO_ACTION init (3),
+     RETRY_ACTION init (4),
+     SUSPEND_ACTION init (5)
+     ) fixed bin int static options (constant);
+
+dcl  (
+     NO_ERROR_SEVERITY init (0),
+     RETRY_SEVERITY init (1),
+     ABORT_OR_ABANDON_SEVERITY init (2),
+     FAILED_ABORT_OR_ABANDON_SEVERITY init (3),
+     FATAL_SEVERITY init (4)
+     ) fixed bin (35) internal static options (constant);
+
+dcl  (
+     ENTRY_ITEM init (1),
+     TXN_ITEM init (2)
+     ) fixed bin int static options (constant);
+dcl  INITIAL_CHECKPOINT init (0) fixed bin internal static options (constant);
+dcl  PRINT_ALL_INFO bit (36) int static options (constant) init ((36)"1"b);
+dcl  RELATIVE_TIME_OPTION bit (2) int static options (constant) init ("11"b);
+dcl  (
+     TEN_SECONDS init (10),
+     USEC_PER_SECOND init (1000000),
+     LONG_TIME_USEC init (1000000000000)
+     ) fixed bin (71) int static options (constant);
+
+/* Based */
+
+dcl  1 handler_node aligned based,
+       2 next_ptr ptr,
+       2 condition_name char (32),
+       2 action fixed bin,
+       2 retry_limit fixed bin;
+
+dcl  1 tm_info (tdt_max_count) aligned like txn_info based (tm_info_ptr);
+
+dcl  tix (tix_bound) fixed bin based (tix_ptr);
+
+dcl  area area based (area_ptr);
+
+dcl  arg char (arg_len) based (arg_ptr);
+dcl  key char (key_len) based (key_ptr);
+dcl  return_arg char (return_len) varying based (return_ptr);
+
+/* Automatic */
+
+dcl  1 print_switches aligned,
+       2 (bj_path, dtm, errors, owner, pid, rollback_count, state, switches, tid, tix) bit (1) unaligned,
+       2 pad bit (26) unaligned;
+
+dcl  1 select_switches aligned,
+       2 (abandoned, all, dead, tid, tix) bit (1) unaligned,
+       2 pad bit (31) unaligned;
+
+dcl  1 cond_info aligned like condition_info;
+
+dcl  (key_buffer, my_name, on_action_name) char (32);
+dcl  (begun_time_str, ctl_args_str, requested_time_str) char (32);
+
+dcl  (af_sw, cl_sw, had_to_wait_sw, handler_invoked_sw, multiple_info_sw, on_action_specified_sw) bit (1);
+dcl  (print_no_txn_warning_sw, printed_something_sw, succeeded_sw, total_sw) bit (1);
+dcl  (txn_exists_sw, txn_existed_sw, wait_sw) bit (1);
+dcl  bj_opening_id bit (36);
+dcl  txn_id bit (36) aligned;
+
+dcl  (alp, area_ptr, arg_ptr, first_handler_ptr, key_ptr, return_ptr, tix_ptr, tm_info_ptr) ptr;
+
+dcl  (arg_count, arg_index, command_line_start, existing_txn_policy) fixed bin;
+dcl  (fixed_txn_id, key_index, tix_index, tdt_index, txn_index) fixed bin;
+dcl  (retry_count, retry_limit, tdt_max_count, tix_bound, tix_count, wait_seconds) fixed bin;
+dcl  (abandoned_count, dead_count, error_count, txn_count, used_count) fixed bin;
+dcl  (arg_len, key_len, return_len) fixed bin (21);
+dcl  code fixed bin (35);
+dcl  (start_usec, wait_usec) fixed bin (71);
+
+dcl  (complain, complain_suppress_name) entry variable options (variable);
+
+/* External */
+
+dcl  dm_error_$system_not_initialized fixed bin (35) ext;
+dcl  dm_error_$transaction_suspended fixed bin (35) ext;
+dcl  error_table_$badopt fixed bin (35) ext;
+dcl  error_table_$noarg fixed bin (35) ext;
+dcl  error_table_$not_act_fnc fixed bin (35) ext;
+dcl  error_table_$too_many_args fixed bin (35) ext;
+dcl  transaction_severity_ fixed bin ext;
+
+/* Entries */
+
+dcl  (
+     active_fnc_err_,
+     active_fnc_err_$suppress_name
+     ) entry options (variable);
+dcl  before_journal_manager_$get_bj_path_from_oid entry (bit (36) aligned, char (*), char (*), fixed bin (35));
+dcl  before_journal_manager_$get_bj_path_from_uid entry (bit (36) aligned, char (*), char (*), fixed bin (35));
+dcl  (
+     com_err_,
+     com_err_$suppress_name
+     ) entry options (variable);
+dcl  command_query_ entry options (variable);
+dcl  continue_to_signal_ entry (fixed bin (35));
+dcl  convert_status_code_ entry (fixed bin (35), char (8), char (100));
+dcl  cu_$af_return_arg entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  cu_$arg_list_ptr entry (ptr);
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  cu_$arg_ptr_rel entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr);
+dcl  cu_$cp entry (ptr, fixed bin (21), fixed bin (35));
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  find_condition_info_ entry (ptr, ptr, fixed bin (35));
+dcl  get_process_id_ entry returns (bit (36));
+dcl  get_system_free_area_ entry returns (ptr);
+dcl  hcs_$validate_processid entry (bit (36) aligned, fixed bin (35));
+dcl  (
+     ioa_,
+     ioa_$rsnnl
+     ) entry options (variable);
+dcl  pathname_ entry (char (*), char (*)) returns (char (168));
+dcl  timer_manager_$sleep entry (fixed bin (71), bit (2));
+dcl  transaction_manager_$abandon_txn entry (bit (36) aligned, fixed bin (35));
+dcl  transaction_manager_$abort_txn entry (bit (36) aligned, fixed bin (35));
+dcl  transaction_manager_$begin_txn entry (fixed bin, bit (36), bit (36) aligned, fixed bin (35));
+dcl  transaction_manager_$commit_txn entry (bit (36) aligned, fixed bin (35));
+dcl  transaction_manager_$get_current_txn_id entry (bit (36) aligned, fixed bin (35));
+dcl  transaction_manager_$get_state_description entry (fixed bin) returns (char (*));
+dcl  transaction_manager_$get_tdt_size entry (fixed bin);
+dcl  transaction_manager_$get_txn_index entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+dcl  transaction_manager_$get_txn_info_index entry (fixed bin, ptr, fixed bin (35));
+dcl  transaction_manager_$handle_conditions entry ();
+dcl  transaction_manager_$kill_txn entry (bit (36) aligned, fixed bin (35));
+dcl  transaction_manager_$resume_txn entry (fixed bin (35));
+dcl  transaction_manager_$rollback_txn entry (bit (36) aligned, fixed bin, fixed bin (35));
+
+/* Builtins */
+
+dcl  (addr, addrel, character, clock, fixed, hbound, index, length, ltrim, null, rtrim, substr, unspec, verify) builtin;
+
+/* Conditions */
+
+dcl  (any_other, cleanup, dm_not_available_, sub_error_) condition;
+%page;
+	call cu_$af_return_arg (arg_count, return_ptr, return_len, code);
+	if code = 0 then do;
+	     af_sw = "1"b;
+	     complain = active_fnc_err_;
+	     complain_suppress_name = active_fnc_err_$suppress_name;
+	end;
+	else if code = error_table_$not_act_fnc then do;
+	     af_sw = "0"b;
+	     complain = com_err_;
+	     complain_suppress_name = com_err_$suppress_name;
+	end;
+	else do;
+	     call com_err_ (code, "transaction");
+	     call ERROR_RETURN ();
+	end;
+
+	if arg_count = 0 then do;
+	     my_name = "txn key";
+	     call complain_suppress_name (error_table_$noarg, "transaction", "^a", USAGE_STRING ("{other_args}"));
+	     call ERROR_RETURN ();
+	end;
+
+	call cu_$arg_ptr (1, arg_ptr, arg_len, code);
+	if code ^= 0 then do;
+	     call complain (code, "transaction", "Argument 1.");
+	     call ERROR_RETURN ();
+	end;
+
+	if arg = "e" | arg = "st" then do;
+	     key_ptr = addr (key_buffer);
+	     key_len = length (key_buffer);
+	     if arg = "e"
+	     then key = "execute";
+	     else key = "status";
+	end;
+	else do;
+	     key_ptr = arg_ptr;
+	     key_len = arg_len;
+	end;
+
+	do key_index = hbound (KEY_NAMES, 1) by -1 to 1 while (KEY_NAMES (key_index) ^= key);
+	end;
+	if key_index = 0 then do;
+	     call complain (0, "transaction", "Invalid key argument ^a", arg);
+	     call ERROR_RETURN ();
+	end;
+
+	my_name = "txn " || rtrim (KEY_NAMES (key_index));
+
+	on dm_not_available_ begin;
+	     call complain (dm_error_$system_not_initialized, my_name);
+	     call ERROR_RETURN ();
+	end;
+
+	go to KEY (key_index);
+RETURN:
+	return;
+%page;
+/* "txn abandon" */
+KEY (1):
+	if arg_count > 1 then do;
+	     call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING (""));
+	     call ERROR_RETURN ();
+	end;
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then go to ABANDON_ATTEMPTED;
+	end;
+
+	call transaction_manager_$abandon_txn (CURRENT_ID (), code);
+ABANDON_ATTEMPTED:
+	if code ^= 0 then do;
+	     if af_sw
+	     then return_arg = "false";
+	     else call complain (code, my_name);
+	end;
+	else do;
+	     if af_sw then return_arg = "true";
+	end;
+
+	return;
+%page;
+/* txn abort */
+KEY (2):
+	if arg_count > 1 then do;
+	     call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING (""));
+	     call ERROR_RETURN ();
+	end;
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then go to ABORT_ATTEMPTED;
+	end;
+
+	call transaction_manager_$abort_txn (CURRENT_ID (), code);
+ABORT_ATTEMPTED:
+	if code ^= 0 then do;
+	     if af_sw
+	     then return_arg = "false";
+	     else call complain (code, my_name);
+	end;
+	else do;
+	     if af_sw then return_arg = "true";
+	end;
+
+	return;
+%page;
+/* txn begin */
+KEY (3):
+	wait_sw = "0"b;
+	wait_usec = LONG_TIME_USEC;
+
+	do arg_index = 2 to arg_count;
+
+	     call cu_$arg_ptr (arg_index, arg_ptr, arg_len, code);
+
+	     if index (arg, "-") ^= 1 then do;
+		call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING ("{-control_args}"));
+		call ERROR_RETURN ();
+	     end;
+
+	     else if arg = "-no_wait" | arg = "-nwt" then wait_sw = "0"b;
+
+	     else if arg = "-wait" | arg = "-wt" then do;
+		arg_index = arg_index + 1;
+		if arg_index > arg_count then do;
+		     call complain (0, my_name, "No value specified for -wait");
+		     call ERROR_RETURN ();
+		end;
+		call cu_$arg_ptr (arg_index, arg_ptr, arg_len, code);
+		wait_seconds = cv_dec_check_ (arg, code);
+		if code ^= 0 then do;
+		     call complain (code, my_name, "Invalid -wait number of seconds ^a", arg);
+		     call ERROR_RETURN ();
+		end;
+		wait_sw = "1"b;
+		wait_usec = (wait_seconds + TEN_SECONDS) * USEC_PER_SECOND;
+						/* extra 10 because that's how often we try */
+	     end;
+
+	     else if arg = "-wait_indefinitely" | arg = "-wti" then do;
+		wait_sw = "1"b;
+		wait_usec = LONG_TIME_USEC;
+	     end;
+
+	     else do;
+		call complain (error_table_$badopt, my_name, "^a", arg);
+		call ERROR_RETURN ();
+	     end;
+	end;
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then go to BEGIN_ATTEMPTED;
+	end;
+
+	bj_opening_id = "0"b;			/* use default BJ */
+
+	start_usec = clock ();
+	had_to_wait_sw = "0"b;
+
+	do while (^had_to_wait_sw | clock () - start_usec < wait_usec);
+
+	     call transaction_manager_$begin_txn (TM_NORMAL_MODE, bj_opening_id, txn_id, code);
+BEGIN_ATTEMPTED:
+	     if code = 0 then do;
+		if had_to_wait_sw then do;
+		     call date_time_ (start_usec, requested_time_str);
+		     call date_time_ (clock (), begun_time_str);
+		     call ioa_ ("Transaction requested at ^a begun ^a", requested_time_str, begun_time_str);
+		end;
+		if af_sw then return_arg = "true";
+		return;
+	     end;
+	     else if ^wait_sw | code ^= dm_error_$system_not_initialized then do;
+		if af_sw then return_arg = "false";
+		else call complain (code, my_name);
+		call ERROR_RETURN ();
+	     end;
+
+/* Wait 10 seconds */
+
+	     call timer_manager_$sleep (TEN_SECONDS, RELATIVE_TIME_OPTION);
+	     had_to_wait_sw = "1"b;
+	end;
+
+	if af_sw then return_arg = "false";
+	else call complain (0, my_name, "Data Management not available within ^a seconds.", wait_seconds);
+
+	call ERROR_RETURN ();
+%page;
+/* txn commit */
+KEY (4):
+	if arg_count > 1 then do;
+	     call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING (""));
+	     call ERROR_RETURN ();
+	end;
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then go to COMMIT_ATTEMPTED;
+	end;
+
+	call transaction_manager_$commit_txn (CURRENT_ID (), code);
+COMMIT_ATTEMPTED:
+	if code ^= 0 then do;
+	     if af_sw then return_arg = "false";
+	     else call complain (code, my_name);
+	end;
+	else if af_sw then return_arg = "true";
+
+	return;
+%page;
+/* txn execute */
+KEY (5):
+	cl_sw, on_action_specified_sw, wait_sw = "0"b;
+	existing_txn_policy = EXISTING_TXN_NOT_ALLOWED;
+	wait_usec = LONG_TIME_USEC;
+	retry_count = 0;
+	transaction_severity_ = FATAL_SEVERITY;
+
+/* Test for existing transaction */
+
+	call transaction_manager_$get_current_txn_id (txn_id, code);
+	txn_existed_sw = (code = 0);
+
+	area_ptr = get_system_free_area_ ();
+	first_handler_ptr = null;
+	if ^txn_existed_sw then do;			/* set up default handlers */
+	     call SAVE_HANDLER ("cleanup", ABORT_ACTION, 0);
+	     call SAVE_HANDLER ("any_other", SUSPEND_ACTION, 0);
+	end;
+
+	call cu_$arg_list_ptr (alp);
+
+	command_line_start = 0;
+	do arg_index = 2 to arg_count while (command_line_start = 0);
+
+	     call cu_$arg_ptr (arg_index, arg_ptr, arg_len, code);
+
+	     if index (arg, "-") ^= 1 then command_line_start = arg_index;
+
+	     else if arg = "-abandon_on" then do;
+		call GET_CONDITION_LIST ("-abandon_on", arg_index, ABANDON_ACTION, 0);
+		if ^on_action_specified_sw then do;
+		     on_action_specified_sw = "1"b;
+		     on_action_name = "-abandon_on";
+		end;
+	     end;
+
+	     else if arg = "-abort_on" then do;
+		call GET_CONDITION_LIST ("-abort_on", arg_index, ABORT_ACTION, 0);
+		if ^on_action_specified_sw then do;
+		     on_action_specified_sw = "1"b;
+		     on_action_name = "-abort_on";
+		end;
+	     end;
+
+	     else if arg = "-command_level" | arg = "-cl" then cl_sw = "1"b;
+
+	     else if arg = "-existing_transaction_allowed" | arg = "-eta"
+	     then existing_txn_policy = EXISTING_TXN_ALLOWED;
+
+	     else if arg = "-existing_transaction_required" | arg = "-etr"
+	     then existing_txn_policy = EXISTING_TXN_REQUIRED;
+
+	     else if arg = "-no_action_on" then do;
+		call GET_CONDITION_LIST ("-no_action_on", arg_index, NO_ACTION, 0);
+		if ^on_action_specified_sw then do;
+		     on_action_specified_sw = "1"b;
+		     on_action_name = "-no_action_on";
+		end;
+	     end;
+
+	     else if arg = "-no_existing_transaction_allowed" | arg = "-neta"
+	     then existing_txn_policy = EXISTING_TXN_NOT_ALLOWED;
+
+	     else if arg = "-no_wait" | arg = "-nwt" then wait_sw = "0"b;
+
+	     else if arg = "-retry_on" then do;
+		arg_index = arg_index + 1;
+		call cu_$arg_ptr (arg_index, arg_ptr, arg_len, code);
+		if arg_index > arg_count then do;
+		     call complain (0, my_name, "No number or condition list specified for -retry_on");
+		     call ERROR_RETURN ();
+		end;
+		retry_limit = cv_dec_check_ (arg, code);
+		if code ^= 0 then do;
+		     call complain (code, my_name, "Invalid count ^a for -retry_on", arg);
+		     call ERROR_RETURN ();
+		end;
+		call GET_CONDITION_LIST ("-retry_on", arg_index, RETRY_ACTION, retry_limit);
+		if ^on_action_specified_sw then do;
+		     on_action_specified_sw = "1"b;
+		     on_action_name = "-retry_on";
+		end;
+	     end;
+
+	     else if arg = "-suspend_on" then do;
+		call GET_CONDITION_LIST ("-suspend_on", arg_index, SUSPEND_ACTION, 0);
+		if ^on_action_specified_sw then do;
+		     on_action_specified_sw = "1"b;
+		     on_action_name = "-suspend_on";
+		end;
+	     end;
+
+	     else if arg = "-wait" | arg = "-wt" then do;
+		arg_index = arg_index + 1;
+		if arg_index > arg_count then do;
+		     call complain (0, my_name, "No value specified for -wait");
+		     call ERROR_RETURN ();
+		end;
+		call cu_$arg_ptr (arg_index, arg_ptr, arg_len, code);
+		wait_seconds = cv_dec_check_ (arg, code);
+		if code ^= 0 then do;
+		     call complain (code, my_name, "^a", arg);
+		     call ERROR_RETURN ();
+		end;
+		wait_sw = "1"b;
+		wait_usec = (wait_seconds + TEN_SECONDS) * USEC_PER_SECOND;
+						/* extra 10 because that's how often we try */
+	     end;
+
+	     else if arg = "-wait_indefinitely" | arg = "-wti" then do;
+		wait_sw = "1"b;
+		wait_usec = LONG_TIME_USEC;
+	     end;
+
+	     else do;
+		call complain (error_table_$badopt, my_name, "^a", arg);
+		call ERROR_RETURN ();
+	     end;
+	end;
+
+	if command_line_start > 0 & cl_sw then do;
+	     call complain (0, my_name, "Command line is incompatible with -command_level.");
+	     call ERROR_RETURN ();
+	end;
+
+	if on_action_specified_sw & existing_txn_policy ^= EXISTING_TXN_NOT_ALLOWED then do;
+	     call complain (0, my_name, "-existing_transaction_^[allowed^;required^] is incompatible with ^a",
+		existing_txn_policy = EXISTING_TXN_ALLOWED, on_action_name);
+	     call ERROR_RETURN ();
+	end;
+
+	if txn_existed_sw & existing_txn_policy = EXISTING_TXN_NOT_ALLOWED then do;
+	     call complain (0, my_name, "Current transaction already in effect, id = ^w", txn_id);
+	     call ERROR_RETURN ();
+	end;
+	if ^txn_existed_sw & existing_txn_policy = EXISTING_TXN_REQUIRED then do;
+	     call complain (0, my_name, "No current transaction, -existing_transaction_required.");
+	     call ERROR_RETURN ();
+	end;
+
+/* Try to begin a transaction if necessary */
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code = dm_error_$system_not_initialized
+	     then go to EXECUTE_BEGIN_ATTEMPTED;
+	     else call continue_to_signal_ (0);
+	end;
+
+	if ^txn_existed_sw then
+	     on cleanup begin;
+		call ABORT_OR_ABANDON (txn_id, succeeded_sw);
+	     end;
+
+	bj_opening_id = "0"b;
+
+	start_usec = clock ();
+	had_to_wait_sw = "0"b;
+
+	do while (^had_to_wait_sw | clock () - start_usec < wait_usec);
+
+	     if txn_existed_sw then code = 0;
+	     else call transaction_manager_$begin_txn (TM_NORMAL_MODE, bj_opening_id, txn_id, code);
+EXECUTE_BEGIN_ATTEMPTED:
+	     if code = 0 then do;
+		if had_to_wait_sw then do;
+		     call date_time_ (start_usec, requested_time_str);
+		     call date_time_ (clock (), begun_time_str);
+		     call ioa_ ("Transaction requested at ^a begun ^a", requested_time_str, begun_time_str);
+		end;
+RETRY:
+		call EXECUTE_COMMAND_LINE ();
+
+		if ^txn_existed_sw then do;
+		     call transaction_manager_$commit_txn (txn_id, code);
+		     if code ^= 0 then do;
+			call ABORT_OR_ABANDON (txn_id, succeeded_sw);
+			if succeeded_sw then transaction_severity_ = ABORT_OR_ABANDON_SEVERITY;
+			else transaction_severity_ = FAILED_ABORT_OR_ABANDON_SEVERITY;
+			if af_sw then return_arg = AF_SEVERITY_VALUE (transaction_severity_);
+			else call complain (code, my_name, "Unable to commit transaction.");
+			call ERROR_RETURN ();
+		     end;
+		end;
+		if retry_count > 0 then do;
+		     transaction_severity_ = RETRY_SEVERITY;
+		     if ^af_sw then call complain (0, my_name,
+			     "^d retries were required to successfully execute the command line.", retry_count);
+		end;
+		else transaction_severity_ = NO_ERROR_SEVERITY;
+		if af_sw then return_arg = AF_SEVERITY_VALUE (transaction_severity_);
+		return;
+	     end;
+	     else if ^wait_sw | code ^= dm_error_$system_not_initialized then do;
+		transaction_severity_ = FATAL_SEVERITY;
+		if af_sw then return_arg = AF_SEVERITY_VALUE (transaction_severity_);
+		else call complain (code, my_name, "Could not begin transaction.");
+		call ERROR_RETURN ();
+	     end;
+
+/* Wait 10 seconds */
+
+	     call timer_manager_$sleep (TEN_SECONDS, RELATIVE_TIME_OPTION);
+	     had_to_wait_sw = "1"b;
+	end;
+
+	transaction_severity_ = FATAL_SEVERITY;
+	if af_sw then return_arg = AF_SEVERITY_VALUE (transaction_severity_);
+	else call complain (0, my_name, "Data Management not available within ^d seconds.", wait_seconds);
+
+	return;
+%page;
+/* txn kill */
+KEY (6):
+	if arg_count > 2 then do;
+KILL_USAGE:
+	     call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING ("{transaction_id}"));
+	     call ERROR_RETURN ();
+	end;
+
+	if arg_count = 2 then do;
+	     call cu_$arg_ptr (2, arg_ptr, arg_len, code);
+	     if index (arg, "-") = 1 then go to KILL_USAGE;
+	     fixed_txn_id = cv_dec_check_ (arg, code);
+	     if code ^= 0 then do;
+		call complain (code, my_name, "Invalid transaction id ^a", arg);
+		call ERROR_RETURN ();
+	     end;
+	     unspec (txn_id) = unspec (fixed_txn_id);
+	end;
+	else txn_id = CURRENT_ID ();
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then go to KILL_ATTEMPTED;
+	end;
+
+	call transaction_manager_$kill_txn (txn_id, code);
+KILL_ATTEMPTED:
+	if code ^= 0 then do;
+	     if af_sw then return_arg = "false";
+	     else call complain (code, my_name);
+	end;
+	else do;
+	     if af_sw then return_arg = "true";
+	end;
+
+	return;
+%page;
+/* txn rollback */
+KEY (7):
+	if arg_count > 1 then do;
+	     call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING (""));
+	     call ERROR_RETURN ();
+	end;
+
+	on sub_error_ begin;
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then go to ROLLBACK_ATTEMPTED;
+	end;
+
+	call transaction_manager_$rollback_txn (CURRENT_ID (), INITIAL_CHECKPOINT, code);
+ROLLBACK_ATTEMPTED:
+	if code ^= 0 then do;
+	     if af_sw then return_arg = "false";
+	     else call complain (code, my_name);
+	end;
+	else do;
+	     if af_sw then return_arg = "true";
+	end;
+
+	return;
+%page;
+/* txn status */
+KEY (8):
+	area_ptr = get_system_free_area_ ();
+	tix_ptr, tm_info_ptr, txn_info_ptr = null;
+
+	on cleanup call CLEAN_UP_STATUS ();
+
+	tix_bound = arg_count - 1;
+	allocate tix in (area) set (tix_ptr);
+	tix_count = 0;
+
+	unspec (print_switches), unspec (select_switches) = "0"b;
+	multiple_info_sw, total_sw = "0"b;
+
+	do arg_index = 2 to arg_count;
+
+	     call cu_$arg_ptr (arg_index, arg_ptr, arg_len, code);
+
+	     if index (arg, "-") ^= 1 then do;
+		if af_sw then ctl_args_str = "-control_arg";
+		else ctl_args_str = "-control_args";
+		call complain_suppress_name (error_table_$too_many_args, my_name, USAGE_STRING (ctl_args_str));
+		go to STATUS_RETURN;
+	     end;
+
+/* Control args for selecting transactions */
+
+	     if arg = "-abandoned" then
+		if af_sw then go to BAD_STATUS_AF_ARG;
+		else select_switches.abandoned = "1"b;
+	     else if arg = "-all" | arg = "-a" then
+		if af_sw then go to BAD_STATUS_AF_ARG;
+		else select_switches.all, total_sw = "1"b;
+	     else if arg = "-dead" then
+		if af_sw then go to BAD_STATUS_AF_ARG;
+		else select_switches.dead, select_switches.all = "1"b;
+	     else if arg = "-total" | arg = "-tt" then
+		if af_sw then go to BAD_STATUS_AF_ARG;
+		else total_sw = "1"b;
+
+	     else if arg = "-transaction_id" | arg = "-tid" | arg = "-id" then do;
+		if arg_index = arg_count then print_switches.tid = "1"b;
+		else do;
+		     call cu_$arg_ptr (arg_index + 1, arg_ptr, arg_len, code);
+		     if index (arg, "-") = 1 then print_switches.tid = "1"b;
+		     else do;			/* -tid N */
+			arg_index = arg_index + 1;
+			fixed_txn_id = cv_dec_check_ (arg, code);
+			if code ^= 0 then do;
+			     call complain (code, my_name, "Invalid transaction id ^a", arg);
+			     go to STATUS_RETURN;
+			end;
+			unspec (txn_id) = unspec (fixed_txn_id);
+			txn_index = transaction_manager_$get_txn_index (txn_id, code);
+			if code ^= 0 then call complain (code, my_name, "transaction id = ^a", arg);
+			else do;
+			     select_switches.tid = "1"b;
+			     tix_count = tix_count + 1;
+			     tix (tix_count) = txn_index;
+			end;
+		     end;
+		end;
+	     end;
+
+	     else if arg = "-transaction_index" | arg = "-tix" | arg = "-index" then do;
+		if arg_index = arg_count then print_switches.tix = "1"b;
+		else do;
+		     call cu_$arg_ptr (arg_index + 1, arg_ptr, arg_len, code);
+		     if index (arg, "-") = 1
+		     then print_switches.tix = "1"b;
+		     else do;
+			arg_index = arg_index + 1;
+			txn_index = cv_dec_check_ (arg, code);
+			if code ^= 0 then do;
+			     call complain (code, my_name, "Invalid transaction index ^a", arg);
+			     go to STATUS_RETURN;
+			end;
+			select_switches.tix = "1"b;
+			tix_count = tix_count + 1;
+			tix (tix_count) = txn_index;
+		     end;
+		end;
+	     end;
+
+/* Control args for selecting fields to print */
+
+	     else if arg = "-before_journal_path" | arg = "-bj_path" then call REQUEST_INFO (print_switches.bj_path);
+	     else if arg = "-begun" | arg = "-date_time_begun" | arg = "-dtbg" then
+		call REQUEST_INFO (print_switches.dtm);
+	     else if arg = "-error_info" | arg = "-error" then call REQUEST_INFO (print_switches.errors);
+	     else if arg = "-owner" then call REQUEST_INFO (print_switches.owner);
+	     else if arg = "-process_id" | arg = "-pid" then call REQUEST_INFO (print_switches.pid);
+	     else if arg = "-rollback_count" | arg = "-rbc" then call REQUEST_INFO (print_switches.rollback_count);
+	     else if arg = "-state" then call REQUEST_INFO (print_switches.state);
+	     else if arg = "-switches" | arg = "-switch" | arg = "-sw" then call REQUEST_INFO (print_switches.switches);
+
+	     else do;
+BAD_STATUS_AF_ARG:
+		call complain (error_table_$badopt, my_name, "^a", arg);
+		go to STATUS_RETURN;
+	     end;
+	end;
+
+	if af_sw & tix_count > 1 then do;
+	     call complain (0, my_name, "Can return info for only one transaction.");
+	     go to STATUS_RETURN;
+	end;
+
+	on sub_error_ begin;			/* eg., DM initialization error */
+	     code = SUB_ERROR_CODE ();
+	     if code ^= 0 then do;
+		call complain (code, my_name);
+		go to RETURN;
+	     end;
+	end;
+
+	if tix_count = 0 & ^select_switches.all & ^total_sw then do;
+	     tix_count = tix_count + 1;
+	     txn_id = CURRENT_ID ();
+	     tix (tix_count) = transaction_manager_$get_txn_index (txn_id, code);
+	     if code ^= 0 then do;
+		call complain (code, my_name, "transaction id = ^o", fixed (txn_id));
+		go to STATUS_RETURN;
+	     end;
+	end;
+
+	if unspec (print_switches) = "0"b
+	then if af_sw then do;
+		call complain_suppress_name (error_table_$noarg, my_name, "Usage:  [txn status -control_arg]");
+		go to STATUS_RETURN;
+	     end;
+	     else do;
+		unspec (print_switches) = unspec (PRINT_ALL_INFO);
+		multiple_info_sw = "1"b;
+	     end;
+
+	if select_switches.all | total_sw then
+EXAMINE_WHOLE_TDT: do;
+
+	     call transaction_manager_$get_tdt_size (tdt_max_count);
+	     if tdt_max_count = 0 then do;
+		if af_sw then call complain (0, my_name, "No transactions defined.");
+						/* should never happen */
+		else call ioa_ ("No transactions defined.");
+		go to STATUS_RETURN;
+	     end;
+
+	     allocate tm_info in (area) set (tm_info_ptr);
+	     allocate txn_info in (area) set (txn_info_ptr);
+	     txn_info.version = TXN_INFO_VERSION_5;
+
+	     do tdt_index = 1 to tdt_max_count;
+		call transaction_manager_$get_txn_info_index (tdt_index, txn_info_ptr, code);
+		if code ^= 0 then do;
+		     call complain (code, my_name, "TDT entry #^d", tdt_index);
+		     go to STATUS_RETURN;
+		end;
+
+		tm_info (tdt_index) = txn_info;
+	     end;
+
+/* Print totals if requested */
+
+	     if total_sw then do;
+
+		abandoned_count, dead_count, error_count, txn_count, used_count = 0;
+		do tdt_index = 1 to tdt_max_count;
+		     if tm_info.owner_process_id (tdt_index) ^= "0"b then used_count = used_count + 1;
+		     if DEAD_PROCESS (tm_info.owner_process_id (tdt_index)) then dead_count = dead_count + 1;
+		     if tm_info.abandoned_sw (tdt_index) then abandoned_count = abandoned_count + 1;
+		     if tm_info.txn_id (tdt_index) ^= "0"b then txn_count = txn_count + 1;
+		     if tm_info.error_sw (tdt_index) then error_count = error_count + 1;
+		end;
+
+		call ioa_ ("TDT size: ^d entries", tdt_max_count);
+		call ioa_ ("In use: ^d", used_count);
+		call ioa_ ("Dead processes: ^d", dead_count);
+		call ioa_ ("Abandoned entries: ^d", abandoned_count);
+		call ioa_ ("Transactions: ^d", txn_count);
+		call ioa_ ("Error transactions: ^d", error_count);
+		call ioa_ ("");
+	     end;
+
+/* Print or return individual transaction information */
+
+	     printed_something_sw = "0"b;
+	     if af_sw then return_arg = """""";		/* default value is "" (eg., no txn) */
+
+	     if select_switches.all
+	     then do tdt_index = 1 to tdt_max_count;
+
+		if tm_info.owner_process_id (tdt_index) ^= "0"b then do;
+		     txn_info = tm_info (tdt_index);
+		     call PRINT_ENTRY ();
+		end;
+	     end;
+
+	     else do tix_index = 1 to tix_count;
+		txn_info = tm_info (tix (tix_index));
+		call PRINT_ENTRY ();
+	     end;
+
+	     if ^printed_something_sw & ^af_sw &
+		(select_switches.abandoned | select_switches.dead | select_switches.tid | select_switches.tix) then
+		call complain (0, my_name, "No entries with specified attributes.");
+	end EXAMINE_WHOLE_TDT;
+
+	else EXAMINE_SPECIFIED_ENTRIES: do;
+	     allocate txn_info in (area) set (txn_info_ptr);
+	     txn_info.version = TXN_INFO_VERSION_5;
+
+	     do tix_index = 1 to tix_count;
+		call transaction_manager_$get_txn_info_index (tix (tix_index), txn_info_ptr, code);
+		if code = 0 then call PRINT_ENTRY ();
+		else call complain (code, my_name, "TDT entry #^d.", tix (tix_index));
+	     end;
+	end EXAMINE_SPECIFIED_ENTRIES;
+STATUS_RETURN:
+	call CLEAN_UP_STATUS ();
+
+	return;
+%page;
+ABORT_OR_ABANDON: proc (P_txn_id, P_succeeded_sw);
+
+dcl  P_txn_id bit (36) aligned;
+dcl  P_succeeded_sw bit (1);
+dcl  code fixed bin (35);
+
+	call transaction_manager_$abort_txn (P_txn_id, code);
+	if code ^= 0 then do;
+	     call transaction_manager_$abandon_txn (P_txn_id, code);
+	     if code ^= 0 then do;
+		P_succeeded_sw = "0"b;
+		call ERROR_RETURN ();
+	     end;
+	end;
+	P_succeeded_sw = "1"b;
+	return;
+
+     end ABORT_OR_ABANDON;
+%page;
+AF_SEVERITY_VALUE: proc (P_severity) returns (char (*));
+
+dcl  P_severity fixed bin;
+
+	if P_severity < 2 then return ("true");
+	else return ("false");
+
+     end AF_SEVERITY_VALUE;
+%page;
+CLEAN_UP_STATUS: proc;
+
+	if tix_ptr ^= null then free tix in (area);
+	if tm_info_ptr ^= null then free tm_info in (area);
+	if txn_info_ptr ^= null then free txn_info in (area);
+
+     end CLEAN_UP_STATUS;
+%page;
+CODE_DESCRIPTION: proc (P_code) returns (char (100));
+
+dcl  P_code fixed bin (35);
+dcl  message char (100);
+dcl  dm_error_$ external bit (36) aligned;
+dcl  better_message char (100);
+dcl  better_code fixed bin (35);
+dcl  pp_as_word bit (36) aligned;
+dcl  segno builtin;
+
+%include packed_pointer;
+
+	call convert_status_code_ (P_code, "", message);
+	if substr (message, 1, 4) = "Code" then do;	/* Perhaps dm_error_ in another process */
+	     pp_as_word = unspec (P_code);
+	     packed_pointer_ptr = addr (pp_as_word);
+	     packed_pointer.segno = segno (addr (dm_error_$));
+	     unspec (better_code) = pp_as_word;
+	     call convert_status_code_ (better_code, "", better_message);
+	     if substr (better_message, 1, 4) ^= "Code" then message = better_message;
+	end;
+	return (message);
+
+     end CODE_DESCRIPTION;
+%page;
+CONDITION_HANDLER: proc (P_txn_id, P_retry_count, P_retry_label);
+
+dcl  P_txn_id bit (36) aligned;
+dcl  P_retry_count fixed bin;
+dcl  P_retry_label label variable;
+dcl  p ptr;
+dcl  condition_name char (32);
+
+	if handler_invoked_sw then do;
+	     call continue_to_signal_ (0);
+	     handler_invoked_sw = "0"b;
+	     return;
+	end;
+	handler_invoked_sw = "1"b;
+
+	if first_handler_ptr = null then return;	/* no handler for any condition */
+
+	call find_condition_info_ (null, addr (cond_info), code);
+	if code ^= 0 then condition_name = "any_other";	/* can't get name, trigger the any_other handler */
+	else condition_name = cond_info.condition_name;
+
+/* Try the specific condition name */
+
+	do p = first_handler_ptr repeat (p -> handler_node.next_ptr) while (p ^= null);
+	     if p -> handler_node.condition_name = condition_name then do;
+		call do_action (p, P_txn_id, P_retry_count, P_retry_label);
+		return;
+	     end;
+	end;
+
+/* That having failed, look for an any_other handler */
+
+	do p = first_handler_ptr repeat (p -> handler_node.next_ptr) while (p ^= null);
+	     if p -> handler_node.condition_name = "any_other" then do;
+		call do_action (p, P_txn_id, P_retry_count, P_retry_label);
+		return;
+	     end;
+	end;
+
+	handler_invoked_sw = "0"b;
+
+	return;
+
+
+do_action: proc (P_ptr, P_txn_id, P_retry_count, P_retry_label);
+
+dcl  P_ptr ptr;
+dcl  P_txn_id bit (36) aligned;
+dcl  (P_retry_count, action) fixed bin;
+dcl  code fixed bin (35);
+dcl  P_retry_label label variable;
+
+	action = P_ptr -> handler_node.action;
+	if action = ABANDON_ACTION then do;
+	     call transaction_manager_$abandon_txn (P_txn_id, code);
+	     if code ^= 0 then transaction_severity_ = FAILED_ABORT_OR_ABANDON_SEVERITY;
+	     else transaction_severity_ = ABORT_OR_ABANDON_SEVERITY;
+	     if af_sw then return_arg = AF_SEVERITY_VALUE (transaction_severity_);
+	     else call complain (0, my_name,
+		     "Abandoning the command line and its transaction because the ^a condition was signaled.",
+		     P_ptr -> handler_node.condition_name);
+	     goto RETURN;
+	end;
+	else if action = ABORT_ACTION then do;
+	     call transaction_manager_$abort_txn (P_txn_id, code);
+	     if code ^= 0 then transaction_severity_ = FAILED_ABORT_OR_ABANDON_SEVERITY;
+	     else transaction_severity_ = ABORT_OR_ABANDON_SEVERITY;
+	     if af_sw then return_arg = AF_SEVERITY_VALUE (transaction_severity_);
+	     else call complain (0, my_name,
+		     "Aborting the command line and its transaction because the ^a condition was signaled.",
+		     P_ptr -> handler_node.condition_name);
+	     goto RETURN;
+	end;
+	else if action = NO_ACTION then ;
+	else if action = RETRY_ACTION then do;
+	     P_retry_count = P_retry_count + 1;
+	     if P_retry_count > p -> handler_node.retry_limit then return;
+	     else go to P_retry_label;
+	end;
+	else if action = SUSPEND_ACTION then do;
+	     call transaction_manager_$handle_conditions ();
+	     handler_invoked_sw = "0"b;
+	end;
+
+     end do_action;
+
+     end CONDITION_HANDLER;
+%page;
+CURRENT_ID: proc returns (bit (36) aligned);
+
+dcl  txn_id bit (36) aligned;
+dcl  tried_resume_sw bit (1);
+dcl  code fixed bin (35);
+
+	tried_resume_sw = "0"b;
+GET_ID:
+	call transaction_manager_$get_current_txn_id (txn_id, code);
+	if code ^= 0 then do;
+	     if code = dm_error_$transaction_suspended & ^tried_resume_sw then
+		if my_name = "txn status" then return (txn_id);
+		else if my_name = "txn abandon" | my_name = "txn abort" then do;
+		     tried_resume_sw = "1"b;
+		     code = 0;
+		     call transaction_manager_$resume_txn (code);
+		     if code ^= 0 then do;
+			if af_sw then return_arg = "false";
+			else call complain (code, my_name, "Could not resume transaction.");
+			go to RETURN;
+		     end;
+		     else go to GET_ID;
+		end;
+	     if txn_id = "0"b then do;
+		if af_sw then return_arg = "false";
+		else call complain (code, my_name);
+		go to RETURN;
+	     end;
+	end;
+	return (txn_id);
+
+     end CURRENT_ID;
+%page;
+DEAD_PROCESS: proc (P_process_id) returns (bit (1));
+
+dcl  P_process_id bit (36) aligned;
+dcl  code fixed bin (35);
+
+	if P_process_id = "0"b then return ("0"b);
+
+	call hcs_$validate_processid (P_process_id, code);
+	return (code ^= 0);
+
+     end DEAD_PROCESS;
+%page;
+ERROR_RETURN: proc;
+
+	go to RETURN;
+
+     end ERROR_RETURN;
+%page;
+EXECUTE_COMMAND_LINE: proc;
+
+dcl  line_len fixed bin (21);
+dcl  arg_index fixed bin;
+
+	if command_line_start > 0 then do;
+	     line_len = -1;
+	     do arg_index
+		= command_line_start to arg_count;
+		call cu_$arg_ptr_rel (arg_index, arg_ptr, arg_len, 0, alp);
+		line_len = line_len + arg_len + 1;
+	     end;
+	     begin;
+dcl  line char (line_len);
+
+		line = "";
+		line_len = -1;
+		do arg_index = command_line_start to arg_count;
+		     call cu_$arg_ptr_rel (arg_index, arg_ptr, arg_len, 0, alp);
+		     substr (line, line_len + 2, arg_len) = arg;
+		     line_len = line_len + arg_len + 1;
+		end;
+
+		handler_invoked_sw = "0"b;
+		on any_other begin;
+		     call CONDITION_HANDLER (txn_id, retry_count, RETRY);
+		end;
+
+		call cu_$cp (addr (line), line_len, code);
+		if code ^= 0 then transaction_severity_ = ABORT_OR_ABANDON_SEVERITY; /* Is this right? */
+	     end;
+	end;
+
+	else do;
+	     begin;
+dcl  var_line char (3000) varying;
+dcl  1 qi aligned like query_info;
+
+		unspec (qi) = "0"b;
+		qi.version = query_info_version_5;
+		qi.question_iocbp, qi.answer_iocbp, qi.explanation_ptr = null;
+		qi.suppress_name_sw = "1"b;
+
+		call command_query_ (addr (qi), var_line, "transaction execute", "Command line:");
+
+		handler_invoked_sw = "0"b;
+		on any_other begin;
+		     call CONDITION_HANDLER (txn_id, retry_count, RETRY);
+		end;
+
+		call cu_$cp (addrel (addr (var_line), 1), length (var_line), code);
+		if code ^= 0 then transaction_severity_ = ABORT_OR_ABANDON_SEVERITY;
+	     end;
+	end;
+
+     end EXECUTE_COMMAND_LINE;
+%page;
+GET_CONDITION_LIST: proc (P_name, P_index, P_action, P_retry_limit);
+
+dcl  P_name char (*);
+dcl  (P_index, P_action, P_retry_limit, comma_pos, list_pos) fixed bin;
+dcl  condition_name char (32);
+dcl  COMMA char (1) int static options (constant) init (",");
+
+	P_index = P_index + 1;
+	if P_index > arg_count then do;
+	     call complain (0, my_name, "No condition list specified for ^a", P_name);
+	     go to RETURN;
+	end;
+	call cu_$arg_ptr_rel (P_index, arg_ptr, arg_len, code, alp);
+
+	list_pos = 1;
+	do while (list_pos <= arg_len);
+
+	     comma_pos = verify (substr (arg, list_pos), COMMA);
+	     if comma_pos = 0 then return;
+
+	     list_pos = list_pos + comma_pos - 1;
+	     comma_pos = index (substr (arg, list_pos), COMMA);
+	     if comma_pos = 0 then do;
+		condition_name = substr (arg, list_pos);
+		list_pos = arg_len + 1;
+	     end;
+	     else do;
+		condition_name = substr (arg, list_pos, comma_pos - 1);
+		list_pos = list_pos + comma_pos;
+	     end;
+
+	     call SAVE_HANDLER (condition_name, P_action, P_retry_limit);
+	end;
+
+	return;
+
+     end GET_CONDITION_LIST;
+%page;
+PRINT_ENTRY: proc ();
+
+dcl  (buffer, dn) char (168);
+dcl  state_description_buffer char (68);
+dcl  (en, time_string) char (32);
+
+	if txn_info.owner_process_id = "0"b then do;
+	     if af_sw & print_switches.pid then return_arg = "0";
+	     return;
+	end;
+
+	if select_switches.abandoned & ^txn_info.abandoned_sw then do;
+	     if ^select_switches.dead | ^DEAD_PROCESS (txn_info.owner_process_id) then return;
+	end;
+	else if select_switches.dead & ^DEAD_PROCESS (txn_info.owner_process_id) then return;
+
+	printed_something_sw = "1"b;
+
+	txn_exists_sw = (txn_info.txn_id ^= "0"b);
+	print_no_txn_warning_sw = "0"b;
+
+	if print_switches.tix then call PRINT_ITEM ("Transaction index", character (txn_info.txn_index), ENTRY_ITEM);
+	if print_switches.tid then
+	     call PRINT_ITEM ("Transaction id", character (fixed (txn_info.txn_id)), TXN_ITEM);
+	if print_switches.pid then do;
+	     call ioa_$rsnnl ("^w^[ (dead)^]", buffer, length (buffer), txn_info.owner_process_id,
+		DEAD_PROCESS (txn_info.owner_process_id) & ^af_sw);
+	     call PRINT_ITEM ("Process id", buffer, ENTRY_ITEM);
+	end;
+	if print_switches.owner then call PRINT_ITEM ("Owner", (txn_info.owner_name), ENTRY_ITEM);
+	if print_switches.dtm then do;
+	     if txn_info.date_time_created = 0
+	     then time_string = "(undefined)";
+	     else call date_time_ (txn_info.date_time_created, time_string);
+	     call PRINT_ITEM ("Begun at", time_string, TXN_ITEM);
+	end;
+	if print_switches.state then do;
+	     state_description_buffer = transaction_manager_$get_state_description (txn_info.state);
+	     call PRINT_ITEM ("State", state_description_buffer, TXN_ITEM);
+	end;
+	if print_switches.errors then
+	     if ^txn_info.error_sw then call PRINT_ITEM ("Error", "none", TXN_ITEM);
+	     else call PRINT_ITEM ("Error", CODE_DESCRIPTION (txn_info.error_code), TXN_ITEM);
+	if print_switches.rollback_count then
+	     call PRINT_ITEM ("Rollback count", character (txn_info.rollback_count), TXN_ITEM);
+	if print_switches.bj_path then do;
+	     if txn_info.bj_uid = "0"b then
+		if af_sw then return_arg = "";
+		else call ioa_ ("No before journal.");
+	     else do;
+		if txn_info.owner_process_id = get_process_id_ () then
+		     call before_journal_manager_$get_bj_path_from_oid (txn_info.bj_oid, dn, en, code);
+		else call before_journal_manager_$get_bj_path_from_uid (txn_info.bj_uid, dn, en, code);
+		if code ^= 0 then
+		     call complain (code, my_name, "Before journal uid = ^w", txn_info.bj_uid);
+		else call PRINT_ITEM ("Before journal path", pathname_ (dn, en), TXN_ITEM);
+	     end;
+	end;
+	if print_switches.switches then do;
+	     if unspec (txn_info.flags) = "0"b then buffer = "none";
+	     else do;
+		buffer = "";
+		if txn_info.abandoned_sw then buffer = "ABANDONED";
+		if txn_info.kill_sw then call append ("KILL");
+		if txn_info.suspended_sw then call append ("SUSPENDED");
+		if txn_info.dead_process_sw then call append ("DEAD_PROCESS");
+	     end;
+	     call PRINT_ITEM ("Switches", buffer, TXN_ITEM);
+	end;
+
+	if print_no_txn_warning_sw then call ioa_ ("No transaction.");
+
+	if multiple_info_sw & ^af_sw then call ioa_ (""); /* separate blocks of info */
+
+append: proc (P_str);
+
+dcl  P_str char (*);
+
+	if buffer ^= "" then buffer = rtrim (buffer) || ",";
+	buffer = rtrim (buffer) || P_str;
+
+     end append;
+
+     end PRINT_ENTRY;
+%page;
+PRINT_ITEM: proc (P_name, P_value, P_item_type);
+
+dcl  (P_name, P_value) char (*);
+dcl  P_item_type fixed bin;
+
+	if af_sw then do;
+	     if txn_exists_sw | P_item_type = ENTRY_ITEM then return_arg = ltrim (rtrim (P_value));
+	end;
+
+	else if ^txn_exists_sw & P_item_type = TXN_ITEM then print_no_txn_warning_sw = "1"b;
+
+	else if multiple_info_sw then call ioa_ ("^a: ^a", P_name, ltrim (rtrim (P_value)));
+	else call ioa_ ("^a", ltrim (rtrim (P_value)));
+
+     end PRINT_ITEM;
+%page;
+REQUEST_INFO: proc (P_sw);
+
+dcl  P_sw bit (1) unaligned;
+
+	P_sw = "0"b;				/* to test if others on */
+	if unspec (print_switches) ^= "0"b then do;
+	     if af_sw then do;
+		call complain (0, my_name, "Can only return one item of information.");
+		go to RETURN;
+	     end;
+	     multiple_info_sw = "1"b;
+	end;
+
+	P_sw = "1"b;
+
+	return;
+
+     end REQUEST_INFO;
+%page;
+SAVE_HANDLER: proc (P_condition_name, P_action, P_retry_limit);
+
+dcl  P_condition_name char (*);
+dcl  (P_action, P_retry_limit) fixed bin;
+dcl  (p, last_p) ptr;
+
+	if first_handler_ptr = null then do;
+	     allocate handler_node in (area) set (p);
+	     first_handler_ptr = p;
+FILL_NEW_NODE:
+	     p -> handler_node.next_ptr = null;
+	     p -> handler_node.condition_name = P_condition_name;
+FILL_NODE:
+	     p -> handler_node.action = P_action;
+	     p -> handler_node.retry_limit = P_retry_limit;
+	     return;
+	end;
+	do p = first_handler_ptr repeat (p -> handler_node.next_ptr) while (p ^= null);
+	     if p -> handler_node.condition_name = P_condition_name then go to FILL_NODE;
+	     last_p = p;
+	end;
+	allocate handler_node in (area) set (p);
+	last_p -> handler_node.next_ptr = p;
+	go to FILL_NEW_NODE;
+
+     end SAVE_HANDLER;
+%page;
+SUB_ERROR_CODE: proc returns (fixed bin (35));
+
+	call find_condition_info_ (null, addr (cond_info), code);
+	if code ^= 0 then return (dm_error_$system_not_initialized);
+
+	if cond_info.info_ptr -> sub_error_info.default_restart then do;
+						/* a warning */
+	     call continue_to_signal_ (0);
+	     return (0);
+	end;
+
+	else return (cond_info.info_ptr -> sub_error_info.retval);
+
+     end SUB_ERROR_CODE;
+%page;
+USAGE_STRING: proc (P_str) returns (char (128));
+
+dcl  P_str char (*);
+dcl  buffer char (128) varying;
+
+	buffer = "Usage:  " || rtrim (my_name);
+	if P_str ^= "" then buffer = buffer || " " || P_str;
+	if af_sw
+	then return ("[" || buffer || "]");
+	else return (buffer);
+
+     end USAGE_STRING;
+%page;
+%include condition_info;
+%page;
+%include condition_info_header;
+%page;
+%include dm_tm_modes;
+%page;
+%include dm_tm_txn_info;
+%page;
+%include query_info;
+%page;
+%include sub_error_info;
+
+
+     end transaction;

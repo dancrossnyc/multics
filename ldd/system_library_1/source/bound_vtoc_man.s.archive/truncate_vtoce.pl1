@@ -1,0 +1,361 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/* format: style4 */
+truncate_vtoce: proc (branchp, first_page, code);
+
+
+/* FUNCTION -
+
+   This procedure truncates the segment whose branch is pointed  to  by  the  input
+   argument  "branchp",  from  the  page  number  defined  by  the  input  argument
+   "first_page". The current length of the segment becomes equal  to  "first_page".
+   All core and disk records occupied by the truncated portion of the segment
+   are  freed.  In  addition,  the quota used information of the parents, up to the
+   appropriate terminal quota directory, are updated to reflect the fact that  they
+   , are not responsible any longer for those pages that have been freed.
+
+   If  code  = 0 upon return, the operation was successful. Otherwise the operation
+   failed at some point because of a system error.
+
+   The parent directory is supposed to be locked before this procedure  is  called.
+
+
+   IMPLEMENTATION -
+
+   If the segment is active, the truncation takes place in the ASTE. The VTOCE will
+   automatically  be updated at deactivation or any time the procedure update_vtoce
+   is called.
+
+   If the segment is not active, the truncation takes place directly in the  VTOCE.
+   Since  the  parent  is  locked  and  the  segment  is  not active, it is safe to
+   manipulate the VTOCE. However, updating the used count of the  parents  will  be
+   done  on the ASTE's of the parent, after having forced them to the active state.
+
+
+
+   MODIFIED BY :
+
+   04/29/75  A. Bensoussan - Written for the new storage system.
+   05/76	By Greenberg for await_vtoce,  06/76 for hphcs_$delete_vtoce.
+   06/76 D.Vinograd - added entry hold which does not release pvtx .
+   07/76 D. Vinograd modified to set volume dumper bit map so that truncated/deleted vtoces are dumped
+   06/08/81 by J. Bongiovanni to set vtoce.records to 0 if truncating to 0
+   07/10/82 by J. Bongiovanni to read entire VTOCE
+   08/18/82 by J. Bongiovanni for new pc$deposit_list calling sequence
+   10/26/82 by J. Bongiovanni to reset fm_damaged if truncating to 0, fix grandparent locking
+   830430 BIM to make check of pvtx and vtocx against branch.
+   83-08-06 by E. N. Kittlitz to do pvtx/vtocx check using search_ast$check.
+   84-12-20 by Keith Loepere to count dirs pages against own quota.
+   85-01-10 by Keith Loepere for covert channel detection.
+   85-01-21 by Keith Loepere to add dtm setting and detection.
+*/
+
+%page;
+
+dcl  branchp ptr;
+dcl  code fixed bin (35);
+dcl  first_page fixed bin (17);
+
+dcl  csl fixed bin;
+dcl  deleting bit (1) init ("0"b);
+dcl  1 deposit aligned,
+       2 list (256) bit (22) aligned;
+dcl  dir_must_be_unlocked bit (1);
+dcl  event_count fixed bin;
+dcl  first fixed bin;
+dcl  hold bit (1) init ("0"b);
+dcl  i fixed bin;
+dcl  1 local_vtoce like vtoce aligned;
+dcl  multi_class bit (1) aligned;
+dcl  n fixed bin;
+dcl  normal bit (1) aligned;
+dcl  page_count fixed bin;
+dcl  pageno_list (256) fixed bin aligned;
+dcl  par_astep ptr;
+dcl  par_dp ptr;
+dcl  par_ep ptr;
+dcl  par_pvid bit (36) aligned;
+dcl  par_uid bit (36) aligned;
+dcl  par_vtocx fixed bin;
+dcl  pvid bit (36) aligned;
+dcl  pvtx fixed bin;
+dcl  uid bit (36) aligned;
+dcl  vtocx fixed bin;
+
+dcl  error_table_$mylock fixed bin (35) external;
+dcl  error_table_$vtoce_connection_fail fixed bin (35) external;
+dcl  pds$throttle_segment_state_changes bit (1) aligned external;
+dcl  sst$checksum_filemap fixed bin (35) external;
+
+dcl  activate entry (ptr, fixed bin (35)) returns (ptr);
+dcl  dbm_man$set_incr entry (fixed bin, fixed bin, fixed bin (35));
+dcl  filemap_checksum_ entry (ptr, fixed bin, bit (36) aligned);
+dcl  get_pvtx entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+dcl  get_pvtx$hold_pvtx entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  get_pvtx$release_pvtx entry (bit (36) aligned, fixed bin);
+dcl  limit_covert_channel entry (fixed bin);
+dcl  lock$dir_unlock entry (ptr);
+dcl  lock$lock_ast entry;
+dcl  lock$unlock_ast entry;
+dcl  pc$deposit_list entry (fixed bin, fixed bin, ptr, fixed bin, ptr);
+dcl  pc$truncate entry (ptr, fixed bin);
+dcl  pc$updates entry (ptr);
+dcl  quotaw$cu entry (ptr, fixed bin, bit (1), fixed bin, fixed bin (35));
+dcl  search_ast$check entry (bit (36) aligned, bit (36) aligned, fixed bin, fixed bin (35)) returns (ptr);
+dcl  sum$getbranch_root_my entry (ptr, bit (1), ptr, fixed bin (35));
+dcl  syserr entry options (variable);
+dcl  vtoc_man$await_vtoce entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+dcl  vtoc_man$get_vtoce entry (bit (36) aligned, fixed bin, fixed bin, bit (3), ptr, fixed bin (35));
+dcl  vtoc_man$put_vtoce entry (bit (36) aligned, fixed bin, fixed bin, bit (3), ptr, fixed bin (35));
+
+dcl  (addr, bit, clock, fixed, min, null, ptr, substr) builtin;
+
+%page;
+	first = first_page;
+	go to join;
+hold: entry (branchp, first_page, code);
+	first = first_page;
+	hold = "1"b;
+	goto join;
+truncate_vtoce_delete: entry (branchp, code);
+	deleting = "1"b;
+	first = 0;
+join:
+
+/* INITIALIZE POINTERS AND VARIABLES */
+
+	normal = ^(deleting | hold);
+	ep = branchp;
+	code = 0;
+
+	uid = entry.uid;
+	pvid = entry.pvid;
+	pvtx = get_pvtx (pvid, code); if code ^= 0 then return;
+	vtocx = entry.vtocx;
+	multi_class = entry.multiple_class;
+	event_count = 0;
+
+/* IF THE SEGMENT IS ACTIVE, CALL UPON PAGE CONTROL TO DO ALL THE WORK */
+
+	call lock$lock_ast;
+
+	astep = search_ast$check (uid, pvid, vtocx, (0)); /* ignore double-uid error for now */
+
+	if astep ^= null then do;			/* aste really matches */
+	     if aste.hc_sdw then call syserr (CRASH, "truncate_vtoce: attempt to destroy hc_sdw seg astep ^p", astep);
+	     csl = fixed (aste.csl);
+	     call pc$truncate (astep, first);
+	     if first = 0 then do;			/* was truncate to zero length? */
+		if aste.damaged then aste.fmchanged = "1"b; /* force update_vtoce if reset it */
+		aste.damaged = "0"b;		/* user wanted zeroes: he's got them */
+		aste.fm_damaged = "0"b;		/* any filemap damage got better */
+	     end;
+	     call lock$unlock_ast;
+	     if ^deleting & hold then call get_pvtx$hold_pvtx (pvid, pvtx, code);
+	     go to covert_test;
+	end;
+
+	call lock$unlock_ast;
+
+
+/* THE SEGMENT IS NOT ACTIVE - THEREFORE THE OPERATION HAS TO BE DONE ON THE VTOCE. */
+/* NOTE THAT ANOTHER SEGMENT WITH THE SAME UID MIGHT BE ACTIVE, BUT WE DON'T CARE. */
+
+	vtocep = addr (local_vtoce);
+
+	call vtoc_man$get_vtoce (pvid, pvtx, vtocx, "111"b, vtocep, code);
+	if code ^= 0 then return;
+
+	if uid ^= vtoce.uid then do;
+	     code = error_table_$vtoce_connection_fail;
+	     return;
+	end;
+
+	csl = fixed (vtoce.csl);
+
+	if ^deleting then call get_pvtx$hold_pvtx (pvid, pvtx, code);
+	if code ^= 0 then return;			/* Got demounted if return */
+
+
+/* PERFORM THE TRUNCATION ON THE VTOCE AND WRITE IT BACK IN THE DISK -
+   DO NOT DEPOSIT ANY DISK ADDRESSES YET, BUT REMEMBER THEM */
+
+	n = 0;
+	do i = first to csl - 1;
+	     if substr (vtoce.fm (i), 1, 1) = "0"b then do;
+		n = n + 1;
+		deposit.list (n) = vtoce.fm (i);
+		pageno_list (n) = i;
+		vtoce.fm (i) = truncate_vtoce_null_addr;
+	     end;
+	end;
+
+	if vtoce.fm_damaged & (sst$checksum_filemap ^= 0)
+	then n = 0;				/* don't deposit potentially bogus addresses */
+
+	vtoce.csl = bit (fixed (min (first, csl), 9), 9);
+	if first = 0 then do;
+	     vtoce.records = "0"b;
+	     vtoce.damaged = "0"b;
+	     vtoce.fm_damaged = "0"b;
+	end;
+	else vtoce.records = bit (fixed (fixed (vtoce.records, 9) - n, 9), 9); /* #@!*%! */
+
+	if sst$checksum_filemap = 0 then do;
+	     vtoce.fm_damaged = "0"b;
+	     vtoce.fm_checksum_valid = "0"b;
+	     vtoce.fm_checksum = ""b;
+	end;
+	else do;
+	     vtoce.fm_checksum_valid = "1"b;
+	     call filemap_checksum_ (addr (vtoce.fm), fixed (vtoce.csl, 9), vtoce.fm_checksum);
+	end;
+
+	if vtoce.dirsw then
+	     if ^vtoce.deciduous then
+		vtoce.used (1) = vtoce.used (1) - n;	/* update dir quota */
+
+/* Set dtu, dtcm.
+   This setting can be a covert channel event (external to page control's
+   detection of dtu/dtm setting).  If the object is multi-class, then it sits
+   in a lower class dir and this dtu setting is lower class visible.  The dtm
+   is always lower class visible, since it propogates up the hierarchy. */
+
+	if normal then do;
+	     vtoce.dtm, vtoce.dtu = bit (fixed (clock (), 52), 52);
+	     if multi_class then event_count = 2;
+	     else event_count = 1;
+	end;
+
+	call vtoc_man$put_vtoce ("0"b, pvtx, vtocx, "111"b, vtocep, code);
+	if code ^= 0 then go to release;
+
+	if deleting | (^deleting & ^vtoce.per_process & ^vtoce.deciduous) then
+	     call dbm_man$set_incr (pvtx, vtocx, code);
+
+
+/* IF THERE ARE ANY DISK ADDRESSES TO BE DEPOSITED, DO IT NOW - AND ALSO UPDATE THE USED COUNT
+   IN ASTE's OF SUPERIOR DIRECTORIES AFTER HAVING FORCED THEM TO BE ACTIVE */
+
+	if n = 0 then go to release;
+
+	if ^vtoce.deciduous then do;			/* Cannot free deciduous space (hc part) */
+	     call vtoc_man$await_vtoce ("0"b, pvtx, vtocx, code);
+	     if code ^= 0 then go to release;
+	     call pc$deposit_list (pvtx, (n), addr (deposit.list), vtocx, addr (pageno_list));
+	end;
+
+release:
+	if normal then call get_pvtx$release_pvtx (pvid, pvtx); /* Free volume for demount */
+
+
+	if entry.owner = "111111111111111111111111111111111000"b then return;
+						/* No quota handling if hphcs_$delv */
+
+	dp = ptr (ep, 0);
+	par_uid = dir.uid;
+	par_pvid = dir.pvid;
+	par_vtocx = dir.vtocx;
+	dir_must_be_unlocked = "0"b;
+
+	call lock$lock_ast;
+
+	par_astep = search_ast$check (par_uid, par_pvid, par_vtocx, code);
+	if code ^= 0 then do;			/* can't activate it, so punt */
+	     call lock$unlock_ast;
+	     return;
+	end;
+
+	if par_astep = null then do;
+	     call lock$unlock_ast;
+
+	     call sum$getbranch_root_my (dp, "0"b, par_ep, code);
+
+	     if code = 0 then dir_must_be_unlocked = "1"b;
+	     else if code = error_table_$mylock then code = 0; else return;
+
+	     par_dp = ptr (par_ep, 0);
+	     par_astep = activate (par_ep, code);
+
+	     if code ^= 0 then do;
+		if dir_must_be_unlocked then call lock$dir_unlock (par_dp);
+		return;
+	     end;
+	end;
+
+	if ^vtoce.deciduous then do;
+	     if vtoce.dirsw then
+		if vtoce.received (1) = 0 then	/* non-terminal dir - give back quota to terminal cell */
+		     call quotaw$cu (par_astep, (-n), "1"b, 0, code);
+		else ;				/* deleting dir merely zeroes its own terminal quota */
+	     else call quotaw$cu (par_astep, (-n), "0"b, 0, code);
+	     if normal then call pc$updates (par_astep); /* let dumper know to come */
+	end;
+	call lock$unlock_ast;
+
+	if dir_must_be_unlocked then call lock$dir_unlock (par_dp);
+%page;
+covert_test:
+	if ^normal then return;
+
+/* see if the truncation of these pages can transmit some data */
+
+	if ^pds$throttle_segment_state_changes then return; /* uninteresting */
+	if multi_class then do;			/* only multi-class segment attributes count towards covert channels */
+
+/* The changing of records used is a covert channel relevant event.  The number
+   of events depends on how many pages were truncated. */
+
+	     csl = csl - first;
+	     if csl > 0 then do;
+		page_count = 1;
+		do event_count = event_count repeat event_count + 1 while (page_count <= csl);
+		     page_count = page_count * 2;	/* this finds log2(csl), sort of */
+		end;
+	     end;
+	end;
+
+	if event_count > 0 then call limit_covert_channel (event_count);
+	return;
+
+/* format: off */
+
+%page; %include aste;
+%page; %include dir_entry;
+%page; %include dir_header;
+%page; %include null_addresses;
+%page; %include syserr_constants;
+%page; %include vtoce;
+%page;
+/* format: on */
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   truncate_vtoce: attempt to destroy hc_sdw seg astep PPP
+
+   S: $crash
+
+   T: $run
+
+   M: An attempt has been made to truncate
+   a supervisor segment.
+   The AST entry is located at PPP.
+   $err
+
+   A: $recover
+
+   END MESSAGE DOCUMENTATION */
+
+     end truncate_vtoce;

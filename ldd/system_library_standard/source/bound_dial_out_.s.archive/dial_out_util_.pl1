@@ -1,0 +1,697 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1991   *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+dial_out_util_:
+     procedure;
+
+/* Written January 1983 by C. Hornig */
+/* Modified March 1983 by K. Loepere to fix bugs, enhance for waiting */
+/* Modified September 1983 by R.J.C. Kissel to send lines to the remote */
+/*  system wth their terminators in one put_chars call. (Mostly for 6M). */
+/* Modified December 1983 by B. Margolin to change reset_do_modes to just
+   call iox_$modes and iox_$control, rather than calling set_modes (which
+   would set some tty modes improperly for a reset), and remove the minor
+   optimization in set_modes which is no longer valid. */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(91-07-15,Oke), approve(91-09-09,MCR8247),
+     audit(92-04-24,WAAnderson), install(92-04-24,MR12.5-1012):
+     To setup a length for substr's of input_buffer in escape and special
+     character processing.  Previously this did not account for num_chars_read
+     and thus indexed into uninitialized parts of the automatic variable
+     input_buffer, with amusing results.
+  2) change(91-08-15,Schroth), approve(91-09-09,MCR8247),
+     audit(92-04-24,WAAnderson), install(92-04-24,MR12.5-1012):
+     Added cleanup handler to interaction_loop entry to reset the wait alarm
+     timer when unwinding.
+                                                   END HISTORY COMMENTS */
+
+
+dcl  Active_function bit (1) aligned;
+dcl  Arg_list ptr parameter;
+dcl  Code fixed bin (35) parameter;
+dcl  Dop ptr parameter;
+dcl  Data_ptr ptr parameter;
+dcl  Entry variable entry parameter;
+dcl  Nelem fixed bin (21) parameter;
+dcl  Silent bit (1) aligned parameter;
+dcl  Waiting bit (1) aligned parameter;
+
+dcl  CR char (1) static options (constant) init ("");
+dcl  NL char (1) static options (constant) init ("
+");
+
+dcl  cleanup condition;
+dcl  program_interrupt condition;
+dcl  quit condition;
+
+dcl  active_function bit (1) aligned init ("0"b);
+dcl  active_len_before_quotes fixed bin (21);		/* see if final quotes pair */
+dcl  active_result char (do_info.active_result_max_len) based (do_info.active_result_ptr) var;
+dcl  cmd_buff char (do_info.cmd_buff_len) based (do_info.cmd_ptr);
+						/* accumulated stuff to either send out or execute */
+dcl  cmd_len fixed bin (21);
+dcl  code fixed bin (35);
+dcl  escape_seen bit (1) aligned;			/* last char was an escape char */
+dcl  1 ev_msg aligned like event_wait_info;
+dcl  in_command bit (1) aligned;			/* now reading a command */
+dcl  need_to_echo_command bit (1) aligned;		/* have processed the command character */
+dcl  need_to_check_net bit (1) aligned;			/* chars may be present at net */
+dcl  need_to_check_term bit (1) aligned;		/* chars may be present at term */
+dcl  net_input_buff char (do_info.net_input_buff_len) based (do_info.net_input_buff_ptr);
+dcl  silent bit (1) aligned init ("0"b);		/* don't print stuff from net */
+dcl  1 term_rs aligned like do_info.net_rs;
+dcl  1 wait_list aligned,
+       2 count fixed bin,
+       2 pad fixed bin,
+       2 ev_chn (2) fixed bin (71);
+dcl  waiting bit (1) aligned init ("0"b);		/* in mode ignoring terminal input waiting for something from net */
+
+dcl  error_table_$line_status_pending fixed bin (35) ext static;
+dcl  error_table_$timeout fixed bin (35) ext static;
+
+dcl  com_err_ entry () options (variable);
+dcl  cu_$arg_list_ptr entry () returns (ptr);
+dcl  cu_$generate_call entry (entry, ptr);
+dcl  cu_$set_cl_intermediary entry (entry);
+dcl  get_user_free_area_ entry returns (ptr);
+dcl  ioa_$nnl entry () options (variable);
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ssu_$execute_line entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl  timer_manager_$alarm_call entry (fixed bin (71), bit (2), entry, ptr);
+dcl  timer_manager_$reset_alarm_call entry (entry);
+dcl  requote_string_$quote_string entry (char (*)) returns (char (*));
+
+dcl  (addcharno, addr, divide, index, length, min, mod, null, rtrim, substr) builtin;
+
+/* * * * * * * * * SEND_CHARS * * * * * * * * * * */
+
+send_chars:
+     entry (Dop, Data_ptr, Nelem, Code);
+
+	dop = Dop;
+	call send (Data_ptr, Nelem, Code);
+	return;
+
+/* * * * * * * * * * SEND_NL * * * * * * * * * */
+
+send_nl:
+     entry (Dop, Code);
+
+	dop = Dop;
+	call send (addr (CR), 1, Code);
+	if Code ^= 0 then return;
+	if do_info.flags.send_lf_sw then do;
+	     call send (addr (NL), 1, Code);
+	     if Code ^= 0 then return;
+	     end;
+	return;
+
+/* * * * * * * * * * SEND * * * * * * * * */
+
+send:
+     procedure (Data_ptr, Nelem, Code);
+
+dcl  Code fixed bin (35) parameter;
+dcl  Data_ptr ptr parameter;
+dcl  Nelem fixed bin (21) parameter;
+
+rewrite:
+	call iox_$put_chars (do_info.ci.net_iocb, Data_ptr, Nelem, Code);
+	if Code = error_table_$line_status_pending then do;
+	     call line_status;
+	     goto rewrite;
+	     end;
+	return;
+     end send;
+
+/* * * * * * * * * * PROCESS_LINE_STATUS * * * * * * * * * * */
+
+process_line_status:
+     entry (Dop);
+
+	dop = Dop;
+	call line_status;
+	return;
+
+/* * * * * * * * * * SET_DO_MODES * * * * * * * * * */
+
+set_do_modes:
+     entry (Dop);
+
+	dop = Dop;
+	call set_modes (do_info.ci.raw_sw, do_info.ci.echo_sw, do_info.ci.lfecho_sw);
+	return;
+
+/* * * * * * * * * * RESET_DO_MODES * * * * * * * * * */
+
+reset_do_modes:
+     entry (Dop);
+
+	dop = Dop;
+	call iox_$modes (iox_$user_input, do_info.old_modes, (""), (0));
+	call iox_$control (iox_$user_input, "printer_on", null (), (0));
+	return;
+
+/* * * * * * * * * LINE_STATUS * * * * * * * * * * */
+
+line_status:
+     procedure;
+
+dcl  ls_data bit (72) aligned;
+dcl  code fixed bin (35);
+
+	call iox_$control (do_info.ci.net_iocb, "line_status", addr (ls_data), code);
+	call get_modes;
+	return;
+     end line_status;
+
+/* * * * * * * * * GET_MODES * * * * * * * * * */
+
+get_modes:
+     procedure;
+
+dcl  code fixed bin (35);
+dcl  1 ftd aligned like foreign_terminal_data;
+dcl  i fixed bin;
+
+	ftd.version = FOREIGN_TERMINAL_DATA_VERSION_1;
+	ftd.area_ptr = get_user_free_area_ ();
+	call iox_$control (do_info.ci.net_iocb, "get_foreign_terminal_data", addr (ftd), code);
+	if code ^= 0 then return;
+
+	mode_string_info_ptr = ftd.mode_string_info_ptr;
+	if mode_string_info.version = mode_string_info_version_2 then do;
+	     do_info.flags.echo_sw = "0"b;
+	     do i = 1 to mode_string_info.number;	/* process each mode */
+		mode_value_ptr = addr (mode_string_info.modes (i));
+		if mode_value.version = mode_value_version_3 then do;
+		     if /* case */ ((mode_value.mode_name = "echoplex") | (mode_value.mode_name = "echo"))
+			& mode_value.flags.boolean_valuep & mode_value.flags.boolean_value
+		     then do_info.ci.flags.echo_sw = "1"b;
+		     else if (mode_value.mode_name = "lfecho") & mode_value.flags.boolean_valuep
+		     then do_info.ci.flags.lfecho_sw = mode_value.flags.boolean_value;
+		     else if (mode_value.mode_name = "breakall") & mode_value.flags.boolean_valuep
+		     then do_info.ci.flags.no_breakall_sw = ^mode_value.flags.boolean_value;
+		     end;
+	     end;
+	     end;
+	call set_modes (do_info.ci.raw_sw, do_info.ci.echo_sw, do_info.ci.lfecho_sw);
+	free mode_string_info;
+	return;
+
+%include mode_string_info;
+
+     end get_modes;
+
+/* * * * * * * * * * SET_MODES * * * * * * * * * */
+
+set_modes:
+     procedure (Raw, Echo, Lfecho);
+
+dcl  (Raw, Echo, Lfecho) bit (1) unaligned parameter;
+dcl  code fixed bin (35);
+
+	call iox_$modes (iox_$user_input, do_info.old_modes, (""), code);
+	call iox_$control (iox_$user_input, "printer_on", null (), code);
+
+	if Raw then call iox_$modes (iox_$user_input, "force,rawi,rawo,^replay,^polite,^prefixnl", (""), code);
+
+	if ^do_info.no_breakall_sw then do;
+	     call iox_$modes (iox_$user_input, "breakall", (""), code);
+	     if ^Lfecho | ^Echo then call iox_$modes (iox_$user_input, "^lfecho", (""), code);
+	     end;
+
+	if ^Echo then do;
+	     call iox_$modes (iox_$user_input, "force,^tabecho,^crecho", (""), code);
+	     call iox_$control (iox_$user_input, "printer_off", null (), code);
+	     end;
+
+	do_info.raw_mode = Raw;
+	do_info.echo_mode = Echo;
+	do_info.lfecho_mode = Lfecho;
+	return;
+     end set_modes;
+%page;
+interaction_loop:
+     entry (Dop, Waiting, Active_function);
+
+/* This is the main loop that looks for chars coming from either end and
+   normally just sends them to the other end.  The terminals chars are examined
+   for escape sequences. */
+
+	dop = Dop;
+	waiting = Waiting;
+	active_function, silent = Active_function;
+	if active_function then do;
+	     do_info.active_result_max_len = do_info.active_result_max_len - 1;
+						/* leave room for final quote */
+	     active_result = """";
+	     end;
+
+	if ^waiting
+	then on program_interrupt			/* set only for main usage, not wait */
+		begin;
+		call set_do_modes (dop);		/* just in case */
+		call cu_$set_cl_intermediary (do_info.my_cl_intermediary);
+		call ioa_$nnl ("^1aInput:  ", do_info.ci.esc_char);
+		call terminal_input ("1"b);
+		waiting = "0"b;
+		goto reenter_interaction_loop;
+	     end;
+
+	on cleanup
+	     begin;
+	     if waiting & do_info.time_out > 0 then call timer_manager_$reset_alarm_call (abort_wait);
+	end;
+
+reenter_interaction_loop:
+	if waiting
+	then if do_info.match_length > 0
+	     then					/* did what he wants already come */
+		if net_input_found () then goto interaction_done;
+	in_command, need_to_echo_command, escape_seen = "0"b;
+	need_to_check_net, need_to_check_term = "1"b;	/* set everything to give us a chance to see what's there */
+	cmd_len = 0;
+	term_rs.ev_chn = 0;
+	do_info.abort_code = 0;
+
+	do while ("1"b);
+	     if need_to_check_net then do;
+		call iox_$control (do_info.ci.net_iocb, "read_status", addr (do_info.net_rs), code);
+		if code ^= 0 then do_info.net_rs.data_available = "1"b;
+
+		if do_info.net_rs.data_available
+		then call net_input;
+		else need_to_check_net = "0"b;
+		end;
+
+	     if need_to_check_term & ^waiting then do;
+		call iox_$control (iox_$user_input, "read_status", addr (term_rs), code);
+		if code ^= 0 then term_rs.data_available = "1"b;
+
+		if term_rs.data_available
+		then call terminal_input ("0"b);
+		else do;
+		     need_to_check_term = "0"b;
+		     if need_to_echo_command then do;
+			call reset_do_modes (dop);
+			if ^do_info.ci.flags.echo_sw
+			then call ioa_$nnl ("^1a^a", do_info.ci.esc_char, substr (cmd_buff, 1, cmd_len));
+			need_to_echo_command = "0"b;
+			end;
+		     end;
+		end;
+
+	     if (^need_to_check_term | waiting) & ^need_to_check_net then do;
+						/* if we're convinced no one has something for us, wait */
+		wait_list.ev_chn (1) = do_info.net_rs.ev_chn;
+		if (term_rs.ev_chn ^= 0) & ^waiting then do;
+		     wait_list.ev_chn (2) = term_rs.ev_chn;
+		     wait_list.count = 2;
+		     end;
+		else wait_list.count = 1;
+
+		if waiting & do_info.time_out > 0
+		then call timer_manager_$alarm_call ((do_info.time_out), "11"b, abort_wait, null ());
+		call ipc_$block (addr (wait_list), addr (ev_msg), do_info.abort_code);
+		if waiting & do_info.time_out > 0 then call timer_manager_$reset_alarm_call (abort_wait);
+
+		if do_info.abort_code ^= 0 then goto return_to_caller;
+		if ev_msg.channel_index = 1
+		then need_to_check_net = "1"b;
+		else need_to_check_term = "1"b;
+		end;
+	end;
+
+interaction_done:
+	if active_function then do;			/* make sure that the final quotes pair correctly
+						   (Normally, an extra quote is needed at the end to properly requote the result.
+						   We may need to fiddle, though, for this to come out right if
+						   we overflowed the end before.) */
+	     do_info.active_result_max_len = do_info.active_result_max_len + 1;
+						/* give room for one more quote */
+	     active_len_before_quotes = length (rtrim (active_result, """"));
+	     if active_len_before_quotes = 0
+	     then					/* all quotes */
+		if mod (length (active_result), 2) ^= 0
+		then active_result = active_result || """";
+						/* pair up */
+		else ;
+	     else if mod (length (active_result) - active_len_before_quotes, 2) = 0
+	     then active_result = active_result || """";
+	     else ;
+	     end;
+	return;
+
+abort_wait:
+     proc (mc_ptr, name, wc_ptr, data_ptr) options (non_quick);
+						/* must be non_quick since it is called (non-locally) through an entry variable) */
+dcl  (mc_ptr, wc_ptr, data_ptr) ptr;
+dcl  name char (*);
+	do_info.abort_code = error_table_$timeout;
+	goto interaction_done;
+     end;
+
+
+/* * * * * * * * * PROCESS_NET_INPUT * * * * * * * * * */
+
+process_net_input:
+     entry (Dop, Silent);
+
+	dop = Dop;
+	silent = Silent;
+	call net_input;
+	return;
+
+net_input:
+     procedure;
+
+dcl  half_size fixed bin;				/* amount to scroll down char matching area */
+dcl  num_received fixed binary (21) automatic;
+
+	if do_info.net_input_last_char_filled = do_info.net_input_buff_len then do;
+						/* we filled matching area to end; scroll down last half over first half to
+						   get more space and so new high half flows from end of old high half -
+						   also update pointer to last char therein we matched on a wait */
+	     half_size = divide (do_info.net_input_buff_len, 2, 17);
+						/* since the chars we scroll over can't be seen again or matched - output them */
+	     if do_info.net_input_last_char_output < half_size
+	     then call output_net_input (half_size - do_info.net_input_last_char_output);
+	     substr (net_input_buff, 1, half_size) = substr (net_input_buff, half_size + 1, half_size);
+	     do_info.net_input_last_char_filled = half_size;
+	     net_input_last_char_output = net_input_last_char_output - half_size;
+	     end;
+
+	call iox_$get_chars (do_info.ci.net_iocb, addcharno (addr (net_input_buff), do_info.net_input_last_char_filled),
+	     do_info.net_input_buff_len - do_info.net_input_last_char_filled, num_received, do_info.abort_code);
+						/* read as much as still fits in area */
+	if do_info.abort_code = error_table_$line_status_pending then do;
+	     call process_line_status (dop);
+	     return;
+	     end;
+	if (num_received = 0) & (do_info.abort_code ^= 0) then goto return_to_caller;
+
+	if num_received > 0 then do;
+	     do_info.net_input_last_char_filled = do_info.net_input_last_char_filled + num_received;
+	     if waiting				/* see if we have read desired chars */
+	     then if net_input_found ()
+		then goto interaction_done;
+		else ;
+	     else call output_net_input (do_info.net_input_last_char_filled - do_info.net_input_last_char_output);
+	     end;
+	return;
+     end net_input;
+
+net_input_found:
+     proc () returns (bit (1) aligned);
+dcl  match_string char (do_info.match_length) based (do_info.match_string_p);
+dcl  matched_pos fixed bin;
+
+/* net_input very nicely keeps a running script of what came from the net.
+   He keeps scrolling this down, by halves, in the net_input_buff.  Thus, we
+   can do an index to see if the string came in (from the marked point at which
+   we last looked).  This will succeed as long as the string being searched for
+   does not exceed half the size of net_input_buff. */
+
+	if do_info.match_length = 0			/* any chars satisfy */
+	then return ("1"b);
+	else do;
+	     matched_pos =
+		index (
+		substr (net_input_buff, do_info.net_input_last_char_output + 1,
+		do_info.net_input_last_char_filled - do_info.net_input_last_char_output), match_string);
+						/* search only in chars after what
+						   matched a previous wait desire */
+	     if matched_pos > 0 then do;
+		call output_net_input (do_info.match_length + matched_pos - 1);
+		return ("1"b);
+		end;
+	     end;
+	return ("0"b);
+     end;
+
+output_net_input:
+     proc (amount);
+
+/* take desired chars and send to all appropriate places */
+dcl  amount fixed bin (21);
+
+	if amount <= 0 then return;
+	if active_function then do;
+	     active_result =
+		active_result
+		||
+		requote_string_$quote_string (substr (net_input_buff, do_info.net_input_last_char_output + 1, amount))
+		;
+	     end;
+
+	if ^silent then do;				/* not in send_file discard mode or active function */
+	     call iox_$put_chars (iox_$user_output,
+		addcharno (addr (net_input_buff), do_info.net_input_last_char_output), amount, do_info.abort_code);
+	     if do_info.abort_code ^= 0 then goto return_to_caller;
+	     end;
+	if do_info.fo_iocbp ^= null () then do;		/* file out in progress */
+	     call iox_$put_chars (do_info.fo_iocbp,
+		addcharno (addr (net_input_buff), do_info.net_input_last_char_output), amount, code);
+	     if code ^= 0 then do;
+		call com_err_ (code, do_info.ci.command_name, "Error in file_output, reverting.");
+		call revert_fo (addr (do_info));
+		end;
+	     end;
+	do_info.net_input_last_char_output = do_info.net_input_last_char_output + amount;
+     end;
+
+terminal_input:
+     procedure (Force_get_line);
+
+dcl  Force_get_line bit (1) aligned parameter;
+dcl  c char (1) aligned;				/* previous char examining */
+dcl  code fixed bin (35);
+dcl  fragment_len fixed bin (21);			/* amount of input to add to command or output */
+dcl  indx fixed bin (21);				/* start of string being considered */
+dcl  input_buffer char (128);
+dcl  next_char fixed bin (21);			/* pos rel to indx of next char to consider */
+dcl  next_whatever fixed bin (21);			/* pos rel to indx of nl, cr, being looked for */
+dcl  num_bytes_read fixed bin (21);
+
+/* * * * * * * * * * * * * * * * * * * * * * * * */
+
+	num_bytes_read = 0;
+
+	if Force_get_line | ^do_info.raw_mode
+	then call iox_$get_line (iox_$user_input, addr (input_buffer), length (input_buffer), num_bytes_read,
+		do_info.abort_code);
+	else call iox_$get_chars (iox_$user_input, addr (input_buffer), length (input_buffer), num_bytes_read,
+		do_info.abort_code);
+	if (do_info.abort_code ^= 0) & (num_bytes_read = 0) then goto do_info.abort_label;
+
+	if num_bytes_read = 0 then return;
+	indx = 1;
+	if escape_seen then do;			/* last char of previous buffer was escape */
+	     escape_seen = "0"b;
+	     fragment_len = 1;
+	     c = substr (input_buffer, indx, 1);
+	     if c = do_info.ci.esc_char then call insert; /* two esc's in a row make only one */
+	     else if in_command then do;
+		call switch;			/* leave command */
+		call insert;			/* add char to regular input */
+		end;
+	     else if ^((c = CR) | (do_info.lfecho_mode & do_info.echo_mode & (c = NL))) then do;
+		call switch;			/* start command */
+		call insert;
+		end;
+	     else ;				/* esc CR is null command */
+	     indx = 2;				/* first char used */
+	     end;
+
+/* loop, grabbing strings up to break chars (esc, nl, etc) */
+	do while (indx <= num_bytes_read);		/* look for an interesting char (esc, CR,...) */
+	     next_char = index (substr (input_buffer, indx, num_bytes_read - indx + 1), do_info.ci.esc_char);
+	     if next_char = 0 then next_char = num_bytes_read - indx + 1;
+						/* last char is considered interesting if no esc, nl... */
+	     next_whatever = index (substr (input_buffer, indx, num_bytes_read - indx + 1), CR);
+	     if next_whatever = 0 then next_whatever = num_bytes_read - indx + 1;
+	     next_char = min (next_char, next_whatever);
+	     if in_command | (do_info.lfecho_mode & do_info.echo_mode) then do;
+						/* NL is interesting only in a command or when modes say it is */
+		next_whatever = index (substr (input_buffer, indx, num_bytes_read - indx + 1), NL);
+		if next_whatever = 0 then next_whatever = num_bytes_read - indx + 1;
+		next_char = min (next_char, next_whatever);
+		end;
+
+	     c = substr (input_buffer, indx + next_char - 1, 1);
+	     if /* case */ c = do_info.ci.esc_char then do;
+		fragment_len = next_char - 1;
+		call insert;			/* chars up to esc go to appropriate buffer */
+		indx = indx + fragment_len + 1;	/* -> after esc */
+		if indx > num_bytes_read
+		then escape_seen = "1"b;		/* remember to look at in next buffer */
+		else do;
+		     fragment_len = 1;
+		     c = substr (input_buffer, indx, 1);
+		     if c = do_info.ci.esc_char then call insert;
+						/* two esc's in a row make only one */
+		     else if in_command then do;
+			call switch;		/* leave command */
+			call insert;		/* add char to regular input */
+			end;
+		     else if ^((c = CR) | (do_info.lfecho_mode & do_info.echo_mode & (c = NL))) then do;
+			call switch;		/* start command */
+			call insert;		/* add char to it */
+			end;
+		     else ;			/* esc CR is null command */
+		     indx = indx + 1;
+		     end;
+		end;
+	     else if (c = CR) | (c = NL /* if we thought they were interesting before */) then do;
+		fragment_len = next_char - 1;
+		call insert;			/* add chars to appropriate buffer */
+		indx = indx + fragment_len + 1;	/* -> after CR */
+		if in_command
+		then call switch;			/* CR ends command */
+		else do;				/* Send a line with its terminator. */
+		     call insert_char (CR);
+		     if do_info.flags.send_lf_sw then call insert_char (NL);
+		     call transmit_buffer ();
+		     end;
+		end;
+	     else do;				/* must be last char in buffer */
+		fragment_len = next_char;
+		call insert;			/* add to buffer */
+		indx = indx + fragment_len;
+		end;
+	end;
+	if ^in_command & (cmd_len > 0) then call transmit_buffer ();
+
+	return;
+
+
+switch:
+	procedure ();
+dcl  this_cmd_len fixed bin (21);
+
+	     if in_command then do;			/* end to command detected - prepare to execute */
+		this_cmd_len = cmd_len;
+		cmd_len = 0;
+		if need_to_echo_command & ^do_info.ci.flags.echo_sw
+		then call ioa_$nnl ("^1a^a", do_info.ci.esc_char, substr (cmd_buff, 1, this_cmd_len));
+		in_command, need_to_echo_command = "0"b;
+		call cmd_proc (do_info.sci_ptr, do_info.cmd_ptr, this_cmd_len, code);
+		end;
+	     else do;				/* begin start of command */
+		call transmit_buffer ();
+		in_command, need_to_echo_command = "1"b;
+		end;
+
+	     return;
+
+	end switch;
+
+
+insert:
+	procedure ();
+
+/* add chars to output buffer */
+
+	     substr (cmd_buff, cmd_len + 1, fragment_len) = substr (input_buffer, indx, fragment_len);
+	     cmd_len = cmd_len + fragment_len;
+
+	end insert;
+
+insert_char:
+	proc (Char);
+
+dcl  Char char (1) parameter;
+
+	     substr (cmd_buff, cmd_len + 1, 1) = Char;
+	     cmd_len = cmd_len + 1;
+
+	     return;
+
+	end insert_char;
+
+/* * * * * * * * * * TRANSMIT_BUFFER * * * * * * * * * */
+
+transmit_buffer:					/* send characters to the remote */
+	procedure;
+
+	     call send_chars (dop, addr (cmd_buff), cmd_len, do_info.abort_code);
+	     if do_info.abort_code ^= 0 then goto do_info.abort_label;
+	     cmd_len = 0;
+	     return;
+
+	end transmit_buffer;
+
+/* * * * * * * * * * COMMAND_PROC * * * * * * * * * */
+
+cmd_proc:
+	procedure (Sci_ptr, Cmd_ptr, Cmd_len, Code) options (non_quick);
+						/* get a standard argument list */
+
+dcl  (Cmd_ptr, Sci_ptr) ptr parameter;
+dcl  Cmd_len fixed bin (21) parameter;
+dcl  Code fixed bin (35) parameter;
+
+	     call call_out (dop, ssu_$execute_line, cu_$arg_list_ptr ());
+	     need_to_check_term = "1"b;
+	     need_to_check_net = "1"b;		/* who knows what happened while we were gone */
+	     call output_net_input (do_info.net_input_last_char_filled - do_info.net_input_last_char_output);
+						/* after possible wait request, flush what wasn't  grabbed */
+	     return;
+
+	end cmd_proc;
+
+     end terminal_input;
+
+/* * * * * * * * * * REVERT_FO * * * * * * * * */
+
+revert_fo:
+     entry (Dop);
+
+	dop = Dop;
+	if do_info.fo_iocbp = null then return;
+	call iox_$close (do_info.fo_iocbp, code);
+	call iox_$detach_iocb (do_info.fo_iocbp, code);
+	call iox_$destroy_iocb (do_info.fo_iocbp, code);
+	do_info.fo_iocbp = null;
+	return;
+
+/* * * * * * * * * * CALL_OUT * * * * * * * * * */
+
+call_out:
+     entry (Dop, Entry, Arg_list);
+
+	dop = Dop;
+	on cleanup
+	     begin;
+	     call set_do_modes (dop);
+	     call cu_$set_cl_intermediary (do_info.my_cl_intermediary);
+	end;
+	on quit system;
+
+	call reset_do_modes (dop);
+	call cu_$set_cl_intermediary (do_info.saved_cl_intermediary);
+
+	call cu_$generate_call (Entry, Arg_list);
+
+	call set_do_modes (dop);
+	call cu_$set_cl_intermediary (do_info.my_cl_intermediary);
+	return;
+
+return_to_caller:
+	return;
+%page;
+%include dial_out_invocation;
+%include event_wait_info;
+%include foreign_terminal_data;
+%include iox_dcls;
+
+     end dial_out_util_;

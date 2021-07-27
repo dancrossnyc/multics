@@ -1,0 +1,252 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1989                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-12,GWMay), approve(86-08-12,MCR7445), audit(86-11-20,GDixon),
+     install(86-11-21,MR12.0-1223):
+     changed to set bit count on the segment <volname>.contents_names.
+  2) change(89-01-06,GWMay), approve(89-01-06,MCR8039), audit(89-01-09,Farley),
+     install(89-01-17,MR12.3-1002):
+     Changed to call msf_mgr_$adjust to correctly set the size of the
+     <volname>.contents_names segments.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+dmpr_finish_: proc (code);
+
+/* This routine provides a centralized cleanup function for the volume dumper. It closes the account segment, unlocks
+   any logs that may have been left locked, detachs a switches that may have been left attached,
+   releases any temp segs, clears any pending alarms by deleting the event channel, and resets the ring 0
+   dumper and its data. This routine is used to clean up  both in the normal case and after a dumper abort when
+   the state of the world is not well understood. */
+
+/* Modified: 8/82 by GA Texada to fix phx13662, phx13708						*/
+/* Modified: 3/83 by E. N. Kittlitz for 256K segments.					          */
+/* Modified: 8/01/83 by GA Texada to call manage_volume_pool_$check_reserved
+		 to free any reserved volumes not in valid use.				          */
+
+dcl code		     fixed bin (35);
+dcl i		     fixed bin;
+dcl attach_name	     char (32);
+dcl bit_count	     fixed bin (24);
+dcl ignore	     fixed bin (35);
+dcl tp		     (4) ptr;
+
+dcl msf_manager_$adjust  entry (ptr, fixed bin, fixed bin (24), bit (3), fixed bin (35));
+dcl msf_manager_$close   entry (ptr);
+dcl manage_volume_pool_$check_reserved entry (ptr, entry, fixed bin (35));
+dcl manage_volume_pool$free entry (ptr, entry options (variable), char (*) aligned, fixed bin (35));
+dcl ioa_$rsnnl	     entry options (variable);
+dcl hcs_$fs_get_path_name entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+dcl adjust_bit_count_    entry (char (*), char (*), bit (1), fixed bin, fixed bin (35));
+dcl hcs_$delentry_seg    entry (ptr, fixed bin (35));
+dcl hcs_$terminate_seg   entry (ptr, fixed bin, fixed bin (35));
+dcl release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl dmpr_report_$error_output entry options (variable);
+dcl dmpr_report_$online_output entry options (variable);
+dcl dmpr_log_$close_volume_log entry (fixed bin (35));
+dcl set_lock_$unlock     entry (bit (36) aligned, fixed bin (35));
+dcl ipc_$delete_ev_chn   entry (fixed bin (71), fixed bin (35));
+dcl hc_backup_$dmpr_unlock_pv entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl hc_backup_$revert_dmpr entry (fixed bin);
+dcl hcs_$set_256K_switch entry (bit (2) aligned, bit (2) aligned, fixed bin (35));
+dcl iox_$close	     entry (ptr, fixed bin (35));
+dcl iox_$find_iocb	     entry (char (*), ptr, fixed bin (35));
+dcl iox_$detach_iocb     entry (ptr, fixed bin (35));
+
+dcl set_bc_n_truncate    bit (3) int static init ("110"b) options (constant);
+
+dcl null		     builtin;
+%page;
+    code = 0;
+    if dmprp = null then return;
+    if ^dmpr_data_.data_init then return;		/* reject calls if dmpr_data_ not inited */
+
+
+    if dmpr_data_.bvlp ^= null then do;
+        bvlp = dmpr_data_.bvlp;
+        call unlock_volume_log;
+        call setbc_term (dmpr_data_.bvlp);
+      end;
+
+
+    if dmpr_data_.fcbp ^= null then do;
+        if dmpr_data_.contents_namesp ^= null then do;
+	  contents_namesp = dmpr_data_.contents_namesp;
+	  bit_count = backup_volume_contents_names.offset * BITS_PER_WORD;
+	  call msf_manager_$adjust (dmpr_data_.fcbp, dmpr_data_.component,
+	       bit_count, set_bc_n_truncate, ignore);
+	  call msf_manager_$close (dmpr_data_.fcbp);
+	end;
+      end;
+
+    if dmpr_data_.pvlp ^= null then do;
+        pvlp = dmpr_data_.pvlp;
+        call unlock_pvolog;
+        call setbc_term (dmpr_data_.pvlp);
+      end;
+
+    if dmpr_data_.contentsp ^= null then
+      call setbc_term (dmpr_data_.contentsp);
+
+    if dmpr_data_.control_iocbp ^= null () then
+      call detach ("dump_control", dmpr_data_.control_iocbp); /* detach control seg */
+
+    if dmpr_data_.account_iocbp ^= null () then
+      call detach ("account_file", dmpr_data_.account_iocbp); /* and account file */
+
+    if dmpr_data_.detach then do;
+        if dmpr_data_.outputvol_iocbp ^= null then
+	call dmpr_report_$online_output (0, myname,
+	     "Finished volume ^a: ^d ^d ^d ^d", dmpr_data_.volname,
+	     dmpr_data_.dump_volume_dir_rec, dmpr_data_.dump_volume_dir_num, dmpr_data_.dump_volume_seg_rec,
+	     dmpr_data_.dump_volume_seg_num);
+        dmpr_data_.not_reported = "0"b;
+        if dmpr_data_.pre_attach_vol = 0 then
+	call detach ("dump_volume", dmpr_data_.outputvol_iocbp); /* and output volume */
+        else do;
+	  do i = dmpr_data_.vol_idx + 1 to dmpr_data_.pre_attach_vol
+	       while (dmpr_data_.pre_attach_pvlp (i) ^= null ());
+	    if dmpr_data_.auto_vol then
+	      call manage_volume_pool$free (dmpr_data_.vpp, dmpr_report_$error_output,
+		 dmpr_data_.pre_attach_volname (i), ignore);
+	    call hcs_$delentry_seg (dmpr_data_.pre_attach_pvlp (i), ignore);
+	  end;
+	  do i = 1 to dmpr_data_.pre_attach_vol while (dmpr_data_.pre_attach_iocbp (i) ^= null ());
+	    call ioa_$rsnnl ("^a.^d", attach_name, ignore, "dump_volume", i);
+	    call detach (attach_name, dmpr_data_.pre_attach_iocbp (i));
+	  end;
+	  dmpr_data_.pre_attach_vol = 0;
+	end;
+      end;
+
+    if dmpr_data_.vpp ^= null () then			/* free ANY old reserved volumes		*/
+      call manage_volume_pool_$check_reserved (dmpr_data_.vpp, dmpr_report_$error_output, (0));
+						/* don't care about code here			*/
+    if dmpr_data_.error_iocbp ^= null () then
+      call detach ("error_file", dmpr_data_.error_iocbp);	/* and error file */
+    if dmpr_data_.dump_type = incr & dmpr_data_.incr_ev_chn ^= 0 then do; /* incremental case */
+        call ipc_$delete_ev_chn (dmpr_data_.incr_ev_chn, code);
+        dmpr_data_.incr_ev_chn = 0;
+      end;
+
+    call hc_backup_$dmpr_unlock_pv (dmpr_data_.pvid, dmpr_data_.dump_type, ignore);
+
+    call hc_backup_$revert_dmpr (dmpr_data_.dump_type);
+
+    tp (1) = dmpr_data_.dirp;
+    tp (2) = dmpr_data_.inputp;
+    tp (3) = dmpr_data_.recordp;
+    tp (4) = dmpr_data_.infop;
+
+    call release_temp_segments_ ("dumper", tp, code);
+    call hcs_$set_256K_switch (dmpr_data_.old_256K_switch, (""b), (0));
+
+    dmpr_data_.dump_in_progress = "0"b;			/* finished				*/
+    call set_lock_$unlock (dmpr_data_.lock, ignore);
+
+    dmprp = null;					/* vanish the control seg */
+    return;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+detach: proc (iocb_name, iocbp);
+
+/* This proc detachs the switch specified . It ignores all errors */
+
+dcl iocb_name	     char (*);
+dcl tiocbp	     ptr;
+dcl iocbp		     ptr;
+
+    call iox_$find_iocb (iocb_name, tiocbp, ignore);
+
+    call iox_$close (tiocbp, ignore);
+
+    call iox_$detach_iocb (tiocbp, ignore);
+
+    iocbp = null ();
+
+    return;
+
+  end detach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+unlock_volume_log: proc;
+
+/* This proc unlocks the backup_volume_log, which may be locked. It also closes the volume log. */
+
+    call set_lock_$unlock (backup_volume_log.lock, ignore);
+    call dmpr_log_$close_volume_log (code);
+    return;
+  end unlock_volume_log;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+unlock_pvolog: proc;
+
+/* This proc unlocks the output volume log */
+
+    call set_lock_$unlock (pvolog.lock, ignore);
+    return;
+  end unlock_pvolog;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+setbc_term: proc (p);
+
+/* This proc terminates the specified segment and sets the ptr to it to null */
+
+dcl p		     ptr;
+dcl dn		     char (168);
+dcl en		     char (32);
+dcl ldn		     fixed bin;
+    call hcs_$fs_get_path_name (p, dn, ldn, en, ignore);
+    call adjust_bit_count_ (dn, en, "0"b, (0), ignore);
+    call hcs_$terminate_seg (p, 0, ignore);
+    p = null;
+
+  end setbc_term;
+%page;
+%include dmpr_data_;
+%page;
+%include backup_static_variables;
+%page;
+%include backup_volume_log;
+%page;
+%include backup_pvol_info;
+%page;
+%include fs_vol_label;
+%page;
+%include backup_volume_header;
+%page;
+%include backup_volume_contents;
+%page;
+%include pvolog;
+%page;
+%include system_constants;
+%page;
+%include terminate_file;
+
+
+  end dmpr_finish_;

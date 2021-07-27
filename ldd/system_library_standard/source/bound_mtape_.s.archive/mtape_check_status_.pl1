@@ -1,0 +1,251 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-08-17,GWMay), approve(87-09-09,MECR0006),
+     audit(87-09-04,Farley), install(87-09-09,MR12.1-1101):
+     Added checks to return on write errors and reposition the tape on read
+     errors.
+  2) change(87-10-19,GWMay), approve(87-10-19,MCR7779), audit(87-11-02,Farley),
+     install(87-11-30,MR12.2-1006):
+     Formally install MECR0006.
+                                                   END HISTORY COMMENTS */
+
+
+mtape_check_status_: proc (arg_mtdp, arg_code);
+
+/* format: style4 */
+
+/* *	This program performs certain "last ditch" exception recovery
+   *	functions for mtape_. In particular, automatic recovery from device
+   *	attention and power off are attempted from within this module.
+   *
+   *	Modification History:
+   *
+   *	Created by J. A. Bush 11/11/83
+*/
+
+/*		ARGUMENT DATA		*/
+
+dcl  arg_mtdp ptr;					/* Pointer to the mtape data structure */
+dcl  arg_code fixed bin (35);				/* Return error code */
+
+/*		AUTOMATIC DATA		*/
+
+dcl  code fixed bin (35);
+dcl  1 save_position like mtape_data.position aligned;
+
+/*		CONSTANT DATA		*/
+
+dcl  DEV_ATT_MSG char (64) int static options (constant) init
+	("Attempting recovery from device attention condition.");
+dcl  PWR_OFF_MSG char (64) int static options (constant) init
+	("Attempting recovery from power off condition.");
+
+/*		EXTERNAL STATIC DATA	*/
+
+dcl  error_table_$device_attention fixed bin (35) ext static;
+dcl  error_table_$device_parity fixed bin (35) ext static;
+dcl  error_table_$unable_to_do_io fixed bin (35) ext static;
+dcl  mtape_dev_attention_recovery condition;
+
+/*		BUILTIN FUNCTIONS		*/
+
+dcl  null builtin;
+
+/*		EXTERNAL ENTRIES		*/
+
+dcl  mtape_util_$error entry options (variable);
+dcl  mtape_mount_cntl_$remount entry (ptr, fixed bin (35));
+dcl  mtape_io_$order entry (ptr, char (*), fixed bin, ptr, fixed bin (35));
+
+/*		BASED VARIABLES		*/
+
+dcl  based_area area based (mtape_data.areap);
+%page;
+/* Beginning of mtape_check_status_ entry */
+
+	mtdp = arg_mtdp;				/* copy args */
+	vs_ptr = mtape_data.vs_current;
+	mpfmip = mtape_data.pfm_info_ptr;
+	moip = mtape_data.open_info_ptr;
+						/* save current file and block pos. */
+	save_position = mtape_data.position;
+						/* allocate area to store status    */
+	allocate ths in (based_area) set (ths_ptr);
+	mtape_data.last_ur_status_ptr = ths_ptr;
+	ths.version = THS_VERSION;
+
+	call tape_ioi_$hardware_status (mtape_data.tioi_id, ths_ptr, code);
+	if code ^= 0 then do;
+	     call mtape_util_$error (mtdp, code,
+		"^/mtape_check_status_: error from tape_ioi_$hardware_status");
+	     return;
+	end;
+
+	if ths.major = DEVICE_ATTENTION & (ths.minor = HANDLER_IN_STANDBY
+	     | ths.minor = NO_SUCH_HANDLER | ths.minor = HANDLER_CHECK)
+	     & arg_code ^= error_table_$device_parity then do;
+	     call MSG_OUT ("Unrecoverable error");
+	     if ths.minor = HANDLER_CHECK then
+		arg_code = error_table_$unable_to_do_io;
+	     else
+		arg_code = error_table_$device_attention;
+	end;
+
+	else
+						/* if apparent pwr off, see if recoverable recursion not allowed */
+
+	     if ths.major = POWER_OFF then do;
+	     if mtape_vol_set.pwr_off_retry then do;
+		call mtape_util_$error (mtdp, 0,
+		     "^/Recovery of PWR OFF status condition unsuccessful");
+		arg_code = error_table_$unable_to_do_io;
+	     end;
+	     else do;
+		mtape_vol_set.pwr_off_retry = "1"b;
+		arg_code = error_table_$device_attention;
+						/* Tell user and operator about the error and that we are atempting
+						   recovery. */
+		call MSG_OUT ("Power off condition");
+		call mtape_util_$error (mtdp, 0, PWR_OFF_MSG);
+		mtape_vol_set.demount_comment = PWR_OFF_MSG;
+		call RECOVERY;			/* attempt recovery */
+		arg_code = code;
+	     end;
+	end;
+	else
+	     if ths.major = DEVICE_ATTENTION &
+	     (mtape_open_info.open_mode = Sequential_input
+	     | mtape_open_info.open_mode = Stream_input) then do;
+
+	     if mtape_vol_set.dev_att_retry then do;
+		call mtape_util_$error (mtdp, 0,
+		     "^/Recovery of DEV ATT status condition unsuccessful");
+		arg_code = error_table_$unable_to_do_io;
+	     end;
+
+	     else do;
+						/* protect against recursion */
+		mtape_vol_set.dev_att_retry = "1"b;
+		mtape_vol_set.demount_comment = DEV_ATT_MSG;
+
+/* Tell user and operator about the error and that we are attempting
+   recovery. */
+		call MSG_OUT ("Device Attention condition");
+		call mtape_util_$error (mtdp, 0, DEV_ATT_MSG);
+
+		call RECOVERY;			/* attempt recovery */
+		arg_code = code;
+
+/* should not return here unless recovery unsuccessful */
+	     end;
+	end;
+
+	else					/* Report it, unless PFM wants it */
+	     if ^mtape_pfm_info.extended_error_recovery then do;
+	     call MSG_OUT ("Unrecoverable error");
+	     arg_code = error_table_$unable_to_do_io;
+	end;
+
+	free ths in (based_area);
+	mtape_data.last_ur_status_ptr = null;
+	return;
+%page;
+/* RECOVERY - subroutine to attempt recovery from dev attention/pwr off
+   condition */
+
+RECOVERY: proc;
+
+	if mtape_vol_set.pwr_off_retry | save_position.phy_file < 3 then do;
+
+	     call mtape_mount_cntl_$remount (mtdp, code);
+
+	     if code ^= 0 then do;
+		call mtape_util_$error (mtdp, code,
+		     "^/Remount of volume ^a unsuccessful, while attempting error recovery",
+		     mtape_vol_set.volume_name);
+		arg_code = code;			/* return this error code */
+		return;
+	     end;
+
+	     mtape_vol_set.demount_comment = "";
+						/* Do file position if necessary */
+	     if save_position.phy_file ^= 0 then do;
+		call mtape_io_$order (mtdp, "fsf", save_position.phy_file, null,
+		     code);
+		if code ^= 0 then return;
+	     end;
+						/* Do block position if necessary */
+	     if save_position.phy_block ^= 0 then do;
+		call mtape_io_$order (mtdp, "fsr", save_position.phy_block, null,
+		     code);
+		if code ^= 0 then return;
+	     end;
+	end;
+
+	else do;
+
+/* Move the tape back 2 and forward 2. The effect is to clean the
+   fuzz off of the tape heads.  DO NOT EVER REMOVE THIS CODE. */
+
+	     code = 0;
+	     call mtape_io_$order (mtdp, "bsf", 2, null, code);
+	     if code ^= 0 then return;
+
+	     call mtape_io_$order (mtdp, "fsf", 2, null, code);
+	     if code ^= 0 then return;
+
+/* Do block position if necessary */
+	     if save_position.phy_block ^= 0 then do;
+		call mtape_io_$order (mtdp, "fsr", save_position.phy_block,
+		     null, code);
+		if code ^= 0 then return;
+	     end;
+	end;
+
+	signal mtape_dev_attention_recovery;
+	return;
+     end RECOVERY;
+
+/* MSG_OUT - subroutine to output common formatted error message */
+
+MSG_OUT: proc (preamble);
+
+dcl  preamble char (*);
+						/* display common msg format */
+	call mtape_util_$error (mtdp, arg_code,
+	     "^/^a detected on volume ^a, mounted on device ^a.
+Physical position: file # ^d, block # ^d.
+Hardware status: ""^a"".", preamble, mtape_vol_set.volume_name,
+	     mtape_vol_set.device_name, save_position.phy_file,
+	     save_position.phy_block + 1, ths.description);
+
+	return;
+     end MSG_OUT;
+%page;
+%include mtape_data;
+%page;
+%include mtape_vol_set;
+%page;
+%include mtape_err_stats;
+%page;
+%include mtape_constants;
+%page;
+%include mtape_pfm_info;
+%page;
+%include mtape_open_close_info;
+%page;
+%include iox_modes;
+%page;
+%include tape_ioi_dcls;
+%page;
+%include tape_ioi_hw_status;
+
+     end mtape_check_status_;

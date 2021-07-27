@@ -1,0 +1,474 @@
+/* ***********************************************************
+   *                                                         *
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   *                                                         *
+   *********************************************************** */
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+/* format: style1,^inddcls,ifthenstmt,ifthendo,ifthen,indcomtxt,dclind5 */
+ta_load_table_: proc (table_ptr, arg_array, table_name, code);
+
+/* This procedure implements the load_table key of tape_archive. */
+
+/* Written 06/29/77 by C. D. Tavares.
+   Modified 09/24/79 to work if the final table on tape has a tape error smack
+   in the middle of it.
+   Modified 09/03/80 by CDT to fix ref thru null ptr and to warn user if volid
+   supplied by user doesn't match volid in loaded table (source of problems
+   when volumes shipped to other sites and given other volids).
+   Modified 10/24/80 by CDT to add tape_ibm_ capability.
+   Modified 12/9/81 by CDT for highest_mount_type stuff.
+   Modified 12/17/81 by CDT to make it upgrade the table to the current
+   version before checking the table for consistency.
+   BIM 3/82 -density control argument.
+   Last modified 83-03-16 by S. G. Harris (UNCA) for version 4.
+   Modified 7/83 by S. Krupp for conversion to mtape_.
+   Modified 01/09/84 by J. A. Bush to enable the referencing dir search rule
+   for finding I/O module
+   Modified 85-2-14 by C Spitzer. Correct algorithm for finding the last good
+   table on the tape. Use volume ids from command line rather than from table.
+   Take out -retain implying -ring.
+*/
+
+dcl  (arg_array	        (*) char (168),
+     table_name	        char (*),
+     code		        fixed bin (35)) parameter;
+
+/* AUTOMATIC */
+
+dcl  answer	        char (256) varying,
+     attach_description     char (256),
+     date_time_string       char (24),
+     density	        fixed bin,
+     dname	        char (168),
+     ename	        char (32),
+     got_older_table        bit (1),
+     i		        fixed bin,
+     iom_ctl_arg	        bit (1) aligned,
+     max_chars_in_seg       fixed bin (21),
+     n_chars_read	        fixed bin (21),
+     n_table_volids	        fixed bin,
+     n_volids	        fixed bin,
+     n_words_read	        fixed bin (18),
+     open_description       char (256),
+     retain_sw	        bit (1) aligned,
+     table_volid	        char (168),
+     tape_input_switch      pointer,
+     temp_seg_ptrs	        (2) pointer,
+     last_good_copy_ptr     pointer,
+     ptr_active	        fixed bin,
+     file_number	        fixed bin,
+     table_file_number      fixed bin,
+     volume_type	        char (32),
+     volid	        (8) char (32),
+     vt_ctl_arg	        bit (1) aligned;
+
+%include query_info_;
+
+/* ENTRIES */
+
+dcl  (com_err_,
+     com_err_$suppress_name,
+     command_query_,
+     ioa_,
+     ioa_$rsnnl)	        entry options (variable),
+     date_time_$fstime      entry (bit (36) aligned, char (*)),
+     get_lock_id_	        entry returns (bit (36) aligned),
+     (release_temp_segments_,
+     get_temp_segments_)    entry (char (*), pointer dimension (*),
+		        fixed bin (35)),
+     hcs_$fs_get_path_name  entry (ptr, char (*), fixed bin, char (*),
+		        fixed bin (35)),
+     hcs_$set_bc_seg        entry (pointer, fixed bin (24), fixed bin (35)),
+     hcs_$set_safety_sw_seg entry (pointer, bit (1) aligned, fixed bin (35)),
+     hcs_$terminate_noname  entry (ptr, fixed bin (35)),
+     hcs_$truncate_seg      entry (pointer, fixed bin (18), fixed bin (35)),
+     resource_info_$canonicalize_name
+		        entry (char (*), char (*), char (*),
+		        fixed bin (35));
+
+dcl  ta_table_mgr_$find_and_verify
+		        entry (char (*), char (*), ptr, bit (1) aligned,
+		        fixed bin (35));
+
+%include iox_dcls;
+
+/* EXTERNAL STATIC */
+
+dcl  (error_table_$bad_arg,
+     error_table_$badopt,
+     error_table_$noarg,
+     error_table_$no_file,
+     error_table_$not_detached,
+     error_table_$short_record,
+     error_table_$too_many_args)
+		        ext fixed bin (35) static,
+     sys_info$max_seg_size  ext fixed bin (35) static;
+
+/* CONSTANTS */
+
+dcl  TABLE_PREFIX	        char (13) int static options (constant) init ("ONLINE-TABLE-");
+dcl  myname	        char (32) int static options (constant) init ("tape_archive");
+
+%include iox_modes;
+
+/* CONDITION */
+
+dcl  cleanup	        condition;
+
+/* BUILTINS */
+
+dcl  (addr, binary, char, codeptr, dim, divide, fixed, hbound, length, min, null, substr, unspec) builtin;
+
+/* BASED VARIABLES */
+
+%include tape_archive_table_dcl;
+%include mtape_file_status;
+
+/* BASED */
+
+dcl  based_table	        (n_words_read) bit (36) aligned based;
+dcl  1 automatic_fst        aligned like mtape_fst;
+
+	got_older_table = "0"b;
+
+	call iox_$find_iocb ("ta_tape_input_", tape_input_switch, code);
+	if code ^= 0 then do;
+		call com_err_ (code, myname, "Searching for the tape input switch.");
+		goto end_processing;
+	     end;
+
+	max_chars_in_seg = sys_info$max_seg_size * 4;
+	query_info.version = query_info_version_5;
+
+	if tape_archive_table.n_component_slots
+	     + tape_archive_table.n_request_slots > 0 then do;
+		query_info.yes_or_no_sw = "1"b;
+		call command_query_
+		     (addr (query_info), answer, myname,
+		     "^a already exists.  Do you wish to overwrite it?? ",
+		     table_name);
+		if answer = "no" then return;
+	     end;
+
+	volume_type = "";
+	n_volids = 0;
+	volid (*) = "";
+	density = 0;
+	retain_sw = ""b;
+	iom_ctl_arg, vt_ctl_arg = "0"b;
+
+	do i = 1 to dim (arg_array, 1);
+	     if arg_array (i) = "-io_module" | arg_array (i) = "-iom" |
+		arg_array (i) = "-volume_type" | arg_array (i) = "-vt"
+	     then do;
+		     if arg_array (i) = "-io_module" | arg_array (i) = "-iom"
+			then iom_ctl_arg = "1"b;
+		     else vt_ctl_arg = "1"b;
+		     i = i + 1;
+		     if i > dim (arg_array, 1) then do;
+			     call com_err_
+				(error_table_$noarg, myname,
+				"^[I/O module^;Volume type^] must follow ^a",
+				iom_ctl_arg, arg_array (i - 1));
+			     return;
+			end;
+
+		     if (iom_ctl_arg & ^(arg_array (i) = "tape_ansi_" | arg_array (i) = "tape_ibm_")) |
+			(vt_ctl_arg & ^(arg_array (i) = "ansi" | arg_array (i) = "ibm"))
+		     then do;
+			     call com_err_
+				(error_table_$bad_arg, myname,
+				"^[I/O module^;Volume type^] ^a not supported.",
+				iom_ctl_arg, volume_type);
+			     return;
+			end;
+
+(nostrz):		     if iom_ctl_arg
+		     then do;
+			     if arg_array (i) = "tape_ansi_"
+				then volume_type = "ansi";
+			     else volume_type = "ibm";
+			end;
+		     else volume_type = arg_array (i);
+
+		end;
+
+	     else if arg_array (i) = "-retain" then do;
+		     i = i + 1;
+		     if i > dim (arg_array, 1) then retain_sw = "1"b;
+		     else if arg_array (i) = "all" then retain_sw = "1"b;
+		     else if arg_array (i) = "none" then retain_sw = ""b;
+		     else do;
+			     call com_err_
+				(error_table_$badopt, myname,
+				"^a; Use -retain all or -retain none.",
+				arg_array (i));
+			     return;
+			end;
+		end;
+
+	     else if arg_array (i) = "-density"
+		| arg_array (i) = "-den"
+	     then do;
+		     i = i + 1;
+		     if i > hbound (arg_array, 1)
+		     then do;
+			     call com_err_ (error_table_$noarg, myname, "-density requires a density number.");
+			     return;
+			end;
+		     density = binary (arg_array (i));
+		end;
+
+	     else if char (arg_array (i), 1) = "-" then do;
+		     call com_err_
+			(error_table_$badopt, myname,
+			arg_array (i));
+		     return;
+		end;
+
+
+	     else do;
+		     n_volids = n_volids + 1;
+		     if n_volids > hbound (volid, 1) then do;
+			     call com_err_
+				(error_table_$too_many_args,
+				myname,
+				"Only ^d volume ids allowed.",
+				n_volids - 1);
+			     return;
+			end;
+
+(nostrz):		     volid (n_volids) = arg_array (i);
+		end;
+	end;
+
+	if n_volids = 0 then do;
+		query_info.yes_or_no_sw = ""b;
+		call command_query_
+		     (addr (query_info), answer, myname,
+		     "Enter volume name of first volume: ");
+
+		volid (1) = answer;
+		n_volids = 1;
+	     end;
+
+	if density = 0 then density = Default_density;
+
+	tape_archive_table.n_volumes_in_set (tape_archive_table.active_set) = n_volids;
+	tape_archive_table.volume_set (tape_archive_table.active_set).volume_id (*) = volid (*);
+
+	do i = 1 to n_volids;
+	     call resource_info_$canonicalize_name
+		("tape_vol", (volid (i)), volid (i), code);
+	     if code ^= 0 then do;
+		     call com_err_ (code, myname, "Canonicalizing the volume ^a name.", volid (i));
+		     goto end_processing;
+		end;
+	end;
+
+	if volume_type = ""
+	then volume_type = "ansi";			/* default */
+
+	temp_seg_ptrs = null;
+
+	on cleanup call cleanerup;
+
+	call get_temp_segments_ (myname, temp_seg_ptrs (*), code);
+	if code ^= 0 then do;
+		call com_err_ (code, myname, "Unable to get temporary segments.");
+		goto end_processing;
+	     end;
+
+	ptr_active = 1;
+	last_good_copy_ptr = null;
+
+	call ioa_$rsnnl ("^a^v( ^a^) -density ^d -volume_type ^a",
+	     attach_description, 0, TAPE_ARCHIVE_IO_MODULE, dim (volid, 1),
+	     volid (*), density, volume_type);
+
+	call iox_$attach_ptr (tape_input_switch, attach_description, codeptr (ta_load_table_), code);
+	if code ^= 0
+	then if code ^= error_table_$not_detached
+	     then do;
+		call com_err_ (code, myname, "Attaching the tape input switch.");
+		goto end_processing;
+	     end;
+
+	open_description = "-mode binary -block 8192 -number 1";
+	fst_ptr = addr (automatic_fst);
+	mtape_fst.version = fst_version_1;
+	file_number = 0;
+
+	call iox_$open_file (tape_input_switch, Sequential_input, open_description, ""b, code);
+	open_description = "-mode binary -block 8192";
+
+	last_good_copy_ptr = null;			/* read no tables yet */
+	do while (code = 0);
+	     file_number = file_number + 1;
+	     call iox_$control (tape_input_switch, "file_status", fst_ptr, code);
+	     if code = 0
+	     then do;
+		     if substr (mtape_fst.f_stat.file_id, 1, length (TABLE_PREFIX)) = TABLE_PREFIX
+		     then do;
+			     table_file_number = file_number;
+			     call hcs_$truncate_seg (temp_seg_ptrs (ptr_active), 0, 0);
+			     call iox_$read_record (tape_input_switch,
+				temp_seg_ptrs (ptr_active), max_chars_in_seg, n_chars_read, code);
+			     if code = error_table_$short_record
+				then code = 0;
+			     if code = 0
+			     then do;
+				     last_good_copy_ptr = temp_seg_ptrs (ptr_active);
+				     ptr_active = 3 - ptr_active;
+				end;
+			end;
+		     call iox_$close (tape_input_switch, code);
+		     if code = 0
+			then call iox_$open_file (tape_input_switch, Sequential_input, open_description, ""b, code);
+		end;
+	end;					/* do while */
+
+	if code = error_table_$no_file
+	     then code = 0;				/* read to the EOT */
+
+	if code ^= 0 then do;
+		call com_err_ (code, myname, "Searching for the table on the tape.");
+end_processing:
+		call cleanerup;
+		return;
+	     end;
+
+	if last_good_copy_ptr = null then do;
+		call com_err_ (error_table_$no_file, myname, "There is no valid table on the tape.");
+		call cleanerup;
+		return;
+	     end;
+
+	if table_file_number ^= file_number
+	     then got_older_table = "1"b;		/* table wasn't last file on the tape */
+
+	n_words_read = divide (n_chars_read + 3, 4, 18, 0);
+
+	unspec (table_ptr -> based_table) =
+	     unspec (last_good_copy_ptr -> based_table);
+
+	call hcs_$truncate_seg (table_ptr, n_words_read, 0);
+
+	call hcs_$set_bc_seg (table_ptr, n_chars_read * 9, code);
+
+	call hcs_$set_safety_sw_seg (table_ptr, "1"b, code);
+
+
+/* The following set of calls checks the table for consistency, upgrading the
+   version if necessary */
+
+	call hcs_$fs_get_path_name (table_ptr, dname, 0, ename, code);
+
+	call ta_table_mgr_$find_and_verify
+	     (dname, ename, table_ptr, "0"b, code);
+	if code ^= 0 then do;
+		call com_err_ (code, myname,
+		     "^a>^a", dname, ename);
+		call cleanerup;
+		return;
+	     end;
+
+/* Kill the extra null refname put onto the segment by find_and_verify */
+
+	call hcs_$terminate_noname (table_ptr, 0);
+
+	if got_older_table then do;
+		call date_time_$fstime (last_good_copy_ptr ->
+		     tape_archive_table.date_time_tape_modified,
+		     date_time_string);
+		call com_err_$suppress_name (0, myname,
+		     "The most recent readable copy of ^a (^a) has been loaded.",
+		     table_name, date_time_string);
+	     end;
+
+/* Now that we're sure we know where everything is, check the volume names in
+   the table for consistency with the names used to load this table. */
+
+	n_table_volids =
+	     tape_archive_table.n_volumes_in_set
+	     (tape_archive_table.active_set);
+
+	if n_volids ^= n_table_volids then
+	     call ioa_
+		("^a-- ^a contains ^[only ^;^]^d volumes in volume set.",
+		"tape_archive: Warning", table_name,
+		(n_table_volids < n_volids), n_table_volids);
+
+	do i = 1 to min (n_volids, n_table_volids);
+	     call resource_info_$canonicalize_name ("tape_vol",
+		(tape_archive_table.volume_set
+		(tape_archive_table.active_set).volume_id (i)),
+		table_volid, code);
+	     if code ^= 0 then do;
+		     table_volid =
+			tape_archive_table.volume_set
+			(tape_archive_table.active_set).volume_id (i);
+		     call com_err_ (code, myname,
+			"Canonicalizing volume name ""^a"" from table.",
+			table_volid);
+		end;
+
+	     if volid (i) ^= table_volid then do;
+		     call ioa_
+			("^a: ^a-- At least one volume name supplied (^a)
+     does not match volume name in table (^a).",
+			myname, "Warning",
+			volid (i), table_volid);
+		     call ioa_
+			("^15xAn ""alter_volume"" operation may be indicated.");
+		     i = 100;
+		end;
+	end;
+
+	tape_archive_table.density (tape_archive_table.active_set) = density; /* why force the user to alter? */
+	call PUT_VOLUME_TYPE (volume_type);
+
+	call cleanerup;
+	return;
+
+cleanerup: proc;
+
+	if temp_seg_ptrs (1) ^= null then
+	     call release_temp_segments_
+		(myname, temp_seg_ptrs (*), (0));
+
+	call iox_$close (tape_input_switch, (0));
+
+	if retain_sw
+	then do;
+		tape_archive_table.mount_lock = get_lock_id_ ();
+		tape_archive_table.highest_mount_type = Read;
+	     end;
+	else call iox_$detach_iocb (tape_input_switch, (0));
+
+	return;
+     end cleanerup;
+
+
+PUT_VOLUME_TYPE: proc (volume_type);
+
+dcl  volume_type	        char (*);
+
+	if volume_type = "ansi"
+	     then tape_archive_table.io_module_name = "tape_ansi_";
+	else tape_archive_table.io_module_name = "tape_ibm_";
+
+     end PUT_VOLUME_TYPE;
+
+     end ta_load_table_;

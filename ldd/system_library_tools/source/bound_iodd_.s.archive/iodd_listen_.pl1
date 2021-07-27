@@ -1,0 +1,612 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,^ifthenstmt */
+
+/* format: off */
+
+/* This is the central I/O daemon driver procedure, which "listens" for operator input and for wakeups from the
+   coordinator (in general, whichever happens first). It avoids going blocked for input (unless needed) by using the
+   iodd_get_cmd_ subroutine.  It will listen for requests to be processed for each of the minor devices assigned to the
+   process (if currently active) and service them in a round-robin fashion. This procedure will normally be called once
+   per session, except in case of reinitialization */
+
+/* Created:  September 1973 by Robert S. Coren */
+/* Modified: January 1975 by J. C. Whitmore for generalization and access isolation */
+/* Modified: October 1975 by J. C. Whitmore to check for active slave before printing message */
+/* Modified: December 1975 by M. A. Braida to include default condition handler for restart from slave */
+/* Modified: August 1977 by J. C. Whitmore to use iodd_get_cmd_ for reading command lines */
+/* Modified: November 1977 by J. C. Whitmore to use iodd_msg_ for all operator messages */
+/* Modified: July 1978 by J. C. Whitmore to support daemon_save condition and commands: next, go N */
+/* Modified: November 1978 by J. C. Whitmore to implement inactivity logout */
+/* Modified: October 1979 by J. C. Whitmore to signal when driver is idle */
+/* Modified: 18 December 1981 by G. Palter to correct entry number 0033 (phx11367) on the io_daemon error list:
+      When operating in test mode with the coordinator and a driver in the same process, if the operator types ahead the
+      necessary commands to stop both the driver and coordinator while a request is running, the request will be finished
+      normally but will remain in the queue and be reprocessed the next time that queue is run */
+/* Modified: February 23, 1985 by C. Marker to use version 5 message segments */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-25,Wallman), install(88-10-28,MR12.2-1199):
+     Upgraded to version 5 iod tables.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: on */
+
+
+iodd_listen_:
+     procedure ();
+
+
+/* Entries */
+
+dcl  clock_ entry () returns (fixed bin (71));
+dcl  continue_to_signal_ entry (fixed bin (35));
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl  iodd_msg_ entry options (variable);
+dcl  iodd_get_cmd_ entry (ptr, fixed bin, fixed bin, 1 aligned like ctl, char (*), fixed bin, fixed bin (35));
+dcl  iodd_command_processor_ entry (fixed bin, fixed bin, char (*), fixed bin (35));
+dcl  iodd_quit_handler_ entry ();
+dcl  iox_$look_iocb entry (char (*) aligned, ptr, fixed bin (35));
+dcl  iox_$control entry (ptr, char (*), ptr, fixed bin (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+dcl  timer_manager_$alarm_call entry (fixed bin (71), bit (2), entry);
+dcl  timer_manager_$reset_alarm_call entry (entry);
+dcl  timer_manager_$sleep entry (fixed bin (71), bit (2));
+
+
+/* Automatic */
+
+dcl  wakeup_code fixed bin;				/* action for coord on wakeup */
+dcl  wakeup_count fixed bin;				/* how many coord request wakeups to send before block */
+dcl  dr_ptr ptr;					/* general pointer to a driver status seg */
+dcl  desc_ptr ptr;					/* pointer to the request descriptor */
+dcl  i fixed bin;					/* do loop index */
+dcl  code fixed bin (35);
+dcl  line char (132);				/* input from terminal */
+dcl  nchars fixed bin;				/* number of chars read */
+dcl  must_tell_coord bit (1);
+dcl  idle_msg_sent bit (1);
+
+dcl  timer_channel fixed bin (71);			/* IPC channel to use for the timer */
+
+dcl  1 ctl aligned,					/* control flags for iodd_get_cmd_ */
+       2 wait_for_input bit (1) unal,			/* true if we should wait for a command */
+       2 prompt_master bit (1) unal,			/* true if we want to ask master for a cmd */
+       2 prompt_slave bit (1) unal,			/* true if we want to ask slave for a cmd */
+       2 pad bit (33) unal;
+
+dcl  state fixed bin;				/* state of command processing */
+						/* 0 = not ready to handle requests */
+						/* 1 = ready or processing requests */
+						/* 2 & 3 are driver module defined cmd levels */
+						/* 4 = handling a quit */
+						/* 5 = unclaimed signal (test mode) */
+
+dcl  source fixed bin;				/* which terminal gave the command line */
+dcl  last_cmd fixed bin;				/* which source (master or slave) gave the last cmd line */
+dcl  master_cmd bit (1);				/* true if master gave a cmd at this level */
+dcl  slave_cmd bit (1);				/* true if slave gave a cmd at this level */
+
+dcl  terminal (2) ptr;				/* iocb ptrs of the master and slave input devices */
+
+dcl  free_devices fixed bin;				/* counter for round robin loop */
+dcl  driver_index fixed bin;				/* ptr list index of current minor dev driver */
+dcl  now fixed bin (71);				/* current clock_ time */
+
+dcl  1 event_info aligned,				/* info about a wakeup received */
+       2 chan fixed bin (71),
+       2 ev_msg fixed bin (71),
+       2 sender bit (36),
+       2 origin fixed bin,
+       2 wait_list_index fixed bin;
+
+dcl  1 form_data aligned,				/* data from ctl_dim_ for form alignment */
+       2 page_length fixed bin,			/* length of logical page */
+       2 line_length fixed bin,			/* number of chars before folding line */
+       2 line_no fixed bin,				/* current line on the page */
+       2 carriage_pos fixed bin,			/* position of next char on the line */
+       2 aligned bit (1) unal,			/* "1"b if we are simulating form feeds */
+       2 pad bit (35) unal;
+
+
+/* Constants */
+
+dcl  null_cmd_level fixed bin int static options (constant) init (0);
+dcl  listen_cmd_level fixed bin int static options (constant) init (1);
+dcl  none fixed bin int static options (constant) init (0); /* constant for no terminal giving cmd */
+dcl  master fixed bin int static options (constant) init (1);
+						/* constant  indicating input from master device */
+dcl  slave fixed bin int static options (constant) init (2);/* constant indicating input from slave */
+dcl  both fixed bin int static options (constant) init (0); /* constant indicating both the master and slave */
+dcl  normal fixed bin int static options (constant) init (1);
+						/* normal iodd_msg_ messages */
+dcl  error fixed bin int static options (constant) init (2);/* error messages for iodd_msg_ */
+dcl  new_request fixed bin int static options (constant) init (1);
+						/* coord code for new request - done with current */
+dcl  request_done fixed bin int static options (constant) init (0);
+						/* coord code to take back current request */
+
+
+/* Conditions */
+
+dcl  (quit, no_coord, daemon_again, daemon_again_slave, daemon_kill, daemon_cancel, daemon_unclaimed, daemon_save, resume,
+     re_init, daemon_logout, daemon_slave_logout, daemon_idle, cleanup) condition;
+
+
+/* Builtins */
+
+dcl  (addr, null, substr, string) builtin;
+
+
+/* Based structures */
+
+dcl  chan_list_ptr ptr;				/* pointer to event channel list */
+
+dcl  1 ev_chan_list aligned based (chan_list_ptr),	/* wait list for all drivers and consoles */
+       2 number fixed bin,
+       2 channel (12) fixed bin (71);
+
+
+/* External static */
+
+dcl  iodd_stat_p ptr external static;
+
+/**/
+
+	stat_p = iodd_stat_p;			/* set the pointer to iodd_static */
+	list_ptr = iodd_static.driver_list_ptr;		/* establish the list of driver status segs */
+	chan_list_ptr = iodd_static.chan_list_ptr;	/* get pointer to list of event channels */
+	timer_channel = ev_chan_list.channel (3);	/* timer uses the first minor dev chan */
+
+	call iox_$look_iocb (iodd_static.slave_input, iodd_static.slave_in, code);
+	if code ^= 0
+	then go to slave_err;
+	call iox_$look_iocb (iodd_static.slave_output, iodd_static.slave_out, code);
+						/* just checking */
+	if code ^= 0 then do;
+slave_err:
+	     if iodd_static.slave.active
+	     then					/* did we think there was a slave? */
+		call iodd_msg_ (error, master, code, "iodd_listen_", "Slave functions terminated.");
+	     iodd_static.slave.active = "0"b;
+	     iodd_static.slave.accept_input = "0"b;
+	     iodd_static.slave.print_errors = "0"b;
+	     iodd_static.slave.allow_quits = "0"b;
+	end;
+
+	iodd_static.requests_til_cmd = 0;		/* set for free running mode */
+	iodd_static.quit_during_request = "0"b;		/* make sure initialization is correct */
+	iodd_static.request_in_progress = "0"b;
+	iodd_static.recursion_flag = "0"b;
+	iodd_static.re_init_in_progress = "0"b;		/* any re_init is now done */
+	iodd_static.logout_pending = "0"b;
+	iodd_static.auto_logout_pending = "0"b;
+	iodd_static.runout_requests = "0"b;
+	iodd_static.current_devices = 0;		/* we will check for ready devices */
+	idle_msg_sent = "0"b;			/* init flag for idle condition handler */
+
+	do i = 1 to iodd_static.assigned_devices;	/* check the data in driver status */
+	     dr_ptr = driver_ptr_list.stat_segp (i);	/* next driver status ptr */
+	     if ^dr_ptr -> driver_status.attached then do;/* not attached, can't be ready */
+		dr_ptr -> driver_status.ready = "0"b;	/* correct the error */
+		dr_ptr -> driver_status.request_pending = iodd_static.driver_proc_id;
+						/* tell coord */
+	     end;
+	     else if dr_ptr -> driver_status.ready then do;
+		iodd_static.current_devices = iodd_static.current_devices + 1;
+						/* count it */
+		dr_ptr -> driver_status.request_pending = (36)"0"b;
+						/* tell coord */
+	     end;
+	     else dr_ptr -> driver_status.request_pending = iodd_static.driver_proc_id;
+						/* not ready */
+	     dr_ptr -> driver_status.busy = "0"b;	/* none busy yet */
+	end;
+
+
+/* Now set up the remaining condition handlers */
+
+	on cleanup call timer_manager_$reset_alarm_call (trigger_auto_logout);
+
+	on quit
+	     begin;
+	     call timer_manager_$reset_alarm_call (trigger_auto_logout);
+	     iodd_static.auto_logout_pending = "0"b;
+	     call iodd_quit_handler_;			/* to come to command level after quit */
+	end;
+
+	on resume go to resume_operation;		/* clean up after unclaimed signal */
+
+	on daemon_save ;				/* make this a null condition */
+
+	on daemon_again call iodd_msg_ (normal, master, 0, "", "No current request to ""restart"".");
+
+	on daemon_again_slave call iodd_msg_ (normal, slave, 0, "", "No current request to ""restart"".");
+
+	on daemon_cancel call iodd_msg_ (normal, both, 0, "iodd_listen_", "No current request to ""cancel"".");
+
+	on daemon_kill call iodd_msg_ (normal, both, 0, "iodd_listen_", "No current request to ""kill"".");
+
+	on daemon_idle call idle_proc;
+
+
+	if iodd_static.slave.allow_quits
+	then call iox_$control (iodd_static.slave_in, "quit_enable", null, code);
+
+	terminal (master) = iodd_static.master_in;	/* internal copy of iocbp for easy logic */
+
+	must_tell_coord = ""b;			/* clear the send wakeup flag */
+	string (ctl) = ""b;				/* clear all control flags */
+	driver_index = 0;				/* so we start with index of 1st driver */
+
+/* Everything is initialized, start the listen function by checking for commands */
+
+check_for_cmd:
+	ctl.wait_for_input = (iodd_static.step | iodd_static.master_hold | iodd_static.slave_hold);
+	ctl.prompt_master = "0"b;			/* normally the slave will give commands */
+	ctl.prompt_slave = "1"b;
+	master_cmd = "0"b;				/* no cmd from the master yet */
+	slave_cmd = "0"b;				/* likewise for the slave */
+	last_cmd = none;
+
+	go to read;
+
+wait:
+	ctl.wait_for_input = "1"b;			/* say we must wait for input */
+
+read:
+	if iodd_static.current_devices > 0
+	then state = listen_cmd_level;		/* get ready for iodd_command_processor_ */
+	else state = null_cmd_level;
+
+	call iodd_get_cmd_ (addr (line), 128, nchars, ctl, "", source, code);
+
+	if must_tell_coord then do;			/* do we owe the coord a wakeup? */
+	     if source = none then do;
+		iodd_static.driver_ptr -> driver_status.last_wake_time = clock_ ();
+		wakeup_code = new_request;		/* save an extra wakeup */
+	     end;
+	     else wakeup_code = request_done;		/* have a command, send this back and wait */
+	     call wake_coord (wakeup_code);
+	     must_tell_coord = ""b;
+	end;
+
+	if source = none
+	then go to find_work;			/* no command, go look for a request */
+
+	call timer_manager_$reset_alarm_call (trigger_auto_logout);
+						/* this is some activity, cancel auto logout */
+	iodd_static.auto_logout_pending = "0"b;
+
+	idle_msg_sent = "0"b;			/* we want a new idle message after commands */
+
+	if source = master then do;
+	     if iodd_static.slave.active
+	     then					/* don't let the slave interrupt the master */
+		call iox_$control (iodd_static.slave_in, "quit_disable", null, (0));
+	     master_cmd = "1"b;			/* if master gave a cmd */
+	end;
+	else slave_cmd = "1"b;			/* otherwise it was the slave */
+	last_cmd = source;				/* who gave the last command? */
+	ctl.wait_for_input = "0"b;			/* got some */
+
+	call iodd_command_processor_ (source, state, substr (line, 1, nchars), code);
+
+	if iodd_static.slave.allow_quits
+	then					/* let slave get a chance */
+	     call iox_$control (iodd_static.slave_in, "quit_enable", null, (0));
+
+	terminal (slave) = iodd_static.slave_in;	/* reset this, it may change */
+	if code = 1
+	then go to read;				/* go for a request... but first check for more input */
+	if code = 0 | code = 2
+	then go to wait;				/* we want more input .. no errors */
+	call iox_$control (terminal (source), "resetread", null, (0));
+						/* clear input after bad command */
+	go to wait;				/* and wait for correct input */
+
+find_work:					/* ask coord for work if all is well */
+	if iodd_static.forms
+	then					/* be sure alignment is set when simulating forms */
+	     if iodd_static.ctl_term.attached then do;	/* if the terminal is there */
+		call iox_$control (iodd_static.slave_out, "form_status", addr (form_data), code);
+		if code ^= 0 then do;		/* something was wrong */
+		     iodd_static.forms = "0"b;	/* drop the forms */
+
+		     call iodd_msg_ (normal, both, code, "iodd_listen_",
+			"Control terminal form simulation terminated.");
+
+		     ctl.prompt_master = "1"b;	/* force operator action */
+		     ctl.prompt_slave = "1"b;		/* slave can also answer */
+		     call iox_$control (iodd_static.master_in, "resetread", null, (0));
+						/* but fresh answer */
+		     call iox_$control (iodd_static.slave_in, "resetread", null, (0));
+		     go to wait;
+		end;
+		if ^form_data.aligned then do;	/* dim says not aligned...so, */
+		     call iodd_msg_ (normal, slave, 0, "", "Control forms not aligned.");
+						/* tell someone */
+		     go to wait;			/* must enable wakeups */
+		end;
+	     end;
+	     else iodd_static.forms = "0"b;		/* not legal if no ctl term attached */
+
+
+
+	if last_cmd = slave
+	then					/* do we owe the master a courtesy msg? */
+	     if master_cmd
+	     then call iodd_msg_ (normal, master, 0, "", "^a driver continuing.", iodd_static.major_device);
+	     else ;
+
+	else if slave_cmd
+	then if iodd_static.slave.active
+	     then					/* be sure it wasn't detached by last command */
+		call iodd_msg_ (normal, slave, 0, "", "^a driver continuing.", iodd_static.major_device);
+
+
+	master_cmd = "0"b;
+	slave_cmd = "0"b;
+
+	call timer_manager_$reset_alarm_wakeup (timer_channel);
+						/* clear out any pending timeouts */
+
+	do i = 3 to ev_chan_list.number;		/* reset all wakeups from coord */
+	     call ipc_$drain_chn (ev_chan_list.channel (i), code);
+						/* can't afford to check code here */
+	end;
+
+/**/
+
+/* This is the main loop for checking to see if the coordinator has given any requests to process.  We will go through the
+   entire list of device drivers for this process and do any pending requests.  Start with the last driver to be checked
+   (not necessarily the current driver) as indicated by the value of "driver_index".  If there is no request pending for
+   an active driver, we will ask the coordinator for service if we have waited more than "wakeup_time" seconds with no
+   word.  Otherwise, we will block for "wakeup_time" seconds to see if a request comes in or if a command arrives */
+
+	free_devices = 0;				/* clear the count of inactive devices */
+	wakeup_count = iodd_static.current_devices;	/* max number of wakeups to send before block */
+
+	do while (free_devices < iodd_static.assigned_devices);
+	     driver_index = driver_index + 1;		/* start with the next device */
+	     if driver_index > iodd_static.assigned_devices
+	     then driver_index = 1;
+	     iodd_static.driver_ptr = driver_ptr_list.stat_segp (driver_index);
+						/* set the current driver ptr */
+	     iodd_static.output_device = driver_ptr -> driver_status.device_id;
+						/* make things consistent */
+
+	     if runout_requests then do;		/* trying to flush pending requests from halted dev */
+		free_devices = free_devices + 1;	/* only go around once */
+		if ^driver_ptr -> driver_status.ready
+		then				/* check pending for non-ready devices */
+		     if driver_ptr -> driver_status.request_pending = iodd_static.coord_proc_id
+		     then go to process_request;
+	     end;
+	     else if driver_ptr -> driver_status.request_pending then do;
+						/* something waiting or driver inactive? */
+		if driver_ptr -> driver_status.request_pending = iodd_static.coord_proc_id
+		then go to process_request;		/* we found one that is valid */
+
+		free_devices = free_devices + 1;	/* not the coord, must be free */
+		driver_ptr -> driver_status.busy = "0"b;
+		driver_ptr -> driver_status.ready = "0"b;
+						/* just to be sure */
+	     end;
+	     else do;				/* device driver is ready with nothing to do */
+		now = clock_ ();			/* see what time it is */
+		if last_cmd = none
+		then				/* in automatic mode */
+		     if driver_ptr -> driver_status.last_wake_time + 1000000 * iodd_static.wakeup_time > now
+		     then go to block_for_all_events;
+		if wakeup_count <= 0
+		then go to block_for_all_events;	/* when all are serviced, wait */
+
+		call wake_coord (new_request);	/* request some service from the coord */
+
+		driver_ptr -> driver_status.last_wake_time = now;
+						/* record the time */
+		free_devices = 0;			/* reset the count...we found one */
+		driver_ptr -> driver_status.ready = "1"b;
+						/* keep it straight in case driver module goofs */
+		wakeup_count = wakeup_count - 1;	/* say we sent one */
+	     end;
+	end;					/* that's all for the main loop */
+						/* if we fall through, there was nothing to do */
+	if iodd_static.runout_requests then do;		/* if we expected to stop everything */
+	     iodd_static.runout_requests = "0"b;	/* change back to normal mode */
+	     if iodd_static.logout_pending
+	     then signal daemon_logout;		/* this is a clean way back */
+	end;
+	else call iodd_msg_ (normal, both, 0, "", "No ready device or pending requests.");
+	iodd_static.slave_hold = "1"b;		/* force the issue */
+	iodd_static.logout_pending = "0"b;		/* cancel the flag in case */
+	go to check_for_cmd;			/* get a command and enable wakeups */
+
+/**/
+
+block_for_all_events:				/* Here we wait for something to happen */
+	if iodd_static.auto_logout_interval > 0
+	then					/* are we watching for inactivity? */
+	     call timer_manager_$alarm_call ((iodd_static.auto_logout_interval), "11"b, trigger_auto_logout);
+	call timer_manager_$alarm_wakeup (iodd_static.wakeup_time, "11"b, timer_channel);
+						/* simulate a coord wakeup after N seconds */
+	call ipc_$block (chan_list_ptr, addr (event_info), code);
+	if code ^= 0 then do;
+	     call convert_ipc_code_ (code);		/* get an error_table_ value */
+	     call iodd_msg_ (error, master, code, "iodd_listen_", "Fatal error: main block point.");
+	     if iodd_static.test_entry
+	     then signal daemon_unclaimed;		/* let programmer peek */
+	     else signal re_init;
+	end;
+
+	if event_info.wait_list_index < 3
+	then go to read;				/* if it was a terminal, go look for input */
+
+	driver_ptr = driver_ptr_list.stat_segp (event_info.wait_list_index - 2);
+						/* set the current driver ptr */
+	iodd_static.output_device = driver_ptr -> driver_status.device_id;
+	if driver_ptr -> driver_status.request_pending ^= iodd_static.coord_proc_id
+						/* really a request? */
+	then if iodd_static.auto_logout_pending
+	     then signal daemon_slave_logout;		/* No, are we to logout? */
+	     else do;
+		signal daemon_idle;			/* see if driver module wants to take action */
+		go to check_for_cmd;		/* Nope! So poke around a bit */
+	     end;
+
+
+
+process_request:					/* We have a valid request from the coordinator   */
+	idle_msg_sent = "0"b;			/* give message again when we are next idle */
+
+	call timer_manager_$reset_alarm_call (trigger_auto_logout);
+						/* this is some activity, cancel auto logout */
+	iodd_static.auto_logout_pending = "0"b;
+	driver_ptr -> driver_status.busy = "1"b;	/* be sure we tell the coord when done */
+
+	call iodd_static.driver_request;		/* pass it off to the driver module for action */
+
+	iodd_static.requests_til_cmd = iodd_static.requests_til_cmd - 1;
+						/* decrement the go N value */
+
+/**/
+
+resume_operation:					/* pass it back to coord if done or "resume" signalled */
+	if iodd_static.requests_til_cmd = 0
+	then iodd_static.slave_hold = "1"b;		/* force cmd hold after N done */
+	desc_ptr = addr (driver_ptr -> driver_status.descriptor);
+
+	if iodd_static.driver_ptr -> driver_status.busy | desc_ptr -> request_descriptor.finished then do;
+	     if driver_ptr -> driver_status.ready
+	     then driver_ptr -> driver_status.request_pending = (36)"0"b;
+						/* ready for next one */
+	     else driver_ptr -> driver_status.request_pending = iodd_static.driver_proc_id;
+
+	     desc_ptr -> request_descriptor.finished = "1"b;
+						/* force the done flag */
+
+	     if iodd_static.step
+	     then wakeup_code = request_done;		/* step mode, ask for request later */
+	     else if iodd_static.master_hold
+	     then wakeup_code = request_done;		/* in hold, ask later */
+	     else if iodd_static.slave_hold
+	     then wakeup_code = request_done;
+	     else if driver_ptr -> driver_status.ready
+	     then wakeup_code = new_request;		/* we want more service */
+	     else wakeup_code = request_done;		/*  we don't want another request right now */
+
+	     if wakeup_code = new_request
+	     then must_tell_coord = "1"b;		/* tell coord after checking for cmd */
+	     else do;
+		call wake_coord (wakeup_code);
+		must_tell_coord = ""b;		/* we already told it */
+	     end;
+	     driver_ptr -> driver_status.busy = "0"b;	/* all done */
+	end;
+	iodd_static.request_in_progress, iodd_static.recursion_flag, iodd_static.quit_during_request,
+	     iodd_static.quit_signaled = "0"b;
+	iodd_static.segptr = null;			/* reset current segment pointer */
+	go to check_for_cmd;			/* See if there is a command, or wait for step */
+
+/**/
+
+/* Send "ready/done" wakeup to coordinator */
+
+wake_coord:
+     procedure (wakeup_code);
+
+dcl  ec fixed bin (35);				/* temp error code */
+dcl  wakeup_code fixed bin;				/* what action is wanted */
+						/* 1 = done and give me another */
+						/* 0 = done and don't bug me */
+
+	event_message = 0;
+	addr (event_message) -> ev_msg.code = wakeup_code;
+	addr (event_message) -> ev_msg.seq_id = 0;
+	addr (event_message) -> ev_msg.minor_dev_index = driver_ptr -> driver_status.dev_index;
+
+	call hcs_$wakeup (coord_proc_id, driver_ptr -> driver_status.coord_chan, event_message, code);
+
+	if code ^= 0 then do;
+	     ec = code;				/* if error_table_ code...report */
+	     call convert_ipc_code_ (ec);
+	     call iodd_msg_ (error, master, ec, "iodd_listen_", "Fatal error:  Unable to send wakeup to coord.");
+	     if code = 1 | code = 3
+	     then signal no_coord;
+	     else signal re_init;			/* must be bad args */
+	end;
+
+	if iodd_static.test_entry			/* give coordinator (which may be us) a chance to wakeup */
+	then call timer_manager_$sleep (1, "11"b);	/* 1 second should be enough */
+
+	return;
+
+     end wake_coord;
+
+/**/
+
+/* Handles the daemon_idle condition */
+
+idle_proc:
+     procedure ();
+
+	if ^idle_msg_sent
+	then					/* if not told already about idle condition... */
+	     call iodd_msg_ (normal, slave, 0, "", "^a driver: No requests, driver is idle.", iodd_static.major_device);
+
+	idle_msg_sent = "1"b;			/* don't repeat the message */
+
+	call continue_to_signal_ (0);			/* let the driver module know about this */
+
+	return;
+
+     end idle_proc;
+
+
+
+/* Sets the auto logout bit in iodd_static so the driver will logout after N minutes of inactivity, where N is defined by
+   iodd_static.auto_logout_interval */
+
+trigger_auto_logout:
+     procedure ();
+
+	iodd_static.auto_logout_pending = "1"b;
+
+/* if no command or request is present after returning from the main block point, the driver will logout */
+
+	return;
+
+     end trigger_auto_logout;
+%page;
+%include driver_ptr_list;
+%page;
+%include driver_status;
+%page;
+%include iod_event_message;
+%page;
+%include iod_tables_hdr;
+%page;
+%include iodd_static;
+%page;
+%include mseg_message_info;
+%page;
+%include request_descriptor;
+
+     end iodd_listen_;

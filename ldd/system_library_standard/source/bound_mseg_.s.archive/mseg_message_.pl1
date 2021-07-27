@@ -1,0 +1,1236 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1985 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-04-01,Palter), approve(), audit(), install():
+      Pre-hcom comments.
+      Created:  April 1985 by G. Palter based upon mseg_, mseg_add_, and
+         mseg_util_
+  2) change(86-09-30,Lippard), approve(86-11-24,MCR7578),
+     audit(87-07-13,Dickson), install(87-08-06,MR12.1-1067):
+      Modified to always give new message IDs.
+                                                   END HISTORY COMMENTS */
+
+
+/* Message segment primitive operations (mseg_) which manipulate the individual messages within the segment */
+
+/* format: style3,linecom */
+
+mseg_message_:
+     procedure ();
+
+	return;					/* not an entrypoint */
+
+
+/* Parameters */
+
+dcl	P_mseg_operation_ptr			/* -> description of this operation (I) */
+			pointer parameter;
+dcl	P_code		fixed binary (35) parameter;
+
+dcl	P_operation_name	character (*) parameter;	/* *_for_mseg: the actual operation performing this act (I) */
+
+dcl	P_ms_count	fixed binary parameter;	/* count_messages: set to # of accessible messages (O) */
+
+dcl	P_users_area_ptr	pointer parameter;		/* read_message*: -> area in which to allocate message (I) */
+
+
+/* Local copies of parameters */
+
+dcl	users_area	area based (users_area_ptr);
+dcl	users_area_ptr	pointer;
+
+dcl	code		fixed binary (35);
+
+
+/* Remaining declarations */
+
+dcl	1 local_md	aligned like message_descriptor;
+
+dcl	1 mseg_message_bits aligned based (mseg_message_info.ms_ptr),
+	  2 data		bit (mseg_message_info.ms_len) unaligned;
+
+dcl	1 local_aef	aligned like audit_event_flags;
+
+dcl	local_message_block (32) bit (36) aligned;
+
+dcl	operation_specific_return
+			entry (fixed binary (35)) variable;
+dcl	operation_specific_abort
+			entry () variable;
+dcl	operation_name	character (64);
+dcl	operation_started_locally
+			bit (1) aligned;
+
+dcl	mseg_dir_name	character (168);
+dcl	mseg_entryname	character (32);
+
+dcl	(first_mb_ptr, prev_mb_ptr, next_mb_ptr)
+			pointer;
+dcl	(prev_md_ptr, next_md_ptr)
+			pointer;
+dcl	next_message_in_hash_chain
+			pointer;
+
+dcl	rqo_detected	bit (1) aligned;
+dcl	do_owner_check	bit (1) aligned;
+
+dcl	now		fixed binary (71);
+dcl	(n_bits_remaining, n_bits_copied, n_bits_to_copy)
+			fixed binary (24);
+dcl	message_offset	fixed binary (18) unaligned unsigned;
+dcl	(n_blocks_needed, block_no, block_id, last_block_allocated)
+			fixed binary (18);
+dcl	hash_idx		fixed binary (9);
+
+dcl	(
+	error_table_$bad_segment,
+	error_table_$bad_subr_arg,
+	error_table_$bigarg,
+	error_table_$noalloc,
+	error_table_$notalloc,
+	error_table_$no_message,
+	error_table_$null_info_ptr,
+	error_table_$rqover,
+	error_table_$smallarg,
+	error_table_$unimplemented_version
+	)		fixed binary (35) external;
+
+dcl	access_operations_$mseg_add_message
+			bit (36) aligned external;
+dcl	sys_info$ring1_privilege
+			bit (36) aligned external;
+
+dcl	access_audit_r1_$get_audit_flags
+			entry () returns (bit (36) aligned);
+dcl	access_audit_r1_$log_obj_ptr
+			entry () options (variable);
+dcl	get_process_id_	entry () returns (bit (36));
+dcl	mseg_check_access_$message
+			entry (pointer, fixed binary (35));
+dcl	mseg_utils_$abort_operation
+			entry (pointer);
+dcl	mseg_utils_$begin_operation
+			entry (bit (36) aligned, pointer, character (*), character (*), character (*), pointer,
+			bit (1) aligned, fixed binary (35));
+dcl	mseg_utils_$finish_operation
+			entry (pointer);
+dcl	mseg_utils_$salvage_for_cause
+			entry (pointer, fixed binary (35)) options (variable);
+dcl	read_allowed_	entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+
+dcl	(addr, after, before, clock, currentsize, divide, fixed, index, length, min, mod, null, rtrim, setwordno, string,
+	substr, unspec, wordno)
+			builtin;
+
+dcl	(area, cleanup)	condition;
+%page;
+/* Add a message */
+
+mseg_message_$add_message:
+     entry (P_mseg_operation_ptr, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	on cleanup call operation_was_aborted ();
+
+	call begin_operation (mseg_operations_$add_message);
+	if rqo_detected
+	then call return_from_operation (error_table_$rqover);
+	else if code ^= 0
+	then call return_from_operation (code);
+
+
+ADD_MESSAGE:
+	mseg_message_info_ptr = addr (mseg_operation.message_info);
+	if (mseg_message_info.ms_ptr = null ()) & (mseg_message_info.ms_len ^= 0)
+	then call return_from_operation (error_table_$null_info_ptr);
+	else if mseg_message_info.ms_len < 0
+	then call return_from_operation (error_table_$smallarg);
+	else if mseg_message_info.ms_len > (36 * mseg_data_$max_message_size)
+	then call return_from_operation (error_table_$bigarg);
+
+
+	/*** Set that portion of the message descriptor which we already know */
+
+	unspec (local_md) = ""b;
+
+	if mseg_operation.add_message_info_all_valid
+	then do; /*** Admin Add -- Caller has supplied the message and all required data about its sender */
+	     local_md = mseg_message_info, by name;
+	     if rtrim (operation_name) = "mseg_$add_message"
+	     then local_md.ms_id = ""b;
+	end;
+
+	else do;	/*** Ordinary Add -- Caller has supplied only ms_ptr, ms_len, and ms_access_class */
+		local_md.ms_id = ""b;		/* generate one presently */
+		local_md.ms_len = mseg_message_info.ms_len;
+		local_md.ms_access_class = mseg_message_info.ms_access_class;
+		local_md.sender_id = mseg_operation.group_id;
+		local_md.sender_process_id = get_process_id_ ();
+		local_md.sender_level = mseg_operation.validation_level;
+		local_md.sender_authorization = mseg_operation.authorization;
+		local_md.sender_max_authorization = mseg_operation.max_authorization;
+		if mseg_operation.call_admin_gate
+		then local_md.sender_audit = access_audit_r1_$get_audit_flags ();
+		else local_md.sender_audit = ""b;
+	     end;
+
+	if local_md.ms_id = ""b			/* we must generate a message ID */
+	then do;
+		now = clock ();			/* ... IDs for now are simply clock readings */
+		local_md.ms_id = unspec (now);
+	     end;
+
+
+	/*** Compute the number of blocks needed to hold the message */
+
+	mb_ptr = addr (local_message_block);		/* to allow PL/I to compute block sizes for us */
+	md_ptr = addr (local_md);
+	message_block_header.data_lth = 0;
+
+	n_blocks_needed = 1				/* ... the first block which includes the descriptor */
+	     +
+	     divide ((local_md.ms_len - length (first_message_block.pad) + length (other_message_block.pad) - 1),
+	     length (other_message_block.pad), 18, 0);
+
+	if n_blocks_needed > mseg_segment.n_blocks_unused
+	then do;					/* not enough room in the segment */
+		call check_block_map_consistency ();	/* ... be sure the segment's not damanged */
+		if mseg_operation.call_admin_gate & ^mseg_operation.suppress_access_checks
+		then do;				/* ... audit the covert channel */
+			string (local_aef) = ""b;
+			local_aef.cc_10_100 = "1"b;
+			call access_audit_r1_$log_obj_ptr (operation_name, mseg_operation.validation_level,
+			     string (local_aef), access_operations_$mseg_add_message, mseg_ptr,
+			     error_table_$notalloc, null (), 0, "Message segment is full.");
+		     end;
+		call return_from_operation (error_table_$notalloc);
+	     end;
+
+	mseg_segment.modification_in_progress = "1"b;	/* a fault now will cause the segment to be salvaged */
+
+
+	/*** Pre-allocate the blocks for the message and thread them together */
+
+	last_block_allocated = 0;
+
+	do block_no = 1 to n_blocks_needed;
+
+	     begin;
+dcl	rest_of_block_map	bit (mseg_segment.n_blocks_allocated - last_block_allocated) unaligned
+			defined (mseg_segment.block_map.map) position (last_block_allocated + 1);
+		block_id = index (rest_of_block_map, "0"b);
+		if block_id = 0			/* ... not as many free blocks as the header claimed */
+		then call salvage_and_return (mseg_format_errors_$inconsistent_block_map);
+		block_id, last_block_allocated = block_id + last_block_allocated;
+	     end;
+
+	     substr (mseg_segment.block_map.map, block_id, 1) = "1"b;
+	     mb_ptr = setwordno (mseg_ptr, mseg_segment.block_size * (block_id - 1));
+
+	     if block_no = 1
+	     then do;				/* first block of the message */
+		     first_mb_ptr = mb_ptr;
+		     message_block_header.descriptor_present = "1"b;
+		     md_ptr = addr (first_message_block.descriptor);
+		end;
+	     else prev_mb_ptr -> message_block_header.next_block = wordno (mb_ptr);
+
+	     prev_mb_ptr = mb_ptr;
+	end;
+
+	message_block_header.next_block = 0;		/* indicate end of chain for the last block */
+
+
+	/*** Fill in the real message descriptor in the first block */
+
+	message_descriptor = local_md;		/* copy info we've already gathered */
+
+	message_descriptor.sentinel = MESSAGE_DESCRIPTOR_SENTINEL;
+
+	message_descriptor.message_chain.next_message = 0;/* this will be the last message in the segment */
+	message_descriptor.message_chain.prev_message = mseg_segment.message_chain.last_message;
+
+	hash_idx = fixed (substr (local_md.ms_id, 64, 9), 9, 0);
+	message_descriptor.prev_message_in_hash_chain = mseg_segment.hash_table.last_message (hash_idx);
+
+
+	/*** Copy the user's message into the segment */
+
+	n_bits_remaining = mseg_message_info.ms_len;	/* haven't copied anything yet */
+	n_bits_copied = 0;
+
+	mb_ptr = first_mb_ptr;
+
+	do block_no = 1 to n_blocks_needed;
+
+	     message_block_header.data_lth = 0;		/* allows PL/I to compute # of bits available in the block */
+	     if block_no = 1
+	     then n_bits_to_copy = min (n_bits_remaining, length (first_message_block.pad));
+	     else n_bits_to_copy = min (n_bits_remaining, length (other_message_block.pad));
+
+	     message_block_header.data_lth = n_bits_to_copy;
+	     if n_bits_to_copy > 0			/* there's something to put in this block */
+	     then begin;
+dcl	source_bits	bit (n_bits_to_copy) unaligned defined (mseg_message_bits.data)
+			position (n_bits_copied + 1);
+		     if block_no = 1
+		     then first_message_block.data = source_bits;
+		     else other_message_block.data = source_bits;
+		     n_bits_remaining = n_bits_remaining - n_bits_to_copy;
+		     n_bits_copied = n_bits_copied + n_bits_to_copy;
+		end;
+
+	     mb_ptr = setwordno (mseg_ptr, message_block_header.next_block);
+	end;
+
+
+	/*** Thread the message into the appropriate chains */
+
+	if mseg_segment.n_messages = 0		/* it's the first message */
+	then mseg_segment.message_chain.first_message = wordno (first_mb_ptr);
+	else do;					/* it's not the first message */
+		call set_message_ptrs (mseg_segment.message_chain.last_message, prev_mb_ptr, prev_md_ptr);
+		prev_md_ptr -> message_descriptor.message_chain.next_message = wordno (first_mb_ptr);
+	     end;
+
+	mseg_segment.message_chain.last_message = wordno (first_mb_ptr);
+	mseg_segment.hash_table.last_message (hash_idx) = wordno (first_mb_ptr);
+
+	mseg_segment.n_blocks_unused = mseg_segment.n_blocks_unused - n_blocks_needed;
+
+	mseg_segment.n_messages = mseg_segment.n_messages + 1;
+
+	mseg_segment.modification_in_progress = "0"b;	/* all done */
+
+	if mseg_message_info.ms_id = ""b
+	then mseg_message_info.ms_id = local_md.ms_id;	/* return the message ID to our caller */
+
+	call return_from_operation (0);
+%page;
+/* Add a message on behalf of another message primitive operation -- This entrypoint is identical to add_message, above,
+   except that it does not invoke mseg_utils_$begin_operation. */
+
+mseg_message_$add_message_for_mseg:
+     entry (P_mseg_operation_ptr, P_operation_name, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	operation_started_locally = "0"b;
+
+	on cleanup call operation_was_aborted ();
+
+	mseg_operation_ptr = P_mseg_operation_ptr;
+	operation_name = P_operation_name;
+
+	mseg_ptr = mseg_operation.mseg_ptr;
+
+	go to ADD_MESSAGE;
+%page;
+/* Count the accessible messages */
+
+mseg_message_$count_messages:
+     entry (P_mseg_operation_ptr, P_ms_count, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	on cleanup call operation_was_aborted ();
+
+	call begin_operation (mseg_operations_$count_messages);
+	if rqo_detected
+	then do;					/* couldn't even lock the segment: it must be empty */
+		P_ms_count = 0;
+		call return_from_operation (0);
+	     end;
+	else if code ^= 0
+	then call return_from_operation (code);
+
+	if mseg_segment.n_messages = 0
+	then P_ms_count = 0;			/* the segment is empty */
+
+	else if mseg_operation.suppress_access_checks
+	then P_ms_count = mseg_segment.n_messages;	/* the caller doesn't want us to worry about access */
+
+	else if ring1_privilege ()
+	     | read_allowed_ (mseg_operation.caller.authorization, mseg_operation.access_info.access_class)
+	then P_ms_count = mseg_segment.n_messages;	/* the user has access to see everything in the segment */
+
+	else do;					/* we have to count the messages */
+		do_owner_check = "0"b;		/* ... we must have "s" so we don't need to check owner */
+		P_ms_count = 0;
+		do message_offset = mseg_segment.message_chain.first_message
+		     repeat (message_descriptor.message_chain.next_message) while (message_offset ^= 0);
+		     call set_message_ptrs (message_offset, mb_ptr, md_ptr);
+		     if is_accessible_message ()
+		     then P_ms_count = P_ms_count + 1;
+		end;
+	     end;
+
+	call return_from_operation (0);
+%page;
+/* Delete a message */
+
+mseg_message_$delete_message:
+     entry (P_mseg_operation_ptr, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	on cleanup call operation_was_aborted ();
+
+	call begin_operation (mseg_operations_$delete_message);
+	if rqo_detected
+	then call return_from_operation (error_table_$no_message);
+	else if code ^= 0
+	then call return_from_operation (code);
+
+	if mseg_segment.n_messages = 0		/* can't delete if there's nothing there */
+	then call return_from_operation (error_table_$no_message);
+
+	mseg_message_info_ptr = addr (mseg_operation.message_info);
+
+	call find_message (mseg_message_info.ms_id);
+	if mb_ptr = null ()				/* the given ID doesn't identify a real message */
+	then call return_from_operation (error_table_$no_message);
+
+	mseg_operation.md_ptr_valid = "1"b;
+	mseg_operation.md_ptr = md_ptr;
+	call mseg_check_access_$message (mseg_operation_ptr, code);
+	if code ^= 0				/* the message can't be deleted */
+	then call return_from_operation (code);
+
+	local_md = message_descriptor;		/* will need these later to unthread the message */
+	message_offset = wordno (mb_ptr);
+
+	mseg_segment.modification_in_progress = "1"b;	/* a fault now will cause the segment to be salvaged */
+
+	call process_message (mb_ptr, "0"b, "0"b, "1"b);	/* does most of the dirty work */
+
+	call unchain_message ();			/* remove it from the various chains */
+
+	mseg_segment.modification_in_progress = "0"b;	/* all done */
+
+	call return_from_operation (0);
+%page;
+/* Read (and optionally delete) a message */
+
+mseg_message_$read_message:
+     entry (P_mseg_operation_ptr, P_users_area_ptr, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	on cleanup call operation_was_aborted ();
+
+	if P_users_area_ptr ^= null ()		/* the user must supply an area */
+	then users_area_ptr = P_users_area_ptr;
+	else call return_from_operation (error_table_$bad_subr_arg);
+
+	call begin_operation (mseg_operations_$read_message);
+	if rqo_detected
+	then call return_from_operation (error_table_$no_message);
+	else if code ^= 0
+	then call return_from_operation (code);
+
+READ_MESSAGE:
+	if mseg_segment.n_messages = 0		/* can't read something if there's nothing there */
+	then call return_from_operation (error_table_$no_message);
+
+	mseg_message_info_ptr = addr (mseg_operation.message_info);
+	if mseg_message_info.version ^= MSEG_MESSAGE_INFO_V1
+	then call return_from_operation (error_table_$unimplemented_version);
+
+	do_owner_check = mseg_operation.only_own_access | mseg_message_info.own;
+
+
+	/*** Find the desired message and check the user's access to same */
+
+	if mseg_message_info.message_code = MSEG_READ_SPECIFIED
+	then call find_message (mseg_message_info.ms_id);
+
+	else if mseg_message_info.message_code = MSEG_READ_FIRST
+	then do;
+		call set_message_ptrs (mseg_segment.message_chain.first_message, mb_ptr, md_ptr);
+		call find_next_accessible_message ((72)"0"b);
+	     end;
+
+	else if mseg_message_info.message_code = MSEG_READ_LAST
+	then do;
+		call set_message_ptrs (mseg_segment.message_chain.last_message, mb_ptr, md_ptr);
+		call find_previous_accessible_message ((72)"1"b);
+	     end;
+
+	else if mseg_message_info.message_code = MSEG_READ_BEFORE_SPECIFIED
+	then do;
+		call find_message (mseg_message_info.ms_id);
+		if mb_ptr = null ()
+		then do;				/* given ID doesn't exist: search the entire backward chain */
+			call set_message_ptrs (mseg_segment.message_chain.last_message, mb_ptr, md_ptr);
+			call find_previous_accessible_message (mseg_message_info.ms_id);
+		     end;
+		else if message_descriptor.message_chain.prev_message ^= 0
+		then do;				/* it exists: search from its previous message */
+			call set_message_ptrs (message_descriptor.message_chain.prev_message, mb_ptr, md_ptr);
+			call find_previous_accessible_message (mseg_message_info.ms_id);
+		     end;
+		else call return_from_operation (error_table_$no_message);
+	     end;
+
+	else if mseg_message_info.message_code = MSEG_READ_AFTER_SPECIFIED
+	then do;
+		call find_message (mseg_message_info.ms_id);
+		if mb_ptr = null ()
+		then do;				/* given ID doesn't exist: search the entire forward chain */
+			call set_message_ptrs (mseg_segment.message_chain.first_message, mb_ptr, md_ptr);
+			call find_next_accessible_message (mseg_message_info.ms_id);
+		     end;
+		else if message_descriptor.message_chain.next_message ^= 0
+		then do;				/* it exists: search from its next message */
+			call set_message_ptrs (message_descriptor.message_chain.next_message, mb_ptr, md_ptr);
+			call find_next_accessible_message (mseg_message_info.ms_id);
+		     end;
+		else call return_from_operation (error_table_$no_message);
+	     end;
+
+	else call return_from_operation (error_table_$bad_subr_arg);
+
+	if mb_ptr = null ()				/* didn't find a message to read */
+	then call return_from_operation (error_table_$no_message);
+
+	mseg_operation.md_ptr_valid = "1"b;
+	mseg_operation.md_ptr = md_ptr;
+	call mseg_check_access_$message (mseg_operation_ptr, code);
+	if code ^= 0				/* insufficient access to read the message */
+	then call return_from_operation (code);
+
+
+	/*** Allocate space in the user's storage for the message and copy it from the segment */
+
+	mseg_message_info.ms_ptr = null ();		/* for cleanup handler */
+	operation_specific_abort = abort_read_operation;
+	operation_specific_return = return_from_read_operation;
+
+	mseg_message_info.ms_len = message_descriptor.ms_len;
+
+	on area
+	     begin;
+		code = error_table_$noalloc;
+		go to RETURN_FROM_READ_OPERATION;	/* avoids making return_from_operation non-quick */
+	     end;
+
+	allocate mseg_message_bits in (users_area) set (mseg_message_info.ms_ptr);
+
+
+	/*** We can now copy the relevant data directly from the message descriptor
+	     into our caller's mseg_message_info structure.  However, we must not reveal the sender's audit flags unless
+	     the caller could obtain them itself (via access_audit_r1_$get_audit_flags) or the process has ring-1
+	     privilege.  Otherwise, if we always returned the sender's audit flags, a user could determine his audit
+	     flags by adding and then reading a message from any message segment.  (A user isn't allowed to know his
+	     audit flags to prevent him from only trying certain "incorrect" acts when he knows he won't be audited.) */
+
+	mseg_message_info = message_descriptor, by name;
+
+	if operation_started_locally			/* never censor if read was initiated directly by mseg_ */
+	then if ^(ring1_privilege () | (mseg_operation.caller.validation_level = mseg_data_$admin_ring))
+	     then mseg_message_info.sender_audit = ""b;
+
+
+	/*** Copy the message from the segment and, if requested, delete it */
+
+	local_md = message_descriptor;
+
+	if mseg_message_info.delete
+	then do;					/* stash data that will be needed later to finish deletion */
+		message_offset = wordno (mb_ptr);
+		mseg_segment.modification_in_progress = "1"b;
+	     end;
+
+	call process_message (mb_ptr, "1"b, "0"b, (mseg_message_info.delete));
+						/* does most of the dirty work */
+
+	if mseg_message_info.delete
+	then do;
+		call unchain_message ();
+		mseg_segment.modification_in_progress = "0"b;
+	     end;
+
+	code = 0;					/* success */
+
+
+RETURN_FROM_READ_OPERATION:
+	call return_from_operation (code);
+
+
+
+/* Special processing required upon completion of a read operation */
+
+return_from_read_operation:
+     procedure (p_code);
+
+dcl	p_code		fixed binary (35) parameter;
+
+	if p_code ^= 0				/* the read failed ... */
+	then if mseg_message_info.ms_ptr ^= null ()	/* ... so we must eliminate whatever we did manage to read */
+	     then do;
+		     free mseg_message_bits in (users_area);
+		     mseg_message_info.ms_ptr = null ();
+		end;
+
+	return;
+
+     end return_from_read_operation;
+
+
+
+/* Special processing required upon abnormal termination of a read operation */
+
+abort_read_operation:
+     procedure ();
+
+	if mseg_message_info.ms_ptr ^= null ()
+	then do;
+		free mseg_message_bits in (users_area);
+		mseg_message_info.ms_ptr = null ();
+	     end;
+
+	return;
+
+     end abort_read_operation;
+%page;
+/* Read (and optionally delete) a message on behalf of another message primitive operation -- This entrypoint is identical
+   to read_message, above, except that it does not invoke mseg_utils_$begin_operation. */
+
+mseg_message_$read_message_for_mseg:
+     entry (P_mseg_operation_ptr, P_operation_name, P_users_area_ptr, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	operation_started_locally = "0"b;
+
+	on cleanup call operation_was_aborted ();
+
+	mseg_operation_ptr = P_mseg_operation_ptr;
+	operation_name = P_operation_name;
+	users_area_ptr = P_users_area_ptr;		/* guaranteed non-null by our caller */
+
+	mseg_ptr = mseg_operation.mseg_ptr;
+
+	go to READ_MESSAGE;
+%page;
+/* Update a message -- The data stored in the message are replaced by the data supplied by the caller.  If the caller
+   provides less data than are presently in the message, this operation will only replace the first part of the data and
+   leave the remaining data intact.  Thus, this operation can be used to update the application header in a message
+   without actually having to first read the message from the segment. */
+
+mseg_message_$update_message:
+     entry (P_mseg_operation_ptr, P_code);
+
+	call setup_operation ();			/* for cleanup handler */
+	on cleanup call operation_was_aborted ();
+
+	call begin_operation (mseg_operations_$update_message);
+	if rqo_detected
+	then call return_from_operation (error_table_$no_message);
+	else if code ^= 0
+	then call return_from_operation (code);
+
+	if mseg_segment.n_messages = 0		/* can't update if there's nothing there */
+	then call return_from_operation (error_table_$no_message);
+
+	mseg_message_info_ptr = addr (mseg_operation.message_info);
+
+	call find_message (mseg_message_info.ms_id);
+	if mb_ptr = null ()				/* the given ID doesn't identify a real message */
+	then call return_from_operation (error_table_$no_message);
+
+	mseg_operation.md_ptr_valid = "1"b;
+	mseg_operation.md_ptr = md_ptr;
+	call mseg_check_access_$message (mseg_operation_ptr, code);
+	if code ^= 0				/* the message can't be updated */
+	then call return_from_operation (code);
+
+	if mseg_message_info.ms_len > message_descriptor.ms_len
+	then call return_from_operation (error_table_$bigarg);
+
+	local_md = message_descriptor;
+
+	call process_message (mb_ptr, "0"b, "1"b, "0"b);	/* does the real dirty work */
+
+	call return_from_operation (0);
+%page;
+/* Common initialization for all operations */
+
+setup_operation:
+     procedure ();
+
+	code = 0;
+
+	operation_specific_abort = nulle;		/* nothing special when we abort or return (yet) */
+	operation_specific_return = nulle;
+
+	mseg_operation_ptr = null ();
+
+	operation_started_locally = "1"b;		/* abort/return must invoke mseg_utils_ */
+
+	return;
+
+     end setup_operation;
+
+
+
+/* Begin the operation -- This procedure isn't part of setup_operation so that we can be certain to have a cleanup handler
+   available at all times that the message segment may be in use. */
+
+begin_operation:
+     procedure (p_mseg_operation_id);
+
+dcl	p_mseg_operation_id bit (36) aligned parameter;
+
+	mseg_operation_ptr = P_mseg_operation_ptr;
+
+	call mseg_utils_$begin_operation (p_mseg_operation_id, mseg_operation_ptr, operation_name, mseg_dir_name,
+	     mseg_entryname, mseg_ptr, rqo_detected, code);
+
+	return;
+
+     end begin_operation;
+
+
+
+/* The "null" entry which indicates that there's no special abort/return processing for an operation */
+
+nulle:
+     procedure ();
+
+	return;
+
+     end nulle;
+%page;
+/* Return after completion of an operation */
+
+return_from_operation:
+     procedure (p_code);
+
+dcl	p_code		fixed binary (35) parameter;
+
+	if operation_specific_return ^= nulle		/* let the operation do anything special */
+	then call operation_specific_return (p_code);
+
+	if operation_started_locally & (mseg_operation_ptr ^= null ())
+	then call mseg_utils_$finish_operation (mseg_operation_ptr);
+						/* may be invoked before we've called begin_operation */
+
+	P_code = p_code;				/* set our caller's status code */
+	go to RETURN_FROM_OPERATION;
+
+     end return_from_operation;
+
+RETURN_FROM_OPERATION:
+	return;
+
+
+
+/* Abort an operation */
+
+operation_was_aborted:
+     procedure ();
+
+	if operation_specific_abort ^= nulle		/* let the operation do anything special */
+	then call operation_specific_abort ();
+
+	if operation_started_locally
+	then call mseg_utils_$abort_operation (mseg_operation_ptr);
+
+	return;
+
+     end operation_was_aborted;
+
+
+
+/* Salvage the message segment due to internal inconsistencies and return error_table_$bad_segment to our caller */
+
+salvage_and_return:
+     procedure (p_format_error);
+
+dcl	p_format_error	fixed binary (35) parameter;
+
+	call mseg_utils_$salvage_for_cause (mseg_operation_ptr, p_format_error);
+
+	call return_from_operation (error_table_$bad_segment);
+
+     end salvage_and_return;
+%page;
+/* Set the supplied message block and descriptor pointers from the given offset */
+
+set_message_ptrs:
+     procedure (p_message_offset, p_mb_ptr, p_md_ptr);
+
+dcl	p_message_offset	fixed binary (18) unaligned unsigned parameter;
+dcl	(p_mb_ptr, p_md_ptr)
+			pointer parameter;
+dcl	block_id		fixed binary (18);
+
+	if (p_message_offset
+	     <= (wordno (addr (mseg_segment.block_map)) + divide (mseg_segment.n_blocks_allocated + 35, 36, 18, 0)))
+	     | (p_message_offset > (mseg_segment.block_size * (mseg_segment.n_blocks_allocated - 1)))
+	then call salvage_and_return (mseg_format_errors_$invalid_message_block_offset);
+
+	if mod (p_message_offset, mseg_segment.block_size) ^= 0
+	then call salvage_and_return (mseg_format_errors_$invalid_message_block_offset);
+
+	block_id = divide (p_message_offset, mseg_segment.block_size, 18, 0) + 1;
+	if substr (mseg_segment.block_map.map, block_id, 1) = "0"b
+	then call salvage_and_return (mseg_format_errors_$unused_block_in_message);
+
+	p_mb_ptr = setwordno (mseg_ptr, p_message_offset);
+
+	if p_mb_ptr -> message_block_header.descriptor_present
+	then do;
+		begin;
+dcl	saved_mb_ptr	bit (72) aligned;
+		     /*** The following code fragment is a replacement for the statement
+			     p_md_ptr = addr (p_mb_ptr -> first_message_block_descriptor);
+			That statement will not work as PL/I must reference through mb_ptr in order to compute the
+			size of first_message_block.data_space.pad.  Additionally, we can't use normal assignment
+			statements to save/restore the value of mb_ptr as it is sometimes legimately unitialized
+			when this procedure is invoked. */
+		     unspec (saved_mb_ptr) = unspec (mb_ptr);
+		     mb_ptr = p_mb_ptr;
+		     p_md_ptr = addr (first_message_block.descriptor);
+		     unspec (mb_ptr) = unspec (saved_mb_ptr);
+		end;
+		if p_md_ptr -> message_descriptor.sentinel ^= MESSAGE_DESCRIPTOR_SENTINEL
+		then call salvage_and_return (mseg_format_errors_$bad_descriptor_sentinel);
+	     end;
+
+	else call salvage_and_return (mseg_format_errors_$no_descriptor_in_first_block);
+
+	return;					/* executed iff the message looks OK so far */
+
+     end set_message_ptrs;
+%page;
+/* Determine if the user has ring1 privilege */
+
+ring1_privilege:
+     procedure () returns (bit (1) aligned);
+
+	return ((mseg_operation.caller.privileges & sys_info$ring1_privilege) ^= ""b);
+
+     end ring1_privilege;
+
+
+
+/* Determine if the current message (mb_ptr, md_ptr) is accessible to (i.e., readable by) the user */
+
+is_accessible_message:
+     procedure () returns (bit (1) aligned);
+
+	if do_owner_check				/* we have to checks that it's our message */
+	then if owner_doesnt_match ()
+	     then return ("0"b);			/* ... and it isn't */
+
+	if mseg_operation.suppress_access_checks
+	then return ("1"b);				/* our caller doesn't want us to worry about AIM, etc. */
+
+	return (ring1_privilege ()
+	     | read_allowed_ (mseg_operation.caller.authorization, message_descriptor.ms_access_class));
+
+
+
+/* Determine if the user doesn't own this message */
+
+owner_doesnt_match:
+     procedure () returns (bit (1) aligned);
+
+declare	name		character (32) varying;
+declare	message_name	character (32) varying;
+
+	name = before (mseg_operation.caller.group_id, ".");
+	message_name = before (message_descriptor.sender_id, ".");
+
+	if (name ^= "anonymous") & (message_name ^= "anonymous")
+	then /*** The user isn't anonymous and the message wasn't written by an anonymous user.  We can simply test the
+		Person_ids to see if the user owns this message. */
+	     return (name ^= message_name);
+
+	else if (name = "anonymous") & (message_name = "anonymous")
+	then do;	/*** The user is an anonymous user and the message was written by an anonymous user.  We must test the
+		     Project_ids to see if the user owns this message. */
+		name = before (after (mseg_operation.caller.group_id, "."), ".");
+		message_name = before (after (message_descriptor.sender_id, "."), ".");
+		return (name ^= message_name);
+	     end;
+
+	else /*** Either the user is an anonymous user and the message wsn't written by one or vice-versa.  By
+		definition, the user can not possibly own this message. */
+	     return ("1"b);
+
+     end owner_doesnt_match;
+
+     end is_accessible_message;
+%page;
+/* Search the message hash table with the given message ID */
+
+find_message:
+     procedure (p_ms_id);
+
+dcl	p_ms_id		bit (72) aligned parameter;
+dcl	message_offset	fixed binary (18) unaligned unsigned;
+dcl	n_messages_checked	fixed binary (18);
+
+	hash_idx = fixed (substr (p_ms_id, 64, 9), 9, 0);
+
+	next_message_in_hash_chain = null ();		/* hash chain isn't doubly linked (sigh) */
+	n_messages_checked = 0;
+
+	do message_offset = mseg_segment.hash_table.last_message (hash_idx)
+	     repeat (message_descriptor.prev_message_in_hash_chain) while (message_offset ^= 0);
+
+	     call set_message_ptrs (message_offset, mb_ptr, md_ptr);
+
+	     if message_descriptor.ms_id = p_ms_id	/* found it! */
+	     then return;
+	     else next_message_in_hash_chain = md_ptr;
+
+	     n_messages_checked = n_messages_checked + 1;
+	     if n_messages_checked > mseg_segment.n_messages
+	     then call salvage_and_return (mseg_format_errors_$circular_hash_chain);
+	end;
+
+
+	/*** Control arrives here iff the given ID isn't in the hash table */
+
+	mb_ptr, md_ptr = null ();
+
+	return;
+
+     end find_message;
+%page;
+/* Find the first accessible message in the specified direction along the chronological message chain whose message ID is
+   greater than (if forward) or less than (if backward) the specified value.  If the current message (mb_ptr, md_ptr)
+   satisfies the criteria, it is selected. */
+
+find_accessible_message:
+     procedure (p_ms_id_key);
+	return;					/* not used */
+
+dcl	p_ms_id_key	bit (72) aligned parameter;
+
+dcl	(hash_mb_ptr, hash_md_ptr)
+			pointer;
+dcl	(scan_forward, scan_backward)
+			bit (1) aligned;
+dcl	message_offset	fixed binary (18) unaligned unsigned;
+dcl	n_messages_checked	fixed binary (18);
+
+
+find_next_accessible_message:				/* ... using the forward chain and ID > KEY */
+     entry (p_ms_id_key);
+
+	scan_forward = "1"b;
+	scan_backward = "0"b;
+	go to FIND_THE_MESSAGE;
+
+
+find_previous_accessible_message:			/* ... using the backward chain and ID < KEY */
+     entry (p_ms_id_key);
+
+	scan_backward = "1"b;
+	scan_forward = "0"b;
+	go to FIND_THE_MESSAGE;
+
+
+FIND_THE_MESSAGE:
+	n_messages_checked = 0;
+
+	do while (mb_ptr ^= null ());
+
+	     if is_accessible_message ()		/* the user can see this message */
+	     then if scan_forward
+		then if message_descriptor.ms_id > p_ms_id_key
+		     then go to FOUND_THE_MESSAGE;
+		     else ;
+		else if scan_backward
+		then if message_descriptor.ms_id < p_ms_id_key
+		     then go to FOUND_THE_MESSAGE;
+		     else ;
+
+	     n_messages_checked = n_messages_checked + 1;
+	     if n_messages_checked > mseg_segment.n_messages
+	     then call salvage_and_return (mseg_format_errors_$circular_message_chain);
+
+	     if scan_forward
+	     then message_offset = message_descriptor.message_chain.next_message;
+	     else message_offset = message_descriptor.message_chain.prev_message;
+
+	     if message_offset ^= 0			/* there are more candidates */
+	     then call set_message_ptrs (message_offset, mb_ptr, md_ptr);
+	     else mb_ptr = null ();
+	end;
+
+
+	/*** Control arrives here iff an appropriate message is not found */
+
+	md_ptr = null ();				/* be sure both message pointers are null */
+	return;
+
+
+	/*** Control arrives here when an appropriate message has been found.  If we are going to delete the message, we
+	     must find its successor in its hash chain so we can later relink said chain.  This is necessary as the hash
+	     chains are not doubly linked.  (In version 6 message segments, we will doubly link the hash chain). */
+
+FOUND_THE_MESSAGE:
+	if mseg_message_info.delete
+	then do;
+		hash_idx = fixed (substr (message_descriptor.ms_id, 64, 9), 9, 0);
+		next_message_in_hash_chain = null ();
+		n_messages_checked = 0;
+
+		do message_offset = mseg_segment.hash_table.last_message (hash_idx)
+		     repeat (hash_md_ptr -> message_descriptor.prev_message_in_hash_chain)
+		     while (message_offset ^= 0);
+		     call set_message_ptrs (message_offset, hash_mb_ptr, hash_md_ptr);
+		     if hash_md_ptr -> message_descriptor.ms_id = message_descriptor.ms_id
+		     then return;			/* found it: next_message_in_hash_chain is now properly set */
+		     else next_message_in_hash_chain = hash_md_ptr;
+		     n_messages_checked = n_messages_checked + 1;
+		     if n_messages_checked > mseg_segment.n_messages
+		     then call salvage_and_return (mseg_format_errors_$circular_hash_chain);
+		end;
+
+		/*** Control arrives here iff the message doesn't appear in its hash chain which means that the
+		     message segment is inconsistent. */
+		call salvage_and_return (mseg_format_errors_$inconsistent_hash_chain);
+	     end;
+
+	return;
+
+     end find_accessible_message;
+%page;
+/* Process an already extant message for reading, updating, or deletion -- The major portion of the processing for each of
+   these operations consists of walking the chain of blocks which comprise the message and validating that it is a
+   properly formed message.  Only a small fraction of the work involves the actual reading, updating, or deleting. */
+
+process_message:
+     procedure (p_first_mb_ptr, p_read, p_update, p_delete);
+
+dcl	p_first_mb_ptr	pointer parameter;
+dcl	(p_read, p_update, p_delete)
+			bit (1) aligned parameter;
+
+dcl	next_mb_ptr	pointer;
+dcl	first_block	bit (1) aligned;
+dcl	(actual_ms_len, n_bits_remaining, n_bits_copied, n_bits_to_copy)
+			fixed binary (24);
+dcl	(n_actual_blocks, block_id)
+			fixed binary (18);
+
+	actual_ms_len = 0;				/* check actual length and # of blocks for inconsistencies */
+	n_actual_blocks = 0;
+
+	n_bits_copied = 0;
+	if p_update
+	then n_bits_remaining = mseg_message_info.ms_len;
+
+	first_block = "1"b;				/* we are called with the first block in the message */
+
+	do mb_ptr = p_first_mb_ptr repeat (next_mb_ptr) while (mb_ptr ^= null ());
+
+	     block_id = divide (wordno (mb_ptr), mseg_segment.block_size, 18, 0) + 1;
+	     if substr (mseg_segment.block_map.map, block_id, 1) = "0"b
+	     then call salvage_and_return (mseg_format_errors_$unused_block_in_message);
+
+	     actual_ms_len = actual_ms_len + message_block_header.data_lth;
+	     if actual_ms_len > local_md.ms_len		/* check that the message length is OK */
+	     then call salvage_and_return (mseg_format_errors_$inconsistent_message_length);
+
+	     n_actual_blocks = n_actual_blocks + 1;	/* check that the block chain is OK */
+	     if n_actual_blocks > mseg_segment.n_blocks_allocated
+	     then call salvage_and_return (mseg_format_errors_$circular_message_blocks);
+
+	     if message_block_header.next_block = 0	/* find the next block now as deleting will zero the header */
+	     then next_mb_ptr = null ();
+	     else next_mb_ptr = setwordno (mseg_ptr, message_block_header.next_block);
+
+	     if ^first_block			/* only the first block should have a descriptor */
+	     then if message_block_header.descriptor_present
+		then call salvage_and_return (mseg_format_errors_$descriptor_in_other_block);
+
+	     if p_read
+	     then do;  /*** Copy the message from the segment to the storage previously allocated in the user's area */
+		     n_bits_to_copy = message_block_header.data_lth;
+		     if n_bits_to_copy > 0
+		     then begin;			/* if there's something to get from this block */
+dcl	target_bits	bit (n_bits_to_copy) unaligned defined (mseg_message_bits.data)
+			position (n_bits_copied + 1);
+			     if first_block
+			     then target_bits = first_message_block.data;
+			     else target_bits = other_message_block.data;
+			     n_bits_copied = n_bits_copied + n_bits_to_copy;
+			end;
+		end;
+
+	     else if p_update
+	     then do;  /*** Copy the updated portion of the message from the user's storage */
+		     n_bits_to_copy = min (n_bits_remaining, message_block_header.data_lth);
+		     if n_bits_to_copy > 0		/* there's something to put into this block */
+		     then begin;
+dcl	source_bits	bit (n_bits_to_copy) unaligned defined (mseg_message_bits.data)
+			position (n_bits_copied + 1);
+dcl	target_bits	bit (n_bits_to_copy) unaligned defined (other_message_block.data) position (1);
+			     target_bits = source_bits;
+			     n_bits_remaining = n_bits_remaining - n_bits_to_copy;
+			     n_bits_copied = n_bits_copied + n_bits_to_copy;
+			end;
+		end;
+
+	     if p_delete
+	     then do;  /*** Delete this block */
+		     substr (mseg_segment.block_map.map, block_id, 1) = "0"b;
+		     if first_block
+		     then unspec (first_message_block) = ""b;
+		     else unspec (other_message_block) = ""b;
+		     mseg_segment.n_blocks_unused = mseg_segment.n_blocks_unused + 1;
+		end;
+
+	     first_block = "0"b;
+	end;
+
+	if actual_ms_len < local_md.ms_len		/* the descriptor says it should be longer */
+	then call salvage_and_return (mseg_format_errors_$inconsistent_message_length);
+
+	return;
+
+     end process_message;
+%page;
+/* Remove the now-deleted message that was located at message_offset and whose descriptor is in local_md from the various
+   message chains in the segment */
+
+unchain_message:
+     procedure ();
+
+	if local_md.message_chain.prev_message = 0
+	then do;					/* it was the first message in the segment */
+		if mseg_segment.message_chain.first_message ^= message_offset
+		then call salvage_and_return (mseg_format_errors_$inconsistent_forward_chain);
+		mseg_segment.message_chain.first_message = local_md.message_chain.next_message;
+	     end;
+	else do;					/* it wasn't first */
+		call set_message_ptrs (local_md.message_chain.prev_message, prev_mb_ptr, prev_md_ptr);
+		if prev_md_ptr -> message_descriptor.message_chain.next_message ^= message_offset
+		then call salvage_and_return (mseg_format_errors_$inconsistent_forward_chain);
+		prev_md_ptr -> message_descriptor.message_chain.next_message = local_md.message_chain.next_message;
+	     end;
+
+	if local_md.message_chain.next_message = 0
+	then do;					/* it was the last message in the segment */
+		if mseg_segment.message_chain.last_message ^= message_offset
+		then call salvage_and_return (mseg_format_errors_$inconsistent_backward_chain);
+		mseg_segment.message_chain.last_message = local_md.message_chain.prev_message;
+	     end;
+	else do;					/* it wasn't last */
+		call set_message_ptrs (local_md.message_chain.next_message, next_mb_ptr, next_md_ptr);
+		if next_md_ptr -> message_descriptor.message_chain.prev_message ^= message_offset
+		then call salvage_and_return (mseg_format_errors_$inconsistent_backward_chain);
+		next_md_ptr -> message_descriptor.message_chain.prev_message = local_md.message_chain.prev_message;
+	     end;
+
+	if next_message_in_hash_chain = null ()
+	then do;					/* it was the last message in its hash chain */
+		if mseg_segment.hash_table.last_message (hash_idx) ^= message_offset
+		then call salvage_and_return (mseg_format_errors_$inconsistent_hash_chain);
+		mseg_segment.hash_table.last_message (hash_idx) = local_md.prev_message_in_hash_chain;
+	     end;
+	else do;					/* it wasn't last */
+		if next_message_in_hash_chain -> message_descriptor.prev_message_in_hash_chain ^= message_offset
+		then call salvage_and_return (mseg_format_errors_$inconsistent_hash_chain);
+		next_message_in_hash_chain -> message_descriptor.prev_message_in_hash_chain =
+		     local_md.prev_message_in_hash_chain;
+	     end;
+
+	mseg_segment.n_messages = mseg_segment.n_messages - 1;
+
+	return;
+
+     end unchain_message;
+%page;
+/* Check that the block map and unused block count are consistent */
+
+check_block_map_consistency:
+     procedure ();
+
+dcl	(actual_n_blocks_unused, last_block_checked, next_unused_block, next_used_block)
+			fixed binary (18);
+
+	actual_n_blocks_unused = 0;
+	last_block_checked = 0;
+
+	do while (last_block_checked < mseg_segment.n_blocks_allocated);
+
+	     begin;				/* find the next unused block (if any) */
+dcl	rest_of_block_map	bit (mseg_segment.n_blocks_allocated - last_block_checked) unaligned
+			defined (mseg_segment.block_map.map) position (last_block_checked + 1);
+		next_unused_block = index (rest_of_block_map, "0"b);
+	     end;
+
+	     if next_unused_block = 0			/* all the remaining blocks are in use */
+	     then last_block_checked = mseg_segment.n_blocks_allocated;
+
+	     else do;				/* at least one more unused block */
+		     last_block_checked = last_block_checked + next_unused_block - 1;
+		     begin;			/* find the first used block after this unused block */
+dcl	rest_of_block_map	bit (mseg_segment.n_blocks_allocated - last_block_checked) unaligned
+			defined (mseg_segment.block_map.map) position (last_block_checked + 1);
+			next_used_block = index (rest_of_block_map, "1"b);
+			if next_used_block = 0	/* ... the rest of the blocks are unused */
+			then next_used_block = length (rest_of_block_map) + 1;
+		     end;
+		     actual_n_blocks_unused = actual_n_blocks_unused + next_used_block - 1;
+		     last_block_checked = last_block_checked + next_used_block - 1;
+		end;
+	end;
+
+	if actual_n_blocks_unused ^= mseg_segment.n_blocks_unused
+	then call salvage_and_return (mseg_format_errors_$inconsistent_block_map);
+
+	return;
+
+     end check_block_map_consistency;
+
+/* format: off */
+%page; %include mseg_data_;
+%page; %include mseg_segment;
+%page; %include mseg_wakeup_state;
+%page; %include mseg_message;
+%page; %include mseg_operation;
+%page; %include mseg_message_info;
+%page; %include entry_access_info;
+%page; %include mseg_operations_;
+%page; %include mseg_format_errors_;
+%page; %include access_audit_eventflags;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+
+   Message:
+   Audit (mseg_$add_message): DENIED addition of a message to a message segment
+	ADDED_INFO <Message segment is full.>
+
+   S:	$access_audit
+
+   T:	$run
+
+   M:	A message was not added to a mailbox or message segment because
+	there is not enough room for the message in the segment.  Repeated
+	occurences of this event over a short period of time could indicate
+	an attempt to exploit a moderate bandwidth covert channel.
+	ADDED_INFO will identify the user and segment in question.
+
+   A:	$notify_ssa
+
+
+   END MESSAGE DOCUMENTATION */
+
+/* format: on */
+
+     end mseg_message_;

@@ -1,0 +1,1977 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+" *                                                         *
+" ***********************************************************
+
+" Program to trace procedure calls
+"
+" Barry L. Wolman, 2 January 1970
+" Modified: 18 June 1971 by BLW for Version II pl1
+" Modified: 30 May 1972 by BLW to use per/process info procedure instead of usage_values
+" Modified: 2 March 1973 by BLW for 6180
+" Modified: 16 May 1974 by BLW for change in setting up cleanup handler
+" Modified: 2 January 1974 by Richard A. Barnes to fix up many bugs
+" Modified: 7 May 1975 by RAB for new pl1_operators_ interface
+" Modified: 6 December 1975 by RAB to fix bugs in TRACE_CATCH_CLEANUP and update_stats
+" Modified: 20 September 1977 by PCK to use a temporary segment for trace_storage.
+" Modified: Autumn 1978 by R.E. Mullen for dynamic tracelist
+" Modified: 28 July 1981 by Jeffrey D. Ives, fix returns (*), cleanup trace_catch_$in_trace.
+" Modified: 01 Apr 1982 by Jeffrey D. Ives, add trace_catch_$switch for efficiency.
+" Rewritten: 23 June 1983 by Jeffrey D. Ives, multitasking, accurate metering, and macros.
+" Modified: May 1984 by Jeffrey D. Ives, for new trace_tab, parameters, global_parameters.
+
+	name	trace_catch_
+
+
+" This is the first reference trap code for trace_catch_.  It snaps these
+" links so that the linker will not run and invoke trace_catch_ while
+" trace_catch_ itself is running.
+
+	entry	initialize
+initialize:
+	rccl	sys_info$clock_,*
+	epp5	cpu_time_and_paging_op_$cpu_time_and_paging_op_
+	epp5	trace_catch_$trace_catcher_
+	epp5	trace_catch_$TRACE_CATCH_CLEANUP
+
+	epp5	pl1_operators_$operator_table
+	epp5	operator_pointers_$operator_pointers_
+	epp5	pl1_operators_$alm_entry
+	epp5	pl1_operators_$trace_operator_table
+	epp5	trace_operator_pointers_$trace_operator_pointers_
+	epp5	pl1_operators_$trace_alm_entry
+
+" Remember these entrypoints because they are very special.
+
+	epp5	trace_transactions_$transaction_begin
+	sprp5	pr4|TRANSACTION_BEGIN
+	epp5	trace_transactions_$transaction_begin_force
+	sprp5	pr4|TRANSACTION_BEGIN_FORCE
+	epp5	signal_$signal_
+	sprp5	pr4|SIGNAL_
+	epp5	signal_$io_signal
+	sprp5	pr4|IO_SIGNAL
+	short_return
+
+" STACK FRAME DATA   STACK FRAME DATA   STACK FRAME DATA   STACK FRAME DATA
+
+" Do not put anything ahead of ptr_registers_saved unless it is mod16 in length.
+
+	temp8	registers_saved
+	temp8	ptr_registers_saved(2)	" This must be on a mod16 boundary!
+
+	tempd	arg_list.header
+	tempd	arg_list.first_arg_ptr
+	tempd	arg_list.second_arg_ptr
+	tempd	arg_list.third_arg_ptr
+
+	tempd	event(8)
+	tempd	cleanup_unit(3)
+	tempd	trace_frames_saved
+
+	tempd	global_start.real_time	" These three MUST be kept together.
+	tempd	global_start.vcpu_time
+	temp	global_start.page_faults
+
+	temp	indicators_saved
+	temp	watch_values_changed
+	temp	stack_frame_end(0)		" For checking stack_frame_size.
+
+	equ	stack_frame_size,112	" Trace_catch_ pushes this size frame.
+
+" MACRO DEFINITIONS   MACRO DEFINITIONS   MACRO DEFINITIONS   MACRO DEFINITIONS
+
+
+	macro	get_pr4
+	epaq	*
+	lprp4	pr7|stack_header.lot_ptr,*au
+	&end
+
+
+
+
+	macro	read_the_calendar_clock	<pr4|&1 like meters aligned>
+	rccl	sys_info$clock_,*
+	staq	pr4|&1+meters.real_time
+	&end
+
+
+
+
+	macro	read_vcpu_time_and_page_faults <pr4|&1 like meters aligned>
+
+	stcd	pr6|stack_frame.return_ptr
+	call6	cpu_time_and_paging_op_$cpu_time_and_paging_op_
+
+	epbp7	pr6|0
+	epp4	pr6|stack_frame.lp_ptr,*
+	staq	pr4|&1+meters.vcpu_time   " Vcpu time is returned in AQ register.
+	stx0	pr4|&1+meters.page_faults " Page faults are returned in X0 and X1.
+	sxl1	pr4|&1+meters.page_faults
+	&end
+
+"		  A FEW WORDS ON THE METERING METHOD
+
+" The trace facility meters real time, virtual CPU time, and page faults.
+" Trace_catch_ reads the real time clock and usage meters as soon as possible
+" when it gets control and as late as possible when it relinquishes control.
+" This minimizes the effect of the overhead tracing overhead that is metered.
+" The remaining inaccuracy is reduced by a set of compensation values.
+
+" There are four kinds of intervals during which an entrypoint can collect
+" meters:
+
+"      1. from the time it is entered until control enters another
+"      2. from the time it is entered until it returns
+"      3. from the time it is returned to until it enters another
+"      4. from the time it is returned to until it returns
+
+" When control leaves trace_catch_, the meters are always saved in
+" trace_catch_$start.  When control comes back, they are saved in
+" trace_catch_$stop.  The difference between start and stop is accumulated in
+" the trace_catch_ frame associated with the procedure that relinquished
+" control.  Eventually, when that frame is popped or unwound, the accumulated
+" meters are added to the tab for that procedure.  At that time, they are also
+" added to trace_catch_$metered which accumulates all metered quantities and
+" is always equal the sum of the meters in the tabs and trace_catch_$removed,
+" which accumulates the meters of entrypoints that are removed from the trace
+" table.
+
+" The meters described in the previous paragraph are called frame meters and
+" represent the usage of a procedure without including the usage of any traced
+" procedures it calls.  Global meters represent the usage from the time a
+" procedure is called until it returns.  However, if it calls itself, it
+" should not be double metered.  When an entrypoint is called, the values in
+" trace_catch_$metered are saved in its trace_catch_ frame in the variable
+" global_start.  When it finally returns (or is unwound) the difference
+" between the current value of tc_$metered and global_start is added to
+" tab.global, which accumulates the entrypoint's global meters.
+
+" The user may wish to see the meters or remove entrypoints from the trace
+" table while trace_catch_ frames are still on the stack.  Therefore, at the
+" beginning of each trace command, there is a call to
+" trace_catch_$stop_tracing.  This routine yanks the trace operator pointers
+" and walks the stack of trace_catch_ frames, flushing the accumulated frame
+" and global meters into the corresponding tabs.  At the end of each trace
+" command, there is a call to trace_catch_$start_tracing which again walks the
+" stack and sets the global_starts to tc_$metered.
+
+" This macro starts a metering interval.  It puts the linkage section offset of
+" the appropriate portion of the compensation table in pr4|start_comp.  It
+" then reads the meters into pr4|start.  It does not store real_time because
+" this will be done at the very last.
+" It clobbers X4 and the registers clobbered by read_vcpu_time_and_page_faults.
+
+	macro	start_metering_interval	<compensation_type>
+	eax4	global_parameters+global_parms.comps+from_&1
+	stx4	pr4|start_comp		" Remember which compensations to use.
+
+	read_vcpu_time_and_page_faults	start
+
+NOTHING_TO_START&U:
+	&end
+
+
+
+
+
+
+
+" This macro calculates the usages during a metering interval and adds them to
+" the meters in whatever stack frame &1 points to and to pr4|metered.
+" Pr4|start_comp contains an offset into the linkage section for the
+" compensation values.  If pr4|start is zero, there is no interval and there
+" is nothing to do.  It assumes that pr4|stop contains the stop readings and
+" it uses pr4|delta as working storage.  It clobbers AQ and X4.
+
+	macro	metering_interval_calculations	<sp>,<compensation_type>
+	lcaq	pr4|start+meters.real_time
+	tze	INTERVAL_CALCULATED&U
+
+	ldx4	pr4|start_comp		" How were they started?
+	adaq	pr4|stop+meters.real_time	" Calculate elapsed real time.
+	tmi	trace_error_halt_$trace_error_halt_
+	sbaq	pr4|to_&2.real_time,x4	" Subtract appropriate compensation.
+	tpl	*+2			" A negative number would later
+	lls	72			" be detected as an inconsistency.
+	staq	pr4|delta+meters.real_time
+
+	ldaq	pr4|stop+meters.vcpu_time	" Calculate elapsed vcpu time.
+	sbaq	pr4|start+meters.vcpu_time
+	cmpaq	pr4|delta+meters.real_time	" Elapsed vcpu time should always be less
+	tmoz	*+5			" than or equal to elapsed real time.
+	szn	pr4|global_parameters+global_parms.calibrate " Don't apply correction
+	tnz	*+3			" when determining compensations.
+	ldaq	pr4|delta+meters.real_time	" If it isn't, use real time instead.
+	tra	*+2			" Delta real is already compensated.
+	sbaq	pr4|to_&2.vcpu_time,x4	" Subtract appropriate compensation.
+	staq	pr4|delta+meters.vcpu_time
+
+	ldaq	&1|event+event.frame.real_time
+	adaq	pr4|delta+meters.real_time	" Update frame real time.
+	staq	&1|event+event.frame.real_time
+
+	ldaq	&1|event+event.frame.vcpu_time
+	adaq	pr4|delta+meters.vcpu_time	" Update frame vcpu time.
+	staq	&1|event+event.frame.vcpu_time
+
+	lda	pr4|stop+meters.page_faults
+	sba	pr4|start+meters.page_faults
+	tmi	trace_error_halt_$trace_error_halt_
+	asa	&1|event+event.frame.page_faults " Update frame page faults.
+
+INTERVAL_CALCULATED&U:
+	lls	72			" Insure that they are not used again.
+	staq	pr4|start+meters.real_time
+	staq	pr4|start+meters.vcpu_time
+	stz	pr4|start+meters.page_faults
+	&end
+
+" This macro starts a global metering interval if the recursion count is 1.
+" This is because we don't want to multiple-meter procedures used recursively.
+
+	macro	start_global_metering_interval	<sp>
+
+	lda	&1|event+event.saved.level	" Only start global meters
+	tpnz	GLOBAL_INTERVAL_STARTED&U	" at recursion level 1.
+	tmi	trace_error_halt_$trace_error_halt_
+
+	lda	pr4|metered+meters.page_faults
+	sta	&1|global_start.page_faults
+
+	ldaq	pr4|metered+meters.vcpu_time
+	staq	&1|global_start.vcpu_time
+
+	ldaq	pr4|metered+meters.real_time	" Store this one last because it shows
+	staq	&1|global_start.real_time " that the others are valid.
+
+GLOBAL_INTERVAL_STARTED&U:
+	&end
+
+" This macro takes the meters that have been accumulating in a trace_catch_
+" frame and adds them to the tab.  It also adds them to trace_catch_$metered,
+" which accumulates all metered time and page faults.  This may be done either
+" because the frame is being popped or because we need the latest information
+" in the tab in order to produce a metering report.
+
+	macro	update_tab_meters	<sp>
+	ldaq	pr4|metered+meters.real_time
+	adaq	&1|event+event.frame.real_time	" Update metered real time.
+	staq	pr4|metered+meters.real_time
+
+	ldaq	pr2|tab.local+meters.real_time
+	adaq	&1|event+event.frame.real_time	" Update tab real time.
+	staq	pr2|tab.local+meters.real_time
+
+	ldaq	pr4|metered+meters.vcpu_time
+	adaq	&1|event+event.frame.vcpu_time	" Update metered vcpu time.
+	staq	pr4|metered+meters.vcpu_time
+
+	ldaq	pr2|tab.local+meters.vcpu_time
+	adaq	&1|event+event.frame.vcpu_time	" Update tab real time.
+	staq	pr2|tab.local+meters.vcpu_time
+
+	lda	&1|event+event.frame.page_faults
+	asa	pr4|metered+meters.page_faults " Update metered page faults.
+	asa	pr2|tab.local+meters.page_faults " Update tab page faults.
+
+	ldaq	&1|global_start.real_time
+	tze	FRAME_METERS_UPDATED&U	" No global metering in this frame.
+
+	ldaq	pr4|metered+meters.real_time	" Update global real time.
+	sbaq	&1|global_start.real_time
+	tmi	trace_error_halt_$trace_error_halt_
+	adaq	pr2|tab.global+meters.real_time
+	staq	pr2|tab.global+meters.real_time
+
+	ldaq	pr4|metered+meters.vcpu_time	" Update global vcpu time.
+	sbaq	&1|global_start.vcpu_time
+	adaq	pr2|tab.global+meters.vcpu_time
+	staq	pr2|tab.global+meters.vcpu_time
+
+	lda	pr4|metered+meters.page_faults " Update global page faults.
+	sba	&1|global_start.page_faults
+	tmi	trace_error_halt_$trace_error_halt_
+	asa	pr2|tab.global+meters.page_faults
+
+FRAME_METERS_UPDATED&U:
+	lls	72			" Insure that they are not used again.
+	staq	&1|event+event.frame.real_time
+	staq	&1|event+event.frame.vcpu_time
+	stz	&1|event+event.frame.page_faults
+	staq	&1|global_start.real_time
+	staq	&1|global_start.vcpu_time
+	stz	&1|global_start.page_faults
+	&end
+
+" FILL EVENT FOR PRINT OR STOP MACRO
+
+	macro	fill_event_for_trace_or_signal
+	lda	EVENT_VERSION_3
+	sta	event+event.version
+	lxl0	trace_frames_saved+trace_frames.count
+	sxl0	event+event.frame_count
+
+	epp0	ptr_registers_saved+2*0,*	" This is where PR0 was saved.
+	sprp0	event+event.arg_list_ptr
+	epp0	pr6|0
+	epp0	pr0|stack_frame.prev_sp,*	" Pointer to caller's stack frame.
+	lda	pr0|stack_frame.flag_word
+	ana	stack_frame.support_bit,dl
+	tnz	*-3			" Skip support frames.
+	sprp0	event+event.callers_sp
+	epp0	pr0|stack_frame.return_ptr,*	" Pointer to caller's return point.
+	sprp0	event+event.return_ptr
+	&end	" fill_event_for_trace_or_signal
+
+
+
+" CALL STOP ROUTINE MACRO
+
+	macro	call_stop_routine <sp>,<ca/re>
+
+" call global_parameters.stop_routine (event, watch_values_changed);
+" dcl  global_parameters.stop_routine entry (1 like event aligned, bit aligned);
+
+	ldx0	=2a&2,du
+	stx0	&1|event+event.kind
+
+	ldaq	two_arg_list_header
+	staq	arg_list.header
+	ldaq	pr4|global_parameters+global_parms.stop_routine+2 " Environment ptr.
+	staq	arg_list.third_arg_ptr
+	eraq	null_ptr
+	anaq	ptr_mask
+	tze	*+3
+	ldaq	two_arg_list_header_w_env
+	staq	arg_list.header
+	epp0	&1|event
+	spri0	arg_list.first_arg_ptr
+	epp0	&1|watch_values_changed
+	spri0	arg_list.second_arg_ptr
+
+	call	pr4|global_parameters+global_parms.stop_routine,*(arg_list.header)
+	&end
+
+" CALL PRINT ROUTINE MACRO
+
+	macro	call_trace_routine_or_buffer <sp>,<ca/re/un/si>
+
+" call global_parameters.print_routine (event);
+" dcl  global_parameters.print_routine entry (1 like event aligned);
+
+	ldx0	=2a&2,du
+	stx0	&1|event+event.kind
+
+	lda	pr4|global_parameters+global_parms.buffer_ptr
+	cmpa	packed_null
+	tze	CALL_TRACE_PRINT&U
+	lprp1	pr4|global_parameters+global_parms.buffer_ptr
+	ldaq	pr1|buffer.h.version
+	cmpaq	BUFFER_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+	lda	pr1|buffer.h.count
+	aos	pr1|buffer.h.count
+	ana	=o017777,dl		" mod 8192
+	als	4			" 16 words per event.
+	epp1	pr1|buffer.e,al		" pr1 -> buffer entry
+	mlr	(pr),(pr)
+	desc9a	&1|event,(event_size-2)*4
+	desc9a	pr1|0,(event_size-2)*4
+	ldaq	pr4|stop+meters.real_time
+	staq	pr1|event_size-2		" Put clock reading in last two words.
+	ife	&2,si
+	mlr	(),(pr)			" Initialize so we can punt fast.
+	desc9a	UNUSUAL_SIGNAL_ARG_LIST,24	" "Unusual signal_ arg list"
+	desc9a	pr1|event.saved,24		" 24 is from event.saved to the clock.
+	epp0	&1|ptr_registers_saved+2*0,*	" PR0 -> argument list header.
+	lxl0	pr0|0			" If arg_list.header.call_type
+	cmpx0	4,du			" ^= Interseg_call_type
+	tnz	SKIP_TRACE_PRINT&U	" then punt.
+	ldx0	pr0|1			" If arg_list.header.desc_count
+	cmpx0	2,du			" < 1
+	tmi	SKIP_TRACE_PRINT&U	" then punt.
+	ldx0	pr0|0			" If arg_list.header.arg_count
+	cmpx0	2,du			" < 1
+	tmi	SKIP_TRACE_PRINT&U	" then punt.
+	lda	pr0|2,x0*			" A = descriptor
+	als	1			" Bit bucket = arg_descriptor.flag
+	lrl	25
+	arl	5			" A = arg_descriptor.type
+	cmpa	21,dl			" If arg_descriptor.type ^= char_dtype
+	tnz	SKIP_TRACE_PRINT&U	" then punt.
+	qrl	12			" Q = arg_descriptor.size
+	epp0	pr0|2,*			" PR0 -> signal name.
+	mlr	(pr,rl),(pr),fill(040)
+	desc9a	pr0|0,ql
+	desc9a	pr1|event.saved,24		" 24 is from event.saved to the clock.
+	ifend
+	tra	SKIP_TRACE_PRINT&U
+
+CALL_TRACE_PRINT&U:
+	ldaq	one_arg_list_header		" call trace_print_$trace (event);
+	staq	arg_list.header
+	ldaq	pr4|global_parameters+global_parms.trace_routine+2 " Environment ptr.
+	staq	arg_list.second_arg_ptr
+	eraq	null_ptr
+	anaq	ptr_mask
+	tze	*+3
+	ldaq	one_arg_list_header_w_env
+	staq	arg_list.header
+	epp0	&1|event
+	spri0	arg_list.first_arg_ptr
+
+	call	pr4|global_parameters+global_parms.trace_routine,*(arg_list.header)
+SKIP_TRACE_PRINT&U:
+	&end
+
+" CHECK OR UPDATE WATCH TABLE MACRO
+
+" This macro either checks or updates the watch table, depending on its second
+" argument.  It clobbers PR0, PR1, AQ, and X0.
+
+	macro	check_or_update_watch_table	<sp>,<check/update>
+	ife	&2,check
+	stz	&1|watch_values_changed
+	ifend
+	ife	&2,update
+	szn	&1|watch_values_changed
+	tze	WATCH_TABLE_DONE&U
+	ifend
+
+	epp1	pr4|wt_ptr,*		" Pr1 points to the table header.
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	lxl0	pr1|table.count
+WATCH_TABLE_LOOP&U:
+	eax0	-1,x0
+	tmi	WATCH_TABLE_DONE&U
+	eaa	0,x0
+	ars	18
+	cmpa	pr1|table.idx+idx.low	" if idx - idx.low < 0
+	tmi	*+3			" then actual_idx = idx;
+	sba	pr1|table.idx+idx.low	" else actual_idx = idx - idx.low
+	ada	pr1|table.idx+idx.high	" + idx.high;
+	als	1
+	lprp0	pr1|table.e+te.key,al
+	ldq	pr0|0
+	cmpq	pr1|table.e+te.data,al
+	tze	WATCH_TABLE_LOOP&U
+	ife	&2,check
+	eaa	TRUE
+	sta	&1|watch_values_changed
+	ifend
+	ife	&2,update
+	stq	pr1|table.e+te.data,al
+	tra	WATCH_TABLE_LOOP&U
+	ifend
+WATCH_TABLE_DONE&U:
+	&end
+
+" TRACE IF NECESSARY MACRO
+
+	macro	trace_and_stop_if_necessary	<sp>,<ca/re/un>
+
+	szn	pr4|global_parameters+global_parms.meter
+	tnz	DONT_CALL_ANYTHING&U
+
+	lda	pr2|tab.parms_ptr
+	cmpa	packed_null		" If this entrypoint has been removed,
+	tze	DONT_CALL_ANYTHING&U	" then don't trace it.
+
+	szn	pr2|tab.on		" If this entrypoint is -off,
+	tze	DONT_CALL_ANYTHING&U	" then don't trace it.
+
+	szn	pr4|global_parameters+global_parms.alm
+	tnz	*+4
+	lda	pr2|tab.translator_id
+	cmpa	1,dl			" If tab.translator_id = ALM
+	tze	DONT_CALL_ANYTHING&U	" then don't trace.
+
+	inhibit	off		" <-> <-> <-> <-> <-> <-> <-> <-> <->
+	lprp3	pr2|tab.parms_ptr		" pr3 = tab.parms_ptr;
+	ldaq	pr3|parms.version
+	cmpaq	PARAMETERS_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	lda	pr3|parms.trace		" Check inout.
+&^=&2,ca&[	als	1
+&]	tpl	CHECK_WATCH_TABLE&U
+
+	ldaq	&1|event+event.saved.calls
+	adl	1,dl			" Get current count.
+	staq	arg_list.header		" Save in strange temporary.
+
+	szn	pr3|parms.every		" Is this parameter active?
+	tze	CHECK_FIRST&U
+
+	lrs	34			" If mod (call_count, tab.every) ^= 0
+	dvf	pr3|parms.every		" then don't trace.
+	lls	36
+	ldq	arg_list.header+1		" Actually counts.calls+1.
+	qls	1
+	dvf	pr3|parms.every		" Q = mod (saved calls, tab.every);
+	qrs	0			" Set indicators from register Q.
+	tnz	CHECK_WATCH_TABLE&U
+
+CHECK_FIRST&U:
+	lcaq	arg_list.header		" Actually counts.calls.
+	adl	pr3|parms.first		" If tab.first - saved calls > 0
+	tpnz	CHECK_WATCH_TABLE&U	" then don't trace.
+
+	szn	pr3|parms.last
+	tze	*+4			" -last 0 means it is diasbled.
+	lcaq	arg_list.header		" Actually counts.calls.
+	adl	pr3|parms.last		" If parms.last - saved calls < 0
+	tmi	CHECK_WATCH_TABLE&U	" then don't trace.
+
+	lda	&1|event+event.saved.level
+	ada	1,dl			" Get current level.
+	cmpa	pr3|parms.low		" If level - parms.low < 0
+	tmi	CHECK_WATCH_TABLE&U	" then don't trace.
+
+	szn	pr3|parms.high
+	tze	*+3			" -high 0 means it is diasbled.
+	cmpa	pr3|parms.high		" If level - parms.high > 0
+	tpnz	CHECK_WATCH_TABLE&U	" then don't trace.
+
+	szn	pr3|parms.new_high		" If -new_high is off
+	tze	*+3			" then skip this check.
+	cmpa	&1|event+event.saved.max_level
+	tmoz	CHECK_WATCH_TABLE&U	" then don't trace.
+
+	call_trace_routine_or_buffer &1,&2
+	
+CHECK_WATCH_TABLE&U:
+	ine	&2,un
+
+	check_or_update_watch_table	&1,check
+
+	szn	&1|watch_values_changed
+	tnz	STOP_IT&U
+
+	lda	pr3|parms.stop
+&^=&2,ca&[	als	1
+&]	tpl	DONT_CALL_ANYTHING&U
+
+	ldaq	&1|event+event.saved.calls
+	adl	1,dl			" Get real counts.calls.
+	staq	arg_list.header		" Use this as a temporary.
+
+	szn	pr3|parms.stop_every	" Is this parameter active?
+	tze	CHECK_STOP_LOW&U
+
+	lrs	34			" If mod (call_count, tab.every) ^= 0
+	dvf	pr3|parms.stop_every	" then don't stop.
+	lls	36
+	ldq	arg_list.header+1		" Actually counts.calls+1.
+	qls	1
+	dvf	pr3|parms.stop_every	" Q = mod (saved calls, tab.every);
+	qrs	0			" Set indicators from register Q.
+	tnz	DONT_CALL_ANYTHING&U
+
+CHECK_STOP_LOW&U:
+	lda	&1|event+event.saved.level
+	ada	1,dl			" Get current level.
+	cmpa	pr3|parms.stop_low		" If level - parms.stop_low < 0
+	tmi	DONT_CALL_ANYTHING&U	" then don't stop.
+
+STOP_IT&U:
+
+	call_stop_routine &1,&2
+
+	check_or_update_watch_table	&1,update
+
+	ifend
+	inhibit	on		" <+> <+> <+> <+> <+> <+> <+> <+> <+>
+DONT_CALL_ANYTHING&U:
+	&end
+
+	macro	is_tracing_permitted	<THE_ANSWER_IS_NO_LABEL>
+" Is tracing this entry point permitted?
+
+	lda	pr2|tab.translator_id	" If tab.translator_id < 0,
+	tmi	&1		" then this program can't be traced.
+	szn	pr4|global_parameters+global_parms.alm
+	tnz	*+3
+	cmpa	1,dl			" If tab.translator_id = ALM
+	tze	&1		" then don't trace.
+
+	szn	pr2|tab.on		" If this entrypoint is -off,
+	tze	&1		" then don't trace it.
+	&end
+
+
+
+
+
+	macro	pop_tab	<sp>
+	lda	&1|event+event.saved.level	" Revert tab.cts.level,
+	tmi	trace_error_halt_$trace_error_halt_
+	sta	pr2|tab.cts+counts.level
+	&end;
+
+"	  A FEW WORDS ABOUT THE STRUCTURE OF THE TRACE TABLES
+
+" The trace facility maintains four tables in the same format:
+
+"      tt:  The trace table itself, which has a maximum of 10,000 entries.
+"      stt: The table of entrypoints specified by the trace command.
+"      wt:  The table locations being watched, with a maximum of 1024 entries.
+"      swt: The table of locations specified by the watch_locations command.
+
+" Each table has an 8 word header that contains a version, the maximum number
+" of entries (max_count), and the current number of entries (count).  The
+" table entries are two words each and are sorted into ascending order based
+" on the numeric value of the first word, which is known as the key.  The
+" second word is known as the data.
+
+" In order to facilitate updating, the entries in a table are divided into two
+" halves.  One half is at the low end of the table and the other half is at
+" the high end.  When an entry is to be added to a table, entries are shifted
+" from one half to the other until the new entry can be added by appending it
+" to the high end of the low half.
+
+" The index of a table entry must be translated into the index of an element
+" in the table array.  Both the array indexes and the table indexes are zero
+" relative.  The first element of the table array is 0 and the index of the
+" last element is max_count - 1.  If an entry is in the low half, the array
+" index is the same as the entry index.
+
+" There is a double word in the table header that describes the halvs.  The
+" first word is called idx.low and the second word is called idx.high.
+" Idx.high is the array index of the first element in the high half.  If it is
+" equal to max_count, there are no entries in the high half.  Idx.low is the
+" number of entries in the low half.  An entry is in the high half if its
+" entry index is >= idx.low.  If an entry is in the high half, its array index
+" is its entry index - idx.low + idx.high.
+
+" There are three macros for manipulating these tables.
+
+"      seek_table		which finds an entry, given its key.
+"      index_table		which finds an entry, given its entry index.
+"      normalize_table	which moves entries until idx.low = entry index.
+
+" SEEK TABLE MACRO
+" This macro searches the trace or locations table for an entry or location.
+" It is called with:
+" 	PR1 -> table header,
+" 	Q containing the key being searched for.
+" If the entry is found, it returns to the FOUND label with:
+" 	PR2 -> the matching entry
+" 	X2 containing the entry index
+"	A, X1, and table.working_storage clobbered.
+" If the entry is not found, it returns to the NOT_FOUND label with:
+" 	X2 containing the entry index it would have if it were added.
+"	PR2, A, X1, and table.working_storage clobbered.
+" If the table is empty, it goes to the NOT_FOUND label with:
+" 	X2 = 0.
+"	PR2, A, X1, and table.working_storage clobbered.
+
+	macro	seek_table	" Syntax: seek_table FOUND,NOT_FOUND
+	lda	pr1|table.idx+idx.high
+	als	1
+	epp2	pr1|table.e,al	" Pr2 points to high half.
+	lda	pr1|table.max_count
+	sba	pr1|table.idx+idx.high " If table.max_count - idx.high = 0,
+	tze	SEEK_LOW&U	" then the high half is empty.
+	tmi	trace_error_halt_$trace_error_halt_
+	cmpq	pr2|te.key	" If Q - table.e (idx.high) < 0
+	tmi	SEEK_LOW&U
+	tpnz	BINARY_LOOP&U
+	lxl2	pr1|table.idx+idx.low " Good luck.  We found it.
+	tra	&1
+
+SEEK_LOW&U:
+	epp2	pr1|table.e	" Pr2 points to low half.
+	lda	pr1|table.idx+idx.low	" A = number of entries in low half.
+	tpnz	BINARY_LOOP&U	" If A > 0, then do a binary search.
+	tmi	trace_error_halt_$trace_error_halt_
+	eax2	0		" else it's not in the table.
+	tra	&2
+
+" The binary search uses pr2 to point to the group of remaining candidates.
+" It uses the A register to contain the number of remaining candidates.
+" During the search uses X2 to represent the offset to the middle of the candidates.
+
+BINARY_LOOP&U:		" X2 contains offset that divides portion in half,
+	eax2	-1,al		" with the upper division being the larger one.
+	tmi	BINARY_NOT_FOUND&U " Quit, if the portion is zero length.
+
+	anx2	=o777776,du	" Truncate offset in x2 to a double word boundary.
+	ars	1		" Calculate size of the portion for the next pass.
+
+	cmpq	pr2|te.key,x2	" If value we are looking for is LESS than value we
+	tmi	BINARY_LOOP&U	" are looking at, then look again in LOWER division.
+
+	epp2	pr2|te_size,x2	" If value we are looking for is MORE than value we
+	tpnz	BINARY_LOOP&U	" are looking at, then look again in UPPER division.
+
+	epp2	pr2|-te_size	" Success!  The binary search always
+	eax1	&1	" succeeds with PR2 -> to the next entry.
+	tra	FIGURE_INDEX&U
+
+BINARY_NOT_FOUND&U:		" The binary search always fails with
+	eax1	&2	" PR2 -> entry where it should have been.
+
+FIGURE_INDEX&U:
+	eaa	pr1|table.e	" Calculate the winning index.
+	arl	19
+	sta	pr1|table.working_storage
+	eaa	pr2|0
+	arl	19
+	sba	pr1|table.working_storage
+	eax2	0,al
+	cmpa	pr1|table.idx+idx.low	" If index - idx.low <= 0,
+	tmoz	0,x1	" then it is in the low half and we are done.
+	sba	pr1|table.idx+idx.high
+	tmi	trace_error_halt_$trace_error_halt_
+	ada	pr1|table.idx+idx.low
+	eax2	0,al		" index = index - idx.high + idx.low;
+	tra	0,x1
+	&end
+
+" INDEX TABLE MACRO
+" This macro assumes that:
+"	PR1 -> table,
+"	X2 = table index.
+" It finishes with:
+"	PR2 -> the table entry specified by the index in X2,
+"	A clobbered.
+
+	macro	index_table
+	eaa	0,x2
+	ars	18
+	tmi	trace_error_halt_$table_index_oob
+	cmpa	pr1|table.idx+idx.low	" If table_index - idx.low > 0,
+	tpl	INDEX_HIGH&U	" then get it from the high half.
+	als	1
+	epp2	pr1|table.e,al
+	tra	INDEX_DONE&U
+INDEX_HIGH&U:
+	sba	pr1|table.idx+idx.low
+	ada	pr1|table.idx+idx.high	" Q = array_index - idx.low + idx.high;
+	cmpa	pr1|table.max_count
+	tpl	trace_error_halt_$table_index_oob
+	als	1
+	epp2	pr1|table.e,al
+INDEX_DONE&U:
+	&end
+
+" NORMALIZE TABLE MACRO
+" This macro assumes that:
+"	PR1 -> table
+"	X2 contains an entry index.
+" It moves table entries until idx.low = X2, using the mlr or mrl instruction.
+" When it returns:
+"	idx.low = X2.
+"	PR2, PR3, AQ, and table.working_storage clobbered.
+
+	macro	normalize_table
+	ldaq	pr1|table.idx
+	staq	pr1|table.working_storage
+	eaa	0,x2
+	ars	18
+	sba	pr1|table.idx+idx.low	"A = table_index - idx.low;
+	tze	TABLE_NORMALIZED&U " The table is already normalized.
+	asa	pr1|table.working_storage+idx.low  " Working_storage is an image of
+	asa	pr1|table.working_storage+idx.high " what table.idx will be.
+	ldq	pr1|table.max_count
+	sbq	pr1|table.count	" If table.max_count - table.count = 0,
+	tze	TABLE_NORMALIZED&U " then table is full, so just change idx.
+	tmi	trace_error_halt_$trace_error_halt_
+	ars	0		" Set the indicator registers from A.
+	tpnz	MOVE_HIGH_TO_LOW&U " If A > 0, move data down.
+
+MOVE_LOW_TO_HIGH&U:		" If A < 0, move data up.
+	ldaq	pr1|table.working_storage
+	lls	1
+	epp2	pr1|table.e,al	" Pr2 -> table.e (idx.low).
+	epp3	pr1|table.e,ql	" Pr3 -> table.e (idx.high).
+	lda	pr1|table.idx+idx.low
+	sba	pr1|table.working_storage+idx.low
+	als	3		" There are eight bytes per entry.
+	mrl	(pr,rl),(pr,rl)
+	desc9a	pr2|0,al
+	desc9a	pr3|0,al
+	tra	TABLE_NORMALIZED&U
+
+MOVE_HIGH_TO_LOW&U:
+	ldaq	pr1|table.idx
+	lls	1
+	epp2	pr1|table.e,al	" Pr2 -> table.e (idx.low).
+	epp3	pr1|table.e,ql	" Pr3 -> table.e (idx.high).
+	lda	pr1|table.working_storage+idx.low
+	sba	pr1|table.idx+idx.low
+	als	3		" There are eight bytes per entry.
+	mlr	(pr,rl),(pr,rl)
+	desc9a	pr3|0,al
+	desc9a	pr2|0,al
+
+TABLE_NORMALIZED&U:
+	ldaq	pr1|table.working_storage
+	staq	pr1|table.idx
+	&end
+
+" TABLE SEEK
+" dcl trace_catch_$table_seek entry (ptr, bit (36) aligned) returns (fixed bin);
+" table_index = trace_catch_$table_seek (table_ptr, key);
+
+	segdef	table_seek
+table_seek:
+	get_pr4
+	epp1	pr0|2,*
+	epp1	pr1|0,*		" Pr1 points to the table header.
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	pr0|4,*		" Q reg contains the key we seek.
+
+	seek_table	TABLE_SEEK_FOUND,TABLE_SEEK_NOT_FOUND
+
+TABLE_SEEK_FOUND:
+	eaa	0,x2
+	ars	18
+	sta	pr0|6,*
+	short_return		" return (table_index);
+
+TABLE_SEEK_NOT_FOUND:
+	lca	1,dl
+	sta	pr0|6,*
+	short_return		" return (-1)
+
+" TABLE GET
+" dcl trace_catch_$table_get entry (ptr, fixed bin) returns (1 like table_entry aligned);
+" table_entry = trace_catch_$table_get (table_ptr, table_index);
+
+	
+	segdef	table_get
+table_get:
+	get_pr4
+	epp1	pr0|2,*
+	epp1	pr1|0,*		" Pr1 points to the table header.
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	lxl2	pr0|4,*		" X2 contains the index.
+
+	index_table
+
+	ldaq	pr2|te
+	epp3	pr0|6,*
+	sta	pr3|te.key
+	stq	pr3|te.data
+	short_return		" return (AQ);
+
+" TABLE PUT DATA
+" dcl trace_catch_$table_put_data entry (ptr, fixed bin, bit (36) aligned);
+" call trace_catch_$table_put_data (table_ptr, table_index, data);
+
+	
+	segdef	table_put_data
+table_put_data:
+	get_pr4
+	epp1	pr0|2,*
+	epp1	pr1|0,*		" Pr1 points to the table header.
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	lxl2	pr0|4,*		" X2 contains the index.
+
+	index_table
+
+	ldq	pr0|6,*
+	stq	pr2|te.data
+	short_return
+
+" TABLE ADD
+" dcl trace_catch_$table_add entry (ptr, 1 like table_entry aligned) returns (fixed bin);
+" table_index = trace_catch_$table_add (table_ptr, table_entry);
+
+	segdef	table_add
+table_add:
+	get_pr4
+	epp1	pr0|2,*
+	epp1	pr1|0,*		" Pr1 points to the table header.
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	pr0|4,*		" Q reg contains the key we seek.
+
+	seek_table	ADD_ENTRY_FOUND_IN_TABLE,TRY_LOW_HALF_APPEND
+
+ADD_ENTRY_FOUND_IN_TABLE:
+	lca	1,dl
+	sta	pr0|6,*
+	short_return		" return (-1);
+
+TRY_LOW_HALF_APPEND:
+	eaa	0,x2
+	ars	18
+	cmpa	pr1|table.idx+idx.low " If index_we_want ^= idx.low
+	tnz	NORMALIZE_FOR_ADD
+	cmpa	pr1|table.idx+idx.high " If idx.low - idx.high >= 0,
+	tpl	trace_error_halt_$table_full " then the table is already full.
+	als	1
+	epp2	pr1|table.e,al	" PR2 -> where new entry will go.
+	epp3	pr0|4,*
+	lda	pr3|te.key	" Arg is not necessarily double word aligned.
+	ldq	pr3|te.data
+	staq	pr2|te		" table.e (idx.low) = table_entry;
+	lda	pr1|table.idx+idx.low
+	sta	pr0|6,*		" return (idx.low);
+	inhibit	on		" <+> <+> <+> <+> <+> <+> <+> <+> <+>
+	aos	pr1|table.idx+idx.low " idx.low = idx.low + 1;
+	aos	pr1|table.count	" table.count = table.count + 1;
+	inhibit	off		" <-> <-> <-> <-> <-> <-> <-> <-> <->
+	short_return
+
+NORMALIZE_FOR_ADD:
+	normalize_table
+
+	tra	TRY_LOW_HALF_APPEND	" This will work now.
+
+" TABLE REMOVE
+" dcl trace_catch_$table_remove entry (ptr, fixed bin) returns (1 like te aligned);
+" te = trace_catch_$table_remove (table_ptr, table_index);
+
+	segdef	table_remove
+table_remove:
+	get_pr4
+	epp1	pr0|2,*
+	epp1	pr1|0,*		" Pr1 points to the table header.
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	lxl2	pr0|4,*		" X2 contains the index.
+
+	index_table
+
+	ldaq	pr2|te		" Store the return value.
+	epp3	pr0|6,*
+	sta	pr3|te.key	" Return arg is not necessarily
+	stq	pr3|te.data	" double word aligned.
+
+	normalize_table
+
+	inhibit	on		" <+> <+> <+> <+> <+> <+> <+> <+> <+>
+	aos	pr1|table.idx+idx.high " idx.high = idx.high + 1;
+	lca	1,dl
+	asa	pr1|table.count	" table.count = table.count - 1;
+	inhibit	off		" <-> <-> <-> <-> <-> <-> <-> <-> <->
+	short_return
+
+" The entry operators do a tsp2 to trace$catch_pl1_, so
+"
+"	PR2 -> place to resume the entry operator.
+"
+" The entry operator uses the first two words after the end of the stack for
+" temporary storage.  These two words must be restored before resuming the
+" operator.  The following pl1 declaration shows what is stored there.
+"
+"	dcl  1 saved aligned based (stack_header.stack_end_ptr),
+"	       2 entry_ptr ptr unal,	/* packed ptr to entry being traced */
+"	       2 pr1 ptr unal,	/* not needed, but must be restored */
+
+
+" Trace_catcher_ is a stub entry point for the benefit of debuggers.
+
+	entry	trace_catcher_
+trace_catcher_:
+	short_return
+
+
+	segdef	catch_pl1_
+catch_pl1_:
+
+	inhibit	on		<+> <+> <+> <+> <+> <+> <+> <+> <+> <+>
+
+	get_pr4
+
+" Read the calendar clock as soon as possible.
+
+	read_the_calendar_clock	stop
+
+" If tracing is inhibited, just resume the entry operator.
+
+	szn	pr7|stack_header.in_trace
+	tnz	pr2|0
+
+" Getlp.  This cutrate getlp uses PR4 and PR5 as temporaries since the
+" remainder of the entry operator will change them anyway.
+
+	epp5	pr7|stack_header.stack_end_ptr,* " PR5 -> stack frame construction site.
+	epp4	trace_catch_$trace_catcher_	" Let debuggers see a real entry point.
+	spri4	pr5|stack_frame.entry_ptr
+
+" Push.
+
+	spri6	pr5|stack_frame.prev_sp
+	epp4	null_ptr,*
+	spri4	pr5|stack_frame.arg_ptr
+	get_pr4
+	spri4	pr5|stack_frame.lp_ptr
+	epp6	pr5|0
+	epp5	pr6|stack_frame_size
+	spri5	pr7|stack_header.stack_end_ptr
+	spri5	pr6|stack_frame.next_sp
+
+" Save the cpu registers, and the two words where end of stack used to be, in a safe place.
+
+	ldaq	pr6|0
+
+	spri	ptr_registers_saved
+	sreg	registers_saved
+	sti	indicators_saved
+
+" Read the meters.  I wish it could have been done sooner.
+
+	read_vcpu_time_and_page_faults	stop
+
+" To whom it may concern: trace_catch_ is an alm program.
+
+	eax7	1
+	stx7	pr6|stack_frame.translator_id
+
+" Establish a cleanup handler to undo changes to static data.
+
+	epp0	=7acleanup		" Initialize the on unit data block.
+	spri0	cleanup_unit+on_unit.name
+	epp0	PRELIMINARY_CLEANUP_HANDLER	" It just resets stack_header.in_trace.
+	spri0	cleanup_unit+on_unit.body
+	ldq	7,dl
+	stq	cleanup_unit+on_unit.size
+	stz	cleanup_unit+on_unit.next
+
+	equ	cleanup_unit_offset,cleanup_unit
+	eaa	cleanup_unit_offset		" Put it at the head of the list.
+	sta	pr6|stack_frame.on_unit_rel_ptrs
+
+	lda	stack_frame.condition_bit+stack_frame.support_bit,dl
+	orsa	pr6|stack_frame.flag_word	" List is valid & this is a support frame.
+
+" Prevent recursion in case of calls or errors.
+
+	eaa	TRUE
+	sta	pr7|stack_header.in_trace
+
+" Calculate the meters and store them in the previously top trace_catch_ frame,
+" if there is one.
+
+	ldaq	pr7|stack_header.trace_frames
+	staq	trace_frames_saved
+	tze	SEEK_TAB_FOR_CALL
+	lprp5	trace_frames_saved+trace_frames.top_ptr
+	sba	1,dl			" Make sure things are copacetic.
+	cmpa	pr5|trace_frames_saved+trace_frames.count
+	tnz	trace_error_halt_$trace_error_halt_
+
+	metering_interval_calculations	pr5,entry
+
+SEEK_TAB_FOR_CALL:
+
+" Copy the packed pointer to the entry being traced from where the end of stack used to be.
+
+	lda	registers_saved+4	" This is where the sreg instruction puts A.
+	sta	event+event.entry_ptr
+
+" Get the tab for this entrypoint, if it is in the trace table.
+
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	event+event.entry_ptr		" Q reg contains the value we are looking for.
+
+	seek_table	EP_IS_IN_TT_AT_CALL,ADD_ENTRYPOINT
+
+EP_IS_IN_TT_AT_CALL:
+	eaa	0,x2
+	ars	18
+	sta	event+event.entry_idx
+	lprp2	pr2|te.data
+	tra	HAVE_TAB
+
+ADD_ENTRYPOINT:
+	lca	1,dl
+	sta	event+event.entry_idx
+	epp2	null_ptr,*		" Catch bugs early.
+
+
+" If the entry point is signal_$signal_ or signal_$io_signal, then trace as signal.
+
+	ldq	event+event.entry_ptr
+	cmpq	pr4|SIGNAL_
+	tze	THIS_IS_A_SIGNAL
+
+	cmpq	pr4|IO_SIGNAL
+	tze	THIS_IS_A_SIGNAL
+
+" If -auto on, then add this entry point to the trace table.
+
+	szn	pr4|global_parameters+global_parms.automatic
+	tze	POP_TRACE_FRAME_AND_RESUME
+
+" If the entry point is trace_transactions_$transaction_begin, then skip it.
+
+	cmpq	pr4|TRANSACTION_BEGIN
+	tze	POP_TRACE_FRAME_AND_RESUME
+
+	cmpq	pr4|TRANSACTION_BEGIN_FORCE
+	tze	POP_TRACE_FRAME_AND_RESUME
+
+" call trace_entrypoints_$add_entrypoint (event+event.entry_ptr, pr2);
+
+	ldaq	two_arg_list_header
+	staq	arg_list.header
+	epp0	event+event.entry_ptr
+	spri0	arg_list.first_arg_ptr
+	epp0	event+event.entry_idx
+	spri0	arg_list.second_arg_ptr
+
+	call	trace_entrypoints_$add_entrypoint(arg_list.header)
+
+	lxl2	event+event.entry_idx
+	tmi	POP_TRACE_FRAME_AND_RESUME
+
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	index_table
+
+	lprp2	pr2|te.data
+	tra	HAVE_TAB
+
+THIS_IS_A_SIGNAL:
+
+	szn	pr4|global_parameters+global_parms.meter
+	tnz	POP_TRACE_FRAME_AND_RESUME
+
+	szn	pr4|global_parameters+global_parms.signals
+	tze	POP_TRACE_FRAME_AND_RESUME		" Never trace signal_ as a procedure.
+
+
+TRACE_THIS_SIGNAL:
+	fill_event_for_trace_or_signal
+
+	call_trace_routine_or_buffer pr6,si
+
+	tra	POP_TRACE_FRAME_AND_RESUME		" Never trace signal_ as a procedure.
+
+HAVE_TAB:
+	ldaq	pr2|tab.version
+	cmpaq	TAB_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+" Save the old counts before we start modifying them.
+
+	ldaq	pr2|tab.cts
+	staq	event+event.saved
+	ldaq	pr2|tab.cts+2
+	staq	event+event.saved+2
+
+" Count this entry whether we trace it or not.
+
+	ldaq	pr2|tab.cts+counts.calls
+	adl	1,dl
+	staq	pr2|tab.cts+counts.calls
+
+" See if this entrypoint is traceable.
+
+	is_tracing_permitted	POP_TRACE_FRAME_AND_RESUME
+
+" Calculate the recursion level and maximum recursion level.
+
+	lda	pr2|tab.cts+counts.level
+	ada	1,dl
+	sta	pr2|tab.cts+counts.level
+	cmpa	pr2|tab.cts+counts.max_level
+	tmoz	*+2			" if tab.cts.level - tab.cts.max_level > 0
+	sta	pr2|tab.cts+counts.max_level	" then tab.cts.max_level = tab.cts.level;
+
+" Initialize some values used by the cleanup handler.
+
+	lls	72			" Initialize the meters.
+	staq	event+event.frame.real_time
+	staq	event+event.frame.vcpu_time
+	stz	event+event.frame.page_faults
+	staq	global_start.real_time
+	staq	global_start.vcpu_time
+	stz	global_start.page_faults
+
+" Turn on the full cleanup handler now.
+
+	epp0	TRACE_CATCH_CLEANUP
+	spri0	cleanup_unit+on_unit.body
+
+" Push this frame onto the stack of trace_catch_ frames.
+
+	aos	pr7|stack_header.trace_frames+trace_frames.count
+	sprp6	pr7|stack_header.trace_frames+trace_frames.top_ptr
+
+" If we are not just metering, call the procedure that prints the tracing message.
+
+	fill_event_for_trace_or_signal
+
+	trace_and_stop_if_necessary	pr6,ca
+
+" Start the global meters for this procedure if this is the first level of recursion.
+
+	start_global_metering_interval	pr6
+
+" Start the metering interval.
+
+	start_metering_interval	entry
+
+" Establish the return point, like the call operator would.
+
+	epp2	PROCEDURE_RETURN_POINT
+	spri2	pr6|stack_frame.return_ptr
+	sti	pr6|stack_frame.return_ptr+1
+
+" Restore registers.  Ptr_registers_saved pr4 and pr6 contain trace_catch_'s lp and sp.
+
+	lpri	ptr_registers_saved
+	lreg	registers_saved
+	ldi	indicators_saved
+	tra	RESUME_ENTRY_OPERATOR
+
+" Control comes here when the entry point cannot be traced.
+
+POP_TRACE_FRAME_AND_RESUME:
+	start_metering_interval	entry
+
+" Restore registers.  Ptr_registers_saved pr4 and pr6 contain trace_catch_'s lp and sp.
+
+	lpri	ptr_registers_saved
+	lreg	registers_saved
+	ldi	indicators_saved
+
+" Pop our stack frame.
+
+	spri6	pr7|stack_header.stack_end_ptr
+	epp6	pr6|stack_frame.prev_sp,*
+
+RESUME_ENTRY_OPERATOR:
+
+" Restore two words at stack end that were saved with the registers for the entry operator.
+
+	staq	pr7|stack_header.stack_end_ptr,*
+
+" Permit tracing again.
+
+	stz	pr7|stack_header.in_trace
+
+" We have postponed reading the clock until now for accurate metering.
+
+	read_the_calendar_clock	start
+
+" Resume the entry operator.
+
+	tra	pr2|0
+
+" Control comes to this label when the procedure being traced does a return.
+
+PROCEDURE_RETURN_POINT:
+
+" First priority is reading the clock for accurate metering.
+
+	epp4	pr6|stack_frame.lp_ptr,*
+	read_the_calendar_clock	stop
+
+" Save the cpu registers.
+
+	spri	ptr_registers_saved
+	sreg	registers_saved
+
+" Read the meters.
+
+	read_vcpu_time_and_page_faults	stop
+
+" Prevent recursion in case of calls or errors.  The A register is never zero at this point.
+
+	eaa	TRUE
+	sta	pr7|stack_header.in_trace
+
+" Make sure we are where we think we are.
+
+	sprp6	arg_list.header
+	lda	pr7|stack_header.trace_frames+trace_frames.top_ptr
+	cmpa	arg_list.header
+	tnz	trace_error_halt_$trace_error_halt_
+
+" Calculate the elapsed meters and store them in this frame.
+
+	metering_interval_calculations	pr6,return
+
+" Get the tab_ptr, if this entrypoint is still in the trace table.
+
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	event+event.entry_ptr		" Q reg contains the value we are looking for.
+
+	seek_table	EP_IS_IN_TT_AT_RETURN,POP_TRACE_FRAME_AND_RETURN
+
+EP_IS_IN_TT_AT_RETURN:
+	eaa	0,x2
+	ars	18
+	sta	event+event.entry_idx
+	lprp2	pr2|te.data
+	ldaq	pr2|tab.version
+	cmpaq	TAB_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+" If tracing is disabled, the operator pointers have been yanked.  Pretend we arn't here.
+
+	szn	pr4|global_parameters+global_parms.enabled
+	tze	POP_TAB_AND_RETURN
+
+" See if this entrypoint can still be traced.  The user could have turned it off while stopped.
+
+	is_tracing_permitted	POP_TAB_AND_RETURN
+
+" If we are not just metering, call the procedure that prints the tracing message.
+
+	trace_and_stop_if_necessary	pr6,re
+
+" Update the meters in the tab since this frame is about to be popped.
+
+	update_tab_meters	pr6
+
+POP_TAB_AND_RETURN:
+	pop_tab		pr6
+
+" Pop this trace_catch_ frame from the top of the stack of such frames.
+
+POP_TRACE_FRAME_AND_RETURN:
+	ldaq	trace_frames_saved
+	staq	pr7|stack_header.trace_frames
+
+" Start a metering interval, regardless of whether there is anything to meter.
+
+	start_metering_interval	return
+
+" If the end of the frame is not where it should be, because it has been
+" extended to hold the value of a returns (*) function, merge it with the
+" previous frame.
+
+	eax0	pr6|stack_frame_size
+	cmpx0	pr6|stack_frame.next_sp+1
+	tnz	MERGE_FRAMES
+
+
+" Restore registers.  Ptr_registers_saved pr4 and pr6 contain trace_catch_'s lp and sp.
+
+	lpri	ptr_registers_saved
+	lreg	registers_saved
+
+" Pop our stack frame.
+
+	spri6	pr7|stack_header.stack_end_ptr
+	epp6	pr6|stack_frame.prev_sp,*
+	tra	RETURN
+
+MERGE_FRAMES:
+
+" Restore registers.  Ptr_registers_saved pr4 and pr6 contain trace_catch_'s lp and sp.
+
+	lpri	ptr_registers_saved
+	lreg	registers_saved
+
+	ldaq	pr7|stack_header.stack_end_ptr " Remember where this frame ends.
+	epp6	pr6|stack_frame.prev_sp,*	" Drop back to frame we are returning to.
+	staq	pr6|stack_frame.next_sp	" Extend it to protect data in next frame.
+
+RETURN:
+	epbp7	pr6|0
+	epp0	pr6|stack_frame.operator_ptr,*
+	ldi	pr6|stack_frame.return_ptr+1
+
+" Permit tracing again.
+
+	stz	pr7|stack_header.in_trace
+
+" The read the clock as the last step for maximum accuracy.
+
+	read_the_calendar_clock	start
+
+	rtcd	pr6|stack_frame.return_ptr
+
+	inhibit	off		<-> <-> <-> <-> <-> <-> <-> <-> <-> <->
+
+" This preliminary cleanup handler just permits tracing again.
+
+PRELIMINARY_CLEANUP_HANDLER:
+
+	stz	pr7|stack_header.in_trace
+
+	short_return
+
+
+
+
+
+" This code is invoked during stack unwinding.  It calculates the meters for
+" the last interval, adds them to the tab and trace_catch_$metered, pops the
+" tab recursion level, pops the frame off the stack of trace_catch_ frames,
+" and resets stack_header.in_trace to permit tracing again.
+
+	entry	TRACE_CATCH_CLEANUP
+
+TRACE_CATCH_CLEANUP:
+
+	inhibit	on		<+> <+> <+> <+> <+> <+> <+> <+> <+> <+>
+
+	get_pr4
+
+" Read the calendar clock as soon as possible.
+
+	read_the_calendar_clock	stop
+
+" Do what getlp does.
+
+	epp5	pr7|stack_header.stack_end_ptr,* " PR5 -> stack frame construction site.
+	epp3	trace_catch_$TRACE_CATCH_CLEANUP " Let debuggers see a real entry point.
+	spri3	pr5|stack_frame.entry_ptr
+
+" Push.
+
+	spri6	pr5|stack_frame.prev_sp
+	spri0	pr5|stack_frame.arg_ptr
+	spri4	pr5|stack_frame.lp_ptr
+	epp6	pr5|0
+	epp5	pr6|stack_frame_size
+	spri5	pr7|stack_header.stack_end_ptr
+	spri5	pr6|stack_frame.next_sp
+
+" Read the meters.
+
+	read_vcpu_time_and_page_faults	stop
+
+" Prevent tracing of calls or errors during cleanup.
+
+	eaa	TRUE
+	sta	pr7|stack_header.in_trace
+
+" Put environment pointer from argument into pr5.
+
+	epp0	pr6|stack_frame.arg_ptr,*
+	lda	pr0|0
+	eaq	-1
+	cmk	8,dl		" If there in no environment pointer,
+	tnz	trace_error_halt_$trace_error_halt_ " we can't go further.
+	epp5	pr0|2,au*
+
+" Calculate the elapsed meters and store them in the frame being unwound.
+
+	metering_interval_calculations	pr5,entry
+
+" Get the tab_ptr, if this entrypoint is still in the trace table.
+
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	pr5|event+event.entry_ptr	" Q reg contains the value we are looking for.
+
+	seek_table	EP_IS_IN_TT_AT_UNWIND,POP_TRACE_FRAME_AT_UNWIND
+
+EP_IS_IN_TT_AT_UNWIND:
+	eaa	0,x2
+	ars	18
+	sta	pr5|event+event.entry_idx
+	lprp2	pr2|te.data
+	ldaq	pr2|tab.version
+	cmpaq	TAB_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+" If tracing is disabled, the operator pointers have been yanked.  Pretend we arn't here.
+
+	szn	pr4|global_parameters+global_parms.enabled
+	tze	POP_TAB_AT_UNWIND
+
+" See if this entrypoint can still be traced.  The user could have turned it off while stopped.
+
+	is_tracing_permitted	POP_TAB_AT_UNWIND
+
+" Call the procedure that prints the tracing message, if appropriate.
+
+	trace_and_stop_if_necessary	pr5,un
+
+" Move the meters to the tab.
+
+	update_tab_meters	pr5
+
+POP_TAB_AT_UNWIND:			" Restore the recursion level in the tab.
+	pop_tab		pr5
+
+POP_TRACE_FRAME_AT_UNWIND:
+	epp2	null_ptr,*		" For safety.
+
+" Pop this frame off the stack of trace_catch_ frames.
+
+	ldaq	pr5|trace_frames_saved
+	staq	pr7|stack_header.trace_frames
+
+" Permit tracing again.  We don't expect any errors from the few operations below.
+
+	stz	pr7|stack_header.in_trace
+
+" Start a metering interval, regardless of whether there is anything to meter.
+
+	start_metering_interval	return
+
+" Pop our stack frame.
+
+	spri6	pr7|stack_header.stack_end_ptr
+	epp6	pr6|stack_frame.prev_sp,*
+
+" Return.
+
+	epbp7	pr6|0
+	epp0	pr6|stack_frame.operator_ptr,*
+	ldi	pr6|stack_frame.return_ptr+1
+
+" The read the clock as the last step for maximum accuracy.
+
+	read_the_calendar_clock	start
+
+	rtcd	pr6|stack_frame.return_ptr
+
+	inhibit	off		<-> <-> <-> <-> <-> <-> <-> <-> <-> <->
+
+" This entrypoint disables the trace facility by yanking the trace operator
+" pointers from the stack header.  It then flushes the frame and global meters
+" from all the trace_catch_ frames on the stack.  It is
+" only called if trace is enabled at the beginning of the transaction.
+
+" dcl  trace_catch_$stop_tracing entry ();
+" call trace_catch_$stop_tracing ();
+
+	segdef	stop_tracing
+stop_tracing:
+	get_pr4
+
+" See if trace is disabled or effectively disabled.
+
+	szn	pr4|global_parameters+global_parms.enabled
+	tze	STOP_SHORT_RETURN
+	szn	pr4|global_parameters+global_parms.automatic
+	tnz	YANK_OP_PTRS
+	szn	pr4|global_parameters+global_parms.signals
+	tnz	YANK_OP_PTRS
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+	szn	pr1|table.count
+	tnz	YANK_OP_PTRS
+STOP_SHORT_RETURN:
+	short_return
+
+" Yank the pl1, ALM, and other language operator pointers from the stack header.
+
+YANK_OP_PTRS:
+	epp5	pl1_operators_$operator_table
+	spri5	pr7|stack_header.pl1_operators_ptr
+	epp5	operator_pointers_$operator_pointers_
+	spri5	pr7|stack_header.trans_op_tv_ptr
+	epp5	pl1_operators_$alm_entry
+	spri5	pr7|stack_header.entry_op_ptr
+
+	call6	trace_catch_$STOP_TRACING
+
+" Its nice to be able to act like a regular ALM program.
+
+	entry	STOP_TRACING
+STOP_TRACING:
+	push
+
+" Go down the stack of trace_catch_ frames and update the global meters.
+
+	lda	pr7|stack_header.trace_frames+trace_frames.count
+	lprp5	pr7|stack_header.trace_frames+trace_frames.top_ptr
+
+FLUSH_METERS_FROM_THIS_FRAME:
+	tze	ALL_FRAMES_FLUSHED
+	sba	1,dl
+	cmpa	pr5|trace_frames_saved+trace_frames.count
+	tnz	trace_error_halt_$trace_error_halt_
+
+" Get the tab_ptr, if this entrypoint is still in the trace table.
+
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	pr5|event+event.entry_ptr	" Q reg contains the value we are looking for.
+
+	seek_table	EP_IS_IN_TT_AT_STOP,FLUSH_NEXT_FRAME
+
+EP_IS_IN_TT_AT_STOP:
+	lprp2	pr2|te.data
+	ldaq	pr2|tab.version
+	cmpaq	TAB_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+" Add the meters to the tab and to trace_catch_$metered.
+
+	update_tab_meters	pr5
+
+FLUSH_NEXT_FRAME:
+	lda	pr5|trace_frames_saved+trace_frames.count
+	lprp5	pr5|trace_frames_saved+trace_frames.top_ptr
+	tra	FLUSH_METERS_FROM_THIS_FRAME
+
+ALL_FRAMES_FLUSHED:
+	return
+
+" This entrypoint is called at the end of a trace command transaction to plant
+" the operator pointers and restart global metering.  It is only called if
+" trace is enabled at the end of the transaction.  It plants the operators and
+" reads the meters into trace_catch_$start.
+
+" dcl  trace_catch_$start_tracing entry ();
+" call trace_catch_$start_tracing ();
+
+	entry	start_tracing
+start_tracing:
+	push
+
+" See if trace is disabled or effectively disabled.
+
+	szn	pr4|global_parameters+global_parms.enabled
+	tze	START_RETURN
+	szn	pr4|global_parameters+global_parms.automatic
+	tnz	RESTART_METERS
+	szn	pr4|global_parameters+global_parms.signals
+	tnz	RESTART_METERS
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+	szn	pr1|table.count
+	tze	START_RETURN
+
+" Go down the stack of trace_catch_ frames and restart the global meters.
+
+RESTART_METERS:
+	lda	pr7|stack_header.trace_frames+trace_frames.count
+	lprp5	pr7|stack_header.trace_frames+trace_frames.top_ptr
+
+START_METERS_IN_THIS_FRAME:
+	tze	ALL_FRAMES_STARTED
+	sba	1,dl
+	cmpa	pr5|trace_frames_saved+trace_frames.count
+	tnz	trace_error_halt_$trace_error_halt_
+
+" Get the tab_ptr, if this entrypoint is still in the trace table.
+
+	epp1	pr4|tt_ptr,*
+	ldaq	pr1|table.version
+	cmpaq	TT_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+	ldq	pr5|event+event.entry_ptr	" Q reg contains the value we are looking for.
+
+	seek_table	EP_IS_IN_TT_AT_START,START_NEXT_FRAME
+
+EP_IS_IN_TT_AT_START:
+	lprp2	pr2|te.data
+	ldaq	pr2|tab.version
+	cmpaq	TAB_VERSION_3
+	tnz	trace_error_halt_$trace_error_halt_
+
+" Reset the global meters for this procedure if this is the first level of recursion.
+
+	start_global_metering_interval	pr5
+
+START_NEXT_FRAME:
+	lda	pr5|trace_frames_saved+trace_frames.count
+	lprp5	pr5|trace_frames_saved+trace_frames.top_ptr
+	tra	START_METERS_IN_THIS_FRAME
+
+" Plant the pl1 and other language operator pointers in the stack header.
+
+ALL_FRAMES_STARTED:
+	epp5	pl1_operators_$trace_operator_table
+	spri5	pr7|stack_header.pl1_operators_ptr
+	epp5	trace_operator_pointers_$trace_operator_pointers_
+	spri5	pr7|stack_header.trans_op_tv_ptr
+
+" Plant the ALM operator only if alm is on.
+
+	szn	pr4|global_parameters+global_parms.alm
+	tze	*+3
+	epp5	pl1_operators_$trace_alm_entry
+	spri5	pr7|stack_header.entry_op_ptr
+
+START_RETURN:
+	return
+
+" CONSTANTS   CONSTANTS   CONSTANTS   CONSTANTS   CONSTANTS   CONSTANTS   CONSTANTS
+
+
+			even
+BUFFER_VERSION_3:		aci	/TraceBF3/,8
+
+			even
+EVENT_VERSION_3:		aci	/TEV3/,4
+
+			even
+TT_VERSION_3:		aci	/TraceTT3/,8
+
+			even
+TAB_VERSION_3:		aci	/TraceTB3/,8
+
+			even
+PARAMETERS_VERSION_3:	aci	/TraceTP3/,8
+
+			even
+GLOBAL_PARAMETERS_VERSION_3:	aci	/TraceGP3/,8
+
+			even
+UNUSUAL_SIGNAL_ARG_LIST:	aci	/Unusual signal_ arg list/,24
+
+			even
+zero_arg_list_header:	oct	000000000004,000000000000
+one_arg_list_header:	oct	000002000004,000000000000
+two_arg_list_header:	oct	000004000004,000000000000
+three_arg_list_header:	oct	000006000004,000000000000
+four_arg_list_header:	oct	000010000004,000000000000
+five_arg_list_header:	oct	000012000004,000000000000
+
+one_arg_list_header_w_env:	oct	000002000010,000000000000
+two_arg_list_header_w_env:	oct	000004000010,000000000000
+three_arg_list_header_w_env:	oct	000006000010,000000000000
+four_arg_list_header_w_env:	oct	000010000010,000000000000
+five_arg_list_header_w_env:	oct	000012000010,000000000000
+
+null_ptr:			oct	077777000043,000001000000
+ptr_mask:			oct	077777000077,777777077077
+
+double_precision_one:	dec	0,1
+
+vcpu_time_fuzz:		dec	0,16
+
+packed_null:		oct	007777000001
+
+" INTERNAL STATIC   INTERNAL STATIC   INTERNAL STATIC   INTERNAL STATIC   INTERNAL STATIC
+
+		use	static_section
+		join	/link/static_section
+
+TRANSACTION_BEGIN:		oct	007777000001
+TRANSACTION_BEGIN_FORCE:	oct	007777000001
+SIGNAL_:			oct	007777000001
+IO_SIGNAL:		oct	007777000001
+
+		even
+start:		dec	0,0,0,0,0
+start_comp:	dec	0		" UPPER HALF WORD
+		even
+stop:		dec	0,0,0,0,0
+		even
+delta:		dec	0,0,0,0,0
+
+		even
+		segdef	metered
+metered:		dec	0,1,0,1,1
+
+		even
+		segdef	removed
+removed:		dec	0,1,0,1,1
+
+		even
+		segdef	trace_storage_ptr
+trace_storage_ptr:	its	-1,1
+
+		even
+		segdef	tt_ptr
+tt_ptr:		its	-1,1
+
+		even
+		segdef	wt_ptr
+wt_ptr:		its	-1,1
+
+		segdef	parameters_ptr
+parameters_ptr:	oct	007777000001
+
+		even
+		segdef	global_parameters
+		bss	global_parameters,182
+
+" SYMBOLS  SYMBOLS  SYMBOLS  SYMBOLS  SYMBOLS  SYMBOLS  SYMBOLS  SYMBOLS
+
+	bool	TRUE,400000
+
+"
+"	Structure table
+"
+	equ	table.version,0		" DOUBLE
+	equ	table.max_count,2
+	equ	table.count,3
+
+	equ	table.idx,4		" LEVEL 2
+	equ	      idx.low,0
+	equ	      idx.high,1
+
+	equ	table.working_storage,6	" DOUBLE
+	equ	table.e,8			" DOUBLE
+
+"
+"	Structure te
+"
+	equ	te_size,2
+
+	equ	te,0			" DOUBLE
+	equ	te.key,0
+	equ	te.data,1
+
+"
+"	Structure tab
+"
+	equ	tab.version,0		" DOUBLE
+	equ	tab.reference_count,2
+	equ	tab.parms_ptr,3
+
+	equ	tab.cts,4			" like counts
+
+	equ	tab.local,8		" like meters
+
+	equ	tab.on,13
+
+	equ	tab.global,14		" like meters
+
+	equ	tab.translator_id,19
+	equ	tab.function,20
+
+"
+"	Structure event is a 16 word block that describes a trace event.
+"
+	equ	event_size,16
+
+	equ	event.version,0
+	equ	event.kind,1		" UPPER
+	equ	event.frame_count,1		" LOWER
+
+	equ	event.frame,2		" LEVEL 2
+	equ	event.frame.real_time,2		" DOUBLE
+	equ	event.frame.vcpu_time,4		" DOUBLE
+	equ	event.frame.page_faults,6
+
+	equ	event.entry_ptr,7
+	equ	event.saved,8		" LEVEL 2
+	equ	event.saved.calls,8		" DOUBLE
+	equ	event.saved.level,10
+	equ	event.saved.max_level,11
+
+	equ	event.entry_idx,12
+	equ	event.arg_list_ptr,13
+	equ	event.callers_sp,14
+	equ	event.return_ptr,15
+
+"
+"	Structure counts is passed to the trace and stop routines.
+"
+	equ	counts.calls,0		" DOUBLE
+	equ	counts.level,2
+	equ	counts.max_level,3
+
+"
+"	Structure buffer of trace events.
+"
+	equ	buffer.h,0		" LEVEL 2
+	equ	buffer.h.version,0		" DOUBLE
+	equ	buffer.h.not_used,2
+	equ	buffer.h.count,3
+	equ	buffer.e,4		" (0 : 8191) like event
+
+"
+"	Structure meters
+"
+	equ	meters.real_time,0		" DOUBLE
+	equ	meters.vcpu_time,2		" DOUBLE
+	equ	meters.page_faults,4
+
+"
+"	Structure parms
+"
+	equ	parms.version,0		" DOUBLE
+	equ	parms.reference_count,2
+	equ	parms.every,3
+	equ	parms.first,4
+	equ	parms.last,5
+	equ	parms.low,6
+	equ	parms.high,7
+
+	equ	parms.new_high,8
+	equ	parms.arguments,9
+	equ	parms.not_used1,10
+	equ	parms.stop_every,11
+	equ	parms.stop_low,12
+	equ	parms.stop,13
+	equ	parms.trace,14
+	equ	parms.call_ptr,15
+
+"
+"	Structure global_parms (182 words)
+"
+	equ	global_parms.version,0	" DOUBLE
+	equ	global_parms.alm,2
+	equ	global_parms.automatic,3
+	equ	global_parms.meter,4
+	equ	global_parms.signals,5
+	equ	global_parms.enabled,6
+	equ	global_parms.long,7
+
+	equ	global_parms.osw,8		" LEVEL 2
+	equ	global_parms.osw.iocb_ptr,8
+	equ	global_parms.osw.stream_name,10
+	equ	global_parms.osw.file_path,19
+
+	equ	global_parms.spp,84		" LEVEL 2
+	equ	global_parms.spp.entry_value,84
+	equ	global_parms.spp.entry_name,88
+
+	equ	global_parms.trace_routine,154
+	equ	global_parms.stop_routine,158
+
+	equ	global_parms.loud,162
+	equ	global_parms.calibrate,163
+	equ	global_parms.buffer_ptr,164
+	equ	global_parms.not_used,165
+
+	equ	global_parms.comps,166	" LEVEL 2
+
+	equ	from_entry,0
+	equ	from_return,8
+
+	equ	to_entry.real_time,0
+	equ	to_entry.vcpu_time,2
+	equ	to_return.real_time,4
+	equ	to_return.vcpu_time,6
+
+	include	stack_header
+
+	include	stack_frame
+
+	include	on_unit
+
+	end

@@ -1,0 +1,971 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* SCAS_INIT - Initialize the System Controller Addressing Segment.
+   7/24/69 - Noel I. Morris
+   Modified for follow-on 8/72 by C. L. Jensen & N. I. Morris
+   Modified 2/76 by Noel I. Morris for 4MW SCU and new reconfig
+   Modified 2/79 by Bernard S. Greenberg for port expanders/8 cpus.
+   Modified 6/79 by Mike Grady to improve mem/port config checks
+   Modified 12/79 by Mike Grady to fix bugs in above change
+   Modified 9/08/80 by J. A. Bush for the DPS8/70M CPU
+   Modified 01/04/81, W. Olin Sibert, to convert to new config cards and for
+   scs$scas_page_table.
+   Modified January 1981 by C. Hornig to enable ports.
+   Modified by J. Bongiovanni April 1981 for anti-hog switch setting
+   Modified April 1982 by J. Bongiovanni to check CPU data switches
+   Modified 7/82 BIM merge in the Sibert changes.
+   Modified 10/82 BIM to not set the mask instructions to rmcm/smcm
+   until AFTER setting the port enable bits.
+   Modified 8/83 K. Loepere for bootload Multics toehold
+   Modified 9/83 E. N. Kittlitz to not enable scu port for an OFF IOM.
+   Modified 4/84 K. Loepere to be less fussy when initializing for bce.
+   Modified 8/84 K. Loepere to keep cpu ports on bootload scu enabled 
+   after crash.
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-07-27,Farley), approve(88-10-05,MCR7968),
+     audit(88-10-10,Beattie), install(88-10-14,MR12.2-1166):
+     Added check for new rcerr_addscu_memoverlap error code.
+                                                   END HISTORY COMMENTS */
+
+%page;
+
+/* format: style4,delnl,insnl,tree,ifthenstmt,indnoniterend */
+scas_init:
+     procedure;
+
+dcl  (i, j) fixed bin,				/* iteration variables */
+     found bit (1) aligned,				/* useful indicator bit */
+     dps8 bit (1) aligned,				/*  dps8 indicaor used for checking mem tags */
+     n_cpus fixed bin,				/* count of CPU config cards */
+     n_mems fixed bin,				/* count of MEM config cards */
+     cport fixed bin (3),				/* port index of SCU port of CPU being configured */
+     masks_found (4) bit (1) unal,			/* used in interrupt cpu assignment */
+     exp_port fixed bin (2),				/* port expander subport index */
+     tag fixed bin (3),				/* tag from CPU or MEM card */
+     errtag fixed bin (3),				/* tag of CPU or mask in error */
+     enabled bit (1) aligned,				/* port enabled bit */
+     base fixed bin (17),				/* system controller base address */
+     size fixed bin (17),				/* system controller size */
+     interlace fixed bin (3),				/* memory interlace type */
+     expected_base fixed bin (17),			/* expected base by config deck */
+     code fixed bin (35),				/* error code */
+     cpu_low_port fixed bin,				/* low-order cpu port			*/
+     cpu_high_port fixed bin,				/* high-order cpu port			*/
+     cpu_ports bit (36) aligned,			/* mask for cpu ports			*/
+     iom_low_port fixed bin,				/* low-order iom port			*/
+     iom_high_port fixed bin,				/* high-order iom port			*/
+     iom_ports bit (36) aligned,			/* mask for iom ports			*/
+     toehold_abs fixed bin (24),			/* absolute address of toehold */
+     severity fixed bin;				/* for syserr calls (implies whether we try to fix up errors) */
+
+declare  1 sdwi aligned like sdw_info;
+declare  tsdw fixed bin (71);
+
+dcl  tag_letter (0:7) char (1) aligned static init ("A", "B", "C", "D", "E", "F", "G", "H");
+						/* for message */
+dcl  (
+     ALL_ONES bit (36) aligned init ("777777777777"b3),
+     MAX_CYCLE_GROUP fixed bin init (5),
+     XED_INHIB bit (18) init ("717200"b3)
+     ) int static options (constant);
+
+dcl  1 cdata like scs$controller_data based (cdp) aligned,	/* single element of array */
+     cdp ptr,					/* pointer to the above */
+     1 pdata like scs$processor_data based (pdp) aligned,	/* single element of array */
+     pdp ptr;					/* pointer to the above */
+
+dcl  scas$ ext,
+     toehold$ ext;
+
+dcl  privileged_mode_ut$swap_sdw entry (ptr, ptr),
+     absadr entry (ptr, fixed bin (35)) returns (fixed bin (24)),
+     init_scu entry (fixed bin (3), fixed bin (3), fixed bin (35)),
+     rsw_util$port_info entry (fixed bin (3), bit (1) aligned, fixed bin (17), fixed bin (17), fixed bin (3)),
+     rsw_util$set_rsw_mask entry (fixed bin (3), bit (1) aligned),
+     rsw_util$init_rsw_mask entry (fixed bin (3), bit (1) aligned),
+     scr_util$set_port_enable_bit entry (fixed bin (3), bit (1)),
+     scr_util$set_port_enable entry (fixed bin (3), bit (1)),
+     scr_util$set_cfg entry (fixed bin (3)),
+     sdw_util_$construct entry (ptr, ptr),
+     mask_instruction$smcm entry returns (bit (36) aligned),
+     mask_instruction$rmcm entry returns (bit (36) aligned),
+     config_$find entry (char (4) aligned, ptr),
+     syserr entry options (variable);
+
+dcl  (addr, binary, bin, bit, divide, hbound, null, rel, string, substr, unspec) builtin;
+%page;
+	if ((sys_info$collection_1_phase = EARLY_INITIALIZATION) | (sys_info$collection_1_phase = BOOT_INITIALIZATION)
+	     | (sys_info$collection_1_phase = SERVICE_INITIALIZATION))
+	then severity = CRASH;
+	else severity = ANNOUNCE;
+
+/* Initialize SCAS to contain 32 SDW's with DF3. */
+
+	unspec (scs$scas_page_table) = ""b;		/* Clear it out first */
+	do i = 0 to 31;				/* Go through the page table. */
+	     addr (scs$scas_page_table (i)) -> l68_ptw.df_no = "11"b;
+						/* DF3 */
+	end;					/* cause signalled crawlout on touching bad page */
+
+	unspec (sdwi) = ""b;			/* Construct the SCAS SDW */
+	sdwi.address = absadr (addr (scs$scas_page_table), code);
+	if code ^= 0 then call syserr (CRASH, "scas_init: Error from absadr setting up SCAS.");
+	sdwi.read = "1"b;				/* RW access */
+	sdwi.write = "1"b;
+	sdwi.paged = "1"b;				/* SCAS is a "paged" segment */
+	sdwi.size = 32 * 1024;			/* 32 pages */
+
+	call sdw_util_$construct (addr (tsdw), addr (sdwi));
+						/* Do it */
+
+	call privileged_mode_ut$swap_sdw (addr (scas$), addr (tsdw));
+						/* Pop it in */
+
+/* Require port enable bits for all unused processor ports to be set correctly. */
+
+	do tag = 0 to 7;
+	     call rsw_util$set_rsw_mask (tag, "1"b);
+	end;
+
+
+/* Fill in processor switch template info by copying rsw data read in scs_and_clock_init. */
+
+	scs$processor_switch_template = scs$processor_switch_data;
+
+/* Compute the proper value for the CPU data switches. Print a warning if
+   they're not set to this. */
+
+	toehold_abs = absadr (addr (toehold$), code);
+	scs$processor_data_switch_value = bit (bin (toehold_abs, 18), 18) || XED_INHIB;
+	if sys_info$collection_1_phase = EARLY_INITIALIZATION | sys_info$collection_1_phase = BOOT_INITIALIZATION
+	     | sys_info$collection_1_phase = SERVICE_INITIALIZATION
+	then if scs$processor_switch_data (0) ^= scs$processor_data_switch_value
+	     then call syserr (ANNOUNCE, "scas_init: CPU data switches are ^w, should be ^w",
+		     scs$processor_switch_data (0), scs$processor_data_switch_value);
+
+
+/* Set up for computation of cycle port template */
+
+	iom_low_port, cpu_low_port = 36;
+	iom_high_port, cpu_high_port = -1;
+	iom_ports, cpu_ports = "0"b;
+%page;
+/* Get info about each configured CPU. */
+
+	n_cpus = 0;				/* Initialize count of CPU's. */
+	found = "0"b;				/* Clear bootload CPU found indicator. */
+	dps8 = "0"b;				/* clear dps8 indicator flag */
+
+	do i = 0 to 7;				/* Mark all potential CPU's as halted. */
+	     scs$processor_data (i).halted_cpu = "1"b;
+	end;
+
+	cpu_cardp = null ();			/* Initialize config deck pointer. */
+cpu_loop:
+	call config_$find (CPU_CARD_WORD, cpu_cardp);	/* Look for CPU card. */
+	if cpu_cardp = null () then go to cpu_loop_end;	/* If null pointer, no more CPU cards. */
+	n_cpus = n_cpus + 1;			/* Count a CPU. */
+
+	tag = cpu_card.tag - 1;			/* Get expected CPU tag. */
+	if (tag < 0) | (tag > 7)
+	then					/* Make sure tag is legit. */
+	     call syserr (CRASH, "scas_init: Illegal tag on ^a config card.", CPU_CARD_WORD);
+
+	pdp = addr (scs$processor_data (tag));		/* Get pointer to data block for this CPU. */
+	if pdata.offline
+	then					/* If we already saw config card for this CPU ... */
+	     call syserr (CRASH, "scas_init: ^a ^a appears twice in config deck.", CPU_CARD_WORD, tag_letter (tag));
+
+	if tag = scs$bos_processor_tag then do;		/* If this is CPU running ... */
+	     found = "1"b;				/* Indicate bootload CPU found. */
+	     if cpu_card.state ^= "on  " then do;	/* Config card should not lie. */
+		call syserr (severity, "scas_init: Config card for bootload ^a ^a is ^a, must be on.", CPU_CARD_WORD,
+		     tag_letter (tag), cpu_card.state);
+		cpu_card.state = "on";		/* Try to fix */
+		end;
+	     rswp = addr (scs$processor_switch_data (2)); /* get ptr to rsw (2) data */
+	     if dps8_rsw_2.cpu_type > 0 then dps8 = "1"b; /* set flag for checking memories */
+	     end;
+	else if cpu_card.type = "dps8" then dps8 = "1"b;	/*  set switch for checking memory tags */
+
+	cport = cpu_card.port;			/* Get controller port. */
+
+	if cport < cpu_low_port then cpu_low_port = cport;
+	if cport > cpu_high_port then cpu_high_port = cport;
+
+	if cpu_card.expander_port ^= -1 then do;	/* Expander port */
+	     exp_port = cpu_card.expander_port - 1;	/* Get the subport #. */
+	     if (exp_port < 0 | exp_port > 3)
+	     then call syserr (CRASH, "scas_init: Illegal expander subport tag on CPU ^a config card.",
+		     tag_letter (tag));
+	     if tag = scs$bos_processor_tag
+	     then call syserr (CRASH, "scas_init: Bootload CPU may not be on an expander port.");
+	     do i = 0 to 7;				/* Search for duplication. */
+		if scs$processor_data (i).offline then do;
+						/* Already filled ? */
+		     if scs$processor_data (i).controller_port = cport then do;
+			if ^scs$expanded_ports (cport)
+			then call syserr (CRASH,
+				"scas_init: SCU port ^d configured as both expanded and non-expanded.", cport);
+			if scs$processor_data (i).expander_port = exp_port
+			then call syserr (CRASH,
+				"scas_init: CPU ^a and CPU ^a both configured for port ^d subport ^a.",
+				tag_letter (tag), tag_letter (i), cport, tag_letter (cport));
+			end;
+		     end;
+	     end;
+	     scs$cow (tag).expander_port = exp_port;	/*  Set necessary flags */
+	     scs$cow (tag).expanded_port = "1"b;
+	     scs$cow (tag).expander_command = "0"b3;	/* Set connect command */
+	     pdata.expanded_port = "1"b;
+	     scs$expanded_ports (cport) = "1"b;
+	     pdata.expander_port = exp_port;
+	     end;
+	else if scs$expanded_ports (cport)
+	     then call syserr (CRASH, "scas_init: SCU port ^d configured as both expanded and non-expanded port.",
+		     cport);
+	pdata.controller_port = cport;		/* Get it in the processor data. */
+	scs$cow (tag).controller_port = cport;
+	scs$cow_ptrs (tag).rel_cow_ptr = rel (addr (scs$cow (tag).cow));
+						/* Set up indexable ptrs. */
+	scs$cow_ptrs (tag).tag = "00"b3;		/* No indirection. */
+	pdata.offline = "1"b;			/* Set offline state. */
+
+	if sys_info$collection_1_phase = CRASH_INITIALIZATION
+						/* keep all on cpu's enabled on bootload scu */
+	then if cpu_card.state = "on  " then call scr_util$set_port_enable_bit (cport, "1"b);
+	go to cpu_loop;				/* Look for next CPU card. */
+
+cpu_loop_end:
+	if n_cpus < 1
+	then					/* Must be at least one card. */
+	     call syserr (CRASH, "scas_init: No ^a config card.", CPU_CARD_WORD);
+
+	if ^found then call syserr (CRASH, "scas_init: No config card for bootload ^a.", CPU_CARD_WORD);
+%page;
+/* Get info about each configured System Controller. */
+
+	n_mems = 0;				/* Initialize number of controllers. */
+	found = "0"b;				/* Initialize switch. */
+	expected_base = 0;				/* Count config deck size */
+
+	mem_cardp = null ();			/* Initialize config card pointer. */
+mem_loop:
+	call config_$find ("mem ", mem_cardp);		/* Look for a MEM card. */
+	if mem_cardp = null () then go to mem_loop_end;	/* Exit loop when no more MEM cards. */
+	n_mems = n_mems + 1;			/* Increment number of system controllers. */
+
+	tag = mem_card.tag - 1;			/* Get CPU port of controller. */
+	if (tag < 0) | (tag > 7)
+	then					/* Make sure tag is legitimate. */
+	     call syserr (CRASH, "scas_init: Illegal tag on ^a config card.", MEM_CARD_WORD);
+
+	if dps8
+	then					/* if  a dps8 cpu in config deck... */
+	     if tag > 3
+	     then call syserr (CRASH,			/* only  MEM tags A, B, C, and D are allowed */
+		     "scas_init: ^a ^a. Tags greater than ""D"" not supported by DPS8 CPUs", MEM_CARD_WORD,
+		     tag_letter (tag));
+
+	cdp = addr (scs$controller_data (tag));		/* Get pointer to correct element of array. */
+	if cdata.online | cdata.offline
+	then					/* See if controller already found. */
+	     call syserr (CRASH, "scas_init: ^a ^a appears twice in config deck.", MEM_CARD_WORD, tag_letter (tag));
+
+	if mem_card.state = "on  "
+	then					/* See if controller is online. */
+	     cdata.online = "1"b;			/* Controller is online. */
+	else if mem_card.state = "off "
+	     then					/* See if it's offline. */
+		cdata.offline = "1"b;		/* Indicate controller offline. */
+	     else					/* If neither on nor off ... */
+		call syserr (CRASH, "scas_init: Config card for ^a ^a is neither on nor off.", MEM_CARD_WORD,
+		     tag_letter (tag));
+
+	call rsw_util$port_info (tag, enabled, base, size, interlace);
+						/* Get info from processor switches. */
+
+	if base = 0 then do;			/* Test for low-order controller. */
+	     if found
+	     then					/* If more than one low-order system controller ... */
+		call syserr (CRASH, "scas_init: More than one low-order MEM.");
+	     else do;
+		found = "1"b;			/* Set the switch. */
+		if cdata.offline then do;		/* Must not be offline. */
+		     call syserr (severity, "scas_init: Config card for bootload ^a indicates unit is offline.",
+			MEM_CARD_WORD);
+		     mem_card.state = "on";
+		     cdata.offline = "0"b;		/* Try to fix */
+		     cdata.online = "1"b;
+		     end;
+		end;
+	     end;
+
+	if cdata.online & ^enabled then do;		/* If controller is online but not enabled ... */
+	     call syserr (severity, "scas_init: MEM ^a is not enabled.", tag_letter (tag));
+	     mem_card.state = "off";			/* Try to fix */
+	     cdata.online = "0"b;
+	     cdata.offline = "1"b;
+	     end;
+	call rsw_util$init_rsw_mask (tag, (cdata.online));/* Set mask for checking processor switches. */
+
+	cdata.size = size;				/* Set size of memory. */
+	cdata.base = base;				/* Set base of memory. */
+	if sys_info$collection_1_phase > SERVICE_INITIALIZATION
+	then scs$controller_config_size (tag) = 512;	/* Officially recognize only 512k during crash */
+	else scs$controller_config_size (tag) = mem_card.size;
+						/* Save for init_sst. */
+
+	if base < expected_base
+	then call syserr (CRASH, "scas_init: MEM ^a address assignment disagrees with config deck.", tag_letter (tag));
+	if mem_card.size > size
+	then					/* More specified than is possible */
+	     call syserr (CRASH, "scas_init: Size too large on config card for MEM ^a.", tag_letter (tag));
+
+	expected_base = base + size;			/* Set up for next controller */
+
+	cdata.ext_interlaced = (interlace ^= 0);	/* Indicate if memory is interlaced with another. */
+	cdata.four_word = (interlace = 4);		/* Indicate if two or four word interlace. */
+
+	if cdata.online then do;			/* If controller is available now ... */
+	     call init_scu (tag, errtag, code);		/* Initialize it. */
+	     if code ^= 0
+	     then					/* Check for error. */
+		if /* case */ code = rcerr_addscu_size
+		then call syserr (CRASH, "scas_init: MEM ^a has more memory than indicated by CPU switches.",
+			tag_letter (tag));
+		else if code = rcerr_addscu_dup_mask
+		then call syserr (CRASH, "scas_init: MEM ^a has duplicate mask assignments to CPU ^a.",
+			tag_letter (tag), tag_letter (errtag));
+		else if code = rcerr_addscu_no_mask
+		then call syserr (CRASH, "scas_init: MEM ^a has no mask assigned to CPU ^a.", tag_letter (tag),
+			tag_letter (errtag));
+		else if code = rcerr_addscu_bad_mask
+		then call syserr (CRASH, "scas_init: MEM ^a has mask ^a assigned to non-processor port.",
+			tag_letter (tag), tag_letter (errtag));
+		else if code = rcerr_addscu_manual
+		then call syserr (CRASH, "scas_init: MEM ^a is not in PROGRAM mode.", tag_letter (tag));
+		else if code = rcerr_addscu_oldexpand
+		then call syserr (CRASH, "scas_init: MEM ^a is an old SCU with port expander", tag_letter (tag));
+		else if code = rcerr_addscu_bigconfig
+		then				/* Config more than real mem, die */
+		     call syserr (CRASH, "scas_init: Size too large on config card for MEM ^a.", tag_letter (tag));
+		else if code = rcerr_addscu_memoverlap
+		then				/* Mem store size or switches wrong */
+		     call syserr (CRASH, "scas_init: Possible memory address overlap in MEM ^a.", tag_letter (tag));
+
+
+	     end;
+	if sys_info$collection_1_phase > SERVICE_INITIALIZATION then go to mem_loop_end;
+						/* only low 512k memory officially counts during crash */
+	go to mem_loop;				/* Iterate for next MEM card. */
+
+mem_loop_end:
+	if n_mems < 1
+	then					/* Must be at least one card. */
+	     call syserr (CRASH, "scas_init: No ^a config card.", MEM_CARD_WORD);
+
+	if ^found then call syserr (CRASH, "scas_init: No config card for bootload ^a.", MEM_CARD_WORD);
+%page;
+/* Check to make sure that bootload CPU port is correct. */
+
+	scrp = addr (scs$cfg_data (scs$interrupt_controller));
+						/* Get pointer to RSCR CFG data for bootload controller. */
+	if bin (scr_cfg1.port_no, 4) ^= scs$processor_data (scs$bos_processor_tag).controller_port
+	then call syserr (CRASH, "scas_init: CPU config card specifies wrong controller port number.");
+
+/* Make sure that no unconfigured port is enabled. */
+/* Unless we are in early initialization, when this is normal. */
+
+	if ^(sys_info$collection_1_phase = EARLY_INITIALIZATION | sys_info$collection_1_phase > SERVICE_INITIALIZATION)
+	then do tag = 0 to 7;			/* Test all ports. */
+	     if ^scs$controller_data (tag).offline & ^scs$controller_data (tag).online then do;
+		call rsw_util$port_info (tag, enabled, base, size, interlace);
+		if enabled
+		then				/* If unused port is enabled ... */
+		     call syserr (severity,
+			"scas_init: MEM ^a is not in the configuration, but is enabled by the CPU switches.",
+			tag_letter (tag));
+		end;
+	end;
+%page;
+/* enable all the IOM's */
+
+	iom_data_ptr = addr (iom_data$);
+	do tag = 0 to 7;
+	     if scs$port_data (tag).assigned = IOM_PORT then do;
+		if iom_data.per_iom (scs$port_data (tag).iom_number).flags.on_line
+		then				/* someday this will be an scs flag */
+		     call scr_util$set_port_enable_bit (tag, "1"b);
+		if tag < iom_low_port then iom_low_port = tag;
+		if tag > iom_high_port then iom_high_port = tag;
+		end;
+	end;
+
+/* and the BOS processor */
+
+	call scr_util$set_port_enable (binary (scs$processor_data (scs$bos_processor_tag).controller_port, 3), "1"b);
+
+%page;
+/* Determine which CPU's have assigned masks. */
+
+	cdp = addr (scs$controller_data (scs$interrupt_controller));
+						/* Get pointer to info for bootload controller. */
+
+	string (masks_found) = "0000"b;		/* Found no masks. */
+	do i = 0 to 7;				/* Look at all CPU's. */
+	     pdp = addr (scs$processor_data (i));	/* Get pointer to correct array element. */
+	     if pdata.offline then do;
+		do j = 1 to 4;			/* If CPU is to be used, look at masks. */
+		     if cdata.eima_data (j).mask_assigned & ^masks_found (j)
+		     then if cdata.eima_data (j).mask_assignment = pdata.controller_port then do;
+			     masks_found (j) = "1"b;
+			     pdata.interrupt_cpu = "1"b;
+			     scs$set_mask (i) = mask_instruction$smcm ();
+			     scs$read_mask (i) = mask_instruction$rmcm ();
+			     scs$mask_ptr (i) = addr (scs$port_addressing_word (scs$interrupt_controller));
+			     end;
+		end;
+		end;
+	end;
+
+
+/* Check to make sure that bootload CPU has mask assigned to it. */
+
+	if ^scs$processor_data (scs$bos_processor_tag).interrupt_cpu
+	then call syserr (CRASH, "scas_init: Bootload CPU has no system controller mask assigned.");
+%page;
+
+
+
+/* Setup to set cyclic port priority switches (anti-hog).  The strategy
+   is to put all IOMs on a cyclic priority group, all bulk stores on
+   a cyclic priority group, and all CPUs on a cyclic priority group.
+   This can only be done if the ranges of ports within each group
+   do not overlap.  The following checks for overlap.  */
+
+
+	substr (iom_ports, iom_low_port + 1, iom_high_port - iom_low_port + 1) =
+	     substr (ALL_ONES, 1, iom_high_port - iom_low_port + 1);
+	substr (cpu_ports, cpu_low_port + 1, cpu_high_port - cpu_low_port + 1) =
+	     substr (ALL_ONES, 1, cpu_high_port - cpu_low_port + 1);
+
+	if (iom_ports & cpu_ports) = ""b		/* no overlap				*/
+	then do;
+	     call set_cycle_group (iom_low_port, iom_high_port);
+	     call set_cycle_group (cpu_low_port, cpu_high_port);
+	     scs$set_cycle_switches = "1"b;
+	     do i = 0 to hbound (scs$controller_data, 1); /* set switches on all active SCUs		*/
+		if scs$controller_data (i).online then call scr_util$set_cfg (bin (i));
+	     end;
+	     end;
+	else do;					/* cannot set switches			*/
+	     scs$set_cycle_switches = "0"b;
+	     call syserr (ANNOUNCE,
+		"scs_init: CPU/IOM port range overlap. Using manual settings for cycle port priority.");
+	     end;
+
+	return;
+%page;
+/* SET_CYCLE_GROUP - internal procedure to setup cfg bits for a cycle (anti-hog)
+   group											*/
+
+set_cycle_group:
+     proc (low_port, high_port);
+
+dcl  low_port fixed bin;
+dcl  high_port fixed bin;
+
+dcl  middle_port fixed bin;
+
+
+	if high_port <= low_port then return;
+	if high_port - low_port > MAX_CYCLE_GROUP then do;/* too many for one group			*/
+	     middle_port = low_port + divide (high_port - low_port - 1, 2, 17);
+						/* split evenly, with larger group higher */
+	     call set_cycle_group (low_port, middle_port);
+	     call set_cycle_group (middle_port + 1, high_port);
+	     end;
+	else substr (scs$cycle_priority_template, low_port + 1, high_port - low_port) =
+		substr (ALL_ONES, 1, high_port - low_port);
+
+     end set_cycle_group;
+%page;
+%include collection_1_phases;
+%page;
+%include config_mem_card;
+%page;
+%include config_cpu_card;
+%page;
+%include iom_data;
+%page;
+dcl  ptp pointer;
+%include "ptw.l68";
+%page;
+%include rcerr;
+%page;
+%include rsw;
+%page;
+%include scr;
+%page;
+%include scs;
+%page;
+%include sdw_info;
+%page;
+%include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   scas_init: Illegal tag on CPU config card.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	One or more CPU cards is incorrect. Tag must be one of A, B, C, D, E, F, G, H.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: CPU X appears twice in config deck.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: Config card for bootload CPU indicates unit is offline.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: Config card for CPU X is neither on nor off.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: No CPU config card.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: No config card for bootload CPU.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: Illegal tag on MEM config card.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect. Tag must be one of A, B, C, D, E, F, G, H.
+
+   A:	Correct the the configuration deck and reboot.
+
+   Message:
+   "scas_init:  MEM Y. Tags greater than "D" not supported by DPS8 CPUs",
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The physical configuration or the configuration deck is incorrect. DPS8 CPUs
+   have only 4 memory ports, therefore Multics systems comprised of DPS8 cpus or
+   mixed systems of DPS, L68 and DPS8 cpus can only have 4 memories configured.
+   (i.e. Memory tags A, B, C, and D).
+
+   A:	Correct the physical configuration and/or the configuration deck and reboot.
+
+
+   Message:
+   scas_init: MEM Y appears twice in config deck.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: Config card for MEM Y is neither on nor off.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: More than one low-order MEM.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: Config card for bootload MEM indicates unit is offline.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: MEM X is not enabled.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The bootload CPU does not have MEM X enabled.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: Size too large on config card for MEM Y.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	Either the PORT SIZE plug on the free edge of the PQ board
+   of the bootload CPU does not agree with the configuration deck, or the
+   actual amount of memory present in MEM Y does not agree with the
+   config deck.
+
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: MEM Y has more memory than indicated by CPU switches.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The PORT SIZE plug on the free edge of the PQ board
+   of the bootload CPU does not agree with the STORE SIZE switch on MEM Y.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: MEM Y has duplicate mask assignments to CPU X.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The EXECUTE INTERRUPT MASK ASSIGNMENT
+   or MASK/PORT ASSIGNMENT on memory Y is incorrect.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: MEM Y has no mask assigned to CPU X.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The EXECUTE INTERRUPT MASK ASSIGNMENT
+   or MASK/PORT ASSIGNMENT on memory Y is incorrect.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: MEM Y address assignment disagrees with config deck.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The address assignment of memory Y, as read from the
+   address assignment switches on the maintenance panel of the bootload CPU,
+   disagrees with the address assignment
+   of this memory as indicated by the relative position of its MEM card in
+   the configuration deck.
+
+   A:	If the configuration deck is wrong, correct it and reboot. If the
+   configuration deck is correct, check all address assignment
+   switches on processors, IOMs, and the Bulk Store Controller, correct them,
+   reboot bce, and reboot.
+
+   Message:
+   scas_init: MEM Y has mask Z assigned to non-processor port.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The EXECUTE INTERRUPT MASK ASSIGNMENT
+   or MASK/PORT ASSIGNMENT on memory Y is incorrect.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: MEM Y is not in PROGRAM mode.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The MODE switch for memory Y is incorrect.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: No MEM config card.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: No config card for bootload MEM
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the the configuration deck and reboot.
+
+
+   Message:
+   scas_init: Possible memory address overlap in MEM Y.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	This indicates that the lower store size does not agree with
+   the actual memory available in the store unit.  A possible example
+   of this is when the lower store is actually in two store units
+   (A and A1) and the secondary unit (A1) is not enabled.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: CPU config card specifies wrong controller port number.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The configuration deck is incorrect.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: Bootload CPU has no system controller mask assigned.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	No memory assigns a mask register to the bootload CPU.
+
+   A:	Correct the configuration and reboot.
+
+
+   Message:
+   scas_init: MEM Y is not in the configuration, but is enabled by the CPU switches.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The bootload CPU enables memory Y.
+   But there is no MEM card for this memory.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+
+   Message:
+   scas_init: Illegal expander subport tag on CPU X config card.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	A CPU config card, for CPU X, specifies an illegal value
+   for a port-expander subport.  The only legal values for
+   expander subports are A, B, C, and D.
+
+   A:	Correct the config deck and reboot.
+
+
+   Message:
+   scas_init: Bootload CPU may not be on an expander port.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The CPU config card for the bootload CPU indicates
+   that the bootload CPU is on an expanded port.  This is not
+   permitted.
+
+   A:	Correct the configuration or the configuration deck, and reboot.
+
+   Message:
+   scas_init: SCU port P configured as both expanded and non-expanded.
+
+   S:	$crash
+
+   T:	$init
+
+   M:	CPU configuration cards imply that Port P on SCU's
+   (P is the port number, from 0 to 7) is both an expander port
+   (by being named as the CPU port in a CPU card with an
+   expander_port field), and not an expander port (by being named
+   in one that has none).
+
+   A:	Correct the configuratin deck and reboot.
+
+   Message:
+   scas_init: CPU X and CPU Y both configured for port P subport S
+
+   S:	$crash
+
+   T:	$init
+
+   M:	The CPU CONFIG cards for CPU's X and Y both indicate that
+   they are connected to subport S of expanded SCU port P.
+   This is clearly impossible.
+
+   A:	Correct the configuration deck and reboot.
+
+   Message:
+   scas_init: MEM X is an old SCU with port expander
+
+   S:	$crash
+
+   T:	$init
+
+   M:	System controller X is an old-style SCU, but configuration cards
+   indicate that it has at least one expanded port, because there is
+   a CPU on an expanded port in the system.  Old-style system controllers
+   may not have expanded ports.
+
+   A:	The configuration deck is in error. Fix it and reboot.
+
+   Message:
+   scs_init: CPU/IOM port range overlap. Using manual settings for cycle port priority.
+
+   S:     $info
+
+   T:	$init
+
+   M:	The cycle port priority on the SCUs cannot be set optimally because
+   the range of port numbers for CPUs and IOMs overlap.  The
+   manual settings of the cycle port priority switches on the SCUs will
+   be used instead.  The system may experience problems as a result, with
+   the typical symptom being op-not-complete faults at random times
+   by CPUs with higher port numbers (lower SCU port priority).
+
+   A:     Continue to operate the system normally, but consult with
+   Field Engineering personnel.  If possible, the system should be
+   reconfigured so that the range of port numbers of IOMs
+   and CPU do not overlap.  Further, CPU should be on higher-numbered
+   ports than IOMs and Bulk Stores.
+
+   Message:
+   scas_init: CPU data switches are XXXXXXXXXXXX, should be YYYYYYYYYYYY
+
+   S:     $info
+
+   T:	$init
+
+   M:	The CPU data switches are not set properly. The proper values are
+   displayed.
+
+   A:     The incorrect value will prevent returning to bce on that CPU
+   by means of EXECUTE SWITCHES. Certain incorrect values will activate
+   software debugging traps. The switches should be corrected. This
+   can be done while the CPU is running.
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end scas_init;

@@ -1,0 +1,401 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1986 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: ^inddcls,^indattr,indnoniterend,^indnoniterdo,indend,tree,^case,insnl,comcol61,dclind5,declareind5,delnl */
+
+/*DESCRIPTION
+  This set of entry points deletes either all the 1) domains, 2) attribute, or
+  3) relations, depending on which entry point it is entered at. */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-12-03,Spitzer), approve(85-12-03,MCR7311),
+     audit(86-09-15,Gilcrease), install(86-10-16,MR12.0-1187):
+     written
+  2) change(87-11-03,Blair), approve(87-11-03,MCR7792), audit(87-11-30,Dupuis),
+     install(87-12-07,MR12.2-1008):
+     Initialize mstxn_txn_id to 0 before establishing the cleanup handler so
+     that we don't get caught trying to abort a txn based on some bogus value.
+                                                   END HISTORY COMMENTS */
+
+rmdb_delete_all:
+     proc;
+
+	return;					/* not an entry point */
+
+/*DESCRIPTION
+  This entry point deletes all defined domains. This implies all existing
+  attributes and relations must be deleted. For speed, we don't update the
+  crossreference file (if it even exists) as we are doing the task, but delete
+  it as everything in it becomes invalid. */
+
+rmdb_delete_all$domains:
+     entry (Irmdb_ctl_ptr, Oerror_message, Ocode);
+
+	entry_point = DOMAINS;
+	goto COMMON;
+
+rmdb_delete_all$attributes:
+     entry (Irmdb_ctl_ptr, Oerror_message, Ocode);
+
+	entry_point = ATTRIBUTES;
+	goto COMMON;
+
+rmdb_delete_all$relations:
+     entry (Irmdb_ctl_ptr, Oerror_message, Ocode);
+
+	entry_point = RELATIONS;
+	goto COMMON;
+
+COMMON:
+	rmdb_ctl_ptr = Irmdb_ctl_ptr;
+	dbm_ptr = rmdb_ctl.db_model_ptr;
+
+	call transaction_in_progress;
+	mstxn_txn_id = "0"b;
+
+	quit_occurred = "0"b;			/* BEGIN CRITICAL CODE */
+
+	on quit quit_occurred = "1"b;
+
+/* Invalidate the resultant. */
+	rmdb_ctl.saved_res_version_ptr -> based_char8 = "RESTRUCT";
+
+	call mdbm_util_$xref_destroy (rmdb_ctl.crossref_file_info.iocb_ptr, rmdb_ctl.temp_dir_path,
+	     rmdb_ctl.crossref_file_info.name, (""), (0));
+
+	temp_ptr = null;
+	on cleanup
+	     begin;
+		call mstxn_cleanup;
+		call cleaner;
+	     end;
+	on any_other call mstxn_any_other;
+
+	if mstxn_transactions_needed
+	then do;
+%include mrds_start_transaction;
+	     if mstxn_code ^= 0
+	     then call error (mstxn_code, "Could not start a transaction.");
+	     end;
+
+	if entry_point = DOMAINS
+	then call delete_domains;
+
+/* Note that we don't have to expressly delete all the attributes if we entered
+   through the $attributes entry point. This is because all mention of
+   referenced attributes is in the model files, and we will later delete the
+   unreferenced attributes. */
+	call delete_relations;
+
+	if mstxn_transactions_needed
+	then do;
+	     mftxn_code = 0;
+%include mrds_finish_transaction;
+	     end;
+
+	if (entry_point = DOMAINS) | (entry_point = ATTRIBUTES)
+	then call delete_unreferenced_attributes;
+
+	if entry_point = DOMAINS
+	then call rmdb_add_rmdb_history (dbm_ptr, RMDB_DOMAIN_TYPE,
+	          "-all", RMDB_DEL_DMN_OP, "", error_message, (0));
+	else if entry_point = ATTRIBUTES
+	     then call rmdb_add_rmdb_history (dbm_ptr, RMDB_ATTR_TYPE,
+		     "-all", RMDB_DEL_ATTR_OP, "", error_message, (0));
+	     else call rmdb_add_rmdb_history (dbm_ptr, RMDB_REL_TYPE,
+		     "-all", RMDB_DEL_REL_OP, "", error_message, (0));
+
+	call mdbm_util_$inconsistent_reset (dbm_ptr);
+
+	revert quit;				/* END CRITICAL CODE */
+	if quit_occurred
+	then signal quit;
+
+	call error (0, "");
+%page;
+delete_relations:
+     proc;
+
+dcl  last_unreferenced_attribute_ptr ptr;
+dcl  model_name char (32);
+dcl  relation_name char (32);
+
+	local_iocb = rmdb_ctl.crossref_file_info.iocb_ptr;
+
+	if entry_point = RELATIONS
+	then do;
+	     call mdbm_util_$get_temp_segment_path (rmdb_ctl.temp_dir_path, myname, temp_ptr, code);
+	     if code ^= 0
+	     then call error (code, "Unable to get a temp segment.");
+
+	     attribute_list_ptr = temp_ptr;
+	     attribute_list.count = 0;
+
+/* Find the last unreferenced_attribute structure so we can add on the end. */
+	     last_unreferenced_attribute_ptr = null;
+	     do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+		repeat ptr (dbm_ptr, unreferenced_attribute.fwd_thread) while (rel (ua_ptr) ^= NULL_OFFSET);
+
+		last_unreferenced_attribute_ptr = ua_ptr;
+		end;				/* do ua_ptr */
+
+	     end;
+
+/* Process all the relations. */
+	do fi_ptr = ptr (dbm_ptr, db_model.file_ptr) repeat ptr (dbm_ptr, db_model.file_ptr)
+	     while (rel (fi_ptr) ^= NULL_OFFSET);
+
+	     relation_name = file_info.file_name;
+	     model_name = rtrim (relation_name) || ".m";
+
+/* If we are deleting all the relations, we must make all attributes be
+   unreferenced. */
+	     if entry_point = RELATIONS
+	     then do;
+
+/* Initiate the file_model segment so we can get to the list of attributes used
+   within this relation. We don't need to terminate the file_model as
+   we are shortly going to delete it. */
+		call initiate_file_ (rmdb_ctl.absolute_db_path, model_name, R_ACCESS, fm_ptr, (0), code);
+		if fm_ptr ^= null
+		then do;
+
+/* Process all the attributes in this relation. */
+		     ri_ptr = ptr (dbm_ptr, rel_ptr);
+		     do ai_ptr = ptr (fm_ptr, rel_info.attr_ptr) repeat ptr (fm_ptr, attr_info.fwd_thread)
+			while (rel (ai_ptr) ^= NULL_OFFSET);
+
+			call make_attribute_unreferenced;
+			end;			/* do ai_ptr */
+		     end;				/* initiated the file_model */
+		end;
+
+/* Delete the file_model segment and the relation file. */
+	     call delete_$path (rmdb_ctl.absolute_db_path, model_name, "101111"b, myname, (0));
+	     call rmdb_ctl.relmgr_entries.delete_relation (rmdb_ctl.absolute_db_path, relation_name, (0));
+
+	     db_model.file_ptr = file_info.fwd_ptr;
+	     call free (dbm_ptr, rel (fi_ptr));
+
+	     end;					/* do fi_ptr */
+
+/* If we are deleting all the attributes, we must make all domains be unreferenced. */
+	if entry_point = ATTRIBUTES
+	then do di_ptr = ptr (dbm_ptr, db_model.domain_ptr) repeat ptr (dbm_ptr, domain_info.fwd_thread)
+		while (rel (di_ptr) ^= NULL_OFFSET);
+
+		domain_info.unreferenced = "1"b;
+		end;				/* do di_ptr */
+
+/* Mark in the db_model that there aren't any type of files or relations left. */
+	db_model.num_blk_files, db_model.num_unblk_files, db_model.num_rels = 0;
+	return;
+
+make_attribute_unreferenced:
+     proc;
+
+dcl  position fixed bin;
+dcl  search_name char (33);
+
+	search_name = OBJECT_HEAD || attr_info.name;
+	position = index (attribute_list_names, search_name);
+	if position = 0
+	then do;					/* not in list yet */
+	     attribute_list.count = attribute_list.count + 1;
+	     attribute_list.name (attribute_list.count) = search_name;
+
+	     allocate unreferenced_attribute in (dbm_area) set (ua_ptr);
+	     unreferenced_attribute.name = attr_info.name;
+	     unreferenced_attribute.domain_ptr = attr_info.domain_ptr;
+	     unreferenced_attribute.fwd_thread = NULL_OFFSET;
+	     unreferenced_attribute.unused (*) = NULL_OFFSET;
+
+	     if last_unreferenced_attribute_ptr = null
+	     then db_model.unreferenced_attribute_ptr = rel (ua_ptr);
+	     else last_unreferenced_attribute_ptr -> unreferenced_attribute.fwd_thread = rel (ua_ptr);
+	     last_unreferenced_attribute_ptr = ua_ptr;
+
+	     end;
+
+	return;
+     end make_attribute_unreferenced;
+
+     end delete_relations;
+%page;
+delete_domains:
+     proc;
+
+	do di_ptr = ptr (dbm_ptr, db_model.domain_ptr) repeat ptr (dbm_ptr, db_model.domain_ptr)
+	     while (rel (di_ptr) ^= NULL_OFFSET);
+
+	     db_model.domain_ptr = domain_info.fwd_thread;
+
+	     call free (dbm_ptr, domain_info.check_path_ptr);
+	     call free (dbm_ptr, domain_info.ck_stack_ptr);
+	     call free (dbm_ptr, domain_info.encd_path_ptr);
+	     call free (dbm_ptr, domain_info.decd_path_ptr);
+	     call free (dbm_ptr, domain_info.str_before_path_ptr);
+	     call free (dbm_ptr, domain_info.str_err_path_ptr);
+	     call free (dbm_ptr, domain_info.str_after_path_ptr);
+	     call free (dbm_ptr, domain_info.get_before_path_ptr);
+	     call free (dbm_ptr, domain_info.get_err_path_ptr);
+	     call free (dbm_ptr, domain_info.get_after_path_ptr);
+	     call free (dbm_ptr, domain_info.mod_before_path_ptr);
+	     call free (dbm_ptr, domain_info.mod_err_path_ptr);
+	     call free (dbm_ptr, domain_info.mod_after_path_ptr);
+	     call free (dbm_ptr, rel (di_ptr));
+	     end;					/* do while */
+
+	db_model.num_domains = 0;
+
+	return;
+     end delete_domains;
+%page;
+delete_unreferenced_attributes:
+     proc;
+
+	do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+	     repeat ptr (dbm_ptr, db_model.unreferenced_attribute_ptr) while (rel (ua_ptr) ^= NULL_OFFSET);
+
+	     db_model.unreferenced_attribute_ptr = unreferenced_attribute.fwd_thread;
+	     call free (dbm_ptr, rel (ua_ptr));
+	     end;					/* do while */
+
+	return;
+     end delete_unreferenced_attributes;
+%page;
+transaction_in_progress:
+     proc;
+
+	if db_model.db_type_flags.transactions_needed
+	then do;
+	     mstxn_transactions_needed = "1"b;
+	     call transaction_manager_$get_current_txn_id (mstxn_txn_id, mstxn_code);
+	     if mstxn_code = 0
+	     then do;
+		mstxn_txn_id = "0"b;
+		call error (error_table_$action_not_performed,
+		     rtrim (ENTRY_POINT_NAMES (entry_point)) ||
+		     " may not be deleted while a transaction is in progress. Commit or abort the transaction and try again.");
+		end;
+	     end;
+	else mstxn_transactions_needed = "0"b;
+
+	if entry_point = DOMAINS
+	then call mdbm_util_$inconsistent_set (dbm_ptr, "delete_domain", "Deleting all domains.",
+		"delete_domain -all -brief");
+	else if entry_point = ATTRIBUTES
+	     then call mdbm_util_$inconsistent_set (dbm_ptr, "delete_attribute", "Deleting all attributes.",
+		     "delete_attribute -all -brief");
+	     else call mdbm_util_$inconsistent_set (dbm_ptr, "delete_relation", "Deleting all relations.",
+		     "delete_relation -all -brief");
+
+	return;
+     end transaction_in_progress;
+%page;
+free:
+     proc (base_ptr, offset);
+
+dcl  base_ptr ptr parameter;				/* base of segment */
+dcl  based_variable fixed bin (35) based;		/* used just to free structures */
+dcl  freeing_ptr ptr;				/* -> structure to free */
+dcl  offset bit (18) unaligned parameter;		/* offset to base_ptr of structure */
+
+	if offset ^= NULL_OFFSET
+	then do;
+	     freeing_ptr = ptr (base_ptr, offset);
+	     free freeing_ptr -> based_variable;
+	     offset = NULL_OFFSET;
+	     end;
+	return;
+     end free;
+%page;
+/*DESCRIPTION
+  Error handler and cleanup handler. This is the only way to exit these
+  subroutines.
+*/
+
+error:
+     proc (code, msg);
+
+dcl  code fixed bin (35) parameter;
+dcl  msg char (*) parameter;
+
+	Ocode = code;
+	Oerror_message = msg;
+	goto RETURN_TO_CALLER;
+     end error;
+
+RETURN_TO_CALLER:
+	call cleaner;
+	return;
+
+cleaner:
+     proc;
+
+	if temp_ptr ^= null
+	then call mdbm_util_$free_temp_segment (myname, temp_ptr, (0));
+
+	return;
+     end cleaner;
+
+restore_significant_data:
+     proc;
+	return;
+     end restore_significant_data;
+
+should_rollback:
+     proc returns (bit (1) aligned);
+	return ("0"b);
+     end should_rollback;
+%page;
+%include access_mode_values;
+%include mrds_rmdb_ctl;
+%include mdbm_db_model;
+%include mdbm_file_model;
+%include rmdb_crossref_info;
+%include rmdb_history_entry;
+%page;
+dcl  addr builtin;
+dcl  any_other condition;
+dcl  ATTRIBUTES fixed bin int static options (constant) init (2);
+dcl  based_char8 char (8) based;
+dcl  cleanup condition;
+dcl  code fixed bin (35);
+dcl  delete_$path entry (char (*), char (*), bit (36) aligned, char (*), fixed bin (35));
+dcl  DOMAINS fixed bin int static options (constant) init (1);
+dcl  entry_point fixed bin;
+dcl  ENTRY_POINT_NAMES (3) char (32) int static options (constant) init ("Domains", "Attributes", "Relations");
+dcl  error_message char (500);
+dcl  error_table_$action_not_performed fixed bin (35) ext static;
+dcl  fixed builtin;
+dcl  index builtin;
+dcl  initiate_file_ entry (char (*), char (*), bit (*), ptr, fixed bin (24), fixed bin (35));
+dcl  Irmdb_ctl_ptr ptr parameter;
+dcl  local_iocb ptr;
+dcl  mdbm_util_$free_temp_segment entry (char (*), ptr, fixed bin (35));
+dcl  mdbm_util_$get_temp_segment_path entry (char (*), char (*), ptr, fixed bin (35));
+dcl  mdbm_util_$inconsistent_reset entry (ptr);
+dcl  mdbm_util_$inconsistent_set entry (ptr, char (*), char (*), char (*));
+dcl  mdbm_util_$xref_destroy entry (ptr, char(*), char(*), char(*), fixed bin(35));
+dcl  myname char (32) int static options (constant) init ("rmdb_delete_all");
+dcl  null builtin;
+dcl  NULL_OFFSET bit (18) unaligned int static options (constant) init ((18)"1"b);
+dcl  Ocode fixed bin (35) parameter;
+dcl  Oerror_message char (*) parameter;
+dcl  ptr builtin;
+dcl  quit condition;
+dcl  quit_occurred bit (1) aligned;
+dcl  rel builtin;
+dcl  RELATIONS fixed bin int static options (constant) init (3);
+dcl  rmdb_add_rmdb_history entry (ptr, fixed bin, char(32), fixed bin, char(32), char(500), fixed bin(35));
+dcl  rtrim builtin;
+dcl  sys_info$max_seg_size fixed bin (35) ext static;
+dcl  temp_ptr ptr;
+
+     end rmdb_delete_all;

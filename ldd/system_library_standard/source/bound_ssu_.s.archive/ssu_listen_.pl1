@@ -1,0 +1,250 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+
+/* format: off */
+
+/* Default subsystem listener: reads request lines from the requested I/O switch and executes them via a call to
+   ssu_$execute_line */
+
+/* Created:  3 May 1980 by W. Olin Sibert from the old system_listen_ */
+/* Modified: 8 May 1980 by W. Olin Sibert to handle error_table_$long_record */
+/* Modified: 2 November 1981 by W. Olin Sibert to not prompt if input is pending and to prompt after a blank line, error
+      sequence (ssu 4) */
+/* Modified: 15 February 1982 by G. Palter to support new prompt modes, recognize ssu_et_$null_request_line, reject use
+      from within standalone invocations, reflect the reorganization of the sci structure, and correct a bug where prompts
+      would forever be turned off */
+/* Modified: June 1982 by G. Palter to not trap calls to ssu_$abort_line as it is now always handled by
+      ssu_$execute_line (ssu 12) and to properly handle all return codes from ssu_$execute_line */
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+
+ssu_listen_:
+     procedure ();
+
+	return;					/* not an entrypoint */
+
+
+/* Parameters */
+
+dcl  P_sci_ptr pointer parameter;
+dcl  P_iocb_ptr pointer parameter;			/* -> I/O switch from which input is read */
+dcl  P_code fixed binary (35) parameter;
+
+
+/* Local copies of parameters */
+
+dcl  iocb_ptr pointer;
+dcl  code fixed binary (35);
+
+
+/* Remaining declarations */
+
+dcl  1 saved_listener_info aligned like sci.listener_info;
+dcl  (saved_in_listener, saved_executing_request) bit (1) aligned;
+
+dcl  request_line character (request_line_lth) based (request_line_ptr);
+dcl  request_line_lth fixed binary (21);
+dcl  request_line_ptr pointer;
+
+dcl  line_buffer character (line_buffer_lth) based (line_buffer_ptr);
+dcl  line_buffer_lth fixed binary (21);
+dcl  line_buffer_ptr pointer;
+
+dcl  automatic_line_buffer character (4096);
+
+dcl  new_ptr pointer;
+dcl  new_read_ptr pointer;
+dcl  new_read_lth fixed binary (21);
+
+dcl  last_line_blank bit (1) aligned;
+dcl  (print_prompt, force_prompt, last_prompt_suppressed_by_typeahead) bit (1) aligned;
+dcl  suppress_ready bit (1) aligned;
+
+dcl  1 read_status_info aligned like tty_read_status_info automatic;
+
+dcl  iox_$user_input pointer external;
+dcl  iox_$user_output pointer external;
+
+dcl  sys_info$max_seg_size fixed binary (19) external;
+
+/* format: off */
+dcl (error_table_$long_record, ssu_et_$not_in_standalone_invocation, ssu_et_$null_request_line,
+     ssu_et_$request_line_aborted, ssu_et_$subsystem_aborted)
+	fixed binary (35) external;
+/* format: on */
+
+dcl  ioa_$nnl entry () options (variable);
+dcl  iox_$control entry (pointer, character (*), pointer, fixed binary (35));
+dcl  iox_$get_line entry (pointer, pointer, fixed binary (21), fixed binary (21), fixed binary (35));
+dcl  ssu_$abort_subsystem entry () options (variable);
+dcl  ssu_$execute_line entry (pointer, pointer, fixed binary (21), fixed binary (35));
+dcl  ssu_$get_temp_segment entry (pointer, character (*), pointer);
+dcl  ssu_$release_temp_segment entry (pointer, pointer);
+
+dcl  (program_interrupt, cleanup) condition;
+
+dcl  (addr, maxlength, null, substr) builtin;
+
+/**/
+
+/* The Listener */
+
+listen:
+     entry (P_sci_ptr, P_iocb_ptr, P_code);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+
+	if sci.standalone_invocation then do;		/*  commands simulating subsystems have no request loops */
+	     P_code = ssu_et_$not_in_standalone_invocation;
+	     return;
+	end;
+
+	if P_iocb_ptr = null () then			/* default I/O switch is user_input */
+	     iocb_ptr = iox_$user_input;
+	else iocb_ptr = P_iocb_ptr;
+
+	saved_listener_info = sci.listener_info;	/* allow recursive listener loops */
+	saved_in_listener = sci.in_listener;
+	saved_executing_request = sci.executing_request;
+
+	sci.listener_info.abort_subsystem_label = RETURN_FROM_LISTENER;
+
+	on condition (cleanup)
+	     begin;
+		if sci.listener_info.temp_seg_ptr ^= null () then
+		     call ssu_$release_temp_segment (sci_ptr, sci.listener_info.temp_seg_ptr);
+		sci.listener_info = saved_listener_info;
+		sci.in_listener = saved_in_listener;
+		sci.executing_request = saved_executing_request;
+	     end;
+
+	sci.in_listener = "1"b;			/* the listener is running */
+
+	line_buffer_ptr = addr (automatic_line_buffer);	/* start out with a "small" buffer */
+	line_buffer_lth = maxlength (automatic_line_buffer);
+
+	on condition (program_interrupt)
+	     begin;
+		call sci.entries.program_interrupt (sci_ptr);
+						/* call the program_interrupt procedure */
+		suppress_ready = "1"b;		/* no ready message, please */
+		force_prompt = "1"b;		/* prompt if enabled */
+		go to READ_REQUEST_LINE;
+	     end;
+
+
+/* The Listener Loop: only exit is via a call to ssu_$abort_subsystem */
+
+	suppress_ready = "1"b;			/* no ready message first time through */
+	force_prompt = "1"b;			/* print a prompt if enabled */
+	last_line_blank, last_prompt_suppressed_by_typeahead = "0"b;
+
+	code = 0;					/* make us do something initially */
+
+	do while (code ^= ssu_et_$subsystem_aborted);
+
+READ_REQUEST_LINE:
+	     if suppress_ready then			/* no ready message this time through */
+		suppress_ready = "0"b;
+	     else if sci.ready_enabled & ^last_line_blank then call sci.entries.ready (sci_ptr);
+						/* otherwise, only give ready message after non-blank lines */
+
+	     call sci.entries.pre_request_line (sci_ptr);
+
+	     if sci.dont_prompt then			/* never, ever prompt */
+		print_prompt = "0"b;
+	     else if force_prompt then do;		/* unconditonally prompt */
+		print_prompt = "1"b;
+		force_prompt = "0"b;
+	     end;
+	     else if last_line_blank then		/* previous line was null ... */
+		if sci.prompt_after_null_lines | last_prompt_suppressed_by_typeahead then
+		     print_prompt = "1"b;		/* ... but that shouldn't stop a prompt here */
+		else print_prompt = "0"b;		/* ... and no reason to prompt after it */
+	     else if sci.dont_prompt_if_typeahead then do;/* don't prompt if user already typed a request line */
+		call iox_$control (iocb_ptr, "read_status", addr (read_status_info), code);
+		if code = 0 then
+		     if read_status_info.input_pending then do;
+			print_prompt = "0"b;	/* ... something's waiting */
+			last_prompt_suppressed_by_typeahead = "1"b;
+		     end;				/* ... overrides blank line check */
+		     else print_prompt = "1"b;	/* ... no typeahead */
+		else print_prompt = "1"b;		/* ... can't check: assume prompt is OK */
+	     end;
+	     else print_prompt = "1"b;		/* go ahead and prompt */
+
+	     if print_prompt then do;
+		call iox_$control (iox_$user_output, "reset_more", (null ()), (0));
+		call ioa_$nnl (sci.prompt, (sci.recursion_info.level ^= 1), sci.recursion_info.level);
+		last_prompt_suppressed_by_typeahead = "0"b;
+	     end;
+
+	     request_line_ptr = line_buffer_ptr;	/* this is where the request ends up, of course */
+	     last_line_blank = "0"b;			/* leave it off until we *** successfully *** execute */
+
+	     call iox_$get_line (iocb_ptr, addr (line_buffer), maxlength (line_buffer), request_line_lth, code);
+
+	     if code = error_table_$long_record then do;	/* switch to big buffer, and finish reading */
+		if sci.listener_info.temp_seg_ptr ^= null () then
+		     call ssu_$abort_subsystem (sci_ptr, code, "Listener already using large buffer.");
+		call ssu_$get_temp_segment (sci_ptr, "listener", sci.listener_info.temp_seg_ptr);
+		new_ptr = sci.listener_info.temp_seg_ptr;
+						/* prepare to move what's already been read */
+		new_read_ptr = addr (substr (new_ptr -> line_buffer, (request_line_lth + 1), 1));
+						/* addr of next char in buffer */
+		substr (new_ptr -> line_buffer, 1, request_line_lth) = substr (line_buffer, 1, request_line_lth);
+						/* copy the existing data */
+		line_buffer_ptr = new_ptr;		/* now, update the line buffer info */
+		line_buffer_lth = 4 * sys_info$max_seg_size;
+		call iox_$get_line (iocb_ptr, new_read_ptr, (line_buffer_lth - request_line_lth), new_read_lth, code);
+		if code ^= 0 then			/* goodness */
+		     call ssu_$abort_subsystem (sci_ptr, code, "Reading first large request line.");
+		request_line_ptr = line_buffer_ptr;
+		request_line_lth = request_line_lth + new_read_lth;
+	     end;
+
+	     else if code ^= 0 then			/* any other error is probably serious */
+		call ssu_$abort_subsystem (sci_ptr, code, "Reading line from ^a", iocb_ptr -> iocb.name);
+
+	     call ssu_$execute_line (sci_ptr, request_line_ptr, request_line_lth, code);
+
+	     last_line_blank = (code = ssu_et_$null_request_line);
+						/* to control the prompt */
+
+	     if (code ^= ssu_et_$subsystem_aborted) & (code ^= ssu_et_$request_line_aborted) then
+		call sci.entries.post_request_line (sci_ptr);
+	end;					/* only call user after successfully executed lines */
+
+
+/* Come here after a call to ssu_$abort_subsystem */
+
+RETURN_FROM_LISTENER:
+	if sci.listener_info.temp_seg_ptr ^= null () then
+	     call ssu_$release_temp_segment (sci_ptr, sci.listener_info.temp_seg_ptr);
+
+	sci.listener_info = saved_listener_info;
+	sci.in_listener = saved_in_listener;
+	sci.executing_request = saved_executing_request;
+
+	P_code = ssu_et_$subsystem_aborted;
+
+	return;
+
+/**/
+
+%include "_ssu_check_sci";
+%page;
+%include "_ssu_sci";
+%page;
+%include iocb;
+%page;
+%include tty_read_status_info;
+
+     end ssu_listen_;

@@ -1,0 +1,543 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-05,GJohnson), approve(86-06-05,MCR7387),
+     audit(86-06-10,Martinson), install(86-07-11,MR12.0-1091):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4 */
+
+syserr_seg_manager:
+     procedure ();
+
+/* *	SYSERR_SEG_MANAGER
+   *
+   *	This procedure is responsible for all file-system manipulations of
+   *	the syserr log segments.  It is responsible for the names of the
+   *	segments kept in syserr_log_data.log_name; it is driven by the
+   *	swap_time in syserr_log_data when setting and changing the names.
+   *	It expects the names to be set appropriately by the first part of
+   *	syserr initialization (see init_syserr_log).
+   *
+   *	This procedure manipulates the file system, and therefore can only
+   *	be run in a real process (such as by a gate call) or late in
+   *	initialization.
+   *
+   *	Modification history:
+   *	84-10-02, W. Olin Sibert: Separated from syserr_copy, when it was
+   *	   pointed out by Benson that the SyserrLogger daemon can't be expected
+   *	   to do file system manipulations without a KST.
+   *	84-10-15, WOS: Added threshold initialization entrypoints
+   *	84-10-17, WOS: Added syserr_seg_manager$verify_lock
+   *	84-11-11, WOS: Added console recovery support.
+   1985-01-02, BIM: fixed reference to lock for fast lock.
+   *	85-02-15, Keith Loepere: don't rename log segs under paged lock.
+   This is part of making the paged lock the highest paged
+   lock, so that any paged code can write to the paged log.
+   *	85-03-03, EJ Sharpe: added verify_sequence entrypoint, format
+*/
+
+declare  P_code fixed bin (35) parameter;
+declare  P_copy_channel fixed bin (71) parameter;
+declare  P_current_log_empty bit (1) aligned parameter;
+declare  P_last_history_sequence fixed bin (35) parameter;
+declare  P_new_sequence fixed bin (35) parameter;
+declare  P_page_threshold fixed bin parameter;
+declare  P_recovery_flag bit (1) aligned parameter;
+declare  P_swap_time fixed bin (71) parameter;
+
+declare  code fixed bin (35);
+declare  copy_channel fixed bin (71);
+declare  current_log_empty bit (1) aligned;
+declare  last_history_sequence fixed bin (35);
+declare  live_log_ptr pointer;
+declare  new_sequence fixed bin (35);
+declare  non_live_log fixed bin;
+declare  non_live_log_ptr pointer;
+declare  non_live_name char (32);
+declare  page_threshold fixed bin;
+declare  recovery_flag bit (1) aligned;
+declare  sequence_increment fixed bin (35);
+declare  swap_time fixed bin (71);
+
+declare  log_data_$syserr_log_dir char (168) external static;
+declare  log_data_$syserr_log_empty_name char (32) external static;
+declare  log_data_$syserr_log_history_dir char (168) external static;
+declare  log_data_$syserr_log_name char (32) external static;
+declare  pds$process_group_id char (32) external static;
+declare  pds$processid bit (36) aligned external static;
+
+declare  error_table_$action_not_performed fixed bin (35) external static;
+declare  error_table_$log_segment_empty fixed bin (35) external static;
+
+declare  chname$cfile entry (char (*), char (*), char (*), char (*), fixed bin (35));
+declare  level$get entry () returns (fixed bin (3));
+declare  level$set entry (fixed bin (3));
+declare  log_name_$name entry (char (*), fixed bin (71)) returns (char (32));
+declare  log_position_$next_message entry (ptr, ptr, bit (1) aligned);
+declare  syserr entry options (variable);
+declare  syserr$error_code entry options (variable);
+declare  syserr_copy_wired_log$adjust_wired_log_sequence entry (fixed bin (35));
+declare  syserr_copy$lock entry ();
+declare  syserr_copy$unlock entry ();
+declare  syserr_copy$swap_logs entry ();
+declare  unique_chars_ entry (bit (*)) returns (char (15));
+
+declare  WHOAMI char (32) internal static options (constant) init ("syserr_seg_manager");
+
+declare  (addr, max, min, null) builtin;
+%page;
+
+/* This entrypoint is called late during Collection 2 initialization to
+   change the names of the two syserr log segments in >sl1 from their
+   SLT names to the appropriate log segment names. The live log becomes
+   "syserr_log", and the non-live log becomes "syserr_log.empty" or
+   "syserr_log.YYYYMMDD.HHMMSS", depending on whether it has contents.
+   The SLT names were placed into syserr_log_data earlier by init_syserr_log,
+   which is the only procedure that knows about them. */
+
+
+syserr_seg_manager$initialize_log_names:
+     entry ();
+
+	call syserr_copy$lock ();			/* Be polite.... even though this IS initialization */
+						/* Besides, if the daemon ran and tried to swap logs.... */
+
+	call get_log_ptrs ();
+
+	call get_log_names ();
+
+	call syserr_copy$unlock ();			/* don't lock directories under paged syserr lock */
+
+	call set_log_names ();
+
+	return;
+%page;
+
+/* This entrypoint is called early in Answering Service initialization
+   to start the business of copying messages from ring zero into the
+   permanent syserr log family in >sc1>syserr_log. The Answering
+   Service supplies a threshold for the number of pages of outstanding
+   log messages allowed to hang around in ring zero, and an event
+   channel over which the copying takes place. To stop copying, this
+   entrypoint is called with a channel value of zero. */
+
+syserr_seg_manager$start_copying:
+     entry (P_copy_channel, P_page_threshold);
+
+	copy_channel = P_copy_channel;
+	page_threshold = P_page_threshold;
+
+	call syserr_copy$lock ();
+
+	call get_log_ptrs ();
+
+	syserr_log_data.copy_threshold = max (1, min (page_threshold,
+	     syserr_log_data.log_size (1), syserr_log_data.log_size (2)) - 1);
+	syserr_log_data.copy_channel = copy_channel;
+	syserr_log_data.copy_process_id = pds$processid;
+
+	call syserr_copy$unlock ();
+
+	return;
+
+
+
+
+/* This entry is called to turn the wakeups required by console recovery
+   on and off. When "recovery mode" is in effect, a wakeup will be sent
+   to the copying process whenever a printable message is logged, regardless
+   of how full the log partition is. */
+
+syserr_seg_manager$set_recovery_flag:
+     entry (P_recovery_flag);
+
+	recovery_flag = P_recovery_flag;
+
+	call syserr_copy$lock ();
+
+	call get_log_ptrs ();
+
+	syserr_log_data.wakeup_on_printable = recovery_flag;
+
+	call syserr_copy$unlock ();
+
+	return;
+%page;
+
+syserr_seg_manager$segment_info:
+     entry (P_swap_time, P_current_log_empty);
+
+	call syserr_copy$lock ();
+
+	call get_log_ptrs ();
+
+	swap_time = syserr_log_data.swap_time;
+	current_log_empty = (live_log_ptr -> log_segment.first_sequence = 0);
+
+	call syserr_copy$unlock ();
+
+	P_swap_time = swap_time;
+	P_current_log_empty = current_log_empty;
+
+	return;
+%page;
+
+syserr_seg_manager$swap_logs:				/* Called through hphcs_, to prepare for copying */
+     entry (P_code);				/* Log is UNLOCKED on entry */
+
+	call syserr_copy$lock ();
+
+	call get_log_ptrs ();
+
+	if (syserr_log_data.swap_time ^= 0) then do;	/* A swap is pending, can't ask for another one */
+	     code = error_table_$action_not_performed;
+	     call syserr_copy$unlock ();
+	end;
+
+	else if (live_log_ptr -> log_segment.last_sequence = 0) then do; /* Nothing in the live log now, */
+	     code = error_table_$log_segment_empty;	/* don't even bother trying to swap */
+	     call syserr_copy$unlock ();
+	end;
+
+	else do;					/* Otherwise, there's something there. Swap */
+	     call syserr_copy$swap_logs ();		/* Call our counterpart to swap the logs */
+
+	     call get_log_ptrs ();			/* Get them again, they've changed */
+	     live_log_ptr -> log_segment.previous_log_dir = log_data_$syserr_log_dir; /* Until it's copied out */
+	     non_live_log_ptr -> log_segment.previous_log_dir = log_data_$syserr_log_history_dir;
+
+	     call get_log_names ();
+
+	     call syserr_copy$unlock ();		/* don't lock directories under paged syserr lock */
+
+	     call set_log_names ();
+	     code = 0;
+	end;
+
+	P_code = code;
+	return;
+%page;
+
+syserr_seg_manager$reuse_empty_log:			/* Called through hphcs_, once copying has happened */
+     entry (P_code);				/* Log is UNLOCKED on entry */
+
+
+	call syserr_copy$lock ();
+
+	call get_log_ptrs ();
+
+	if (syserr_log_data.swap_time ^= 0) then do;	/* There WAS a pending swap, but it's allegedly done */
+	     syserr_log_data.swap_time = 0;		/* Mark that log as empty */
+
+	     non_live_log_ptr -> log_segment.previous_log_dir = ""; /* Prevent anyone from looking */
+	     live_log_ptr -> log_segment.previous_log_dir = log_data_$syserr_log_history_dir;
+
+	     call get_log_names ();
+
+	     call syserr_copy$unlock ();		/* don't lock directories under paged syserr lock */
+
+	     call set_log_names ();			/* Finally, reset the names */
+	end;
+
+	else do;
+	     code = error_table_$action_not_performed;	/* No, there wasn't */
+	     call syserr_copy$unlock ();
+	end;
+
+	P_code = code;
+	return;
+%page;
+
+/* This entry is called by verify_lock to find out whether the syserr log
+   is locked, and, if so, by whom. It is unlocked if it is locked by the
+   faulting process, and copy signalling is turned off if the faulting
+   process is the copier. This entry *should* see very little use, since
+   in the new mechanism, the copier only does name swapping while the log
+   is locked, and does the copying itself from ring four. */
+
+syserr_seg_manager$verify_lock:
+     entry () returns (bit (1) aligned);
+
+/* Don't lock first; if it's not locked by us, it's not our problem */
+
+	call get_log_ptrs ();
+
+	if (syserr_log_data.lock.pid ^= pds$processid) then
+	     return ("0"b);
+
+/* It's ours. Fix it */
+
+	if (syserr_log_data.copy_process_id = pds$processid) then do;
+	     call syserr (SYSERR_PRINT_WITH_ALARM,
+		"^a: crawlout with syserr log locked. Automatic syserr log copying disabled.", WHOAMI);
+
+	     syserr_log_data.copy_channel = 0;		/* Turn it off */
+	end;
+
+	call syserr_copy$unlock ();			/* Unlock it, regardless */
+
+	return ("1"b);
+%page;
+
+/* This entrypoint is called only at answering service initialization time.
+   It makes sure that the sequence numbers in the ring 0 paged log (i.e. partition)
+   are consistant with what is found in the log history.  If not, we will fix
+   the sequence numbers in the partition and call upon syserr_copy to do likewise
+   for the wired log.  */
+
+syserr_seg_manager$verify_sequence:
+     entry (P_last_history_sequence, P_new_sequence, P_code);
+
+	last_history_sequence = P_last_history_sequence;
+	new_sequence = P_new_sequence;
+
+	call syserr_copy$lock ();
+
+	call get_log_ptrs ();
+	log_segment_ptr = live_log_ptr;
+
+/* Check to see that at least one message is in the live log.  There should be
+   since init_syserr_log puts one in at system initialization time. */
+
+	if (log_segment.first_sequence = 0) then do;
+	     call syserr (SYSERR_CRASH_SYSTEM, "^a: No messages in live syserr log ^p.", WHOAMI, log_segment_ptr);
+	     call syserr_copy$unlock ();
+	     P_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	if (log_segment.first_sequence < last_history_sequence) then do;
+	     sequence_increment = new_sequence - log_segment.first_sequence;
+	     call syserr_copy_wired_log$adjust_wired_log_sequence (sequence_increment);
+
+/*  Now change all the sequence numbers in the live log segment. */
+
+	     log_segment.first_sequence = log_segment.first_sequence + sequence_increment;
+	     log_segment.last_sequence = log_segment.last_sequence + sequence_increment;
+	     call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Log message sequence numbers adjusted (in ^p) beginning at ^d.", WHOAMI, log_segment_ptr, log_segment.first_sequence);
+
+	     log_message_ptr = null ();		/* Force to first message */
+	     call log_position_$next_message (log_segment_ptr, log_message_ptr, ("0"b));
+	     do while (log_message_ptr ^= null ());
+		log_message.sequence = log_message.sequence + sequence_increment;
+		call log_position_$next_message (log_segment_ptr, log_message_ptr, ("0"b));
+	     end;
+
+/* and now check the non-live log, just in case */
+
+	     log_segment_ptr = non_live_log_ptr;
+
+	     if (log_segment.first_sequence ^= 0) then do;
+		log_segment.first_sequence = log_segment.first_sequence + sequence_increment;
+		log_segment.last_sequence = log_segment.last_sequence + sequence_increment;
+		call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Log message sequence numbers adjusted (in ^p) beginning at ^d.", WHOAMI, log_segment_ptr, log_segment.first_sequence);
+		log_message_ptr = null ();		/* Force to first message */
+		call log_position_$next_message (log_segment_ptr, log_message_ptr, ("0"b));
+		do while (log_message_ptr ^= null ());
+		     log_message.sequence = log_message.sequence + sequence_increment;
+		     call log_position_$next_message (log_segment_ptr, log_message_ptr, ("0"b));
+		end;
+	     end;
+	end;
+
+	call syserr_copy$unlock ();
+	P_code = 0;
+
+	return;
+%page;
+
+get_log_ptrs:
+     procedure ();
+
+	syserr_log_data_ptr = addr (syserr_log_data$);
+
+	non_live_log = 3 - syserr_log_data.live_log;
+	live_log_ptr = syserr_log_data.log_ptr (syserr_log_data.live_log);
+	non_live_log_ptr = syserr_log_data.log_ptr (non_live_log);
+
+	return;
+     end get_log_ptrs;
+%page;
+
+/* These procedures ensure that the log segments have appropriate names.
+   They rename the live log to "syserr_log", and rename the non-live log
+   either to "syserr_log.empty" or "syserr_log.YYYYMMDD.HHMMSS", depending
+   on whether syserr_log_data.swap_time is non-zero. A non-zero value for
+   syserr_log_data.swap_time indicates that a swap has happened in ring zero,
+   caused by the daemon, but that the non-live log has not yet been copied
+   out to ring four.  Notice that the actual renaming is done NOT under the
+   paged lock.  This is because the paged lock is higher than the directory
+   lock on sl1 needed to rename the logs.  As such, the logs can get swapped
+   while we are renaming them.  However, it makes no difference to the user
+   ring if they get swapped right after we rename them, or during, since
+   user ring accesses to them aren't interlocked against ring 0 swapping
+   them anyway.  This can't hurt the Initializer's automatic copying, since
+   we won't return until the names are swapped, and swapping of logs could
+   occur anytime after this, and the Initializer must be prepared to cope. */
+
+get_log_names:
+     procedure ();
+
+	non_live_log = 3 - syserr_log_data.live_log;
+
+	if (syserr_log_data.swap_time ^= 0) then
+	     non_live_name = log_name_$name (log_data_$syserr_log_name, syserr_log_data.swap_time);
+	else non_live_name = log_data_$syserr_log_empty_name;
+
+	return;
+
+     end get_log_names;
+
+set_log_names: proc;
+
+declare  old_level fixed bin (3);
+
+	old_level = level$get ();			/* Log segments are 0,5,5, so we must run like this */
+	call level$set (0);				/* No cleanup handler needed-- ring_alarm will fix it */
+
+	call rename (1, (unique_chars_ (""b)));		/* Give them unique names briefly in order to avoid name conflicts */
+	call rename (2, (unique_chars_ (""b)));
+
+	call rename (syserr_log_data.live_log, log_data_$syserr_log_name);
+	call rename (non_live_log, non_live_name);
+
+	call level$set (old_level);
+
+	return;
+%page;
+
+rename:
+	procedure (P_log, P_new_name);
+
+declare  P_log fixed bin parameter;
+declare  P_new_name char (32);
+
+	     if (P_log ^= 1) & (P_log ^= 2) then
+		call syserr (SYSERR_CRASH_SYSTEM, "^a: Attempt to rename invalid log index ^d", WHOAMI, P_log);
+
+	     if (P_new_name = syserr_log_data.log_name (P_log)) then do;
+		call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Attempt to rename log #^d already named ^a", WHOAMI, P_log, P_new_name);
+		return;
+	     end;
+
+	     call chname$cfile (syserr_log_data.log_dir,
+		syserr_log_data.log_name (P_log), syserr_log_data.log_name (P_log), P_new_name, code);
+
+	     if (code ^= 0) then
+		call syserr$error_code (SYSERR_PRINT_ON_CONSOLE, code, "^a: Cannot rename syserr log #^d from ^a to ^a for ^a",
+		     WHOAMI, P_log, syserr_log_data.log_name (P_log), P_new_name, pds$process_group_id);
+
+	     else syserr_log_data.log_name (P_log) = P_new_name; /* only we use this, so we can set without holding paged lock */
+
+	     return;
+	end rename;
+     end set_log_names;
+
+/* format: off */
+%page; %include log_segment;
+%page; %include log_message;
+%page; %include syserr_constants;
+%page; %include syserr_log_dcls;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   syserr_seg_manager: Crawlout with syserr log locked. Automatic syserr log copying disabled.
+
+   S:     $beep
+
+   T:     $run
+
+   M:     An fault has occurred in the Answering Service while copying syserr
+   messages from ring zero, and copying from ring zero has been disabled. This
+   probably indicates a supervisor logic error.
+   This will be followed by a message from verify_lock identifying the fault.
+
+   A:     Attempt to restart copying, or re-boot the system.
+
+
+   Message:
+   syserr_seg_manager: Attempt to rename invalid log index NNNN
+
+   S:     $crash
+
+   T:     $run
+
+   M:     $err
+
+   A:     $recover
+   Reinitialize the LOG partition with the BCE test_disk command if
+   this persists
+
+
+   Message:
+   syserr_seg_manager: Attempt to rename log #NNNN already named NAME
+
+   S:     $info
+
+   T:     $run
+
+   M:     $err
+
+   A:     $note
+
+
+   Message:
+   syserr_seg_manager: Cannot rename syserr log #NNNN from OLD-NAME to NEW-NAME for USER-NAME
+
+   S:     $info
+
+   T:     $run
+
+   M:     $err
+
+   A:     $note
+
+
+   Message:
+   syserr_seg_manager: No messages in live syserr log PTR.
+
+   S:     $crash
+
+   T:     $init
+
+   M:     $err
+   When attempting to verify the message sequence numbers in the live
+   syserr log, it was found that no messages were present.  This should
+   not hapen at this point because syserr log initialization (init_syserr_log)
+   always places a message in the log.
+
+   A:     $inform
+
+
+   Messaage:
+   syserr_seg_manager: Log message sequence numbers adjusted (in PTR) beginning at SEQUENCE.
+
+   S:	$info
+
+   T:	$init
+
+   M:	The sequence numbers in the log partition were found to preceed the
+   sequence numbers found in the log history.  Thus, the numbers in the
+   partition (and the wired log) were adjusted appropriately.  This
+   message indicates the new sequence number where the adjustment started
+   for each of the two ring 0 paged logs.  (This will occur after the
+   log partition has been damaged or manually cleared).
+
+   A:	$notify
+
+   END MESSAGE DOCUMENTATION
+   */
+
+     end syserr_seg_manager;

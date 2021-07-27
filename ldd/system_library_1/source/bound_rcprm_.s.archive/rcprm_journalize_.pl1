@@ -1,0 +1,882 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  2) change(92-09-23,Zimmerman), approve(92-09-23,MCR8267),
+     audit(92-10-26,Schroth), install(92-10-27,MR12.5-1041):
+     Fix journal list traversal problems encountered when date deleting
+     journals. (phx18654)
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+rcprm_journalize_:
+     proc (arg_resource_desc_ptr, arg_action, arg_clock_time, arg_system_dir);
+
+/* This routine manages the RCPRM journal-- a backup mechanism that allows one
+   to recover clobbered registries given a good (manually-requested) checkpoint
+   copy of the registries, and the journal (that this module manages, ahem)
+   which describes every operation which occurred since the checkpoint. */
+
+/* Written 01/08/79 by C. D. Tavares */
+/* Modified 11/21/79 by CDT to fix several bugs and add a recovery strategy to
+   allow reconstruction to continue after errors. */
+/* Modified 7/13/82 by BLB to ignore action_not_performed error from
+   admin_gate_$reclassify_sys_seg */
+/* Modified 1984-11-02 BIM to recover from missing obsolete journals. */
+/* Modified 1984-12-27 by Keith Loepere for version 2 create_branch_info. */
+/* Modified 1985-02-15 by Chris Jones to use privileges when creating journals,
+   to use rcprm_registry_util_, and for better clean up. */
+
+dcl	arg_resource_desc_ptr  pointer parameter;
+dcl	arg_action	   fixed bin parameter;
+dcl	arg_clock_time	   fixed bin (71) parameter;
+dcl	arg_system_dir	   char (*) parameter;
+
+/* automatic */
+
+dcl	auto_code		   fixed bin (35);
+dcl	clock_time	   fixed bin (71);
+dcl	n_doublewords	   fixed bin;
+dcl	journal_dir	   char (168);
+dcl	prev_time		   fixed bin (71);
+dcl	privileges_string	   bit (36) aligned;
+dcl	system_dir	   char (168) automatic;
+
+declare  current_journal_name	  char (32);
+declare  missing_journal	  bit (1) aligned;
+
+/* static */
+
+dcl	max_seg_size	   fixed bin static initial (0);
+
+dcl	1 force_flags	   like force_write_flags aligned static;
+
+dcl	DEFAULT_JOURNAL_NAME   char (13) static options (constant) init ("rcprm.journal");
+
+/* external static */
+
+dcl	(
+	sys_info$max_seg_size,
+	error_table_$no_record,
+	error_table_$recoverable_error,
+	error_table_$not_seg_type,
+	error_table_$action_not_performed,
+	error_table_$noentry
+	)		   ext fixed bin (35) static;
+
+/* entries */
+
+dcl	(
+	admin_gate_$syserr_error_code,
+	admin_gate_$syserr
+	)		   ext entry options (variable);
+dcl	admin_gate_$reclassify_sys_seg
+			   ext entry (char (*), char (*), bit (72) aligned, fixed bin (35));
+dcl	get_group_id_	   entry returns (char (32));
+dcl	get_max_authorization_ ext entry returns (bit (72) aligned);
+dcl	get_ring_		   entry returns (fixed bin);
+dcl	hcs_$chname_file	   entry (char (*), char (*), char (*), char (*), fixed bin (35));
+dcl	hcs_$chname_seg	   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	hcs_$create_branch_	   entry (char (*), char (*), pointer, fixed bin (35));
+dcl	hcs_$force_write	   ext entry (pointer, pointer, fixed bin (35));
+dcl	initiate_file_	   entry (char (*), char (*), bit (*), ptr, fixed bin (24), fixed bin (35));
+dcl	ioa_$rsnnl	   entry options (variable);
+dcl	pathname_		   entry (char (*), char (*)) returns (char (168));
+dcl	rcprm_registry_util_$grab_registry
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_transaction_control_file
+			   entry (ptr, char (*), fixed bin (35));
+dcl	rcprm_registry_util_$release_registry
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$release_transaction_control_file
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$turn_off_privs
+			   entry (bit (36) aligned);
+dcl	rcprm_registry_util_$turn_on_privs
+			   entry (bit (36) aligned);
+dcl	terminate_file_	   entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+dcl	unique_chars_	   entry (bit (*)) returns (char (15));
+
+dcl	sys_info$access_class_ceiling
+			   bit (72) aligned ext static;
+
+/* based */
+
+dcl	based_words	   (n_doublewords) fixed bin (71) aligned based;
+
+/* builtins and conditions */
+
+dcl	(addr, addrel, binary, currentsize, divide, hbound, null, pointer, rel, rtrim, unspec)
+			   builtin;
+
+dcl	cleanup		   condition;
+
+	tsw_attach_ptr, journalp, switch_ptr = null ();
+	resource_desc_ptr = arg_resource_desc_ptr;
+	clock_time = arg_clock_time;
+	system_dir = arg_system_dir;
+	rcp_priv_was_on = 1;
+	call cu_$level_get (prev_level);
+	on cleanup call clean_up ("0"b, (0));
+
+	call journalize (auto_code);
+	if auto_code ^= 0 then
+	     call admin_gate_$syserr_error_code (BEEP, auto_code, "RCP: Journal lost transaction for ^a.",
+		get_group_id_ ());
+
+	return;
+
+journalize:
+     proc (code);
+
+dcl	code		   fixed bin (35) parameter;
+
+	call find_journal ("1"b, code);
+	if code ^= 0 then
+	     return;
+
+	n_doublewords = divide (currentsize (resource_desc_ptr -> resource_descriptions) + 1, 2, 35, 0);
+	if journal.next_free_word + (n_doublewords * 2) > max_seg_size then do;
+	     call make_new_journal (code);
+	     if code ^= 0 then
+		return;
+	end;
+
+	je_ptr = pointer (journalp, journal.next_free_word);
+
+	journal_entry.clock_time = clock_time;
+	journal_entry.n_doublewords = n_doublewords;
+	journal_entry.action = arg_action;
+	journal_entry.j_resource_desc = resource_desc_ptr -> based_words;
+
+	journal.next_free_word = journal.next_free_word + currentsize (journal_entry);
+	journal.own_last_transaction_time = clock_time;
+
+	call hcs_$force_write (journalp, addr (force_flags), code);
+	if code ^= 0 then do;
+	     call admin_gate_$syserr_error_code (LOG, code, "RCP: Journal could not be forcibly written.");
+	     code = 0;
+	end;
+
+	call terminate_file_ (journalp, (0), TERM_FILE_TERM, (0));
+	return;
+
+     end journalize;
+%skip (4);
+find_journal:
+     proc (create_sw, code);
+
+dcl	create_sw		   bit (1) aligned parameter;
+dcl	code		   fixed bin (35) parameter;
+
+	if max_seg_size = 0 then do;			/* initialize constants */
+	     max_seg_size = sys_info$max_seg_size;
+	     unspec (force_flags) = ""b;
+	     force_flags.priority_write,		/* anything we can get away with */
+		force_flags.lru_or_mru = "1"b;	/* MRU */
+	end;
+
+	journal_dir = pathname_ (system_dir, "journals");
+	current_journal_name = DEFAULT_JOURNAL_NAME;
+	call initiate_file_ (journal_dir, current_journal_name, RW_ACCESS, journalp, (0), code);
+
+	if code = error_table_$noentry then
+	     if create_sw then do;
+		call make_new_journal (code);
+		if code ^= 0 then
+		     return;
+	     end;
+
+	return;
+
+     end find_journal;
+%skip (4);
+find_previous_journal:
+     proc (code);
+
+dcl	code		   fixed bin (35) parameter;
+
+
+	current_journal_name = journal.previous_journal_name;
+	call initiate_file_ (journal_dir, current_journal_name, RW_ACCESS, journalp, (0), code);
+	if code ^= 0 then
+	     call admin_gate_$syserr_error_code (BEEP, code, "RCP: Cannot initiate journal ^a.",
+		pathname_ (journal_dir, current_journal_name));
+
+	return;
+
+     end find_previous_journal;
+
+%skip (4);
+make_new_journal:
+     proc (code);
+
+dcl	code		   fixed bin (35) parameter;
+
+dcl	from_journal_name	   char (32);
+dcl	to_journal_name	   char (32);
+
+
+dcl	1 cbi		   like create_branch_info aligned automatic;
+
+	call ioa_$rsnnl ("rcprm.journal.^a", to_journal_name, (0), unique_chars_ (""b));
+
+	if journalp ^= null then do;
+
+/* If here, we were called because an old log had too little room left--
+   so part of our job is to rename the old log before creating a new one. */
+
+	     from_journal_name = journal.own_name;
+	     journal.subsequent_journal_name = to_journal_name;
+	     prev_time = journal.own_last_transaction_time;
+
+	     call hcs_$chname_file (journal_dir, DEFAULT_JOURNAL_NAME, DEFAULT_JOURNAL_NAME, "", code);
+						/* remove name "rcprm.journal" from exiting journal */
+	     if code ^= 0 then
+		return;
+
+	     call terminate_file_ (journalp, (0), TERM_FILE_TERM, (0));
+	end;
+
+	else do;
+	     from_journal_name = "";			/* first journal in chain */
+	     prev_time = 0;
+	     call admin_gate_$syserr (LOG, "RCP: Creating ^a.", pathname_ (journal_dir, DEFAULT_JOURNAL_NAME));
+	end;
+
+	unspec (cbi) = ""b;
+	cbi.version = create_branch_version_2;
+	cbi.mode = RW_ACCESS;
+	cbi.rings (*) = get_ring_ ();
+	cbi.userid = "*.*.*";
+	cbi.access_class = get_max_authorization_ ();	/* This fellow may not be allowed to SYSTEM_HIGH */
+	cbi.priv_upgrade_sw = (cbi.rings (3) = 1);
+	cbi.parent_ac_sw = ^cbi.priv_upgrade_sw;
+
+	call rcprm_registry_util_$turn_on_privs (privileges_string);
+	call hcs_$create_branch_ (journal_dir, to_journal_name, addr (cbi), code);
+	call rcprm_registry_util_$turn_off_privs (privileges_string);
+	if code ^= 0 then
+	     return;
+
+	call admin_gate_$reclassify_sys_seg (journal_dir, to_journal_name, sys_info$access_class_ceiling, code);
+						/* Force the seg to SYSTEM_HIGH via privileged call */
+	if code ^= 0 & code ^= error_table_$action_not_performed then
+	     return;
+
+	call hcs_$chname_file (journal_dir, to_journal_name, "", DEFAULT_JOURNAL_NAME, code);
+						/* add name "rcprm.journal" to new current journal */
+	if code ^= 0 then
+	     return;
+
+	call initiate_file_ (journal_dir, DEFAULT_JOURNAL_NAME, RW_ACCESS, journalp, (0), code);
+	if code ^= 0 then
+	     return;				/* wow, something really sick */
+
+	journal.version = 0;
+	journal.next_free_word = currentsize (journal);
+	journal.previous_journal_last_transaction_time = prev_time;
+	journal.previous_journal_name = from_journal_name;
+	journal.own_name = to_journal_name;
+	journal.subsequent_journal_name = "";
+
+	return;
+
+     end make_new_journal;
+
+make_fresh_journal:
+     entry (arg_system_dir, code);
+
+/* This entry gets rid of all old journal entries and starts a fresh journal. */
+
+dcl	temp_ptr		   pointer;
+
+dcl	delete_$ptr	   ext entry (pointer, bit (*), char (*), fixed bin (35));
+
+/* This entry called from the proper validation level, jump right into code. */
+
+	call cu_$level_get (prev_level);
+	rcp_priv_was_on = 1;			/* so it won't get reset in window */
+	tsw_attach_ptr, journalp, resource_desc_ptr, switch_ptr = null;
+	system_dir = arg_system_dir;
+
+	on cleanup call clean_up (""b, 0);
+
+	call find_journal (""b, code);
+	if code ^= 0 then
+	     return;
+
+	from_time = journal.own_last_transaction_time;
+	temp_ptr = journalp;
+
+	missing_journal = "0"b;			/* set to 1 if we failed to set journalp in find_previous_journal */
+	do while (^missing_journal);
+	     if journal.previous_journal_name = "" then
+		go to STOP_CHASING;
+
+	     call find_previous_journal (code);
+	     if code ^= 0 then
+		missing_journal = "1"b;
+	     call delete_$ptr (temp_ptr, "101101"b, "rcprm_journalize_", code);
+						/* delete Journal(x), journalp -> Journal(x-1) */
+						/* force, no question, delete anything and chase */
+	     if code ^= 0 then
+		call rename_bad_journal;
+	     temp_ptr = journalp;			/* temp_ptr -> Journal(x-1), find_revious_journal will set journalp -> Journal(x-2) */
+	end;
+
+STOP_CHASING:
+	if ^missing_journal				/* if we have one left at this point */
+	then do;
+	     call delete_$ptr (temp_ptr, "101101"b, "rcprm_journalize_", code);
+	     if code ^= 0 then
+		call rename_bad_journal;
+	end;
+
+	journalp = null;
+	call make_new_journal (code);
+	if code ^= 0 then
+	     return;
+
+	journal.previous_journal_last_transaction_time, journal.own_last_transaction_time = from_time;
+	call terminate_file_ (journalp, (0), TERM_FILE_TERM, (0));
+	return;
+
+reconstruct:
+     entry (arg_system_dir, arg_enames, arg_rtdeps, code);
+
+dcl	arg_enames	   char (*) dimension (*) parameter;
+dcl	arg_rtdeps	   pointer dimension (*) parameter;
+dcl	code		   fixed bin (35) parameter;
+
+/* automatic */
+
+dcl	action		   fixed bin;
+dcl       done                   bit (1) aligned;
+dcl	from_time		   fixed bin (71);
+dcl	eoj		   bit (1) aligned;
+dcl	(i, j, k)		   fixed bin;
+dcl	n_resources	   fixed bin;
+dcl	operation		   bit (36) aligned;
+dcl	prev_level	   fixed bin;
+dcl	rcp_priv_was_on	   fixed bin (35);
+dcl	reclen		   fixed bin (21);
+dcl	switch_ptr	   pointer;
+dcl	syserr_called	   bit (1) aligned;
+dcl       tjournalp              pointer;
+dcl	tsw_attach_ptr	   pointer;
+dcl	who_am_i		   char (64);
+
+/* external static */
+
+dcl	error_table_$bad_date  ext fixed bin (35) static;
+dcl	access_operations_$rcp_reconstruct_registry
+			   bit (36) aligned ext static;
+
+/* entries */
+
+dcl	cu_$level_get	   entry (fixed bin);
+dcl	cu_$level_set	   entry (fixed bin);
+dcl	get_temp_segment_	   entry (char (*), pointer, fixed bin (35));
+dcl	release_temp_segment_  entry (char (*), pointer, fixed bin (35));
+dcl	suffixed_name_$new_suffix
+			   entry (char (*), char (*), char (*), char (32), fixed bin (35));
+dcl	(
+	system_privilege_$rcp_priv_on,
+	system_privilege_$rcp_priv_off
+	)		   ext entry (fixed bin (35));
+
+dcl	rcprm_find_resource_$reconstruct
+			   ext entry (pointer, char (*), fixed bin, pointer, fixed bin (35));
+dcl	rcprm_registry_mgr_$audit
+			   entry (char (*), bit (36) aligned, fixed bin, char (*), char (*), bit (1),
+			   fixed bin (35));
+dcl	rcprm_registry_mgr_$update_registry_header_mylock
+			   ext entry (char (*), pointer, fixed bin (35));
+
+	call cu_$level_get (prev_level);
+	rcp_priv_was_on = 1;			/* so it won't get reset in window */
+	tsw_attach_ptr, journalp, resource_desc_ptr, switch_ptr = null;
+
+	on cleanup call clean_up (""b, 0);
+
+	call cu_$level_set (get_ring_ ());
+	call system_privilege_$rcp_priv_on (rcp_priv_was_on);
+
+	n_resources = hbound (arg_enames, 1);
+
+	begin;
+
+dcl	1 registry_data	   (n_resources) aligned,	/* automatic adjustable */
+	  2 resource_name	   char (32) unaligned,
+	  2 rtdep		   pointer,
+	  2 dtcm		   fixed bin (71);
+
+	     operation = access_operations_$rcp_reconstruct_registry;
+	     ops_ptr = addr (addr (operation) -> encoded_access_op.detailed_operation);
+	     detailed_operation.priv_gate_call = "1"b;
+	     who_am_i = "rcprm_journalize_$reconstruct";
+	     do i = 1 to n_resources;
+		registry_data.resource_name (i) = arg_enames (i);
+		registry_data.rtdep (i) = arg_rtdeps (i);
+	     end;
+
+	     system_dir = arg_system_dir;
+	     code = 0;
+%skip (4);
+
+/* Find the journal and scoot back to the proper time. */
+
+	     call find_journal (""b, code);		/* find the current journal */
+	     if code ^= 0 then
+		call audit ("");
+
+	     done = "0"b;
+	     tjournalp = null ();
+
+	     do while (^done);			/* find older journals */
+		tjournalp = journalp;		/* keep track of the journal we've currently got
+						   so we don't loose it when we go looking for
+						   the next one */
+		call find_previous_journal (code);
+		if code = 0 then do;
+		     call terminate_file_ (tjournalp, (0), TERM_FILE_TERM, code);
+						/* no longer interested in the last one. */
+		     if code ^= 0 then
+			call audit ("");
+		     if journal.previous_journal_name = "" then
+			done = "1"b;  /* end of the list */
+		end;
+		else do; 
+		     /*** The list was improperly terminated, either by
+			some form of crash damage or by someone deleting
+			the journals by hand.  If the former, it will be
+			caught and handled in the next code block.  If the
+			latter, everything should still work o.k....   */
+		     journalp = tjournalp;		/* journalp now points at something useful, the oldest */
+		     done = "1"b;
+		end;
+		
+	     end;
+
+/* We must make ABSOLUTELY SURE that no operations had been performed on any
+   of the registries between the time they were saved and the time of the
+   first recorded journal entry.  We do this by checking the field at the
+   header of the journal that gives the clock_time of the last transaction
+   that occurred in the last set of journals before they were deleted
+   (this field is carried over across the deletion) and verifying that it is
+   less than the DTCM of the affected registries.  All transaction times
+   recorded in the journal are generated BEFORE rcprm_find_resource_ attempts
+   to perform whatever operation it is bidden-- therefore, we are ASSURED that
+   if the DTCM of the registry is greater than the transaction time recorded in
+   the journal, that transaction has already been incorporated.  Likewise
+   we are ASSURED that if the DTCM of the registry is NOT greater than the
+   transaction time of the last transaction in the previous set of journals,
+   this transaction (and possibly a few transactions previous to it) have NOT
+   been incorporated, and if we start reconstruction from this time, we will
+   certainly lose!  So we require that from_time CAN NOT be greater than the
+   DTCM of any registry. */
+
+	     from_time = journal.previous_journal_last_transaction_time;
+
+/* Before we can attach any registries, we must grab the transaction control file
+   with an iron fist to make sure nobody slams things around behind our backs */
+
+	     call rcprm_registry_util_$grab_transaction_control_file (tsw_attach_ptr, system_dir, code);
+	     if code ^= 0 then
+		call audit ("");
+
+	     call get_temp_segment_ ("rcprm_journalize_", resource_desc_ptr, code);
+	     if code ^= 0 then
+		call audit ("");
+
+	     header_ptr = resource_desc_ptr;
+%skip (4);
+
+/* Attach each registry under consideration and examine its DTCM
+   (as recorded in last_transaction_time) */
+
+	     do i = 1 to n_resources;
+
+/**** Open each registry in turn.  First, remove any "rcpr" suffix from registry_data, then attach
+      and open the registry. ****/
+
+		call suffixed_name_$new_suffix ((registry_data.resource_name (i)), "rcpr", "",
+		     registry_data.resource_name (i), code);
+		if code ^= 0 then
+		     call audit (registry_data.resource_name (i));
+
+		call rcprm_registry_util_$grab_registry (switch_ptr, system_dir, registry_data.resource_name (i),
+		     code);
+		if code ^= 0 then
+		     call audit (registry_data.resource_name (i));
+
+		call iox_$seek_key (switch_ptr, (REGISTRY_HEADER_KEY), reclen, code);
+		if code = error_table_$no_record then
+		     code = error_table_$not_seg_type;
+		if code ^= 0 then
+		     call audit (registry_data.resource_name (i));
+
+		call iox_$read_record (switch_ptr, header_ptr, reclen, 0, code);
+		if code ^= 0 then
+		     call audit (registry_data.resource_name (i));
+
+		registry_data.dtcm (i) = registry_header.last_transaction_time;
+
+		call rcprm_registry_util_$release_registry (switch_ptr, code);
+		if code ^= 0 then
+		     call audit (registry_data.resource_name (i));
+
+/**** Note that there is a potential problem here (which won't be fixed for this release).  If a registry has
+      not been changed at all since the last copy_registry -reset, we'll report an error.  This isn't tragic,
+      merely confusing (the safe copy of the registry is correct, but we'll probably cause some concern to
+      whoever is doing the copying). ****/
+		if registry_data.dtcm (i) < from_time then do;
+		     code = error_table_$bad_date;
+		     call audit (registry_data.resource_name (i));
+		end;
+	     end;
+	     switch_ptr = null;
+
+
+/* Here is where we start walking through all the journal entries,
+   processing them one by one. */
+
+	     eoj = ""b;
+
+	     je_ptr = pointer (journalp, currentsize (journal));
+
+	     syserr_called = ""b;
+
+	     do while (^eoj);			/* until end of journal */
+		action = journal_entry.action;
+		n_doublewords = journal_entry.n_doublewords;
+		resource_desc_ptr -> based_words = journal_entry.j_resource_desc;
+
+		do i = 1 by 1 while (i ^> resource_descriptions.n_items);
+		     do j = 1 to n_resources
+			while (registry_data.resource_name (j) ^= resource_descriptions.type (i));
+		     end;
+
+		     if j > n_resources then
+			goto dont_want_it;		/* we're not updating the registry for this type */
+		     if journal_entry.clock_time ^> registry_data.dtcm (j) then do;
+dont_want_it:
+			do k = i to resource_descriptions.n_items - 1;
+			     unspec (resource_descriptions.item (k)) = unspec (resource_descriptions.item (k + 1));
+			end;
+			resource_descriptions.n_items = resource_descriptions.n_items - 1;
+			i = i - 1;		/* "this" item now new, check it again */
+		     end;
+		end;
+
+		if resource_descriptions.n_items > 0 then do;
+
+/* We can't simulate the original call in the original process, but by jiggling
+   some of the given bits we CAN simulate a privileged call on behalf of the
+   original user that will accomplish the same thing (we hope!)  First,
+   do all the operations in as easy a mode as possible-- don't tempt fate! */
+
+		     resource_descriptions.given.name (*) = "1"b;
+		     resource_descriptions.given.uid (*) = "0"b;
+
+/* Registrations, deregistrations and clears are always proxy-type operations,
+   so no additional fiddling with the given bits is necessary (with the
+   minor exception of turning the given.uid bit on for registrations to
+   signify that the old UID of the resource must be reused.)  We don't
+   journalize reservations or cancellations, so we don't have to worry about
+   those.  We don't journalize statuses because they never change the registry.
+   Releases need only the resource name, and we have that.  Sets carry all
+   their own information with them, so these are repeatable.  Only acquisitions
+   are left, and we have to diddle these slightly, because some of the
+   necessary information is sometimes derived from implication. */
+
+		     if action = Acquire then
+			resource_descriptions.given.owner (*), resource_descriptions.given.aim_range (*) = "1"b;
+
+		     if action = Register then
+			resource_descriptions.given.uid (*) = "1"b;
+
+/* Now we cross our fingers and push the red button. */
+
+		     call rcprm_find_resource_$reconstruct (resource_desc_ptr, system_dir, action, tsw_attach_ptr,
+			code);			/* special entry does not try to seize rcp.tcf */
+		     if code ^= 0 then do;		/* wow, bought the farm. */
+			if code ^= error_table_$action_not_performed then
+			     call audit (registry_data.resource_name (j));
+						/* error was general, not resource-related */
+
+/* If code = action_not_performed, error was resource-related and REAL code is
+   in resource_descriptions structure.  Print notification. */
+
+			if ^syserr_called then
+			     call admin_gate_$syserr (BEEP, "RCP: Error during registry reconstruction for ^a.",
+				get_group_id_ ());
+
+			do i = 1 to resource_descriptions.n_items;
+			     call admin_gate_$syserr_error_code (LOG, resource_descriptions.item (i).status_code,
+				"RCP: Could not ^a ^a ^a.", Action_noun (action),
+				resource_descriptions.item (i).type, resource_descriptions.item (i).name);
+			end;
+
+			syserr_called = "1"b;	/* Don't goose beeper more than once */
+			code = 0;
+		     end;
+		end;
+
+		call find_next_entry;
+		call rcprm_registry_mgr_$audit (who_am_i, operation, prev_level, system_dir,
+		     registry_data.resource_name (j), "1"b, 0);
+	     end;
+
+/* Now we update the headers in the registry to account for RTDT's that may
+   have been installed between the checkpoint time and the present. */
+
+	     do i = 1 to n_resources;
+		call rcprm_registry_mgr_$update_registry_header_mylock (system_dir, registry_data.rtdep (i), code);
+		if code ^= 0 then
+		     call audit (registry_data.resource_name (i));
+						/* to have come so far... */
+	     end;
+	end;					/* begin block */
+
+/* If we make it to here, we light a candle to Babbage and collapse. */
+
+	call clean_up ("1"b, code);
+	if code = 0 then
+	     if syserr_called then do;
+		code = error_table_$recoverable_error;
+		call admin_gate_$syserr_error_code (BEEP, code, "RCP: End of reconstruction operation.");
+	     end;
+
+	return;
+%skip (4);
+find_next_entry:
+     proc;
+
+/* This subroutine finds the next transaction entry in the journal. */
+
+dcl	new_name		   char (32);
+
+	je_ptr = addrel (je_ptr, currentsize (journal_entry));
+						/* addrel, addrel, mea culpa! */
+
+	if binary (rel (je_ptr)) < max_seg_size then
+	     if journal_entry.clock_time > 0 then
+		return;				/* great, easy */
+
+	new_name = journal.subsequent_journal_name;
+
+	call terminate_file_ (journalp, (0), TERM_FILE_TERM, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	if new_name = "" then do;
+	     eoj = "1"b;
+	     return;
+	end;
+	journal_dir = pathname_ (system_dir, "journals");
+	call initiate_file_ (journal_dir, new_name, RW_ACCESS, journalp, (0), code);
+	if code ^= 0 then do;
+	     call admin_gate_$syserr_error_code (BEEP, code, "RCP: Cannot initiate journal ^a.",
+		pathname_ (system_dir, new_name));
+	     goto error_return;
+	end;
+
+	je_ptr = pointer (journalp, currentsize (journal));
+	return;
+     end find_next_entry;
+
+%skip (4);
+clean_up:
+     proc (error_matters, code);
+
+dcl	error_matters	   bit (1) aligned parameter;
+dcl	code		   fixed bin (35) parameter;
+
+	if resource_desc_ptr ^= null then
+	     call release_temp_segment_ ("rcprm_journalize_", resource_desc_ptr, code);
+	if error_matters then
+	     if code ^= 0 then
+		goto error_return;
+
+	if journalp ^= null then
+	     call terminate_file_ (journalp, (0), TERM_FILE_TERM, (0));
+
+	if rcp_priv_was_on = 0 then
+	     call system_privilege_$rcp_priv_off (0);
+
+	if switch_ptr ^= null then do;
+	     call rcprm_registry_util_$release_registry (switch_ptr, code);
+	     if error_matters then
+		if code ^= 0 then
+		     goto error_return;
+	end;
+
+	if tsw_attach_ptr ^= null then do;
+	     call rcprm_registry_util_$release_transaction_control_file (tsw_attach_ptr, code);
+	     if error_matters then
+		if code ^= 0 then
+		     goto error_return;
+	end;
+
+	call cu_$level_set (prev_level);
+
+	return;
+
+     end clean_up;
+
+rename_bad_journal:
+     procedure;
+
+declare  p_code		  fixed bin (35);
+
+	p_code = code;
+
+	call hcs_$chname_seg (temp_ptr, current_journal_name, rtrim (current_journal_name) || ".bad", code);
+	if code = 0 then
+	     call admin_gate_$syserr_error_code (LOG, p_code,
+		"RCP: Failed to delete old journal ^a. Renamed it to ^a.bad",
+		pathname_ (journal_dir, current_journal_name), current_journal_name);
+	else call admin_gate_$syserr_error_code (LOG, code,
+		"RCP: Failed to rename or delete old journal ^a. Use hp_delete_vtoce.",
+		pathname_ (journal_dir, current_journal_name));
+	return;
+
+     end rename_bad_journal;
+
+
+%skip (4);
+error_return:
+	call clean_up (""b, (0));
+	return;
+%page;
+audit:
+     proc (a_registry_name);
+
+dcl	a_registry_name	   char (*);
+
+	call rcprm_registry_mgr_$audit (who_am_i, operation, prev_level, system_dir, a_registry_name, "0"b, code);
+	goto error_return;
+
+     end audit;
+
+%include access_audit_encoded_op;
+%page;
+%include rcp_ops;
+%page;
+%include rcprm_journal;
+%page;
+%include resource_control_desc;
+%page;
+%include rcprm_registry_keys;
+%page;
+%include iox_dcls;
+%page;
+%include rcprm_action_codes;
+%page;
+%include iox_modes;
+%page;
+%include rcp_registry;
+%page;
+%include force_write_flags;
+%page;
+%include create_branch_info;
+%page;
+%include syserr_constants;
+%page;
+%include access_mode_values;
+%page;
+%include terminate_file;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   RCP: Journal lost transaction for USERID. ERROR_CODE
+
+   S: $beep
+
+   T: $run
+
+   M: Some RCP Resource Management activity, while successfully completed, was
+   not properly journalized for recovery purposes.  Subsequently, if the
+   registries become damaged before they are safely copied by the System
+   Administrator, this activity will be lost.
+
+   A: $contact_sa
+
+
+   Message:
+   RCP: Journal could not be forcibly written.  ERROR CODE
+
+   S: $info
+
+   T: $run
+
+   M: A force-write to disk of the RCP journal failed.  $err
+
+   A: $contact
+
+
+   Message:
+   RCP: Cannot initiate journal PATH.  ERROR_CODE
+
+   S: $beep
+
+   T: $run
+
+   M: The RCP journal at PATH has been damaged or is missing.
+
+   A: $contact
+
+
+   Message:
+   RCP: Creating DIRNAME>rcprm.journal
+
+   S: $info
+
+   T: $run
+
+   M: Printed by RCP Resource Management when first enabled.
+
+   A: $ignore
+
+
+   Message:
+   RCP: Error during registry reconstruction for USERID.
+   RCP: Could not OPERATION RESOURCE_TYPE RESOURCE_NAME
+   {may occur multiple times}
+   RCP: End of reconstruction operation.
+
+   S: $beep
+
+
+   T: This message should only occur during a special session.  The second
+   message in the series may occur multiple times.
+
+   M: The specified RCP Resource Management activity failed to be re-performed
+   during an attempt to reconstruct the registries by the System Administrator.
+   $err
+
+   A: $contact_sa
+
+   END MESSAGE DOCUMENTATION */
+
+     end rcprm_journalize_;

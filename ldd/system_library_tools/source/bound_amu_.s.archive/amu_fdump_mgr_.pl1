@@ -1,0 +1,564 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-01-19,Parisek), approve(87-07-09,MCR7746),
+     audit(87-07-17,Fawcett), install(87-07-28,MR12.1-1049):
+     Corrected the ioa_ control string on line 149 to correctly format error
+     msg. (phx20262).
+  2) change(87-09-03,Parisek), approve(88-03-09,MCR7861),
+     audit(88-07-08,Farley), install(88-07-12,MR12.2-1055):
+     Check for inconsistent dump segment components and print the
+     inconsistencies if found.
+                                                   END HISTORY COMMENTS */
+
+
+amu_fdump_mgr_: procedure options (separate_static);
+
+
+	return;					/* not an entrypoint */
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend,ifthendo,ifthen,^thendo */
+
+/* This procedure is in charge of initiating and terminating segments which
+   make up FDUMP images. It also manages a chain of previously initiated FDUMPs,
+   in order to make the whole process more efficient. It is not, however, in any
+   way associated with address translation; that is the province of
+   amu_fdump_translate_.
+
+   09/06/80 -- WOS, from earlier version by CAH
+   07/30/81 -- RAF, to add search dir
+   08/18/81 -- RAF, to call amu_$hardcore_fdump
+   06/30/82 -- RAF, to add find_fdump
+   08/31/84 -- BLB, to modify find_fdump and init_fdump to use system_dump_info structure.
+   11/08/84 -- BLB, to ignore non-entries when initializing best_bet values.
+*/						/* 
+
+/* Parameters */
+
+dcl  (
+     P_amu_info_ptr pointer,
+     P_caller char (*),
+     P_code fixed bin (35),
+     P_dirname char (*),
+     P_dump_info_ptr ptr,
+     P_dump_name char (*),
+     P_new fixed bin
+     ) parameter;
+
+/* Automatic */
+
+dcl  1 best_bet,
+       2 ftime fixed bin (71),
+       2 list_idx fixed bin;
+dcl  bc fixed bin (24);
+dcl  1 branch aligned like status_branch automatic;
+dcl  code fixed bin (35);
+dcl  cur_dump_time fixed bin (71);
+dcl  cur_state char (1);
+dcl  dirname char (168);
+dcl  ename char (32);
+dcl  ename_prefix varying char (32);
+dcl  ename_suffix varying char (32);
+dcl  1 fdi aligned like fdump_info automatic;
+dcl  first_seg_ename char (32);
+dcl  found bit(1);
+dcl  idx fixed bin;
+dcl  ignore_code fixed bin (35);
+dcl  ignore_bc fixed bin (24);
+dcl  path_idx fixed bin;
+dcl  rs_length fixed bin;
+dcl  starname char (32);
+dcl  system_area_ptr ptr;
+dcl  ttime fixed bin(71);
+
+/* Based */
+
+dcl  system_area area based (system_area_ptr);
+
+/* Entry and External  */
+
+dcl  amu_$error_for_caller entry options (variable);
+dcl  amu_$list_system_dumps	entry (character (*), character (8) aligned, fixed bin, pointer, pointer, 
+			fixed binary (35));
+dcl  amu_et_$invalid_dump fixed bin (35) external static;
+dcl  amu_$fdump_mpt entry (pointer, char(*), fixed bin (35));
+dcl  amu_$fdump_mpt_current_process entry (ptr);
+dcl  amu_$fdump_mpt_terminate entry (ptr);
+dcl  amu_$create_translation entry (pointer, fixed bin);
+dcl  amu_$search_path_get_dump entry (ptr, fixed bin (35));
+dcl  amu_$temp_seg_release_all entry (pointer);
+dcl  error_table_$nomatch fixed bin (35) external static;
+dcl  error_table_$noentry fixed bin (35) external static;
+dcl  error_table_$translation_failed fixed bin (35) external static;
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  hcs_$star_ entry (char (*), char (*), fixed bin (2), pointer, fixed bin, pointer, pointer, fixed bin (35));
+dcl  hcs_$status_long entry (char (*), char (*), fixed bin (1), pointer, pointer, fixed bin (35));
+dcl  initiate_file_		entry (char(*), char(*), bit(*), ptr, fixed bin(24), fixed bin(35));
+dcl  ioa_ entry () options (variable);
+dcl  ioa_$rsnnl		entry() options(variable);
+dcl pathname_			entry (char(*), char(*)) returns(char(168));
+dcl terminate_file_		entry (ptr, fixed bin(24), bit(*), fixed bin(35));
+
+dcl  cleanup condition;
+
+dcl  (addr, after, divide, hbound, lbound,
+      max, reverse, rtrim, sum,
+      null, unspec)			builtin;
+
+dcl  zero_bc fixed bin (24) int static options (constant) init (0);
+
+%page;
+
+ERROR_RETURN:					/* general error exit */
+	P_code = code;
+	return;
+
+
+/*****************************************************************************/
+
+amu_fdump_mgr_$cur_erf:
+     entry (P_amu_info_ptr);
+
+	amu_info_ptr = P_amu_info_ptr;
+	cur_state = ">";
+	call what_erf ("0"b);
+	return;
+%page;
+/*****************************************************************************/
+
+amu_fdump_mgr_$find_fdump:
+     entry (P_caller, P_amu_info_ptr, P_dump_name, P_new, P_dump_info_ptr, P_code);
+
+/* This entry finds the fdump specified by P_new; 
+
+   P_caller		who called me (input),
+   P_amu_info_ptr		amu_info pointer (input),
+			This can be null() if there is no current fdump.
+   P_dump_name		absolute pathname of the current fdump, if there 
+			is one (input),
+   P_new			number specifying the action to be taken to find 
+			the fdump (input)
+   P_dump_info_ptr		pointer to system_dump_info structure (input). 
+			The structure is filled in with the dump found (output)
+   P_code			standard error code (output).
+*/
+
+    P_code, code = 0;
+    amu_info_ptr = P_amu_info_ptr;
+    system_dump_info_ptr = P_dump_info_ptr;
+    system_area_ptr = get_system_free_area_();
+    system_dump_list_ptr = null();
+
+    ename, dirname,
+    system_dump_info.dump_dir_name, system_dump_info.dump_seg_prefix, 
+        system_dump_info.dump_name, system_dump_info.dump_entry_format = "";
+
+    on cleanup begin;
+       if system_dump_list_ptr ^= null() then free system_dump_list in (system_area);
+       end;
+    
+    call amu_$list_system_dumps ("*", SYSTEM_DUMP_LIST_VERSION_1, LIST_FDUMPS, system_area_ptr, system_dump_list_ptr, code);
+    if code ^= 0 then do;
+       call amu_$error_for_caller ((null ()), code, P_caller,
+           "Selecting the ^[first^;^[last^;^[previous^;^[next^]^]^]^] fdump.", P_new=0, P_new=1, P_new=2, P_new=3);
+       goto ERROR_RETURN;
+       end;
+
+    ttime = -1;					/* We loop to skip non-existant entries 	*/
+    do idx = 1 to system_dump_list.n_dumps while (ttime = -1);
+       call get_fdump_time (system_dump_list.per_dump(idx).dir_name, system_dump_list.per_dump(idx).full_entryname, ttime);
+       best_bet.ftime = ttime;
+       best_bet.list_idx = idx;
+       end;
+
+    if P_new >= 2 then do;   /* next */
+       call expand_pathname_(P_dump_name, dirname, ename,code);
+       if code ^= 0 then do;
+          call amu_$error_for_caller (null(), code, P_caller, "Could not expand fdump name ^a", P_dump_name);
+	goto ERROR_RETURN;
+          end;
+       call get_fdump_time (dirname, ename, ttime);
+       cur_dump_time = fdump_info.dump_seg_ptr (0) -> dump.dump_header.time;
+       best_bet.ftime = 10**15;  /* larger that 52 bit clock */
+       end;
+
+    do idx = 1 to system_dump_list.n_dumps;
+       found = "0"b;
+       call find_erf (system_dump_list.dir_name(idx), system_dump_list.full_entryname(idx), P_new, best_bet.ftime, 
+		 cur_dump_time, found);
+       if found then best_bet.list_idx = idx;
+       end;
+
+    if P_dump_name = pathname_ (system_dump_list.dir_name (best_bet.list_idx), 
+		            system_dump_list.full_entryname (best_bet.list_idx)) then do;
+						/* Nothing was found			*/
+       /* this should only happen if next or previous specified */
+       code = error_table_$noentry;
+       call amu_$error_for_caller (null(), 0, P_caller, 
+           "There is no ^[previous^;next^] fdump. The current fdump ^[^a^;^s^] is the ^[first^;last^] one.",
+	 P_new=2,  P_dump_name^="", P_dump_name, P_new=2);
+       goto ERROR_RETURN;
+       end;
+
+    else do;  /* fill in structure and return */
+       system_dump_info.dump_dir_name = system_dump_list.dir_name (best_bet.list_idx);
+       system_dump_info.dump_seg_prefix = 
+          reverse (after (after (reverse (system_dump_list.full_entryname (best_bet.list_idx)), "."), "."));
+       system_dump_info.dump_name = system_dump_list.minimal_entryname (best_bet.list_idx);
+       call ioa_$rsnnl ("^a.^^d.^a", system_dump_info.dump_entry_format, rs_length, 
+            system_dump_info.dump_seg_prefix, system_dump_info.dump_name);
+       end;
+  
+    if system_dump_list_ptr ^= null() then free system_dump_list in (system_area);
+    P_code = code;
+    return;
+%page;
+/*****************************************************************************/
+
+amu_fdump_mgr_$init_fdump:
+     entry (P_caller, P_dump_info_ptr, P_amu_info_ptr, P_code);
+
+/* This entry initializes a translation for a given fdump.
+
+   P_caller                 who called me (input)
+   P_dump_info_ptr   ptr to system_dump_info structure which contains the fdump info (input)
+   P_amu_info_ptr	        pointer to amu_info (output)
+   P_code		        standard error code (output)
+*/
+
+dcl bif bit (1);
+dcl bidx fixed bin;
+dcl bstring char (64);
+
+	P_code = 0;
+	amu_info_ptr = P_amu_info_ptr;
+	system_dump_info_ptr = P_dump_info_ptr;
+          dirname = system_dump_info.dump_dir_name;
+						/* get the primary name */
+          call ioa_$rsnnl (system_dump_info.dump_entry_format, ename, rs_length, 0);
+	call hcs_$status_long (dirname, ename, 1, addr (branch), (null ()), code);
+	if code ^= 0 then do;			/* This code wil malfunction if a dump is renamed */
+	   call amu_$error_for_caller ((null ()), code, P_caller, "^a^[>^]^a", dirname, (dirname ^= ">"), ename);
+	     goto ERROR_RETURN;
+	     end;
+
+	first_seg_ename = ename;
+
+	ename_prefix = system_dump_info.dump_seg_prefix;
+	ename_suffix = system_dump_info.dump_name;
+
+	fdi.dump_seg_ptr (*) = null ();
+	fdi.dump_seg_lth (*) = 0;
+	bidx = 0;
+	bif = "0"b;
+
+	do idx = lbound (fdi.dump_seg_ptr, 1) to hbound (fdi.dump_seg_ptr, 1);
+						/* initiate the dump segments */
+             call ioa_$rsnnl (system_dump_info.dump_entry_format, ename, rs_length, idx);
+	   call initiate_file_ (dirname, ename, R_ACCESS,  fdi.dump_seg_ptr (idx), bc, code);
+	   if (fdi.dump_seg_ptr (idx) = null ()) then
+	      if code = error_table_$noentry then do;
+	         if idx ^= 0 then do;
+		    if bidx > 0 then do;
+		         idx = idx-1;
+		         goto GOT_ALL_DUMP_SEGMENTS;
+		    end;
+		    bidx = idx;
+		    goto next_idx;
+	         end;
+	         else do;
+	            call amu_$error_for_caller (null(), code, P_caller, "FDUMP ^a.", pathname_(dirname, ename));
+		  goto ERROR_RETURN;
+		  end;
+	         end;
+	   else do;				/* some error initiating the segment */
+	      call amu_$error_for_caller (amu_info_ptr, code, P_caller, "^a^[>^]^a", dirname, (dirname ^= ">"),
+		 ename);
+	      goto ERROR_RETURN;
+	   end;
+ 	   fdi.dump_seg_lth (idx) = divide (bc, 36, 19, 0);
+	   if bidx > 0 then do;
+	        bif = "1"b;
+	        code = error_table_$translation_failed;
+	        call ioa_$rsnnl (rtrim(system_dump_info.dump_entry_format) || " dump segment missing.", bstring, (0), bidx);
+	        call amu_$error_for_caller (amu_info_ptr, code, P_caller, bstring);
+	        goto ERROR_RETURN;
+	   end;
+next_idx:	   
+	   end;					/* of loop finding segments */
+
+GOT_ALL_DUMP_SEGMENTS:
+
+	code = 0;
+          dumpptr = fdi.dump_seg_ptr (0);
+	if (unspec (dump.dump_header.valid)) ^= "1"b then do;
+						/* Is this a valid dump ?? */
+	   code, P_code = amu_et_$invalid_dump;
+	   call amu_$error_for_caller (amu_info_ptr, code, P_caller, "ERF ^a", ename);
+	   return;
+	   end;
+
+	if idx < 1 then do;				/* found nothing at all */
+	   call amu_$error_for_caller (amu_info_ptr, code, P_caller, "^a^[>^]^a", dirname, (dirname ^= ">"), ename);
+	   goto ERROR_RETURN;			/* not that code was still set */
+	   end;
+
+	call amu_$create_translation (amu_info_ptr, FDUMP_TYPE); /* get a fresh amu_info */
+
+	allocate fdump_info in (amu_area) set (amu_info.fdump_info_ptr);
+						/* make a new fdump_info */
+	fdump_info = fdi;				/* copy in what we already have */
+	fdump_info.version = AMU_FDUMP_INFO_VERSION_1;
+	fdump_info.dump_seg_0_uid = branch.uid;
+	fdump_info.dump_dname = dirname;
+	fdump_info.dump_ename = first_seg_ename;
+	fdump_info.erf_name = system_dump_info.dump_name;	/* strip off the leading period */
+	fdump_info.ref_count = 1;
+	fdump_info.n_dump_segs = idx;
+	fdump_info.copy_block_ptr = null ();
+	fdump_info.system_id, fdump_info.version_id = "";
+	cur_state = ">";
+	amu_info.process_idx = 0;
+						/* fill in the process table */
+	call amu_$fdump_mpt (amu_info_ptr, P_caller, code); 
+	if code ^= 0 then do;			/* msg already printed */
+	   goto ERROR_RETURN;
+	   end;
+
+	P_amu_info_ptr = amu_info_ptr;		/* return the fruits of our labors */
+
+	return;					/* end of code for this entrypoint */
+%page;
+/*****************************************************************************/
+
+amu_fdump_mgr_$name_erf:
+     entry (P_amu_info_ptr);
+	amu_info_ptr = P_amu_info_ptr;
+	cur_state = "";
+	call what_erf ("1"b);
+	return;
+%page;
+/*****************************************************************************/
+
+amu_fdump_mgr_$really_terminate_fdump:
+     entry (P_amu_info_ptr, P_code);
+
+/* This entry is used to "really" terminate an FDUMP, and free any
+   temporaries that may have been allocated for it.
+*/
+
+	amu_info_ptr = P_amu_info_ptr;
+	if amu_info.fdump_info_ptr = null then return;
+	call amu_$fdump_mpt_terminate (amu_info_ptr);
+	do idx = 1 to fdump_info.n_dump_segs;		/* terminate the dump */
+               call terminate_file_(fdump_info.dump_seg_ptr (idx - 1), zero_bc, TERM_FILE_TERM, ignore_code);
+	end;
+
+	call amu_$temp_seg_release_all (fdump_info.copy_block_ptr);
+
+	free fdump_info in (amu_area);
+
+	amu_info.fdump_info_ptr = null ();
+	return;					/* end of code for this entrypoint */
+%page;
+/*****************************************************************************/
+
+amu_fdump_mgr_$terminate_fdump:
+     entry (P_amu_info_ptr, P_code);
+
+/* This entry is used to "terminate" an FDUMP. All this means, though, is
+   that its reference count is decremented. To really terminate it (that is,
+   to reuse its temporary segments and segno's), the really_terminate_fdump
+   entrypoint must be used.
+*/
+
+	amu_info_ptr = P_amu_info_ptr;
+
+	fdump_info.ref_count = max ((fdump_info.ref_count - 1), 0);
+
+	P_code = 0;
+	return;					/* There. Simple, wasn't it? */
+%page;
+/*****************************************************************************/
+
+find_erf:
+     proc (dirname, ename, which, best_fdump_time, cur_dump_time, found);
+
+dcl best_fdump_time fixed bin (71);
+dcl cur_dump_time  fixed bin (71);
+dcl (dirname, ename) char(*);
+dcl found bit(1);
+dcl which fixed bin;
+
+dcl ttime fixed bin (71);
+
+    found = "0"b;
+    ttime = -1;
+    call get_fdump_time (dirname, ename, ttime);
+    if ttime = -1 then return;    /* couldn't look at this one, so skip */
+
+    goto case(which);
+    
+case(0):	/* look for oldest, want the first */
+
+    if ttime < best_fdump_time then do;
+       found = "1"b;
+       best_fdump_time = ttime;
+       end;
+    return;
+
+case(1): 	/* look for newest, want the last */
+
+    if ttime > best_fdump_time then do;
+       found = "1"b;
+       best_fdump_time = ttime;
+       end;
+    return;
+
+case(2):   /* look for next oldest, want previous */
+
+    if ttime < cur_dump_time then do;
+       if ttime > best_fdump_time then do;
+          found = "1"b;
+	best_fdump_time = ttime;
+	end;
+       end;
+    return;
+
+case(3):   /* look for next newest, want next */
+    
+    if ttime > cur_dump_time then do;
+       if (ttime - cur_dump_time) < best_fdump_time then do;
+          found = "1"b;
+	best_fdump_time = ttime - cur_dump_time;
+	end;
+       end;
+    return;
+
+end find_erf;
+%page;
+/*****************************************************************************/
+
+get_fdump_time:
+     proc (dirname, fdump_name, dtime);
+
+dcl  dirname char(*);
+dcl  fdump_name char (*);
+
+dcl  code fixed bin(35);
+dcl  dtime fixed bin (71);
+
+    code = 0;
+    call initiate_file_ (dirname, fdump_name, R_ACCESS, dumpptr, ignore_bc, code);
+    if dumpptr = null() then return;
+    dtime = dump.dump_header.time;
+    call terminate_file_(dumpptr, zero_bc, TERM_FILE_TERM, ignore_code);
+
+%include access_mode_values;
+
+end get_fdump_time;
+%page;
+/*****************************************************************************/
+
+amu_fdump_mgr_$list_fdump:
+     entry (P_caller, P_dirname, P_amu_info_ptr, P_code);
+
+	P_code, code = 0;
+	amu_info_ptr = P_amu_info_ptr;
+
+	if P_dirname = "" then do;
+	     call amu_$search_path_get_dump (sl_info_p, code);
+	     if code ^= 0 then do;
+		call amu_$error_for_caller ((null ()), code, P_caller, "Getting dump search paths.");
+		goto ERROR_RETURN;
+		end;
+	     do path_idx = 1 to sl_info.num_paths;
+		dirname = sl_info.paths (path_idx).pathname;
+		call list_all_erf;
+	     end;
+	     return;
+	     end;
+
+
+	else dirname = P_dirname;			/* Use the callers */
+	call list_all_erf;
+	return;
+%page;
+/*****************************************************************************/
+
+list_all_erf:
+     proc;
+	starname = "*.*.0.*";
+
+	star_entry_ptr = null ();
+	star_names_ptr = null ();
+	system_area_ptr = get_system_free_area_ ();
+
+	on condition (cleanup)
+	     begin;
+		if star_names_ptr ^= null () then free star_names in (system_area);
+		if star_entry_ptr ^= null () then free star_entries in (system_area);
+	     end;
+
+	call hcs_$star_ (dirname, starname, star_ALL_ENTRIES, addr (system_area), star_entry_count, star_entry_ptr,
+	     star_names_ptr, code);
+
+	if code = error_table_$nomatch then do;
+	     call ioa_ ("No  ERF  found in ^a", dirname);
+	     return;
+	     end;
+
+	else if code ^= 0 then do;
+	     call amu_$error_for_caller ((null ()), code, P_caller, "^a^[>^]^a", dirname, (dirname ^= ">"), starname);
+	     goto ERROR_RETURN;
+	     end;
+	call ioa_ ("ERF LIST FOR ^a", dirname);
+	do idx = 1 to star_entry_count;
+	     call ioa_ ("^-^a", star_names (idx));
+	end;
+
+	free star_names in (system_area);
+	free star_entries in (system_area);
+
+	revert condition (cleanup);
+	return;
+     end list_all_erf;
+%page;
+/*****************************************************************************/
+
+what_erf:
+     proc (print_sys_vid);
+
+dcl  date_time_ entry (fixed bin (71), char (*)),
+     dump_date char (32),
+     print_sys_vid bit (1);
+
+	dumpptr = fdump_info.dump_seg_ptr (0);
+	call date_time_ (dump.dump_header.time, dump_date);
+	if amu_info.early_dump then
+	     call ioa_ ("This is an early dump.^/");
+	call ioa_ ("^1a ERF ^3a in directory ^a dumped at ^a.^[^[^/  System-ID ^a^;^s^]^[ Version-ID ^a^;^s^]^]", 
+		cur_state, fdump_info.erf_name, fdump_info.dump_dname, dump_date, print_sys_vid, fdump_info.system_id ^= "", 
+		fdump_info.system_id, fdump_info.version_id ^= "", fdump_info.version_id);
+	if print_sys_vid then call amu_$fdump_mpt_current_process (amu_info_ptr);
+	return;
+     end what_erf;
+%page;%include access_mode_values;
+%page;%include amu_fdump_info;
+%page;%include amu_info;
+%page;%include bos_dump;
+%page;%include sl_info;
+%page;%include star_structures;
+%page;%include status_structures;
+%page;%include system_dump_info;
+%page;%include terminate_file;
+
+     end amu_fdump_mgr_;

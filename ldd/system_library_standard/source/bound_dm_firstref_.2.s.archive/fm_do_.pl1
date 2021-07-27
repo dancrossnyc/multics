@@ -1,0 +1,822 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+     audit(87-02-02,Dupuis), install(87-04-02,MR12.1-1020):
+     For TR phx20754, added code to check the version (not *another* structure
+     version check!?!) of the key_count_array and make sure that we really
+     have a key_count_array in case it has moved on us.
+                                                   END HISTORY COMMENTS */
+
+
+/* DESCRIPTION:
+   
+        This procedure implements the "do" primitives of file_manager_:
+   postcommit_do and undo.
+   
+   $undo: this entry rolls back an operation.  It implements
+   file_manager_$undo, called by before_journal_manager_ while rolling
+   back a transaction.  The information passed to this entry is that found
+   in a rollback handler in a before journal.  One of two operations can
+   be undone: file creation and file deletion.
+   
+   $postcommit_do: this entry completes an operation which
+   started in a transaction and which, because of integrity constraints,
+   cannot be completed until after the transaction commits.  This entry
+   implements file_manager_$postcommit_do and is called by
+   before_journal_manager_ while committing a transaction.  The
+   information passed to this entry is that found in a postcommit handler
+   in a before journal.  Only one operation needs to be completed after
+   the transaction commits, file deletion.
+*/
+
+/* HISTORY:
+
+Written by Matthew C. Pierret, 10/17/84.
+Modified:
+12/10/84 by Matthew Pierret:  Changed to set validation level.
+12/17/84 by Matthew Pierret:  Changed to set the file state in the
+            file_access_info.
+01/10/85 by Matthew C. Pierret:  Changed UNDO_DELETE to not check for a match
+            between the given file uid and the file system uid.  It is not
+            necessarily incorrect for these two values to be different.
+02/28/85 by Matthew C. Pierret:  Changed UNDO_CREATE and DO_DELETE to delete
+            the file before removing the entry in sys_pn_tbl.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+03/11/85 by Matthew C. Pierret:  Added the increments postcommit handler.
+03/11/85 by R. Michael Tague:  Completed implementation of the increments
+	  postcommit handler.
+04/22/85 by R. Michael Tague:  Changed to use $internal_get_ci_ptr instead of
+	  $get_ci_ptr to get around the problem of updating increment info
+	  on files that have been closed.  This returns a pointer even if the
+	  file is closed.
+04/25/85 by Matthew C. Pierret:  Changed UNDO_CREATE and DO_DELETE to not
+            remove entries from sys_pn_tbl.  This guarantees that even if
+            rollbacks are repeated, the file uid in each active before journal
+            record can also be found in sys_pn_tbl.  The sys_pn_tbl entries
+            are now deleted during the post-transaction phase of the
+            commit/abort.  SET_ENTRY_STATE is used to be sure that the file is
+            scheduled for post-transaction actions.
+05/03/85 by Matthew Pierret:  Changed UNDO_CREATE and DO_DELETE to discard
+            modified pages for the file to be deleted from the list of modified
+            pages maintained for flushing.
+*/
+
+/* format: style2,ind3,ll79,comcol50,^indprocbody,^indnoniterdo,indnoniterend */
+/* format: ^indblkcom,indcomtxt */
+
+fm_do_$undo:
+   proc (p_file_uid, p_file_oid, p_rollback_info_ptr, p_rollback_info_length,
+        p_code);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+   dcl	 p_file_uid	    bit (36) aligned;
+				         /* Unique id of file. */
+   dcl	 p_file_oid	    bit (36) aligned;
+				         /* Opening id of file */
+   dcl	 p_rollback_info_ptr    ptr;	         /* points to rollback info. */
+   dcl	 p_rollback_info_length fixed bin;     /* byte length of rollback_info */
+   dcl	 p_postcommit_info_ptr  ptr;	         /* points to postcommit info. */
+   dcl	 p_postcommit_info_length
+			    fixed bin;     /* byte length of postcommit_info */
+   dcl	 p_code		    fixed bin (35);
+
+/* Automatic */
+
+   dcl	 my_file_oid	    bit (36) aligned init (""b);
+   dcl	 my_file_uid	    bit (36) aligned init (""b);
+   dcl	 saved_validation_level fixed bin init (0);
+
+/* Based */
+/* Builtin */
+
+   dcl	 (addbitno, addr, lbound, null, rtrim, stacq, substr)
+			    builtin;
+
+/* Condition */
+
+   dcl	 cleanup		    condition;
+
+/* Constant */
+
+   dcl	 myname		    init ("fm_do_") char (32) varying
+			    internal static options (constant);
+   dcl	 BITS_PER_BYTE	    fixed bin init (9) internal static
+			    options (constant);
+   dcl	 BITS_PER_WORD	    fixed bin init (36) internal static
+			    options (constant);
+   dcl	 MAX_UPDATE_ATTEMPTS    fixed bin (35) init (10000) internal
+			    static options (constant);
+   dcl	 (
+	 POSTCOMMIT_ACTION	    init ("complete"),
+	 UNDO_ACTION	    init ("undo")
+	 )		    char (8) internal static options (constant);
+
+/* Entry */
+
+   dcl	 cu_$level_get	    entry (fixed bin);
+   dcl	 cu_$level_set	    entry (fixed bin);
+   dcl	 dm_misc_util_$log	    entry options (variable);
+   dcl	 get_ring_	    entry () returns (fixed bin (3));
+   dcl	 fm_get_$internal_get_ci_ptr
+			    entry (bit (36) aligned,
+			    fixed bin (27) aligned, ptr, fixed bin (35));
+   dcl	 fm_put_$discard_file_flush_list
+			    entry (bit (36) aligned, fixed bin (35));
+   dcl	 fm_sys_pn_tbl_util_$rename
+			    entry (bit (36) aligned, fixed bin,
+			    char (32));
+   dcl	 fm_sys_pn_tbl_util_$redelete_force
+			    entry (bit (36) aligned, fixed bin);
+   dcl	 hcs_$chname_file	    entry (char (*), char (*), char (*),
+			    char (*), fixed bin (35));
+   dcl	 hcs_$del_dir_tree	    entry (char (*), char (*), fixed bin (35));
+   dcl	 hcs_$delentry_file	    entry (char (*), char (*), fixed bin (35));
+   dcl	 hcs_$set_safety_sw	    entry (char (*), char (*), bit (1),
+			    fixed bin (35));
+   dcl	 ioa_$rsnnl	    entry () options (variable);
+   dcl	 pathname_	    entry (char (*), char (*))
+			    returns (char (168));
+
+/* External */
+
+   dcl	 dm_error_$bad_file_oid fixed bin (35) ext;
+   dcl	 dm_error_$fm_bad_postcommit_operation
+			    fixed bin (35) ext;
+   dcl	 dm_error_$fm_bad_undo_op
+			    fixed bin (35) ext;
+   dcl	 dm_error_$fm_word_increment_error
+			    fixed bin (35) ext;
+   dcl	 dm_error_$incr_array_not_found
+			    fixed bin (35) ext;
+   dcl	 error_table_$segnamedup
+			    fixed bin (35) ext;
+   dcl	 error_table_$noentry   fixed bin (35) ext;
+   dcl	 error_table_$unimplemented_version
+			    fixed bin (35) ext;
+
+/* END OF DECLARATIONS */
+%page;
+/* undo: entry (p_file_uid, p_file_oid, p_rollback_info_ptr, p_rollback_info_length, p_code); */
+
+/* DESCRIPTION:
+
+   This entry implements file_manager_$undo.  It rolls back the
+   creation and deletion of files.  The undo algorithm must be
+   idempotent so that it can be interrupted and restarted without
+   causing an error.  The algorithms used for each of creation
+   and deletion are described in the subroutine which implements
+   the algorithm (UNDO_CREATE and UNDO_DELETE).
+
+   The create_rollback_info and delete_rollback_info are of fixed sizes,
+   so p_rollback_info_length is presently not used.
+*/
+
+   p_code = 0;
+   my_file_uid = p_file_uid;
+   my_file_oid = p_file_oid;
+   rollback_info_ptr = p_rollback_info_ptr;
+   if rollback_info_header.version ^= ROLLBACK_INFO_VERSION_1
+   then call ERROR_RETURN (error_table_$unimplemented_version,
+	   VERSION_ERROR_MESSAGE (ROLLBACK_INFO_VERSION_1,
+	   rollback_info_header.version, "rollback_info"));
+
+   call cu_$level_get (saved_validation_level);
+   on cleanup call RESET_LEVEL ();
+
+   if rollback_info_header.operation = DELETE_ROLLBACK_OPERATION
+   then call UNDO_DELETE (my_file_uid, my_file_oid, rollback_info_ptr);
+   else if rollback_info_header.operation = CREATE_ROLLBACK_OPERATION
+   then call UNDO_CREATE (my_file_uid, my_file_oid, rollback_info_ptr);
+   else call ERROR_RETURN (dm_error_$fm_bad_undo_op,
+	   rollback_info_header.operation);
+
+   call RESET_LEVEL ();
+
+   call RETURN ();
+%page;
+postcommit_do:
+   entry (p_file_uid, p_file_oid, p_postcommit_info_ptr,
+        p_postcommit_info_length, p_code);
+
+/* DESCRIPTION:
+
+   This entry implement file_manager_$postcommit_do.  It performs
+   actions which cannot be done during a transaction, but must wait
+   until the transaction has committed.  Currently there are two
+   such sets of actions, those being for file deletion and for
+   incrementing an array of words.  File deletion is delayed to
+   save us from having to make a before image of each control interval
+   in the file.  Incrementing an array of words is specifically for
+   handling the index_mnager_'s key_count_array, which is too heavily hit
+   to be exclusively locked.
+
+   The algorithms used are described in the DO_DELETE and DO_INCREMENT
+   subroutines.  The delete_postcommit_info is fixed size, so the
+   p_postcommit_info_length is not used presently.
+*/
+
+   p_code = 0;
+   my_file_uid = p_file_uid;
+   my_file_oid = p_file_oid;
+   postcommit_info_ptr = p_postcommit_info_ptr;
+   if postcommit_info_header.version ^= POSTCOMMIT_INFO_VERSION_1
+   then call ERROR_RETURN (error_table_$unimplemented_version,
+	   VERSION_ERROR_MESSAGE (POSTCOMMIT_INFO_VERSION_1,
+	   postcommit_info_header.version, "postcommit_info"));
+
+   call cu_$level_get (saved_validation_level);
+   on cleanup call RESET_LEVEL ();
+
+   if postcommit_info_header.operation = DELETE_POSTCOMMIT_OPERATION
+   then call DO_DELETE (my_file_uid, my_file_oid, postcommit_info_ptr);
+   else if postcommit_info_header.operation = INCREMENT_POSTCOMMIT_OPERATION
+   then call DO_INCREMENT (my_file_uid, my_file_oid, postcommit_info_ptr);
+   else call ERROR_RETURN (dm_error_$fm_bad_postcommit_operation,
+	   postcommit_info_header.operation);
+
+   call RESET_LEVEL ();
+
+   call RETURN ();
+%page;
+MAIN_RETURN:
+   return;
+
+RETURN:
+   proc ();
+   p_code = 0;
+   go to MAIN_RETURN;
+   end RETURN;
+
+ERROR_RETURN:
+   proc (er_p_code, er_p_message);
+
+   dcl	 er_p_code	    fixed bin (35);
+   dcl	 er_p_message	    char (*);
+
+   p_code = er_p_code;
+   call LOG_ERROR (er_p_code, er_p_message);
+   call RESET_LEVEL ();
+   go to MAIN_RETURN;
+   end ERROR_RETURN;
+
+
+
+LOG_ERROR:
+   proc (le_p_code, le_p_message);
+
+   dcl	 le_p_code	    fixed bin (35);
+   dcl	 le_p_message	    char (*);
+
+   call dm_misc_util_$log (LOG_SV, le_p_code, myname, le_p_message);
+   return;
+   end LOG_ERROR;
+
+ACTION_ERROR_MESSAGE:
+   proc (aem_p_action, aem_p_operation, aem_p_file) returns (char (*));
+
+   dcl	 aem_p_action	    char (8);
+   dcl	 aem_p_operation	    char (8);
+   dcl	 aem_p_file	    char (168);
+   dcl	 aem_return_string	    char (256);
+   dcl	 aem_return_length	    fixed bin (21);
+
+   call ioa_$rsnnl ("Unable to ^a the ^a of ^a.", aem_return_string,
+        aem_return_length, aem_p_action, aem_p_operation, aem_p_file);
+   return (substr (aem_return_string, 1, aem_return_length));
+
+   end ACTION_ERROR_MESSAGE;
+
+VERSION_ERROR_MESSAGE:
+   proc (vem_p_expected_version, vem_p_given_version, vem_p_structure)
+        returns (char (*));
+
+   dcl	 vem_p_expected_version char (8);
+   dcl	 vem_p_given_version    char (8);
+   dcl	 vem_p_structure	    char (*);
+   dcl	 vem_return_string	    char (256);
+   dcl	 vem_return_length	    fixed bin (21);
+
+   call ioa_$rsnnl ("Expected version ^a of ^a; received ^a.",
+        vem_return_string, vem_return_length, vem_p_expected_version,
+        vem_p_structure, vem_p_given_version);
+   return (substr (vem_return_string, 1, vem_return_length));
+
+   end VERSION_ERROR_MESSAGE;
+
+RESET_LEVEL:
+   proc ();
+
+   if saved_validation_level > 0
+   then call cu_$level_set (saved_validation_level);
+
+   end RESET_LEVEL;
+%page;
+UNDO_CREATE:
+   proc (uc_p_file_uid, uc_p_file_oid, uc_p_create_rollback_info_ptr);
+
+/* DESCRIPTION of UNDO_CREATE:
+
+   The algorithm to undo creation is:
+
+   1) Discard entries for this file in the list of modified pages
+   for this transaction.  We don't want the segment numbers in that list
+   re-used while flushing.
+   2) If uc_p_file_oid is non-null, meaning that the undo is being
+   performed by the process which created the transaction, mark
+   the per-process file access info to have a state of
+   FILE_DOES_NOT_EXIST.
+   3) Delete the file.
+   4) If uc_p_file_oid is non-null, mark the file access info as
+   requiring post-transaction actions.  In the post-transaction
+   phase of the abort, the file's uid will be removed from the
+   uid-pathname table (sys_pn_tbl).  This action is delayed so
+   that if the abort is repeated, the uid will still be in sys_pn_tbl.
+*/
+
+   dcl	 uc_p_file_uid	    bit (36) aligned parameter;
+   dcl	 uc_p_file_oid	    bit (36) aligned parameter;
+   dcl	 uc_p_create_rollback_info_ptr
+			    ptr parameter;
+   dcl	 uc_sys_pn_tbl_index    fixed bin;
+   dcl	 uc_dir_path	    char (168);
+   dcl	 uc_file_name	    char (32);
+   dcl	 uc_code		    fixed bin (35);
+
+   uc_sys_pn_tbl_index =
+        uc_p_create_rollback_info_ptr -> create_rollback_info.sys_pn_tbl_index;
+   uc_dir_path =
+        uc_p_create_rollback_info_ptr -> create_rollback_info.dir_path;
+   uc_file_name =
+        uc_p_create_rollback_info_ptr -> create_rollback_info.file_name;
+
+   call cu_$level_set ((get_ring_ ()));
+
+
+   call SET_FILE_STATE (uc_p_file_oid, FILE_DOES_NOT_EXIST);
+
+   uc_code = 0;
+   call fm_put_$discard_file_flush_list (uc_p_file_uid, uc_code);
+   if uc_code ^= 0
+   then call ERROR_RETURN (uc_code,
+	   ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+	   pathname_ (rtrim (uc_dir_path), uc_file_name)));
+   call hcs_$set_safety_sw (uc_dir_path, uc_file_name, "0"b, uc_code);
+   if uc_code ^= 0 & uc_code ^= error_table_$noentry
+   then call ERROR_RETURN (uc_code,
+	   ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+	   pathname_ (rtrim (uc_dir_path), uc_file_name)));
+   if uc_code ^= error_table_$noentry
+   then
+      do;
+      call hcs_$del_dir_tree (uc_dir_path, uc_file_name, uc_code);
+      if uc_code ^= 0
+      then call ERROR_RETURN (uc_code,
+	      ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+	      pathname_ (rtrim (uc_dir_path), uc_file_name)));
+      call hcs_$delentry_file (uc_dir_path, uc_file_name, uc_code);
+      if uc_code ^= 0
+      then call ERROR_RETURN (uc_code,
+	      ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+	      pathname_ (rtrim (uc_dir_path), uc_file_name)));
+      end;
+
+   call SET_ENTRY_STATE (uc_p_file_oid);
+
+   return;
+
+   end UNDO_CREATE;
+%page;
+UNDO_DELETE:
+   proc (ud_p_file_uid, ud_p_file_oid, ud_p_delete_rollback_info_ptr);
+
+/* DESCRIPTION of UNDO_DELETE:
+
+   The algorithm to undo deletion is:
+
+   0) The initial state should have a file with a delete-name
+   and an entry in sys_pn_tbl with the delete-name, or any
+   intermediate state during this algorithm.
+   1) Add the predelete-name back to the file. If no error
+   occurs, or an error occurs because then name is already on
+   the entry or the entry does not exist, continue.
+   Otherwise, a real error has occured.
+   2) Change the file name in the sys_pn_tbl from the delete-name
+   to the predelete-name.  Whether this step has been done once
+   before or not, an entry must exist in the sys_pn_tbl, so
+   a real error occurs if this step fails. fm_sys_pn_tbl_util_$rename
+   does not return if an error occurs (it signals fm_sub_error_).
+   3) Remove the delete-name from the file.  If the file is
+   not found, assume we have already done this step.  Any other
+   error is a real error.
+*/
+
+   dcl	 ud_p_file_uid	    bit (36) aligned parameter;
+   dcl	 ud_p_file_oid	    bit (36) aligned parameter;
+   dcl	 ud_p_delete_rollback_info_ptr
+			    ptr parameter;
+   dcl	 ud_sys_pn_tbl_index    fixed bin;
+   dcl	 ud_dir_path	    char (168);
+   dcl	 ud_predelete_name	    char (32);
+   dcl	 ud_postdelete_name	    char (32);
+   dcl	 ud_postdelete_path	    char (168);
+   dcl	 ud_code		    fixed bin (35);
+
+   ud_sys_pn_tbl_index =
+        ud_p_delete_rollback_info_ptr -> delete_rollback_info.sys_pn_tbl_index;
+   ud_dir_path =
+        ud_p_delete_rollback_info_ptr -> delete_rollback_info.dir_path;
+   ud_predelete_name =
+        ud_p_delete_rollback_info_ptr -> delete_rollback_info.predelete_name;
+   ud_postdelete_name =
+        ud_p_delete_rollback_info_ptr -> delete_rollback_info.postdelete_name;
+
+   call cu_$level_set ((get_ring_ ()));
+   ud_postdelete_path = pathname_ (ud_dir_path, ud_postdelete_name);
+   ud_code = 0;
+
+   call hcs_$chname_file (ud_dir_path, ud_postdelete_name, "",
+        ud_predelete_name, ud_code);
+   if ud_code ^= 0 & ud_code ^= error_table_$noentry
+        & ud_code ^= error_table_$segnamedup
+   then call ERROR_RETURN (ud_code,
+	   ACTION_ERROR_MESSAGE (UNDO_ACTION, DELETE_ROLLBACK_OPERATION,
+	   pathname_ (rtrim (ud_dir_path), ud_postdelete_name)));
+
+   call fm_sys_pn_tbl_util_$rename (ud_p_file_uid, ud_sys_pn_tbl_index,
+        ud_predelete_name);
+
+   call SET_FILE_STATE (ud_p_file_oid, FILE_EXISTS);
+
+   call hcs_$chname_file (ud_dir_path, ud_postdelete_name, ud_postdelete_name,
+        "", ud_code);
+   if ud_code ^= 0 & ud_code ^= error_table_$noentry
+   then call ERROR_RETURN (ud_code,
+	   ACTION_ERROR_MESSAGE (UNDO_ACTION, DELETE_ROLLBACK_OPERATION,
+	   pathname_ (rtrim (ud_dir_path), ud_postdelete_name)));
+
+   return;
+
+   end UNDO_DELETE;
+%page;
+DO_DELETE:
+   proc (dd_p_file_uid, dd_p_file_oid, dd_p_delete_postcommit_info_ptr);
+
+/* DESCRIPTION of DO_DELETE:
+
+   This routine does the actual deletion of an already logically deleted file.
+   The algorithm to actually delete a file is:
+
+   0) Normally the file will have a unique name and will have an
+   entry in the sys_pn_tbl with that name.
+   1) Discard entries for this file in the list of modified pages
+   for this transaction.  We don't want the segment numbers in that list
+   re-used while flushing.
+   2) Delete the file.
+   3) If dd_p_file_oid is non-null, meaning that the process which
+   created this transaction is performing this postcommit_do,
+   mark the per-process file access info to state that the file is
+   deleted.
+   4) The file's entry is sys_pn_tbl must be removed, but cannot until
+   after the transaction commits.  If dd_p_file_oid is non-null, then
+   it was scheduled for such post-transaction actions when the file
+   was logically deleted.  If dd_p_file_oid is null, then we can't
+   schedule a post-transaction action.  The entry will stay in sys_pn_tbl
+   until it is salvaged by fm_sys_pn_tbl_util_$insert.
+*/
+
+   dcl	 dd_p_file_uid	    bit (36) aligned parm;
+   dcl	 dd_p_file_oid	    bit (36) aligned parm;
+   dcl	 dd_p_delete_postcommit_info_ptr
+			    ptr parameter;
+   dcl	 dd_sys_pn_tbl_index    fixed bin;
+   dcl	 dd_dir_path	    char (168);
+   dcl	 dd_file_name	    char (32);
+   dcl	 dd_code		    fixed bin (35);
+
+   dd_sys_pn_tbl_index =
+        dd_p_delete_postcommit_info_ptr
+        -> delete_postcommit_info.sys_pn_tbl_index;
+   dd_dir_path =
+        dd_p_delete_postcommit_info_ptr -> delete_postcommit_info.dir_path;
+   dd_file_name =
+        dd_p_delete_postcommit_info_ptr -> delete_postcommit_info.file_name;
+
+   call cu_$level_set ((get_ring_ ()));
+
+
+   dd_code = 0;
+   call fm_put_$discard_file_flush_list (dd_p_file_uid, dd_code);
+   if dd_code ^= 0
+   then call ERROR_RETURN (dd_code,
+	   ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+	   DELETE_POSTCOMMIT_OPERATION,
+	   pathname_ (dd_dir_path, dd_file_name)));
+   call hcs_$set_safety_sw (dd_dir_path, dd_file_name, "0"b, dd_code);
+   if dd_code ^= 0 & dd_code ^= error_table_$noentry
+   then call ERROR_RETURN (dd_code,
+	   ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+	   DELETE_POSTCOMMIT_OPERATION,
+	   pathname_ (rtrim (dd_dir_path), dd_file_name)));
+   if dd_code ^= error_table_$noentry
+   then
+      do;
+      call hcs_$del_dir_tree (dd_dir_path, dd_file_name, dd_code);
+      if dd_code ^= 0
+      then call ERROR_RETURN (dd_code,
+	      ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+	      DELETE_POSTCOMMIT_OPERATION,
+	      pathname_ (rtrim (dd_dir_path), dd_file_name)));
+      call hcs_$delentry_file (dd_dir_path, dd_file_name, dd_code);
+      if dd_code ^= 0
+      then call ERROR_RETURN (dd_code,
+	      ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+	      DELETE_POSTCOMMIT_OPERATION,
+	      pathname_ (rtrim (dd_dir_path), dd_file_name)));
+      end;
+
+   call SET_FILE_STATE (dd_p_file_oid, FILE_DOES_NOT_EXIST);
+
+   call SET_ENTRY_STATE (dd_p_file_oid);
+
+   return;
+
+   end DO_DELETE;
+%page;
+DO_INCREMENT:
+   proc (di_p_file_uid, di_p_file_oid, di_p_increment_postcommit_info_ptr);
+
+/* DESCRIPTION of DO_INCREMENT
+
+   This procedure updates an array of words with increment values pointed to by
+   a pointer in the increment postcommit handler.  Since the increment values
+   are stored per process, if this is not the process that wrote the postcommit
+   handler then, we cannot update the file increments.
+
+   The accurate updating of the file values is done using the stacq builtin.
+   Up to MAX_UPDATE_ATTEMPTS attempts at updating the file value using stacq
+   are made before we give up trying.  di_file_word is the word in the DM file
+   to be updated, di_old_file_word is the local copy of this word,
+   di_file_word_increment is the value to be added to the local copy, and
+   di_new_file_word is the local variable containing the sum of the old value
+   and the increment.  The stacq builtin replaces the value in the DM file with
+   the new value if the file value has not changed since it was copied to the
+   local old value.
+*/
+
+   dcl	 di_p_file_uid	    bit (36) aligned parameter;
+   dcl	 di_p_file_oid	    bit (36) aligned parameter;
+   dcl	 di_p_increment_postcommit_info_ptr
+			    ptr parameter;
+
+   dcl	 1 my_inc_postcommit_info
+			    aligned like increment_postcommit_info;
+   dcl	 di_increment_ptr	    ptr;
+   dcl	 di_number_of_words	    fixed bin (35);
+   dcl	 di_ci_number	    fixed bin (27);
+   dcl	 di_offset_in_bytes	    fixed bin (35);
+
+   dcl	 di_increment_index	    fixed bin (35);
+   dcl	 di_update_attempts	    fixed bin (35);
+   dcl	 di_increment_word_ptr  ptr;
+   dcl	 di_file_word	    fixed bin (35) aligned
+			    based (di_increment_word_ptr);
+   dcl	 di_old_file_word	    fixed bin (35) aligned;
+   dcl	 di_new_file_word	    fixed bin (35) aligned;
+   dcl	 di_file_word_increment fixed bin (35) aligned
+			    based (di_increment_ptr);
+
+   dcl	 di_file_state	    fixed bin;
+   dcl	 di_code		    fixed bin (35);
+
+   if di_p_file_oid = ""b
+   then return;
+
+   call GET_FILE_STATE (di_p_file_oid, di_file_state);
+   if di_file_state = FILE_DOES_NOT_EXIST
+   then return;
+
+   call cu_$level_set ((get_ring_ ()));
+
+   unspec (my_inc_postcommit_info) =
+        unspec (di_p_increment_postcommit_info_ptr
+        -> increment_postcommit_info);
+   di_increment_ptr = my_inc_postcommit_info.increments_ptr;
+   di_number_of_words = my_inc_postcommit_info.number_of_words;
+   di_ci_number = my_inc_postcommit_info.ci_number;
+   di_offset_in_bytes = my_inc_postcommit_info.offset_in_bytes;
+
+   call fm_get_$internal_get_ci_ptr (di_p_file_oid, di_ci_number,
+        di_increment_word_ptr, di_code);
+   if di_code ^= 0
+   then call ERROR_RETURN (di_code,
+	   " Cannot get CI pointer to update increment words.");
+
+   di_increment_word_ptr =
+        addbitno (di_increment_word_ptr, di_offset_in_bytes * BITS_PER_BYTE);
+
+/* there should be a key_count_array here */
+   key_count_array_ptr = addcharno(di_increment_word_ptr,-KEY_COUNT_OFFSET_IN_CHARACTERS);
+   if key_count_array.version ^= KEY_COUNT_ARRAY_VERSION_2 then 
+        call ERROR_RETURN (dm_error_$incr_array_not_found, "");
+
+   do di_increment_index = 1 to di_number_of_words;	
+      di_old_file_word = di_file_word;
+      di_new_file_word = di_old_file_word + di_file_word_increment;
+      do di_update_attempts = 1 to MAX_UPDATE_ATTEMPTS
+	 while (
+	 ^
+	 stacq (unspec (di_file_word), unspec (di_new_file_word),
+	 unspec (di_old_file_word)));
+         di_old_file_word = di_file_word;
+         di_new_file_word = di_old_file_word + di_file_word_increment;
+      end;
+      if di_update_attempts > MAX_UPDATE_ATTEMPTS
+      then call ERROR_RETURN (dm_error_$fm_word_increment_error,
+	      " Unable to increment DM file word after several tries.");
+      di_increment_ptr = addbitno (di_increment_ptr, BITS_PER_WORD);
+      di_increment_word_ptr = addbitno (di_increment_word_ptr, BITS_PER_WORD);
+   end;
+   return;
+
+   end DO_INCREMENT;
+%page;
+GET_FILE_STATE:
+   proc (gfs_p_file_oid, gfs_p_file_state);
+
+/* DESCRIPTION of GET_FILE_STATE:
+
+   This routine returns the file_state of the file from the process'
+   file_access_info entry in the file_access_table.
+
+*/
+
+   dcl	 gfs_p_file_oid	    bit (36) aligned parameter;
+   dcl	 gfs_p_file_state	    fixed bin parameter;
+
+   dcl	 gfs_file_access_table_idx
+			    fixed bin;
+   dcl	 gfs_file_uid_tail	    bit (18);
+
+   gfs_file_access_table_idx =
+        addr (gfs_p_file_oid) -> file_oid.file_access_table_idx;
+   gfs_file_uid_tail = addr (gfs_p_file_oid) -> file_oid.uid_tail;
+
+   if gfs_file_access_table_idx < lbound (file_access_table.e, 1)
+        | gfs_file_access_table_idx > file_access_table.h.last_entry
+   then call ERROR_RETURN (dm_error_$bad_file_oid,
+	   " File access table index out of range.");
+
+   if gfs_file_uid_tail
+        ^= substr (file_access_table.e (gfs_file_access_table_idx).uid, 19, 18)
+   then call ERROR_RETURN (dm_error_$bad_file_oid,
+	   " File access table entry uid does not match uid tail.");
+
+   gfs_p_file_state =
+        file_access_table.e (gfs_file_access_table_idx).state.file_state;
+
+   return;
+
+   end GET_FILE_STATE;
+%page;
+SET_FILE_STATE:
+   proc (sfs_p_file_oid, sfs_p_file_state);
+
+/* DESCRIPTION of SET_FILE_STATE:
+
+   This routine sets the file_state of the file in the process'
+   file_access_info entry in the file_access_table for this file.
+   If sfs_p_file_oid is equal to ""b, this process is a process other
+   than the one which wrote the postcommit/rollback handler which is
+   now executing and does not need to have its file_access_info updated.
+   By contract, before_journal_manager_ passes in a ""b sfs_p_file_oid in
+   this case.
+
+   If sfs_p_file_oid is not ""b, it is used to find the file_access_info
+   entry.  The file_state is updated to the given value.
+
+   file_access_table is based on the external pointer variable
+   fm_data_$file_access_table_ptr, so is file_access_table is accessible
+   merely because fm_data_$file_access_table_ptr is declared in the
+   main procedure.
+
+   If the sfs_p_file_oid and the file_access_info entry are not in synch,
+   just return quietly.
+*/
+
+   dcl	 sfs_p_file_oid	    bit (36) aligned parameter;
+   dcl	 sfs_p_file_state	    fixed bin parameter;
+
+   dcl	 sfs_file_access_table_idx
+			    fixed bin;
+   dcl	 sfs_file_uid_tail	    bit (18);
+
+   sfs_file_access_table_idx =
+        addr (sfs_p_file_oid) -> file_oid.file_access_table_idx;
+   sfs_file_uid_tail = addr (sfs_p_file_oid) -> file_oid.uid_tail;
+
+   if sfs_file_access_table_idx < lbound (file_access_table.e, 1)
+        | sfs_file_access_table_idx > file_access_table.h.last_entry
+   then return;
+
+   if sfs_file_uid_tail
+        ^= substr (file_access_table.e (sfs_file_access_table_idx).uid, 19, 18)
+   then return;
+
+   file_access_table.e (sfs_file_access_table_idx).state.file_state =
+        sfs_p_file_state;
+
+   return;
+
+   end SET_FILE_STATE;
+%page;
+SET_ENTRY_STATE:
+   proc (ses_p_file_oid);
+
+/* DESCRIPTION of SET_ENTRY_STATE:
+
+   This routine sets the entry_state of the file in the process'
+   file_access_info entry in the file_access_table for this file
+   such that it is scheduled for post-transaction actions.
+
+   If ses_p_file_oid is equal to ""b, this process is a process other
+   than the one which wrote the postcommit/rollback handler which is
+   now executing and does not need to have its file_access_info updated.
+   By contract, before_journal_manager_ passes in a ""b ses_p_file_oid in
+   this case.
+
+   If ses_p_file_oid is not ""b, it is used to find the file_access_info
+   entry.  The entry is added to the list of entries scheduled for
+   post-transaction actions by setting entry_state to the value of
+   the entry index of the last entry so scheduled.
+
+   file_access_table is based on the external pointer variable
+   fm_data_$file_access_table_ptr, so is file_access_table is accessible
+   merely because fm_data_$file_access_table_ptr is declared in the
+   main procedure.
+*/
+
+   dcl	 ses_p_file_oid	    bit (36) aligned parameter;
+
+   dcl	 ses_file_access_table_idx
+			    fixed bin;
+   dcl	 ses_file_uid_tail	    bit (18);
+   dcl	 ses_entry_idx	    fixed bin;
+
+   ses_file_access_table_idx =
+        addr (ses_p_file_oid) -> file_oid.file_access_table_idx;
+   ses_file_uid_tail = addr (ses_p_file_oid) -> file_oid.uid_tail;
+
+   if ses_file_access_table_idx < lbound (file_access_table.e, 1)
+        | ses_file_access_table_idx > file_access_table.h.last_entry
+   then return;
+
+   if ses_file_uid_tail
+        ^= substr (file_access_table.e (ses_file_access_table_idx).uid, 19, 18)
+   then return;
+
+   if file_access_table.e (ses_file_access_table_idx).pn_tbl_idx <= 0
+   then return;
+
+   do ses_entry_idx = file_access_table.h.post_transaction_actions
+        repeat (file_access_table.e (ses_entry_idx).state.entry_state)
+        while (ses_entry_idx > 0 & ses_entry_idx ^= ses_file_access_table_idx);
+   end;
+   if ses_entry_idx = ses_file_access_table_idx
+   then return /* already on the list */;
+   else
+      do /* add to list */;
+      file_access_table.e (ses_file_access_table_idx).state.entry_state =
+	 file_access_table.h.post_transaction_actions;
+      file_access_table.h.post_transaction_actions = ses_file_access_table_idx;
+      end;
+
+   return;
+
+   end SET_ENTRY_STATE;
+%page;
+%include dm_key_count_array;
+%page;
+%include dm_fm_file_oid;
+%page;
+%include dm_fm_file_access_info;
+%page;
+%include dm_fm_file_access_tbl;
+%page;
+%include dm_fm_rollback_info;
+%page;
+%include dm_fm_postcommit_info;
+%page;
+%include dm_file_validation_name;
+%page;
+%include dm_log_sv_codes;
+
+   end fm_do_$undo;

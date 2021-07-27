@@ -1,0 +1,605 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+/* Utility Module of the APL Device Interface Module.
+   Paul Green, July 1973
+   Modified 740511 by PG to properly handle default line & page lengths.
+   Modified 740530 by PG to add tabsin mode.
+   Modified 741104 by PG to fix detach/reattach handling.
+   Modified 750722 by PG to get baud rate properly under MCS.
+   Modified 770406 by PG to have set_tab_width control tab mode, too.
+   Modified 771003 by PG to have initialize_sdb clear status in all cases.
+   Modified 790613 by PG to fix 402 (TTYDIM changes broke quit-editing).
+   Modified 790910 by PG to record 1200 baud info, and to complete switch to iox_.
+   Modified 800128 by Warren Johnson to allow graphic mode.
+   Modified 800130 by PG to use 1200 baud delay values if actual baud > 1200,
+	and to call apl_dim_select_table_.
+   Modified 800226 by PG to implement ^ll mode.
+*/
+
+/* format: style3 */
+apl_dim_attach:
+     procedure (stream, my_name, att_stream, modes, bv_status, sdb_ptr);
+
+/* parameters */
+
+dcl	(
+	bv_status		bit (72) aligned,		/* status returned by call */
+	stream		char (*),			/* stream name */
+	my_name		char (*),			/* this dim's name */
+	att_stream	char (*),			/* stream to which it is attached */
+	modes		char (*)
+	)		parameter;		/* i/o mode */
+
+/* entries */
+
+dcl	apl_dim_select_table_
+			entry (char (*), ptr, bit (1) aligned),
+	convert_binary_integer_$decimal_string
+			entry (fixed bin) returns (char (12) varying),
+	get_system_free_area_
+			entry () returns (ptr),
+	iox_$control	entry (ptr, char (*), ptr, fixed bin (35)),
+	iox_$find_iocb	entry (char (*), ptr, fixed bin (35)),
+	iox_$get_chars	entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35)),
+	iox_$modes	entry (ptr, char (*), char (*), fixed bin (35)),
+	iox_$put_chars	entry (ptr, ptr, fixed bin (21), fixed bin (35));
+
+/* external static */
+
+dcl	(
+	error_table_$ionmat,
+	error_table_$action_not_performed,
+	error_table_$bad_mode,
+	error_table_$no_room_for_sdb
+	)		external fixed bin (35) aligned static;
+
+/* builtin */
+
+dcl	(addr, addrel, binary, length, null, pointer, substr, unspec)
+			builtin;
+
+/* automatic */
+
+dcl	i		fixed bin,
+	quit_read_n_transmitted
+			fixed bin (21),
+	char_1		char (1) aligned,
+	bit_char		bit (9) aligned,
+	system_area_ptr	ptr,
+	quit_pending	bit (1) aligned;
+
+/* internal static */
+
+dcl	working_table_ptr	ptr internal static initial (null);
+
+/* internal static "constants" */
+
+dcl	new_line		char (1) internal static options (constant) initial ("
+");
+
+/* based */
+
+dcl	system_area	area (65536) based (system_area_ptr);
+
+/* conditions */
+
+dcl	(apl_quit_, area, bad_area_format, quit)
+			condition;
+
+/* include files */
+
+%include apl_dim_sdb;
+%include apl_dim_table;
+
+/* program */
+
+	bv_status, status = ""b;
+	if sdb_ptr ^= null				/* multiple attachment */
+	then do;
+		status_code = error_table_$ionmat;
+		stream_detached = "1"b;
+		bv_status = status;
+		return;
+	     end;
+
+	on area, bad_area_format go to cant_do_it;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	allocate stream_data_block in (system_area) set (sdb_ptr);
+
+	call iox_$find_iocb (stream, stream_data_block.iocb_ptr, status_code);
+	call iox_$find_iocb ((stream_data_block.name), stream_data_block.device_iocb_ptr, status_code);
+	call initialize_sdb (working_table_ptr);
+	go to chmodes;				/* set the modes */
+
+cant_do_it:
+	status_code = error_table_$no_room_for_sdb;
+	stream_detached = "1"b;
+	bv_status = status;
+	return;
+
+apl_dim_order:
+     entry (sdb_ptr, request, arg_ptr, bv_status);	/* order requests are interpreted or passed on */
+
+dcl	request		char (*),			/* request */
+	arg_ptr		ptr,			/* ptr to table or to maximum length values */
+	fbin_arg		based (arg_ptr) fixed bin (35);
+						/* fixed point args to line_ */
+						/* and page_length calls */
+
+dcl	keying_time_param	fixed bin (71) based (arg_ptr),
+	device_type_param	char (32) based (arg_ptr);
+
+declare	1 read_status_structure
+			aligned,
+	  2 event_channel	fixed bin (71),
+	  2 input_available bit (1);
+
+	bv_status, status = ""b;
+
+	device_ptr = stream_data_block.device_info_ptr;
+	conversion_ptr = stream_data_block.conv_tab_ptr;
+
+	if request = "process_quit"			/* handle APL QUIT editing feature */
+	then do;
+
+/* To make this code immune to quits (in case the user manages to sneak in two
+   quits in a big hurry), we'll set up a handler which just sets a flag.
+   If the flag is on, we'll assume he didn't type anything first, and cause
+   an APL interrupt when things have settled down. */
+
+		quit_pending = "0"b;
+
+		on quit quit_pending = "1"b;
+
+		call iox_$control (stream_data_block.device_iocb_ptr, "read_status", addr (read_status_structure),
+		     status_code);
+		if status_code ^= 0
+		then quit_read_n_transmitted = 0;
+		else if ^input_available		/* No input waiting */
+		then quit_read_n_transmitted = 0;
+		else do;
+			call iox_$get_chars (stream_data_block.device_iocb_ptr, addr (quit_read_buffer),
+			     length (quit_read_buffer), quit_read_n_transmitted, status_code);
+		     end;
+
+/* do a reset-read just in case the line break (QUIT) looked like a character
+   with bad parity. */
+
+		call iox_$control (stream_data_block.device_iocb_ptr, "resetread", null, status_code);
+
+/* If the user didn't type anything, or this console doesn't
+   have LINE FEED, we treat the QUIT as an APL interrupt.
+   Note that APL/360 allows a user to type 0 characters
+   and still edit. What a crock! */
+
+		if quit_read_n_transmitted = 0 | ^quit_editing_allowed
+		then do;
+			call interrupt_action;
+			return;
+		     end;
+
+/* check for unmodified 2741-type terminals. */
+
+		if quit_read_n_transmitted = 1
+		then do;
+			char_1 = substr (quit_read_buffer, 1, 1);
+			bit_char = unspec (char_1);
+			if device_move (binary (bit_char, 9)) = "11"b3
+						/* 9 == Quit char (EOT) */
+			then do;
+				call interrupt_action;
+				return;
+			     end;
+		     end;
+
+/* we now know that this is an "editing quit" */
+
+		call iox_$put_chars (stream_data_block.device_iocb_ptr, addrel (addr (editing_prompt), 1),
+		     length (editing_prompt), status_code);
+
+		call iox_$control (stream_data_block.device_iocb_ptr, "start", null, status_code);
+
+		unspec (char_1) = linefeed_character_device;
+
+		if canonicalization_index <= 0	/* AAARRRGGGHHH!!!!!! */
+		then canonicalization_index = 1;
+
+		substr (canonicalization_buffer, canonicalization_index, quit_read_n_transmitted + 1) =
+		     substr (quit_read_buffer, 1, quit_read_n_transmitted) || char_1;
+						/* Mark Quit with LineFeed */
+		canonicalization_index = canonicalization_index + quit_read_n_transmitted + 1;
+
+		if quit_pending
+		then call interrupt_action;
+
+		return;
+
+/* Internal procedure which performs action upon
+   receiving an APL interrupt signal */
+
+interrupt_action:
+     procedure;
+
+	call resetwrite ();
+
+	if hndlquit_mode
+	then do;
+		read_offset = -1;			/* finish resetread on apl_input_ */
+		canonicalization_index = 1;		/* .. (user_tty_ already reset) */
+		call iox_$put_chars (stream_data_block.iocb_ptr, addr (new_line), length (new_line), status_code);
+	     end;
+
+	call iox_$control (stream_data_block.device_iocb_ptr, "start", null, status_code);
+	signal apl_quit_;
+	return;
+
+     end interrupt_action;
+
+	     end;
+
+	else if request = "set_table"			/* set translation table pointer */
+	then call initialize_sdb (arg_ptr);
+	else if request = "line_length"		/* set maximum line length */
+	then do;
+		if fbin_arg >= 3
+		then max_col = fbin_arg;		/* copy argument into sdb */
+	     end;
+	else if request = "page_length"		/* set maximum page length */
+	then do;
+		if fbin_arg >= 2
+		then max_line = fbin_arg;
+	     end;
+	else if request = "table_ptr"			/* pointer to translation table currently in use */
+	then do;
+		arg_ptr = device_info_ptr;
+	     end;
+	else if request = "get_keying_time"
+	then keying_time_param = stream_data_block.keying_time;
+
+	else if request = "get_device_type"
+	then device_type_param = device_info.device_name;
+
+	else if request = "read_back_output"
+	then do;
+		if arg_ptr ^= null
+		then device_type_param = read_back_names (stream_data_block.read_back);
+
+		stream_data_block.read_back = read_back_output;
+	     end;
+
+	else if request = "read_back_spaces"
+	then do;
+		if arg_ptr ^= null
+		then device_type_param = read_back_names (stream_data_block.read_back);
+
+		stream_data_block.read_back = read_back_spaces;
+	     end;
+
+	else if request = "read_back_input"
+	then do;
+		if arg_ptr ^= null
+		then device_type_param = read_back_names (stream_data_block.read_back);
+
+		stream_data_block.read_back = read_back_input;
+	     end;
+
+	else if request = "get_tab_width"
+	then do;
+		if arg_ptr ^= null
+		then fbin_arg = stream_data_block.tab_width;
+	     end;
+
+	else if request = "set_tab_width"
+	then do;
+		i = stream_data_block.tab_width;
+
+		if arg_ptr ^= null
+		then if fbin_arg >= 0
+		     then do;
+			     if fbin_arg < 2
+			     then stream_data_block.tabm = "0"b;
+						/* turn tabs off */
+			     else stream_data_block.tabm = "1"b;
+						/* turn tabs on */
+
+			     stream_data_block.tab_width = fbin_arg;
+			     fbin_arg = i;
+			end;
+		     else status_code = error_table_$action_not_performed;
+		else stream_data_block.tab_width = 10;
+	     end;
+
+	else call iox_$control (stream_data_block.device_iocb_ptr, request, arg_ptr, status_code);
+						/* pass on order call */
+
+	bv_status = status;
+	return;
+
+initialize_sdb:
+     procedure (bv_table_ptr);
+
+/* parameters */
+
+declare	bv_table_ptr	ptr parameter;
+
+/* automatic */
+
+declare	table_ptr		ptr;
+
+declare	1 terminal_info	aligned,
+	  2 version	fixed bin,
+	  2 id		char (4) unal,
+	  2 term_type	char (32) unal,
+	  2 line_type	fixed bin,
+	  2 baud_rate	fixed bin,
+	  2 reserved	(4) fixed bin;
+
+/* program */
+
+	terminal_info.version = 1;
+	call iox_$control (stream_data_block.device_iocb_ptr, "terminal_info", addr (terminal_info), status_code);
+	if status_code = 0
+	then do;
+		if terminal_info.baud_rate = 110
+		then stream_data_block.baud_rate = baud_rate_110;
+		else if (terminal_info.baud_rate = 133) | (terminal_info.baud_rate = 150)
+		then stream_data_block.baud_rate = baud_rate_150_or_134;
+		else if terminal_info.baud_rate = 300
+		then stream_data_block.baud_rate = baud_rate_300;
+		else if terminal_info.baud_rate >= 1200
+		then stream_data_block.baud_rate = baud_rate_1200;
+		else stream_data_block.baud_rate = baud_rate_300;
+						/* default */
+	     end;
+	else do;
+		stream_data_block.baud_rate = baud_rate_300;
+		terminal_info.term_type = "ASCII";
+	     end;
+
+	status = ""b;
+
+	if bv_table_ptr = null
+	then call apl_dim_select_table_ (terminal_info.term_type, table_ptr, ("0"b));
+	else table_ptr = bv_table_ptr;
+
+	working_table_ptr,				/* save away to detach/reattach will use same table */
+	     device_info_ptr, device_ptr = table_ptr;
+
+	if device_info.shift_needed
+	then actshift = "01"b;			/* initially lower case */
+	else actshift = "00"b;
+
+	if max_col = -1				/* meaning it wasn't set by attach or changemode */
+	then max_col = device_info.default_line_length;
+
+	if max_line = -1
+	then max_line = device_info.default_page_length;
+
+	conv_tab_ptr, conversion_ptr = pointer (device_ptr, device_info.conversion_offset);
+	sequence_table_ptr, sequence_ptr = pointer (device_ptr, device_info.sequence_offset);
+	if device_info.compression_in_offset ^= ""b
+	then do;
+		compression_in_ptr = pointer (device_ptr, device_info.compression_in_offset);
+		compression_out_ptr = pointer (device_ptr, device_info.compression_out_offset);
+	     end;
+
+	stream_data_block.internal_type (*) = conversions.code_move (*);
+
+	if conv_tab_ptr -> out (9) = "110000010"b
+	then tabm = "0"b;
+
+	return;
+
+     end initialize_sdb;
+
+apl_dim_detach:
+     entry (sdb_ptr, att_stream, disposal, bv_status);
+
+dcl	disposal		char (*);			/* ignored */
+
+	bv_status, status = ""b;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	free stream_data_block in (system_area);
+
+	sdb_ptr = null ();
+
+	stream_detached = "1"b;
+	bv_status = status;
+	return;
+
+apl_dim_abort:
+     entry (sdb_ptr, oldstatus, bv_status);		/* this is simply passed on to the attached stream */
+
+dcl	oldstatus		bit (72);			/* transaction to be deleted */
+
+	bv_status, status = ""b;
+	call iox_$control (stream_data_block.device_iocb_ptr, "abort", null, status_code);
+	bv_status = status;
+	return;
+
+apl_dim_resetread:
+     entry (sdb_ptr, bv_status);
+
+	bv_status, status = ""b;
+
+	read_offset = -1;
+	canonicalization_index = 1;
+	call iox_$control (stream_data_block.device_iocb_ptr, "resetread", null, status_code);
+
+	bv_status = status;
+	return;
+
+apl_dim_resetwrite:
+     entry (sdb_ptr, bv_status);
+
+	bv_status, status = ""b;
+	call resetwrite ();
+	bv_status = status;
+	return;
+
+resetwrite:
+     procedure;
+
+	call iox_$control (stream_data_block.device_iocb_ptr, "resetwrite", null, status_code);
+	return;
+
+     end resetwrite;
+
+apl_dim_changemode:
+     entry (sdb_ptr, modes, oldmodes, bv_status);
+
+dcl	oldmodes		char (*);
+dcl	mode		char (10) varying,
+	onsw		bit (1),
+	(stoff, endoff, col_temp, term_code)
+			fixed bin,
+	oms		char (128) varying;
+dcl	cv_dec_check_	entry (char (*), fixed bin) returns (fixed bin);
+
+	bv_status, status = ""b;
+
+	if tabm
+	then oms = "tabs,";
+	else oms = "^tabs,";
+
+	if tabsin_mode
+	then oms = oms || "tabsin,";
+	else oms = oms || "^tabsin,";
+
+	if hndlquit_mode
+	then oms = oms || "hndlquit,";
+	else oms = oms || "^hndlquit,";
+
+	if conm
+	then oms = oms || "can,";
+	else oms = oms || "^can,";
+
+	if escm
+	then oms = oms || "esc,";
+	else oms = oms || "^esc,";
+
+	if rawim
+	then oms = oms || "rawi,";
+	else oms = oms || "^rawi,";
+
+	if erklm
+	then oms = oms || "erkl,";
+	else oms = oms || "^erkl,";
+
+	if red_mode
+	then oms = oms || "red,";
+	else oms = oms || "^red,";
+
+	if graphic
+	then oms = oms || "graphic,";
+	else oms = oms || "^graphic,";
+
+	if max_line > 0
+	then oms = oms || "pl" || convert_binary_integer_$decimal_string (max_line) || ",";
+	else oms = oms || "^pl,";
+
+	if max_col > 0
+	then oms = oms || "ll" || convert_binary_integer_$decimal_string (max_col);
+	else oms = oms || "^ll";
+	oldmodes = oms;
+chmodes:						/* make any changes to the stream data block indicated by modes */
+	stoff = 1;
+	do endoff = 1 to length (modes);
+	     if substr (modes, endoff, 1) = "," | substr (modes, endoff, 1) = "."
+	     then go to check_mode;
+	     if endoff = length (modes)
+	     then do;
+		     endoff = endoff + 1;		/* allow setting of last mode if no "." at end of string */
+check_mode:
+		     mode = substr (modes, stoff, endoff - stoff);
+		     stoff = endoff + 1;
+		     if substr (mode, 1, 1) = "^"
+		     then do;			/* are you setting a mode on or off */
+			     mode = substr (mode, 2);
+			     onsw = "0"b;
+			end;
+		     else onsw = "1"b;
+		     if mode = "tabs"
+		     then tabm = onsw;		/* and set the appropriate bit */
+		     else if mode = "hndlquit"
+		     then hndlquit_mode = onsw;
+		     else if mode = "tabsin"
+		     then tabsin_mode = onsw;
+		     else if mode = "can"
+		     then conm = onsw;
+		     else if mode = "esc"
+		     then escm = onsw;
+		     else if mode = "rawi"
+		     then rawim = onsw;
+		     else if mode = "erkl"
+		     then erklm = onsw;
+		     else if mode = "red"
+		     then red_mode = onsw;
+		     else if mode = "graphic"
+		     then graphic = onsw;
+		     else if mode = "default"
+		     then do;
+			     erklm, conm, escm = "1"b;
+			     rawim = "0"b;
+			end;
+		     else if mode = "ll"
+		     then if onsw
+			then do;
+				status_code = error_table_$bad_mode;
+				bv_status = status;
+				return;
+			     end;
+			else stream_data_block.max_col = 0;
+		     else if substr (mode, 1, 2) = "ll"
+		     then do;
+			     col_temp = cv_dec_check_ (substr (mode, 3), term_code);
+			     if term_code ^= 0 | col_temp < 4
+			     then do;
+				     status_code = error_table_$bad_mode;
+				     bv_status = status;
+				     return;
+				end;
+
+			     call iox_$modes (stream_data_block.device_iocb_ptr, (mode), "", 0);
+			     max_col = col_temp;
+			end;
+		     else if mode = "pl"
+		     then if onsw
+			then do;
+				status_code = error_table_$bad_mode;
+				bv_status = status;
+				return;
+			     end;
+			else stream_data_block.max_line = 0;
+		     else if substr (mode, 1, 2) = "pl"
+		     then do;
+			     col_temp = cv_dec_check_ (substr (mode, 3), term_code);
+			     if term_code ^= 0 | col_temp < 2 | ^onsw
+			     then do;
+				     status_code = error_table_$bad_mode;
+				     bv_status = status;
+				     return;
+				end;
+
+			     call iox_$modes (stream_data_block.device_iocb_ptr, (mode), "", 0);
+			     max_line = col_temp;
+			end;
+		     else if mode ^= ""
+		     then status_code = error_table_$bad_mode;
+		end;
+	end;
+	bv_status = status;
+	return;
+
+     end /* apl_dim_attach */;

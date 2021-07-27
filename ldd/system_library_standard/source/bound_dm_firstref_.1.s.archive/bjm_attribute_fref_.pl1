@@ -1,0 +1,381 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+		bjm_attribute_fref_
+	This module maintains or gets before journal attributes which
+     require a running DM system.  It is different from bjm_attribute_ in
+     that it sets of the the DM firstref trap and does not rely on
+     file_manager_ for all support.
+
+	Currently, only setting the per-transaction storage limit is
+     supported.  The general scenario is open the journal, set the limit,
+     and close the journal.  Due to the current bjm error handling
+     mechanism, the setup for BJM error handling is left until the open
+     call has returned.  If it was setup immediately, a BJM recursion error
+     would occur.
+*/
+
+/* HISTORY:
+
+Written by Lee A. Newcomb, 03/18/85.
+Modified:
+03/22/85 by Lee A. Newcomb:  Fixed to use error_table_$item_too_big instead of
+            =$bigarg.
+03/25/85 by Lee A. Newcomb:  Fixed to make sure user has at least "m"
+            access to a BJ's containing dir before setting txn storage limit.
+04/08/85 by Lee A. Newcomb:  Fixed to have FINISH only call ERROR_RETURN if
+            bjm_data_$bj_code is non-zero, instead of any time it is called in
+            normal return; added several explainatory comments; renamed and
+            added several comments for readability.
+*/
+
+/* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+%page;
+bjm_attribute_fref_$set_transaction_storage_limit:
+   proc (p_dir_path, p_entry_name, p_transaction_storage_limit, p_code);
+
+
+/* START OF DECLARATIONS */
+
+/* Parameter */
+dcl  (
+     p_dir_path			char (*),		/* dir containing BJ (Input) */
+     p_entry_name			char (*),		/* BJ name (Input) */
+     p_transaction_storage_limit	fixed bin (35),	/* new txn storage limit (Input) */
+     p_code			fixed bin (35)	/* status code (Output) */
+     )				parameter;
+
+/* Automatic */
+dcl  (
+     bj_oid			bit (36) aligned init (NULL_BJ_OID),
+     bjm_clean_up_needed		bit (1) aligned init (NO),
+						/* for cleanup handler */
+     code				fixed bin (35) init (0),
+     containing_dir_path		char (168) init (""),
+						/* dir containing dir containing BJ */
+     dir_name			char (32) init (""),/* entry name portion of dir_path */
+     dir_path			char (168) init (""),
+						/* copy of parameter */
+     dir_path_effective_access	bit (36) aligned init (N_ACCESS),
+     dir_path_from_bjm		char (168) init (""),
+						/* dir_path as recorded in BJM tables */
+						/* used so links won't bypass access check */
+     entry_name			char (32) init (""),/* copy of parameter */
+     transaction_storage_limit	fixed bin (35) init (-1)
+						/* copy of parameter */
+     )				automatic;
+
+/* Based */
+/* Builtin */
+dcl  (length, reverse, rtrim, substr)	builtin;
+
+/* Condition */
+dcl  cleanup			condition;
+
+/* Constant */
+dcl  (
+     CHECK_FOR_BJM_RECURSION		bit (1) aligned init ("1"b),
+     DONT_CHECK_FOR_BJM_RECURSION	bit (1) aligned init (""b),
+     FINISH_MUST_IGNORE_ERRORS	bit (1) aligned init (""b),
+     FINISH_MUST_NOT_IGNORE_ERRORS	bit (1) aligned init ("1"b),
+     MYNAME			char (32) init ("bjm_attribute_fref_"),
+     NO				bit (1) aligned init (""b),
+     NULL_BJ_OID			bit (36) aligned init (""b),
+     YES				bit (1) aligned init ("1"b)
+     )				internal static options (constant);
+
+/* Entry */
+dcl  (
+     before_journal_manager_$get_bj_path_from_oid
+				entry (bit (36) aligned, char (*),
+				char (*), fixed bin (35)),
+     before_journal_manager_$open_bj	entry (char (*), char (*),
+				bit (36) aligned, fixed bin (35)),
+     bj_ci_zero$put_header		entry (bit (36) aligned, ptr,
+				fixed bin),
+     bj_cleanup_tables$handler	entry (fixed bin (35)),
+     bj_close_oid			entry (bit (36) aligned),
+     bj_oid_util$get_ptr		entry (bit (36) aligned) returns (ptr),
+     bj_max_txn_storage_limit		entry (ptr) returns (fixed bin (35)),
+     bj_pste_lock$lock		entry (ptr, bit (36) aligned),
+     bj_pste_lock$unlock		entry (ptr),
+     expand_pathname_		entry (char (*), char (*), char (*),
+				fixed bin (35)),
+     get_group_id_			entry () returns (char (32)),
+     get_ring_			entry () returns (fixed bin (3)),
+     hcs_$get_user_access_modes	entry (char (*), char (*), char (*),
+				fixed bin, bit (36) aligned,
+				bit (36) aligned, fixed bin (35))
+     )				external;
+
+/* External */
+dcl  (
+     (
+     dm_error_$bj_bad_ppte_version,
+     dm_error_$bj_bad_pste_version,
+     dm_error_$bj_invalid_name,
+     dm_error_$bj_recursive_invoc,
+     error_table_$incorrect_access,
+     error_table_$item_too_big,
+     error_table_$smallarg
+     )				fixed bin (35)
+     )				external static;
+
+/* END OF DECLARATIONS */
+%page;
+/*			repeat for reader's convenience	*/
+/* bjm_attribute_fref_$set_transaction_storage_limit:		*/
+/*     proc (p_dir_path, p_entry_name,			*/
+/*		p_stransaction_storage_limit, p_code);		*/
+
+COPY_AND_INIT_PARAMETERS:
+   do;
+      dir_path = p_dir_path;
+      entry_name = p_entry_name;
+      transaction_storage_limit = p_transaction_storage_limit;
+      p_code = 0;
+   end COPY_AND_INIT_PARAMETERS;
+
+PARTIALLY_VALIDATE_INPUT_PARAMETERS:
+   do;
+      if ^IS_VALID_BJ_NAME (entry_name) then
+         call ERROR_RETURN (dm_error_$bj_invalid_name);
+      if transaction_storage_limit < 0 then
+         call ERROR_RETURN (error_table_$smallarg);
+   end PARTIALLY_VALIDATE_INPUT_PARAMETERS;
+
+SETUP_FOR_NON_STANDARD_EXIT:
+   on cleanup call CLEAN_UP ();
+
+OPEN_JOURNAL:					/* to get the BJ's header */
+   do;
+      call before_journal_manager_$open_bj (dir_path, entry_name, bj_oid, code)
+	 ;
+      if bj_oid = NULL_BJ_OID then
+         call ERROR_RETURN (code);
+   end OPEN_JOURNAL;
+
+VALIDATE_CONTAINING_DIR_MODIFY_ACCESS:
+   do;
+      call before_journal_manager_$get_bj_path_from_oid (bj_oid,
+	 dir_path_from_bjm, (32)"" /* already have BJ name */, code);
+      if code ^= 0 then
+         call ERROR_RETURN (code);
+      call expand_pathname_ (dir_path_from_bjm, containing_dir_path, dir_name,
+	 code);
+      if code ^= 0 then
+         call ERROR_RETURN (code);
+      call hcs_$get_user_access_modes (containing_dir_path, dir_name,
+	 get_group_id_ (), get_ring_ (), dir_path_effective_access,
+	 (""b) /* ignore xmodes */, code);
+      if code ^= 0 then
+         call ERROR_RETURN (code);
+      if (dir_path_effective_access & M_ACCESS) ^= M_ACCESS then
+         call ERROR_RETURN (error_table_$incorrect_access);
+   end VALIDATE_CONTAINING_DIR_MODIFY_ACCESS;
+%page;
+/* Now we can set the bjm_data_ error handling values to indicate we	*/
+/* are in control.  The only way this should be able to fail is if	*/
+/* the DM ring is the login ring.				*/
+   call SET_BJM_DATA_ERROR_HANDLING_VALUES (NONLOCAL_ERROR_EXIT, MYNAME,
+        CHECK_FOR_BJM_RECURSION);
+
+FIND_BJ_PST_ENTRY:
+   do;
+      bj_ppte_ptr = bj_oid_util$get_ptr (bj_oid);
+      call CHECK_VERSION_NUMERIC (bj_ppte.version, BJ_PPTE_VERSION_1,
+	 dm_error_$bj_bad_ppte_version);
+      bj_pste_ptr = bj_ppte.bj_pste_ptr;
+      call CHECK_VERSION_NUMERIC (bj_pste.version, BJ_PSTE_VERSION_2,
+	 dm_error_$bj_bad_pste_version);
+      call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+   end FIND_BJ_PST_ENTRY;
+
+   if transaction_storage_limit = 0 then
+SET_LIMIT_TO_MAXIMUM:
+      transaction_storage_limit = bj_max_txn_storage_limit (bj_pste_ptr);
+   else
+VALIDATE_TRANSACTION_STORAGE_LIMIT:
+        if transaction_storage_limit > bj_max_txn_storage_limit (bj_pste_ptr)
+        then
+      call ERROR_RETURN (error_table_$item_too_big);
+
+SET_NEW_TRANSACTION_STORAGE_LIMIT:
+   do;
+      bj_pste.txn_storage_limit = transaction_storage_limit;
+      call bj_ci_zero$put_header (bj_ppte.pf_oid, bj_pste_ptr, size (bj_pste));
+   end SET_NEW_TRANSACTION_STORAGE_LIMIT;
+
+
+   call RETURN ();
+
+/* end bjm_attribute_fref_$set_transaction_storage_limit; */
+%page;
+MAIN_RETURN:
+   return;
+%skip (4);
+NONLOCAL_ERROR_EXIT:
+   call ERROR_RETURN (bjm_data_$bj_code);
+%skip (4);
+CHECK_VERSION_NUMERIC:
+   proc (cvn_p_given_version, cvn_p_correct_version, cvn_p_error_to_use);
+
+/* The error code to use is passed as this is really a template proc	*/
+/* used in several modules to check structure versions.  It is hoped	*/
+/* newer versions of these structures will be changed to use	*/
+/* char (8) versions.					*/
+
+dcl  (
+     cvn_p_given_version		fixed bin,
+     cvn_p_correct_version		fixed bin,
+     cvn_p_error_to_use		fixed bin (35)
+     )				parameter;
+
+   if cvn_p_given_version ^= cvn_p_correct_version then
+      call ERROR_RETURN (cvn_p_error_to_use);
+
+   end CHECK_VERSION_NUMERIC;
+%skip (4);
+CLEAN_UP:
+   proc ();
+
+/* CLEAN_UP doubles as a cleanup handler and ERROR_FINISH procedure.	*/
+/* We will call the FINISH proc as it is a subset of the work we must	*/
+/* do, passing an argument telling it to not report any errors.	*/
+
+   if bjm_clean_up_needed = YES then
+      call bj_cleanup_tables$handler (0);
+
+   call FINISH (FINISH_MUST_IGNORE_ERRORS);
+
+   return;
+
+   end CLEAN_UP;
+%page;
+ERROR_RETURN:
+   proc (er_p_code);
+
+dcl  er_p_code			fixed bin (35) parameter;
+
+   p_code = er_p_code;
+   call CLEAN_UP ();				/* our ERROR_FINISH proc */
+   goto MAIN_RETURN;
+
+   end ERROR_RETURN;
+%skip (4);
+FINISH:
+   proc (f_p_ignore_errors);
+
+/* FINISH is used to undo anything done which should be reset.  An	*/
+/* example is closing a before journal we may have opened.  Note some	*/
+/* of this work must be done whether we are returning from an error,	*/
+/* while cleaning up, or in the normal course of work.  Rather than	*/
+/* duplicate this code in CLEAN_UP, CLEAN_UP informs us we may not	*/
+/* call ERROR_RETURN.  However, if we want to return normally, RETURN	*/
+/* also calls, but passes a parameter indicating we must report any	*/
+/* errors encountered.					*/
+
+dcl  f_p_ignore_errors		bit (1) aligned parameter;
+dcl  f_bj_oid			bit (36) aligned
+				init (NULL_BJ_OID) automatic;
+
+   if bj_oid ^= NULL_BJ_OID then
+CLOSE_THIS_BJ_OPENING:
+      do;
+      bjm_data_$bj_exit_err = FINISH_ERROR_LABEL;
+      f_bj_oid = bj_oid;
+      bj_oid = NULL_BJ_OID;				/* so we can't close >1 times */
+      call bj_close_oid (f_bj_oid);
+   end CLOSE_THIS_BJ_OPENING;
+
+FINISH_ERROR_LABEL:
+   if (f_p_ignore_errors = FINISH_MUST_NOT_IGNORE_ERRORS)
+        & (bjm_data_$bj_code ^= 0) then
+      call ERROR_RETURN (bjm_data_$bj_code);		/* won't return */
+
+   call SET_BJM_DATA_ERROR_HANDLING_VALUES (bjm_data_$bj_default_error_label,
+        "", DONT_CHECK_FOR_BJM_RECURSION);
+
+   return;
+
+   end FINISH;
+%page;
+IS_VALID_BJ_NAME:
+   proc (ivbn_p_bj_name) reducible returns (bit (1) aligned);
+
+dcl  ivbn_p_bj_name			char (*) parameter;
+
+   return ((length (rtrim (ivbn_p_bj_name)) < 33)
+        & (substr (reverse (rtrim (ivbn_p_bj_name)), 1, 3) = "jb."));
+
+   end IS_VALID_BJ_NAME;
+%skip (4);
+RETURN:
+   proc ();
+
+   call bj_pste_lock$unlock (bj_pste_ptr);
+   call FINISH (FINISH_MUST_NOT_IGNORE_ERRORS);
+   go to MAIN_RETURN;
+
+   end RETURN;
+%page;
+SET_BJM_DATA_ERROR_HANDLING_VALUES:
+   proc (sbdehv_p_error_exit, sbdehv_p_operation,
+        sbdehv_p_check_for_recursive_invocation);
+
+/* This internal procedure centralizes the setting of the BJM global	*/
+/* error values in bjm_data_.  It is called near the beginning of	*/
+/* this module, and in the FINISH internal procedure.  ONLY THE FIRST	*/
+/* OF THESE CALLS SHOULD ASK FOR DETECTION OF A RECURSIVE INVOCATION	*/
+/* OF THE BEFORE JOURNAL MANAGER, if the other calls did, we could	*/
+/* end up getting a recursive call ERROR_RETURN, CLEAN_UP, FINISH,	*/
+/* this proc, etc.						*/
+/*							*/
+/* Note: if sbdehv_p_check_for_recursive_invocation and		*/
+/* bjm_clean_up_needed both have negative meanings, we do not set any	*/
+/* values.  This may happen if we call ERROR_RETURN before calling	*/
+/* this proc (e.g., a failure in partial argument validation).	*/
+
+dcl  (
+     sbdehv_p_error_exit		label variable,
+     sbdehv_p_operation		char (*),
+     sbdehv_p_check_for_recursive_invocation
+				bit (1) aligned
+     )				parameter;
+
+   if sbdehv_p_check_for_recursive_invocation = CHECK_FOR_BJM_RECURSION then
+      if bjm_data_$bj_operation ^= "" then
+         call ERROR_RETURN (dm_error_$bj_recursive_invoc);
+
+   if (bjm_clean_up_needed = NO)
+        & (sbdehv_p_check_for_recursive_invocation
+        = DONT_CHECK_FOR_BJM_RECURSION) then
+      ;
+   else
+SET_BJM_DATA_ERROR_VALUES:
+      do;
+      bjm_clean_up_needed = YES;
+      bjm_data_$bj_operation = sbdehv_p_operation;
+      bjm_data_$bj_exit_err = sbdehv_p_error_exit;
+      bjm_data_$bj_code = 0;
+   end SET_BJM_DATA_ERROR_VALUES;
+
+   return;
+
+   end SET_BJM_DATA_ERROR_HANDLING_VALUES;
+%page;
+%include dm_bj_global_error_info;
+%page;
+%include dm_bj_ppt;
+%page;
+%include dm_bj_pste;
+%page;
+%include access_mode_values;
+
+
+   end bjm_attribute_fref_$set_transaction_storage_limit;

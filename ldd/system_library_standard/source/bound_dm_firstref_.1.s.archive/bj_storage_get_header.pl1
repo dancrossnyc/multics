@@ -1,0 +1,667 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:    
+
+
+ ==> bj_storage_get_header (bj_oid, rec_id, header_ptr)
+
+       Copies into the user's space pointed to by header_ptr (input), the header
+       of the record specfied by its rec_id (input), in the journal specified
+       by its opening id bj_oid (input).
+
+
+ ==> bj_storage_get_header$previous (bj_oid, rec_id, header_ptr)
+
+       Copies, into the user's space pointed to by header_ptr, the header 
+       of the record previous to the record specified by its rec_id (input),
+       in the journal specified by its opening id bj_oid (input). It also
+       returns the rec_id of previous record in rec_id (input and output).
+       If the rec_id passed by the caller has no previous record, this
+       procedure sets rec_id to "0"b and does not modify the user's space
+       pointed to by header_ptr.
+
+
+
+ ==> bj_storage_get_header$last (bj_oid, rec_id, header_ptr)
+
+       Copies, into the user's space pointed to by header_ptr (input), the 
+       header of the last record of the journal specified by its opening id
+       bj_oid (input), and returns the rec_id of that record in rec_id (output).
+       If there is no last record, ie, the journal is empty, it returns a
+       null rec_id (rec_id = "0"b) and leaves the user's space pointed to by
+       header_ptr unchanged.
+
+
+
+ ==> bj_storage_get_header$find_last_record (pf_oid, bj_pste_ptr, header_ptr)    returns rec_id.
+
+
+       This procedure is called only by bj_pste_create, while opening
+       a journal after a system crash. It does not assume that the process
+       has a valid bj_oid for this journal, since the journal is being opened.
+
+       It assumes however that the bj_pste is completely initialized, with
+       the exception of bj_pste.last_rec_id. (In fact bj_pste.n_txn is not
+       initialized either at this point, but this is irrelevant for this
+       procedure.
+
+       At this point, the last CI of the journal has already be found, and
+       its ci number has been entered in bj_pste.last_ci_buffered, put, flushed
+       and on_disk. Where the origin of the circular list was at the time of
+       the crash is not known, and it is not neceassry to know it. The origin
+       has been temporarly set to be as far as possible from the last CI, so that
+       any attempt to append a record to the journal would cause a "journal_full"
+       error. Later in the recovery after crash program, the journal will be
+       examined to find all the unfinished transactions that were using this
+       journal at the time of the crash. At that point, the bj_pste.n_txn 
+       will be initialized, and the origin of the circular list will be set
+       to the least recently written CI by any of the unfinished transactions.
+
+       In order to do its job, this program starts with the last element of
+       the last CI. If it is a full record, it is the last record of the
+       journal. Otherwise, the previous elements have to be examined until
+       a record is found. Most of the logic needed by this program already
+       exist in bj_storage_get_header$previous; that is why find_last_record
+       has been packaged in this segment. 
+
+
+*/
+
+/* HISTORY:
+
+Written by A. Bensoussan, 12/06/82.
+Modified:
+02/23/83 by A. Bensoussan:  to lock/unlock using bj_pste_lock$lock/unlock.
+12/06/84 by M. Sharpe:  to set/reset validation level around the call to
+	  file_manager_, to use ERROR_RETURN.
+12/06/84 by Matthew Pierret:  Changed to set current_ring in each entry
+            instead of just the first.  current_ring is used to set the
+            validation level.
+01/17/85 by Matthew Pierret:  Changed to recognize FM_ROLLBACK_HANDLER and
+            FM_POSTCOMMIT_HANDLER records.
+01/23/85 by Lee A. Newcomb:  Fixed to recognize BEGIN_COMMIT records.
+*/
+/* format: style4,^indcomtxt,indattr,^inddcls,idind40 */
+%page;
+bj_storage_get_header: proc (p_bj_oid, p_rec_id, p_header_ptr);
+
+/* Parameters */
+
+dcl  p_bj_oid			     bit (36) aligned; /* opening id.  Input */
+dcl  p_rec_id			     bit (36) aligned; /* rec_id of curr/last/prev. Input + Output */
+dcl  p_header_ptr			     ptr;		/* ptr to record header.  Input */
+dcl  p_pf_oid			     bit (36) aligned; /* page file oid . Input */
+dcl  p_bj_pste_ptr			     ptr;		/* pste ptr. Input */
+
+
+/* Automatic */
+
+
+dcl  code				     fixed bin (35);
+dcl  rel_distance			     fixed bin (35);
+
+dcl  ci_no			     fixed bin (24) uns;
+dcl  sl_no			     fixed bin (12) uns;
+
+dcl  pf_oid			     bit (36) aligned;
+dcl  rec_id			     bit (36) aligned;
+dcl  expected_rec_id		     bit (36) aligned;
+dcl  element_id			     bit (36) aligned;
+dcl  record_id			     bit (36) aligned;
+
+dcl  element_type			     char (8) aligned;
+dcl  entry_point			     char (8) aligned;
+
+dcl  LOCAL_CI			     dim (512) fixed bin (71);
+
+dcl  saved_level			     fixed bin init (-1);
+dcl  current_ring			     fixed bin (3) init (-1);
+
+
+/* Based */
+
+dcl  1 str_rec_id			     based aligned,
+       2 ci_no			     fixed bin (24) uns unal,
+       2 sl_no			     fixed bin (12) uns unal;
+
+dcl  ci_bytes			     char (bj_pste.ci_size) aligned based (addr (LOCAL_CI));
+
+
+/* Builtin */
+
+dcl  (addr, null, ptr, size, substr)	     builtin;
+
+
+/* Condition */
+
+dcl  cleanup			     condition;
+
+
+/* Constant */
+
+dcl  ME				     char (21) int static
+				     options (constant) init ("bj_storage_get_header");
+
+
+/* Entries */
+
+dcl  bj_oid_util$get_ptr		     entry (bit (36) aligned) returns (ptr);
+dcl  bj_pste_lock$lock		     entry (ptr, bit (36) aligned);
+dcl  bj_pste_lock$lock_partial_check	     entry (ptr);
+dcl  bj_pste_lock$unlock		     entry (ptr);
+dcl  bj_report_err			     entry (fixed bin (35), char (*));
+dcl  bj_storage_util$distance		     entry (ptr, fixed bin (24) uns) returns (fixed bin (24) uns);
+dcl  cu_$level_get			     entry (fixed bin);
+dcl  cu_$level_set			     entry (fixed bin);
+dcl  file_manager_$get		     entry (bit (36) aligned, fixed bin (24) uns, ptr, fixed bin (35));
+dcl  get_ring_			     entry () returns (fixed bin (3));
+
+
+/* External */
+
+dcl  dm_error_$bj_inconsistent_ci	     fixed bin (35) ext;
+dcl  dm_error_$bj_bad_ci_no		     fixed bin (35) ext;
+dcl  dm_error_$bj_bad_slot_no		     fixed bin (35) ext;
+dcl  dm_error_$bj_bad_rec_id		     fixed bin (35) ext;
+dcl  dm_error_$bj_unknown_record_type	     fixed bin (35) ext;
+dcl  dm_error_$bj_logic_err		     fixed bin (35) ext;
+%page;
+
+	entry_point = "";
+
+	bj_ppte_ptr = bj_oid_util$get_ptr (p_bj_oid);	/* USED GLOBALLY */
+	bj_pste_ptr = bj_ppte.bj_pste_ptr;		/* USED GLOBALLY */
+	pf_oid = bj_ppte.pf_oid;			/* USED GLOBALLY */
+	bj_ci_ptr = addr (LOCAL_CI);			/* USED GLOBALLY */
+
+
+	call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+
+
+	rec_id = p_rec_id;
+
+	ci_no = addr (rec_id) -> str_rec_id.ci_no;
+	sl_no = addr (rec_id) -> str_rec_id.sl_no;
+
+	call cu_$level_get (saved_level);
+	current_ring = get_ring_ ();
+
+	on cleanup call cu_$level_set (saved_level);
+
+	call COPY_CI_LOCALLY (ci_no);			/* Copies the CI from the file 
+							   or the buffer into LOCAL_CI */
+
+	element_type = ELEMENT_TYPE (sl_no);		/* Operates on LOCAL_CI; returns 
+							   "full","head", "tail" or "middle" */
+	if element_type = "tail" | element_type = "middle"
+	then call ERROR_RETURN (dm_error_$bj_bad_rec_id);
+
+
+	call GET_RECORD_HEADER (p_rec_id, p_header_ptr);	/* Operates on LOCAL_CI */
+						/* Record header is never split */
+
+
+
+	call bj_pste_lock$unlock (bj_pste_ptr);
+
+	return;
+
+previous: entry (p_bj_oid, p_rec_id, p_header_ptr);
+
+
+	entry_point = "previous";
+
+	bj_ppte_ptr = bj_oid_util$get_ptr (p_bj_oid);	/* USED GLOBALLY */
+	bj_pste_ptr = bj_ppte.bj_pste_ptr;		/* USED GLOBALLY */
+	pf_oid = bj_ppte.pf_oid;			/* USED GLOBALLY */
+	bj_ci_ptr = addr (LOCAL_CI);			/* USED GLOBALLY */
+
+	call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+
+
+	rec_id = p_rec_id;
+
+	ci_no = addr (rec_id) -> str_rec_id.ci_no;
+	sl_no = addr (rec_id) -> str_rec_id.sl_no;
+
+	call cu_$level_get (saved_level);
+	current_ring = get_ring_ ();
+	on cleanup call cu_$level_set (saved_level);
+
+	call COPY_CI_LOCALLY (ci_no);			/* Copies the CI from the file 
+							   or the buffer into LOCAL_CI */
+
+	element_type = ELEMENT_TYPE (sl_no);		/* Operates on LOCAL_CI; returns 
+							   "full","head", "tail" or "middle" */
+	if element_type = "tail" | element_type = "middle"
+	then call ERROR_RETURN (dm_error_$bj_bad_rec_id);
+
+	element_id = rec_id;
+	record_id = "0"b;
+	expected_rec_id = "0"b;
+
+	do while (record_id = "0"b & element_id ^= "0"b);
+
+	     element_id = PREVIOUS_ELEMENT_ID (element_id); /* Gets previous ci in LOCAL_CI if necessary.
+							   Returns "0"b if there is no previous. */
+	     if element_id ^= "0"b then
+		record_id = RECORD_ID (element_id, expected_rec_id); /* Returns "0"b if element_id is not a record_id. */
+	end;
+
+
+	if record_id ^= "0"b then
+	     call GET_RECORD_HEADER (record_id, p_header_ptr); /* Operates on LOCAL_CI */
+						/* Record header is never split */
+
+	p_rec_id = record_id;
+
+
+	call bj_pste_lock$unlock (bj_pste_ptr);
+
+	return;
+
+
+
+last: entry (p_bj_oid, p_rec_id, p_header_ptr);
+
+
+	entry_point = "last";
+
+	bj_ppte_ptr = bj_oid_util$get_ptr (p_bj_oid);	/* USED GLOBALLY */
+	bj_pste_ptr = bj_ppte.bj_pste_ptr;		/* USED GLOBALLY */
+	pf_oid = bj_ppte.pf_oid;			/* USED GLOBALLY */
+	bj_ci_ptr = addr (LOCAL_CI);			/* USED GLOBALLY */
+
+
+
+	call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+
+
+	ci_no = bj_pste.last_ci_buffered;
+
+	call cu_$level_get (saved_level);
+	current_ring = get_ring_ ();
+	on cleanup call cu_$level_set (saved_level);
+
+	call COPY_CI_LOCALLY (ci_no);
+
+	if bj_ci.header2.n_slots = 0 then
+	     do;
+	     ci_no = bj_pste.last_ci_put;
+	     call COPY_CI_LOCALLY (ci_no);
+	end;
+
+	sl_no = bj_ci.header2.n_slots;
+
+	addr (rec_id) -> str_rec_id.ci_no = ci_no;
+	addr (rec_id) -> str_rec_id.sl_no = sl_no;
+
+
+
+	element_id = rec_id;
+	record_id = "0"b;
+	expected_rec_id = "0"b;
+
+	do while (record_id = "0"b & element_id ^= "0"b);
+
+	     record_id = RECORD_ID (element_id, expected_rec_id); /* Returns "0"b if element_id is not a record_id */
+
+	     if record_id = "0"b then
+		element_id = PREVIOUS_ELEMENT_ID (element_id); /* Returns "0"b if there is no previous element */
+	end;
+
+	if record_id ^= "0"b then
+	     call GET_RECORD_HEADER (record_id, p_header_ptr); /* Operates on LOCAL_CI */
+						/* Assumes record is never split */
+	p_rec_id = record_id;
+
+
+	call bj_pste_lock$unlock (bj_pste_ptr);
+
+
+	return;
+
+
+find_last_record: entry (p_pf_oid, p_bj_pste_ptr, p_header_ptr) returns (bit (36) aligned);
+
+
+	entry_point = "findlast";
+	bj_pste_ptr = p_bj_pste_ptr;
+	pf_oid = p_pf_oid;
+	bj_ci_ptr = addr (LOCAL_CI);
+
+
+	call bj_pste_lock$lock_partial_check (bj_pste_ptr);
+
+	ci_no = bj_pste.last_ci_buffered;
+
+	call cu_$level_get (saved_level);
+	current_ring = get_ring_ ();
+	on cleanup call cu_$level_set (saved_level);
+
+	call COPY_CI_LOCALLY (ci_no);
+
+	if bj_ci.n_slots = 0 then
+	     do;
+	     ci_no = bj_pste.last_ci_put;
+	     call COPY_CI_LOCALLY (ci_no);
+	end;
+
+	sl_no = bj_ci.n_slots;
+
+	addr (rec_id) -> str_rec_id.ci_no = ci_no;
+	addr (rec_id) -> str_rec_id.sl_no = sl_no;
+
+
+
+	element_id = rec_id;
+	record_id = "0"b;
+	expected_rec_id = "0"b;
+
+	do while (record_id = "0"b & element_id ^= "0"b);
+
+	     record_id = RECORD_ID (element_id, expected_rec_id); /* Returns "0"b if element_id is not a record_id*/
+
+	     if record_id = "0"b then
+		element_id = PREVIOUS_ELEMENT_ID (element_id); /* Returns "0"b if no more previous element.*/
+						/* Gets previous CI in LOCAL_CI if necessary. */
+	end;
+
+	if record_id ^= "0"b then
+	     call GET_RECORD_HEADER (record_id, p_header_ptr); /* Operates on LOCAL_CI. */
+						/* Assumes header never split */
+
+	call bj_pste_lock$unlock (bj_pste_ptr);
+
+MAIN_RETURN:
+	return (record_id);
+
+
+ERROR_RETURN:
+     proc (er_code);
+
+dcl  er_code			     fixed bin (35);
+
+	call bj_report_err (er_code, ME || "$" || entry_point);
+						/* does not return */
+     end ERROR_RETURN;
+
+%page;
+COPY_CI_LOCALLY: proc (ci);
+
+/* Copies the specified control interval into LOCAL_CI. 
+	If the ci has already been put in the file, it reads it from the file. 
+	If the ci is still in the buffer, it reads it from the buffer.
+	It checks the consistency of the slot table. */
+
+/* This function should be available in bj_storage_util. It could
+	be used by bj_storage_get, which has almost duplicate code */
+
+
+dcl  ci				     fixed bin (24) uns parameter;
+
+dcl  p				     ptr;
+dcl  q				     ptr;
+
+
+
+	rel_distance = bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_put)
+	     - bj_storage_util$distance (bj_pste_ptr, ci);
+
+	if rel_distance >= 0
+
+	then do;
+	     call cu_$level_set ((current_ring));
+	     call GET_CI (ci);			/* Normal case: get ci from file */
+	     call cu_$level_set (saved_level);
+	end;
+
+	else if rel_distance = -1
+
+	then if ci = bj_pste.last_ci_buffered
+	     then do;				/* Special case: get ci from buffer */
+		p = addr (LOCAL_CI);
+		q = ptr (bj_pste_ptr, bj_pste.buffer_offset);
+		p -> ci_bytes = q -> ci_bytes;
+	     end;
+
+	     else call ERROR_RETURN (dm_error_$bj_logic_err);
+
+	else call ERROR_RETURN (dm_error_$bj_bad_rec_id);
+
+
+	if bj_ci.n_slots > 64 | bj_ci.n_slots < 0
+	then call ERROR_RETURN (dm_error_$bj_inconsistent_ci);
+
+	if bj_ci.n_slots > 0 then
+	     if (bj_ci.header2.first_is_contn
+		& bj_ci.header2.first_rec_id = "0"b)
+	     then call ERROR_RETURN (dm_error_$bj_inconsistent_ci);
+
+	return;
+
+     end COPY_CI_LOCALLY;
+%page;
+
+GET_CI: proc (ci);					/* Could also be part of bj_storage_util */
+
+
+dcl  ci				     fixed bin (24) uns;
+
+dcl  my_ci_parts			     (5) fixed bin (71);
+
+
+
+	if ci = 0
+	     | ci < bj_pste.cl.lowest_ci
+	     | ci > bj_pste.cl.highest_ci
+	then call ERROR_RETURN (dm_error_$bj_bad_ci_no);
+
+
+	ci_parts_ptr = addr (my_ci_parts);
+
+	ci_parts.number_of_parts = 1;
+
+	ci_parts.part (1).offset_in_bytes = 0;		/* Relative to header2 */
+	ci_parts.part (1).length_in_bytes = bj_pste.ci_size - (size (ci_header) + size (ci_trailer)) * 4;
+	ci_parts.part (1).local_ptr = addr (bj_ci.header2);
+
+	call file_manager_$get (pf_oid, ci, ci_parts_ptr, code);
+	if code ^= 0 then call ERROR_RETURN (code);
+
+
+	return;
+     end GET_CI;
+
+
+
+ELEMENT_TYPE: proc (sl) returns (char (8) aligned);
+
+/* Operate on LOCAL_CI pointed to by bj_ci_ptr. Determines if
+	the element specified by its slot number sl is a "full" record,
+	or only the "head", the "middle" or the "tail" part of a record.
+	Returns the corresponding character string of the type found.
+	Also validates the slot no and does some consistency checks. */
+
+
+dcl  sl				     fixed bin (12) uns;
+
+
+	if sl = 0 | sl > bj_ci.n_slots
+	then call ERROR_RETURN (dm_error_$bj_bad_slot_no);
+
+
+	if bj_ci.header2.first_is_contn
+	     & bj_ci.header2.last_is_contd
+	then do;
+	     if sl = 1 & bj_ci.n_slots = 1 then return ("middle");
+	end;
+
+
+	if bj_ci.header2.first_is_contn
+	     & sl = 1 then return ("tail");
+
+
+	if bj_ci.header2.last_is_contd
+	     & sl = bj_ci.header2.n_slots then return ("head");
+
+
+	else return ("full");
+
+     end ELEMENT_TYPE;
+
+RECORD_ID: proc (element_id, expected_rec_id) returns (bit (36) aligned);
+
+
+dcl  element_id			     bit (36) aligned; /* Input param */
+dcl  expected_rec_id		     bit (36) aligned; /* Input + Output param */
+
+dcl  sl				     fixed bin (12) uns;
+
+
+
+	sl = addr (element_id) -> str_rec_id.sl_no;
+
+	element_type = ELEMENT_TYPE (sl);
+
+	if element_type = "full" then return (element_id);
+
+	if element_type = "head"
+	     & element_id = expected_rec_id then return (element_id);
+
+	if element_type = "tail" then
+	     expected_rec_id = bj_ci.header2.first_rec_id;
+
+	if element_type = "middle"
+	     & bj_ci.header2.first_rec_id ^= expected_rec_id then expected_rec_id = "0"b;
+
+	return ("0"b);
+
+     end RECORD_ID;
+
+
+PREVIOUS_ELEMENT_ID: proc (element_id) returns (bit (36) aligned);
+
+/* Operate on LOCAL_CI pointed to by bj_ci_ptr.
+	The input argument is the element_id of the current element;
+	that is, the element is currently in the LOCAL_CI. If there is
+	a previous element in this ci, it just decreases sl by 1.
+	Otherwise, it reads the previous CI into LOCAL_CI and
+	sets ci to the value of the previous ci and sl to the value
+	of the last slot in the CI.*/
+
+
+dcl  element_id			     bit (36) aligned; /* Parameter */
+
+dcl  ci				     fixed bin (24) uns;
+dcl  sl				     fixed bin (12) uns;
+
+dcl  bj_storage_util$previous_used_ci
+				     entry (ptr, fixed bin (24) uns) returns (fixed bin (24) uns);
+
+
+	ci = addr (element_id) -> str_rec_id.ci_no;
+	sl = addr (element_id) -> str_rec_id.sl_no;
+
+
+	if sl > 1
+	then sl = sl - 1;
+	else do;
+	     if ci = bj_pste.cl.origin_ci then return ("0"b);
+	     ci = bj_storage_util$previous_used_ci (bj_pste_ptr, ci); /* Never returns "nul value */
+	     call GET_CI (ci);
+	     sl = bj_ci.n_slots;
+	     if sl = 0 | sl > 64			/* What is the max_sl ? */
+	     then call ERROR_RETURN (dm_error_$bj_bad_slot_no);
+	end;
+
+	addr (element_id) -> str_rec_id.ci_no = ci;
+	addr (element_id) -> str_rec_id.sl_no = sl;
+
+	return (element_id);
+
+     end PREVIOUS_ELEMENT_ID;
+
+
+GET_RECORD_HEADER: proc (rec_id, header_ptr);
+
+
+/* Operates on LOCAL_CI. It knows that a record header is never
+	split between 2 CI's. */
+
+dcl  rec_id			     bit (36) aligned; /* Parameter */
+dcl  header_ptr			     ptr;		/* Parameter */
+
+dcl  header_bytes			     char (4 * size (bj_rec_hdr)) aligned based (header_ptr);
+
+dcl  sl				     fixed bin (12) uns;
+dcl  offset			     fixed bin (18) uns;
+dcl  rec_type			     char (4);
+
+
+
+
+	sl = addr (rec_id) -> str_rec_id.sl_no;
+
+	offset = bj_ci.slot (sl).offset;
+
+	if bj_ci.slot (sl).length < size (bj_rec_hdr) * 4
+	then call ERROR_RETURN (dm_error_$bj_inconsistent_ci);
+
+	header_bytes = substr (ci_bytes, size (ci_header) * 4 + (offset + 1), size (bj_rec_hdr) * 4);
+
+
+	rec_type = header_ptr -> bj_rec_hdr.type;
+
+	if rec_type = BJ_RECORD_TYPE.COMMITTED
+	     | rec_type = BJ_RECORD_TYPE.ABORTED
+	     | rec_type = BJ_RECORD_TYPE.ROLLED_BACK
+	     | rec_type = BJ_RECORD_TYPE.BEFORE_IMAGE
+	     | rec_type = BJ_RECORD_TYPE.HANDLER
+	     | rec_type = BJ_RECORD_TYPE.FM_ROLLBACK_HANDLER
+	     | rec_type = BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER
+	     | rec_type = BJ_RECORD_TYPE.BEGIN_COMMIT
+						/*
+               | rec_type = BJ_RECORD_TYPE.PERFORM_COMMIT
+               | rec_type = BJ_RECORD_TYPE.BEGIN_MARK
+*/
+	then ;					/* OK */
+	else call ERROR_RETURN (dm_error_$bj_unknown_record_type);
+
+	return;
+
+     end GET_RECORD_HEADER;
+
+%page;
+%include dm_bj_static;
+
+%page;
+%include dm_bj_ppt;
+
+%page;
+%include dm_bj_pst;
+
+%page;
+%include dm_bj_pste;
+
+%page;
+%include dm_bj_ci;
+
+%page;
+%include dm_ci_header;
+
+%page;
+%include dm_ci;
+
+%page;
+%include dm_ci_parts;
+
+%page;
+%include dm_bj_records;
+
+
+     end bj_storage_get_header;

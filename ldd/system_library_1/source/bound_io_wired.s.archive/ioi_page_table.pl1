@@ -1,0 +1,380 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+
+ioi_page_table:
+     proc;
+
+/* I/O page table manipulation */
+/* Written April 1983 by Chris Jones for IOI rewrite */
+/* Modified 1984-10 by Chris Jones to correctly handle big page tables */
+/* Modified 1984-10-25 BIM to wire additional pages. */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-09-05,Farley), approve(86-07-18,MCR7439),
+     audit(86-09-24,Fawcett), install(86-10-20,MR12.0-1189):
+     Changed to execute in the BCE environment.
+  2) change(88-04-28,GDixon), approve(88-08-08,MCR7964),
+     audit(88-08-01,Lippard), install(88-08-16,MR12.2-1085):
+      A) Correct error in function $ptx_to_ptp which caused a return
+         statement with no argument to be executed. (hardcore 856, phx19472)
+                                                   END HISTORY COMMENTS */
+
+
+/* This program manages the io_page_table_seg.  Said segment consists of a 256 word header followed by 252 page tables of
+   64 words each (i.e. each such page table can describe a segment which is up to 64 pages long).  Page tables are
+   constrained by hardware to start on a 0 mod 64 word boundary.  If it is necessary to describe a segment larger than 64
+   pages, four consecutive page tables are combined to become a 256 word page table (enough for any conceivable
+   application).  Although hardware will allow such a page table to reside on a 0 mod 64 word boundary, we enforce a 0
+   mod 256 word boundary to free us from complications of page tables crossing page boundaries.  The page table segment
+   is constrained to be no larger than 16 pages, it is abs_wired, and is initialized to be one page long (It grows as
+   necessary). Except at BCE it is only 1 fixed page.
+
+   Entries are provided to get a page table of a certain size, to put it back when done, and to fill it in to describe a
+   given segment.  Getting and putting are done under a lock, filling is not. */
+
+dcl	p_astep		   ptr parameter;		/* (I) pointer to the ASTE of a seg for which we fill a pt */
+dcl	p_code		   fixed bin (35) parameter;	/* (O) status code */
+dcl	p_ptx		   fixed bin parameter;	/* (I/O) pointer to a page table */
+dcl	p_size		   fixed bin (19) parameter;	/* (I) size of segment page table is to describe */
+
+dcl	code		   fixed bin (35);
+dcl	locked		   bit (1) aligned;
+dcl	not_at_BCE	   bit (1) aligned;
+dcl	page		   fixed bin;
+dcl	ptp		   ptr;
+dcl	ptx		   fixed bin;
+dcl	size		   fixed bin (19);
+
+dcl	list_head		   fixed bin (9) unsigned unaligned based (free_listp);
+dcl	free_listp	   ptr;
+
+dcl	get_ptrs_$given_segno  entry (fixed bin (15), ptr);
+dcl	lock$lock_fast	   entry (ptr);
+dcl	lock$unlock_fast	   entry (ptr);
+dcl	pc_abs$wire_abs	   entry (ptr, fixed bin (9), fixed bin (9), fixed bin (35));
+dcl	syserr		   entry options (variable);
+
+dcl	error_table_$bad_index fixed bin (35) ext static;
+dcl	error_table_$no_io_page_tables
+			   fixed bin (35) ext static;
+dcl	sst$astsize	   fixed bin external static;
+dcl	sys_info$initialization_state
+			   fixed bin external static;
+
+dcl	(addr, addrel, bin, hbound, lbound, min, mod, null, ptr, segno, unspec)
+			   builtin;
+
+dcl	ME		   char (32) static init ("ioi_page_table");
+
+get:
+     entry (p_size, p_ptx, p_code);
+
+	size = p_size;
+	p_code = 0;
+	call setup;
+	call lock_pts;				/* lock the I/O page table segment to us */
+RETRY_GET:
+	if size > SMALL_PT_SIZE then
+	     ptx = io_page_tables.free_256_ptx;
+	else ptx = io_page_tables.free_64_ptx;
+	if ptx = 0 then do;
+	     call grow_seg (code);
+	     call quit_if_error;
+	     goto RETRY_GET;
+	end;
+
+	call remove_pt (ptx);
+	call unlock_pts;
+	p_ptx = ptx;
+	return;
+
+put:
+     entry (p_ptx, p_code);
+
+	ptx = p_ptx;
+	p_code = 0;
+	call setup;
+	if ^verify_ptx() then
+	     call quit (error_table_$bad_index);
+	call lock_pts;
+	call return_pt (ptx);
+	call unlock_pts;
+	return;
+
+/**** Entry to return a pointer to a page table given its ptx ****/
+
+ptx_to_ptp:
+     entry (p_ptx) returns (ptr);
+
+	ptx = p_ptx;
+	call setup;
+	if ^verify_ptx() then
+	     return (null);
+	else return (ptr (io_page_table_seg_ptr, 64 * (ptx - 1)));
+
+/**** Entry to fill in a page table given an astep   We fill in the smaller of the max size of the page table or
+      the segment.  It is possible for a workspace to be larger than the amount which is wired, but IOI will restrict
+      references to the workspace to the wired portion at connect time.  Obviously this entry should be called with the
+      segment already wired or the page table we fill in will be useless in a short while. ****/
+
+fill:
+     entry (p_ptx, p_astep, p_code);
+
+	ptx = p_ptx;
+	astep = p_astep;
+	p_code = 0;
+	call setup;
+	if ^verify_ptx() then
+	     call quit (error_table_$bad_index);
+	ioptp = addrel (io_page_table_seg_ptr, (ptx - 1) * 64);
+	if io_page_tables.pt_info (ptx).size = PT_64_SIZE then
+	     io_page_table_size = 64;
+	else io_page_table_size = 256;
+	unspec (page_table) = ""b;			/* turns off all valid bits */
+	ptp = addrel (astep, sst$astsize);		/* point to the page table just past the ASTE */
+	do page = 0 to min (io_page_table_size, bin (aste.csl)) - 1;
+	     if addrel (ptp, page) -> l68_core_ptw.wired then do;
+		page_table (page).address = addrel (ptp, page) -> l68_core_ptw.frame;
+		page_table (page).write, page_table (page).valid = "1"b;
+	     end;
+	end;
+	return;
+
+/* Entry to initialize the data base. */
+
+init:
+     entry;
+
+	call setup;
+	if not_at_BCE then do;
+	     call get_ptrs_$given_segno (segno (io_page_table_seg_ptr), astep);
+	     call pc_abs$wire_abs (astep, 0, 1, code);	/* wire the first page. */
+	     if code ^= 0 then
+		call syserr (CRASH, "^a: Unable to wire first page of io_page_table_seg.", ME);
+	end;
+
+	unspec (io_page_tables) = ""b;		/* start with a clean slate */
+	io_page_tables.lock.event = unspec (IO_PAGE_TABLE_LOCK_EVENT);
+	io_page_tables.n_pages_wired = 1;		/* the header says we have only one page (we hope!) */
+	do ptx = lbound (io_page_tables.pt_info, 1) to PTS_PER_PAGE;
+	     io_page_tables.pt_info (ptx).size = PT_64_SIZE;
+	     io_page_tables.pt_info (ptx).in_use = "1"b;	/* so we can free it */
+	     call return_pt (ptx);
+	end;
+	return;
+
+remove_pt:
+     proc (ptx);
+
+dcl	ptx		   fixed bin parameter;
+
+	if io_page_tables.pt_info (ptx).in_use then
+	     call syserr (CRASH, "^a: I/O page table on free list marked as in use.", ME);
+	if io_page_tables.pt_info (ptx).size = PT_64_SIZE then
+	     free_listp = addr (io_page_tables.free_64_ptx);
+	else free_listp = addr (io_page_tables.free_256_ptx);
+	io_page_tables.pt_info (ptx).in_use = "1"b;
+	list_head = io_page_tables.pt_info (ptx).next_pt;
+
+     end remove_pt;
+
+return_pt:
+     proc (ptx);
+
+dcl	ptx		   fixed bin parameter;
+
+	if ^io_page_tables.pt_info (ptx).in_use then
+	     call syserr (CRASH, "^a: I/O page table to be freed marked as not in use.", ME);
+	if io_page_tables.pt_info (ptx).size = PT_64_SIZE then
+	     free_listp = addr (io_page_tables.free_64_ptx);
+	else free_listp = addr (io_page_tables.free_256_ptx);
+	io_page_tables.pt_info (ptx).in_use = "0"b;
+	io_page_tables.pt_info (ptx).next_pt = list_head;
+	list_head = ptx;
+
+     end return_pt;
+
+/* Routine to grow the segment if needed.  If the maximum number of pages are not wired, another one is wired.  Then the
+   new page is carved into identical page tables.  If there are no 64 word page tables left, the new page becomes 64 word
+   page tables.  If there are 64 word page tables available, the new page becomes 256 word page tables.  If there are
+   neither, 64 word page tables are created.  If this was the wrong thing to do, we will be called again, and at that
+   time we'll create 256 word page tables.
+
+   If the segment is at its max size and there are no 64 word page tables available, a 256 word page table is divided
+   into 4 64 word page tables.  If there are 64 word page tables available but no 256 word page tables, we try to combine
+   a group of 4 64 word page tables into one 256 word page table.  If all of this fails, we give up and return an error,
+   which is passed back to our caller.  Processes which are sufficiently annoyed at this behavior on our part, and which
+   are sufficiently privileged, may crash the system at that time. */
+
+grow_seg:
+     proc (code);
+
+dcl	code		   fixed bin (35) parameter;
+
+dcl	astep		   ptr;
+dcl	ptx		   fixed bin;
+
+	code = 0;
+	if io_page_tables.n_pages_wired < MAX_IO_PAGE_TABLE_SEG_PAGES & not_at_BCE then do;
+	     call get_ptrs_$given_segno (segno (io_page_table_seg_ptr), astep);
+	     call pc_abs$wire_abs (astep, (io_page_tables.n_pages_wired), 1, code);
+	     if code ^= 0 then
+		return;
+
+	     if io_page_tables.free_64_ptx = 0 then do;
+		do ptx = PTS_PER_PAGE * io_page_tables.n_pages_wired + 1
+		     to PTS_PER_PAGE * io_page_tables.n_pages_wired + PTS_PER_PAGE;
+		     io_page_tables.pt_info (ptx).size = PT_64_SIZE;
+		     io_page_tables.pt_info (ptx).in_use = "1"b;
+						/* so return will work */
+		     call return_pt (ptx);
+		end;
+	     end;
+	     else do;
+		do ptx = PTS_PER_PAGE * io_page_tables.n_pages_wired + 1
+		     to PTS_PER_PAGE * io_page_tables.n_pages_wired + PTS_PER_PAGE;
+		     io_page_tables.pt_info (ptx).size = PT_256_SIZE;
+		     io_page_tables.pt_info (ptx).in_use = "1"b;
+		     if mod (ptx, 4) = 1 then		/* only return every 4th pt */
+			call return_pt (ptx);
+		end;
+	     end;
+
+	     io_page_tables.n_pages_wired = io_page_tables.n_pages_wired + 1;
+	end;
+	else do;					/* hard part, must shuffle pt's */
+	     if (io_page_tables.free_64_ptx = 0) & (io_page_tables.free_256_ptx = 0) then do;
+		call syserr (LOG, "^a: Out of I/O page table memory.", ME);
+		code = error_table_$no_io_page_tables;
+		return;
+	     end;
+	     if io_page_tables.free_64_ptx = 0 then do;	/* not too hard, split a 256 page table */
+		ptx = io_page_tables.free_256_ptx;
+		call remove_pt (ptx);
+		do ptx = ptx to ptx + 3;
+		     io_page_tables.pt_info (ptx).size = PT_64_SIZE;
+		     call return_pt (ptx);
+		end;
+	     end;
+	     else do;				/* harder, must find four consecutive free pt's */
+		do ptx = io_page_tables.free_64_ptx repeat io_page_tables.pt_info (ptx).next_pt while (ptx ^= 0);
+		     if mod (ptx, 4) = 1 then do;	/* could be a candidate */
+			if ^io_page_tables.pt_info (ptx).in_use & ^io_page_tables.pt_info (ptx + 1).in_use
+			     & ^io_page_tables.pt_info (ptx + 2).in_use & ^io_page_tables.pt_info (ptx + 3).in_use
+			then do;			/* found a group, make it into a 256 word table */
+			     io_page_tables.pt_info.size (ptx), io_page_tables.pt_info.size (ptx + 1),
+				io_page_tables.pt_info.size (ptx + 2), io_page_tables.pt_info.size (ptx + 3) =
+				PT_256_SIZE;
+			     io_page_tables.pt_info (ptx).in_use, io_page_tables.pt_info.in_use (ptx + 1),
+				io_page_tables.pt_info.in_use (ptx + 2), io_page_tables.pt_info.in_use (ptx + 3) =
+				"1"b;
+			     call return_pt (ptx);	/* put it on the 256 word list */
+			     io_page_tables.free_64_ptx = 0;
+						/* we're going to put them all back in now */
+			     do ptx = lbound (io_page_tables.pt_info, 1)
+				to io_page_tables.n_pages_wired * PTS_PER_PAGE;
+				if (io_page_tables.pt_info (ptx).size = PT_64_SIZE)
+				     & ^io_page_tables.pt_info (ptx).in_use then do;
+				     io_page_tables.pt_info (ptx).in_use = "1"b;
+				     call return_pt (ptx);
+				end;
+			     end;
+			     return;
+			end;
+		     end;
+		end;
+		code = error_table_$no_io_page_tables;
+	     end;
+	end;
+
+     end grow_seg;
+
+lock_pts:
+     proc;
+
+	if not_at_BCE then
+	     call lock$lock_fast (addr (io_page_tables.lock));
+	locked = "1"b;
+
+     end lock_pts;
+
+unlock_pts:
+     proc;
+
+	if not_at_BCE then
+	     call lock$unlock_fast (addr (io_page_tables.lock));
+	locked = "0"b;
+
+     end unlock_pts;
+
+setup:
+     proc;
+dcl	bce_io_page_table$	   external;
+
+	locked = "0"b;				/* initialize */
+	if sys_info$initialization_state > 1 then do;	/* out of collection 1 processing */
+	     io_page_table_seg_ptr = addr (io_page_table_seg$);
+	     not_at_BCE = "1"b;
+	end;
+	else do;					/* at BCE */
+	     io_page_table_seg_ptr = addr (bce_io_page_table$);
+	     not_at_BCE = "0"b;
+	end;
+
+     end setup;
+
+verify_ptx:
+     proc returns (bit(1) aligned);
+
+	if (ptx < lbound (io_page_tables.pt_info, 1)) | (ptx > hbound (io_page_tables.pt_info, 1)) then
+	     return ("0"b);
+	else return ("1"b);
+
+     end verify_ptx;
+
+quit_if_error:
+     proc;
+
+	if code ^= 0 then
+	     call quit (code);
+
+     end quit_if_error;
+
+quit:
+     proc (code);
+
+dcl	code		   fixed bin (35) parameter;
+
+	if locked then
+	     call unlock_pts;
+	p_code = code;
+	goto RETURN;
+
+     end quit;
+
+RETURN:
+	return;
+
+%include hc_fast_lock;
+%include io_page_tables;
+%page;
+%include aste;
+%page;
+%include system_types;
+/* so cref will point us here for DPS88M */
+%page;
+%include "ptw.l68";
+/**** %page;
+      %include "ptw.adp"; ****/
+%page;
+%include syserr_constants;
+
+     end ioi_page_table;

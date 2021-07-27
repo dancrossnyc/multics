@@ -1,0 +1,500 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+/* format: style3 */
+init_volmap_seg:
+     proc (Pvtx, Pvname, Code);
+
+/* Program to accomplish the following at physical volume mount time:
+
+     1. Create a volmap_seg for the volume
+
+     2. Determine whether the volume requires salvage
+
+     3. Allocate a record stock
+
+     4. Allocate a VTOCE stock
+
+     5. Initialize the dumper bit map
+
+
+   A volume is salvaged automatically if the following
+   conditions hold:
+
+     1. The volume is a member of the RLV
+
+     2. The vol_trouble_count is non-zero (i.e., the volume was not shut
+        down, or volume inconsistencies were detected).
+
+     3. The number of records left is less than 200, or the number of
+        VTOCEs left is less than 100.
+
+   Some care is required in order than an RPV volume may be salvaged.
+   Specifically, no PVTE fields needed for HC partition withdrawal can be 
+   modified until it is known that the RPV does not need salvage. That way, we 
+   return an error code (causing the volume salvager to be invoked), and pages
+   can be withdrawn against the HC partition. We don't special-case the
+   RPV, but just order things so that the relevant PVTE fields are not
+   modified until after the check for salvage required.
+
+   Written March 1982 by J. Bongiovanni
+   Modified September 1982 by J. Bongiovanni to set aste.vtocx
+   Modified January 1985 by Keith Loepere to return real error codes.
+*/
+
+/*  Parameter  */
+
+dcl	Pvtx		fixed bin parameter;	/* PVTE index */
+dcl	Pvname		char (*) parameter;		/* Physical volume name for error message */
+dcl	Code		fixed bin (35);		/* Return code */
+
+/*  Automatic  */
+
+dcl	base_add		fixed bin;
+dcl	bias		fixed bin;
+dcl	code		fixed bin (35);
+dcl	n_free_vtoce	fixed bin;
+dcl	ox		fixed bin;
+dcl	p99		pic "99";
+dcl	page_left		fixed bin;
+dcl	page_n_words	fixed bin;
+dcl	page_offset	fixed bin (19);
+dcl	pagex		fixed bin;
+dcl	ptp		ptr;
+dcl	severity		fixed bin;
+dcl	tsdw		fixed bin (71);
+dcl	unused_mapp	ptr;
+dcl	unused_map_words	fixed bin;
+dcl	vastep		ptr;
+dcl	vleft		fixed bin;
+dcl	vsdw		fixed bin (71);
+dcl	vtoc_header_pages	fixed bin;
+dcl	vtoc_map_offset	bit (18);
+
+/*  Static  */
+
+dcl	MIN_RECORDS	fixed bin int static options (constant) init (200);
+dcl	MIN_VTOCES	fixed bin int static options (constant) init (100);
+
+/*  Based  */
+
+dcl	unused_map	(unused_map_words) bit (36) aligned based (unused_mapp);
+dcl	1 vaste		aligned like aste based (vastep);
+
+/*  External  */
+
+dcl	abs_seg$		external;
+dcl	error_table_$fsdisk_not_salv fixed bin (35) ext static;
+dcl	error_table_$fsdisk_phydev_err fixed bin (35) ext static;
+dcl	sst$astsize	fixed bin external;
+dcl	1 sst$level	(0:3) aligned external,
+	  2 ausedp	bit (18) unaligned,
+	  2 no_aste	bit (18) unaligned;
+dcl	volmap_abs_seg$	external;
+
+/*  Entry  */
+
+dcl	dbm_man$init_map	entry (fixed bin, ptr, fixed bin (35));
+dcl	get_aste		entry (fixed bin) returns (ptr);
+dcl	get_ptrs_$given_astep
+			entry (ptr) returns (fixed bin (71));
+dcl	init_hc_part$terminate_hc_part
+			entry (fixed bin);
+dcl	lock$lock_ast	entry;
+dcl	lock$unlock_ast	entry;
+dcl	map_free_count	entry (ptr, fixed bin, fixed bin);
+dcl	pc$cleanup	entry (ptr);
+dcl	pmut$swap_sdw	entry (ptr, ptr);
+dcl	ptw_util_$make_disk entry (ptr, fixed bin);
+dcl	put_aste		entry (ptr);
+dcl	sdw_util_$set_size	entry (ptr, fixed bin (19));
+dcl	stock_man$allocate_record_stock
+			entry (ptr, ptr);
+dcl	stock_man$allocate_vtoce_stock
+			entry (ptr, ptr);
+dcl	stock_man$free_record_stock
+			entry (ptr, ptr);
+dcl	stock_man$free_vtoce_stock
+			entry (ptr, ptr);
+dcl	syserr		entry options (variable);
+dcl	thread$out	entry (ptr, bit (18) unaligned);
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	addrel		builtin;
+dcl	bin		builtin;
+dcl	convert		builtin;
+dcl	divide		builtin;
+dcl	hbound		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	size		builtin;
+dcl	unspec		builtin;
+
+/*  Condition  */
+
+dcl	page_fault_error	condition;
+
+%page;
+	pvt_arrayp = addr (pvt$array);
+	pvtep = addr (pvt_array (Pvtx));
+	astep = null ();
+	vastep = null ();
+	tsdw = 0;
+	vsdw = 0;
+	record_stockp = null ();
+	vtoce_stockp = null ();
+
+
+/*  Get an ASTE for the volmap_seg and one to read the VTOC header  */
+
+	call lock$lock_ast;
+
+	vtoc_header_pages = divide (size (vtoc_header) + 1023, 1024, 17);
+	astep = get_aste (vtoc_header_pages);
+	if astep = null ()
+	then call syserr (CRASH, "init_volmap_seg: Unable to get ^dK ASTE for VTOC header.", vtoc_header_pages);
+	call thread$out (astep, sst$level (bin (aste.ptsi, 17)).ausedp);
+
+	aste.pvtx = Pvtx;
+	aste.nqsw, aste.dnzp, aste.ddnp = "1"b;
+	aste.vtocx = -1;
+	tsdw = get_ptrs_$given_astep (astep);
+	call pmut$swap_sdw (addr (abs_seg$), addr (tsdw));
+
+	vastep = get_aste (N_OLD_VOLMAP_PAGES + 1);
+	if vastep = null ()
+	then call syserr (CRASH, "init_volmap_seg: Unable to get ^dK ASTE for volmap_seg.", N_OLD_VOLMAP_PAGES + 1);
+	call thread$out (vastep, sst$level (bin (vaste.ptsi)).ausedp);
+
+	vaste.pvtx = Pvtx;
+	vaste.nqsw, vaste.dnzp, vaste.ddnp = "1"b;
+	vaste.volmap_seg = "1"b;
+	vaste.vtocx = -1;
+	vsdw = get_ptrs_$given_astep (vastep);
+	call sdw_util_$set_size (addr (vsdw), ((N_OLD_VOLMAP_PAGES + 1) * 1024));
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (vsdw));
+
+	call lock$unlock_ast;
+
+
+/* Fill in disk addresses */
+
+	ptp = addrel (astep, sst$astsize);
+	do pagex = 1 to vtoc_header_pages;
+	     call ptw_util_$make_disk (addrel (ptp, pagex - 1), DUMPER_BIT_MAP_ADDR + pagex - 1);
+	end;
+
+	ptp = addrel (vastep, sst$astsize);
+	do pagex = 1 to N_OLD_VOLMAP_PAGES;
+	     call ptw_util_$make_disk (addrel (ptp, pagex - 1), VOLMAP_ADDR + pagex - 1);
+	end;
+	call ptw_util_$make_disk (addrel (ptp, N_OLD_VOLMAP_PAGES), VTOC_MAP_ADDR);
+
+	on page_fault_error goto CLEANUP_AFTER_IO_ERROR;
+
+%page;
+/* Clear unused space in Volume Map pages */
+
+	vol_mapp = addr (volmap_abs_seg$);
+
+	if vol_map.bit_map_n_words < hbound (vol_map.bit_map, 1)
+						/* There is unused space */
+	then do;
+		unused_mapp = addr (vol_map.bit_map (vol_map.bit_map_n_words + 1));
+		unused_map_words = hbound (vol_map.bit_map, 1) - vol_map.bit_map_n_words;
+		unspec (unused_map) = "0"b;
+	     end;
+
+/* Determine the number of records really left in the Volume Map (it may
+   be different from the value in the header if the volume was not shut
+   down properly). */
+
+	call map_free_count (addr (vol_map.bit_map), vol_map.bit_map_n_words, vleft);
+	if vleft ^= vol_map.n_free_rec
+	then do;
+		call syserr (LOG, "init_volmap_seg: Records left on ^a_^a(^a) changed from ^d to ^d.", pvte.devname,
+		     convert (p99, pvte.logical_area_number), Pvname, vol_map.n_free_rec, vleft);
+		vol_map.n_free_rec = vleft;
+	     end;
+%page;
+/* Setup the VTOC Map */
+
+	vtoc_map_offset = bit (bin (1024 * N_OLD_VOLMAP_PAGES, 18), 18);
+	vtoc_mapp = ptr (addr (volmap_abs_seg$), vtoc_map_offset);
+
+/* Clear any unused space in the VTOC Map */
+
+	if vtoc_map.bit_map_n_words < hbound (vtoc_map.bit_map, 1) + 1
+	then do;
+		unused_mapp = addr (vtoc_map.bit_map (vtoc_map.bit_map_n_words));
+		unused_map_words = hbound (vtoc_map.bit_map, 1) + 1 - vtoc_map.bit_map_n_words;
+		unspec (unused_map) = ""b;
+	     end;
+
+/* Get the count of free VTOCEs from the bit map, and compare with the
+   value in the header */
+
+	call map_free_count (addr (vtoc_map.bit_map), vtoc_map.bit_map_n_words, n_free_vtoce);
+	if n_free_vtoce ^= vtoc_map.n_free_vtoce
+	then do;
+		call syserr (LOG, "init_volmap_seg: VTOCEs left on ^a_^a(^a) changed from ^d to ^d.", pvte.devname,
+		     convert (p99, pvte.logical_area_number), Pvname, vtoc_map.n_free_vtoce, n_free_vtoce);
+		vtoc_map.n_free_vtoce = n_free_vtoce;
+	     end;
+
+
+%page;
+/* Check to see whether a salvage is required. If so, undo everything and
+   return an error code indicating this. */
+
+	if pvte.vol_trouble_count > 0
+	then do;
+		if vleft < MIN_RECORDS | n_free_vtoce < MIN_VTOCES
+		then severity = ANNOUNCE;
+		else severity = LOG;
+		call syserr (severity,
+		     "init_volmap_seg: ^d volume inconsistenc^[y^;ies^] on ^a_^a(^a). ^d records left. ^d VTOCEs left."
+		     , pvte.vol_trouble_count, (pvte.vol_trouble_count = 1), pvte.devname,
+		     convert (p99, pvte.logical_area_number), Pvname, vleft, n_free_vtoce);
+		if pvte.hc_part_used
+		then do;				/* Volume of RLV */
+			if vleft < MIN_RECORDS | n_free_vtoce < MIN_VTOCES
+			then do;
+				code = error_table_$fsdisk_not_salv;
+				goto CLEANUP_AFTER_ERROR;
+			     end;
+		     end;
+	     end;
+%page;
+/* Now we know that we're really going to mount the volume. So we can allocate
+   record and vtoce stocks, and fill in the fields in the PVTE from what we've
+   already done.
+*/
+
+	revert page_fault_error;
+
+	if pvte.hc_part_used
+	then call init_hc_part$terminate_hc_part (Pvtx);	/* No more use of HC partition */
+
+	call stock_man$allocate_record_stock (pvtep, record_stockp);
+	call stock_man$allocate_vtoce_stock (pvtep, vtoce_stockp);
+
+	pvte.volmap_astep = vastep;
+	pvte.volmap_seg_sdw = vsdw;
+	pvte.totrec = vol_map.n_rec;
+	pvte.nleft = vol_map.n_free_rec;
+	pvte.vtoc_map_offset = vtoc_map_offset;
+	pvte.n_free_vtoce = vtoc_map.n_free_vtoce;
+	pvte.vtoc_size = vtoc_map.vtoc_last_recno + 1;
+	pvte.n_vtoce = vtoc_map.n_vtoce;
+
+/* Walk the Bit Map and compute the base address and number of free records
+   in each page. There is a kludge for the first page's base address to make
+   life simple for Page Control. This is that the base address in the stock
+   is 64*32 lower than the actual base address, since the first 64 words
+   of the Volume Map are the header. */
+
+	bias = 64 * 32;
+	base_add, pvte.baseadd = vol_map.base_add;
+	page_offset = 64;
+	page_n_words = 1024 - 64;
+
+	do ox = 1 to N_OLD_VOLMAP_PAGES;
+	     call map_free_count (ptr (vol_mapp, page_offset), page_n_words, page_left);
+						/* Count free records */
+	     record_stock.volmap_page (ox).n_free = page_left;
+	     record_stock.volmap_page (ox).baseadd = base_add - bias;
+	     base_add = base_add + 1024 * 32;
+	     page_offset = page_offset + page_n_words;
+	     page_n_words = 1024;
+	end;
+
+
+
+
+%page;
+/* Allocate a dumper bit map for the volume */
+
+	vtoc_headerp = addr (abs_seg$);
+
+	call dbm_man$init_map (Pvtx, addr (vtoc_header.dmpr_bit_map), code);
+	if code ^= 0
+	then call syserr (ANNOUNCE, "init_volmap_seg: Unable to initialize dumper map for ^a_^a(^a)", pvte.devname,
+		convert (p99, pvte.logical_area_number), Pvname);
+	code = 0;
+
+%page;
+	call lock$lock_ast;
+
+CLEANUP_FINISH:
+	if astep ^= null ()
+	then do;
+		tsdw = 0;
+		call pmut$swap_sdw (addr (abs_seg$), addr (tsdw));
+		call pc$cleanup (astep);
+		call put_aste (astep);
+	     end;
+
+	vsdw = 0;
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (vsdw));
+
+	call lock$unlock_ast;
+
+	Code = code;
+
+	return;
+
+
+CLEANUP_AFTER_IO_ERROR:
+	code = error_table_$fsdisk_phydev_err;
+
+CLEANUP_AFTER_ERROR:
+	call lock$lock_ast;
+
+	if vastep ^= null ()
+	then do;
+		if record_stockp ^= null ()
+		then call stock_man$free_record_stock (pvtep, record_stockp);
+		if vtoce_stockp ^= null ()
+		then call stock_man$free_vtoce_stock (pvtep, vtoce_stockp);
+
+		vsdw = 0;
+		call pmut$swap_sdw (addr (volmap_abs_seg$), addr (vsdw));
+		call pc$cleanup (vastep);
+		call put_aste (vastep);
+	     end;
+
+
+	goto CLEANUP_FINISH;
+
+%page;
+%include aste;
+%page;
+%include disk_pack;
+%page;
+%include pvte;
+%page;
+%include stock_seg;
+%page;
+%include syserr_constants;
+%page;
+%include vol_map;
+%page;
+%include vtoc_header;
+%page;
+%include vtoc_map;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   init_volmap_seg: Unable to initialize dumper map for dskX_NN(PVNAME)
+
+   S:     $info
+
+   T:	During system initialization as physical volumes of the Root
+   Logical Volume (RLV) are accepted, during system start_up as physical
+   volumes which were mounted at the last shutdown are accepted, or
+   when a physical volume is mounted and accepted.
+
+   M:     An unexpected error was encountered in initializing the
+   backup queue bit map for the Physical Volume Dumper. The volume
+   on which the error occurred cannot be backed up with the Physical
+   Volume Dumper.
+
+   A:     $inform
+
+
+   Message:
+   init_volmap_seg: Unable to get NK ASTE for VTOC header.
+
+   S:     $crash
+
+   T:	During system initialization as physical volumes of the Root
+   Logical Volume (RLV) are accepted, during system start_up as physical
+   volumes which were mounted at the last shutdown are accepted, or
+   when a physical volume is mounted and accepted.
+
+   M:     An NK ASTE was not available for accessing the VTOC header.
+   The most likely cause is an ASTE pool size which is too small.
+
+   A:     $recover
+   Increase the number of ASTEs in the appropriate pool by means of the
+   SST configuration card.
+
+   Message:
+   init_volmap_seg: Unable to get NK ASTE for volmap_seg.
+
+   S:     $crash
+
+   T:	During system initialization as physical volumes of the Root
+   Logical Volume (RLV) are accepted, during system start_up as physical
+   volumes which were mounted at the last shutdown are accepted, or
+   when a physical volume is mounted and accepted.
+
+   M:     An NK ASTE was not available for accessing the Volume Map.
+   The most likely cause is an ASTE pool size which is too small.
+
+   A:     $recover
+   Increase the number of ASTEs in the appropriate pool by means of the
+   SST configuration card.
+
+   Message:
+   init_volmap_seg: Records left on dskX_NN(PVNAME) changed from X to Y.
+
+   S:     $log
+
+   T:	During system initialization as physical volumes of the Root
+   Logical Volume (RLV) are accepted, during system start_up as physical
+   volumes which were mounted at the last shutdown are accepted, or
+   when a physical volume is mounted and accepted.
+
+   M:     A VTOC header was encountered which did not agree with the Volume
+   Map. This will occur when a volume which was not shut down properly is
+   mounted.
+
+   A:     $inform
+
+   Message:
+   init_volmap_seg: VTOCEs left on dskX_NN(PVNAME) changed from X to Y.
+
+   S:     $log
+
+   T:	During system initialization as physical volumes of the Root
+   Logical Volume (RLV) are accepted, during system start_up as physical
+   volumes which were mounted at the last shutdown are accepted, or
+   when a physical volume is mounted and accepted.
+
+   M:     A VTOC header was encountered which did not agree with the VTOC
+   Map. This will occur when a volume which was not shut down properly is
+   mounted.
+
+   A:     $inform
+
+   Message:
+   init_volmap_seg: YYYY volume inconsistencies on dskX_NN(PVNAME). UUUU records left. VVVV VTOCEs left.
+
+   S:     Logged only if the number of free records and the number of free
+   VTOCEs are both above thresholds. Logged and printed on the console if
+   either is below threshold.
+
+   T:	During system initialization as physical volumes of the Root
+   Logical Volume (RLV) are accepted, during system start_up as physical
+   volumes which were mounted at the last shutdown are accepted, or
+   when a physical volume is mounted and accepted.
+
+   M:     The volume was not shut down properly or inconsistencies were
+   detected while the volume was mounted. The effect of these inconsistencies
+   is that free records and free VTOCEs are lost to the system. Lost records
+   and VTOCEs can be recovered by a volume salvage.
+
+   A:     $inform
+
+   END MESSAGE DOCUMENTATION */
+
+     end init_volmap_seg;

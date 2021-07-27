@@ -1,0 +1,608 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1987 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+/* This procedure implements the Multics PL/1 condition handling mechanism.
+   This procedure is called with the name of a condition and searches back
+   up the condition stack which is embedded in the standard Multics stack until
+   a handler for the condition is found. This handler is then invoked.
+   If the beginning of the stack is reached, a new stack frame is built
+   at the end of the calling ring's stack and the unwinder is called
+   to repeat the above process.
+
+   Modified on November 14, 1971 by R. J. Feiertag to handle special conditions. 		 */
+/* 	Modified on January 13, 1972 by R. J. Feiertag					 */
+/*	Recoded on September 14, 1972 for the 645F by Noel I. Morris			*/
+/*	Modified July 1973 by M. Weaver for any_other, new stack frame flags,
+   and to use nonlocal_goto_ */
+/* 	Modified October 1973 by M. Weaver to re-separate the unwinder,
+   process pl1 snap and system, eliminate special handlers, make use of the new
+   pl1 info structure for I/O conditions and copy more stuff on crawlouts
+
+   Modified 4/75 by S. Webber to add static handler code
+   Emergency fix 760427 by PG to initialize continue flag before calling static handlers.
+   Modified 7/14/76 by Noel I. Morris for virtual time metering
+   Modified 6/76 by D. Vinograd to more correctly determine if fault occured in fim stack frame.
+   Modified 1/26/81 by J. A. Bush to set up any_other condition handler for stack access problems
+   Modified April 2 1981 Benson I. Margulies to special case null_pointer_ 
+	 versus simfault_nnnnnn. This code can be removed for MR10 or 11.
+	 The special case consists of the flag null_pointer_condition
+	 and code in the proc found_specific_condition.
+
+   Modified September 1981 by Benson I. Margulies for:
+     1) passing info_ptr to static handler
+     2) continue_to_signal_ for static handlers.
+   Modified '82 BIM for any_other handler while running.
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-02-13,Farley), approve(87-04-15,MCR7665),
+     audit(87-04-20,Lippard), install(87-04-28,MR12.1-1028):
+     (phx20748) Changed to revert the any_other handler before calling
+     crawlout_default_handler_ so that any recursive calls that it makes back
+     to us will not invoke our any_other handler.
+  2) change(87-04-15,Farley), approve(87-04-15,MCR7665),
+     audit(87-04-20,Lippard), install(87-04-28,MR12.1-1028):
+     Changed to continue to the previous stack frame after handling a specific
+     condition and the handler wishes to continue to signal.  The any_other
+     condition handler, when defined, was being called erroneously.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style2 */
+signal:
+signal_:
+     procedure (a_name, a_mcptr, a_info_ptr, a_wcptr);
+
+	static_okay = "1"b;
+	go to common;
+
+	dcl     a_name		 char (*),	/* condition being signalled */
+	        a_info_ptr		 ptr,		/* information about software signal */
+	        a_wcptr		 ptr,		/* info about wall crossing from this ring before crawlout */
+	        a_mcptr		 ptr;		/* optional machine conditions ptr */
+
+	dcl     mcptr		 ptr,		/* pointer to machine conditions */
+	        info_ptr		 ptr,		/* pointer to software signal info */
+	        wcptr		 ptr,		/* pointer to wall crossing mc */
+	        condition_name	 char (32),	/* local copy of condition being signalled */
+	        l_name		 fixed bin,	/* length of condition name */
+	        loops		 fixed bin init (0),/* count of separate stack frames found */
+	        ou_count		 fixed bin,	/* count of on units in thread */
+	        code		 fixed bin (35),	/* status code for unwind_stack_ */
+	        onlistp		 ptr,		/* pointer to on condition unit in stack frame */
+	        onlistrel		 bit (18),	/* offset within stack frame of on unit */
+	        oldp		 ptr,		/* pointer to previous on unit */
+	        prev_sp		 ptr,		/* used for threading new signal_ stack frame */
+	        next_sp		 ptr,		/* used in back-tracing the stack */
+	        my_sp		 ptr,		/* pointer to original signal_ stack frame */
+	        filep		 ptr,		/* pointer to pl1 file descriptor */
+	        arglistptr		 ptr,		/* pointer to fim or ii arglist */
+	        args		 fixed bin,	/* argument count to signal_ */
+	        unclp		 ptr,		/* pointer to unclaimed signal on unit */
+	        signal_caller_frame_size
+				 fixed bin (18) unsigned,
+						/* size of frame to call signal_ */
+	        io		 bit (1) aligned,	/* "1"b if I/O condition being signalled */
+	        retsw		 bit (1) aligned,	/* used by default handler before crawling out */
+	        continue		 bit (1) aligned;	/* "1"b after return from condition handler
+						   causes signal_ to continue searching for more. */
+	dcl     static_okay		 bit (1) aligned;	/* used to prevent infinite recursion with static handlers */
+
+	dcl     null_pointer_condition bit (1) aligned;	/* null_pointer_ */
+	dcl     any_other		 condition;
+
+	dcl     1 based_machine_conditions
+				 aligned based,	/* used to copy the machine conditions */
+		2 words		 (24) fixed bin (71);
+	dcl     based_ptr		 ptr based;	/* used in picking up ptr from arg list */
+
+	dcl     based_array		 (info_ptr -> condition_info_header.length) fixed bin (35) based;
+						/* used in copying info structures */
+
+	dcl     1 descriptor	 based aligned,	/* PL/1 argument descriptor */
+	        ( 2 flag		 bit (1),		/* non-zero for V2PL/1 */
+		2 type		 bit (6),		/* data type */
+		2 packed		 bit (1),		/* non-zero for packed data */
+		2 number_dims	 bit (4),		/* number of array dimensions */
+		2 size		 bit (24)
+		)		 unal;		/* size of data */
+
+	dcl     1 signal_caller_frame	 based (sp) aligned,/* stack frame for caller of signal_ */
+		2 frame_header	 like stack_frame,	/* stack frame header */
+		2 machine_conditions like based_machine_conditions,
+						/* machine conditions */
+		2 mcptr		 ptr,		/* pointer to machine conditions */
+		2 infoptr		 ptr,		/* pointer to info structure */
+		2 wcptr		 ptr,		/* pointer to wall crossing conditions */
+		2 condition_name	 char (32),	/* condition being signalled */
+		2 condition_name_desc
+				 like descriptor,	/* descriptor for condition name */
+		2 mcptr_desc	 like descriptor,	/* descriptor for pointer */
+		2 infoptr_desc	 like descriptor,	/* descriptor for pointer */
+		2 wcptr_desc	 like descriptor,	/* descriptor for pointer */
+		2 arglist,			/* argument list to signal_ */
+		  3 arg_count	 fixed bin (17) unal,
+						/* 2 * number of args */
+		  3 flag		 fixed bin (17) unal,
+						/* =4 for pl/1 call */
+		  3 desc_count	 fixed bin (17) unal,
+						/* 2 * number of descriptors */
+		  3 pad		 fixed bin (17) unal,
+		  3 condition_name_ptr
+				 ptr,
+		  3 mcptr_ptr	 ptr,
+		  3 infoptr_ptr	 ptr,
+		  3 wcptr_ptr	 ptr,
+		  3 condition_name_desc_ptr
+				 ptr,
+		  3 mcptr_desc_ptr	 ptr,
+		  3 infoptr_desc_ptr ptr,
+		  3 wcptr_desc_ptr	 ptr,
+		2 additions	 fixed bin;	/* info structure and/or wc will be copied here */
+
+	dcl     arg_count_		 external entry (fixed bin);
+	dcl     sct_manager_$call_handler
+				 entry (ptr, char (*), ptr, ptr, bit (1) aligned);
+	dcl     unwind_stack_	 entry (ptr, ptr, fixed bin (35));
+	dcl     nonlocal_goto_$different_ring
+				 entry (ptr, ptr);
+	dcl     crawlout_default_handler_
+				 entry (ptr, char (*), ptr, ptr, bit (1) aligned);
+	dcl     pl1_snap_		 entry (char (*));
+	dcl     default_error_handler_$wall_ignore_pi
+				 entry options (variable);
+	dcl     get_ring_		 entry () returns (fixed bin);
+	dcl     fim$		 ext fixed bin;
+	dcl     pds$vtime_count	 fixed bin ext;
+	dcl     verify_lock$condition	 entry (char (*), ptr);
+
+	dcl     (addr, addrel, baseno, bin, bit, divide, length, min, max, null, pointer, rtrim, size, stackframeptr,
+	        string, substr, unspec)
+				 builtin;
+
+
+%page;
+
+%include on_unit;
+
+	dcl     char_string		 char (onlistp -> on_unit.size) aligned based (onlistp -> on_unit.name),
+						/* used to reference condition name in stack */
+	        tpp		 (2) ptr based (onlistp -> on_unit.file);
+						/* part of file descriptor */
+
+%page;
+%include condition_info_header;
+	dcl     1 pl1_info_struc	 based (info_ptr) aligned like pl1_info;
+						/* info structure for pl1 conditions */
+%include pl1_info;
+%page;
+%include its;
+
+	dcl     1 fim_arglist	 based aligned,
+		2 arg_count	 fixed bin (17) unal,
+		2 flag		 fixed bin (17) unal,
+		2 desc_count	 fixed bin (17) unal,
+		2 pad		 fixed bin (17) unal,
+		2 first_arg	 ptr;		/* ptr to machine conditions */
+
+%page;
+
+%include stack_header;
+
+%include stack_frame;
+
+%include mc;
+
+
+common:						/* to all except io */
+	io = "0"b;				/* not i/o condition */
+
+	go to join;				/* join common code */
+
+/* This entry is called when signalling certain io conditions so that only the
+   handler pertaining to a certain file is invoked */
+
+io_signal:
+     entry (a_name, a_mcptr, a_info_ptr);
+
+	io = "1"b;
+
+/* The arg count stuff below just happens to work for this entrypoint */
+
+
+/* Initialize variables.  Find out how many arguments were supplied in call
+   to signal_.  Copy the ones supplied and provide dummy values for the others.
+*/
+join:
+	on any_other call terminate_minus_2 (-2);
+
+	call arg_count_ (args);			/* get number or arguments */
+
+	mcptr, info_ptr, wcptr = null;
+
+	args = max (min (args, 4), 0);		/* Force computed goto safety */
+
+	goto ARGS (args);
+
+ARGS (4):
+	wcptr = a_wcptr;
+
+ARGS (3):
+	info_ptr = a_info_ptr;
+ARGS (2):
+	mcptr = a_mcptr;
+ARGS (1):
+ARGS (0):
+/**** Find the point on the stack from which we will start to signal.
+      set the "signal" bit so that find_condition_info_ and continue_to_signal_
+      will work in static handlers. The rest of these variables
+      will be used after the static handler case is dealt with. */
+	next_sp, my_sp = stackframeptr ();		/* Extract our stack pointer */
+	sp = my_sp -> stack_frame.prev_sp;		/* Start from the previous stack frame. */
+
+	my_sp -> stack_frame_flags.signal = "1"b;	/* indicate this is signal frame */
+	my_sp -> stack_frame_flags.support = "1"b;	/* use option when available */
+
+	if mcptr ^= null & ^io & static_okay
+	then do;
+		continue = "0"b;			/* default is to not continue. */
+		revert any_other;			/* may resignal */
+		call sct_manager_$call_handler (mcptr, a_name, info_ptr, wcptr, continue);
+/**** Note that continue_to_signal_ will find this continue bit and set it 
+      for the handler. */
+
+		if ^continue
+		then return;
+
+		on any_other call terminate_minus_2 (-2);
+	     end;
+
+	l_name = length (rtrim (a_name));		/* Get true length of condition name. */
+	condition_name = substr (a_name, 1, l_name);	/* Copy the condition name into stack. */
+	null_pointer_condition = (condition_name = "null_pointer");
+
+	if io
+	then do;					/* used io_signal entry */
+		filep = info_ptr;			/* info_ptr points directly to file */
+		info_ptr = null;			/* dont dare crawl out with info_ptr set the way it was */
+	     end;
+	else if info_ptr ^= null
+	then if pl1_info_struc.id = "pliocond"
+	     then if pl1_info_struc.content_flags.file_ptr_sw
+		then do;
+			filep = pl1_info_struc.file_ptr;
+			io = "1"b;		/* have to look for file as well as condition */
+		     end;
+
+
+/* Search back down the stack, examining each frame. */
+
+stack_loop:
+/**** Search the condition stack.  When an on unit for this condition is found,
+   call the indicated handler.  Unless the variable "continue" is set
+   by the handler, signal_ will then return to its caller.  If "continue"
+   is set, signal_ will continue the search down the stack.			*/
+	if sp -> stack_frame_flags.condition
+	then do;					/* Has any condition been set in this frame? */
+		onlistrel = sp -> stack_frame.on_unit_relp1;
+						/* Get start of on list thread. */
+		unclp = null;			/* Initialize pointer to unclaimed_signal unit. */
+		oldp = null;			/* Initialize pointer to previous on unit. */
+		ou_count = 0;			/* initialize on unit count */
+
+		do while (onlistrel);		/* Search the on unit thread. */
+		     onlistp = addrel (sp, onlistrel);	/* Generate a pointer to the on unit. */
+
+		     if found_specific_condition (l_name, condition_name, onlistp)
+		     then do;
+			     if io
+			     then /* If an I/O condition ... */
+				if onlistp -> on_unit.file -> tpp (2) ^= filep -> tpp (2)
+				then go to skip_invoke;
+						/* Skip invocation if not the desired file. */
+
+			     revert any_other;
+			     call caller (onlistp);	/* Invoke the handler. */
+			     on any_other call terminate_minus_2 (-2);
+			     goto end_loop;		/* continue up the stack */
+			end;
+
+		     if onlistp -> on_unit.size = length ("any_other")
+		     then if onlistp -> on_unit.name -> char_string = "any_other"
+			then /* is this "any_other" */
+			     unclp = onlistp;	/* save loc'n of on unit for any_other */
+
+		     if onlistp -> on_unit.size = length ("unclaimed_signal")
+		     then /* Is this "unclaimed_signal"? */
+			if onlistp -> on_unit.name -> char_string = "unclaimed_signal"
+			then unclp = onlistp;	/* Save loc'n of on unit for unclaimed signal. */
+
+
+skip_invoke:
+		     oldp = onlistp;		/* Save pointer to previous on unit. */
+		     onlistrel = onlistp -> on_unit.next;
+						/* Step to next unit and continue. */
+		     ou_count = ou_count + 1;		/* increment count of on units */
+		     if ou_count > 200
+		     then call terminate_minus_2 (-2);
+
+/* term process if too many */
+		end;
+
+
+/* If the desired on unit was not found, check for an unclaimed_signal
+   handler or for a default handler.  If unwinding, check for a cleanup
+   handler.							*/
+
+		if unclp ^= null
+		then /* If there is an unclaimed_signal handler ... */
+		     do;
+			revert any_other;
+			call caller (unclp);	/* Invoke the unclaimed signal handler. */
+			on any_other call terminate_minus_2 (-2);
+		     end;
+	     end;
+
+
+/* Step back to the next stack frame.  Determine if the previous stack frame
+   is in another stack segment.  If not, continue looping.				*/
+
+end_loop:
+	next_sp = sp;				/* Save pointer to this stack frame. */
+	sp = sp -> stack_frame.prev_sp;		/* Step stack pointer back to previous frame. */
+	loops = loops + 1;				/* increment count of stack frames found */
+	if loops > 5000
+	then call terminate_minus_2 (-2);
+
+	if baseno (next_sp) = baseno (sp)
+	then goto stack_loop;			/* Continue search if on same stack. */
+
+
+/* The signal was unclaimed on this stack.  If possible, an attempt
+   will be made to signal this condition on the calling stack.
+   This will be done by simulating a call to signal_ on that stack.		*/
+
+end_scan:
+	if sp = null
+	then call terminate_minus_2 (-2);
+
+/* before we crawl out, see if the system default handling is nonfatal;
+   if so, do it and return */
+
+	retsw = "0"b;
+	revert any_other;
+	call crawlout_default_handler_ (mcptr, substr (condition_name, 1, l_name), wcptr, info_ptr, retsw);
+	if retsw
+	then go to return;				/* assume condition was handled adequately */
+	on any_other call terminate_minus_2 (-2);
+
+
+/* If signalling, we must unwind to get to the calling stack. */
+	call unwind_stack_ (my_sp, null, code);		/* code always 0 in this case */
+
+/* In case there are access/parity problems with stack, set up any_other handler to terminate process.
+   The any_other handler will be reverted  on call to non_local_goto_$different_ring */
+
+	on any_other call terminate_minus_2 (-5);	/* -5 will be translated to error_table_$bad_stack_access by terminate_proc */
+
+/* Construct a new stack frame on the calling stack.  This frame will contain
+   an argument list and arguments for a call to signal_. 			*/
+
+	sb = pointer (sp, "0"b);			/* Get pointer to base of outer ring stack. */
+	prev_sp = sp;				/* Save pointer to last frame on that stack. */
+	sp = sb -> stack_header.stack_end_ptr;		/* Get pointer to new frame. */
+	signal_caller_frame_size = size (signal_caller_frame) - 1;
+						/* Compute min length of signal_caller stack frame */
+
+	sp -> stack_frame.prev_sp = prev_sp;		/* Thread new frame in. */
+	sp -> stack_frame_flags.condition = "0"b;	/* "prev_sp" may have had condition bit set. */
+	sp -> stack_frame_flags.crawl_out = "1"b;	/* indicate we're doing a crawl out */
+	sp -> stack_frame_flags.support = "1"b;
+
+
+/* Set up stack variables in signal caller frame. */
+
+	if mcptr ^= null
+	then do;					/* If machine conditions were supplied ... */
+		signal_caller_frame.machine_conditions = mcptr -> based_machine_conditions;
+						/* Copy the machine conditions into our frame. */
+		signal_caller_frame.mcptr = addr (signal_caller_frame.machine_conditions);
+						/* Set pointer in caller frame. */
+	     end;
+	else /* Otherwise, set null ptr. */
+	     signal_caller_frame.mcptr = null;
+
+/* copy conditions from system fault in outer ring if available */
+
+	if get_ring_ () = 0
+	then do;					/* fim doesn't operate in other rings */
+
+		call verify_lock$condition (condition_name, mcptr);
+						/* Unlock all locks in Ring 0 */
+
+		pds$vtime_count = -1;		/* Reset virtual time counters. */
+
+		if ^next_sp -> stack_frame_flags.signaller
+		     & baseno (next_sp -> stack_frame.return_ptr) = baseno (addr (fim$))
+		then do;
+			arglistptr = next_sp -> stack_frame.next_sp -> stack_frame.arg_ptr;
+						/* get ptr to callee's arg list */
+			unclp = arglistptr -> fim_arglist.first_arg -> based_ptr;
+						/* first arg points to mc */
+
+/* be sure that wall crossing conditions are relevant for target ring */
+			if addr (unclp -> mc.scu (0)) -> scu.ppr.prr ^= addr (sp) -> its.ringno
+			then go to no_wc;		/* not for target ring */
+			signal_caller_frame.wcptr = addr (signal_caller_frame.additions);
+			signal_caller_frame.wcptr -> based_machine_conditions = unclp -> based_machine_conditions;
+			signal_caller_frame_size = signal_caller_frame_size + size (mc);
+						/* add length of wc */
+		     end;
+		else go to no_wc;
+
+	     end;					/* end of checks for ring 0 */
+
+	else
+no_wc:
+	     signal_caller_frame.wcptr = null;
+
+/* copy info structure into outer ring */
+	if info_ptr ^= null
+	then do;					/* there is a structure to copy */
+		signal_caller_frame.infoptr = addrel (sp, signal_caller_frame_size);
+		signal_caller_frame.infoptr -> based_array = info_ptr -> based_array;
+		signal_caller_frame_size = signal_caller_frame_size + info_ptr -> pl1_info_struc.length;
+						/* all info structures have length first */
+	     end;
+	else signal_caller_frame.infoptr = null;	/* indicate no structure */
+
+	signal_caller_frame_size = divide (signal_caller_frame_size + 15, 16, 18, 0) * 16;
+						/* round size up to nearest 16 */
+
+	next_sp,					/* Set new pointer to end of stack. */
+	     sb -> stack_header.stack_end_ptr, sp -> stack_frame.next_sp = addrel (sp, signal_caller_frame_size);
+
+	sp -> stack_frame_flags.old_crawl_out = "1"b;	/* must set after next_sp */
+
+	string (signal_caller_frame.mcptr_desc) = "0"b;	/* Set descriptor for mcptr. */
+	signal_caller_frame.mcptr_desc.flag = "1"b;
+	signal_caller_frame.mcptr_desc.type = bit (bin (13, 6), 6);
+
+	string (signal_caller_frame.infoptr_desc) = "0"b; /* Set descriptor for infoptr */
+	signal_caller_frame.infoptr_desc.flag = "1"b;
+	signal_caller_frame.infoptr_desc.type = bit (bin (13, 6), 6);
+
+	string (signal_caller_frame.wcptr_desc) = "0"b;	/* Set descriptor for wcptr */
+	signal_caller_frame.wcptr_desc.flag = "1"b;
+	signal_caller_frame.wcptr_desc.type = bit (bin (13, 6), 6);
+
+/* set translator id to special value (3) for debugging */
+	signal_caller_frame.translator_id = bit (bin (3, 18), 18);
+	signal_caller_frame.entry_ptr = null;		/* so won't be confused by garbage */
+	signal_caller_frame.condition_name = condition_name;
+						/* Place condition name in caller frame. */
+
+	string (signal_caller_frame.condition_name_desc) = "0"b;
+						/* Set descriptor for condition_name. */
+	signal_caller_frame.condition_name_desc.flag = "1"b;
+	signal_caller_frame.condition_name_desc.type = bit (bin (21, 6), 6);
+	signal_caller_frame.condition_name_desc.size = bit (bin (l_name, 24), 24);
+
+
+/* Set argument list to signal_. */
+
+	signal_caller_frame.arglist.arg_count = 8;	/* Four arguments. */
+	signal_caller_frame.arglist.flag = 4;		/* Indicate PL/1 call. */
+	signal_caller_frame.arglist.desc_count = 8;	/* Four descriptors. */
+	signal_caller_frame.arglist.pad = 0;
+
+	signal_caller_frame.arglist.condition_name_ptr = addr (signal_caller_frame.condition_name);
+	signal_caller_frame.arglist.mcptr_ptr = addr (signal_caller_frame.mcptr);
+	signal_caller_frame.arglist.infoptr_ptr = addr (signal_caller_frame.infoptr);
+	signal_caller_frame.arglist.wcptr_ptr = addr (signal_caller_frame.wcptr);
+	signal_caller_frame.arglist.condition_name_desc_ptr = addr (signal_caller_frame.condition_name_desc);
+	signal_caller_frame.arglist.mcptr_desc_ptr = addr (signal_caller_frame.mcptr_desc);
+	signal_caller_frame.arglist.infoptr_desc_ptr = addr (signal_caller_frame.infoptr_desc);
+	signal_caller_frame.arglist.wcptr_desc_ptr = addr (signal_caller_frame.wcptr_desc);
+
+
+/* Set operator pointer in caller frame to point to argument list.
+   The unwinder will place this value in ap when it performs the
+   non-local goto.  Beware --- THIS IS A KLUDGE.				*/
+
+	stack_frame.operator_and_lp_ptr = addr (signal_caller_frame.arglist);
+
+	sp -> stack_frame.return_ptr = sb -> stack_header.signal_ptr;
+						/* Set return pointer to enter signal_. */
+
+
+/* Perform a non-local goto be calling the unwinder_'s ALM utility routine. */
+
+	call nonlocal_goto_$different_ring (sp, sp -> stack_frame.return_ptr);
+						/* Call signal_ again on target stack */
+
+
+
+	return;
+
+
+/* CALLER - Internal procedure to call handler */
+
+caller:
+     proc (p);
+
+	dcl     p			 ptr;
+	declare entry_variable	 entry variable options (variable);
+
+	declare 1 entry_overlay	 aligned,
+		2 codeptr		 pointer,
+		2 environmentptr	 pointer;
+
+	if p -> on_unit.flags.pl1_snap
+	then call pl1_snap_ (condition_name);		/* perform snap */
+
+	if p -> on_unit.flags.pl1_system
+	then /* use system's handler */
+	     entry_overlay.codeptr = addr (default_error_handler_$wall_ignore_pi);
+	else entry_overlay.codeptr = p -> on_unit.body;	/* otherwise use entry from on unit */
+
+	entry_overlay.environmentptr = sp;
+	unspec (entry_variable) = unspec (entry_overlay);
+
+	continue = "0"b;				/* clear the continue flag */
+	call entry_variable (mcptr, substr (condition_name, 1, l_name), wcptr, info_ptr, continue);
+						/* call the handler */
+/**** Note that continue_to_signal_ will reach into the arglist and
+      change the continue bit. */
+
+	if ^continue
+	then go to return;				/* if finished, then return from signal_ */
+
+	return;					/* return to caller for more searching */
+
+     end caller;
+
+found_specific_condition:
+     procedure (name_length, name, on_unit_ptr) returns (bit (1) aligned);
+
+	declare name_length		 fixed bin;	/* number of non-spaces leading in name */
+	declare name		 character (*);	/* name of condition sought */
+	declare on_unit_ptr		 pointer;		/* unit under scrutiny */
+
+	declare 1 OU		 aligned like on_unit based (on_unit_ptr);
+	declare on_unit_name	 character (OU.size) based (OU.name) aligned;
+
+	if name_length = length (on_unit_name)
+	then if condition_name = on_unit_name
+	     then return ("1"b);			/* really there */
+	if null_pointer_condition			/* global bit flag to avoid repeating this test */
+	then if length (on_unit_name) = length ("simfault_000000")
+	     then if substr (on_unit_name, 1, length ("simfault_")) = "simfault_"
+		then return ("1"b);
+	return ("0"b);				/* no such luck */
+     end found_specific_condition;
+
+return:
+	return;					/* return to caller of signal_ */
+
+terminate_minus_2:
+     procedure (offset);
+	declare offset		 fixed bin;
+	declare baseptr		 builtin;
+	declare killer_ptr		 pointer;
+	declare killer		 fixed bin (35) aligned based (killer_ptr);
+
+	killer_ptr = pointer (baseptr (-2), offset);
+	killer = 0;
+     end terminate_minus_2;
+     end signal_;

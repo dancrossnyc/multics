@@ -1,0 +1,309 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* Procedure to manage allocation of temporaries in stack
+
+	Modified:	23 April 1973 by RAB
+	Modified:	1 May 1977 by RAB to fix bug in assign_aggregate
+	Modified:	10 September 1977 by RAB to fix 1613 by setting temporary.last_freed
+	Modified 780717 by PG to count number of temporary nodes allocated
+	Modified 791016 by PG to check temporary.ref_count < 0
+*/
+
+stack_temp$assign_temp: proc(ref_pt) ;
+
+/* parameters */
+
+dcl	ref_pt ptr parameter;	/* points at temp reference to be allocated */
+
+/* external static */
+
+dcl	(cg_stat$cur_block,cg_stat$cur_statement,cg_stat$agg_temps) ptr ext,
+	cg_stat$max_stack_size fixed bin ext,
+	cg_stat$text_pos fixed bin(18) ext,
+	cg_stat$extended_stack bit(1) ext,
+	pl1_stat_$node_uses (18) fixed bin external static;
+
+/* automatic */
+
+dcl	(p,r,s,o) ptr,
+	atomic bit(1) aligned,
+	(size,bit_length) fixed bin;
+
+/* entries */
+
+dcl	error entry(fixed bin,ptr,ptr),
+	cg_error entry(fixed bin,fixed bin),
+	prepare_operand entry(ptr,fixed bin,bit(1) aligned) returns(ptr),
+	compile_exp entry(ptr),
+	expmac$zero entry(fixed bin(15)),
+	expmac entry(fixed bin(15),ptr),
+	c_a entry(fixed bin(18),fixed bin) returns(ptr);
+
+/* internal static */
+
+dcl (	alloc_words	init(91),
+	store_bp		init(61)) fixed bin(15) int static;
+
+/* builtins */
+
+dcl	(bin, divide, mod, null) builtin;
+
+/* include files */
+
+%include pl1_tree_areas;
+%include temporary;
+%include nodes;
+%include block;
+%include reference;
+%include symbol;
+%include machine_state;
+%include cgsystem;
+%include data_types;
+
+/* program */
+
+	r = ref_pt;
+	s = r -> reference.symbol;
+
+	if r -> reference.aggregate
+	then do;
+
+	     /* this is aggregate temp so assign storage to level 1 ancestor
+	        if none already assigned */
+
+	     r -> reference.allocated = "1"b;
+
+	     do p = s repeat(p -> symbol.father) while(p -> symbol.father ^= null);
+		end;
+
+	     if p -> symbol.initial = null then goto agg; else return;
+	     end;
+
+	if s = null
+	then if r -> reference.data_type = 0
+	     then size = r -> reference.c_length;
+	     else go to get_length;
+	else if s -> symbol.temporary
+	     then size = s -> symbol.c_word_size;
+	     else do;
+get_length:	bit_length = r -> reference.c_length;
+		if r -> reference.data_type = char_string
+		     then bit_length = bit_length * bits_per_char;
+		size = divide(bit_length+bits_per_word-1,bits_per_word,17,0);
+		end;
+
+common:	r -> reference.qualifier = get_temp(size);
+	r -> reference.qualifier -> temporary.ref_count = 1;
+	r -> reference.allocated = "1"b;
+
+	if ^ r -> reference.address_in.storage
+	then if r -> reference.varying_ref
+	     then r -> reference.c_offset = r -> reference.c_offset + 1;
+
+	return;
+
+stack_temp$assign_block: entry(ref_pt,amount);
+
+dcl	amount fixed bin;
+
+	r = ref_pt;
+	size = amount;
+	goto common;
+
+stack_temp$free_temp: entry(ref_pt);
+
+	r = ref_pt;
+
+	s = r -> reference.qualifier;
+	if s = null then return;
+
+	if s -> node.type ^= temporary_node then return;
+
+	if (r -> reference.ref_count < 0) | (s -> temporary.ref_count < 0)
+	then do;
+	     call error(314,cg_stat$cur_statement,r);
+	     return;
+	     end;
+
+	r -> reference.qualifier = null;
+
+	call put_temp(s);
+	return;
+
+stack_temp$assign_return_value:	entry(sym_pt);
+
+	p = sym_pt;
+
+	r = get_temp(2);
+	p -> symbol.initial = r;
+
+	go to chain_agg;
+
+stack_temp$assign_aggregate: entry(sym_pt);
+
+dcl	sym_pt ptr;
+
+	p = sym_pt;
+
+agg:	if p -> symbol.word_size = null then size = p -> symbol.c_word_size;
+	else do;
+	     o = p -> symbol.word_size;
+	     r = prepare_operand(o,1,atomic);
+	     call compile_exp(o);
+	     call expmac$zero((alloc_words));
+	     cg_stat$extended_stack = "1"b;
+	     size = 2;
+	     end;
+
+	r = get_temp(size);
+	p -> symbol.initial = r;
+
+	if p -> symbol.word_size ^= null
+	then do;
+	     call expmac((store_bp),c_a(r -> temporary.location,4));
+	     base_regs(1).type = 3;
+	     base_regs(1).constant = r -> temporary.location;
+	     end;
+
+chain_agg:
+	r -> temporary.symbol = p;
+	r -> temporary.next = cg_stat$agg_temps;
+	cg_stat$agg_temps = r;
+
+	return;
+
+stack_temp$free_aggregates: entry;
+
+	p = cg_stat$agg_temps;
+	do while(p ^= null);
+	     p -> temporary.symbol -> symbol.initial = null;
+	     r = p -> temporary.next;
+	     call put_temp(p);
+	     p = r;
+	     end;
+
+	cg_stat$agg_temps = null;
+	return;
+
+get_temp:	     proc(amount) returns(ptr);
+
+dcl	     (amount,amt,loc,i) fixed bin,
+	     (cb,s,prev,p) ptr;
+
+	     cb = cg_stat$cur_block;
+	     loc = cb -> block.last_auto_loc;
+
+	     amt = amount;
+	     if amt >= 3 then goto big;
+
+	     if amt = 0 then amt = 1;
+
+	     i = amt;
+	     p = cb -> block.free_temps(i);
+
+	     if p ^= null
+	     then do;
+l0:		cb -> block.free_temps(i) = p -> temporary.next;
+l1:		return(p);
+		end;
+
+	     if i = 1
+	     then do;
+l3:		p = create_temp(amt);
+		cb -> block.last_auto_loc = loc + amt;
+
+		if cb -> block.last_auto_loc > cg_stat$max_stack_size
+		then call cg_error(308,cg_stat$max_stack_size);
+
+		goto l1;
+		end;
+
+l4:	     if mod(loc,2) = 0 then goto l3;
+
+	     p = create_temp(1);
+	     p -> temporary.next = cb -> block.free_temps(1);
+	     cb -> block.free_temps(1) = p;
+	     loc = loc + 1;
+	     goto l3;
+
+big:	     prev = null;
+	     i = 3;
+	     p = cb -> block.free_temps(3);
+
+	     do while(p ^= null);
+
+		if p -> temporary.size >= amt
+		then do;
+		     if prev = null then goto l0;
+		     prev -> temporary.next = p -> temporary.next;
+		     goto l1;
+		     end;
+
+		prev = p;
+		p = p -> temporary.next;
+		end;
+
+	     goto l4;
+
+put_temp:	     entry(temp);
+
+dcl	     temp ptr;
+
+	     cb = cg_stat$cur_block;
+
+	     s = temp;
+	     s -> temporary.last_freed = cg_stat$text_pos;
+	     i, amt = s -> temporary.size;
+
+	     if i < 3
+	     then do;
+l5:		s -> temporary.next = cb -> block.free_temps(i);
+		cb -> block.free_temps(i) = s;
+		return;
+		end;
+
+	     prev = null;
+	     i = 3;
+	     p = cb -> block.free_temps(3);
+
+	     do while(p ^= null);
+
+		if amt < p -> temporary.size
+		then do;
+l6:		     if prev = null then goto l5;
+		     s -> temporary.next = prev -> temporary.next;
+		     prev -> temporary.next = s;
+		     return;
+		     end;
+
+		prev = p;
+		p = p -> temporary.next;
+		end;
+
+	     goto l6;
+
+create_temp:	proc(number) returns(ptr);
+
+dcl		number fixed bin,
+		q ptr;
+
+		allocate temporary in(xeq_tree_area) set(q);
+		pl1_stat_$node_uses (bin (temporary_node, 9)) = pl1_stat_$node_uses (bin (temporary_node, 9)) + 1;
+		q -> temporary.node_type = temporary_node;
+		q -> temporary.location = loc;
+		q -> temporary.size = number;
+		return(q);
+
+		end;
+
+	     end;
+
+	end;

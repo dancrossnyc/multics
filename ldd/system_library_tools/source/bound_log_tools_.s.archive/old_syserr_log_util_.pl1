@@ -1,0 +1,686 @@
+/* ***********************************************************
+   *						 *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *						 *
+   * Copyright (c) 1972 by Massachusetts Institute of	 *
+   * Technology and Honeywell Information Systems, Inc.	 *
+   *						 *
+   *********************************************************** */
+
+
+/* SYSERR_LOG_UTIL_ - Procedure to search and read the "syserr log" composed of a ring 4 vfile_ in >system_control_1
+   and a ring 0 threaded list */
+
+/* Written late 1975 by Lee Scheffler */
+/* Modified January 1976 by Larry Johnson to fix some bugs */
+/* Modified April 1976 by Larry Johnson to fix some bugs */
+/* Modified October 1982 by E. N. Kittlitz to add open_path, trim_path */
+/* 84-10-04, WOS: Converted to old_syserr_log_util_ for new logging migration */
+
+/* format: style4 */
+old_syserr_log_util_: proc ();
+
+/* Entries */
+
+dcl  absolute_pathname_ entry (char (*), char (*), fixed bin (35));
+dcl  audit_gate_$copy_syserr_log entry (bit (18) aligned, pointer, fixed bin (24), fixed bin (24));
+dcl  delete_$path entry (char (*), char (*), bit (6), char (*), fixed bin (35));
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  get_pdir_ entry () returns (char (168));
+dcl  get_temp_segments_ entry (char (*), dim (*) ptr, fixed bin (35));
+dcl  release_temp_segments_ entry (char (*), dim (*) ptr, fixed bin (35));
+dcl  hcs_$set_safety_sw entry (char (*), char (*), bit (1), fixed bin (35));
+dcl  iox_$attach_ioname entry (char (*), pointer, char (*), fixed bin (35));
+dcl  iox_$close entry (pointer, fixed bin (35));
+dcl  iox_$control entry (pointer, char (*), pointer, fixed bin (35));
+dcl  iox_$delete_record entry (pointer, fixed bin (35));
+dcl  iox_$detach_iocb entry (pointer, fixed bin (35));
+dcl  iox_$find_iocb entry (char (*), pointer, fixed bin (35));
+dcl  iox_$open entry (pointer, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$position entry (pointer, fixed bin, fixed bin (21), fixed bin (35));
+dcl  iox_$read_key entry (pointer, char (256) varying, fixed bin (21), fixed bin (35));
+dcl  iox_$read_record entry (pointer, pointer, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$seek_key entry (pointer, char (256) varying, fixed bin, fixed bin (35));
+dcl  iox_$write_record entry (pointer, pointer, fixed bin (21), fixed bin (35));
+dcl  pathname_ entry (char (*), char (*)) returns (char (168));
+dcl  sub_err_ entry () options (variable);
+dcl  unique_bits_ entry returns (bit (71));
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+
+/* Builtin */
+
+declare  (addr, addrel, bin, divide, fixed, null, ptr, rel, rtrim, substr, unspec) builtin;
+
+/* Status codes */
+
+dcl  error_table_$bad_arg fixed bin (35) external;
+dcl  error_table_$end_of_info fixed bin (35) external;
+dcl  error_table_$file_busy fixed bin (35) external;
+dcl  error_table_$key_duplication fixed bin (35) external;
+dcl  error_table_$key_order fixed bin (35) external;
+dcl  error_table_$moderr fixed bin (35) external;
+dcl  error_table_$no_record fixed bin (35) external;
+dcl  error_table_$not_detached fixed bin (35) external;
+dcl  error_table_$not_open fixed bin (35) external;
+
+/* Constants */
+
+dcl  R0_VFILE char (13) internal static initial ("r0_syserr_log");
+dcl  R0_SW char (13) internal static initial ("r0_syserr_i/o");
+dcl  R4_SW char (13) internal static initial ("r4_syserr_i/o");
+dcl  R4_PATH char (168) internal static initial (">system_control_1>perm_syserr_log");
+dcl  (NO init ("0"b), YES init ("1"b)) bit (1) internal static;
+dcl  (KSI initial (8), KSO initial (9), KSU initial (10)) fixed bin internal static; /* Opening modes */
+dcl  (EOF initial (+1), BOF initial (-1), SKIP initial (0)) fixed bin internal static; /* For iox_$position */
+
+
+/* Statics */
+
+dcl  iop (2) pointer internal static initial ((2) null ()); /* iop (1) -> IOCB (r0 log in process dir) */
+						/* iop (2) -> IOCB (r4 log in >sc1) */
+dcl  curlog fixed bin (2) internal static initial (0);	/* index into iop of log piece
+						   containing "current messagee" */
+dcl  OPEN bit (1) aligned internal static initial ("0"b);	/* ON iff log is open */
+
+/* Miscellaneous */
+
+dcl  r0_vfile char (32) internal static;		/* Unique name of vfile in process dir holding r0 log */
+dcl  r0_vpath char (168) varying;			/* Pathnaame of same */
+dcl  r4_dir char (168);
+dcl  r4_entry char (32);
+dcl  r4_path char (168);				/* Pathname of ring 4 perm-syserr-log vfile */
+dcl  ec fixed bin (35);				/* Ubiquitous status code */
+dcl  log_len fixed bin (24);				/* Length of ring 0 syserr log */
+dcl  key char (256) varying;				/* iox_ record key */
+dcl  keybits bit (9 * 16);				/* Used to convert fixed bins to char keys */
+dcl  keychars char (16) based (addr (keybits));
+dcl  (off, nextoff, prevoff) bit (18);			/* Used in searching r0 syserr log */
+dcl  time fixed bin (71);				/* Message time */
+dcl  linkage_error condition;				/* Signalled when user has no access to r0 log */
+dcl  key_dup bit (1) aligned;
+dcl  seg_array (1) ptr;				/* array of pointers for temp seg manager */
+
+/* Entry to attach and open the "syserr log" for searching */
+/* This entry first opens the ring 4 syserr log vfile_, creates a virgin temporary vfile_
+   in the process directory, copies the ring 0 syserr log into a temp in the process directory,
+   copies all messages from the ring 0 log not already in the ring 4 log into the temp vfile,
+   then views the two vfiles as one "log" */
+
+old_syserr_log_util_$open: entry (access, ec);
+
+dcl  access bit (36) aligned parameter;			/* "1X"b if ring 0 log is available
+						   "X1"b if ring 4 log is available */
+dcl  r4_ec fixed bin (35);				/* Status code for ring 4 log opening */
+
+	r4_path = R4_PATH;
+	go to open_join;
+
+old_syserr_log_util_$open_path: entry (a_open_path, access, ec);
+
+dcl  a_open_path char (*);				/* pathname of perm-syserr-log */
+
+	r4_path = a_open_path;			/* user tells us where */
+	if r4_path = "" then			/* oops, got lazy */
+	     r4_path = R4_PATH;			/* use the default */
+
+open_join:
+	OPEN = NO;				/* Let's get one thing straight: WE ARE NOT OPEN YET */
+	curlog = 0;				/* Also, we have not yet established our position yet */
+	access = "00"b;				/* In case we abort */
+	iop (1), iop (2) = null ();			/* Make sure we redo these pointers on every open */
+
+	call ATTACH_AND_OPEN ((R4_SW), ("vfile_ " || rtrim (r4_path)), iop (2), (KSI), r4_ec); /* Open the ring 4 log for
+						   keyed-sequential input, no extension */
+	if r4_ec = 0 then access = access | "01"b;	/* Ring 4 log is accessible */
+	else do;
+	     ec = r4_ec;				/* In case we return now */
+	     call CLOSE_AND_DETACH (iop (2), 0);	/* Close it if we did open it */
+	     if r4_ec = error_table_$file_busy then return; /* A put-off: user has access, but its busy */
+	end;
+
+get_r0_log:
+	slog_ptr = null ();				/* In case of abort */
+	r0_vfile = R0_VFILE || "." || unique_chars_ (unique_bits_ ()); /* Get unique name for temp seg */
+	r0_vpath = rtrim (get_pdir_ ()) || ">" || r0_vfile;
+
+	call ATTACH_AND_OPEN ((R0_SW), "vfile_ " || r0_vpath || " -extend", iop (1), (KSO), ec);
+						/* Open previously non-existent vfile_
+						   in process dir. (Do this first to make sure we have room) */
+	if ec ^= 0 then go to r4_only;
+
+	call get_temp_segments_ ("old_syserr_log_util_", seg_array, ec); /* get a temp seg */
+	if ec ^= 0 then go to r4_only;
+	slog_ptr = seg_array (1);			/* this will be used to reference log */
+
+	on linkage_error begin;
+		log_len = 0;			/* no data */
+		go to no_r0_access;
+	     end;
+
+	call audit_gate_$copy_syserr_log ("0"b, slog_ptr, fixed (rel (addr (slog.buffer)), 17), log_len);
+						/* Copy header of ring 0 log from ring 0 */
+no_r0_access:
+	revert linkage_error;
+	if log_len = 0 then do;			/* Don't know why, but no luck */
+	     ec = error_table_$moderr;
+	     go to r4_only;
+	end;
+
+	time = 0;
+	if iop (2) ^= null () then do;		/* If we have  the ring 4 log, get time of last mess */
+
+	     call iox_$position (iop (2), (EOF), 0, ec);	/* Position to end-of-file in ring 4 log */
+	     if ec ^= 0 then do;
+r0_only:
+		call CLOSE_AND_DETACH (iop (2), 0);	/* Problems, punt */
+		go to copy_whole_r0_log;
+	     end;
+
+	     call iox_$position (iop (2), (SKIP), -1, ec);/* Move to last msg in r4 log */
+	     if ec ^= 0 then go to r0_only;
+
+	     call iox_$read_key (iop (2), key, 0, ec);	/* Read its key */
+	     if ec ^= 0 then go to r0_only;
+
+	     call DECODE_KEY (key, time, 0);		/* Pull msg time out of key */
+	end;
+
+	if time = 0 then go to copy_whole_r0_log;	/* Need whole thing */
+
+	if slog.last_copied = slog.last then do;	/* No need to do anything */
+	     access = access | "10"b;			/* R0 log accessiblke, but null */
+	     go to r4_only;
+	end;
+
+	if slog.last_copied = "0"b then do;		/* Need it all */
+copy_whole_r0_log:
+	     call audit_gate_$copy_syserr_log ("0"b, slog_ptr, slog.len + 4 * bin (rel (addr (slog.buffer))), log_len);
+
+	     if time = 0 then do;			/* No r4 log */
+		off = slog.first;
+		prevoff = "0"b;
+		go to fill_r0_vfile;		/* Fill in vfile */
+	     end;
+
+	     else do;				/* We have some searching to do */
+		off = slog.last;
+		nextoff = "0"b;
+
+		do while (off ^= "0"b & nextoff ^= slog.first); /* Cover both intermediate threading states */
+		     smess_ptr = addrel (slog_ptr, off);
+		     if smess.time <= time		/* Found overlap point between both logs */
+		     then go to found_msg;
+		     nextoff = off;
+		     off = smess.prev;
+		end;
+found_msg:
+		prevoff = off;
+		off = nextoff;
+		go to fill_r0_vfile;
+	     end;
+	end;
+
+	if slog.last_copied < slog.last then do;	/* Unwrapped, partially copied log */
+	     call audit_gate_$copy_syserr_log (slog.last_copied, ptr (slog_ptr, slog.last_copied),
+		4 * (bin (slog.last) - bin (slog.last_copied) + 512), log_len); /* 512 extra words to get last message for sure */
+set_off:
+	     if time ^= ptr (slog_ptr, slog.last_copied) -> smess.time
+	     then go to copy_whole_r0_log;		/* Oh well. We tried */
+
+	     off = rel (addr (ptr (slog_ptr, slog.last_copied) -> smess.next_smess)); /* First message for vfile */
+						/* Since we are only going forward,
+						   there is no need to make slog.first
+						   and the first message back pointer
+						   consistent */
+	     prevoff = "0"b;
+	     go to fill_r0_vfile;
+	end;
+
+	else do;					/* Wrapped log, have to copy two pieces */
+	     call audit_gate_$copy_syserr_log (slog.last_copied, ptr (slog_ptr, slog.last_copied),
+		4 * (bin (rel (addr (slog.end_point))) - bin (slog.last_copied)), log_len); /* Copy bottom piece */
+	     call audit_gate_$copy_syserr_log (rel (addr (slog.buffer)), addr (slog.buffer),
+		4 * (bin (slog.last) - bin (rel (addr (slog.buffer))) + 512), log_len);
+	     go to set_off;
+	end;
+
+
+fill_r0_vfile:
+	do while (off ^= "0"b & prevoff ^= slog.last);	/* Cover both intermediate threading cases */
+
+	     smess_ptr = addrel (slog_ptr, off);
+	     key_dup = "0"b;			/* No key duplication yet */
+compute_key:
+	     keybits = unspec (smess.time) || unspec (smess.seq_num) || unspec (smess.code); /* Concoct key for insertion */
+	     key = keychars;			/* Set into the right size variable */
+set_key:
+	     call iox_$seek_key (iop (1), key, 0, ec);	/* Set key for insertion */
+	     if ec = error_table_$key_order then do;	/* Keys not in order (clock messed up?) */
+		call iox_$close (iop (1), ec);	/* Close it... */
+		if ec ^= 0 then go to r4_only;
+		call iox_$open (iop (1), (KSU), "0"b, ec); /* Open for update, so keys can be out of order */
+		if ec ^= 0 then go to r4_only;
+		go to set_key;
+	     end;
+	     if ec = error_table_$key_duplication then do;
+		if key_dup then go to next_mess;	/* Try once, then give up */
+		key_dup = "1"b;
+		smess.time = smess.time + 1;		/* Change key enough to get in */
+		go to compute_key;
+	     end;
+	     if ec ^= error_table_$no_record then go to r4_only; /* Shouldn't be there yet */
+
+	     call iox_$write_record (iop (1), addr (smess.seq_num),
+		4 * (bin (rel (addr (smess.next_smess))) - bin (rel (addr (smess.seq_num)))), ec);
+						/* Record for vfile log does not include threading */
+	     if ec ^= 0 then go to r4_only;
+next_mess:
+	     prevoff = off;
+	     off = smess.next;
+	end;
+
+	call CLOSE_AND_DETACH (iop (1), 0);		/* Close and re-open for efficiency */
+
+	call ATTACH_AND_OPEN ((R0_SW), "vfile_ " || r0_vpath, iop (1), (KSI), ec);
+	if ec = 0 then access = access | "10"b;		/* R0 log is available */
+	else
+r4_only:
+	     call CLOSE_R0_LOG (0);			/* Come here if r0 log not accessible, or null */
+	if slog_ptr ^= null then do;			/* if temp segment gotten */
+	     slog_ptr = null;
+	     call release_temp_segments_ ("old_syserr_log_util_", seg_array, 0);
+	end;
+	if ec = 0 then if iop (2) = null then ec = r4_ec; /* if ring0 ok, return possible ring4 error code */
+	OPEN = (iop (1) ^= null) | (iop (2) ^= null);	/* open only if at least 1 iocb is ok */
+	return;
+
+/* Entry closes up shop after all searching/reading */
+
+old_syserr_log_util_$close: entry (ec);
+
+	if ^OPEN then do;
+	     ec = error_table_$not_open;
+	     return;
+	end;
+	OPEN = NO;				/* No longer there */
+
+	if iop (2) ^= null () then call CLOSE_AND_DETACH (iop (2), 0); /* Close and detach ring 4 log */
+
+	if iop (1) ^= null () then call CLOSE_R0_LOG (0); /* Close, detach, and delete r0 vfile */
+
+	curlog = 0;				/* Haven't got a position any more */
+	ec = 0;
+
+	return;
+
+/* Entry to trim back the ring  4 syserr log */
+
+old_syserr_log_util_$trim: entry (ttime, ec);
+
+dcl  ttime fixed bin (71) parameter;			/* Trim time */
+dcl  iocbp pointer;					/* Points to I/O control block for ring 4 log */
+dcl  deltime fixed bin (71);
+
+	r4_path = R4_PATH;
+	go to trim_join;
+
+old_syserr_log_util_$trim_path: entry (a_trim_path, ttime, ec);
+
+dcl  a_trim_path char (*);
+
+	r4_path = a_trim_path;			/* user tells us where */
+	if r4_path = "" then			/* oops, got lazy */
+	     r4_path = R4_PATH;			/* use the default */
+
+trim_join:
+	call expand_pathname_ (r4_path, r4_dir, r4_entry, ec);
+	if ec ^= 0 then
+	     call sub_err_ (ec, "old_syserr_log_util_", ACTION_CANT_RESTART, null (), (0), "Unexpected error with path ^a.", r4_path);
+	call hcs_$set_safety_sw (r4_dir, r4_entry, "0"b, ec); /* Have to turn off safety switch */
+	if ec ^= 0 then return;			/* No access probably */
+
+	call ATTACH_AND_OPEN ((R4_SW), ("vfile_ " || rtrim (r4_path)), iocbp, (KSU), ec); /* Open permanent log for update */
+	if ec ^= 0 then go to trim_done;
+
+/* before deleting any records, check to see if the break will leave an "=" as the first message.
+   If so, adjust the break slightly */
+
+	begin;
+
+dcl  buffer (512) bit (36) aligned;			/* read messages here */
+
+	     deltime = ttime;			/* default break time is time given */
+	     syserr_msgp = addr (buffer);
+	     seek_info.relation = 1;			/* set up seek head order */
+	     seek_info.nchars = 8;
+	     unspec (seek_info.search_key) = unspec (ttime);
+	     call iox_$control (iocbp, "seek_head", addr (seek_info), ec);
+	     if ec ^= 0 then go to trim_position;	/* give up */
+trim_backup:
+	     call iox_$read_record (iocbp, syserr_msgp, 2048, (0), ec);
+	     if ec ^= 0 then go to trim_position;
+	     if syserr_msg.text ^= "=" then do;		/* found good break */
+		deltime = syserr_msg.time;
+		go to trim_position;
+	     end;
+	     call iox_$position (iocbp, 0, -2, ec);	/* back to previous record */
+	     if ec = 0 then go to trim_backup;
+	     if ec ^= error_table_$end_of_info then go to trim_position;
+	     call iox_$control (iocbp, "seek_head", addr (seek_info), ec); /* back to origional break */
+	     if ec ^= 0 then go to trim_position;
+trim_forward:
+	     call iox_$read_record (iocbp, syserr_msgp, 2048, (0), ec); /* read forward for break */
+	     if ec ^= 0 then go to trim_position;
+	     if syserr_msg.text ^= "=" then do;
+		deltime = syserr_msg.time;
+		go to trim_position;
+	     end;
+	     else go to trim_forward;
+	end;
+
+/* now ready to delete */
+
+trim_position:
+	call iox_$position (iocbp, -1, 0, ec);
+	if ec ^= 0 then go to trim_done;
+
+trim_read_key:
+	call iox_$read_key (iocbp, key, 0 /* don't care */, ec);
+	if ec ^= 0 then do;
+	     if ec = error_table_$end_of_info then ec = 0;/* We are done */
+	     go to trim_done;
+	end;
+
+	call DECODE_KEY (key, time, 0);
+	if deltime <= time				/* If msg time later than trim time we are done */
+	then go to trim_done;
+
+	call iox_$delete_record (iocbp, ec);		/* ZAP */
+	if ec ^= 0 then go to trim_done;
+
+	go to trim_read_key;
+
+trim_done:
+	call hcs_$set_safety_sw (r4_dir, r4_entry, "1"b, 0); /* Turn safety switch back on */
+
+	call CLOSE_AND_DETACH (iocbp, 0);
+
+	return;
+
+/* Entry searches for the first syserr message logged after a given time */
+
+old_syserr_log_util_$search: entry (search_time, rtime, rseq, ec);
+
+dcl  search_time fixed bin (71) parameter;		/* Time for searching, in microseconds */
+dcl  rtime fixed bin (71) parameter;			/* Logging time of message found */
+dcl  rseq fixed bin (35) parameter;			/* Sequence number of message found */
+
+dcl  1 seek_info aligned,				/* Structure for "seek_head" control call */
+       2 relation fixed bin,				/* Search for mess-time >= search_time */
+       2 nchars fixed bin,				/* unspec (fixed bin (71)) is 8 chars */
+       2 search_key char (8);				/* Actual key used */
+
+	rtime = -1;				/* In case of abort */
+	rseq = -1;
+
+	if ^OPEN then do;
+not_open:	     ec = error_table_$not_open;
+	     return;
+	end;
+
+	if search_time = 0 then do;			/* Special value, search to BOF */
+	     if iop (2) = null () then curlog = 1;	/* Nor r4 log, give r0 log */
+	     else curlog = 2;
+	     call iox_$position (iop (curlog), (BOF), 0, 0); /* Position to  first (oldest) message */
+	     go to search_get_time;
+	end;
+
+	if search_time = -1 then do;			/* Special value, search to EOF */
+eof:
+	     if iop (1) = null () then curlog = 2;	/* Nor r0 log, go to r4 log */
+	     else curlog = 1;
+	     call iox_$position (iop (curlog), (EOF), 0, 0); /* Move to end-of-file */
+	     call iox_$position (iop (curlog), (SKIP), -1, 0); /* Move back one to last message */
+	     go to search_get_time;
+	end;
+
+	if search_time < -1 then do;			/* What do you think this is? A time machine? */
+	     ec = error_table_$bad_arg;
+	     return;
+	end;
+
+	seek_info.relation = 1;			/* head >= search_key */
+	seek_info.nchars = 8;			/* To save prologue */
+	substr (unspec (seek_info.search_key), 1, 72) = unspec (search_time); /* fb(71) time is 8 chars */
+
+	do curlog = 2, 1;				/* Try r4 log first */
+	     if iop (curlog) ^= null then do;
+		call iox_$control (iop (curlog), "seek_head", addr (seek_info), ec);
+		if ec = 0 then go to search_get_time;
+	     end;
+	end;
+	go to eof;				/* Not in either log, return last message */
+
+search_get_time:
+	call iox_$read_key (iop (curlog), key, 0, ec);	/* Read the key of the message found */
+	if ec ^= 0 then return;
+get_time:
+	call DECODE_KEY (key, rtime, rseq);		/* Decode into its component parts */
+
+	return;
+
+/* Entry positions n messages forward or backward, crossing logs as necessary */
+
+old_syserr_log_util_$position: entry (n, rtime, rseq, ec);
+
+dcl  n fixed bin (21) parameter;			/* No of messages forward (n>_0) or back (n<0) to move */
+dcl  moven fixed bin (21);
+dcl  move fixed bin;
+
+dcl  1 iox_status aligned,				/* Structure returned by iox_$control "error_status" */
+       2 version fixed bin,				/* vfile version number */
+       2 type fixed bin,				/* Type of operation this is status for */
+       2 to_move fixed bin,				/* How many records we wanted to position */
+       2 moved fixed bin;				/* How many records we actually positioned (signed) */
+
+	rtime = -1;				/* In case of abort */
+	rseq = -1;
+
+	if ^OPEN then go to not_open;
+
+	if curlog = 0 then do;			/* No call to search yet */
+	     ec = error_table_$no_record;
+	     return;
+	end;
+
+	moven = n;
+position:
+	if moven = 0 then go to pos_get_time;		/* No work to do */
+	call iox_$position (iop (curlog), (SKIP), moven, ec); /* Position in current log */
+	if ec = error_table_$end_of_info then do;	/* Ooops! Ran off end */
+	     iox_status.version = 1;
+	     call iox_$control (iop (curlog), "error_status", addr (iox_status), ec); /* Find out how much we missed by */
+	     if ec ^= 0 then return;
+
+	     moven = n - iox_status.moved;		/* Correct for overrun */
+	     if n > 0 & curlog = 2 & iop (1) ^= null () then do; /* Have to switch to r0 piece */
+switch_to_r0:
+		curlog = 1;
+		move = BOF;
+	     end;
+
+	     else if n < 0 & curlog = 1 & iop (2) ^= null then do; /* Have to switch to r4 piece */
+		curlog = 2;
+		move = EOF;
+	     end;
+
+	     else do;
+		ec = error_table_$end_of_info;
+		return;
+	     end;
+
+	     call iox_$position (iop (curlog), move, 0, ec); /* Move to start or end of other piece */
+	     if ec ^= 0 then return;
+
+	     go to position;
+	end;
+
+	if ec ^= 0 then return;			/* Don't know what's wrong */
+pos_get_time:
+	call iox_$read_key (iop (curlog), key, 0, ec);	/* See if this is a real record or EOF */
+	if ec = error_table_$end_of_info		/* Moved fwd to EOF */
+	then if curlog = 2				/* If in ring 4 piece */
+	     then do;				/* See if we can/should switch log pieces */
+		if iop (1) = null () then return;	/* No r0 piece, we at end */
+		moven = 0;			/* No more moving to do */
+		go to switch_to_r0;
+	     end;
+	     else do;				/* curlog = 1; we are in ring 0 piece */
+		call iox_$position (iop (curlog), (SKIP), -1, ec); /* Move back one to last real record */
+		if ec ^= 0 then return;		/* I give up */
+		go to pos_get_time;
+	     end;
+
+	if ec = 0 then go to get_time;		/* Success at last */
+	else return;
+
+/* Entry reads the current syserr message, updates the current message to the next message, and switches logs if necessary */
+
+old_syserr_log_util_$read: entry (bufp, bufl, messl, ec);
+
+dcl  bufp pointer parameter;				/* Points to caller-supplied buffer */
+dcl  bufl fixed bin (21) parameter;			/* Length of caller-supplied buffer */
+dcl  messl fixed bin (21) parameter;			/* Actual length of this message, even if >buffl */
+dcl  retlen fixed bin (21);				/* length in chars returned by iox */
+
+	if ^OPEN then go to not_open;
+
+	if curlog = 0 then do;			/* No call to search yet */
+	     ec = error_table_$no_record;
+	     messl = 0;
+	     return;
+	end;
+
+read:
+	call iox_$read_record (iop (curlog), bufp, 4 * bufl, retlen, ec); /* Read the record */
+	if ec = error_table_$end_of_info		/* If at end of this vfile_ ... */
+	then if curlog = 2				/* Cross boundaries */
+	     then if iop (1) ^= null () then do;
+		     curlog = 1;			/* Switch to ring 0 piece */
+		     call iox_$position (iop (1), (BOF), 0, ec); /* Position to first message in ring 0 piece */
+		     go to read;
+		end;
+	messl = divide (retlen, 4, 21, 0);		/* compute length in words */
+
+	return;
+
+/* Entry returns a status structure, currently including only a version number constant */
+
+old_syserr_log_util_$status: entry (status_p, ec);
+
+dcl  status_p pointer parameter;			/* Points to user-supplied structure */
+
+dcl  1 slu_status aligned based (status_p),		/* Ain't much to it yet */
+       2 version fixed bin;
+
+	slu_status.version = 1;
+	ec = 0;
+	return;
+
+/* Internal procedure to attach and open a log with a given attach description and opening  mode */
+
+ATTACH_AND_OPEN: proc (switch, atd, iocbp, omode, ec);
+
+dcl  switch char (*) parameter;			/* Switch being attached */
+dcl  atd char (*) parameter;				/* Attach description */
+dcl  iocbp pointer parameter;				/* Pointer to created io control block */
+dcl  omode fixed bin parameter;			/* Opening mode */
+dcl  ec fixed bin (35) parameter;			/* Status code */
+dcl  ec1 fixed bin (35);
+
+attach:
+	call iox_$attach_ioname (switch, iocbp, atd, ec);
+	if ec ^= 0 then do;				/* Somebody forgot to turn out the light */
+	     if ec = error_table_$not_detached then do;
+		call iox_$find_iocb (switch, iocbp, ec1); /* Pick up ptr to it if it exists */
+		if ec1 ^= 0 then return;		/* Well, we tried */
+		call CLOSE_AND_DETACH (iocbp, ec1);	/* Chec1k the gas while you're at it */
+		if ec1 = 0 then go to attach;		/* Try again */
+	     end;
+	     return;
+	end;
+
+open:
+	call iox_$open (iocbp, omode, "0"b, ec);
+
+	return;
+
+     end ATTACH_AND_OPEN;
+
+/* Internal procedure to close and detach */
+
+CLOSE_AND_DETACH: proc (iocbp, ec);
+
+dcl  iocbp pointer parameter;
+dcl  ec fixed bin (35) parameter;
+
+	call iox_$close (iocbp, ec);
+	call iox_$detach_iocb (iocbp, ec);
+	iocbp = null ();
+	return;
+     end CLOSE_AND_DETACH;
+
+/* Internal procedure to close and detach the ring 0 log and clean up */
+
+CLOSE_R0_LOG: proc (ec);
+
+dcl  ec fixed bin (35) parameter;
+
+	call CLOSE_AND_DETACH (iop (1), ec);
+
+	call delete_$path (get_pdir_ (), r0_vfile, "000100"b, "", ec);
+
+	return;
+     end CLOSE_R0_LOG;
+
+/* Internal procedure to decode a record key */
+/* Record keys are simply a bit string of concatenated message time, sequence number, and syserr code */
+
+DECODE_KEY: proc (key, time, seq);
+
+dcl  key char (256) varying parameter;
+dcl  time fixed bin (71) parameter;
+dcl  seq fixed bin (35) parameter;
+
+dcl  keybits bit (9 * 16) aligned;			/* Overlay to pick out bit fields */
+dcl  keychars char (16) based (addr (keybits));
+
+	keychars = key;				/* Copy out of varying string because we aren't
+						   supposed to know how varying strings are stored */
+
+	time = fixed (substr (keybits, 1, 72), 71);
+	seq = fixed (substr (keybits, 73, 36), 35);
+
+	return;
+     end DECODE_KEY;
+
+/* special debugging entry that stores the vfile_ attach description in static */
+
+debug: entry (arg_dir, arg_ename);
+
+dcl  (arg_dir, arg_ename) char (*);
+
+	call absolute_pathname_ (pathname_ (arg_dir, arg_ename), r4_path, ec);
+	if ec ^= 0 then
+	     call sub_err_ (ec, "old_syserr_log_util_$debug", ACTION_CANT_RESTART, null (), (0), "Bad pathname from ^a, ^a", arg_dir, arg_ename);
+	R4_PATH = r4_path;
+	return;
+%page;
+%include sub_err_flags;
+%page;
+%include syserr_log;
+%page;
+%include syserr_message;
+
+
+     end old_syserr_log_util_;

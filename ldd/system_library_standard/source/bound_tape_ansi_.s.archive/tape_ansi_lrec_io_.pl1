@@ -1,0 +1,503 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* Modified: 4/82 by J. A. Bush for block sizes > 8192 bytes */
+
+tape_ansi_lrec_io_: procedure;
+						/* argument list */
+	dcl     iocbP		 ptr,		/* pointer to IO control block */
+	        ubP		 ptr,		/* pointer to user buffer */
+	        buf_len		 fixed bin (21),	/* number of characters requested for IO */
+	        rec_len		 fixed bin (21),	/* number of characters read */
+	        code		 fixed bin (35);	/* error code */
+
+%include iocb;
+
+%include tape_ansi_cseg;
+
+%include tape_ansi_fd;
+
+%include tape_ansi_fl;
+
+
+/* based overlays */
+	dcl     buf		 char (cseg.buf_size) aligned based (cseg.lrec.bufP), /* one physical block */
+	        data		 char (move) unaligned based, /* overlay for data move */
+	        RCW		 char (4) unaligned based (dwP); /* D-format rdw */
+	dcl     1 SCW		 based (dwP),	/* segment control word */
+		2 code		 char (1) unaligned,/* control code */
+		2 length		 char (4) unaligned;/* length of segment */
+	dcl     ub		 char (buf_len) unaligned based (ubP); /* user buffer overlay */
+
+/* error codes */
+	dcl     (error_table_$eov_on_write,
+	        error_table_$file_busy,
+	        error_table_$invalid_record_desc,
+	        error_table_$long_record,
+	        error_table_$tape_error,
+	        error_table_$fatal_error,
+	        error_table_$eof_record) fixed bin (35) external static;
+
+
+/* builtin functions */
+	dcl     (addr, binary, decimal, mod, null, substr, verify) builtin;
+
+/* conditions */
+	dcl     (cleanup, conversion)	 condition;
+
+/* automatic storage */
+	dcl     (i, j)		 fixed bin,	/* temporary storage */
+	        csw		 bit (1) init ("0"b), /* indicates close entry */
+	        total		 fixed bin (21) initial (0), /* number of characters moved in this request */
+	        move		 fixed bin initial (0), /* number of characters moved per segment/record */
+	        left		 fixed bin (21),	/* number of characters remaining for this request */
+	        long_record		 bit (1) initial ("0"b), /* long record switch */
+	        parity_error	 bit (1) initial ("0"b), /* parity error switch */
+	        req_off		 fixed bin,	/* number of buffer characters processed by this request */
+	        remain		 fixed bin,	/* number of unprocessed characters in buffer */
+	        ecode		 fixed bin (35) init (0), /* temporary error code */
+	        data_len		 fixed bin initial (0), /* number of characters in varying length record */
+	        cwl		 picture "9999",	/* control word length for RCW and SCW */
+	        first_span		 bit (1) initial ("1"b); /* first segment of spanned request switch */
+
+/* pointers */
+	dcl     dwP		 ptr,		/* pointer to RCW - SCW */
+	        fromP		 ptr,		/* pointer to buffer for data move */
+	        toP		 ptr;		/* pointer to user buffer for data move */
+
+/* static storage */
+	dcl     1 scw		 internal static aligned, /* SCW data */
+		2 complete	 char (1) initial ("0"), /* complete code - ASCII 0 */
+		2 initial		 char (1) initial ("1"), /* initial code - ASCII 1 */
+		2 medial		 char (1) initial ("2"), /* medial code - ASCII 2 */
+		2 final		 char (1) initial ("3"); /* final code - ASCII 3 */
+
+	dcl     bpad		 char (20) internal static init ((20)"^");
+
+	dcl     ebcdic		 init (2) fixed bin internal static;
+
+/* subroutine calls */
+	dcl     ascii_to_ebcdic_	 ext entry (char (*), char (*)),
+	        ebcdic_to_ascii_	 ext entry (char (*), char (*)),
+	        tape_ansi_file_cntl_$data_eof ext entry (ptr, fixed bin (35)),
+	        tape_ansi_file_cntl_$data_eot ext entry (ptr, fixed bin (35)),
+	        tape_ansi_file_cntl_$position_for_output ext entry (ptr, fixed bin (35)),
+	        tape_ansi_tape_io_$close ext entry (ptr, fixed bin (35)),
+	        tape_ansi_tape_io_$get_buffer ext entry (ptr, ptr, fixed bin (35)),
+	        tape_ansi_tape_io_$read ext entry (ptr, ptr, fixed bin, fixed bin (35)),
+	        tape_ansi_tape_io_$release_buffer ext entry (ptr, ptr, fixed bin (35)),
+	        tape_ansi_tape_io_$write ext entry (ptr, ptr, fixed bin, fixed bin (35));
+
+read_record: entry (iocbP, ubP, buf_len, rec_len, code);	/* read_record entry point */
+
+	cP = iocbP -> iocb.actual_iocb_ptr -> iocb.attach_data_ptr; /* get pointer to cseg */
+
+	if cseg.file_lock then do;
+		rec_len = 0;
+		code = error_table_$file_busy;
+		return;
+	     end;
+	else do;
+		on cleanup begin;
+			cseg.file_lock = "0"b;
+			cseg.code = error_table_$fatal_error;
+		     end;
+		cseg.file_lock = "1"b;
+	     end;
+
+	if cseg.code ^= 0 then do;			/* was there a non-restartable error? */
+		code = cseg.code;			/* set return code */
+		cseg.file_lock = "0"b;
+		return;
+	     end;
+
+	if cseg.rlN ^= -1 then do;			/* data record is in read length segment */
+		if buf_len >= cseg.rlN then do;	/* user wants as much as (or more than) we have */
+			code = 0;
+			move = cseg.rlN;		/* give only as much as we have */
+		     end;
+		else do;				/* user wants less than we have */
+			code = error_table_$long_record;
+			move = buf_len;		/* give what s(he) wants */
+		     end;
+		ubP -> data = cseg.rlP -> data;	/* move to user */
+		rec_len = move;			/* indicate amount moved */
+		cseg.rlN = -1;			/* read length buffer is now empty */
+		cseg.lrec.reccnt = cseg.lrec.reccnt + 1;
+		cseg.file_lock = "0"b;
+		return;
+	     end;
+
+	go to r_format (fd.format);			/* transfer to begin processing */
+
+r_format (1): call get_record;			/* U format - get a logical record */
+	move = remain;				/* user gets all, even pad chars (if any) */
+	if buf_len < move then do;			/* buffer < record */
+		long_record = "1"b;
+		move = buf_len;			/* move as much as can fit */
+	     end;
+	req_off = remain;				/* this request processes the entire block */
+	call move_to_user;				/* move data to user's workspace */
+	call read_release;				/* release the record */
+	go to r_count;				/* return to caller */
+
+r_format (2): call get_record;			/* get 1 record */
+	if fd.reclen > remain then move = remain;	/* don't try to move more than we have */
+	else move = fd.reclen;			/* move only up to 1 record's worth */
+	if buf_len < move then do;			/* buffer < record */
+		long_record = "1"b;
+		move = buf_len;			/* move only what can fit */
+	     end;
+	req_off = fd.reclen;			/* process one record */
+	call move_to_user;				/* move data to user's workspace */
+	call read_release;				/* release the record */
+	go to r_count;				/* return to caller */
+
+r_format (3): call get_record;			/* D format - get a logical record */
+	if substr (buf, cseg.offset + 1, 1) = "^" then do;/* pad RCW? */
+		call tape_ansi_tape_io_$release_buffer (cP, cseg.lrec.bufP, 0); /* pad rcw is last in block */
+		go to r_format (3);			/* try again */
+	     end;
+	dwP = addr (substr (buf, cseg.offset + 1));	/* get pointer to rcw */
+	on conversion go to inv_desc;			/* detect invalid descriptor */
+	data_len = binary (RCW, 17) - 4;		/* get length of data */
+	revert conversion;				/* stop handling the condition */
+	if data_len > remain - 4 then go to inv_desc;	/* block bigger than block size? */
+	move = data_len;				/* move up to 1 record */
+	if buf_len < move then do;			/* buffer < record */
+		long_record = "1"b;
+		move = buf_len;			/* move only what can fit */
+	     end;
+	cseg.offset = cseg.offset + 4;		/* the rdw has been processed */
+	req_off = data_len;				/* process one logical record */
+	call move_to_user;				/* move data to user's workspace */
+	call read_release;				/* release the record */
+	go to r_count;				/* return to caller */
+
+r_format (4): call get_record;			/* S format - get a logical record */
+	left = buf_len;				/* save request for decrementing */
+r_sw_check: call process_sw;				/* process the SCW - get type and data length */
+	if left >= data_len then move = data_len;	/* give user the entire segment..... */
+	else do;					/* user doesn't want all the data */
+		long_record = "1"b;			/* buffer < record */
+		move = left;			/* move only as much as can fit */
+	     end;
+	call move_to_user;				/* move the data to the user's workspace */
+	left = left - move;				/* keep track of remainder of request */
+	if SCW.code = scw.complete | SCW.code = scw.final then do; /* segment is last (or only) of record */
+		call read_release;			/* release it */
+		go to r_count;			/* and we're done */
+	     end;
+	else call read_release;			/* release the record and continue */
+	if left ^= 0 then do;			/* user wants more, and more segments are available */
+		call get_record;			/* get the next segment */
+		go to r_sw_check;			/* transfer to process the SCW/SDW, etc. ..... */
+	     end;
+	call skip_segments;				/* request satisfied, but more segments remain - skip them */
+	long_record = "1"b;				/* buffer < record */
+	go to r_count;				/* return to caller */
+
+inv_desc: ecode = error_table_$invalid_record_desc;	/* set error ecode */
+	go to r_exit;
+
+r_count:	cseg.lrec.reccnt = cseg.lrec.reccnt + 1;
+
+r_exit:	if parity_error then code = error_table_$tape_error;
+	else code = ecode;
+	cseg.code = code;
+	if code = 0 then if long_record then code = error_table_$long_record;
+	rec_len = total;				/* return total number of characters moved */
+	cseg.file_lock = "0"b;
+	return;					/* and return to the caller */
+
+get_record: procedure;				/* internal procedure to get 1 logical record */
+	if cseg.lrec.bufP = null then do;		/* get a block if inactive buffer */
+restart:		call tape_ansi_tape_io_$read (cP, cseg.lrec.bufP, cseg.nc_buf, ecode); /* get 1 physical block */
+		if ecode ^= 0 then do;		/* was there an error or EOF? */
+			if ecode = error_table_$eof_record then do; /* EOF detected */
+				call tape_ansi_file_cntl_$data_eof (iocbP, ecode); /* see if follow-on volume */
+				if ecode = 0 then go to restart; /* switched to new file section */
+				else go to r_exit;	/* no next volume or error */
+			     end;
+			else do;			/* not EOF - some sort of error */
+				if ecode = error_table_$tape_error then parity_error = "1"b; /* process this block */
+				else go to r_exit;	/* terminate processing */
+			     end;
+		     end;
+		cseg.blkcnt = cseg.blkcnt + 1;	/* keep track of physical blocks read */
+		cseg.offset = fd.bo;		/* skip ANSI block prefix, if any */
+		if cseg.nc_buf - cseg.offset < 0 then do; /* fatal error */
+			ecode = error_table_$fatal_error;
+			go to r_exit;
+		     end;
+		if cseg.nc_buf > fd.blklen then cseg.nc_buf = fd.blklen; /* eliminate obvious padding */
+		if fd.format = 2 then do;		/* F/FB - strip pad characters */
+			i = (cseg.nc_buf - fd.bo) / fd.reclen; /* # of records */
+			j = mod (cseg.nc_buf - fd.bo, fd.reclen); /* # of extra chars */
+			if j ^= 0 then do;		/* if any, test them */
+				if verify (substr (buf, cseg.nc_buf - j + 1, j), "^") = 0
+				then cseg.nc_buf = cseg.nc_buf - j; /* all pad - eliminate */
+				else go to out;	/* keep all - treat as short record */
+			     end;
+			do j = i to 1 by -1;	/* test records for all "^" */
+			     if verify (substr (buf, fd.bo + ((j - 1) * fd.reclen) + 1, fd.reclen), "^") = 0
+			     then cseg.nc_buf = cseg.nc_buf - fd.reclen;
+			     else go to out;	/* reached end of pad characters */
+			end;
+		     end;
+	     end;
+out:	remain = cseg.nc_buf - cseg.offset;		/* get number of characters to be processed */
+	return;					/* exit */
+     end get_record;
+
+process_sw: procedure;				/* internal procedure to process SCW's */
+ck_dw:	if substr (buf, cseg.offset + 1, 1) = "^" then do;/* pad SCW? */
+		call tape_ansi_tape_io_$release_buffer (cP, cseg.lrec.bufP, 0); /* all pad chars - release block */
+		call get_record;			/* get another record */
+		go to ck_dw;			/* try again */
+	     end;
+	dwP = addr (substr (buf, cseg.offset + 1));	/* get pointer to SDW/SCW */
+	on conversion go to inv_desc;			/* handle the conversion condition */
+	data_len = binary (SCW.length, 17) - 5;		/* get length of data */
+	if binary (SCW.code) > 3 then go to inv_desc;	/* error if SCW.code > 3 */
+	if data_len > remain - 5 then go to inv_desc;	/* block greater than block size? */
+	revert conversion;				/* disable the condition handler */
+	cseg.offset = cseg.offset + 5;		/* SCW has been processed */
+	req_off = data_len;				/* the entire segment will be processed */
+	return;					/* exit */
+     end process_sw;
+
+skip_segments: procedure;				/* internal procedure to skip to beginning of spanned record */
+s_get:	call get_record;				/* get a segment */
+	call process_sw;				/* process its SCW/SDW */
+	if SCW.code = scw.final then do;		/* is this the final segment? */
+		call read_release;			/* release it */
+		return;				/* and exit */
+	     end;
+	call read_release;				/* release the segment */
+	go to s_get;				/* get the next segment */
+     end skip_segments;
+
+move_to_user: procedure;				/* internal procedure to move data to user's workspace */
+
+	if move = 0 then return;
+	fromP = addr (substr (buf, cseg.offset + 1));	/* set pointer to data to be moved */
+	toP = addr (substr (ub, total + 1));		/* set pointer to user buffer */
+	if fd.mode ^= ebcdic then toP -> data = fromP -> data; /* ascii/binary */
+	else call ebcdic_to_ascii_ (fromP -> data, toP -> data); /* ebcdic */
+	total = total + move;			/* sum each move */
+	return;					/* exit */
+     end move_to_user;
+
+read_release: procedure;				/* internal procedure to release a record and/or block */
+	cseg.offset = cseg.offset + req_off;		/* the request has been processed */
+	remain = cseg.nc_buf - cseg.offset;		/* get number of characters not yet processed */
+	if fd.format = 4 then if remain < 5 then go to release_it; /* S format and SCW can't fit */
+	     else return;				/* S format and SCW can fit */
+	if remain < 4 then do;			/* if so, the block may have been exhausted */
+		if fd.format = 2 then if fd.reclen <= remain then return;
+						/* save if another record could fit */
+release_it:	call tape_ansi_tape_io_$release_buffer (cP, cseg.lrec.bufP, 0); /* block exhausted */
+	     end;
+	return;					/* exit */
+     end read_release;
+
+write_record: entry (iocbP, ubP, buf_len, code);		/* write_record entry point */
+
+	cP = iocbP -> iocb.actual_iocb_ptr -> iocb.attach_data_ptr; /* get pointer to cseg */
+
+	if cseg.file_lock then do;
+		code = error_table_$file_busy;
+		return;
+	     end;
+	else do;
+		on cleanup begin;
+			cseg.file_lock = "0"b;
+			cseg.code = error_table_$fatal_error;
+		     end;
+		cseg.file_lock = "1"b;
+	     end;
+
+	if cseg.code ^= 0 then do;			/* was there a non-restartable error? */
+		code = cseg.code;			/* set return code */
+		cseg.file_lock = "0"b;
+		return;
+	     end;
+
+	if vl (fl.vlX).pos ^= 1 then do;		/* not positioned for output */
+		call tape_ansi_file_cntl_$position_for_output (iocbP, ecode);
+		if ecode ^= 0 then go to w_exit;	/* error */
+	     end;
+
+	go to w_format (fd.format);			/* transfer to begin processing */
+
+
+
+w_format (1): if buf_len > fd.blklen - fd.bo then go to w_long; /* U format - check buf_len */
+	call get_buf;				/* get a buffer */
+	move = buf_len;				/* move the requested amount of data */
+	req_off = buf_len;				/* number of characters to be processed */
+	call move_to_buf;				/* move the data to the write buffer */
+	call write_buf;				/* write one block */
+	go to w_count;				/* return to caller */
+
+w_format (2): if buf_len > fd.reclen then go to w_long;	/* F format - check buf_len validity */
+	call get_buf;				/* get a buffer */
+	move = buf_len;				/* transfer the request as stated */
+	remain = fd.reclen - buf_len;			/* get difference between buf_len and reclen for padding */
+	if remain ^= 0 then substr (buf, cseg.offset + buf_len + 1, remain) = " "; /* pad the record */
+	req_off = fd.reclen;			/* process one logical record */
+	call move_to_buf;				/* move the data to the write buffer */
+	if ^fd.blocked then call write_buf;		/* unblocked: write 1 record per block */
+	else if cseg.offset = fd.blklen then call write_buf; /* blocked: write if block full */
+	go to w_count;				/* return to caller */
+
+w_format (3): data_len = buf_len + 4;			/* D format - record length = buf_len + rdw length */
+	if data_len > fd.reclen then go to w_long;	/* check data_len validity */
+	call get_buf;				/* get a buffer */
+	if fd.blocked then if data_len > fd.blklen - cseg.offset then do; /* record won't fit in this block */
+		     call write_buf;		/* write the current buffer contents */
+		     call get_buf;			/* get another write buffer */
+		end;				/* request validity has been verified, so just continue */
+	dwP = addr (substr (buf, cseg.offset + 1));	/* locate rdw position */
+	cwl = decimal (data_len, 4);			/* convert length to ASCII characters */
+	RCW = cwl;				/* store in RCW */
+	cseg.offset = cseg.offset + 4;		/* the rdw has been processed */
+	req_off = buf_len;				/* process buf_len characters */
+	move = buf_len;				/* move buf_len characters */
+	call move_to_buf;				/* move the data to the write buffer */
+	if ^fd.blocked then call write_buf;		/* unblocked: write 1 record per block */
+	else if fd.blklen - cseg.offset < 4 then call write_buf; /* write block if even null record can't fit */
+	go to w_count;				/* return to caller */
+
+w_format (4): if buf_len > fd.reclen then go to w_long;	/* S format - check buf_len validity */
+	call get_buf;				/* get a buffer */
+	left = buf_len;				/* save request for decrementing */
+	remain = fd.blklen - cseg.offset;		/* get number of characters left in block */
+w_fit_check: dwP = addr (substr (buf, cseg.offset + 1));	/* locate SCW position */
+	if left + 5 <= remain then do;		/* will the request fit entirely? */
+		if first_span then SCW.code = scw.complete; /* if first segment then code is complete */
+		else SCW.code = scw.final;		/* else code is final */
+		move = left;			/* move all the data */
+	     end;
+	else do;					/* request will not fit in block */
+		if first_span then do;		/* if first segment then this is initial */
+			SCW.code = scw.initial;	/* set code */
+			first_span = "0"b;		/* set switch to indicate medial/final segments to follow */
+		     end;
+		else SCW.code = scw.medial;		/* not first segment, won't fit -- medial segment */
+		move = remain - 5;			/* move as much data as will fit */
+	     end;
+	left = left - move;				/* decrement data to be moved count */
+	data_len = move + 5;			/* compute segment length */
+	cwl = decimal (data_len, 4);			/* convert length to ASCII characters */
+	SCW.length = cwl;				/* store in SCW */
+	cseg.offset = cseg.offset + 5;		/* SCW has been processed */
+	req_off = move;				/* process the data move */
+	call move_to_buf;				/* move data to write buffer */
+	remain = remain - data_len;			/* get number of characters left after request */
+	if ^fd.blocked then go to w_now;		/* write each segment if not blocked */
+	if remain < 6 then do;			/*  blocked: could another segment fit? */
+w_now:		call write_buf;			/* write the block */
+		call get_buf;			/* get another buffer */
+		remain = fd.blklen - cseg.offset;	/* initialize number of remaining characters */
+	     end;
+	if left ^= 0 then go to w_fit_check;		/* if more segments need be written, continue processing */
+	go to w_count;				/* .... or return to caller */
+
+
+w_long:	code = error_table_$long_record;		/* set return code */
+	go to w_exit1;				/* csw can't be "1"b and shouldn't lock file */
+
+w_count:	cseg.lrec.reccnt = cseg.lrec.reccnt + 1;	/* increment record count */
+
+w_exit:	code = ecode;				/* return error code (if any) */
+	cseg.code = code;				/* set logical record I/O lock (if any) */
+	if csw then go to c_exit;			/* if close entry, go to close exit */
+w_exit1:	cseg.file_lock = "0"b;			/* unlock the file */
+	return;					/* return to caller */
+
+get_buf: procedure;					/* internal procedure to get a write buffer for data transfer */
+	if cseg.lrec.bufP = null then do;		/* get a buffer if necessary */
+		call tape_ansi_tape_io_$get_buffer (cP, cseg.lrec.bufP, 0); /* get the buffer */
+		cseg.offset = fd.bo;		/* initialize buffer offset */
+		if cseg.offset ^= 0 then substr (buf, 1, cseg.offset) = ""; /* set to blanks */
+	     end;
+	return;					/* exit */
+     end get_buf;
+
+
+move_to_buf: procedure;				/* internal procedure to move data from user's buffer */
+	if move = 0 then go to move_nothing;		/* return if no data to be moved */
+	fromP = addr (substr (ub, total + 1));		/* set pointer to data to be moved */
+	toP = addr (substr (buf, cseg.offset + 1));	/* set pointer to buffer */
+	if fd.mode ^= ebcdic then toP -> data = fromP -> data; /* ascii/binary */
+	else call ascii_to_ebcdic_ (fromP -> data, toP -> data); /* ebcdic */
+	total = total + move;			/* sum each move */
+move_nothing: cseg.offset = cseg.offset + req_off;	/* the request has been processed */
+	return;					/* return to caller */
+     end move_to_buf;
+
+write_buf: procedure;				/* internal procedure to write one physical block */
+	if cseg.offset < 20 then do;			/* pad to 20 bytes if < 20 bytes */
+		remain = 20 - cseg.offset;		/* get pad requirement */
+		go to w_pad;			/* pad the block */
+	     end;
+w_mod:	remain = 4 - mod (cseg.offset, 4);		/* get difference between actual and desired blklen */
+	if remain = 4 then go to w_put;		/* length is correct - do not pad */
+w_pad:	substr (buf, cseg.offset + 1, remain) = substr (bpad, 1, remain); /* pad with circumflex */
+	cseg.offset = cseg.offset + remain;		/* increment to reflect padding */
+w_put:	call tape_ansi_tape_io_$write (cP, cseg.lrec.bufP, cseg.offset, ecode); /* write the block */
+	if ecode = 0 then cseg.blkcnt = cseg.blkcnt + 1;	/* OK: up block count */
+	else if ecode = error_table_$eov_on_write then do;/* EOT detected */
+		cseg.blkcnt = cseg.blkcnt + 1;	/* block was written */
+		if csw then return;			/* ignore EOT if closing */
+		else do;
+			call tape_ansi_file_cntl_$data_eot (iocbP, ecode); /* switch to next volume */
+			if ecode ^= 0 then do;	/* terminate if switching failed */
+				if fd.format = 4 & left ^= 0 then go to w_exit; /* S format record only partially written */
+				else do;		/* not S format, or S and completely written */
+					cseg.code = ecode; /* inhibit further iox_$write_record calls */
+					code = 0; /* but return no error on this call */
+					cseg.lrec.reccnt = cseg.lrec.reccnt + 1; /* increment record count */
+					go to w_exit1; /* return to caller */
+				     end;
+			     end;
+		     end;
+	     end;
+	else do;					/* IO error (occurred on a previous block) */
+		cseg.blkcnt = cseg.blkcnt - cseg.soft_status.nbuf + 1; /* decrement block count */
+		cseg.lrec.reccnt = -cseg.lrec.reccnt;	/* make record count unreliable */
+		go to w_exit;			/* terminate processing */
+	     end;
+	return;					/* return to caller */
+     end write_buf;
+
+close: entry (acP, code);				/* close entry to synchronize and terminate io */
+	dcl     acP		 ptr;		/* pointer to control segment */
+
+	cP = acP;					/* set pointer to control segment */
+	csw = "1"b;				/* indicate close entry in case write error */
+	if cseg.open_mode = 4 then do;		/* opened for input */
+		if cseg.lrec.bufP ^= null then go to close2; /* release an active buffer */
+		go to c_exit;			/* synchronize and finish up io */
+	     end;
+	else do;					/* file was opened for output */
+		if cseg.lrec.bufP = null then go to c_exit; /* no active buffer - synchronize and close */
+		if cseg.offset = 0 then go to close2;	/* active empty buffer - release, synch., and close */
+		if cseg.offset = fd.bo then go to close2; /* buffer has only a block prefix */
+		call write_buf;			/* active buffer with data - write the buffer */
+		go to c_exit;			/* synchronize and close io */
+	     end;
+close2:	call tape_ansi_tape_io_$release_buffer (cP, cseg.lrec.bufP, 0); /* release the buffer */
+c_exit:	call tape_ansi_tape_io_$close (cP, code);	/* terminate the tape_ansi_tape_io_ set up */
+	return;					/* exit */
+
+     end tape_ansi_lrec_io_;

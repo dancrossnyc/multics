@@ -1,0 +1,608 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+mcs_timer:
+     procedure ();
+
+MAIN_RETURN:					/* This is the only way out of this program. Everything */
+	return;					/* does a non-local goto to here */
+
+/* *	MCS_TIMER -- Ring zero MCS timer manager
+   *
+   *	This procedure implements timers for ring zero MCS. When a timer comes due,
+   *	a TIMER interrupt is delivered to the lucky channel. For all the frankly
+   *	fascinating details, see MTB-xxx.
+   *
+   *	Written 24 March 1982, W. Olin Sibert, for the ASEA Hyperchannel project.
+   *	Modification history:
+   *	24 Mar 82, WOS: Initial coding, for the ASEA Hyperchannel project.
+   *	30 May 82, WOS: Added subchan_idx parameters, changed timer_id to bit (36).
+   *	October 1982, CAH: Redesigned to use an hproc.
+*/
+
+declare  P_devx fixed bin parameter;			/* Channel number */
+declare  P_subchan_idx fixed bin parameter;		/* Index of subchannel timer belongs to */
+declare  P_time fixed bin (71) parameter;		/* Time for timer to come due */
+declare  P_timer_id bit (36) aligned parameter;		/* Timer ID caller uses to tell timers apart */
+
+declare  devx fixed bin;				/* Local copies of parameters */
+declare  subchan_idx fixed bin;
+declare  time fixed bin (71);
+declare  timer_id bit (36) aligned;
+
+declare  wire_mask fixed bin (71);			/* pmut$wire_and_mask info */
+declare  wire_ptr pointer;
+declare  start_time fixed bin (71);			/* Time mcs_timer was entered, for metering */
+
+declare  timer_found bit (1) aligned;			/* Whether locate_timer found this sort of timer anywhere */
+declare  timer_was_queued bit (1) aligned;		/* Whether the located timer was in the interrupt queue */
+declare  channel_locked bit (1) aligned;		/* we managed to lock channel */
+
+declare  pds$processid bit (36) aligned external static;
+
+declare  channel_manager$queued_interrupt entry (fixed bin, fixed bin, bit (72) aligned);
+declare  privileged_mode_ut$wire_and_mask entry (fixed bin (71), pointer);
+declare  privileged_mode_ut$unwire_unmask entry (fixed bin (71), pointer);
+declare  pxss$unique_ring_0_wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+declare  syserr entry options (variable);
+declare  tty_lock$check_for_interrupt entry (fixed bin, fixed bin, bit (72) aligned) returns (bit (1) aligned);
+declare  tty_lock$dequeue_one_interrupt entry (fixed bin, fixed bin, bit (72) aligned);
+declare  tty_lock$dequeue_all_interrupts entry (fixed bin, fixed bin);
+declare  tty_lock$lock_channel_int entry (fixed bin, fixed bin, bit (72) aligned, bit (1) aligned);
+declare  tty_lock$unlock_channel_int entry (fixed bin);
+
+declare  (addr, clock, null, pointer, rel, size, stacq, unspec) builtin;
+
+/* format: on */
+%page;
+mcs_timer$set:
+     entry (P_devx, P_subchan_idx, P_time, P_timer_id);
+
+	devx = P_devx;
+	time = P_time;
+	call get_id_and_subchan ();
+
+	call setup_channel ();
+
+	call locate_timer ();
+
+	if timer_found then call timer_error ("Duplicate timer ID. Cannot set");
+
+	call allocate_timer_block ();			/* Get space for the new timer */
+
+	call fill_timer_block ();			/* and fill it in */
+
+	call thread_timer_block ();			/* Add it to the lists */
+
+	call finished (tty_buf.timer_call_time, tty_buf.timer_set_calls);
+						/* All done */
+	call unlock_timer_lock ();
+	goto MAIN_RETURN;				/* Depart */
+%page;
+mcs_timer$change:
+     entry (P_devx, P_subchan_idx, P_time, P_timer_id);
+
+	devx = P_devx;
+	time = P_time;
+	call get_id_and_subchan ();
+
+	call setup_channel ();
+
+	call locate_timer ();
+
+	if ^timer_found then call timer_error ("Timer not found. Cannot change");
+
+	if timer_was_queued then do;
+	     call tty_lock$dequeue_one_interrupt (devx, TIMER, unspec (timer_info));
+						/* If it came from the interrupt queue, must get a new */
+	     call allocate_timer_block ();		/* timer block. Otherwise, we can just re-use the old one */
+	     end;
+	else call unthread_timer_block ();
+
+	call fill_timer_block ();
+
+	call thread_timer_block ();
+
+	call finished (tty_buf.timer_call_time, tty_buf.timer_change_calls);
+
+	call unlock_timer_lock ();
+
+	goto MAIN_RETURN;				/* Depart */
+%page;
+mcs_timer$reset:
+     entry (P_devx, P_subchan_idx, P_timer_id);
+
+	devx = P_devx;
+	call get_id_and_subchan ();
+
+	call setup_channel ();
+
+	call locate_timer ();
+
+	if ^timer_found then call timer_error ("Timer not found. Cannot reset");
+
+	if timer_was_queued
+	then call tty_lock$dequeue_one_interrupt (devx, TIMER, unspec (timer_info));
+	else do;					/* Remove from the lists and free */
+	     call unthread_timer_block ();
+	     call free_timer_block ();
+	     end;
+
+	call finished (tty_buf.timer_call_time, tty_buf.timer_reset_calls);
+
+	call unlock_timer_lock ();
+
+	goto MAIN_RETURN;				/* Depart */
+%page;
+mcs_timer$reset_all:
+     entry (P_devx);
+
+	devx = P_devx;
+	call setup_channel ();
+
+	call tty_lock$dequeue_all_interrupts (devx, TIMER);
+						/* Get the urgent ones first */
+
+	do while (lcte.timer_offset ^= ""b);		/* Keep flushing from the front of the queue */
+	     timer_ptr = pointer (ttybp, lcte.timer_offset);
+	     call unthread_timer_block ();
+	     call free_timer_block ();
+	end;
+
+	call finished (tty_buf.timer_call_time, tty_buf.timer_reset_calls);
+						/* There. That was easy, wasn't it? */
+
+	call unlock_timer_lock ();
+
+	goto MAIN_RETURN;				/* Depart */
+%page;
+mcs_timer$verify_lock:
+     entry ();
+
+	ttybp = addr (tty_buf$);			/* We can't call setup_global, since this entry doesn't */
+						/* follow the usual conventions about locking */
+	if (tty_buf.timer_lock = pds$processid)
+	then call syserr (CRASH, "mcs_timer: Crawlout with MCS timer lock locked.");
+
+	return;					/* not likely, but better than falling through */
+%page;
+/* This is called by mcs_timer_daemon to do the work */
+
+mcs_timer$poll:
+     entry () returns (fixed bin (71));
+
+	call setup_global ();
+
+POLLING_LOOP:
+	if tty_buf.next_timer_offset = ""b then do;	/* No more left */
+	     call finished (tty_buf.timer_polling_time, tty_buf.timer_poll_calls);
+	     call unlock_timer_lock ();
+	     return (0);
+	     end;
+
+	timer_ptr = pointer (ttybp, tty_buf.next_timer_offset);
+						/* Find the first one to deliver */
+	time = timer.time;				/* Copy data from the timer */
+	timer_id = timer.data;			/* since we are about to free it */
+	devx = timer.devx;
+	subchan_idx = timer.subchan_idx;
+
+	if (time > clock ()) then do;			/* No more left */
+	     call finished (tty_buf.timer_polling_time, tty_buf.timer_poll_calls);
+	     call unlock_timer_lock ();
+	     return (time);
+	     end;
+
+	call unthread_timer_block ();
+
+	call free_timer_block ();
+
+	timer_info.id = timer_id;
+	timer_info.subchan_idx = subchan_idx;
+
+	call tty_lock$lock_channel_int (devx, TIMER, unspec (timer_info), channel_locked);
+	if channel_locked then do;
+	     call unlock_timer_lock ();
+	     call channel_manager$queued_interrupt (devx, TIMER, unspec (timer_info));
+	     call tty_lock$unlock_channel_int (devx);
+	     call lock_timer_lock ();
+	     end;
+
+	goto POLLING_LOOP;
+%page;
+locate_timer:
+     procedure ();
+
+/* This procedure finds the requested timer for a channel, given the timer ID,
+   and sets the global variables to indicate its whereabouts. */
+
+	timer_found = tty_lock$check_for_interrupt (devx, TIMER, unspec (timer_info));
+	if timer_found then do;			/* There's one waiting for you when you get home */
+	     timer_ptr = null ();			/* for good measure */
+	     timer_was_queued = "1"b;			/* indicate where found */
+	     return;
+	     end;
+
+	timer_was_queued = "0"b;
+	timer_found = "1"b;
+
+	do timer_ptr = pointer (ttybp, lcte.timer_offset) repeat (pointer (ttybp, timer.next_for_lcte))
+	     while (rel (timer_ptr) ^= ""b);
+
+	     if (timer.data = timer_id)
+	     then if (timer.subchan_idx = subchan_idx) then return;
+						/* Jackpot */
+
+	end;
+
+	timer_found = "0"b;
+	timer_ptr = null ();			/* Again, for good measure */
+
+	return;
+     end locate_timer;
+%page;
+allocate_timer_block:
+     procedure ();
+
+/* Procedure to get space for a timer block, and abort if it can't */
+
+	call tty_space_man$get_space (size (timer), timer_ptr);
+	if (timer_ptr = null ()) then call timer_error ("Cannot get space to set");
+
+	return;
+     end allocate_timer_block;
+
+
+
+free_timer_block:
+     procedure ();
+
+/* Procedure to return space used by a timer block */
+
+	call tty_space_man$free_space (size (timer), timer_ptr);
+
+	return;
+     end free_timer_block;
+
+
+
+fill_timer_block:
+     procedure ();
+
+/* Procedure to fill in a timer block from the global variables */
+
+	unspec (timer) = ""b;
+	timer.devx = devx;
+	timer.subchan_idx = subchan_idx;
+	timer.data = timer_id;
+	timer.time = time;
+
+	return;
+     end fill_timer_block;
+%page;
+thread_timer_block:
+     procedure ();
+
+/* Procedure to thread in the current timer block onto the global timer queue and the queue for the lcte */
+/* Also updates the global variables in tty_buf */
+
+declare  soonest_timer_ptr pointer;
+declare  next_timer_ptr pointer;
+declare  prev_timer_ptr pointer;
+declare  found_it bit (1) aligned;
+
+
+	lctep = addr (lct.lcte_array (timer.devx));	/* Who this one belongs to */
+
+	if (tty_buf.next_timer_offset ^= ""b) then do;	/* Set soonest_timer_ptr to mean we need to update */
+	     soonest_timer_ptr = pointer (ttybp, tty_buf.next_timer_offset);
+
+	     if (soonest_timer_ptr -> timer.time >= timer.time)
+	     then soonest_timer_ptr = timer_ptr;	/* New one is soonest in the list */
+	     else soonest_timer_ptr = null ();		/* Otherwise, leave it alone */
+	     end;
+	else soonest_timer_ptr = timer_ptr;		/* There were none before, so this must be it */
+
+	prev_timer_ptr = pointer (ttybp, 0);		/* Prepare to rethread */
+	next_timer_ptr = pointer (ttybp, tty_buf.next_timer_offset);
+
+	found_it = "0"b;
+	do while ((rel (next_timer_ptr) ^= ""b) & (^found_it));
+						/* Look for a place to thread it in */
+	     if (next_timer_ptr -> timer.time > timer.time)
+	     then found_it = "1"b;
+	     else do;
+		prev_timer_ptr = next_timer_ptr;
+		next_timer_ptr = pointer (ttybp, next_timer_ptr -> timer.next_timer);
+		end;
+	end;
+
+	if rel (prev_timer_ptr) ^= ""b then prev_timer_ptr -> timer.next_timer = rel (timer_ptr);
+						/* Splice it in, if we can */
+	if rel (next_timer_ptr) ^= ""b then next_timer_ptr -> timer.prev_timer = rel (timer_ptr);
+
+	timer.next_timer = rel (next_timer_ptr);
+	timer.prev_timer = rel (prev_timer_ptr);
+
+	next_timer_ptr = pointer (ttybp, lcte.timer_offset);
+
+	timer.prev_for_lcte = ""b;			/* Thread in at the beginning of the LCTE list */
+	timer.next_for_lcte = rel (next_timer_ptr);
+
+	if (rel (next_timer_ptr) ^= ""b) then next_timer_ptr -> timer.prev_for_lcte = rel (timer_ptr);
+
+	lcte.timer_offset = rel (timer_ptr);
+
+	if (soonest_timer_ptr ^= null ()) then do;	/* Must update "next time" */
+	     tty_buf.next_timer_offset = rel (soonest_timer_ptr);
+	     call pxss$unique_ring_0_wakeup (tty_buf.timer_process, tty_buf.timer_ev_chn, 0, (0));
+	     end;
+
+	tty_buf.timer_count = tty_buf.timer_count + 1;
+
+	return;
+     end thread_timer_block;
+%page;
+unthread_timer_block:
+     procedure ();
+
+/* Procedure to unthread the current timer block from the global timer queue and the lcte queue */
+/* Also updates the global variables in tty_buf, changing the next timer info if necessary */
+
+declare  soonest_timer_ptr pointer;			/* For updating tty_buf */
+declare  next_timer_ptr pointer;
+declare  prev_timer_ptr pointer;
+
+
+	prev_timer_ptr = pointer (ttybp, timer.prev_timer);
+						/* First, unthread it from the global list */
+	next_timer_ptr = pointer (ttybp, timer.next_timer);
+
+	if (rel (timer_ptr) = tty_buf.next_timer_offset)
+	then soonest_timer_ptr = next_timer_ptr;	/* If we're removing the first one, update */
+	else soonest_timer_ptr = null ();		/* If not skip this step */
+
+	if (timer.next_timer ^= ""b) then next_timer_ptr -> timer.prev_timer = timer.prev_timer;
+
+	if (timer.prev_timer ^= ""b) then prev_timer_ptr -> timer.next_timer = timer.next_timer;
+
+	tty_buf.timer_count = tty_buf.timer_count - 1;
+
+	if soonest_timer_ptr ^= null () then do;	/* This means the one we unthreaded was the first */
+	     tty_buf.next_timer_offset = rel (soonest_timer_ptr);
+	     end;					/* "That's longer than anybody's ever been gone before!" */
+
+	lctep = addr (lct.lcte_array (timer.devx));	/* Who this one belongs to */
+
+	prev_timer_ptr = pointer (ttybp, timer.prev_for_lcte);
+						/* Next, unthread it from the list for the LCTE */
+	next_timer_ptr = pointer (ttybp, timer.next_for_lcte);
+
+	if (timer.next_for_lcte ^= ""b) then next_timer_ptr -> timer.prev_for_lcte = timer.prev_for_lcte;
+
+	if (timer.prev_for_lcte ^= ""b) then prev_timer_ptr -> timer.next_for_lcte = timer.next_for_lcte;
+
+	if (rel (timer_ptr) = lcte.timer_offset) then lcte.timer_offset = rel (next_timer_ptr);
+
+	return;
+     end unthread_timer_block;
+%page;
+setup_global:
+     procedure ();
+
+/* Set up for any kind of mcs_timer operation. Sets global variables, wires and masks,
+   and locks the timer lock */
+
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	lctep = null ();
+
+	start_time = clock ();
+
+	call lock_timer_lock ();
+
+	return;
+     end setup_global;
+
+
+
+setup_channel:
+     procedure ();
+
+/* This procedure performs additional setup up for an operation on a particular
+   channel, and checks that it is locked by the correct process. */
+
+	call setup_global ();
+
+	lctep = addr (lct.lcte_array (devx));
+
+	if (lcte.lock ^= pds$processid)
+	then call syserr (CRASH, "mcs_timer: Channel not locked by this process. Devx = ^d.", devx);
+
+	return;
+     end setup_channel;
+
+
+
+
+get_id_and_subchan:
+     procedure ();
+
+	timer_id = P_timer_id;
+	subchan_idx = P_subchan_idx;
+
+	timer_info.id = timer_id;
+	timer_info.subchan_idx = subchan_idx;
+
+	return;
+     end get_id_and_subchan;
+%page;
+timer_error:
+     procedure (P_message);
+
+declare  P_message char (*) parameter;
+
+
+	call syserr (tty_buf.recoverable_error_severity, "mcs_timer: ^a timer ^w for devx(subchan) ^d(^d)", P_message,
+	     timer_id, devx, subchan_idx);
+
+	call finished ((0), tty_buf.timer_error_calls);	/* Don't meter calls that don't complete */
+
+	call unlock_timer_lock ();
+
+	goto MAIN_RETURN;				/* Depart */
+
+     end timer_error;
+
+
+
+finished:
+     procedure (P_time_meter, P_count);
+
+declare  P_time_meter fixed bin (71) parameter;
+declare  P_count fixed bin (35) parameter;
+
+
+	P_time_meter = P_time_meter + (clock () - start_time);
+	if (P_count < 34359738367)
+	then					/* Avoid overflows. That number is 2**35-1 */
+	     P_count = P_count + 1;
+	return;
+     end finished;
+%page;
+lock_timer_lock:
+     procedure ();
+
+declare  spin_start_time fixed bin (71);
+
+
+	if (tty_buf.timer_lock = pds$processid)
+	then call syserr (CRASH, "mcs_timer: Timer lock already locked to this process.");
+
+	call privileged_mode_ut$wire_and_mask (wire_mask, wire_ptr);
+
+	if ^(stacq (tty_buf.timer_lock, pds$processid, ""b)) then do;
+
+	     spin_start_time = clock ();		/* Didn't lock at first attempt */
+	     tty_buf.timer_lock_wait_count = tty_buf.timer_lock_wait_count + 1;
+
+	     do while (^stacq (tty_buf.timer_lock, pds$processid, ""b));
+	     end;
+
+	     tty_buf.timer_lock_wait_time = tty_buf.timer_lock_wait_time + (clock () - spin_start_time);
+	     end;
+
+	tty_buf.timer_lock_count = tty_buf.timer_lock_count + 1;
+
+	return;
+     end lock_timer_lock;
+
+
+
+unlock_timer_lock:
+     procedure ();
+
+	if ^(stacq (tty_buf.timer_lock, "0"b, pds$processid))
+	then call syserr (CRASH, "mcs_timer: Timer lock not locked by this process.");
+
+	call privileged_mode_ut$unwire_unmask (wire_mask, wire_ptr);
+
+	return;
+     end unlock_timer_lock;
+%page;
+%include mcs_timer_data;
+%include tty_buf;
+%include lct;
+%include mcs_interrupt_info;
+%include tty_space_man_dcls;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   mcs_timer: Timer lock already locked to this process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process that had the MCS timer lock locked tried to lock it again.
+
+   A:	$inform
+
+
+   Message:
+   mcs_timer: Timer lock not locked by this process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process called to unlock the MCS timer lock, but did not have it locked.
+
+   A:	$inform
+
+
+   Message:
+   mcs_timer: Channel not locked by this process. Devx = DDDD.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process called to perform an MCS timer operation, but the channel it
+   specified (devx DDDD) was not locked by the calling process.
+   by the calling process.
+
+   A:	$inform
+
+
+   Message:
+   mcs_timer: Timer not found. Cannot OOOOO timer NNN for devx(subchan) DDD(SSS).
+
+   S:	$log
+
+   T:	$run
+
+   M:	An attempt was made to perform operation OOOOO (reset or change) on
+   an MCS timer when no timer or queued timer interrupt with the specified ID
+   could be found for the requesting channel. The call is ignored.
+
+   A:	$inform
+
+
+   Message:
+   mcs_timer: Duplicate timer ID. Cannot set timer NNN for devx(subchan) DDD(SSS).
+
+   S:	$log
+
+   T:	$run
+
+   M:	An attempt was made to set an MCS timer with the specified timer ID,
+   but the channel already had an outstanding timer or queued timer interrupt
+   with that ID. The call is ignored.
+
+   A:	$inform
+
+
+   Message:
+   mcs_timer: Cannot get space to set timer NNN for devx(subchan) DDD(SSS).
+
+   S:	$log
+
+   T:	$run
+
+   M:	An attempt was made to set an MCS timer with the specified timer ID,
+   but it was not possible to allocate the necessary space in tty_buf to hold
+   timer data block. The call is ignored.
+
+   A:	$inform
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end mcs_timer;

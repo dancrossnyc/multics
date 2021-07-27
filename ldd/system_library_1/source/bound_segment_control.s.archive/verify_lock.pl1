@@ -1,0 +1,837 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style3 */
+
+verify_lock:
+     procedure;
+
+/*
+
+   verify_lock: called by signal_ before we leave ring 0.
+
+   USAGE: call verify_lock;
+
+   NOTES:
+   1. If an error condition exist this proc will crash the system
+   with an appropriate error message.
+
+   Modification history:
+   75-05-30, A. Bensoussan: Initial coding
+   76-07-26, Greenberg: Modified to avoid online-salv recursion in pdir salv
+   79-02-03, D. Spector: Modified to log only crawl-outs which unlock locks
+   79-07-28, W. Olin Sibert: Modified to unlock all dir locks, even if
+     they don't correspond to real dirs -- fixes Volume_Dumper lossage
+     which causes notify timeouts when fake dir remains locked
+   81-04-09, J. Bongiovanni: Modified to call vtoc_man$crawlout if vtoc
+     buffer lock held, and to correct syserr logging of history registers
+   82-02-23, BIM: Modified for improved dir locking and other stuff.
+   82-04-01, J. Bongiovanni: Modified for PVT locks
+   82-04-15, JIS: Changed to cleanup system_free_seg before checking lock array
+   82-04-28, BIM: Modified for removal of system free seg entirely.
+   83-01-18, BIM: Modified to cleanup of write_sw in dirlockt.
+   83-03-12, BIM: Modified for readers in the dir_lock_seg_, better messages.
+   83-08-05, Chris Jones: Modified for ioi_verify_lock.
+   84-10-25, WOS: Changed for syserr_seg_manager$verify
+   83-11-08, BIM: Change for better readers in dir_lock_seg_, check for masked.
+   84-11-01, Keith Loepere to remove unused notion of directory detectability.
+   85-02-21, EJ Sharpe: use syserr_fault_msg include for binary messages,
+		added condition_nolog entrypoint for initial use by scavenger
+   85-03-28, EJ Sharpe: chaged to log MC/HREG only if some lock unlocked for phx16862
+   85-05-13, EJ Sharpe: added check for lock on dm_journal_seg_ 
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-05,GJohnson), approve(86-06-05,MCR7387),
+     audit(86-06-10,Martinson), install(86-07-11,MR12.0-1091):
+     Correct error message documentation.
+  2) change(86-10-23,Fawcett), approve(86-10-23,MCR7517),
+     audit(86-10-30,Beattie), install(86-11-03,MR12.0-1206):
+     Changed to remove the word BOS from Error message documentation.
+                                                   END HISTORY COMMENTS */
+
+dcl	1 dirs_locked	aligned,			/* remember them here, */
+	  2 count		fixed bin,		/* so they can all be unlocked before */
+	  2 array		(30) aligned,		/* any are salvaged */
+	    3 seg_ptr	pointer,
+	    3 uid		bit (36) aligned;
+
+dcl	code		fixed bin (35);
+dcl	cond_name		char (32);
+
+dcl	check_masked	bit (1) aligned;
+dcl	log_condition	bit (1) aligned;		/* flag indicating we should log this condition */
+dcl	unlock_occurred	bit (1) aligned;		/* indicates something was force unlocked */
+dcl	mcptr		ptr;
+dcl	pvtx		fixed bin;
+dcl	pagex		fixed bin;
+dcl	p99		pic "99";
+dcl	tsdw		fixed bin (71);
+
+%include hc_lock;
+
+dcl	condition_	entry (char (*), entry);
+dcl	ioi_verify_lock	entry () returns (bit (1) aligned);
+dcl	reversion_	entry (char (*));
+dcl	syserr		entry options (variable);
+dcl	syserr$binary	entry options (variable);
+dcl	syserr$error_code	entry options (variable);
+dcl	on_line_salvager	entry (ptr, fixed bin (35));
+dcl	lock$dir_unlock_given_uid
+			entry (bit (36) aligned);
+dcl	lock$dir_lock_salvage
+			entry (ptr, bit (36) aligned, fixed bin (35));
+dcl	lock$unlock_fast	entry (ptr);
+dcl	lock$lock_fast	entry (pointer);
+dcl	pxss$notify	entry (bit (36) aligned);
+dcl	get_pvtx$cleanup	entry () returns (bit (1) aligned);
+dcl	debug_check	entry (char (4) aligned) returns (bit (1));
+dcl	vtoc_man$crawlout	entry;
+dcl	tty_lock$verify	entry () returns (bit (1) aligned);
+dcl	syserr_seg_manager$verify_lock
+			entry () returns (bit (1) aligned);
+dcl	kstsrch		entry (bit (36) aligned, fixed bin (17), ptr);
+dcl	page$write_volmap_page_unwired
+			entry (ptr, fixed bin);
+dcl	page$unlock_volmap	entry (ptr);
+dcl	pmut$swap_sdw	entry (ptr, ptr);
+dcl	pmut$read_mask	entry (fixed bin (71));
+dcl	vtoce_stock_man$force_unlock
+			entry (ptr);
+
+dcl	pds$process_group_id
+			external char (32) aligned;
+dcl	pds$processid	external bit (36) aligned;
+dcl	pds$block_lock_count
+			external fixed bin (17);
+dcl	scs$sys_level	fixed bin (71) external static;
+dcl	error_table_$salv_pdir_procterm
+			external fixed bin (35);
+dcl	ahd$search_rules_lock
+			external;
+dcl	sst$astl		bit (36) aligned external static;
+dcl	tc_data$system_shutdown
+			external bit (1) aligned;
+dcl	tc_data$lock_error_severity
+			fixed bin external static;
+dcl	pvt$n_entries	fixed bin external static;
+dcl	volmap_abs_seg$	external static;
+
+dcl	seg_fault_error	condition;
+dcl	page_fault_error	condition;
+dcl	subscriptrange	condition;
+
+dcl	(addr, addrel, baseptr, convert, hbound, null, unspec)
+			builtin;
+%page;
+/* MAIN PROGRAM */
+
+	cond_name = "r0 process termination";
+	check_masked = "0"b;
+	mcptr = null;
+	log_condition = "1"b;
+
+start:
+	if debug_check ("crwl")
+	then call syserr (SYSERR_CRASH_SYSTEM, "verify_lock: Crawlout stop specified on PARM card.");
+
+	unlock_occurred = "0"b;
+	code = 0;
+
+	if (syserr_seg_manager$verify_lock ())
+	then call NOTE_UNLOCK ("syserr_log");
+
+	call VERIFY_PVT_LOCKS;
+
+	call VERIFY_VTOC_BUFFERS;
+
+	if (ioi_verify_lock ())			/* logs own messages */
+	then unlock_occurred = "1"b;
+
+	call VERIFY_DBM;
+
+	call VERIFY_DM_JOURNAL_SEG;
+
+	if (get_pvtx$cleanup ())			/* logs own messages */
+	then unlock_occurred = "1"b;
+
+	call VERIFY_DIR_LOCK_SEG;
+
+	call VERIFY_AST (code);
+	if code ^= 0
+	then call syserr (SYSERR_CRASH_SYSTEM, "verify_lock: Crawlout with AST lock set.");
+
+	call VERIFY_SEARCH_RULES;
+
+	if (tty_lock$verify ())			/* logs own messages */
+	then unlock_occurred = "1"b;
+
+	dirs_locked.count = 0;
+	dirs_locked.seg_ptr (*) = null ();
+	dirs_locked.uid (*) = (36)"0"b;
+
+	call VERIFY_DIRECTORIES (code);
+	if code ^= 0
+	then call syserr (SYSERR_CRASH_SYSTEM, "verify_lock: Crawlout error on directory cleanup.");
+
+	call SALVAGE_DIRECTORIES;
+
+	if pds$block_lock_count ^= 0
+	then call syserr (SYSERR_CRASH_SYSTEM, "verify_lock: block_lock_count ^d, should be 0", pds$block_lock_count);
+
+	if check_masked
+	then call VERIFY_MASKED;
+
+
+	if log_condition & unlock_occurred
+	then if mcptr = null
+	     then call syserr (SYSERR_LOG_OR_PRINT, "verify_lock: ^a condition by ^a", cond_name, pds$process_group_id);
+	     else call make_syserr_message (cond_name, mcptr);
+
+	return;
+%page;
+/* These entry points are called when hardcore wants to log a message about the condition. */
+
+verify_lock_bad_dir:
+     entry (a_mcptr);
+
+	cond_name = "bad_dir_";
+	mcptr = null;
+	check_masked = "1"b;
+	log_condition = "1"b;
+	go to start;
+
+condition:
+     entry (a_name, a_mcptr);
+
+dcl	a_name		char (*);
+dcl	a_mcptr		ptr;
+
+	cond_name = a_name;
+	mcptr = a_mcptr;
+	check_masked = "1"b;
+	log_condition = "1"b;
+	go to start;
+
+
+/* The following entrypoint is used by hardcore procedures which perform
+their own logging of the condition. */
+
+condition_nolog:
+     entry (a_name, a_mcptr);
+
+	cond_name = a_name;
+	mcptr = a_mcptr;
+	check_masked = "1"b;
+	log_condition = "0"b;
+	go to start;
+%page;
+VERIFY_VTOC_BUFFERS:
+     proc;
+
+	vtoc_buffer_segp = addr (vtoc_buffer_seg$);
+	lock_ptr = addr (vtoc_buffer.lock);
+
+	if lock.pid = pds$processid
+	then do;
+		call vtoc_man$crawlout;
+		call lock$unlock_fast (lock_ptr);
+		call NOTE_UNLOCK ("vtoc_buffer_seg");
+	     end;
+	else call CHECK_NOTIFY (lock_ptr);
+	return;
+     end VERIFY_VTOC_BUFFERS;
+%page;
+VERIFY_DBM:
+     procedure;
+
+%include dbm;
+%page;
+	dbmp = addr (dbm_seg$);
+	lock_ptr = addr (dbm.lock_data);
+	if lock.pid = pds$processid
+	then do;
+		call lock$unlock_fast (lock_ptr);
+		call NOTE_UNLOCK ("dbm_seg");
+	     end;
+	else call CHECK_NOTIFY (lock_ptr);
+	return;
+     end VERIFY_DBM;
+%page;
+VERIFY_DM_JOURNAL_SEG:
+     procedure;
+
+%include dm_journal_seg_;
+%page;
+	dm_journal_segp = addr (dm_journal_seg_$);
+	lock_ptr = addr (dm_journal.lock);
+	if lock.pid = pds$processid
+	then do;
+		call lock$unlock_fast (lock_ptr);
+		call NOTE_UNLOCK ("dm_journal_seg_");
+	     end;
+	else call CHECK_NOTIFY (lock_ptr);
+	return;
+     end VERIFY_DM_JOURNAL_SEG;
+%page;
+VERIFY_DIR_LOCK_SEG:
+     procedure;
+
+	dir_lock_segp = addr (dir_lock_seg$);
+	lock_ptr = addr (dir_lock_seg.seg_lock);
+
+	if lock.pid = pds$processid
+	then do;
+		call NOTE_UNLOCK ("dir_lock_seg");
+		call lock$unlock_fast (lock_ptr);
+	     end;
+	else call CHECK_NOTIFY (lock_ptr);
+	return;
+     end VERIFY_DIR_LOCK_SEG;
+
+
+
+VERIFY_AST:
+     proc (code);
+
+dcl	code		fixed bin (35);
+
+	lock_ptr = addr (sst$astl);
+
+	if lock.pid = pds$processid
+	then do;
+		code = 1;
+	     end;
+	else call CHECK_NOTIFY (lock_ptr);
+	return;
+     end VERIFY_AST;
+%page;
+
+/* Check for dir locks */
+
+
+VERIFY_DIRECTORIES:
+     procedure (code);
+
+dcl	code		fixed bin (35);
+dcl	i		fixed bin (17);
+dcl	rx		fixed bin;
+dcl	this_dir_locked	bit (1) aligned;
+
+	code = 0;
+	dir_lock_segp = addr (dir_lock_seg$);
+	dir_lock_all_locksp = dir_lock_seg.header.locks_ptr;
+	dir_lock_all_readersp = dir_lock_seg.header.readers_ptr;
+
+LOOP_OVER_DIRS:
+	do i = 1 to dir_lock_seg.header.highest_in_use;
+	     this_dir_locked = "0"b;
+	     dir_lockp = addr (dir_lock_all_dir_locks (i));
+	     dir_read_lockers_ptr = addr (dir_lock_all_readers (i, 1));
+	     if dir_lock.lock_count ^= 0
+	     then do;
+		     call lock$lock_fast (addr (dir_lock_seg.header.seg_lock));
+						/* make sure this is for real */
+		     if dir_lock.lock_count > 0
+		     then if dir_lock.write_locker = pds$processid
+			then this_dir_locked = "1"b;
+			else ;			/* locked exclusively to someone else */
+		     else if dir_lock.lock_count < 0
+		     then /* read locked */
+LOOP_OVER_LOCKERS:
+			do rx = 1 to hbound (dir_read_lockers, 1);
+			     if dir_read_lockers (rx) = pds$processid
+			     then this_dir_locked = "1"b;
+			end LOOP_OVER_LOCKERS;
+
+		     call lock$unlock_fast (addr (dir_lock_seg.header.seg_lock));
+		     if this_dir_locked
+		     then call VERIFY_DIR (dir_lock.uid, (dir_lock.salvage_sw), (dir_lock.lock_count > 0));
+		end;
+
+	end LOOP_OVER_DIRS;
+	return;
+
+     end VERIFY_DIRECTORIES;
+
+
+VERIFY_DIR:
+     procedure (uid, salvage_sw, write_sw) options (non_quick);
+
+dcl	uid		bit (36) aligned;
+dcl	salvage_sw	bit (1) aligned;
+dcl	write_sw		bit (1) aligned;
+
+	dp = GET_SEG_PTR (uid);
+
+	if salvage_sw				/* Salvager had it locked */
+	then do;					/* Do nearly nothing */
+		call syserr (SYSERR_LOG_OR_PRINT, "verify_lock: Crawlout while in directory salvager, dir (^w,^p).",
+		     uid, dp);
+		go to unlock_return;
+	     end;
+
+	if dp = null				/* This is not the KST uid, the dir may not even be there */
+	then go to unlock_return;
+
+	on seg_fault_error, page_fault_error go to NO_MODIFY_CHECK;
+	if (dir.modify ^= pds$processid) & (dir.modify ^= ""b)
+	then do;
+		call syserr (tc_data$lock_error_severity, "verify_lock: dir.modify ^p ^w ^^= processid.", dp,
+		     dp -> dir.modify);
+	     end;
+
+NO_MODIFY_CHECK:
+	revert seg_fault_error, page_fault_error;
+
+	on subscriptrange
+	     call syserr (SYSERR_CRASH_SYSTEM, "verify_lock: more than ^d directories locked to process.",
+		hbound (dirs_locked.seg_ptr, 1));
+
+	dirs_locked.count = dirs_locked.count + 1;
+(subscriptrange):
+	dirs_locked.seg_ptr (dirs_locked.count) = dp;
+	revert subscriptrange;
+
+	dirs_locked.uid (dirs_locked.count) = uid;
+unlock_return:
+	call syserr (SYSERR_LOG_OR_PRINT, "verify_lock: Unlocking dir ^w. Locked for ^[read^]^[write^]^[, salvage^].",
+	     uid, ^write_sw, write_sw, salvage_sw);
+	unlock_occurred = "1"b;
+
+	call lock$dir_unlock_given_uid (uid);		/* we may be one of many readers */
+
+     end VERIFY_DIR;
+
+SALVAGE_DIRECTORIES:
+     procedure;
+
+declare	dirx		fixed bin;
+declare	uid		bit (36) aligned;
+
+	if dirs_locked.count = 0
+	then return;
+
+	do dirx = 1 to dirs_locked.count;
+	     call lock$dir_lock_salvage (dirs_locked.seg_ptr (dirx), uid, (0));
+						/* get unique lock */
+
+	     call syserr (SYSERR_LOG_OR_PRINT, "verify_lock: Salvaging dir ^p ^w on crawlout.", dp, uid);
+
+	     call condition_ ("any_other", salvager_handler);
+
+	     code = 0;
+
+	     call on_line_salvager (dirs_locked.seg_ptr (dirx), code);
+
+	     call reversion_ ("any_other");
+
+
+	     if code = error_table_$salv_pdir_procterm
+	     then call syserr$error_code (SYSERR_TERMINATE_PROCESS, code, "Terminating user process ^a: ",
+		     pds$process_group_id);
+
+CONTINUE_VERIFY_LOCK:
+	     call lock$dir_unlock_given_uid (uid);	/* unlock it even if it isn't a real dir */
+	end;
+	return;
+
+salvager_handler:
+     procedure (mc_ptr, condition_name, wc_ptr, info_ptr, continue_flag);
+
+declare	(mc_ptr, wc_ptr, info_ptr)
+			pointer;
+declare	condition_name	character (*);
+declare	continue_flag	bit (1) aligned;
+
+
+	call syserr (SYSERR_PRINT_ON_CONSOLE, "verify_lock: ^a condition by ^a while salvaging directory.",
+	     condition_name, pds$process_group_id);
+
+	if mc_ptr ^= null
+	then call make_syserr_message (condition_name, mc_ptr);
+
+	go to CONTINUE_VERIFY_LOCK;			/* unwind stack, running cleanup handlers */
+						/* in salvager subsystem */
+     end salvager_handler;
+
+     end SALVAGE_DIRECTORIES;
+%page;
+VERIFY_PVT_LOCKS:
+     procedure;
+
+	pvt_arrayp = addr (pvt$array);
+	do pvtx = 1 to pvt$n_entries;
+
+	     pvtep = addr (pvt_array (pvtx));
+
+	     if pvte.vtoc_map_lock = pds$processid
+	     then do;
+		     call vtoce_stock_man$force_unlock (pvtep);
+		     call syserr (SYSERR_LOG_OR_PRINT,
+			"verify_lock: Force unlocked VTOC Map lock (^a_^a^[^a^;^s^]) on crawlout for ^a", pvte.devname,
+			convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name, pds$process_group_id);
+		     pvte.vol_trouble_count = pvte.vol_trouble_count + 1;
+		     tsdw = 0;
+		     unlock_occurred = "1"b;
+		     call pmut$swap_sdw (addr (volmap_abs_seg$), addr (tsdw));
+		end;
+
+	     if pvte.volmap_lock = pds$processid
+	     then do;
+		     call pmut$swap_sdw (addr (volmap_abs_seg$), addr (pvte.volmap_seg_sdw));
+		     record_stockp = pvte.volmap_stock_ptr;
+		     do pagex = 0 to record_stock.n_volmap_pages;
+			call page$write_volmap_page_unwired (pvtep, pagex);
+		     end;
+		     call page$unlock_volmap (pvtep);
+		     call syserr (SYSERR_LOG_OR_PRINT,
+			"verify_lock: Force unlocked Volmap lock (^a_^a^[^a^;^s^]) on crawlout for ^a", pvte.devname,
+			convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name, pds$process_group_id);
+		     tsdw = 0;
+		     unlock_occurred = "1"b;
+		     call pmut$swap_sdw (addr (volmap_abs_seg$), addr (tsdw));
+		end;
+
+	end;
+
+     end VERIFY_PVT_LOCKS;
+%page;
+VERIFY_SEARCH_RULES:
+     proc;
+
+	if tc_data$system_shutdown
+	then return;
+	lock_ptr = addr (ahd$search_rules_lock);
+	if lock.pid = pds$processid
+	then do;
+		call NOTE_UNLOCK ("search rules");
+		call lock$unlock_fast (lock_ptr);
+	     end;
+	else call CHECK_NOTIFY (lock_ptr);
+     end VERIFY_SEARCH_RULES;
+
+
+
+VERIFY_MASKED:
+     procedure;
+
+declare	mask		fixed bin (71);
+
+	call pmut$read_mask (mask);
+	if mask = scs$sys_level
+	then call syserr (SYSERR_CRASH_SYSTEM, "verify_lock: Crawlout while masked.");
+
+	return;
+     end VERIFY_MASKED;
+
+
+CHECK_NOTIFY:
+     proc (a_lock_ptr);
+
+dcl	a_lock_ptr	ptr;
+
+	lock_ptr = a_lock_ptr;
+	if lock.pid = (36)"0"b & lock.flags.notify_sw = "1"b
+	then call pxss$notify (lock.event);
+	return;
+     end CHECK_NOTIFY;
+
+
+NOTE_UNLOCK:
+     procedure (What_did_we_unlock);
+
+declare	What_did_we_unlock	char (*);
+
+	call syserr (SYSERR_LOG_OR_PRINT, "verify_lock: Unlocked ^a.", What_did_we_unlock);
+	unlock_occurred = "1"b;
+     end NOTE_UNLOCK;
+
+
+GET_SEG_PTR:
+     proc (uid) returns (ptr);
+
+dcl	uid		bit (36) aligned;
+dcl	segptr		ptr;
+
+	call kstsrch (uid, (0), kstep);
+	if kstep ^= null
+	then segptr = baseptr (kstep -> kste.segno);
+	else segptr = null;
+	return (segptr);
+     end GET_SEG_PTR;
+
+
+make_syserr_message:
+     procedure (cond_name, mcptr);
+
+dcl	cond_name		character (*);
+dcl	mcptr		pointer;
+dcl	1 auto_fault_msg	aligned like fault_msg;	/* Machine conditions and history for syserr logging */
+dcl	ssptr		pointer;			/* pointer to signaller stack frame */
+
+	ssptr = addrel (mcptr, -8);			/* signaller_stack.pad is 8 words long! */
+						/* Construct contiguous machine conditions and history registers */
+	unspec (auto_fault_msg.mach_cond) = unspec (ssptr -> signaller_stack.mach_cond);
+	auto_fault_msg.hist_reg = ssptr -> signaller_stack.history_registers;
+	call syserr$binary (SYSERR_LOG_OR_PRINT, addr (auto_fault_msg), SB_verify_lock, SBL_verify_lock,
+	     "verify_lock: ^a condition by ^a", cond_name, pds$process_group_id);
+						/* Save machine cond (and history) if known */
+
+     end make_syserr_message;
+
+/* format: off */
+
+%page; %include dir_header;
+%page; %include dir_lock_seg_;
+%page; %include kst;
+%page; %include pvte;
+%page; %include signaller_stack;
+%page; %include stock_seg;
+%page; %include syserr_binary_def;
+%page; %include syserr_constants;
+%page; %include syserr_fault_msg;
+%page; %include mc;
+%page; %include vtoc_buffer;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   verify_lock: Crawlout stop specified on PARM card.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	The system PARM card specified the CRWL parameter.
+   A process is attempting to crawl out.
+   This message will occur so that system programmers can take a dump.
+
+   A:	Take a dump.
+   Issuing the BCE go command
+   will cause the system to continue.
+
+   Message:
+   verify_lock: Crawlout with AST lock set.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A user process encountered
+   a condition while processing with the AST locked.
+   This condition may have been due to a
+   hardware or software failure.
+   $crashes
+
+   A:	$recover
+
+   Message:
+   verify_lock: Crawlout error on directory cleanup.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process encountered a signalled condition
+   with one or more directories locked.
+   Before the system causes a crawlout,
+   it unlocks and salvages
+   all locked directories for the process.
+   This process of cleanup encountered an unrecoverable error.
+   $crashes
+
+   A:	$recover
+
+   Message:
+   verify_lock: block_lock_count XX, should be 0
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process has encountered
+   a condition in ring 0,
+   and is in the process of attempting a crawlout.
+   The system must unlock all locks
+   before it performs the crawlout;
+   all known locks have been unlocked
+   but the process' lock counter is still nonzero.
+   $err
+   $crashes
+
+   A:	$recover
+
+   Message:
+   verify_lock: NAME condition by PERS.PROJ
+
+   S:	$log
+
+   T:	$run
+
+   M:	User PERS.PROJ encountered a NAME condition in ring 0.
+   The system attempts to unlock and reset all ring 0 data bases
+   locked by the process.
+
+   A:     These messages almost always indicate benign errors in
+   the supervisor. They should be reported, nonetheless. They are
+   accompanied by the binary machine condition information.
+   This message is logged only when the condition occured while
+   some ring-0 lock was set.  One or more messages preceeding
+   this one will indicate which locks were held by the process
+   and forcibly reset.
+
+   Message:
+   verify_lock: Crawlout while in directory salvager, dir (UID,PTR).
+
+   S:	$log
+
+   T:	$run
+
+   M:	A process faulted while salvaging a dir on crawlout.
+
+   A:     $ignore
+
+   Message:
+   verify_lock: dir.modify PPPP WWWW ^^= processid.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process is attempting to crawl out.
+   The system has discovered that a directory
+   which is marked locked to the process
+   has its "modify" field
+   not equal to the processid of the process.
+   $err
+   $crashes
+
+   A:	$recover
+
+   Message:
+   verify_lock: more than N directory locks locked to process.
+
+   S:     $crash
+
+   T:     $run
+
+   M:     The process held more dir locks than verify lock
+   could store for later salvaging. This indicates a logic error
+   in the supervisor.
+
+   A:    $crashes
+   $recover
+
+   Message:
+   verify_lock: Unlocking dir UUUUUUUUUUUU. Locked for READ_OR_WRITE {,salvage}.
+
+   S:	$log
+
+   T:	$run
+
+   M:	The directory with UID UUUUUUUUUUUU was found locked at crawl-out
+   time. It is salvaged and then unlocked.
+
+   A:	$inform
+
+   Message:
+   verify_lock: Salvaging dir PTR UID on crawlout.
+
+   S:	$log
+
+   T:	$run
+
+   M:	This message is displayed for each directory found locked on a
+   crawlout.  The online salvager will be called and the directory unlocked.
+
+   A:	$ignore
+
+   Message:
+   Terminating user process NAME: Fatal salvaging of process directory.
+
+   S:	$term
+
+   T:	$run
+
+   M:	A process is attempting to crawl out. The system discovered that
+   the process was interrupted while its process directory was locked, and has
+   salvaged the process directory. Salvaging the process directory may delete
+   critical process segments and cause the process to terminate, so the process
+   is terminated cleanly instead.
+
+   A:	$ignore
+
+   Message: 
+   verify_lock: COND condition by USER while salvaging directory.
+
+   S:	$announce
+
+   T:	$salvt
+
+   M:	A fault occurred while salvaging a directory found locked at
+   crawlout. This indicates a serious problem with the directory.
+
+   A:	$inform
+
+   Message:
+   verify_lock: Force unlocked VTOC Map lock (dskX_NN) on crawlout for PERSON.PROJECT.TAG
+
+   S:     $log
+
+   T:	$run
+
+   M:	The VTOC Map lock for the device indicated was found locked to the
+   process on crawlout. The lock has been reset, and the count of volume
+   inconsistencies has been incremented by one.
+
+   A:     Any free records or VTOCEs lost because of the crawlout can be
+   recovered by a volume salvage.
+
+   Message:
+   verify_lock: Force unlocked Volmap lock (dskX_NN) on crawlout for PERSON.PROJECT.TAG
+
+   S:     $log
+
+   T:	$run
+
+   M:	The Volmap Lock for the device indicated was found locked to a
+   process on crawlout. The lock has been reset, and the count of volume
+   inconsistencies for the device has been incremented by one.
+
+   A:     Any free records or VTOCEs lost because of the crawlout can
+   be recovered by a volume salvage.
+
+   Message:
+   verify_lock: Crawlout while masked.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	$crashes
+
+   A:	$inform
+
+   Message:
+   verify_lock: Unlocked LOCK.
+
+   S:	$log
+
+   T:	$run
+
+   M:	The lock LOCK was found locked at crawlout and unlocked.
+
+   A:	$ignore
+
+   END MESSAGE DOCUMENTATION */
+
+     end verify_lock;

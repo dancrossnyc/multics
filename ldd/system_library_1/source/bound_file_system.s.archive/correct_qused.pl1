@@ -1,0 +1,320 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4 */
+correct_qused: proc (a_dir, a_osu, a_odu, a_nsu, a_ndu, a_did_anything, a_code);
+
+/* Quota used reconstructor. An original algorithm by Bernard Greenberg
+   Feb. 1977
+
+   Modified 1/82 BIM for write lock on dir to get exclusive lock.
+   Modified 8/83 E. N. Kittltiz for search_ast$check.
+   Modified 7/84 Keith Loepere to use the new dc_find.
+   Modified 10/84 Keith Loepere to provide audit info.
+   Modified 12/84 Keith Loepere for new dir quota definition.
+*/
+
+/* Parameters */
+
+dcl  a_code fixed bin (35) parameter;
+dcl  a_did_anything bit (1) aligned parameter;
+dcl  a_dir char (*) parameter;
+dcl  a_ndu fixed bin (34) parameter;
+dcl  a_nsu fixed bin (34) parameter;
+dcl  a_odu fixed bin (34) parameter;
+dcl  a_osu fixed bin (34) parameter;
+
+/* Variables */
+
+dcl  branches_passed fixed bin;
+dcl  code fixed bin (35);
+dcl  correct_dir bit (1) aligned;
+dcl  correct_seg bit (1) aligned;
+dcl  did_anything bit (1) aligned;
+dcl  dname char (168);
+dcl  dpvid bit (36) aligned;
+dcl  dudelta fixed bin (34);
+dcl  duid bit (36) aligned;
+dcl  dvtocx fixed bin;
+dcl  htblsize fixed bin;
+dcl  1 local_vtoce aligned like vtoce;
+dcl  ndu fixed bin (34);				/* old-new X seg-dir used */
+dcl  nentries fixed bin;
+dcl  nsu fixed bin (34);
+dcl  odu fixed bin (34);
+dcl  osu fixed bin (34);
+dcl  scode fixed bin (35);
+dcl  scode1 fixed bin (35);
+dcl  sudelta fixed bin (34);
+
+/* External */
+
+dcl  error_table_$rqover fixed bin (35) ext;
+dcl  error_table_$vtoce_connection_fail fixed bin (35) ext;
+
+/* Misc */
+
+dcl  (addr, fixed, mod, null, ptr, rel, unspec) builtin;
+
+dcl  bad_dir_ condition;
+
+/* Entries */
+
+dcl  get_pvtx entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+dcl  lock$lock_ast entry;
+dcl  lock$unlock_ast entry;
+dcl  logical_volume_manager$lvtep entry (bit (36) aligned, ptr, fixed bin (35));
+dcl  quotaw$rvq entry (ptr, fixed bin (34), fixed bin (34), fixed bin (34), fixed bin (34));
+dcl  search_ast$check entry (bit (36) aligned, bit (36) aligned, fixed bin, fixed bin (35)) returns (ptr);
+dcl  syserr entry options (variable);
+dcl  vtoc_attributes$correct_qused entry (bit (36) aligned, bit (36) aligned,
+	fixed bin, fixed bin (34), fixed bin (34), fixed bin (35));
+dcl  vtoc_man$get_vtoce entry (bit (36) aligned, fixed bin, fixed bin, bit (3), ptr, fixed bin (35));
+%page;
+
+/* The basic operational theorem of this program is that the quota used total for any directory quota cell  is
+   either  right  or  wrong  by  a finite and constant amount.  If that amount of error can be computed at any
+   given time (T0) by figuring out what it should be, it can be corrected at any time  later  by  adding  this
+   fixed correction, regardless of how many pages were created or destroyed in the interim. */
+
+	correct_dir, correct_seg = "1"b;
+	go to join;
+
+correct_seg_qused: entry (a_dir, a_osu, a_nsu, a_did_anything, a_code);
+
+	correct_dir = "0"b;
+	correct_seg = "1"b;
+	go to join;
+
+correct_dir_qused: entry (a_dir, a_odu, a_ndu, a_did_anything, a_code);
+
+	correct_dir = "1"b;
+	correct_seg = "0"b;
+
+join:	dname = a_dir;
+	did_anything = "0"b;
+	scode, code = 0;
+	vtocep = addr (local_vtoce);
+
+	call dc_find$dir_write_priv (dname, FS_OBJ_CORRECT_QUSED, dp, code);
+	if code ^= 0 then go to err;
+
+	if correct_seg then do;
+	     call logical_volume_manager$lvtep (dir.sons_lvid, (null ()), code);
+						/* We check before and after cycle, the
+						   first time to rule out problem. We check at the
+						   end if demount occured during run. Still small window. */
+	     if code ^= 0 then go to unlock_err;
+	end;
+
+/* Directory is locked at this point (actually back at dc_find). Until we 
+   unlock it, nobody can  truncate  VTOCEs  or  create  or  delete segments
+   or dirs in it. Finite and constant set of inferior UID's from here to the
+   end.   Furthermore,  all  "used"  change  can only be on active segments,
+   all of which must be active now, and no new ones can become active because
+   we have the directory locked. */
+
+	nentries = dir.seg_count + dir.dir_count;
+	htblsize = (nentries * 7) / 5;
+
+	duid = dir.uid;				/* Get uid into automatic */
+	dpvid = dir.pvid;				/* pvid of directory, copied from branch */
+	dvtocx = dir.vtocx;				/* vtocx of directory, copied from branch */
+
+	call lock$lock_ast;
+
+/* Lock the AST.  If this dir is not active, none of its sons can become active until
+   we unlock this dir. If it is, we must call quotaw to get info. */
+
+	astep = search_ast$check (duid, dpvid, dvtocx, code); /* is it there? */
+	if code ^= 0 then do;			/* double-uid */
+	     call lock$unlock_ast;
+	     go to unlock_err;
+	end;
+
+	if astep = null then do;
+	     nsu = 0;				/* At time T0, which never existed, no active inferior
+						   quota was found */
+	     call lock$unlock_ast;			/* And will remain so. */
+
+	     call internal_vtoc_man (dir.uid, dir.pvid, dir.vtocx);
+						/* Get current quota numbers for this dir */
+	     if code ^= 0 then go to unlock_err;
+
+	     ndu = fixed (vtoce.records, 9);		/* Count dirs pages toward itself */
+	     osu = vtoce.used (0);
+	     odu = vtoce.used (1);			/* Read old totals at time T0 */
+	end;
+
+	else					/* There is active inferior quota */
+	     call quotaw$rvq (astep, osu, odu, nsu, ndu); /* Get false (o) numbers and active
+						   inferior totals (n) */
+
+/* The time that quotaw$rvq reads these numbers is called "T0". The "false" numbers read out of the  ASTE  for
+   this dir at T0 is (was) wrong by  a  finite  number,  "d(0:1)".   The   difference   between   the   active
+   inferior totals  and   the   "right" number at time T0 is the sum of the non-active used for all VTOCEs not
+   active  at  time  T0.  As long as the AST remains locked, the membership of this set cannot change. We have
+   not  unlocked it  since  T0.  From this number, we can find "d". */
+
+	begin;					/* * * * * START OF BEGIN BLOCK * * * * * * */
+
+dcl  hshx fixed bin;
+dcl  htbl (0:htblsize - 1) bit (36) aligned;
+						/* Enter begin block to make hashtable */
+
+
+	     unspec (htbl) = "0"b;			/* No stuff in table */
+	     if astep ^= null then do;		/* AST still locked here */
+		do astep = ptr (astep, aste.infp) repeat ptr (astep, aste.infl) while (rel (astep));
+						/* Loop the AST to record activity at T0 */
+
+		     if hash_search ((aste.uid)) then call syserr (1, "correct_qused: hash error");
+		     else htbl (hshx) = aste.uid;
+		end;
+		call lock$unlock_ast;		/* I don't care what gets deactivated now */
+	     end;
+
+	     branches_passed = 0;			/* Don't loop */
+	     nentries = nentries + dir.lcount;		/* Gotta count them too */
+
+	     do ep = ptr (dp, dir.entryfrp) repeat ptr (dp, entry.efrp) while (rel (ep));
+		branches_passed = branches_passed + 1;
+		if branches_passed > nentries then signal bad_dir_;
+		if entry.bs then do;		/* Skip them links */
+		     if entry.owner ^= dir.uid
+			| (entry.type ^= SEG_TYPE & entry.type ^= DIR_TYPE) then signal bad_dir_;
+		     if ^hash_search (entry.uid) then do; /* If not active at T0, get VTOC stuff */
+			if ^correct_seg then
+			     if ^entry.dirsw then go to next_entry; /* avoid asking for non-mounted vtoce */
+			call internal_vtoc_man (entry.uid, (entry.pvid), entry.vtocx);
+			if code ^= 0 then scode = code;
+			else do;
+			     if vtoce.dirsw then do;
+				if vtoce.received (0) = 0 & ^vtoce.master_dir then nsu = nsu + vtoce.used (0);
+				if vtoce.received (1) = 0 then ndu = ndu + vtoce.used (1); /* dirs pages already counted in used */
+			     end;
+			     else nsu = nsu + fixed (vtoce.records, 9);
+			end;
+		     end;
+		end;
+next_entry:    end;
+	     if branches_passed < nentries then signal bad_dir_;
+
+hash_search: proc (c_uid) returns (bit (1) aligned);	/* Internal to begin block */
+
+dcl  c_uid bit (36) aligned parameter;
+
+dcl  cuid bit (36) aligned;
+dcl  hshi fixed bin;
+
+	cuid = c_uid;
+	if cuid = "0"b then signal bad_dir_;
+	hshi = mod (fixed (cuid, 36), htblsize);
+	do hshx = hshi to htblsize - 1, 0 to hshi - 1;
+	     if htbl (hshx) = cuid then return ("1"b);
+	     else if htbl (hshx) = "0"b then return ("0"b);
+	end;
+	signal bad_dir_;				/* dir header must have lied */
+     end hash_search;
+	end;					/* * * * * END OF BEGIN BLOCK * * * * * * * */
+%page;
+
+/* Now nsu and ndu are the correct used totals at time T0, while osu and odu are the erroneous totals at  time
+   T0. Thus, we can find d(0:1), the difference.  This difference will not change, it is the fixed error. */
+
+
+	sudelta = nsu - osu;
+	dudelta = ndu - odu;
+
+/* We are now free to change whatever we have at any time by these differences. */
+
+	if scode ^= 0 then do;			/* if was problem check for lv demount window */
+	     if correct_seg then do;
+		call logical_volume_manager$lvtep (dir.sons_lvid, (null ()), scode1);
+		if scode1 ^= 0 then do;
+		     code = scode1;
+		     sudelta, dudelta = 0;
+		end;
+	     end;
+	end;
+
+	if ^correct_seg then sudelta = 0;
+	if ^correct_dir then dudelta = 0;
+
+	if sudelta ^= 0 | dudelta ^= 0
+	then call vtoc_attributes$correct_qused (duid, dir.pvid, (dir.vtocx), sudelta, dudelta, code);
+	else code = 0;
+
+	if code = 0 then did_anything = "1"b;
+	else if code = error_table_$rqover then did_anything = "1"b; /* Avoid page fault */
+
+
+unlock_err:
+	call dc_find$finished (dp, "1"b);
+err:	if code = 0 then code = scode;
+
+	a_did_anything = did_anything;
+	a_code = code;
+	if correct_seg then do;
+	     a_nsu = nsu;
+	     a_osu = osu;
+	end;
+	if correct_dir then do;
+	     a_ndu = ndu;
+	     a_odu = odu;
+	end;
+	return;
+
+%page;
+internal_vtoc_man: proc (b_uid, b_pvid, b_vtocx);
+
+/* Internal proc to get a whole bunch of vtoc info for a segment guaranteed not to be active */
+
+dcl  b_pvid bit (36) aligned parameter;
+dcl  b_uid bit (36) aligned parameter;
+dcl  b_vtocx fixed bin (17) unal parameter;
+
+dcl  pvtx fixed bin;
+
+	pvtx = get_pvtx (b_pvid, code);
+	if code ^= 0 then return;
+
+	call vtoc_man$get_vtoce (b_pvid, pvtx, (b_vtocx), "100"b, vtocep, code);
+	if code = 0 then if vtoce.uid ^= b_uid then code = error_table_$vtoce_connection_fail;
+     end;
+
+/* format: off */
+
+%page; %include aste;
+%page; %include dc_find_dcls;
+%page; %include dir_entry;
+%page; %include dir_header;
+%page; %include fs_obj_access_codes;
+%page; %include fs_types;
+%page; %include vtoce;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   correct_qused: hash error
+
+   S: $crash
+
+   T: $run
+
+   M: Multiple entries within a directory undergoing quota correction have 
+   the same UID.
+
+   END MESSAGE DOCUMENTATION */
+
+     end;

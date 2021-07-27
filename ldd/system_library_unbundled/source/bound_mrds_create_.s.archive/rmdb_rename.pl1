@@ -1,0 +1,818 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1985 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: ^inddcls,^indattr,indnoniterend,^indnoniterdo,indend,tree,^case,insnl,comcol61,dclind5,declareind5,delnl */
+
+/*DESCRIPTION
+  This subroutine implements renaming of domains, attributes and relation.
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(85-12-03,Spitzer), approve(85-12-03,MCR7311),
+     audit(86-09-15,Gilcrease), install(86-10-16,MR12.0-1187):
+     written
+                                                   END HISTORY COMMENTS */
+
+rmdb_rename:
+     proc (Irmdb_ctl_ptr, Irename_object_info_ptr, Oerror_message, Ocode);
+
+	rmdb_ctl_ptr = Irmdb_ctl_ptr;
+	rename_object_info_ptr = Irename_object_info_ptr;
+	local_iocb = rmdb_ctl.crossref_file_info.iocb_ptr;
+	dbm_ptr = rmdb_ctl.db_model_ptr;
+
+	if rename_object_info.version ^= rename_object_info_version_1
+	then call error (error_table_$unimplemented_version,
+		"Version " || rename_object_info.version || " for the rename_object_info structure.");
+
+	if /* case */ rename_object_info.type = RENAME_ATTRIBUTE
+	then do;
+	     rename_entry = rename_attribute;
+	     key_head = ATTRIBUTE_KEY_HEAD;
+	     end;
+	else if rename_object_info.type = RENAME_DOMAIN
+	then do;
+	     rename_entry = rename_domain;
+	     key_head = DOMAIN_KEY_HEAD;
+	     end;
+	else if rename_object_info.type = RENAME_RELATION
+	then do;
+	     rename_entry = rename_relation;
+	     key_head = RELATION_KEY_HEAD;
+	     end;
+	else call error (mrds_error_$internal_error,
+		"Rename operation of type " || ltrim (char (rename_object_info.type)));
+
+	if local_iocb = null
+	then do;
+	     call mdbm_util_$xref_build (rmdb_ctl.temp_dir_path, rmdb_ctl.absolute_db_path, dbm_ptr,
+		rmdb_ctl.crossref_file_info.name, local_iocb, error_message, code);
+	     if code ^= 0
+	     then call error (code, error_message);
+	     rmdb_ctl.crossref_file_info.iocb_ptr = local_iocb;
+	     end;
+
+	max_seg_size = sys_info$max_seg_size * 4;
+
+	tempp, fm_ptr = null;
+	on cleanup call cleaner;
+
+/* Verify all of the input arguments. See that all the from names are there and
+   all the to names aren't. */
+	do loop = 1 to rename_object_info.count;
+	     call mdbm_util_$xref_find_record (local_iocb, rtrim (key_head), rename_object_info.from (loop), null, 0,
+		error_message, code);
+	     if code ^= 0
+	     then if code = error_table_$no_record
+		then do;
+		     if rename_object_info.type = RENAME_ATTRIBUTE
+		     then code = mrds_error_$no_model_attr;
+		     else if rename_object_info.type = RENAME_DOMAIN
+			then code = mrds_error_$no_model_dom;
+			else code = mrds_error_$no_model_rel;
+		     call error (code, rename_object_info.from (loop));
+		     end;
+		else call error (code, error_message);
+
+	     call mdbm_util_$xref_find_record (local_iocb, rtrim (key_head), rename_object_info.to (loop), null, 0,
+		error_message, code);
+	     if code = 0
+	     then do;
+		if rename_object_info.type = RENAME_ATTRIBUTE
+		then code = mrds_error_$attr_already_exists;
+		else if rename_object_info.type = RENAME_DOMAIN
+		     then code = mrds_error_$domain_already_defined;
+		     else code = mrds_error_$dup_rel;
+		call error (code, rename_object_info.to (loop));
+		end;
+	     else if code ^= error_table_$no_record
+		then call error (code, error_message);
+	     end;					/* do loop */
+
+	call mdbm_util_$get_temp_segment_path (rmdb_ctl.temp_dir_path, myname, tempp, code);
+	if code ^= 0
+	then call error (code, "Unable to get temp segments.");
+
+/* Actually rename the suckers now. */
+	do loop = 1 to rename_object_info.count;
+	     call rename_entry (rename_object_info.from (loop), rename_object_info.to (loop));
+	     end;					/* do loop */
+
+	call cleaner;
+	call error (0, "");
+
+RETURN_TO_CALLER:
+	return;
+
+cleaner:
+     proc;
+
+	if tempp ^= null
+	then call mdbm_util_$free_temp_segment (myname, tempp, (0));
+	if fm_ptr ^= null
+	then call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, (0));
+	return;
+     end cleaner;
+
+error:
+     proc (cd, msg);
+
+dcl  cd fixed bin (35) parameter;
+dcl  msg char (*) parameter;
+
+	Ocode = cd;
+	if Ocode = 0
+	then Oerror_message = "";
+	else Oerror_message = msg;
+
+	call cleaner;
+	goto RETURN_TO_CALLER;
+
+     end error;
+%page;
+/*DESCRIPTION
+  This implements renaming a single attribute. Note that quits are trapped
+  during critical code. Steps Are:
+  - if the attribute is unreferenced rename the attribute in db_model
+  - otherwise
+    - mark the db and resultant inconsistent.
+    - get the attribute xref record.
+    - for each relation in the xref
+      - initiate the file_model
+      - find the attribute within the file_model
+      - rename the attribute within the file_model
+      - rename the attribute within the referenced domain xref record
+    - mark the db consistent
+  - rename the attribute xref record.
+  - add a history entry
+*/
+
+rename_attribute:
+     proc (ra_from, ra_to);
+
+dcl  ra_attribute_xref_ptr ptr;
+dcl  ra_from char (*) parameter;
+dcl  ra_loop fixed bin;
+dcl  ra_relation_name char (32);
+dcl  ra_to char (*) parameter;
+dcl  ra_unreferenced_domain bit (1) aligned;
+
+	ra_unreferenced_domain = "0"b;
+	goto RENAME_ATTRIBUTE_COMMON;
+
+rename_attribute$unreferenced_domain:
+     entry (ra_from, ra_to);
+
+	ra_unreferenced_domain = "1"b;
+	goto RENAME_ATTRIBUTE_COMMON;
+
+RENAME_ATTRIBUTE_COMMON:
+
+	ra_attribute_xref_ptr = tempp;
+
+/* Get the attribute crossreference record */
+	call mdbm_util_$xref_find_record (local_iocb, ATTRIBUTE_KEY_HEAD, ra_from, ra_attribute_xref_ptr, max_seg_size,
+	     error_message, code);
+	if code ^= 0
+	then call error (code, error_message);
+
+/* BEGIN CRITICAL CODE */
+	quit_occurred = FALSE;
+	on quit quit_occurred = TRUE; 
+
+/* disallow renaming of generated attributes */
+	di_ptr = ptr (dbm_ptr, ra_attribute_xref_ptr -> crossref_info_record.offset);
+	if domain_info.name = ra_from
+	then call error (error_table_$unsupported_operation, 
+	     "Attempt to rename a generated attribute: " || ra_from);
+
+	if ra_attribute_xref_ptr -> crossref_info_record.count = 0
+	then if ra_unreferenced_domain		/* unreferenced attribute */
+	     then do;				/* this is the generated attribute */
+		call mdbm_util_$xref_modify_record_name (local_iocb, ATTRIBUTE_KEY_HEAD, ra_from, ra_to, ra_attribute_xref_ptr, error_message, code);
+		if code ^= 0
+		then call error (code, error_message);
+		di_ptr = ptr (dbm_ptr, ra_attribute_xref_ptr -> crossref_info_record.offset);
+		call mdbm_util_$xref_modify_reference_name (local_iocb, DOMAIN_KEY_HEAD, (domain_info.name), ra_from,
+		     ra_to, error_message, code);
+		if code ^= 0
+		then call error (code, error_message);
+		end;
+	     else do;
+		continue = TRUE;
+		do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+		     repeat ptr (dbm_ptr, unreferenced_attribute.fwd_thread) while (rel (ua_ptr) ^= NULL_OFFSET & continue);
+		     if unreferenced_attribute.name = ra_from
+		     then do;
+			unreferenced_attribute.name = ra_to;
+			continue = FALSE;
+			di_ptr = ptr (dbm_ptr, ra_attribute_xref_ptr -> crossref_info_record.offset);
+			call mdbm_util_$xref_modify_reference_name (local_iocb, DOMAIN_KEY_HEAD, (domain_info.name), ra_from,
+			     ra_to, error_message, code);
+			if code ^= 0
+			then call error (code, error_message);
+			call mdbm_util_$xref_modify_record_name (local_iocb, ATTRIBUTE_KEY_HEAD, ra_from, ra_to, 
+			     null(), error_message, code);
+			if code ^= 0
+			then call error (code, error_message);
+			end;
+		     end;				/* do ua_ptr */
+		end;
+	else do;					/* referenced attribute */
+
+/* Mark database inconsistent */
+	     rmdb_ctl.saved_res_version_ptr -> based_char8 = "RESTRUCT";
+	     if ra_unreferenced_domain
+	     then call mdbm_util_$inconsistent_set (dbm_ptr, "rename_domain",
+		     "Renaming domain " || rtrim (ra_from) || " to " || rtrim (ra_to),
+		     "undo_rename " || rtrim (ra_to) || " " || rtrim (ra_from));
+	     else call mdbm_util_$inconsistent_set (dbm_ptr, "rename_attribute",
+		     "Renaming attribute " || rtrim (ra_from) || " to " || rtrim (ra_to),
+		     "undo_rename " || rtrim (ra_to) || " " || rtrim (ra_from));
+
+	     fm_ptr = null;
+	     on cleanup call cleaner;
+
+/* Do for all relations this attribute is referenced in */
+	     do ra_loop = 1 to ra_attribute_xref_ptr -> crossref_info_record.count;
+
+/* Try to open the file_model */
+		ra_relation_name = rtrim (ra_attribute_xref_ptr -> crossref_info_record.object (ra_loop)) || ".m";
+		call initiate_file_ (rmdb_ctl.absolute_db_path, ra_relation_name, RW_ACCESS, fm_ptr, (0), code);
+		if code ^= 0
+		then call error (code, "Initiating relation " || ra_relation_name);
+
+/* rename the attr_info name in the file_model */
+		ri_ptr = ptr (fm_ptr, file_model.rel_ptr);
+		continue = TRUE;
+		do ai_ptr = ptr (fm_ptr, rel_info.attr_ptr) repeat ptr (fm_ptr, attr_info.fwd_thread)
+		     while (rel (ai_ptr) ^= NULL_OFFSET & continue);
+		     if attr_info.name = ra_from
+		     then do;
+			attr_info.name = ra_to;
+			continue = FALSE;
+			end;
+		     end;				/* do ai_ptr */
+
+		call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, (0));
+		end;				/* do ra_loop */
+
+/* Modify the attribute name in the domain reference record */
+		di_ptr = ptr (dbm_ptr, ra_attribute_xref_ptr -> crossref_info_record.offset);
+		call mdbm_util_$xref_modify_reference_name (local_iocb, DOMAIN_KEY_HEAD, (domain_info.name), ra_from,
+		     ra_to, error_message, code);
+		if code ^= 0
+		then call error (code, error_message);
+
+/* Modify the name on the attribute crossreference record */
+	     call mdbm_util_$xref_modify_record_name (local_iocb, ATTRIBUTE_KEY_HEAD, ra_from, ra_to,
+		ra_attribute_xref_ptr, error_message, code);
+	     if code ^= 0
+	     then call error (code, error_message);
+
+	     call mdbm_util_$inconsistent_reset (dbm_ptr);
+	     end;
+
+/* Add history entry */
+
+	if ^ra_unreferenced_domain
+	then call rmdb_add_rmdb_history (dbm_ptr, RMDB_ATTR_TYPE, (ra_from), RMDB_RN_ATTR_OP, (ra_to), (""), (0));
+
+/* END CRITICAL CODE */
+	revert quit;
+	if quit_occurred
+	then signal quit;
+
+	return;
+     end rename_attribute;
+%page;
+/*DESCRIPTION
+ This implements renaming a single domain. Note that quits are trapped during
+   critical code. Steps are:
+   - rename domain_info in db_model
+   - get the domain xref record
+   - if the domain is referenced
+     - for each attribute in the domain xref record 
+       - change the domain name in each attribute xref record
+   - change the name on the domain xref record
+   - add a history entry
+*/
+
+rename_domain:
+     proc (rd_from, rd_to);
+
+dcl  rd_domain_xref_ptr ptr;
+dcl  rd_from char (*) parameter;
+dcl  rd_loop fixed bin;
+dcl  rd_to char (*) parameter;
+
+	rd_domain_xref_ptr = tempp;
+
+/* BEGIN CRITICAL CODE */
+
+	quit_occurred = FALSE;
+	on quit quit_occurred = TRUE;
+
+/* Get the domain xref record. */
+	call mdbm_util_$xref_find_record (local_iocb, DOMAIN_KEY_HEAD, rd_from, rd_domain_xref_ptr, max_seg_size,
+	     error_message, code);
+	if code ^= 0
+	then call error (code, error_message);
+
+/* Get a pointer to the domain_info structure in the db_model */
+	di_ptr = ptr (dbm_ptr, rd_domain_xref_ptr -> crossref_info_record.offset);
+	if domain_info.name ^= rd_from
+	then call error (mrds_error_$internal_error, "Domain " || rtrim (domain_info.name) || " should be " || rd_from);
+
+/* Make sure the new domain name isn't an attribute based on this domain */
+	continue = TRUE;
+	do rd_loop = 1 to rd_domain_xref_ptr -> crossref_info_record.count 
+	     while (continue);
+	     if rd_domain_xref_ptr -> crossref_info_record.object (rd_loop) = rd_to
+	     then continue = FALSE;
+	     end;
+	if ^continue
+	then call error (error_table_$unsupported_operation, 
+	     "The new domain name has already been used for an attribute based on this domain: " || rd_to);
+
+/* Make sure the new domain name hasn't been used for an attribute already. */
+	call mdbm_util_$xref_find_record (local_iocb, rtrim (ATTRIBUTE_KEY_HEAD), rd_to, null, 0, error_message, code);
+	if code = 0
+	then call error (error_table_$unsupported_operation,
+	     "The new domain name has already been used for an attribute in the database: " || rd_to);
+
+/* Change the name in domain_info */
+	domain_info.name = rd_to;
+
+/* Rename the domain xref record key. */
+	call mdbm_util_$xref_modify_record_name (local_iocb, DOMAIN_KEY_HEAD, rd_from, rd_to, rd_domain_xref_ptr,
+	     error_message, code);
+	if code ^= 0
+	then call error (code, error_message);
+
+/* Rename the generated attribute record for this domain, along with all
+   relation referenced for this generated attribute. */
+	call rename_attribute$unreferenced_domain (rd_from, rd_to);
+
+	call rmdb_add_rmdb_history (dbm_ptr, RMDB_DOMAIN_TYPE, (rd_from), RMDB_RN_DMN_OP, (rd_to), (""), (0));
+
+/* END CRITICAL CODE */
+	revert quit; 
+	if quit_occurred
+	then signal quit;				/* finally signal it */
+
+	return;
+     end rename_domain;
+%page;
+/*DESCRIPTION
+  This implements renaming a single relation. Note that quits are disabled 
+  during critical code. Steps are:
+  - mark db and resultant inconsistent
+  - rename file_info in db_model
+  - if the relation is a vfile
+    - rename the relation file
+  -otherwise
+    - copy the relation to the new named relation using copy_
+    - delete the original relation
+  - rename the file_model segment
+  - add a history entry
+  - mark the db consistent
+*/
+
+rename_relation:
+     proc (rr_from, rr_to);
+
+dcl  rr_from char (*) parameter;
+dcl  rr_from_model_name char (32);
+dcl  rr_relation_xref_ptr ptr;
+dcl  rr_to char (*) parameter;
+dcl  rr_to_model_name char (32);
+
+	rr_relation_xref_ptr = tempp;
+
+/* BEGIN CRITICAL CODE */
+	quit_occurred = FALSE;
+	on quit quit_occurred = TRUE;
+
+	call mdbm_util_$xref_find_record (local_iocb, RELATION_KEY_HEAD, rr_from, rr_relation_xref_ptr, max_seg_size,
+	     error_message, code);
+	if code ^= 0
+	then call error (code, error_message);
+
+	fi_ptr = ptr (dbm_ptr, rr_relation_xref_ptr -> crossref_info_record.offset);
+	if file_info.file_name ^= rr_from
+	then call error (mrds_error_$internal_error,
+		"Relation " || rtrim (file_info.file_name) || " should be " || rr_from);
+
+	rr_from_model_name = rtrim (rr_from) || ".m";
+
+	fm_ptr = null;
+	on cleanup call cleaner;
+	call initiate_file_ (rmdb_ctl.absolute_db_path, rr_from_model_name, RW_ACCESS, fm_ptr, (0), code);
+	if code ^= 0
+	then call error (code, "Initiating file_model for relation " || rr_from);
+
+	rmdb_ctl.saved_res_version_ptr -> based_char8 = "RESTRUCT";
+	call mdbm_util_$inconsistent_set (dbm_ptr, "rename_relation",
+	     "Renaming relation " || rtrim (rr_from) || " to " || rr_to,
+	     "undo_rename " || rtrim (rr_to) || " " || rtrim (rr_from));
+
+	file_info.file_name = rr_to;
+	ri_ptr = ptr (fm_ptr, file_model.rel_ptr);
+	rel_info.name = rr_to;
+
+	if db_model.db_type_flags.vfile_type
+	then call fs_util_$chname_file (rmdb_ctl.absolute_db_path, rr_from, rr_from, rr_to, code);
+	else do;
+	     copy_options_ptr = addr (local_copy_options);
+	     copy_options.version = COPY_OPTIONS_VERSION_1;
+	     copy_options.caller_name = myname;
+	     copy_options.source_dir, copy_options.target_dir = rmdb_ctl.absolute_db_path;
+	     copy_options.source_name = rr_from;
+	     copy_options.target_name = rr_to;
+
+	     unspec (copy_options.flags) = "0"b;
+	     copy_options.flags.no_name_dup = TRUE;
+	     copy_options.flags.force = TRUE;
+	     copy_options.flags.delete = TRUE;
+	     copy_options.flags.mbz = "0"b;
+
+	     unspec (copy_options.copy_items) = "0"b;
+	     copy_options.copy_items.acl = TRUE;
+	     copy_options.copy_items.ring_brackets = FALSE;
+	     copy_options.copy_items.dumper_switches = FALSE;
+	     copy_options.copy_items.mbz = "0"b;
+
+	     file_model.relation_copy_good = FALSE;
+	     call fs_util_$copy (copy_options_ptr, code);
+
+/* Do this delete because file_manager_ has a bug: it doesn't get around to
+   abiding by the flags. When/if DM is fixed the next group of statements may
+   be removed. */
+	     if code = 0
+	     then do;
+		acl_ptr = null;
+		call fs_util_$list_acl (copy_options.source_dir, copy_options.source_name, GENERAL_ACL_VERSION_1,
+		     addr (my_area), acl_ptr, code);
+		if code ^= 0
+		then call error (code, "Getting acl to relation " || copy_options.source_name);
+
+		call fs_util_$replace_acl (copy_options.source_dir, copy_options.target_name, acl_ptr, "0"b, code);
+		if code ^= 0
+		then call error (code, "Setting acl on relation " || copy_options.target_name);
+
+		file_model.relation_copy_good = TRUE;
+
+		call fs_util_$delentry_file (copy_options.source_dir, copy_options.source_name, code);
+		if code ^= 0
+		then call error (code, "Deleting the old relation " || copy_options.source_name);
+		end;
+	     end;
+
+	if code ^= 0
+	then call error (code, "Renaming relation " || rtrim (rr_from) || " to " || rr_to);
+
+	do ai_ptr = ptr (fm_ptr, rel_info.attr_ptr)
+	            repeat ptr (fm_ptr, attr_info.fwd_thread)
+	            while (rel (ai_ptr) ^= NULL_OFFSET);
+	     call mdbm_util_$xref_modify_reference_name (local_iocb, ATTRIBUTE_KEY_HEAD, (attr_info.name), rr_from, rr_to, error_message, code);
+	     if code ^= 0
+	     then call error (code, error_message);
+	     end;
+
+	call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, code);
+	if code ^= 0
+	then call error (code, "Terminating file_model for relation " || rr_from);
+
+	rr_to_model_name = rtrim (rr_to) || ".m";
+
+	call fs_util_$chname_file (rmdb_ctl.absolute_db_path, rr_from_model_name, rr_from_model_name, rr_to_model_name,
+	     code);
+	if code ^= 0
+	then call error (code, "Renaming relation " || rtrim (rr_from_model_name) || " to " || rr_to_model_name);
+
+	call mdbm_util_$xref_modify_record_name (local_iocb, RELATION_KEY_HEAD, rr_from, rr_to, rr_relation_xref_ptr,
+	     error_message, code);
+	if code ^= 0
+	then call error (code, error_message);
+
+	call rmdb_add_rmdb_history (dbm_ptr, RMDB_REL_TYPE, (rr_from), RMDB_RN_REL_OP, (rr_to), (""), (0));
+
+	call mdbm_util_$inconsistent_reset (dbm_ptr);
+
+/* END CRITICAL CODE */
+	revert quit;
+	if quit_occurred
+	then signal quit;
+
+	return;
+     end rename_relation;
+%page;
+/*DESCRIPTION
+  This entry point attempts to undo the actions of the rename requests.
+  These can only be run when the database is marked inconsistent, and
+  attempt to recover all the information possible. They don't report any
+  errors that may be caused by items missing, mis-named, etc as these could
+  result from a system or process interruption during a rename request. Note
+  that we don't have to update the crossreference file in the [pd], as we are
+  operating in an environment that hasn't created it yet. Also note that if
+  there is an interruption during the undo process, it may be restarted the next
+  time the specified database is touched. Certain operations may be retried,
+  however, if they don't complete this request will continue on trying to undo
+  the entire operation. The database inconsistent switch doesn't get reset until
+  the entire undo operation succeeds.
+*/
+
+rmdb_rename$undo_rename:
+     entry (Isci_ptr, Iinfo_ptr);
+
+	call initialize;
+	if operation = "rename_domain"
+	then call undo_domain;
+	else if operation = "rename_attribute"
+	     then call undo_attribute;
+	     else if operation = "rename_relation"
+		then call undo_relation;
+
+	call mdbm_util_$inconsistent_reset (dbm_ptr);
+	return;
+
+undo_domain:
+     proc;
+
+	continue = TRUE;
+
+/* do for all domains in the database */
+	do di_ptr = ptr (dbm_ptr, db_model.domain_ptr) repeat ptr (dbm_ptr, domain_info.fwd_thread)
+	     while (rel (di_ptr) ^= NULL_OFFSET & continue);
+	     if domain_info.name = from_name
+	     then do;
+		continue = FALSE;
+		domain_info.name = to_name;
+		end;
+	     end;
+
+	return;
+     end undo_domain;
+%page;
+undo_relation:
+     proc;
+
+	continue = TRUE;
+
+/* do for all relations in the database */
+	do fi_ptr = ptr (dbm_ptr, db_model.file_ptr) repeat ptr (dbm_ptr, file_info.fwd_ptr)
+	     while (rel (fi_ptr) ^= NULL_OFFSET & continue);
+	     if file_info.file_name = from_name
+	     then do;
+		file_info.file_name = substr (to_name, 1, length (file_info.file_name));
+		continue = FALSE;
+		end;
+	     end;
+
+	tempp, fm_ptr = null;
+	on cleanup call cleaner;
+
+	call initiate_file_ (rmdb_ctl.absolute_db_path, to_name, RW_ACCESS, fm_ptr, (0), code);
+	if code ^= 0
+	then if code ^= error_table_$noentry
+	     then goto RETURN_TO_CALLER;
+	     else do;
+		call initiate_file_ (rmdb_ctl.absolute_db_path, from_name, RW_ACCESS, fm_ptr, (0), code);
+		if code ^= 0
+		then goto RETURN_TO_CALLER;
+		call fs_util_$chname_file (rmdb_ctl.absolute_db_path, from_name, from_name, to_name, code);
+		end;
+
+	ri_ptr = ptr (fm_ptr, file_model.rel_ptr);
+	rel_info.name = to_name;
+
+	if db_model.db_type_flags.vfile_type
+	then call fs_util_$chname_file (rmdb_ctl.absolute_db_path, from_name, from_name, to_name, (0));
+	else if file_model.relation_copy_good
+	     then do;
+		copy_options_ptr = addr (local_copy_options);
+		copy_options.version = COPY_OPTIONS_VERSION_1;
+		copy_options.caller_name = "undo_rename";
+		copy_options.source_dir, copy_options.target_dir = rmdb_ctl.absolute_db_path;
+		copy_options.source_name = from_name;
+		copy_options.target_name = to_name;
+
+		unspec (copy_options.flags) = "0"b;
+		copy_options.flags.no_name_dup = TRUE;
+		copy_options.flags.force = TRUE;
+		copy_options.flags.delete = TRUE;
+		copy_options.flags.mbz = "0"b;
+
+		unspec (copy_options.copy_items) = "0"b;
+		copy_options.copy_items.acl = TRUE;
+		copy_options.copy_items.ring_brackets = FALSE;
+		copy_options.copy_items.dumper_switches = FALSE;
+		copy_options.copy_items.mbz = "0"b;
+
+		call fs_util_$copy (copy_options_ptr, code);
+
+/* Do this delete because file_manager_ has a bug: it doesn't get around to
+        abiding by the flags. When/if DM is fixed the next group of statements may
+        be removed. */
+		if code = 0
+		then do;
+		     acl_ptr = null;
+		     call fs_util_$list_acl (copy_options.source_dir, copy_options.source_name, GENERAL_ACL_VERSION_1,
+			addr (my_area), acl_ptr, code);
+		     if code = 0
+		     then do;
+			call fs_util_$replace_acl (copy_options.source_dir, copy_options.target_name, acl_ptr, "0"b,
+			     code);
+			if code = 0
+			then call fs_util_$delentry_file (copy_options.source_dir, copy_options.source_name, (0));
+			end;
+		     end;
+
+		file_model.relation_copy_good = FALSE;
+		end;
+	     else call fs_util_$delentry_file (rmdb_ctl.absolute_db_path, from_name, (0));
+
+	call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, (0));
+	fm_ptr = null;
+	return;
+     end undo_relation;
+%page;
+undo_attribute:
+     proc;
+
+	continue = TRUE;
+
+/* do for all unreferenced attributes in the db model */
+	do ai_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr) repeat ptr (dbm_ptr, attr_info.fwd_thread)
+	     while (rel (ai_ptr) ^= NULL_OFFSET & continue);
+	     if attr_info.name = from_name
+	     then do;
+		attr_info.name = to_name;
+		continue = FALSE;
+		end;
+	     end;					/* do ai_ptr */
+
+	if continue
+	then do;					/* the attribute is referenced somewhere */
+	     fm_ptr, tempp = null;
+	     on cleanup call cleaner;
+
+/* Do for all relations in the database */
+	     do fi_ptr = ptr (dbm_ptr, db_model.file_ptr) repeat ptr (dbm_ptr, file_info.fwd_ptr)
+		while (rel (fi_ptr) ^= NULL_OFFSET);
+		call initiate_file_ (rmdb_ctl.absolute_db_path, (file_info.file_name), R_ACCESS, fm_ptr, (0), code);
+		if code = 0
+		then do;
+		     continue = TRUE;
+		     ri_ptr = ptr (fm_ptr, file_model.rel_ptr);
+
+/* Do for all attribute within a single relation */
+		     do ai_ptr = ptr (fm_ptr, rel_info.attr_ptr) repeat ptr (fm_ptr, attr_info.fwd_thread)
+			while (rel (ai_ptr) ^= NULL_OFFSET & continue);
+			if attr_info.name = from_name
+			then do;
+			     attr_info.name = to_name;
+			     continue = FALSE;
+			     end;
+			end;			/* do ai_ptr */
+		     call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, (0));
+		     fm_ptr = null;
+		     end;
+		end;				/* do fi_ptr */
+	     end;
+
+	return;
+     end undo_attribute;
+%page;
+initialize:
+     proc ();
+
+dcl  i_nargs fixed bin;
+
+	sci_ptr = Isci_ptr;
+	rmdb_ctl_ptr = Iinfo_ptr;
+	dbm_ptr = rmdb_ctl.db_model_ptr;
+	if dbm_ptr = null
+	then goto RETURN_TO_CALLER;			/* no database opened yet */
+
+	call mdbm_util_$inconsistent_get_info (dbm_ptr, incon_value, operation, (""), (""));
+	if ^incon_value
+	then call ssu_$abort_line (sci_ptr, 0, "This request can only be called when making the database consistent.");
+
+	call ssu_$arg_count (sci_ptr, i_nargs);
+	if i_nargs ^= 2
+	then goto RETURN_TO_CALLER;
+
+	call ssu_$arg_ptr (sci_ptr, 1, argp, argl);
+	from_name = arg;
+	call ssu_$arg_ptr (sci_ptr, 2, argp, argl);
+	to_name = arg;
+
+	return;
+     end initialize;
+%page;
+%include access_mode_values;
+%page;
+%include acl_structures;
+%page;
+%include copy_flags;
+%page;
+%include copy_options;
+%page;
+%include mdbm_db_model;
+%page;
+%include mdbm_file_model;
+%page;
+%include mrds_rmdb_ctl;
+%page;
+%include rmdb_crossref_info;
+%page;
+%include rmdb_history_entry;
+%page;
+%include rmdb_rename_object_info;
+%page;
+%include terminate_file;
+%page;
+dcl  addr builtin;
+dcl  arg char (argl) based (argp);
+dcl  argl fixed bin (21);
+dcl  argp ptr;
+dcl  based_char8 char (8) based;
+dcl  char builtin;
+dcl  cleanup condition;
+dcl  code fixed bin (35);
+dcl  continue bit (1) aligned;
+dcl  empty builtin;
+dcl  error_message char (500);
+dcl  error_table_$no_record fixed bin (35) ext static;
+dcl  error_table_$noentry fixed bin (35) ext static;
+dcl  error_table_$unimplemented_version fixed bin (35) ext static;
+dcl  error_table_$unsupported_operation fixed bin (35) ext static;
+dcl  FALSE bit (1) aligned int static options (constant) init ("0"b);
+dcl  fixed builtin;
+dcl  from_name char (32);
+dcl  fs_util_$chname_file entry (char (*), char (*), char (*), char (*), fixed bin (35));
+dcl  fs_util_$copy entry (ptr, fixed bin (35));
+dcl  fs_util_$delentry_file entry (char (*), char (*), fixed bin (35));
+dcl  fs_util_$list_acl entry (char (*), char (*), char (*), ptr, ptr, fixed bin (35));
+dcl  fs_util_$replace_acl entry (char (*), char (*), ptr, bit (1), fixed bin (35));
+dcl  Iinfo_ptr ptr parameter;
+dcl  incon_value bit (1);
+dcl  initiate_file_ entry (char (*), char (*), bit (*), ptr, fixed bin (24), fixed bin (35));
+dcl  Irename_object_info_ptr ptr parameter;
+dcl  Irmdb_ctl_ptr ptr parameter;
+dcl  Isci_ptr ptr parameter;
+dcl  key_head char (32);
+dcl  length builtin;
+dcl  1 local_copy_options aligned like copy_options;
+dcl  local_iocb ptr;
+dcl  loop fixed bin;
+dcl  ltrim builtin;
+dcl  max_seg_size fixed bin (21);
+dcl  mdbm_util_$get_temp_segment_path entry (char (*), char (*), ptr, fixed bin (35));
+dcl  mdbm_util_$inconsistent_get_info entry (ptr, bit (1), char (*), char (*), char (*));
+dcl  mdbm_util_$inconsistent_reset entry (ptr);
+dcl  mdbm_util_$inconsistent_set entry (ptr, char (*), char (*), char (*));
+dcl  mdbm_util_$free_temp_segment entry (char (*), ptr, fixed bin (35));
+dcl  mrds_error_$attr_already_exists fixed bin (35) ext static;
+dcl  mrds_error_$domain_already_defined fixed bin (35) ext static;
+dcl  mrds_error_$dup_rel fixed bin (35) ext static;
+dcl  mrds_error_$internal_error fixed bin (35) ext static;
+dcl  mrds_error_$no_model_attr fixed bin (35) ext static;
+dcl  mrds_error_$no_model_dom fixed bin (35) ext static;
+dcl  mrds_error_$no_model_rel fixed bin (35) ext static;
+dcl  my_area area;
+dcl  myname char (32) int static options (constant) init ("rmdb_rename");
+dcl  null builtin;
+dcl  NULL_OFFSET bit (18) aligned int static options (constant) init ((18)"1"b);
+dcl  Ocode fixed bin (35) parameter;
+dcl  Oerror_message char (*) parameter;
+dcl  operation char (32);
+dcl  ptr builtin;
+dcl  quit condition;
+dcl  quit_occurred bit (1) aligned;
+dcl  rel builtin;
+dcl  rename_entry entry variable internal entry (char (*), char (*));
+dcl  rmdb_add_rmdb_history entry (ptr, fixed bin, char (32), fixed bin, char (32), char (500), fixed bin (35));
+dcl  mdbm_util_$xref_build entry (char (*), char (*), ptr, char (*), ptr, char (*), fixed bin (35));
+dcl  mdbm_util_$xref_find_record entry (ptr, char (*), char (*), ptr, fixed bin (21), char (*), fixed bin (35));
+dcl  mdbm_util_$xref_modify_record_name entry (ptr, char (*), char (*), char (*), ptr, char (*), fixed bin (35));
+dcl  mdbm_util_$xref_modify_reference_name entry (ptr, char (*), char (*), char (*), char (*), char (*), fixed bin (35));
+dcl  rtrim builtin;
+dcl  sci_ptr ptr;
+dcl  ssu_$abort_line entry () options (variable);
+dcl  ssu_$arg_count entry (ptr, fixed bin);
+dcl  ssu_$arg_ptr entry (ptr, fixed bin, ptr, fixed bin (21));
+dcl  substr builtin;
+dcl  sys_info$max_seg_size fixed bin (35) ext static;
+dcl  tempp ptr;
+dcl  terminate_file_ entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+dcl  to_name char (32);
+dcl  TRUE bit (1) aligned int static options (constant) init ("1"b);
+dcl  unspec builtin;
+
+     end rmdb_rename;

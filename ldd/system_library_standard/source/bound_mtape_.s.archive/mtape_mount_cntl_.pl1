@@ -1,0 +1,624 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(82-10-05,Bush), approve(), audit(), install():
+     Created.
+  2) change(83-12-01,Bush), approve(), audit(), install():
+     Modified for performance improvements.
+  3) change(85-10-03,GWMay), approve(85-10-03,MCR7282), audit(85-12-16,GDixon),
+     install(85-12-17,MR12.0-1001):
+     Added history comments in required format.  Modified the display that
+     tells the recording density of the requested tape.  It was printing "CPI"
+     instead of "BPI".
+  4) change(87-08-17,GWMay), approve(87-09-09,MECR0006),
+     audit(87-09-04,Farley), install(87-09-09,MR12.1-1101):
+     Simplified the code that determines the type of tape being read.
+     Added interrupt masking while modifying the iocb.
+  5) change(87-10-19,GWMay), approve(87-10-19,MCR7779), audit(87-11-02,Farley),
+     install(87-11-30,MR12.2-1006):
+     Formally install MECR0006.
+                                                   END HISTORY COMMENTS */
+
+
+mtape_mount_cntl_: procedure;
+
+/* format: style4 */
+
+/* *	This program is part of the mtape_ I/O module and as such is not
+   *	called directly by users, but through the iox_ I/O system. This
+   *	module implements the mtape_ interface to RCP for mounting,
+   *	demounting and volume switching tape volumes.
+   *
+*/
+
+/*		ARGUMENT DATA		*/
+
+dcl  arg_mtdp ptr;					/* Input pointer to the mtape_data structure */
+dcl  arg_code fixed bin (35);				/* Return error code */
+dcl  vs_arg_mtdp ptr;				/* Input pointer to the mtape_data structure */
+dcl  vs_arg_code fixed bin (35);			/* Return error code */
+dcl  vs_arg_volp ptr;				/* Pointer to VS structure of volume to mount */
+
+/*		AUTOMATIC DATA		*/
+
+dcl  (req_work_area_len, act_work_area_len, ws_max) fixed bin (19);
+dcl  (rcp_state, ioi_id, err_count, num_waits) fixed bin;
+dcl  ips_mask bit (36) aligned;
+dcl  to_max fixed bin (71);
+dcl  (code, vs_code, max_buf_len) fixed bin (35);
+dcl  (dl, act_len) fixed bin (21);
+dcl  susp_buf_ptrs (16) ptr;
+dcl  lbuf_arrayp (1) ptr;
+dcl  (i, j, n_susp_bufs, act_num) fixed bin;
+dcl  (wa_ptr, tptr, volp) ptr;
+dcl  rcp_comment char (256);
+dcl  Stape_is_readable bit (1) aligned;
+dcl  1 auto_tioi_info aligned like tioi_info;
+dcl  1 auto_err_count aligned like tec;
+dcl  1 atbs aligned like tbs;
+dcl  1 event_info aligned like event_wait_info;
+
+/*		CONSTANT DATA		*/
+
+dcl  myname char (6) int static options (constant) init ("mtape_");
+dcl  DISPOSITION bit (1) int static options (constant) init ("0"b);
+dcl  SAVE_CUR_BUF bit (1) int static options (constant) init ("1"b);
+dcl  DONT_SAVE_CUR_BUF bit (1) int static options (constant) init ("0"b);
+dcl  WRITE_IO fixed bin int static options (constant) init (2);
+
+/*		EXTERNAL STATIC DATA	*/
+
+dcl  error_table_$resource_unavailable fixed bin (35) ext static;
+dcl  error_table_$resource_reserved fixed bin (35) ext static;
+dcl  error_table_$area_too_small fixed bin (35) ext static;
+dcl  error_table_$unimplemented_version fixed bin (35) ext static;
+
+/*		BUILTIN FUNCTIONS		*/
+
+dcl  (addr, null, size, unspec) builtin;
+dcl  (any_other, cleanup) condition;
+
+/*		EXTERNAL ENTRIES		*/
+dcl  hcs_$reset_ips_mask entry (bit (36) aligned, bit (36) aligned);
+dcl  hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned);
+dcl  mtape_util_$alloc entry (ptr, fixed bin, ptr, fixed bin (21), ptr);
+dcl  mtape_util_$error entry options (variable);
+dcl  mtape_util_$get_statistics entry (ptr, fixed bin (35));
+dcl  mtape_util_$user_query entry (ptr, fixed bin, fixed bin (35));
+dcl  mtape_io_$allocate_buffers entry (ptr, fixed bin (21), fixed bin (35));
+dcl  mtape_io_$order entry (ptr, char (*), fixed bin, ptr, fixed bin (35));
+dcl  hcs_$assign_channel entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  iox_$propagate entry (ptr);
+dcl  get_temp_segment_ entry (char (*), ptr, fixed bin (35));
+dcl  release_temp_segment_ entry (char (*), ptr, fixed bin (35));
+dcl  ioa_ entry () options (variable);
+dcl  timer_manager_$sleep entry (fixed bin (71), bit (2));
+dcl  rcp_$attach entry (char (*), ptr, fixed bin (71), char (*), bit (36) aligned, fixed bin (35));
+dcl  rcp_$check_attach entry (bit (36) aligned, ptr, char (*), fixed bin,
+	fixed bin (19), fixed bin (71), fixed bin, fixed bin (35));
+dcl  rcp_$detach entry (bit (36) aligned, bit (*), fixed bin, char (*), fixed bin (35));
+
+/*		BASED DATA		*/
+
+dcl  1 save_wks based (tptr) aligned,			/* structure to save workspace */
+       2 smtd like mtape_data,			/* for copying mtape_data structure out */
+       2 n_susp_buffers fixed bin,			/* number of suspended buffers to copy out */
+       2 susp_buffers (mtape_data.nbufs),
+         3 stbs like tbs,				/* for the suspended buffers status */
+         3 buffer char (max_buf_len) unaligned;		/* buffer data */
+
+dcl  based_buffer char (dl) based;
+%page;
+/* mount - entry to mount a volume from the volume set */
+
+mount: entry (arg_mtdp, arg_code);
+
+	mtdp = arg_mtdp;				/* copy argument */
+	maip = mtape_data.attach_info_ptr;
+	arg_code, code = 0;				/* Reset return error code */
+	if mtape_data.tape_infop = null then do;	/* if rcp data block not allocated.. */
+	     call INIT_RCP_DATA;			/* do it now */
+	     if code ^= 0 then
+		go to mount_return;
+	end;
+
+	tape_info_ptr = mtape_data.tape_infop;		/* set tape info pointer */
+	vs_ptr = mtape_data.vs_current;		/* get pointer to this volumes VS structure */
+	tape_info.device_name = "";			/* set tape info that changes */
+	tape_info.model = 0;
+	tape_info.write_flag = mtape_attach_info.ring;
+	tape_info.speed = mtape_attach_info.speed;
+	if mtape_attach_info.density = 1600 then	/* set density */
+	     tape_info.density = "00010"b;
+	else if mtape_attach_info.density = 6250 then
+	     tape_info.density = "00001"b;
+	else if mtape_attach_info.density = 800 then
+	     tape_info.density = "00100"b;
+	else if mtape_attach_info.density = 556 then	/* MUST CHECK THESE *** */
+	     tape_info.density = "01000"b;
+	else tape_info.density = "10000"b;		/* 200 BPI */
+
+	tape_info.volume_name = mtape_vol_set.volume_name;/* copy volume name */
+
+	call ioa_ ("Mounting volume ""^a"" with ^[a^;no^] write ring", /* Let user know whats going on */
+	     mtape_vol_set.volume_name, mtape_attach_info.ring);
+
+/* Now request the volume mount from RCP */
+
+	call rcp_$attach (DEVICE_TYPE (TAPE_DRIVE_DTYPEX), tape_info_ptr, mtape_data.mount_echan,
+	     (mtape_vol_set.mount_comment), mtape_vol_set.rcp_id, code);
+	if code ^= 0 then do;			/* some problem */
+	     call mtape_util_$error (mtdp, code, "Error from rcp_$attach");
+	     go to mount_return;
+	end;
+
+/* Now wait for the mount to complete */
+
+	event_wait_channel.channel_id (1) = mtape_data.mount_echan;
+	num_waits = 0;				/* initialize wait loop counter */
+	rcp_state = 1;				/* set state to go through loop once */
+	on cleanup call DETACH_ON_CLEANUP;		/* in case user does not want to wait.. */
+
+	do while (rcp_state ^= 0);			/* do until mounted, or mount timer running */
+	     rcp_comment = "";			/* initialize comment */
+	     call rcp_$check_attach (mtape_vol_set.rcp_id, tape_info_ptr, rcp_comment, ioi_id,
+		ws_max, to_max, rcp_state, code);
+	     if rcp_comment ^= "" then		/* if we got something to report from RCP.. */
+		call mtape_util_$error (mtdp, 0, "RCP comment: ^a", rcp_comment);
+	     go to ATTACH_STATE (rcp_state);		/* do appropriate processing */
+
+ATTACH_STATE (2):					/* long wait */
+	     code = error_table_$resource_unavailable;	/* set appropriate error code */
+ATTACH_STATE (3):					/* fatal error */
+	     if mtape_attach_info.wait then		/* if we will wait for attachment */
+		if (code = error_table_$resource_unavailable | /* and one of these */
+		     code = error_table_$resource_reserved) then
+		     if num_waits <= mtape_attach_info.wait_time then do; /* wait for 1 minute */
+			call SLEEP;
+			go to ATTACH_STATE (0);
+		     end;
+		     else do;			/* wait time exceeded */
+			call mtape_util_$error (mtdp, code,
+			     "Mount wait time of ^d minutes exceeded", mtape_attach_info.wait_time);
+			go to mount_return;
+		     end;
+	     call mtape_util_$error (mtdp, code, "Error from rcp_$check_attach, while waiting for tape mount");
+	     go to mount_return;
+
+ATTACH_STATE (1):					/* short wait, go blocked */
+	     call ipc_$block (addr (event_wait_channel), addr (event_info), code);
+	     if code ^= 0 then do;			/* error from block */
+		call mtape_util_$error (mtdp, code, "Error from ipc_$block, while waiting for tape mount");
+		go to mount_return;
+	     end;
+ATTACH_STATE (0):					/* mount complete */
+	end;
+
+	revert cleanup;
+	mtape_vol_set.mounts = mtape_vol_set.mounts + 1;	/* increment number of times mounted */
+	if (tape_info.volume_type = Volume_blank |
+	     tape_info.volume_type = Volume_unreadable) then do;
+	     Stape_is_readable = "0"b;
+	     mtape_vol_set.volume_density = mtape_attach_info.density;
+	end;
+	else do;
+	     Stape_is_readable = "1"b;
+	     mtape_vol_set.volume_density =
+		MTAPE_VALID_DENSITIES (tape_info.volume_density);
+	end;
+
+	mtape_vol_set.volume_type = tape_info.volume_type;
+
+	call ioa_ ("Mounted ^a volume ""^a"" ^[(recorded at ^d BPI), ^;^1s^]on device ^a",
+	     Tape_volume_types (tape_info.volume_type),
+	     tape_info.volume_name,
+	     Stape_is_readable,
+	     mtape_vol_set.volume_density,
+	     tape_info.device_name);
+
+	mtape_vol_set.device_name = tape_info.device_name;/* copy values from the tape_info structure */
+	if Stape_is_readable then			/* only copy if valid name */
+	     mtape_vol_set.volume_id = tape_info.volume_name;
+	mtape_vol_set.mounted, mtape_vol_set.ever_mounted = "1"b; /* set mounted flags */
+	if mtape_data.vs_mounted_tail ^= null then	/* thread in MRM chain, if possible */
+	     mtape_data.vs_mounted_tail -> mtape_vol_set.mrm_vs_ptr = vs_ptr;
+	mtape_vol_set.lrm_vs_ptr = mtape_data.vs_mounted_tail; /* thread the LRM chain */
+	mtape_data.vs_mounted_tail = vs_ptr;
+	mtape_vol_set.auth_required = tape_info.opr_auth;
+	mtape_data.drives_in_use = mtape_data.drives_in_use + 1; /* one more drive used */
+	call INIT_TIOI;				/* activate tape_ioi_ for this volume */
+mount_return:
+	arg_code = code;
+	return;
+%page;
+/* demount - entry to demount the current volume of the volume set */
+
+demount: entry (arg_mtdp, arg_code);
+
+	mtdp = arg_mtdp;				/* copy argument */
+	arg_code = 0;				/* reset return error code */
+	vs_ptr = mtape_data.vs_current;		/* set the volume set members ptr */
+
+/* Update error stats and deactivate tape_ioi_. Note: suspended buffers/work area have already been copied out */
+
+	call mtape_util_$get_statistics (mtdp, code);	/* update error stats */
+	tape_ioi_error_counts_ptr = addr (auto_err_count);
+	tec.version = TEC_VERSION_1;			/* set version number */
+	call tape_ioi_$deactivate (mtape_vol_set.tioi_id, tape_ioi_error_counts_ptr, code);
+	err_count = mtape_vol_set.rel_error_stats.read.errors + mtape_vol_set.rel_error_stats.write.errors +
+	     mtape_vol_set.rel_error_stats.orders.errors; /* RCP S/B changed to get all stats */
+
+/* Now detach the device */
+
+	call rcp_$detach (mtape_vol_set.rcp_id, DISPOSITION, err_count, (mtape_vol_set.demount_comment), code);
+	mtape_vol_set.mounted = "0"b;			/* volume is no longer mounted */
+	mtape_vol_set.device_name = "";		/* its no longer on a device */
+	mtape_vol_set.rcp_id, mtape_vol_set.tioi_id = "0"b; /* Not needed now */
+	mtape_data.drives_in_use = mtape_data.drives_in_use - 1; /* 1 less drive in use */
+	unspec (mtape_vol_set.rel_error_stats) = "0"b;	/* init error stats, this mount */
+
+/* Now thread this volume set member out of LRM and MRM chains */
+
+	if mtape_vol_set.lrm_vs_ptr ^= null then do;
+	     if mtape_vol_set.mrm_vs_ptr ^= null then	/* if in middle of mounted list.. */
+		mtape_vol_set.mrm_vs_ptr -> mtape_vol_set.lrm_vs_ptr = mtape_vol_set.lrm_vs_ptr;
+	end;
+	else do;					/* lrm_vs_ptr = null => this was first vol mounted */
+	     if mtape_vol_set.mrm_vs_ptr ^= null then	/* if there is a next volume */
+		mtape_vol_set.mrm_vs_ptr -> mtape_vol_set.lrm_vs_ptr = null; /* make it first mounted */
+	end;
+	if mtape_vol_set.mrm_vs_ptr ^= null then do;
+	     if mtape_vol_set.lrm_vs_ptr ^= null then	/* if in middle of mounted list.. */
+		mtape_vol_set.lrm_vs_ptr -> mtape_vol_set.mrm_vs_ptr = mtape_vol_set.mrm_vs_ptr;
+	end;
+	else do;					/* mrm_vs_ptr = null => this was last vol mounted */
+	     mtape_data.vs_mounted_tail = mtape_vol_set.lrm_vs_ptr;
+	     if mtape_vol_set.lrm_vs_ptr ^= null then	/* if there is a previous volume.. */
+		mtape_vol_set.lrm_vs_ptr -> mtape_vol_set.mrm_vs_ptr = null; /* make it last mounted */
+	end;
+	mtape_vol_set.lrm_vs_ptr, mtape_vol_set.mrm_vs_ptr = null;
+
+	arg_code = code;
+
+	return;
+%page;
+/* volume_switch - entry to perform volume switching on demand */
+
+volume_switch: entry (vs_arg_mtdp, vs_arg_volp, vs_arg_code);
+
+	mtdp = vs_arg_mtdp;				/* copy args */
+	maip = mtape_data.attach_info_ptr;
+	volp = vs_arg_volp;
+	vs_arg_code = 0;
+	if volp = null then do;			/* No vol_set structure */
+	     call mtape_util_$user_query (mtdp, Q_NO_NEXT_VOLUME, vs_code); /* ask user for new volume */
+	     if vs_code ^= 0 then			/* user did not want new volume */
+		go to vs_return;
+	     volp = mtape_data.vs_tail;		/* this will be the last allocated */
+	end;
+	if volp -> mtape_vol_set.version ^= mtape_vs_version_1 then do; /* is it a vol_set structure? */
+	     vs_code = error_table_$unimplemented_version;/* no, set error code */
+	     go to vs_return;
+	end;
+	vs_ptr = mtape_data.vs_current;		/* set for current volume */
+	call mtape_io_$order (mtdp, "rwnw", 0, null, vs_code); /* rewind old volume */
+	if vs_code ^= 0 then			/* can't win no_how */
+	     go to vs_return;
+	call SAVE_ACTIVATION (DONT_SAVE_CUR_BUF);	/* go save suspended buffers etc. */
+	if vs_code ^= 0 then go to vs_return;
+	if volp -> mtape_vol_set.mounted then do;	/* if required tape volume already mounted */
+	     vs_ptr = volp;				/* set vol set for new volume */
+	     call tape_ioi_$allocate_work_area (mtape_vol_set.tioi_id, size (mtape_data),
+		act_work_area_len, wa_ptr, vs_code);
+	     wa_ptr -> mtape_data = mtape_data;		/* move mtape_data to new work area */
+	     mtdp = wa_ptr;				/* and reset pointer to same */
+	     mtape_data.tioi_id = mtape_vol_set.tioi_id;	/* copy tape_ioi_ activation ID into work area */
+	     mtape_data.vs_current = vs_ptr;		/* set current vs ptr */
+	     call mtape_io_$order (mtdp, "rew", 0, null, vs_code); /* make sure he is rewound */
+	     if vs_code ^= 0 then			/* can't win no_how */
+		go to vs_return;
+	end;
+	else do;					/* volume not mounted */
+	     if mtape_data.drives_in_use = mtape_attach_info.ndrives then do; /* must demount one first */
+		call FIND_DEMOUNT_CANDIDATE;		/* go find volume to demount */
+		call demount (mtdp, vs_code);		/* demount it */
+		if vs_code ^= 0 then go to vs_return;
+	     end;
+	     mtape_data.vs_current = volp;		/* set current volume set ptr */
+	     call mount (mtdp, vs_code);		/* go mount the requested volume */
+	     if vs_code ^= 0 then go to vs_return;
+	end;
+	call RESTORE_ACTIVATION;			/* copy suspended buffers back in etc */
+	if vs_code ^= 0 then go to vs_return;
+	call mtape_data.pfm_init (mtdp, vs_code);	/* Go read the volume labels */
+
+vs_return:
+	vs_arg_code = vs_code;			/* copy return code */
+	vs_arg_mtdp = mtdp;				/* reset value of mtdp */
+	ips_mask = ""b;
+	on any_other call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	call hcs_$set_ips_mask ("0"b, ips_mask);
+
+	mtape_data.iocb_ptr -> iocb.attach_data_ptr = mtdp; /* and reset IOCB */
+	call iox_$propagate (mtape_data.iocb_ptr);	/* propagate the IOCB change */
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	return;					/* and return to caller */
+%page;
+/* remount - external entry for remounting same volume after device attention condition */
+
+remount: entry (arg_mtdp, vs_arg_code);
+
+	mtdp = arg_mtdp;
+	maip = mtape_data.attach_info_ptr;
+	vs_ptr = mtape_data.vs_current;
+	vs_arg_code = 0;
+
+	call SAVE_ACTIVATION (SAVE_CUR_BUF);		/* save suspended buffers etc. */
+	if vs_code ^= 0 then			/* quit on error */
+	     go to remount_return;
+	call demount (mtdp, vs_code);			/* demount current volume */
+	if vs_code = 0 then				/* if all ok */
+	     call mount (mtdp, vs_code);		/* remount the volume */
+	if vs_code ^= 0 then
+	     go to remount_return;
+	call RESTORE_ACTIVATION;			/* copy suspended buffers back in */
+
+remount_return:
+	vs_arg_code = vs_code;			/* copy return code */
+	vs_arg_mtdp = mtdp;				/* reset value of mtdp */
+	ips_mask = ""b;
+	on any_other call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	call hcs_$set_ips_mask ("0"b, ips_mask);
+
+	mtape_data.iocb_ptr -> iocb.attach_data_ptr = mtdp; /* and reset IOCB */
+	call iox_$propagate (mtape_data.iocb_ptr);	/* propagate the IOCB change */
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	return;					/* and return to caller */
+%page;
+/* INIT_RCP_DATA - procedure to set up the tape_info structure */
+
+INIT_RCP_DATA: proc;
+
+	call mtape_util_$alloc (mtdp, MTAPE_ALLOC_STR, null, size (tape_info) * 4, mtape_data.tape_infop);
+	tape_info_ptr = mtape_data.tape_infop;
+	tape_info.version_num = tape_info_version_3;	/* set version number */
+	tape_info.tracks = mtape_attach_info.tracks;	/* set constant data */
+	tape_info.system_flag = mtape_attach_info.system;
+
+/* Create an event channel for mount requests */
+
+	if mtape_data.mount_echan = 0 then do;		/* Only create if we hav'nt already */
+	     call ipc_$create_ev_chn (mtape_data.mount_echan, code);
+	     if code ^= 0 then do;			/* we loose altogether */
+		call mtape_util_$error (mtdp, code, "Can't create ipc wait channel for mount requests.");
+		return;
+	     end;
+	end;
+
+     end INIT_RCP_DATA;
+
+/* SLEEP - internal procedure to go to sleep for 1 minute and incrment the sleep loop counter */
+
+SLEEP: proc;
+
+	call timer_manager_$sleep (60, "11"b);		/* Wait for one minute. */
+	num_waits = num_waits + 1;			/* increment number of loops */
+
+     end SLEEP;
+
+/* DETACH_ON_CLEANUP - int procedure to detach tape when cleanup condition is raised */
+
+DETACH_ON_CLEANUP: proc;
+
+dcl  clean_code fixed bin (35);
+
+	call rcp_$detach (mtape_vol_set.rcp_id, "0"b, (0), "", clean_code); /* no frills */
+	if clean_code ^= 0 then ;
+
+     end DETACH_ON_CLEANUP;
+%page;
+/* INIT_TIOI - internal procedure to activate tape_ioi_ and create a work area */
+
+INIT_TIOI: proc;
+
+/* On first call, create a fast event channel for doing I/O if possible, if not create regular one */
+
+	if mtape_data.io_echan = 0 then do;		/* if not already there create one */
+	     call hcs_$assign_channel (mtape_data.io_echan, code);
+	     if code ^= 0 then do;			/* if we didn't get fast channel... */
+		call ipc_$create_ev_chn (mtape_data.io_echan, code);
+		if code ^= 0 then do;		/* we loose altogether */
+		     call mtape_util_$error (mtdp, code, "Can't create ipc wait channel for doing I/O.");
+		     return;
+		end;
+	     end;
+	end;
+
+	tioi_info_ptr = addr (auto_tioi_info);		/* initialize the tape_ioi_ info structure */
+	tioi_info.version = tioi_info_version_1;
+	tioi_info.ioi_index = ioi_id;
+	tioi_info.timeout_max = to_max;
+	tioi_info.event_id = mtape_data.io_echan;
+	tioi_info.workspace_max = ws_max;
+
+	call tape_ioi_$activate (tape_info_ptr, tioi_info_ptr, mtape_vol_set.tioi_id, code);
+	if code ^= 0 then do;
+	     call mtape_util_$error (mtdp, code, "Calling tape_ioi_$activate");
+	     return;
+	end;
+
+/*        Get workspace for permanent mtape_data storage. */
+
+	req_work_area_len = size (mtape_data);
+
+	call tape_ioi_$allocate_work_area (mtape_vol_set.tioi_id, req_work_area_len, act_work_area_len, wa_ptr, code);
+	if code ^= 0 then do;
+	     call mtape_util_$error (mtdp, code, "Calling tape_ioi_$allocate_work_area");
+	     return;
+	end;
+	if act_work_area_len ^= req_work_area_len then do;
+	     code = error_table_$area_too_small;	/* A different code should be used. */
+	     call mtape_util_$error (mtdp, code,
+		"Can't get a big enough work area, need ^d words, tape_ioi_ will give us ^d words.",
+		req_work_area_len, act_work_area_len);
+	     return;
+	end;
+	wa_ptr -> mtape_data = mtape_data;		/* copy the data into the work area */
+	mtdp, arg_mtdp = wa_ptr;			/* now everyone will look in work area */
+	mtape_data.tioi_id = mtape_vol_set.tioi_id;	/* copy for fast reference */
+
+	ips_mask = ""b;
+	on any_other call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	call hcs_$set_ips_mask ("0"b, ips_mask);
+
+	mtape_data.iocb_ptr -> iocb.attach_data_ptr = mtdp; /* reset iocb */
+	call iox_$propagate (mtape_data.iocb_ptr);	/* let iox_ know about iocb change */
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	return;
+
+     end INIT_TIOI;
+%page;
+/* FIND_DEMOUNT_CANDIDATE - subroutine to find a volume to demount on a LRU basis */
+
+FIND_DEMOUNT_CANDIDATE: proc;
+
+	if mtape_attach_info.ndrives = 1 then		/* if we have only 1 tape drive, must demount */
+	     return;				/* current volume. mtape_data.vs_current already set */
+	fi_ptr = mtape_data.fi_current;		/* get current file_info  pointer */
+
+/* Now thread the LRM chain until we find the head */
+
+	do vs_ptr = mtape_data.vs_mounted_tail repeat mtape_vol_set.lrm_vs_ptr
+	     while (mtape_vol_set.lrm_vs_ptr ^= null);
+	end;
+	if vs_ptr = mtape_file_info.begin_vs_ptr then	/* if the selected volume is 1st file section */
+	     if mtape_vol_set.mrm_vs_ptr ^= null then	/* and there is a more recent mount */
+		vs_ptr = mtape_vol_set.mrm_vs_ptr;	/* use the next LRU volume */
+	mtape_data.vs_current = vs_ptr;		/* finished, he is the guy to demount */
+
+     end FIND_DEMOUNT_CANDIDATE;
+%page;
+/* SAVE_ACTIVATION - internal procedure to save suspended buffers, deallocate buffers and work area */
+
+SAVE_ACTIVATION: proc (cur_buf_disp);
+
+dcl  cur_buf_disp bit (1);
+
+	call get_temp_segment_ (myname, tptr, vs_code);	/* get temp seg to copy stuff into */
+	if vs_code ^= 0 then			/* can't get it, give up */
+	     return;
+	save_wks.smtd = mtape_data;			/* copy the mtape_data structure out */
+	mtdp = addr (save_wks.smtd);			/* and switch pointer */
+	max_buf_len = mtape_data.block_size;		/* set the max buffer size */
+	atbs.version = TBS_VERSION_1;			/* set version */
+	if cur_buf_disp = SAVE_CUR_BUF & mtape_data.last_io = WRITE_IO then do;
+	     call tape_ioi_$list_buffers (mtape_vol_set.tioi_id, READY_STATE, susp_buf_ptrs, n_susp_bufs, vs_code);
+	     if vs_code ^= 0 then
+		return;
+	     call tape_ioi_$buffer_status (mtape_vol_set.tioi_id, susp_buf_ptrs (n_susp_bufs), addr (atbs), vs_code);
+	     if vs_code ^= 0 then return;
+	     save_wks.susp_buffers (1).stbs = atbs;	/* save buffer status */
+	     dl = atbs.data_len;			/* set data length */
+	     save_wks.susp_buffers (1).buffer = susp_buf_ptrs (n_susp_bufs) -> based_buffer; /* and data */
+	     j = 1;				/* set offset */
+	end;
+	else j = 0;
+	call tape_ioi_$list_buffers (mtape_vol_set.tioi_id, SUSPENDED_STATE, susp_buf_ptrs, n_susp_bufs, vs_code);
+	if vs_code ^= 0 then
+	     return;
+	save_wks.n_susp_buffers = n_susp_bufs + j;
+	if n_susp_bufs ^= 0 then do;			/* if we have suspended buffers, copy them out too */
+	     do i = 1 to n_susp_bufs;
+		j = j + 1;			/* increment saved buffer index */
+		call tape_ioi_$buffer_status (mtape_vol_set.tioi_id, susp_buf_ptrs (i), addr (atbs), vs_code);
+		if vs_code ^= 0 then return;
+		save_wks.susp_buffers (j).stbs = atbs;	/* save buffer status */
+		dl = atbs.data_len;			/* set data length */
+		save_wks.susp_buffers (j).buffer = susp_buf_ptrs (i) -> based_buffer; /* and data */
+		call tape_ioi_$set_buffer_ready (mtape_vol_set.tioi_id, susp_buf_ptrs (i), vs_code);
+		if vs_code ^= 0 then return;
+	     end;
+	end;
+	call mtape_util_$get_statistics (mtdp, vs_code);	/* update error stats */
+	call tape_ioi_$deallocate (mtape_vol_set.tioi_id, vs_code); /* deallocate all buffers and work area */
+	all_buf_ptrs (*) = null;			/* reset buffer pointers */
+	all_buf_lens (*) = 0;			/* and buffer lengths */
+	mtape_data.lab_bufp = null;			/* set label buffer to null too */
+	mtape_data.phy_file, mtape_data.phy_block = 0;	/* reset position counters */
+
+     end SAVE_ACTIVATION;
+%page;
+/* RESTORE_ACTIVATION - internal procedure to allocate buffers and copy suspended buffers to new buffers. */
+
+RESTORE_ACTIVATION: proc;
+
+	call tape_ioi_$allocate_buffers (mtape_data.tioi_id, /* allocate and reserve a label buffer */
+	     mtape_data.lab_buf_len, 1, act_len, act_num, lbuf_arrayp, vs_code);
+	if vs_code ^= 0 then return;
+	call tape_ioi_$reserve_buffer (mtape_data.tioi_id, lbuf_arrayp (1), vs_code); /* reserve the buffer */
+	if vs_code ^= 0 then return;
+	mtape_data.lab_bufp = lbuf_arrayp (1);		/* copy label buffer ptr */
+
+/* Allocate data buffers and copy any suspended buffers back in 1 at a time */
+
+	if mtape_data.nbufs > 0 then do;		/* if we had buffers allocated before, do it now */
+	     call mtape_io_$allocate_buffers (mtdp, mtape_data.block_size, vs_code);
+	     if vs_code ^= 0 then return;
+	     if save_wks.n_susp_buffers ^= 0 then do;
+		do i = 1 to save_wks.n_susp_buffers;	/* do each buffer */
+		     tbs_ptr = addr (susp_buffers (i).stbs);
+		     all_buf_lens (i), dl = tbs.data_len; /* copy length */
+		     all_buf_ptrs (i) -> based_buffer = addr (susp_buffers (i).buffer) -> based_buffer; /* copy data */
+
+		end;
+		mtape_data.cur_buf_idx = save_wks.n_susp_buffers + 1; /* set up the current buffer index */
+	     end;
+	end;
+	call release_temp_segment_ (myname, tptr, (0));	/* release our temp segment */
+
+     end RESTORE_ACTIVATION;
+%page;
+%include mtape_data;
+%page;
+%include mtape_attach_info;
+
+%include mtape_detach_info;
+%page;
+%include mtape_vol_set;
+%page;
+%include mtape_file_info;
+%page;
+%include mtape_err_stats;
+
+%include tape_ioi_info;
+%page;
+%include rcp_tape_info;
+%include rcp_volume_formats;
+%page;
+%include mtape_constants;
+%include rcp_resource_types;
+%page;
+%include event_wait_channel;
+%include event_wait_info;
+%page;
+%include iocb;
+%page;
+%include tape_ioi_dcls;
+%include tape_ioi_error_counts;
+%page;
+%include tape_ioi_buffer_status;
+
+     end mtape_mount_cntl_;

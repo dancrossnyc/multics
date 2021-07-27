@@ -1,0 +1,873 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: off */
+
+lv_request_: proc (msgp);
+	go to interrupt;
+
+/* lv_request_: a mdxhdx poor man's RCP. Bernard Greenberg 09/09/76. Thanks to THVV's tape_opr_. */
+/* Modified July 1977 by T. Casey to add calls to device_acct_ and fix up masking and unmasking */
+/* Modified November 1981, E. N. Kittlitz.  user_table_entry conversion. */
+/* Modified December 1981, J. Bongiovanni, for poll_mounts, allow mounting LV with no processes attached */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-04-28,GDixon), approve(87-07-13,MCR7741),
+     audit(87-05-07,Parisek), install(87-08-04,MR12.1-1055):
+     Updated for change to user_table_entry.incl.pl1.
+  2) change(87-07-31,GDixon), approve(87-07-31,MCR7741),
+     audit(87-08-03,Parisek), install(87-08-04,MR12.1-1055):
+      A) Provide operator message documentation for sys_log_ calls.
+      B) Change to use get_userid_$info to provide standard-format group ids
+         in error messages.
+      C) Reorganization variable declarations according to standards.
+      D) Put out LV attach/detach messages in a more standard format similar
+         to messages emitted by as_access_audit_.  Some day, we should
+         create a new entrypoint in as_access_audit_ to emit these messages.
+  3) change(88-04-18,Farley), approve(88-05-26,MCR7880),
+     audit(88-05-31,Parisek), install(88-07-05,MR12.2-1052):
+     Modified attach_list entry to use standard argument parsing and allow
+     multiple LVs (or -all).  Entry is now callable via the Initializer's
+     list_lv_attachments (llva) request.  Added "signal_io_" to the
+     any_other_handler's list of conditions to pass on, so Initializer I/O
+     will work properly.
+  4) change(90-07-04,Schroth), approve(90-07-16,MCR8184),
+     audit(90-07-30,WAAnderson), install(90-08-16,MR12.4-1024):
+     Ensure event call channels are unmasked on exit.
+                                                   END HISTORY COMMENTS */
+
+
+/* AUTOMATIC */
+
+dcl  argl fixed bin (21);
+dcl  argp ptr;
+dcl  argx fixed bin;
+dcl  array (200) fixed bin;				/* return result lvax's from wds */
+dcl  d_lvname char (32);				/* dlv time lvname */
+dcl  demounting bit (1);				/* interrupt time task */
+dcl  dtx fixed bin;
+dcl (ec, xec) fixed bin (35);
+dcl  ev_calls_masked bit (1) aligned;			/* to remember if we mask event calls */
+dcl (i, n) fixed bin;				/* index and length in 'array' array */
+dcl  list_all_vols bit (1) aligned;
+dcl  lvax fixed bin;				/* lvat index */
+dcl  lvname char (32);				/* lv name of interest */
+dcl (lvx, pvx) fixed bin;				/* disk table indices */
+dcl  my_evchn fixed bin (71);				/* init_time event chan */
+dcl  n_devtab_entries fixed bin;
+dcl  n_vols_to_list fixed bin;
+dcl  nargs fixed bin;
+dcl  next_time fixed bin (71);
+dcl  pid bit (36) aligned;
+dcl  result fixed bin;				/* generated test mhv result */
+dcl  shown_lvat_header bit (1);
+dcl  status char (25);				/* Status of attachment for report */
+dcl  unit_string char (200) varying;
+dcl  user_procid bit(36) aligned;
+dcl  user_procname char (33);				/* user process name */
+dcl  vols_to_list (10) char (32);
+dcl  vtlx fixed bin;				/* vols_to_list index */
+
+dcl 1 devtab_copy (16) aligned,
+    2 device_id char (8),
+    2 device_price (0:7) float bin;
+
+dcl 1 local_lvate aligned like lvate;
+
+dcl 1 mount_transmission aligned,			/* message sent in bits by lv_request_communicator_ */
+    2 req char (4) unaligned,				/* "moun", "demo", or "poll" */
+    2 lvax fixed bin (17) unal,			/* lvat index */
+    2 other fixed bin (17) unaligned;			/* mbz */
+
+/* STATIC */
+
+dcl  ALARM___ char (8) static init ("alarm___") options (constant); /* timer message */
+dcl  FALSE bit (1) static init ("0"b) options (constant);
+dcl  LV_RING fixed bin init (1) static;			/* ring of lv_request_communicator_ */
+dcl  SL0 fixed bin init (0) int static;			/* = SL_LOG_SILENT, log messages only */
+dcl  TRUE bit (1) static init ("1"b) options (constant);
+dcl  initialized bit (1) static init ("0"b);		/* set up ok */
+dcl  myprocessid bit (36) aligned static;		/* for ev msg checks */
+dcl  testing bit (1) static init ("0"b);		/* test environment */
+
+
+/* BASED */
+
+dcl  arg char (argl) based (argp);
+
+dcl 1 evmessage based (msgp) aligned,			/* ipc message */
+    2 evchn fixed bin (71),
+    2 bits bit (72),				/* data */
+    2 sender bit (36),
+    2 origin,
+      3 devs fixed bin (17) unal,
+      3 ring fixed bin (17) unal;
+
+/* PARAMETERS */
+
+dcl  msgp ptr parm;					/* ipc message ptr */
+dcl  a_pid bit (36) aligned parm;			/* processid being termed */
+dcl  a_lvx fixed bin parm;				/* mhv/dhv communication */
+dcl  a_dtp ptr parm;				/* disk_table COPY ptr */
+dcl  a_lvname char (*) parm;				/* lv parameter at dhv time */
+
+/* BUILTINS */
+
+dcl (addr, addrel, hbound, null, rtrim, unspec) builtin;
+
+/* ENTRIES & EXTERNAL */
+
+dcl  as_$find_process entry (bit (36) aligned, fixed bin, ptr);
+dcl  com_err_ entry () options (variable);
+dcl  condition_ entry (char (*), entry);
+dcl  cu_$arg_count entry (fixed bin, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl (device_acct_$on, device_acct_$off) entry (fixed bin, char (*), ptr);
+dcl  disk_table_$dhv entry (char (*));
+dcl  disk_table_$dry_run_mhv entry (char (*), fixed bin);
+dcl  disk_table_$get_dtp entry returns (ptr);		/* this guy returns a fresh copy each time */
+dcl  disk_table_$mhv entry (char (*));
+dcl  error_table_$noarg fixed bin (35) ext;
+dcl  error_table_$resource_unavailable fixed bin (35) ext;
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  get_ring_ entry returns (fixed bin);
+dcl  get_userid_$info entry (bit(36) aligned, char(*), char(*), char(*), fixed bin, fixed bin, fixed bin, fixed bin(35));
+dcl  initializer_mdc_$check_mount entry (fixed bin, char (*), char (*) varying);
+dcl  initializer_mdc_$free_lvate entry (fixed bin);
+dcl  initializer_mdc_$init_lvat entry (fixed bin (71), fixed bin (35));
+dcl  initializer_mdc_$invalidate_lvate entry (fixed bin);
+dcl  initializer_mdc_$lvat_scan_lv entry (char (*), (*) fixed bin, fixed bin);
+dcl  initializer_mdc_$mhvmessage entry (fixed bin, char (*));
+dcl  initializer_mdc_$poll_mounts entry ((*) fixed bin, fixed bin, fixed bin (71));
+dcl  initializer_mdc_$respond_mount_lv entry (fixed bin, fixed bin, fixed bin (35), fixed bin (35));
+dcl  initializer_mdc_$retrieve_lvate entry (fixed bin, ptr, fixed bin (35));
+dcl  initializer_mdc_$scan_process_lvat entry (bit (36) aligned, (*) fixed bin, fixed bin);
+dcl  initializer_mdc_$set_lvat_info entry (fixed bin, bit (36) aligned, fixed bin);
+dcl  ioa_ entry options (variable);
+dcl (ioa_$rsnnl, as_$dump) entry options (variable);
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl (ipc_$mask_ev_calls, ipc_$unmask_ev_calls) entry (fixed bin (35));
+dcl (sys_log_, sys_log_$error_log) entry options (variable);
+dcl  system_info_$device_prices entry (fixed bin, ptr);
+dcl  timer_manager_$alarm_wakeup entry (fixed bin(71), bit(2), fixed bin(71));
+
+
+dcl  command_error condition;
+
+/* --------------------------------------------------------- */
+
+init1:	entry;
+
+	SL0 = SL_LOG;				/* for real debugging */
+
+init:	entry;
+
+	call ipc_$create_ev_chn (my_evchn, ec);
+	call ipc_$decl_ev_call_chn (my_evchn, lv_request_, null, 1, ec);
+
+	if ec = 0 then call initializer_mdc_$init_lvat (my_evchn, ec);
+	if ec ^= 0 then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "lv_request_",
+		"Cannot initialize logical volume mounting software.");
+	     return;
+	end;
+
+	myprocessid = get_process_id_ ();
+
+	call system_info_$device_prices (n_devtab_entries, addr (devtab_copy));
+	do devtab_ix_lv = 1 to n_devtab_entries		/* look up lv in devtab */
+		while (devtab_copy (devtab_ix_lv).device_id ^= dev_id (dev_lv));
+	end;
+	if devtab_ix_lv = n_devtab_entries + 1 then	/* if not there, we won't charge for logical volumes */
+	     devtab_ix_lv = 0;
+
+	initialized = "1"b;
+	return;
+
+/* --------------------------------------------------------- */
+
+dhv:	entry (a_lvname);				/* Called to purge lv from table */
+
+	if ^initialized then return;
+	lvname = a_lvname;
+	call initializer_mdc_$lvat_scan_lv (lvname, array, n);
+	do i = 1 to n;
+
+	     lvax = array (i);
+	     call get (lvax);
+	     call find_u (lvate.pid);
+
+	     if lvate.waiting then do;
+		call sys_log_ (SL0,
+		     "lv_request_: Denied LV ^a to ^a ^12.3b.", lvname,
+		     user_procname, user_procid);
+		call initializer_mdc_$respond_mount_lv (lvax, 2, error_table_$resource_unavailable, ec);
+		if ec ^= 0 then call beef ("Cancelling pending mount via dlv");
+	     end;
+	     if lvate.mounted then do;
+		call detach;
+		call initializer_mdc_$invalidate_lvate (lvax);
+	     end;
+	end;
+	return;
+
+/* --------------------------------------------------------- */
+
+attach_list: entry;
+
+	if ^initialized then do;
+	     call ioa_ ("lv_request_: Logical volume software has not been initialized.");
+	     return;
+	end;
+
+/* Called on CALL SIDE ONLY, can call ioa_ */
+
+	call cu_$arg_count (nargs, ec);
+	if ec ^= 0 then do;
+	     call com_err_ (ec, "lv_request_", "Getting argument count.");
+	     return;
+	end;
+	if nargs < 1 then do;
+	     call com_err_ (error_table_$noarg, "lv_request_", "Logical volume name or -all.");
+	     return;
+	end;
+
+	list_all_vols = FALSE;
+	n_vols_to_list = 0;
+	do argx = 1 to nargs;
+	     call cu_$arg_ptr (argx, argp, argl, ec);
+	     if ec ^= 0 then do;
+		call com_err_ (ec, "lv_request_", "Getting arg ^d.", argx);
+		return;
+	     end;
+	     if arg = "-all" | arg = "-a" then list_all_vols = TRUE;
+	     else do;
+		n_vols_to_list = n_vols_to_list + 1;
+		if n_vols_to_list ^> hbound (vols_to_list, 1)
+		     then vols_to_list (n_vols_to_list) = arg;
+		else do;
+		     call ioa_ ("lv_request_: Too many LVs specified. All LVs past ""^a"" will be ignored.", vols_to_list (n_vols_to_list - 1));
+		     argx = nargs;			/* simulate end of args */
+		     n_vols_to_list = hbound (vols_to_list, 1);
+		end;
+	     end;
+	end;
+
+	dtp = disk_table_$get_dtp ();
+
+	shown_lvat_header = "0"b;
+	if list_all_vols then
+	     do lvx = 1 to dt.n_lv_entries;
+	     if dt.lv_array (lvx).used then do;
+		lvname = dt.lv_array (lvx).lvname;
+		call list_vol_attachments;
+	     end;
+	end;
+
+	else do vtlx = 1 to n_vols_to_list;
+	     lvname = vols_to_list (vtlx);
+	     do lvx = 1 to dt.n_lv_entries
+		while (lvname ^= dt.lv_array (lvx).lvname);
+	     end;
+	     if lvx ^> dt.n_lv_entries then
+		call list_vol_attachments;
+	     else call ioa_ ("^/LV ""^a"" is not defined.", lvname);
+	end;
+
+	if list_all_vols & ^shown_lvat_header then
+	     call ioa_ ("^/No LV Attachments.");
+	return;
+
+/* --------------------------------------------------------- */
+
+list_vol_attachments: proc;
+
+	     call initializer_mdc_$lvat_scan_lv (lvname, array, n);
+
+	     if n = 0 then do;
+		if ^list_all_vols then
+		     call ioa_ ("^/No attachments to LV ""^a"".", lvname);
+		return;
+	     end;
+
+	     call ioa_ ("^/LV ""^a"" Attachments:^/", lvname);
+	     if ^shown_lvat_header then do;
+		call ioa_ ("User^35tProcess_id^49tStatus^/");
+		shown_lvat_header = "1"b;
+	     end;
+
+	     do i = 1 to n;
+		lvax = array (i);
+		call get (lvax);
+		call find_u (lvate.pid);
+		if lvate.mounted then status = "In use";
+		else if lvate.detach_requested then status = "Detaching";
+		else if lvate.waiting | lvate.pending_mount then status = "Waiting for mount";
+		else if lvate.invalidated then status = "Invalidated";
+		else status = "??????";
+
+		call ioa_ ("^33a ^12.3b  ^a", user_procname, user_procid,
+		     status);
+	     end;
+
+	     return;
+	end list_vol_attachments;
+
+/* --------------------------------------------------------- */
+
+cleanup_process: entry (a_pid);
+
+	if ^initialized then return;
+	call find_u (a_pid);
+	pid = a_pid;
+	call initializer_mdc_$scan_process_lvat (pid, array, n);
+
+	do i = 1 to n;
+
+	     lvax = array (i);
+	     call get (lvax);
+	     lvname = lvate.lvname;
+	     if lvate.mounted then call detach;
+	     call initializer_mdc_$free_lvate (lvax);
+	end;
+	return;
+
+/* --------------------------------------------------------- */
+
+mhv_complete: entry (a_lvx, a_dtp);
+
+	if ^initialized then return;
+	lvx = a_lvx;
+	lvname = a_lvname;
+	dtp = a_dtp;
+	lvep = addr (dt.lv_array (lvx));
+	lvname = lve.lvname;
+
+	call initializer_mdc_$lvat_scan_lv (lvname, array, n);
+	do i = 1 to n;
+	     lvax = array (i);
+	     call get (lvax);
+	     if lvate.pending_mount then do;
+		call find_u (lvate.pid);
+		call initializer_mdc_$respond_mount_lv (lvax, 1, 0, ec);
+		if ec ^= 0 then call beef ("Sending mount ready message");
+		else call attach;
+	     end;
+	end;
+	return;
+
+/* --------------------------------------------------------- */
+
+
+interrupt:
+
+	ev_calls_masked = "0"b;
+
+	call condition_ ("any_other", any_other_handler);
+
+	if ^ (evmessage.sender = myprocessid | evmessage.ring = LV_RING) then do;
+	     call find_u (evmessage.sender);
+	     call sys_log_ (SL0,
+		"lv_request_: Spurious wakeup ^24.3b received from ^a ^12.3b ^d",
+		evmessage.bits, user_procname, user_procid,
+		evmessage.ring);
+	     return;
+	end;
+
+
+	unspec (mount_transmission) = evmessage.bits;
+
+	if evmessage.bits = unspec (ALARM___) | mount_transmission.req = "poll"
+	     then do;
+	     call poll_mounts;
+	     return;
+	end;
+	
+
+/* must be real requst */
+
+	if mount_transmission.other ^= 0 | (mount_transmission.req ^= "moun" & mount_transmission.req ^= "demo")
+	then do;
+	     call sys_log_ (SL_LOG_BEEP,
+		"lv_request_ : bad transmission: ^24.3b", evmessage.bits);
+	     return;
+	end;
+
+	lvax = mount_transmission.lvax;
+	demounting = mount_transmission.req = "demo";
+	call get (lvax);
+	if xec ^= 0 then do;
+badlvax:	     call sys_log_ (SL_LOG_BEEP,
+		"lv_request_: bad LV attach table index ^d in ^[demount^;mount^] request",
+		lvax, demounting);
+	     return;
+	end;
+
+	if evmessage.sender ^= lvate.pid then go to badlvax;
+	call find_u (evmessage.sender);
+	lvname = lvate.lvname;			/* For attach/detach messages */
+
+
+	if demounting then do;
+	     if lvate.mounted then call detach;
+	     call initializer_mdc_$free_lvate (lvax);
+	     call initializer_mdc_$scan_process_lvat (evmessage.sender, array, n);
+	     if n = 0 then do;
+		if utep ^= null then ute.lvs_attached = "0"b;
+	     end;
+	     return;
+	end;
+
+/* Mount a logical volume. */
+
+	dtp = disk_table_$get_dtp ();
+
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if lve.hv_mounted & lve.lvname = lvname then do;
+		call initializer_mdc_$set_lvat_info (lvax, lve.lvid, lvx);
+		call initializer_mdc_$respond_mount_lv (lvax, 1, 0, ec);
+		if ec = 0 then do;
+		     call attach;
+		     if utep ^= null () then ute.lvs_attached = "1"b;
+		end;
+		else call beef ("Mount already ready");
+		return;
+	     end;
+	end;
+
+/*  */
+/* Must generate a mhv */
+
+	ev_calls_masked = "1"b;			/* remember to unmask below */
+	call ipc_$mask_ev_calls (ec);			/* Must protect initializer from ioa_ */
+	if ec ^= 0 then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "lv_request_",
+		"Masking event calls.");
+	     go to no_avail;
+	end;
+
+	on command_error;				/* Ignore command errors, too */
+						/* distk_table_ is into com_err_. */
+
+
+	call disk_table_$dry_run_mhv (lvname, result);
+
+	if result = 0 then go to mhv_it;		/* if can hack without dhvs, do it now */
+
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if (lve.hv_mounted | lve.mounting) & ^lve.public then do;   /* can only demount in-use privates */
+		d_lvname = lve.lvname;
+		call initializer_mdc_$lvat_scan_lv (d_lvname, array, n);
+		if n = 0 then do;
+		     do pvx = 1 to dt.n_entries;
+			dtep = addr (dt.array (pvx));
+			if dte.lvx = lvx then do;
+			     lve.good_candidate = "1"b;
+			     dte.used = "0"b;
+			     dte.pre_accepted = "1"b;
+			end;
+		     end;
+		     if lve.good_candidate then do;	/* Now try trial mhv */
+			call disk_table_$dry_run_mhv (lvname, result);
+			if result = 0 then go to dlv_and_mhv;
+		     end;
+		end;
+	     end;
+	end;
+
+/*	No amount of dhvery will make this volume mountable */
+
+no_avail:
+	call sys_log_ (SL0, "No drives available to mount ^a for ^a ^12.3b",
+	     lvname, user_procname, user_procid);
+	call initializer_mdc_$respond_mount_lv (lvax, 3, error_table_$resource_unavailable, ec);
+	if ec ^= 0 then call beef ("Drive availability denial");
+unmask:	if ev_calls_masked then			/* if we masked event calls above */
+	     call ipc_$unmask_ev_calls ((0));		/* then unmask. otherwise leave mask alone */
+	return;
+
+/*  */
+/*  If we dlv marked lve's, there will be enough space */
+
+dlv_and_mhv:
+	n = 0;
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if lve.good_candidate then do;
+		n = n + 1;
+		array (n) = lvx;
+	     end;
+	end;
+
+	do i = 1 to n;
+	     lvep = addr (dt.lv_array (array (i)));
+	     call disk_table_$dhv ((lve.lvname));
+	end;
+
+/*  See if it all worked */
+
+	do i = 1 to n;
+	     lvep = addr (dt.lv_array (array (i)));
+	     if lve.demounting then go to no_avail;
+	end;
+
+/* Drives logically free. Now mhv */
+
+mhv_it:	call sys_log_ (SL0,
+	     "lv_request_: Beginning mount of LV ^a for ^a ^12.3b.",
+	     lvname, user_procname, user_procid);
+	call disk_table_$mhv (lvname);
+
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if lve.lvname = lvname then do;
+		if lve.hv_mounted then go to unmask;	/* lv_request_$mhv_complete took care */
+		if lve.mounting then do;
+		     call initializer_mdc_$respond_mount_lv (lvax, 4, 0, ec);
+		     call initializer_mdc_$mhvmessage (lvax, user_procname);
+						/* beep beep */
+		     if ec ^= 0 then call beef ("Sending response to wait for mount");
+		end;
+		if utep ^= null () then ute.lvs_attached = "1"b;
+		go to unmask;
+	     end;
+	end;
+
+	go to no_avail;				/* Somehow didn't make it */
+						/*  */
+
+/* Subroutines */
+
+beef:	proc (beef);				/* Can't send message */
+
+dcl  beef char (*);
+
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "lv_request_",
+		"Cannot send message to ^a ^12.3b: ^a", user_procname,
+		user_procid, beef);
+
+	     return;
+	end;
+
+attach:	proc;
+
+	     call sys_log_ (SL0,
+		"lv_request_: ATTACH^20tLV ^a to ^a ^12.3b.",
+		lvname, user_procname, user_procid);
+	     if utep ^= null
+		then call device_acct_$on (devtab_ix_lv, lvname, utep);
+	end;
+
+detach:	proc;
+
+	     call sys_log_ (SL0,
+		"lv_request_: DETACH^20tLV ^a from ^a ^12.3b.", lvname,
+		user_procname, user_procid);
+
+	     if utep ^= null then
+		call device_acct_$off (devtab_ix_lv, lvname, utep);
+
+	end;
+
+get:	proc (a_lvax);
+
+dcl  a_lvax fixed bin;
+
+	     lvatep = addr (local_lvate);
+	     call initializer_mdc_$retrieve_lvate (a_lvax, lvatep, xec);
+	end;
+
+
+find_u:	proc (pid);
+
+dcl  ape char (24);
+dcl  aprj char(12);
+dcl  tag char(1);
+dcl  anon fixed bin;
+
+dcl  pid bit (36) aligned;
+
+	     if testing then do;
+		call get_userid_$info(pid, ape, aprj, tag, 0, anon, 0, ec);
+		if ec = 0 then utep = addrel (null, 1);
+		else utep = null;
+	     end;
+	     else do;
+		call as_$find_process (pid, (0), utep);
+		if utep ^= null then do;
+		     ape = ute.person;
+		     aprj = ute.project;
+		     tag = ute.tag;
+		     anon = ute.anonymous;
+		end;
+	     end;
+	     if utep = null then user_procname = "PROCESSID";
+	     else call ioa_$rsnnl("^[*^]^a.^a.^a", user_procname, (0),
+		(anon=1), ape, aprj, tag);
+	     user_procid = pid;
+
+	     return;
+
+	end;
+
+
+any_other_handler: proc (mcp, cname, cop, inp, cont);
+
+dcl (mcp, cop, inp) ptr, cname char (*), cont bit (1);
+
+	     if testing | ^initialized
+	     | cname = "quit" | cname = "alrm" | cname = "program_interrupt"
+	     | cname = "cput" | cname = "signal_io_" then do;
+		cont = "1"b;
+		return;
+	     end;
+
+	     call sys_log_ (SL_LOG_BEEP,
+		"lv_request_: Unexpected condition ^a occurred.", cname);
+	     call as_$dump ("lv_request_");
+	     ec = 0;
+	     do while (ec = 0);			/* be sure to get completely unmasked */
+		call ipc_$unmask_ev_calls (ec);
+	     end;
+	     go to unmask;				/* nonlocal goto. return to ipc_ to get this ev chn uninhibited */
+	end;
+
+
+/* Subroutine to check for pending mounts whose timeout has expired */
+
+poll_mounts:
+	proc;
+	
+	dtp = disk_table_$get_dtp ();
+
+	call initializer_mdc_$poll_mounts (array, n, next_time);
+	if n > 0 
+	     then do i = 1 to n;
+	     call get (array (i));
+	     do lvx = 1 to dt.n_lv_entries
+		while (dt.lv_array (lvx).lvname ^= lvate.lvname | ^dt.lv_array (lvx).used);
+	     end;
+	     if lvx <= dt.n_lv_entries then do;
+		unit_string = "";
+		do dtx = 1 to dt.n_entries;
+		     dtep = addr (dt.array (dtx));
+		     if dte.lvx = lvx
+			then if dte.pre_accepted
+			then unit_string = unit_string || rtrim (dte.pvname) || " (" || rtrim (dte.drive_name) || ") ";
+		end;
+		if unit_string ^= "" then do;
+		     call find_u (lvate.pid);
+		     call initializer_mdc_$check_mount (array (i),
+			user_procname, unit_string);
+		end;
+	     end;
+	end;
+	
+	if next_time > 0
+	     then call timer_manager_$alarm_wakeup (next_time, "00"b, evmessage.evchn);
+
+
+	end;
+
+
+test:	entry;
+
+	LV_RING = get_ring_ ();
+	testing = "1"b;
+	SL0 = SL_LOG;
+	return;
+
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   lv_request_: ERROR_MESSAGE. Cannot initialize logical volume mounting
+   software.
+
+   S:	$as2
+
+   T:	$init
+
+   M:	Initialization of the logical volume attach table failed.  
+   ERROR_MESSAGE is the text associated with the error code returned by
+   initializer_mdc_$init_lvat.
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: Denied LV LVNAME to PERSON.PROJECT.TAG PROCESSID
+
+   S:	$as0
+
+   T:	When dismounting a logical volume.
+
+   M:	The user process identified by PERSON.PROJECT.TAG and PROCESSID
+   was waiting to mount a logical volume LVNAME which is being dismounted
+   by the operator.  The mount request was therefore denied.
+
+   A:	$ignore
+
+   
+   Message:
+   lv_request_: Spurious wakeup EVENT_MESSAGE received from PERSON.PROJECT.TAG
+   PROCESSID RINGNO
+ 
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	A wakeup was received on the lv_request_ interrupt event channel
+   with event data EVENT_MESSAGE from the process with PERSON.PROJECT.TAG,
+   PROCESSID and RINGNO.  This message is invalid because it did not come
+   from the Initializer, ring 1 environment.
+
+   A:	$ignore
+
+
+   Message:
+   lv_request_: bad transmission:  EVENT_MESSAGE
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	An unexpected EVENT_MESSAGE was received by the mount/demount
+   interrupt handler.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: bad LV attach table index N in {DE}MOUNT request
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	The Logical Volume attach table index given in the event message
+   associated with the mount or demount interrupt is invalid.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_:  ERROR_MESSAGE.  Masking event calls.
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	An error occurred while attempting to mask event call wakeups.
+   ERROR_MESSAGE is the text associated with the error code returned by
+   ipc_$mask_ev_calls.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: No drives available to mount LV LVNAME for PERSON.PROJECT.TAG
+   PROCESSID
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	Drives needed to mount the volumes of LVNAME were in use or
+   deleted.  The logical volume could not be mounted for the process identified
+   by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	$ignore
+
+
+   Message:
+   lv_request_:  Beginning mount of LV LVNAME for PERSON.PROJECT.TAG PROCESSID
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	The volumes associated with LVNAME are now being mounted for
+   the process identified by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	$ignore
+
+
+   Message:
+   lv_request_: Cannot send message to PERSON.PROJECT.TAG PROCESSID: ADDED_INFO
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	The Initializer is attempting to respond to a request to mount
+   or demount a logical volume, but is unable to send a wakeup to the user
+   process.  The process may have logged out.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: ATTACHED LV LVNAME to PERSON.PROJECT.TAG PROCESSID.
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	This message records attachment of logical volume LVNAME to the
+   process identified by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	 $ignore
+
+
+   Message:
+   lv_request_: DETACHED LV LVNAME from PERSON.PROJECT.TAG PROCESSID.
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	This message records detachment of logical volume LVNAME from the
+   process identified by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	 $ignore
+
+   
+   Message:
+   lv_request_: Unexpected condition CONDNAME occurred.
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	Condition CONDNAME was signalled unexpectedly during a mount or
+   demount request.  An answering service dump is created to further document
+   the cause of the error.
+
+   A:	$notify_sa.
+
+
+   END MESSAGE DOCUMENTATION */
+
+ %include devid;
+ %include disk_table;
+ %include lv_atttbl;
+ %include sys_log_constants;
+ %include user_attributes;
+ %include user_table_entry;
+
+     end;

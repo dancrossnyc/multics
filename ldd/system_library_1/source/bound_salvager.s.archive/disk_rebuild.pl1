@@ -1,0 +1,1307 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* disk_rebuild (from_pvtx, to_pvtx, label_pagep, opt_bits, addr_delta, code);
+
+   Assume from_pvtx was volume salvaged and is currently in use.
+   From_pvtx is rebuilt by moving low partitions to make room
+   for the increased vtoc, and copying all vtoce pages by
+   using addr_delta address assignment (since disk rotation
+   makes it impossible to address consecutively laid out segments
+   in the same rotation).
+
+   Written by B. S. Greenberg
+   Modified 8/79 by Mike Grady to fix two bugs - partition display following
+   a rebuild, and to skip ehs entries on rpv rebuild.
+   Modified 03/21/81, W. Olin Sibert, for ADP PTWs and SDWs
+   Modified 03/08/82, J. Bongiovanni, to set pvte.n_vtoce on "to" volume,
+   for new PVTE, and to allow VTOC compression
+   Modified 12/06/82, J. Bongiovanni, for VTOCE checksums
+   Modified 8/9/83, E. N. Kittlitz, search_ast$check, lock ast
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  2) change(86-06-02,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-29,Beattie), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices, calculating n_vtoce
+     per device_type.
+  3) change(86-10-23,Fawcett), approve(86-10-23,MCR7517),
+     audit(86-10-30,Beattie), install(86-11-03,MR12.0-1206):
+     Changed to remove the word BOS from message.
+  4) change(87-09-23,Fawcett), approve(87-09-23,MECR0009),
+     audit(87-09-23,Beattie), install(87-09-24,MR12.1-1120):
+     Change to the internal proc CHECK_VTOC_SIZES.  Fix a bug so that the new
+     number of vtoces will be calculated on the pvtx2 device type instead of
+     pvtx1.
+  5) change(89-09-07,Farley), approve(89-10-05,MCR8137),
+     audit(89-10-11,WAAnderson), install(89-10-11,MR12.3-1090):
+     Changed to call the "no test" entries of read_disk and write_disk, except
+     when reading or writing the label record.  This will speed up processing
+     of the rebuild.
+     
+     Added a call to pc_wired$write to update modified pages of entry-held
+     (ehs) segments back to disk, except when they are contained in a hardcore
+     partition.  (phx14387)
+     
+     Modified the CHECK_VTOC_SIZES procedure to only check the valid vtoc map
+     bits.  Bits on in the PAD bit fields of the words, due to an inconsistent
+     volume, was resulting in a failure to do VTOC compression. (phx15063 &
+     phx17219)
+     
+     Removed a non-local goto at the end of the CLEAN_UP procedure that was
+     prematurely stopping the unwinder's cleanup process.
+                                                   END HISTORY COMMENTS */
+
+/* format: style4 */
+disk_rebuild: proc (a_pvtx1, a_pvtx2, label_pagep, opt_bits, addr_delta, a_code);
+
+
+dcl  (a_pvtx1, a_pvtx2, pvtx) fixed bin;		/* Physical volume table index of vol to be salvaged */
+dcl  (pvtx1, pvtx2) fixed bin,
+     (i, j, k, l, r, first_free, last_free) fixed bin;
+dcl  (vtoce_incr, n_vtoce, addr_delta) fixed bin;
+dcl  (baseadd1, baseadd2, old_vtoc_size, lost_pages) fixed bin,
+     (addr_index, map_size) fixed bin,
+     (lp, label_pagep) ptr,
+     opt_bits bit (36) aligned,
+     save_vtocx fixed bin init (-1),
+     damaged_count fixed bin init (0),
+     delta fixed bin;
+dcl  vtoc_buf bit (36 * 192) aligned,
+     vtoc_bufp ptr;
+dcl  page_buf bit (36 * 1024) aligned,
+     bufp ptr;
+dcl  (a_code, code) fixed bin (35);			/* Error code */
+
+dcl  no_free_aste_err fixed bin (35) internal static init (1);
+
+dcl  table1p ptr;					/* Pointer to table1, i.e. bit_table */
+dcl  table3p ptr;					/* Pointer to table3, i.e. new_bit_map */
+
+dcl  s_ptr ptr;
+
+dcl  ptp pointer;					/* Pointer to page table in aste */
+dcl  vtocx fixed bin;				/* Index of the vtoc entry being processed */
+dcl  pvid bit (36) aligned;				/* ID of volume being processed */
+dcl  n_used_rec fixed bin;				/* Number of records used */
+dcl  n_free_vtoce fixed bin;				/* Number of free vtoc entries */
+dcl  max_n_vtoc_seg fixed bin internal static init (16);
+dcl  free_count fixed bin;				/* count of free vtoces added to consolidated list */
+dcl  p99 pic "99";					/* for name conversion */
+dcl  (dname1, dname2) char (9) varying;
+
+
+dcl  1 table1 based (table1p) aligned,
+       2 bit_table (0:label.vol_size - 1) bit (1) unaligned;
+
+
+dcl  pds$processid ext bit (36) aligned;
+
+dcl  sst$astl bit (36) aligned external;
+dcl  sst$astsize fixed bin external;
+dcl  sst$checksum_filemap fixed bin external;
+dcl  1 sst$level (0:3) aligned external,
+       2 ausedp bit (18) unaligned,
+       2 no_aste bit (18) unaligned;
+dcl  sst$pts (0:3) fixed bin external;
+dcl  sst$root_pvtx fixed bin external;
+
+dcl  pv_salv_seg$ fixed bin external static;
+dcl  volmap_abs_seg$ external static;
+dcl  dseg$ (0:1023) fixed bin (71) aligned external static;
+
+dcl  filemap_checksum_ entry (ptr, fixed bin, bit (36) aligned);
+dcl  get_aste entry (fixed bin) returns (ptr);
+dcl  get_ptrs_$given_segno entry (fixed bin) returns (ptr);
+dcl  get_ptrs_$given_astep entry (ptr) returns (fixed bin (71) aligned);
+dcl  get_pvtx$hold_pvtx entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  get_pvtx$release_pvtx entry (bit (36) aligned, fixed bin (35));
+dcl  lock$lock_ast entry;
+dcl  lock$unlock_ast entry;
+dcl  page$cam entry;
+dcl  pc$cleanup ext entry (ptr);
+dcl  pc$truncate_deposit_all entry (ptr);
+dcl  pc_wired$write entry (ptr, fixed bin, fixed bin);
+dcl  pc_wired$write_wait entry (ptr, fixed bin, fixed bin);
+dcl  pmut$swap_sdw entry (ptr, ptr);
+dcl  ptw_util_$make_null entry (pointer, bit (22) aligned);
+dcl  put_aste entry (ptr);
+dcl  read_disk entry (fixed bin, fixed bin, ptr, fixed bin (35));
+dcl  read_disk$read_disk_no_test entry (fixed bin, fixed bin, ptr, fixed bin (35));
+dcl  salvager$set_options ext entry (bit (36) aligned);
+dcl  salv_err_msg entry options (variable);
+dcl  salv_err_msg$code entry options (variable);
+dcl  search_ast$check ext entry (bit (36) aligned, bit (36) aligned, fixed bin, fixed bin (35)) returns (ptr);
+dcl  syserr entry options (variable);
+dcl  thread$out entry (ptr, bit (18));
+dcl  update_vtoce ext entry (ptr);
+dcl  vm_vio$clean_up entry (fixed bin);
+dcl  vm_vio$get_vtocep entry (fixed bin, fixed bin) returns (ptr);
+dcl  vm_vio$init entry (fixed bin, fixed bin (35)) returns (ptr);
+dcl  vtoc_man$get_vtoce ext entry (bit (36) aligned, fixed bin, fixed bin, bit (3) aligned, ptr, fixed bin (35));
+dcl  vtoce_stock_man$drain_stock_range entry (ptr, fixed bin, fixed bin);
+dcl  write_disk entry (fixed bin, fixed bin, ptr, fixed bin (35));
+dcl  write_disk$write_disk_no_test entry (fixed bin, fixed bin, ptr, fixed bin (35));
+
+dcl  (cleanup, page_fault_error) condition;
+
+dcl  (min, null, addr, addrel, baseno, bit, ceil, divide, fixed, mod, ptr, rel, rtrim, substr, unspec) builtin;
+
+%page;
+
+/* MAIN PROGRAM */
+
+	vtoc_bufp = addr (vtoc_buf);
+	bufp = addr (page_buf);
+
+	begin;					/* allocate tables for address incrementation */
+
+dcl  last_used (addr_delta) fixed bin;
+
+	     delta = addr_delta;
+	     lp = label_pagep;
+	     pvtx1 = a_pvtx1;
+	     pvtx2, pvtx = a_pvtx2;
+	     code = 0;
+	     free_count = 0;
+	     pvt_arrayp = addr (pvt$array);
+
+	     call salvager$set_options (opt_bits);
+	     p99 = pvt_array (pvtx1).logical_area_number;
+	     dname1 = rtrim (pvt_array (pvtx1).devname || "_" || p99 || pvt_array (pvtx1).sv_name);
+	     p99 = pvt_array (pvtx2).logical_area_number;
+	     dname2 = rtrim (pvt_array (pvtx2).devname || "_" || p99 || pvt_array (pvtx2).sv_name);
+
+	     call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: Begin disk rebuild of ^a onto ^a.", dname1, dname2);
+	     if pvtx1 = pvtx2 then do;
+		call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: same drive specified for source and copy, aborting.");
+		goto err_ret;
+	     end;
+
+	     if ^pvt_array (pvtx1).used then do;
+		call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: ^a must be mounted for rebuild.", dname1);
+		goto err_ret;
+	     end;
+
+	     if pvt_array (pvtx2).used then do;
+		call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: ^a must not be mounted for rebuild.", dname2);
+		goto err_ret;
+	     end;
+
+	     call CHECK_VTOC_SIZES;
+
+	     pvtep = addr (pvt_array (pvtx2));
+	     pvid = addr (pvt_array (pvtx1)) -> pvte.pvid;/* get first disk id */
+
+/* cop label so vm_vio init works */
+	     do i = 0 to VTOC_ORIGIN - 0;
+		if i = 0 then call copy_page (0, 0, "1"b);
+		else call copy_page (i, i, "0"b);
+	     end;
+
+	     on cleanup begin;
+		     if salv_data$debug then call syserr (CRASH, "disk_rebuild: salv cleanup debugging stop, dump and type go.");
+		     call CLEAN_UP;
+		end;
+
+/* label.vtoc_size has been updated to new value, other info  old */
+	     s_ptr = vm_vio$init (pvtx, code); if code ^= 0 then goto err_ret;
+
+	     labelp = ptr (s_ptr, LABEL_ADDR * 1024);
+	     vol_mapp = ptr (s_ptr, VOLMAP_ADDR * 1024);
+	     vtoc_headerp = ptr (s_ptr, DUMPER_BIT_MAP_ADDR * 1024);
+	     vtoc_mapp = ptr (s_ptr, VTOC_MAP_ADDR * 1024);
+
+	     call salv_err_msg (SALV_DEBUG, "^/disk_rebuild: Summary of original disk contents follows:^/");
+	     call REPORT_SUMMARY;
+
+/* Set up VTOC header for pre-MR10 compatibility */
+
+	     vtoc_header.n_vtoce = n_vtoce;
+	     vtoc_header.n_free_vtoce = 0;
+	     vtoc_header.first_free_vtocx = -1;
+	     vtoc_header.vtoc_last_recno = label.vtoc_size - 1;
+
+/* The VTOC Map has been copied from the old volume. Null it out. */
+
+	     vtoc_map.n_vtoce = n_vtoce;
+	     vtoc_map.vtoc_last_recno = label.vtoc_size - 1;
+	     vtoc_map.bit_map_n_words = divide (n_vtoce + 31, 32, 17);
+	     unspec (vtoc_map.bit_map) = ""b;
+
+	     pvt_array (pvtx2).n_vtoce = n_vtoce;	/* So vtoc_man works */
+	     vtoce_incr = n_vtoce - old_vtoc_size;
+	     vtoc_header.vtoc_last_recno = label.vtoc_size - 1;
+						/* find out about partition changes */
+	     first_free = label.vtoc_size;
+update_frec:   do i = 1 to lp -> label.nparts;
+		if lp -> label.parts (i).frec = first_free then do;
+		     first_free = first_free + lp -> label.parts (i).nrec;
+		     goto update_frec;
+		end;
+	     end;
+
+	     last_free = lp -> label.vol_size;
+	     do j = 1 to lp -> label.nparts;
+		if lp -> label.parts (j).frec > first_free then if lp -> label.parts (j).frec < last_free then
+			last_free = lp -> label.parts (j).frec;
+	     end;
+
+	     last_free = last_free - 1;
+	     lost_pages = vol_map.n_rec - (last_free - first_free);
+	     if lost_pages > vol_map.n_free_rec then do;
+		call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: not enough free records (only ^d.) for increase (need ^d.)",
+		     vol_map.n_free_rec, lost_pages);
+		goto err_out;
+	     end;
+
+	     baseadd1 = vol_map.base_add;
+	     baseadd2 = first_free;
+
+	     if baseadd1 ^= baseadd2 then
+		call salv_err_msg (SALV_DEBUG, "disk_rebuild: base of paging region changed from  ^d. to ^d.", baseadd1, baseadd2);
+
+	     vol_map.base_add = baseadd2;
+	     map_size, vol_map.n_rec = vol_map.n_rec - lost_pages;
+	     vol_map.bit_map_n_words = ceil (map_size / 32);
+						/* now copy matching partitions */
+	     do i = 1 to lp -> label.nparts;
+		do j = 1 to label.nparts;
+		     if lp -> label.parts (i).part = label.parts (j).part then do;
+			r = min (lp -> label.parts (i).nrec, label.parts (j).nrec);
+			if lp -> label.parts (i).part = "bos"
+			     | lp -> label.parts (i).part = "alt" then r = 0;
+			call salv_err_msg (SALV_DEBUG, "disk_rebuild: copying ^d. rec of part ^a", r, label.parts (j).part);
+			k = label.parts (j).frec;
+			do l = lp -> label.parts (i).frec to lp -> label.parts (i).frec + (r - 1);
+			     call copy_page (k, l, "0"b);
+			     k = k + 1;
+			end;
+		     end;
+		end;
+	     end;
+						/* now copy new label page, old one not needed anymore */
+	     call write_disk (pvtx2, 0, lp, code);
+	     if code ^= 0 then do;
+		call salv_err_msg$code (SALV_ANNOUNCE, "", code, "disk_rebuild: Error writing label:");
+		goto err_out;
+	     end;
+	     labelp = lp;				/* all new references go to new label copy */
+%page;
+
+	     call INIT_TABLES (table1p, table3p, code);
+
+	     n_free_vtoce = 0;
+	     n_used_rec = 0;
+	     save_vtocx = -1;
+						/* initialize to get assigned addresses to cycle above baseadd2 */
+	     do i = 1 to delta;
+		last_used (i) = baseadd2 - i;
+	     end;
+						/* copy each permanent, valid vtoce */
+	     call copy_vtoc;			/* and move all pages onto new disk */
+
+	     call UPDATE_VOL_MAP;
+
+	     call UPDATE_VTOC_MAP;
+
+	     call FORCE_VTOC_ON_DISK;
+
+	     call FORCE_LABEL_ON_DISK;
+
+	     call salv_err_msg (SALV_DEBUG, "disk_rebuild: End of rebuilding. New summary report follows:^/");
+
+	     call REPORT_SUMMARY;
+
+
+err_out:
+	     if free_count > 0 then call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: ^d. vtoces added to list of free vtoces", free_count);
+	     if code = 0 then call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: Disk rebuild finished.");
+	     else call salv_err_msg$code (SALV_ANNOUNCE, "", code, "disk_rebuild: disk rebuild finished with error:");
+
+
+	     call CLEAN_UP;
+
+err_ret:	     a_code = code;
+	     if ^pvt_array (pvtx2).used
+	     then pvt_array (pvtx2).n_vtoce = 0;
+
+	     return;
+%page;
+
+copy_vtoc: proc;
+
+dcl  r fixed bin;
+
+dcl  whole_vtoce bit (192 * 36) based aligned;
+
+	do vtocx = 0 to min (old_vtoc_size, n_vtoce) - 1; /* could have shrunk */
+	     if mod (vtocx, 1000) = 0 then if vtocx > 0 then
+		     call syserr (ANNOUNCE, "disk_rebuild: processing VTOCE #^d.", vtocx);
+	     call vtoc_man$get_vtoce (pvid, pvtx1, vtocx, "111"b, vtoc_bufp, code);
+	     if code ^= 0 then do;
+		call salv_err_msg$code (SALV_ANNOUNCE, "", code, "disk_rebuild: reading vtocx ^oo:", vtocx);
+		goto err_out;
+	     end;
+
+/* get ptr to spot for  new one */
+	     vtocep = vm_vio$get_vtocep (pvtx2, vtocx);
+	     if vtoc_bufp -> vtoce.uid = "0"b then do;
+		call FREE_VTOCE;
+		goto next_vtocx;
+	     end;
+	     if ^vtoc_bufp -> vtoce.dirsw then do;
+		if vtoc_bufp -> vtoce.per_process then do;
+		     if salv_data$debug then call salv_err_msg (SALV_DEBUG, "disk_rebuild: freeing per process vtocx ^oo: ^a",
+			     vtocx, vtoc_bufp -> vtoce.primary_name);
+		     call FREE_VTOCE;
+		     goto next_vtocx;
+		end;
+		if vtoc_bufp -> vtoce.deciduous then do;
+		     if salv_data$debug then call salv_err_msg (SALV_DEBUG, "disk_rebuild: freeing deciduous vtocx ^oo: ^a",
+			     vtocx, vtoc_bufp -> vtoce.primary_name);
+		     call FREE_VTOCE;
+		     goto next_vtocx;
+		end;
+	     end;
+						/* see if have to update */
+	     call lock$lock_ast;
+	     astep = search_ast$check ((vtoc_bufp -> vtoce.uid), pvid, vtocx, (0)); /* ignore double-uid error */
+	     if astep ^= null then do;
+		if ^aste.ehs then			/* if we don't need this */
+		     call pc$cleanup (astep);		/* get everything updated on disk */
+		else if ^aste.hc_part then		/* if needed, at least get modified */
+		     call pc_wired$write (astep, 0, -1);/* pages updated to disk */
+		call update_vtoce (astep);
+		call lock$unlock_ast;		/* don't really need it any more */
+		call vtoc_man$get_vtoce (pvid, pvtx1, vtocx, "111"b, vtoc_bufp, code);
+		if code ^= 0 then do;
+		     call salv_err_msg$code (SALV_ANNOUNCE, "", code, "disk_rebuild: reading vtocx ^oo:", vtocx);
+		     goto err_out;
+		end;
+	     end;
+	     else call lock$unlock_ast;		/* unlocked no matter what */
+
+	     if vtoc_bufp -> vtoce.damaged then damaged_count = damaged_count + 1;
+
+	     vtocep -> whole_vtoce = vtoc_bufp -> whole_vtoce;
+	     do i = 0 to 255;
+		if substr (vtoce.fm (i), 1, 1) ^= "1"b then do;
+		     call get_new_addr (vtocx, r);
+		     call copy_page (fixed (substr (vtoce.fm (i), 2, 17), 17), r, "0"b);
+		     vtoce.fm (i) = bit (fixed (r, 18), 18);
+		     n_used_rec = n_used_rec + 1;
+		end;
+	     end;
+	     if sst$checksum_filemap = 0 then do;
+		vtocep -> vtoce.fm_checksum_valid = "0"b;
+		vtocep -> vtoce.fm_checksum = ""b;
+	     end;
+	     else do;
+		vtocep -> vtoce.fm_checksum_valid = "1"b;
+		call filemap_checksum_ (addr (vtocep -> vtoce.fm),
+		     fixed (vtocep -> vtoce.csl), vtocep -> vtoce.fm_checksum);
+	     end;
+	     vtocep -> vtoce.fm_damaged = "0"b;
+
+next_vtocx:
+	end;
+
+	if old_vtoc_size ^= n_vtoce then
+	     call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: no. vtoces changed from ^d. to ^d.", old_vtoc_size, n_vtoce);
+	if n_vtoce > old_vtoc_size then do vtocx = old_vtoc_size to n_vtoce - 1;
+	     vtocep = vm_vio$get_vtocep (pvtx2, vtocx);
+	     call FREE_VTOCE;
+	end;
+
+     end copy_vtoc;
+%page;
+
+copy_page: proc (from, to, sp_bit);
+
+dcl  (from, to) fixed bin;
+dcl  sp_bit bit (1) aligned;
+
+	if sp_bit then
+	     call read_disk (pvtx1, from, bufp, code);
+	else call read_disk$read_disk_no_test (pvtx1, from, bufp, code);
+	if code ^= 0 then do;
+	     call salv_err_msg$code (SALV_ANNOUNCE, "", code, "disk_rebuild: Error from read_disk, aborting:");
+	     goto err_out;
+	end;
+
+	if sp_bit then do;
+	     bufp -> label.vtoc_size = lp -> label.vtoc_size;
+	     call write_disk (pvtx2, to, bufp, code);
+	end;
+	else call write_disk$write_disk_no_test (pvtx2, to, bufp, code);
+	if code ^= 0 then do;
+	     call salv_err_msg$code (SALV_ANNOUNCE, "", code, "disk_rebuild: Error from write_disk, aborting:");
+	     goto err_out;
+	end;
+
+     end copy_page;
+
+get_new_addr: proc (a_vtocx, a_addr);
+						/* last_used (delta) is array of last awarded cyclic addresses */
+dcl  a_vtocx fixed bin,
+     a_addr fixed bin;
+
+	if a_vtocx ^= save_vtocx then do;		/* switch  to next slot cycle */
+	     addr_index = 1;
+	     do j = 1 to delta;
+		if last_used (j) < last_used (addr_index) then addr_index = j;
+	     end;
+	     save_vtocx = a_vtocx;
+	end;
+
+	a_addr, last_used (addr_index) = last_used (addr_index) + delta;
+	bit_table (last_used (addr_index)) = "1"b;
+						/* check next address to see if oob */
+	if last_used (addr_index) + delta > map_size + baseadd2 then do;
+	     call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: out of room on vtocx ^oo , page ^oo", vtocx, i);
+	     goto err_out;
+	end;
+     end get_new_addr;
+%page;
+
+FREE_VTOCE: proc;
+
+dcl  bitx fixed bin;
+dcl  wordx fixed bin;
+
+
+	if vtoce.uid ^= "0"b then free_count = free_count + 1;
+
+	unspec (vtoce) = "0"b;
+
+	wordx = divide (vtocx, 32, 17);
+	bitx = mod (vtocx, 32) + 1;
+	bit_map_wordp = addr (vtoc_map.bit_map (wordx));
+	substr (bit_map_word.bits, bitx, 1) = "1"b;
+
+	n_free_vtoce = n_free_vtoce + 1;
+
+	return;
+
+     end FREE_VTOCE;
+
+
+
+UPDATE_VOL_MAP: proc;
+
+dcl  1 old_map (vol_map.bit_map_n_words) based (addr (vol_map.bit_map)) aligned,
+       2 pad1 bit (1) unaligned,
+       2 bits bit (32) unaligned,
+       2 pad2 bit (3) unaligned;
+
+dcl  1 new_map (vol_map.bit_map_n_words) based (table3p) aligned like old_map;
+
+dcl  bit_table_map (1000) bit (32) based (addr (bit_table (vol_map.base_add))) unaligned;
+
+dcl  w fixed bin;
+dcl  j fixed bin;
+dcl  n_free_rec fixed bin;
+
+
+
+	unspec (new_map) = "0"b;
+
+	do w = 1 to vol_map.bit_map_n_words;
+	     new_map (w).bits = ^bit_table_map (w);
+	end;
+
+	j = mod (vol_map.n_rec, 32);
+	if j ^= 0 then substr (new_map (w - 1).bits, j + 1) = "0"b;
+
+	if unspec (old_map) = unspec (new_map) then ;
+	else do;
+	     call report_bit_map_changed;
+	     unspec (old_map) = unspec (new_map);
+	end;
+
+	n_free_rec = vol_map.n_rec - n_used_rec;
+
+	if vol_map.n_free_rec ^= n_free_rec then
+	     do;
+	     call report_n_free_rec_changed;
+	     vol_map.n_free_rec = n_free_rec;
+	end;
+	return;
+
+%page;
+
+report_bit_map_changed: proc;
+	     call salv_err_msg (SALV_DEBUG, "disk_rebuild: Map of assigned addresses changed");
+	     return;
+	end;
+
+report_n_free_rec_changed: proc;
+	     call salv_err_msg (SALV_DEBUG, "disk_rebuild: no. of free recs changed from ^d. to ^d.",
+		vol_map.n_free_rec, n_free_rec);
+	     return;
+	end;
+
+     end UPDATE_VOL_MAP;
+
+
+UPDATE_VTOC_MAP: proc;
+
+	if vtoc_map.n_free_vtoce ^= n_free_vtoce then do;
+	     call report_n_free_vtoce;
+	     vtoc_map.n_free_vtoce = n_free_vtoce;
+	end;
+
+
+	return;
+
+
+report_n_free_vtoce: proc;
+	     call salv_err_msg (SALV_DEBUG, "disk_rebuild: no. of free vtoces changed from ^d. to ^d.",
+		vtoc_header.n_free_vtoce, n_free_vtoce);
+	     return;
+	end;
+
+     end UPDATE_VTOC_MAP;
+
+
+
+
+
+
+
+FORCE_VTOC_ON_DISK: proc;
+
+dcl  i fixed bin;
+
+
+	do i = 1 to max_n_vtoc_seg - 1;
+	     astep = get_ptrs_$given_segno (fixed (baseno (s_ptr)) + i);
+	     if astep ^= null then call pc_wired$write_wait (astep, 0, -1);
+	end;
+
+	return;
+
+     end FORCE_VTOC_ON_DISK;
+%page;
+FORCE_LABEL_ON_DISK: proc;
+
+	astep = get_ptrs_$given_segno (fixed (baseno (s_ptr)));
+
+	if astep ^= null then call pc_wired$write_wait (astep, LABEL_ADDR, 1);
+
+	return;
+
+     end FORCE_LABEL_ON_DISK;
+%page;
+REPORT_SUMMARY: procedure;
+
+dcl  i fixed bin, ptot fixed bin (24);
+
+	call salv_err_msg (SALV_DEBUG, "^/disk_rebuild: Summary Report^/^5xVolume ^a of logical volume ^a.^/",
+	     label.pv_name, label.lv_name);
+
+	call salv_err_msg (SALV_DEBUG, "Paging region begins at record ^d. (^oo), for ^d. (^oo) records.",
+	     vol_map.base_add, vol_map.base_add, vol_map.n_rec, vol_map.n_rec);
+	call salv_err_msg (SALV_DEBUG, "^d. (^oo) free records therein.", vol_map.n_free_rec, vol_map.n_free_rec);
+
+	call salv_err_msg (SALV_DEBUG, "Label/VTOC size is ^d. records, ^d. VTOCEs.", label.vtoc_size, vtoc_header.n_vtoce);
+	call salv_err_msg (SALV_DEBUG, "VTOC version ^d., ^d. free VTOCEs.^/", vtoc_header.version, vtoc_header.n_free_vtoce);
+
+	if label.nparts = 0 then call salv_err_msg (SALV_DEBUG, "No partitions defined.");
+	else do;
+	     ptot = 0;
+	     call salv_err_msg (SALV_DEBUG, "^/^10xPartition Map^/Name^16xStart^15xLength^/");
+	     do i = 1 to label.nparts;
+		call salv_err_msg (SALV_DEBUG, "^4a^6x^9d.^x(^6oo)^x^9d.^x(^6oo)",
+		     label.parts.part (i), label.parts (i).frec, label.parts (i).frec, label.parts (i).nrec,
+		     label.parts (i).nrec);
+		ptot = ptot + label.parts (i).nrec;
+	     end;
+	     call salv_err_msg (SALV_DEBUG, "^35x______^2x_______^/^31x^9d.^x(^6oo)^/", ptot, ptot);
+	end;
+	call salv_err_msg (SALV_DEBUG, "Volume size is ^d. (^oo) records total.^/", label.vol_size, label.vol_size);
+
+	if damaged_count > 0 then call salv_err_msg (SALV_DEBUG, "^/^10x^d. damaged segments.", damaged_count);
+
+
+     end REPORT_SUMMARY;
+%page;
+CHECK_VTOC_SIZES:
+     proc;
+
+/* Validates the size of the new VTOC. It may be equal to or larger than the
+   old VTOC. Or it may be smaller, provided that there are no active VTOCEs
+   in the region of the old VTOC being truncated. */
+
+dcl  all_free bit (1);
+dcl  bit_map_words fixed bin;
+dcl  first_free_word fixed bin;
+dcl  res fixed bin;
+dcl  tsdw fixed bin (71);
+dcl  wordx fixed bin;
+
+dcl  ALL_FREE bit (36) aligned internal static options (constant)
+	init ("377777777770"b3);
+
+
+	old_vtoc_size = pvt_array (pvtx1).n_vtoce;
+	n_vtoce = (lp -> label.vtoc_size - VTOC_ORIGIN) * VTOCES_PER_RECORD (pvt_array (pvtx2).device_type);
+
+	if n_vtoce >= old_vtoc_size then return;
+
+/* Get all free VTOCEs in the truncated region into the VTOC Map */
+
+	call vtoce_stock_man$drain_stock_range (addr (pvt_array (pvtx1)), n_vtoce, old_vtoc_size - 1);
+
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (pvt_array (pvtx1).volmap_seg_sdw));
+	vtoc_mapp = ptr (addr (volmap_abs_seg$), pvt_array (pvtx1).vtoc_map_offset);
+
+	on page_fault_error begin;
+		call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: Read error accessing VTOC Map of ^a",
+		     dname1);
+		tsdw = 0;
+		call pmut$swap_sdw (addr (volmap_abs_seg$), addr (tsdw));
+		goto err_ret;
+	     end;
+
+	all_free = "1"b;
+	first_free_word = divide (n_vtoce + 32, 32, 17);
+	bit_map_words = divide (old_vtoc_size + 31, 32, 17);
+	if (bit_map_words - 2) >= first_free_word
+	then do wordx = first_free_word to bit_map_words - 2
+		while (all_free);
+	     if (vtoc_map.bit_map (wordx) & ALL_FREE) ^= ALL_FREE
+	     then all_free = "0"b;
+	end;
+
+	res = mod (n_vtoce, 32);
+	if res ^= 0
+	then do;
+	     bit_map_wordp = addr (vtoc_map.bit_map (first_free_word - 1));
+	     if substr (bit_map_word.bits, res + 1, 32 - res) ^= substr (ALL_FREE, 2, 32 - res)
+	     then all_free = "0"b;
+	end;
+
+	res = mod (old_vtoc_size, 32);
+	if res = 0 then res = 32;
+	bit_map_wordp = addr (vtoc_map.bit_map (bit_map_words - 1));
+	if substr (bit_map_word.bits, 1, res) ^= substr (ALL_FREE, 2, res)
+	then all_free = "0"b;
+
+	tsdw = 0;
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (tsdw));
+	vtoc_mapp = null ();
+
+	if ^all_free then do;
+	     call salv_err_msg (SALV_ANNOUNCE, "disk_rebuild: Cannot compress VTOC on ^a because active VTOCEs in the truncated region.",
+		dname1);
+	     goto err_ret;
+	end;
+
+	return;
+
+     end;
+
+%page;
+CLEAN_UP: proc;
+
+
+dcl  segno fixed bin;
+
+
+	segno = fixed (baseno (addr (pv_salv_seg$)), 18);
+
+	astep = get_ptrs_$given_segno (segno);
+
+	if astep ^= null then
+	     do;
+
+	     dseg$ (segno) = 0;
+	     call page$cam;
+
+	     call pc$truncate_deposit_all (astep);
+	     if aste.usedf then call get_pvtx$release_pvtx ((pvt_array.pvid (aste.pvtx)), (aste.pvtx));
+
+	     if sst$astl ^= pds$processid then call lock$lock_ast;
+	     call put_aste (astep);
+	     call lock$unlock_ast;
+
+	end;
+
+	call vm_vio$clean_up (pvtx);
+
+     end CLEAN_UP;
+%page;
+INIT_TABLES: proc (table1p, table3p, code);
+
+dcl  table1p ptr;
+dcl  table3p ptr;
+dcl  code fixed bin (35);
+
+dcl  pv_salv_seg$ ext;
+
+dcl  1 pv_salv_seg based (addr (pv_salv_seg$)) aligned,
+
+       2 table1,
+         3 bit_table (0:label.vol_size - 1) bit (1) unaligned,
+
+       2 table3,
+         3 new_map (1:vol_map.bit_map_n_words) bit (36) aligned,
+
+       2 end bit (36) aligned;
+
+dcl  segno fixed bin,				/* segno assigned to this segment  */
+     pvtx fixed bin,				/* PVT index for this segment  */
+     msl fixed bin;					/* number of pages for this segment  */
+
+dcl  (i, pts, ptsi) fixed bin;
+
+dcl  tsdw fixed bin (71);
+
+	code = 0;
+
+	segno = fixed (baseno (addr (pv_salv_seg$)), 18);
+	pvtx = sst$root_pvtx;
+	msl = divide (fixed (rel (addr (pv_salv_seg.end)), 18), 1024, 17, 0) + 1;
+
+
+/* ALLOCATE AN ASTE OF THE APPROPRIATE SIZE */
+
+	call lock$lock_ast;
+
+	astep = get_aste (msl);			/* Get an ASTE with the appropriate size PT */
+
+	if astep = null then
+	     do;
+	     call lock$unlock_ast;
+	     code = no_free_aste_err;
+	     call syserr (ANNOUNCE, "disk_rebuild: INIT_TABLES: aste pool ^oo too small", msl);
+	     return;
+	end;
+
+	ptsi = fixed (aste.ptsi);
+	pts = sst$pts (ptsi);
+
+
+/* ZERO THE ASTE  */
+
+	astep -> aste_part.two = "0"b;		/* Zero the rest of the ASTE except ptsi and marker */
+
+
+/* INITIALIZE THE PAGE TABLE WITH NULL ADDRESSES AND PAGE FAULT BITS */
+
+	ptp = addrel (astep, sst$astsize);		/* get a pointer to the page table */
+
+	do i = 0 to pts - 1;
+	     call ptw_util_$make_null (addrel (ptp, i), fill_page_table_null_addr); /* Make null PTWs */
+	end;
+
+
+/* INITIALIZE THE ASTE */
+
+	astep -> aste.vtocx = -1;			/* show there is no VTOCE for the segment */
+	astep -> aste.dnzp = "1"b;
+	astep -> aste.nqsw = "1"b;			/* turn on no quota switch */
+	astep -> aste.strp = bit (fixed (segno, 18), 18); /* store segment number in AST */
+	astep -> aste.msl = bit (fixed (msl, 9), 9);	/* set the max length */
+	astep -> aste.pvtx = pvtx;			/* store the root physical volume table index */
+
+
+/* THE CLEAN_UP OPERATION WILL DEPEND ON THE ORDER IN WHICH THE NEXT ACTIONS ARE PERFORMED */
+
+	tsdw = get_ptrs_$given_astep (astep);		/* Get initial  SDW. */
+	dseg$ (segno) = tsdw;			/* store temp SDW in the descriptor segment */
+	call page$cam;
+	call get_pvtx$hold_pvtx ((pvt_array (pvtx).pvid), pvtx, (0)); /* Hold this vol */
+
+	astep -> aste.usedf = "1"b;			/* mark it as being used - as late as possible */
+
+	call thread$out (astep, sst$level (ptsi).ausedp); /* thread the entry out of the used list */
+
+	call lock$unlock_ast;
+
+
+/* INITIALIZE POINTERS TO TABLES */
+
+	table1p = addr (pv_salv_seg.table1);
+	table3p = addr (pv_salv_seg.table3);
+
+	return;
+
+     end INIT_TABLES;
+
+	end;					/* begin block and proc */
+
+/* format: off */
+
+%page; %include aste;
+%page; %include disk_pack;
+%page; %include fs_vol_label;
+%page; %include null_addresses;
+%page; %include pvte;
+%page; %include salv_data;
+%page; %include salvager_severities;
+%page; %include syserr_constants;
+%page; %include vol_map;
+%page; %include vtoc_header;
+%page; %include vtoc_map;
+%page; %include vtoce;
+
+/* format: on */
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   disk_rebuild: Begin disk rebuild of DSKX_NN{s} onto DSKY_MM{s}
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	This message is printed when disk rebuilding begins.
+
+   A:	$ignore
+
+   Message:
+   disk_rebuild: salv cleanup debugging stop, dump and type go
+
+   S:	$crash
+
+   T:	During disk rebuild
+
+   M:	A disk rebuild has aborted due to a crawlout, and the debug switch is set.
+   This message causes the system to return to BCE so that a dump can be taken.
+
+   A:	Follow programmer instructions.
+
+
+   Message:
+   disk_rebuild: INIT_TABLES: aste pool WWWo too small
+
+   S:	$info
+
+   T:	$run
+
+   M:	The physical volume salvager
+   was unable to
+   obtain the necessary temporary AST entries
+   for its work segments.
+   No salvaging was done.
+
+   A:	Shut down,
+   manually correct the SST card,
+   and reboot.
+   Then salvage all volumes,
+   since the indicator that volumes need salvaging
+   may have been lost.
+
+   Message:
+   disk_rebuild: processing VTOCE #XXX.
+
+   S:	$info
+
+   T:	$dskr
+
+   M:	This message indicates that a disk rebuild is progressing normally.
+   It is printed every 1000. VTOC entries.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: not enough free records (only XXX.) for increase (need YYY.)
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	An attempt was made to increase the size
+   of some partitions
+   or of the VTOC.
+   This required a decrease in the size of the paging region.
+   The paging region is too full to be shrunk as required.
+   The disk rebuild is aborted.
+
+   A:	Issue a different disk_rebuild command,
+   or bring up Multics and delete some segments from the pack before trying again.
+
+
+   Message:
+   disk_rebuild: same drive specified for source and copy, aborting
+
+   S:	$salvout
+
+   T:	During disk rebuilding
+
+   M:	The operator attempted to specify the same drive as input and output.
+   No action was taken.
+
+   A:	Enter a corrected command.
+
+
+   Message:
+   disk_rebuild: base of paging region changed from XXX. to YYY.
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	The base of the paging
+   region for the new pack is different from that for the old one.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: copying XXX. rec of part NAME
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	A disk rebuild is reformatting a pack
+   which contains non-paging partitions.
+   The contents of these partitions are copied exactly.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: Error writing label: ERRORMESS
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	A disk error has occurred writing the new label during a disk rebuild.
+   The disk rebuild is aborted.
+
+   A:	Correct the problem and issue a new command.
+
+
+   Message:
+   disk_rebuild: Summary of original disk contents follows:
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	A summary report of the volume parameters before rebuilding is printed.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: End of rebuilding. New summary report follows:
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	Rebuilding has completed.  A summary report of the new volume parameter
+   is printed.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: Summary Report
+   .br
+        Volume PVNAME of logical volume LVNAME.
+   .sp
+   Paging region begins at record DD. (WWo), for LL. (XXo) records.
+   .br
+   DD. (WWo) free records therein.
+   .br
+   Label/VTOC size is RR. records, MM. VTOCEs.
+   .br
+   VTOC version X., TTT. free VTOCEs.
+   .sp
+             Partition Map
+   .br
+   Name                Start               Length
+   .sp
+   NAME            DDD. (   WWWo)       DDD. (   WWWo)
+   .br
+                                      ______  _______
+   .br
+                                        DDD. (   WWWo)
+   .sp
+   Volume size is DDDD. (YYYYo) records total.
+   .sp
+             DD. damaged segments.
+
+   S:	$salvout
+
+   T:	During disk rebuilding.
+
+   M:	This is a report summarizing physical volume parameters printed by
+   the disk rebuilder both before and after rebuilding.
+   The partition map is omitted if no partitions are defined on the volume.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: Disk rebuild finished.
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	The disk rebuild has completed.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: vtocx XXXo NAME branch unconnected due to YYYo
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	This is debugging output
+   produced only if the debug switch is on
+   during a disk rebuild with branch checking.
+   It informs the system programmers of the
+   reasons for connection failure.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild:  Disk rebuild finished with errors: ERRORMESS
+
+   S:     $salvout
+
+   T:     $dskr
+
+   M:     The disk rebuild has been aborted due to the indicated ERRORMESS.
+
+   A:     $inform
+
+
+   Message:
+   disk_rebuild: Error from read_disk, aborting: ERRORMESS
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	$err
+   The disk rebuild is aborted.
+
+   A:	$inform
+
+
+   Message:
+   disk_rebuild: Error from write_disk, aborting: ERRORMESS
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	$err
+   The disk rebuild is aborted.
+
+   A:	$inform
+
+
+   Message:
+   disk_rebuild: out of room on vtocx XXXo, page YYYo
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	$err
+   The disk rebuild is aborted.
+
+   A:	$inform
+
+
+   Message:
+   disk_rebuild: reading vtocx XXXo: ERRORMESS
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	$err
+
+   A:	$inform
+
+
+   Message:
+   disk_rebuild: NN vtoces added to list of free vtoces.
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	NN free VTOC entries
+   were found while salvaging and added to the list of free VTOC entries.
+   This is a normal message.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: freeing deciduous vtocx XXXo: NAME
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   was deciduous, and has been deleted from the RPV.
+   This is debugging output
+   printed for system programmers
+   if a SALV DEBG card is supplied.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: freeing process vtocx XXXo: NAME
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   was per-process
+   and has been deleted.
+   This is debugging output
+   printed for system programmers
+   if a SALV DEBG card is used.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: Map of assigned addresses changed
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	If any corrections were made to the
+   map on the volume
+   which shows which addresses are free and which are in use,
+   this message is printed.
+   If the volume was not properly shut down, this message is to be expected.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: no. of free recs changed from OLD. to NEW.
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	If The number of free records
+   in the volume label
+   is changed by a volume salvage,
+   this message is printed.
+   If the volume was not properly shut down, this message is to be expected.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: no. of free vtoces changed from OLD. to NEW. 
+
+   S:	$salvout
+
+   T:	$dskr
+
+   M:	If the number of
+   free VTOC entries
+   in the volume label
+   is changed by a volume salvage,
+   this message is printed.
+
+   A:	$ignore
+
+
+   Message:
+   disk_rebuild: dskX_NN{s} must be mounted for rebuild.
+
+   S:     $salvout
+
+   T:	$dskr
+
+   M:	The "from" volume must be mounted for the rebuild.
+
+   A:	Mount the logical volume to which the "from" volume belongs
+   and try the rebuild abain.
+
+   Message:
+   disk_rebuild: dskX_NN{s} must not be mounted for rebuild.
+
+   S:     $salvout
+
+   T:	$dskr
+
+   M:	The "to" volume must not be mounted to the Storage System for
+   a rebuild.
+
+   A:     Demount the logical volume to which the volume belongs and retry
+   the rebuild.
+
+   Message:
+   disk_rebuild: Read error accessing VTOC Map of dskX_NN{s}
+
+   S:     $salvout
+
+   T:	$dskr
+
+   M:	$err
+   The rebuild is aborted.
+
+   A:     $inform
+
+   Message:
+   disk_rebuild: Cannot compress VTOC on dskX_NN{s} because active VTOCEs in the
+   truncated region.
+
+   S:     $salvout
+
+   T:     $dskr
+
+   M:     A rebuild was requested in which the number of VTOCEs on the new
+   volume was smaller than the number of VTOCEs on the old volume. This is
+   permitted only if there are no active VTOCEs in the truncated region
+   (that is, no active VTOCEs on the old volume have VTOCE indices which
+   would be too high for the new volume).
+
+   A:     Run sweep_pv -from num_vtoces
+   to remove these VTOCEs from the old volume and retry the rebuild. It
+   may be necessary to salvage the volume to recover lost VTOCEs in the
+   truncated region.
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end disk_rebuild;

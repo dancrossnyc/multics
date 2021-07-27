@@ -1,0 +1,509 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1986 *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-12-05,RBarstad), approve(86-12-11,MCR7585),
+     audit(87-08-05,Gilcrease), install(87-08-07,MR12.1-1075):
+     Created.
+                                                   END HISTORY COMMENTS */
+
+/* format: style3,^ifthenstmt,indthenelse,^indnoniterdo,^indprocbody,initcol3,dclind5,idind32 */
+ws_tty_mgr_:
+     proc ();
+     return;
+
+/* ------------------------  DESCRIPTION  ---------------------------------- */
+
+/****^ VERSION 1.36
+							
+     management entries for ws_tty_
+ 							
+*/
+%page;
+/* ------------------------  PARAMETERS  ----------------------------------- */
+
+dcl  I_iocb_ptr		       parm ptr;		/* iocb ptr input */
+dcl  O_iocb_ptr		       parm ptr;		/* iocb ptr output */
+dcl  I_flags		       parm bit (9);	/* control msg flags */
+dcl  I_msg_id		       parm char (3);
+dcl  I_msg_data_ptr		       parm ptr;
+dcl  I_msg_data_size	       parm fixed bin (21);
+dcl  O_msg_id		       parm char (3);	/* actual id returned from WSTERM */
+dcl  O_msg_data_size	       parm fixed bin (21);	/* actual data size read from WSTERM */
+dcl  O_code		       fixed bin (35) parm;
+
+/* ------------------------  AUTOMATIC  ------------------------------------ */
+
+dcl  n_chars_actually_read	       fixed bin (21);
+dcl  iocb_ptr		       ptr;		/* local copy */
+dcl  flags		       bit (9);		/* local copy */
+dcl  event_code		       fixed bin (35);
+dcl  code			       fixed bin (35);	/* error code */
+dcl  offset_msg_data_ptr             pointer;
+dcl  retval		       fixed bin (35);
+dcl  saved_mask		       bit (36) aligned;	/* saved ips mask */
+dcl  total_chars_read                fixed bin (21);
+dcl  unmask_count                    fixed bin;
+dcl  count                           fixed bin;
+
+dcl  1 saved_mask_bit	       aligned based (addr (saved_mask)),
+       2 interrupts		       bit (35) unaligned,
+       2 control		       bit (1) unaligned;
+
+dcl  1 ws_send_msg		       aligned,		/* sent by "send message" control */
+       2 type		       fixed bin (8) unaligned, /* foreground or background */
+       2 id		       char (3) unaligned,	/* one of ws_control_ids */
+       2 flags		       bit (9) unaligned,
+       2 data_size		       fixed bin (8) unaligned,
+       2 message_data	       char (MAX_SEND_MSG_SIZE) unaligned;
+						/* longest message */
+
+dcl  1 ws_control_msg	       aligned,		/* for iox put&get chars */
+       2 id		       char (3) unaligned,	/* one of ws_control_ids */
+       2 data_size_hi	       fixed bin (8) unaligned,
+       2 data_size_lo	       fixed bin (8) unaligned;
+
+dcl  ws_message_ptr		       ptr;
+dcl  ws_message_length	       fixed bin (21);
+
+dcl  1 mio_message		       like mowse_io_message;
+
+/* ------------------------  BASED  ---------------------------------------- */
+
+dcl  msg_data_ptr		       ptr;		/* local copy of I_msg_data_ptr */
+dcl  msg_data_size		       fixed bin (21);	/* local copy of I_msg_data_size */
+dcl  msg_data		       char (msg_data_size) based (msg_data_ptr);
+						/* caller's string */
+dcl  based_chars                     (0:total_chars_read) char (1) based unaligned;  /* to bump read ptr */
+
+/* ------------------------  CONSTANTS  ------------------------------------ */
+
+dcl  (
+     ME			       char (11) init ("ws_tty_mgr_"),
+     BYTE_SIZE		       fixed bin init (256),
+     DIALED_UP		       fixed bin init (5),	/* tty_state */
+     IGNORE		       fixed bin init (1),	/* tty_state */
+     FALSE		       bit (1) init ("0"b),
+     TRUE			       bit (1) init ("1"b),
+     MAX_SEND_MSG_SIZE	       fixed bin (21) init (255),
+     ZERO_IPS_MASK		       bit (36) init ((36)"0"b),
+     SEND_MSG_OVERHEAD	       fixed bin init (6),	/* 8K - longest string size */
+     CONTROL_MSG_OVERHEAD	       fixed bin (21) init (5)/* 8K - longest string size */
+     )			       internal static options (constant);
+
+/* ------------------------  EXTERNALS  ------------------------------------ */
+
+dcl  (
+     error_table_$no_iocb,
+     error_table_$no_operation,
+     error_table_$io_no_permission,
+     error_table_$unable_to_do_io
+     )			       fixed bin (35) external static;
+
+/* ------------------------  ENTRIES  -------------------------------------- */
+
+dcl  hcs_$set_ips_mask	       entry (bit (36) aligned, bit (36) aligned);
+dcl  hcs_$reset_ips_mask	       entry (bit (36) aligned, bit (36) aligned);
+dcl  ipc_$mask_ev_calls              entry (fixed bin(35));
+dcl  ipc_$unmask_ev_calls            entry (fixed bin(35));
+dcl  iox_$control		       entry (ptr, char (*), ptr, fixed bin (35));
+dcl  iox_$get_chars		       entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$put_chars		       entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl  sub_err_		       entry () options (variable);
+dcl  ws_trace_		       entry () options (variable);
+
+/* ------------------------  BUILTINS and CONDITIONS  ---------------------- */
+
+dcl  (addr, max, min, null, substr)  builtin;
+dcl  (any_other, cleanup)	       condition;
+
+%page;
+/* ------------------------  PROGRAM  -------------------------------------- */
+
+send_message:
+     entry (I_iocb_ptr, I_msg_id, I_flags, I_msg_data_ptr, I_msg_data_size);
+
+     iocb_ptr = I_iocb_ptr;
+     ws_send_msg.id = I_msg_id;
+     flags = I_flags;
+     msg_data_ptr = I_msg_data_ptr;
+     msg_data_size = I_msg_data_size;
+
+     mowse_io_data_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+     ws_send_msg.type = FG_CONTROL_MESSAGE;
+
+     if msg_data_ptr = null
+	then do;					/* no data */
+	     msg_data_size = 0;
+	     ws_send_msg.data_size = 0;
+	     ws_send_msg.flags = WS_FLAG_NONE;
+	     ws_send_msg.message_data = "";
+
+	     if ws_tty_data$Flags.Trace
+		then call ws_trace_ (" ^a$send_message: ID= ^a, no data.", ME, ws_send_msg.id);
+
+	end;
+	else do;
+	     if ws_tty_data$Flags.Trace
+		then call ws_trace_ (" ^a$send_message: ID= ^a, size= ^i, '^a'.", ME, ws_send_msg.id, msg_data_size,
+			msg_data);
+
+	     if msg_data_size > MAX_SEND_MSG_SIZE
+		then call sub_err_ (code, "ws_tty_mgr_$send_message", ACTION_CANT_RESTART, sub_error_info_ptr, retval,
+			"String size of ^i too large for internal buffers.", msg_data_size);
+
+	     ws_send_msg.data_size = msg_data_size;
+	     ws_send_msg.flags = flags;
+	     ws_send_msg.message_data = msg_data;
+	end;
+
+     mio_message.version = mowse_io_info_version_1;
+     mio_message.channel = FG;
+     mio_message.io_message_ptr = addr (ws_send_msg);
+     mio_message.io_message_len = msg_data_size + SEND_MSG_OVERHEAD;
+     mowse_io_message_ptr = addr (mio_message);
+
+/**** BEGIN IO SECTION ****/
+     event_code = 0;
+     unmask_count = 0;
+     saved_mask = ZERO_IPS_MASK;
+     on cleanup call cleanup_handler;
+     on any_other call any_other_handler;
+     call hcs_$set_ips_mask (mowse_io_data.ws.ips_mask, saved_mask);
+     do while (event_code = 0);
+	call ipc_$unmask_ev_calls (event_code);
+	unmask_count = unmask_count +1;
+     end;
+
+     call iox_$control (iocb_ptr, "send_message", mowse_io_message_ptr, code);
+
+     if saved_mask_bit.control
+	then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+     do count = 2 to unmask_count;
+	call ipc_$mask_ev_calls (0); end;
+     revert any_other, cleanup;
+/**** END IO SECTION ****/
+
+     if code ^= 0
+	then call sub_err_ (code, "ws_tty_mgr_$send_message", ACTION_CANT_RESTART, sub_error_info_ptr, retval,
+		"Attempting to write to iocb ^p via iox_$put_chars.", iocb_ptr);
+
+     return;
+%page;
+/* ------------------------------------------------------------------------- */
+
+send_text:
+     entry (I_iocb_ptr, I_msg_data_ptr, I_msg_data_size);
+
+     iocb_ptr = I_iocb_ptr;
+     msg_data_ptr = I_msg_data_ptr;
+     msg_data_size = I_msg_data_size;
+
+     mowse_io_data_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+     if msg_data_ptr = null
+	then do;					/* no data */
+	     msg_data_size = 0;
+
+	     if ws_tty_data$Flags.Trace
+		then call ws_trace_ (" ^a$send_text: no data.", ME);
+
+	end;
+	else do;
+	     if ws_tty_data$Flags.Trace
+		then call ws_trace_ (" ^a$send_text: size= ^i, '^a'.", ME, msg_data_size, msg_data);
+	end;
+
+/**** BEGIN IO SECTION ****/
+     event_code = 0;
+     unmask_count = 0;
+     saved_mask = ZERO_IPS_MASK;
+     on cleanup call cleanup_handler;
+     on any_other call any_other_handler;
+     call hcs_$set_ips_mask (mowse_io_data.ws.ips_mask, saved_mask);
+     do while (event_code = 0);
+	call ipc_$unmask_ev_calls (event_code);
+	unmask_count = unmask_count +1;
+     end;
+
+     call iox_$put_chars (iocb_ptr, msg_data_ptr, msg_data_size, code);
+
+     if saved_mask_bit.control
+	then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+     do count = 2 to unmask_count;
+	call ipc_$mask_ev_calls (0); end;
+     revert any_other, cleanup;
+/**** END IO SECTION ****/
+
+     if code ^= 0
+	then call sub_err_ (code, "ws_tty_mgr_$send_text", ACTION_CANT_RESTART, sub_error_info_ptr, retval,
+		"Attempting to write to iocb ^p via iox_$put_chars.", iocb_ptr);
+
+     return;
+%page;
+/* ------------------------------------------------------------------------- */
+
+get_message:
+     entry (I_iocb_ptr, I_msg_data_ptr, I_msg_data_size, O_msg_data_size, O_msg_id);
+
+     iocb_ptr = I_iocb_ptr;
+     msg_data_size = I_msg_data_size;
+     msg_data_ptr = I_msg_data_ptr;
+
+     mowse_io_data_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ (" ^a$get_message: iocb ptr= ^p, size= ^i, data ptr= ^p.", ME, iocb_ptr, msg_data_size,
+		msg_data_ptr);
+
+     ws_message_ptr = addr (ws_control_msg);
+
+/* init */
+     n_chars_actually_read = 0;
+     ws_control_msg.id = " ";
+     ws_control_msg.data_size_lo = 0;
+     ws_control_msg.data_size_hi = 0;
+     total_chars_read = 0;
+
+/* read the control id and count */
+     call get_ws_chars (ws_message_ptr, CONTROL_MSG_OVERHEAD, n_chars_actually_read);
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ (" ^a$get_message: ID received= ^a, size= ^i, hi&lo= ^i, ^i.", ME, ws_control_msg.id,
+		n_chars_actually_read, ws_control_msg.data_size_hi, ws_control_msg.data_size_lo);
+     ws_message_length = ws_control_msg.data_size_lo + ws_control_msg.data_size_hi * BYTE_SIZE;
+
+/* read the actual input chars */
+     if ws_message_length = 0
+	then O_msg_data_size = 0;
+	else do;
+	     call get_ws_chars (msg_data_ptr, min (ws_message_length, msg_data_size), n_chars_actually_read);
+	     if ws_tty_data$Flags.Trace
+		then call ws_trace_ (" ^a$get_message: #chars received= ^i, chars= '^a'.", ME, n_chars_actually_read,
+			substr (msg_data, 1, max (1, n_chars_actually_read)));
+
+	     if ws_message_length > msg_data_size
+		then do;
+		if ws_tty_data$Flags.Trace then do;
+		    call ws_trace_ (" ^a$get_message sub_err_: ws_message_length(^i) > msg_data_size(^i)", ME, ws_message_length, msg_data_size);
+		    call ws_trace_ (" ^a$get_message sub_err_: ID=^a, hi&lo=^i&^i.", 
+		         ME, ws_control_msg.id, ws_control_msg.data_size_hi, ws_control_msg.data_size_lo);
+		    call ws_trace_ (" ^a$get_message sub_err_: #chars read=^i, chars='^a'.", 
+		         ME, n_chars_actually_read, substr (msg_data, 1, max (1, n_chars_actually_read)));
+		    end /* Trace */;
+		    call sub_err_ (error_table_$no_operation, "ws_tty_mgr_$get_message", ACTION_CANT_RESTART,
+			sub_error_info_ptr, retval, "Input truncated to fit caller's buffer.");
+	         end;
+
+	     total_chars_read = n_chars_actually_read;
+	     do while (total_chars_read < ws_message_length); /* message got split up into packets */
+		offset_msg_data_ptr = addr (msg_data_ptr -> based_chars (total_chars_read));
+		call get_ws_chars (offset_msg_data_ptr, (ws_message_length-total_chars_read), n_chars_actually_read);
+		total_chars_read = total_chars_read + n_chars_actually_read;
+	     end;
+
+	     O_msg_data_size = total_chars_read;
+	end;
+
+     O_msg_id = ws_control_msg.id;
+
+     return;
+%page;
+/* ------------------------------------------------------------------------- */
+
+have_wsterm:
+     entry (I_iocb_ptr, O_tty_state, O_code) returns (bit (1));
+
+/* checks to see if WSTERM is connected */
+/*  if it is, returns TRUE and sets tty_state to DIALED_UP */
+/*  if it is not, returns FALSE, sets tty_state to IGNORE, and sets code to error_table_$io_no_permission */
+
+dcl  O_tty_state		       fixed bin parm;
+dcl  internal_ws_state_ptr	       ptr;
+dcl  1 internal_ws_state	       aligned like mowse_io_terminal_state;
+
+     O_code = 0;
+
+     iocb_ptr = I_iocb_ptr;
+
+     internal_ws_state.version = mowse_io_info_version_1;
+     internal_ws_state_ptr = addr (internal_ws_state);
+
+     call iox_$control (iocb_ptr, "get_terminal_emulator_state", internal_ws_state_ptr, code);
+
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ (" ^a$have_wsterm: terminal_emulator_state = ^b, code= ^i.", ME, internal_ws_state.state,
+		code);
+
+     if code ^= 0
+	then do;
+	     O_tty_state = 0;
+	     O_code = code;
+	     return (FALSE);
+	end;
+
+     if internal_ws_state.state = FALSE
+	then do;
+	     O_tty_state = IGNORE;
+	     O_code = error_table_$io_no_permission;
+	end;
+	else /* state = TRUE */
+	     O_tty_state = DIALED_UP;
+
+     return (internal_ws_state.state);
+%page;
+/* ------------------------------------------------------------------------- */
+
+ok_iocb:
+     entry (I_iocb_ptr, O_iocb_ptr, O_attach_data_ptr, O_code) returns (bit (1));
+
+/* checks the iocb_ptr and returns the actual ptr and the attach_data_ptr */
+/* returns TRUE if all ok */
+
+dcl  O_attach_data_ptr	       ptr parm;
+
+     O_iocb_ptr, O_attach_data_ptr = null;
+
+     if I_iocb_ptr = null
+	then goto no_iocb;
+
+     O_iocb_ptr = I_iocb_ptr -> iocb.actual_iocb_ptr;
+
+     if O_iocb_ptr = null
+	then goto no_iocb;
+
+     O_attach_data_ptr = O_iocb_ptr -> iocb.attach_data_ptr;
+
+     if ws_tty_data$Flags.Trace
+	then do;
+	     call ws_trace_ (
+		" ^a$ok_iocb(TRUE): I_iocb_ptr=^p, O_iocb_ptr=^p, O_attach_data_ptr=^p, iocb.name=^a, open_descrip=^a.",
+		ME, I_iocb_ptr, O_iocb_ptr, O_attach_data_ptr, O_iocb_ptr -> iocb.name,
+		O_attach_data_ptr -> mowse_io_data.open_descrip);
+	end;
+
+     O_code = 0;
+     return (TRUE);
+
+no_iocb:
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ (" ^a$ok_iocb(FALSE):I_iocb_ptr=^p, O_iocb_ptr=^p.", ME, I_iocb_ptr, O_iocb_ptr);
+
+     O_code = error_table_$no_iocb;
+     return (FALSE);
+
+/* ------------------------  END PROGRAM  ---------------------------------- */
+%page;
+/* ------------------------  INTERNAL PROCEDURES  -------------------------- */
+
+get_ws_chars:
+     proc (buffer_ptr, n_chars_to_read, n_chars_returned);
+
+dcl  buffer_ptr		       ptr parm;
+dcl  n_chars_to_read	       fixed bin (21) parm;
+dcl  n_chars_returned	       fixed bin (21) parm;
+
+/**** BEGIN IO SECTION ****/
+     event_code = 0;
+     unmask_count = 0;
+     saved_mask = ZERO_IPS_MASK;
+     on cleanup call cleanup_handler;
+     on any_other call any_other_handler;
+     call hcs_$set_ips_mask (mowse_io_data.ws.ips_mask, saved_mask);
+     do while (event_code = 0);
+	call ipc_$unmask_ev_calls (event_code);
+          unmask_count = unmask_count +1;
+     end;
+
+     call iox_$get_chars (iocb_ptr, buffer_ptr, n_chars_to_read, n_chars_returned, code);
+
+     if saved_mask_bit.control
+	then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+     do count = 2 to unmask_count;
+	call ipc_$mask_ev_calls (0); end;
+     revert any_other, cleanup;
+/**** END IO SECTION ****/
+
+     if code ^= 0
+	then call sub_err_ (code, "ws_tty_mgr_$get_message", ACTION_CANT_RESTART, sub_error_info_ptr, retval,
+		"Attempting to read from iocb ^p via iox_$get_chars.", iocb_ptr);
+
+     return;
+     end get_ws_chars;
+%page;
+/* ------------------------------------------------------------------------- */
+
+cleanup_handler:
+     proc;
+
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ ("  ^a$cleanup_handler :saved_mask=^o.", ME, saved_mask);
+
+     if saved_mask_bit.control
+	then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+     do count = 2 to unmask_count;
+	call ipc_$mask_ev_calls (0);
+	end;
+
+     return;
+     end cleanup_handler;
+%page;
+/* ------------------------------------------------------------------------- */
+
+any_other_handler:
+     proc;
+
+dcl  1 ci			       aligned like condition_info;
+dcl  find_condition_info_	       entry (ptr, ptr, fixed bin (35));
+dcl  continue_to_signal_	       entry (fixed bin (35));
+
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ ("  ^a$any_other_handler :saved_mask=^o.", ME, saved_mask);
+
+     if saved_mask_bit.control
+	then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+     do count = 2 to unmask_count;
+	call ipc_$mask_ev_calls (0);
+	end;
+
+     ci.version = 1;
+     call find_condition_info_ (null (), addr (ci), (0));
+
+     if ws_tty_data$Flags.Trace
+	then call ws_trace_ ("  ^a$any_other_handler: condition_name=^a.", ME, ci.condition_name);
+
+     call continue_to_signal_ ((0));
+
+     return;
+     end any_other_handler;
+%page;
+/* ------------------------  INCLUDES  ------------------------------------- */
+
+%include ws_control_ids;
+%page;
+%include ws_tty_data;
+%page;
+%include mowse_io_control_info;
+%page;
+%include mowse;
+%page;
+%include mowse_messages;
+%page;
+%include sub_err_flags;
+%page;
+%include sub_error_info;
+%page;
+%include condition_info_header;
+%page;
+%include condition_info;
+%page;
+%include iocb;
+%page;
+%include mowse_io_data;
+
+     end ws_tty_mgr_;

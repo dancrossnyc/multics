@@ -1,0 +1,1856 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-13,GWMay), approve(86-02-13,MCR7337), audit(86-03-11,Farley),
+     install(86-03-17,MR12.0-1030):
+     old history comments:
+         Written May to July 1982 by Chris Jones.
+         Various bugfixes by Chris Jones, December 1982 to November 1983.
+         Modified 1985-03-14, BIM: set code right on blank tape.
+         Modified 04/25/85 by Chris Jones to properly ignore extra statuses.
+         Modified 05/02/85 by Chris Jones to set code (NOT result) to
+                       error_table_$blank_tape.
+  2) change(86-02-13,GWMay), approve(86-02-13,MCR7337), audit(86-03-11,Farley),
+     install(86-03-17,MR12.0-1030):
+     removed a section of code from the end of "missing_statuses" which checked
+     for the initiate bit to be on and set the status index up by 1. This code
+     would not always work with the FIPS tape drives.
+                                                   END HISTORY COMMENTS */
+
+
+/* This is where all the tape tape_ioi_ I/O is done.  There are entries to read, write, perform
+   random order commands, and check on any of the preceding. */
+
+/* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+tape_ioi_io:
+     proc;
+
+/**** NOTE
+      This program uses the "code" output argument ambiguously.
+      For some entrypoints, such as check_write, code will be set
+      nonzero even though the other output arguments are valid.
+      In particular, check_write will return code = error_table_$device_end
+      AND TAPE_IO_EOT when the EOT reflector is detected on write. */
+
+/* Parameters */
+
+dcl	p_buffer_data_ptr	   ptr parameter;		/* (I/O) pointer to  the data to be or just processed */
+dcl	p_code		   fixed bin (35) parameter;	/* (O) system status code */
+dcl	p_icount		   fixed bin parameter;	/* (I) count of orders to be done */
+dcl	p_ocount		   fixed bin parameter;	/* (O) count of orders actually done */
+dcl	p_data_len	   fixed bin (21) parameter;	/* (I/O) data count in characters */
+dcl	p_order_data_ptr	   ptr parameter;		/* (I) data area for order commands */
+dcl	p_order		   char (4) parameter;	/* (I) the order to be performed */
+dcl	p_result_idx	   fixed bin parameter;	/* (O) encoding of relative success of operation */
+dcl	p_tioi_id		   bit (36) aligned parameter;/* (I) tape_ioi_ activation ID */
+dcl	p_write_buffers	   (*) ptr parameter;	/* (I) list of buffers to write */
+
+/* Automatic variables */
+
+dcl	auto_special_status	   bit (36) aligned;
+dcl	buffer_idx	   fixed bin;
+dcl	buffer_ptr	   ptr;
+dcl	code		   fixed bin (35);
+dcl	device_command	   bit (6);
+dcl	idcw_idx		   fixed bin;
+dcl	lost_statuses	   fixed bin;
+dcl	next_buffer_offset	   fixed bin (18) unsigned unaligned;
+dcl	recovery_strategy	   fixed bin (3) unsigned;
+dcl	semi_queued_offset	   fixed bin (18) unsigned unaligned;
+dcl	status_class	   char (2);
+dcl	status_present	   bit (1) aligned;
+
+/* Static storage */
+
+dcl	order_mnemonics	   (0:21) char (4) static options (constant)
+			   init ("rdy", "bsf", "bsr", "fsf", "fsr", "eof", "ers", "dse", "rew", "run", "lod", "rqs",
+			   "rss", "rqd", "rsd", "den", "per", "pro", "rsv", "rel", "rcr", "wcr");
+
+dcl	order_commands	   (0:21) bit (6) static options (constant)
+			   init ("00"b3, "47"b3, "46"b3, "45"b3, "44"b3, "55"b3, "54"b3, "73"b3, "70"b3, "72"b3,
+			   "75"b3, "00"b3, "40"b3, "50"b3, "51"b3, "77"b3, "63"b3, "62"b3, "66"b3, "67"b3, "26"b3,
+			   "16"b3);
+
+dcl	densities		   (5) fixed bin static options (constant) init (200, 556, 800, 1600, 6250);
+dcl	density_commands	   (5) bit (6) static options (constant) init ("64"b3, "61"b3, "60"b3, "65"b3, "41"b3);
+
+dcl	BITS_PER_BYTE	   fixed bin static options (constant) init (9);
+dcl	BITS_PER_CHAR	   fixed bin static options (constant) init (6);
+dcl	BITS_PER_WORD	   fixed bin static options (constant) init (36);
+dcl	BYTES_PER_DCW_TALLY	   fixed bin static options (constant) init (16384);
+dcl	BYTES_PER_WORD	   fixed bin static options (constant) init (4);
+dcl	CHARS_PER_WORD	   fixed bin static options (constant) init (6);
+dcl	ORDERS_PER_IDCW_TALLY  fixed bin static options (constant) init (64);
+dcl	WORDS_PER_DCW_TALLY	   fixed bin static options (constant) init (4096);
+
+dcl	TIMEOUT_IO	   fixed bin (71) static options (constant) init (30000000);
+dcl	TIMEOUT_ORDER	   fixed bin (71) static options (constant) init (10000000);
+dcl	TWENTY_SECONDS	   fixed bin (71) static options (constant) init (20000000);
+dcl	MAX_RETRY_COUNT	   fixed bin static options (constant) init (10);
+
+/* Externals */
+
+dcl	ioi_$connect	   entry (fixed bin, fixed bin (18), fixed bin (35));
+dcl	ioi_$get_detailed_status
+			   entry (fixed bin, bit (1) aligned, bit (216), fixed bin (35));
+dcl	ioi_$get_special_status
+			   entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+dcl	ioi_$timeout	   entry (fixed bin, fixed bin (71), fixed bin (35));
+dcl	ipc_$drain_chn	   entry (fixed bin (71), fixed bin (35));
+dcl	tape_ioi_buffer_man$internal_set_buffer_ready
+			   entry (ptr, ptr);
+dcl	tape_ioi_error_retry   entry (ptr, ptr, ptr, fixed bin (35));
+dcl	tape_ioi_error_retry$backspace
+			   entry (ptr, ptr, ptr, fixed bin, fixed bin (35));
+dcl	tape_ioi_error_retry$eof
+			   entry (ptr, fixed bin (35));
+dcl	tape_ioi_hardware_status$hardware_status
+			   entry (bit (36) aligned, ptr, fixed bin (35));
+dcl	tape_ioi_utils$get_buffer_ptr
+			   entry (ptr, ptr) returns (ptr);
+dcl	tape_ioi_utils$get_status
+			   entry (ptr) returns (ptr);
+dcl	tape_ioi_utils$get_status_class
+			   entry (ptr) returns (char (2));
+dcl	tape_ioi_utils$get_workspace_ptr
+			   entry (bit (36) aligned, ptr);
+dcl	tape_ioi_utils$io_in_progress
+			   entry (ptr) returns (bit (1) aligned);
+
+dcl	error_table_$action_not_performed
+			   fixed bin (35) ext static;
+dcl	error_table_$bad_arg   fixed bin (35) ext static;
+dcl	error_table_$bad_density
+			   fixed bin (35) ext static;
+dcl	error_table_$blank_tape
+			   fixed bin (35) ext static;
+dcl	error_table_$buffer_invalid_state
+			   fixed bin (35) ext static;
+dcl	error_table_$device_active
+			   fixed bin (35) ext static;
+dcl	error_table_$device_attention
+			   fixed bin (35) ext static;
+dcl	error_table_$device_code_alert
+			   fixed bin (35) ext static;
+dcl	error_table_$device_end
+			   fixed bin (35) ext static;
+dcl	error_table_$device_not_active
+			   fixed bin (35) ext static;
+dcl	error_table_$device_parity
+			   fixed bin (35) ext static;
+dcl	error_table_$invalid_state
+			   fixed bin (35) ext static;
+dcl	error_table_$invalid_tape_record_length
+			   fixed bin (35) ext static;
+dcl	error_table_$lost_device_position
+			   fixed bin (35) ext static;
+dcl	error_table_$no_operation
+			   fixed bin (35) ext static;
+dcl	error_table_$unexpected_device_status
+			   fixed bin (35) ext static;
+
+/* Builtins */
+
+dcl	(addr, addrel, bin, bit, clock, divide, hbound, lbound, min, mod, null, ptr, rel, size, string, substr, unspec)
+			   builtin;
+
+/* Vanilla operations.  They simply call the queue_* and check_* entries. */
+order:
+     entry (p_tioi_id, p_order, p_icount, p_order_data_ptr, p_ocount, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	call setup;
+	call queue_order_proc (p_order, p_icount, p_order_data_ptr, code);
+	if code = 0 then
+	     call check_order_proc (p_ocount, p_result_idx, code);
+	else p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;
+	p_code = code;
+	return;
+
+read:
+     entry (p_tioi_id, p_buffer_data_ptr, p_data_len, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	call setup;
+	semi_queued_offset = 0;
+	do buffer_ptr = ptr (wksp, tai.free_list_offset) repeat ptr (wksp, next_buffer_offset)
+	     while (rel (buffer_ptr) ^= ""b & code = 0);
+	     next_buffer_offset = buffer_ptr -> tbi.next_state_offset;
+	     if ^buffer_ptr -> tbi.reserved then do;
+		call queue_read_proc (buffer_ptr, code);
+		if code = 0 then
+		     tai.total_reads = tai.total_reads + 1;
+	     end;
+	end;
+	call run ("0"b, code);			/* kick if necessary */
+	if code = 0 then
+	     call check_read_proc (p_buffer_data_ptr, p_data_len, p_result_idx, code);
+	else p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;
+	p_code = code;
+	return;
+
+write:
+     entry (p_tioi_id, p_write_buffers, p_data_len, p_buffer_data_ptr, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	p_buffer_data_ptr = null ();
+	call setup;
+	semi_queued_offset = 0;
+
+/* Queue any suspended buffers. */
+
+	do buffer_ptr = ptr (wksp, susp_list_offset) repeat ptr (wksp, next_buffer_offset)
+	     while (rel (buffer_ptr) ^= ""b & code = 0);
+	     next_buffer_offset = buffer_ptr -> tbi.next_state_offset;
+	     call queue_write_proc (buffer_ptr, buffer_ptr -> tbi.buffer_len, code);
+	end;
+	if code ^= 0 then do;
+QUEUE_WRITE_ERROR:
+	     call run ("1"b, (0));
+	     p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;
+	     call quit (code);
+	end;
+
+/* Now queue any buffers the caller passed us. */
+
+	do buffer_idx = lbound (p_write_buffers, 1) to hbound (p_write_buffers, 1) while (code = 0);
+	     if p_write_buffers (buffer_idx) ^= null () then do;
+		buffer_ptr = tape_ioi_utils$get_buffer_ptr (wksp, p_write_buffers (buffer_idx));
+		if buffer_ptr = null () then
+		     code = error_table_$bad_arg;
+		else do;
+		     buffer_ptr -> tbi.modes = tai.modes;
+		     call queue_write_proc (buffer_ptr, p_data_len, code);
+		     if code = 0 then
+			tai.total_writes = tai.total_writes + 1;
+		end;
+	     end;
+	end;
+	if code ^= 0 then
+	     goto QUEUE_WRITE_ERROR;
+	call run ("1"b, (0));
+
+/* Now return a pointer to a ready buffer */
+
+	if tai.free_list_offset ^= 0 then do;
+	     p_result_idx = TAPE_IO_SUCCESS;
+	     p_buffer_data_ptr = ptr (wksp, ptr (wksp, tai.free_list_offset) -> tbi.data_offset);
+	end;
+	else call check_write_proc (p_buffer_data_ptr, p_result_idx, p_code);
+	return;
+
+/* The basic queueing and checking entries */
+
+queue_order:
+     entry (p_tioi_id, p_order, p_icount, p_order_data_ptr, p_code);
+
+	call setup;
+	call queue_order_proc (p_order, p_icount, p_order_data_ptr, p_code);
+	return;
+
+check_order:
+     entry (p_tioi_id, p_ocount, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	call setup;
+	call check_order_proc (p_ocount, p_result_idx, p_code);
+	return;
+
+queue_read:
+     entry (p_tioi_id, p_buffer_data_ptr, p_code);
+
+	call setup;
+	semi_queued_offset = 0;
+	buffer_ptr = tape_ioi_utils$get_buffer_ptr (wksp, p_buffer_data_ptr);
+	if buffer_ptr ^= null () then do;
+	     call queue_read_proc (buffer_ptr, p_code);
+	     if p_code = 0 then
+		tai.total_reads = tai.total_reads + 1;
+	end;
+	else p_code = error_table_$bad_arg;
+	call run ("0"b, (0));
+	return;
+
+check_read:
+     entry (p_tioi_id, p_buffer_data_ptr, p_data_len, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	call setup;
+	call check_read_proc (p_buffer_data_ptr, p_data_len, p_result_idx, p_code);
+	return;
+
+queue_write:
+     entry (p_tioi_id, p_buffer_data_ptr, p_data_len, p_code);
+
+	call setup;
+	semi_queued_offset = 0;
+	buffer_ptr = tape_ioi_utils$get_buffer_ptr (wksp, p_buffer_data_ptr);
+	if buffer_ptr ^= null () then do;
+	     call queue_write_proc (buffer_ptr, p_data_len, p_code);
+	     if p_code = 0 then
+		tai.total_writes = tai.total_writes + 1;
+	end;
+	else p_code = error_table_$bad_arg;
+	call run ("1"b, (0));
+	return;
+
+check_write:
+     entry (p_tioi_id, p_buffer_data_ptr, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	call setup;
+	call check_write_proc (p_buffer_data_ptr, p_result_idx, p_code);
+	return;
+
+/* Entry to stop all tape motion. */
+
+stop_tape:
+     entry (p_tioi_id, p_ocount, p_result_idx, p_code);
+
+	p_result_idx = TAPE_IO_USER_PROGRAM_ERROR;	/* in case setup doesn't return */
+	call setup;
+
+/* First see if nothing is going on.  It's not an error to call us in this case. */
+
+	if ^tape_ioi_utils$io_in_progress (wksp) then do;
+	     p_ocount = 0;
+	     p_result_idx = TAPE_IO_SUCCESS;
+	     return;
+	end;
+
+/* Something's happening.  We have to handle orders (both in order_idcw and in order_data), and queued I/O. */
+
+	addr (tai.order_idcw) -> idcw.control = "00"b;
+	do idcw_idx = lbound (tai.order_data, 1) to hbound (tai.order_data, 1);
+	     idcwp = addr (tai.order_data (idcw_idx));
+	     if idcw.code = "111"b then		/* don't hammer non-IDCWs */
+		idcw.control = "00"b;
+	end;
+
+/* Now handle all queued buffers */
+
+	do buffer_ptr = ptr (wksp, queue_list_offset) repeat ptr (wksp, buffer_ptr -> tbi.next_state_offset)
+	     while (rel (buffer_ptr) ^= ""b);
+	     addr (buffer_ptr -> tbi.idcw_word) -> idcw.control = "00"b;
+	end;
+
+/* We've set it up so that we'll stop when the next IDCW is fetched, or the operation finishes.
+   Now, just hang on 'til the tape stops. */
+
+	if ^tai.order_queued then
+	     tai.order_count_done = 0;
+
+	do while ("1"b);
+	     call get_status (tai.modes.wait, STOP_TAPE_MAKE_CALLER_WAIT);
+	     idcwp = ptr (wksp, bin (substr (istat.lpw, 1, 18)) - 1);
+	     statp = addr (istat.iom_stat);
+	     if tai.order_queued then
+		tai.order_count_done = tai.order_count_done + bin (idcw.count) - bin (status.rcount);
+	     else tai.order_count_done = tai.order_count_done + 1;
+	     if ^istat.run then do;
+		p_ocount = tai.order_count_done;
+		p_result_idx = TAPE_IO_SUCCESS;
+		do buffer_ptr = ptr (wksp, queue_list_offset) repeat ptr (wksp, next_buffer_offset)
+		     while (rel (buffer_ptr) ^= ""b);
+		     next_buffer_offset = buffer_ptr -> tbi.next_state_offset;
+		     call tape_ioi_buffer_man$internal_set_buffer_ready (wksp, buffer_ptr);
+		end;
+		do buffer_ptr = ptr (wksp, susp_list_offset) repeat ptr (wksp, next_buffer_offset)
+		     while (rel (buffer_ptr) ^= ""b);
+		     next_buffer_offset = buffer_ptr -> tbi.next_state_offset;
+		     call tape_ioi_buffer_man$internal_set_buffer_ready (wksp, buffer_ptr);
+		end;
+		tai.order_queued, tai.read_queued, tai.write_queued = "0"b;
+		return;
+	     end;
+	end;
+
+STOP_TAPE_MAKE_CALLER_WAIT:
+	p_ocount = 0;
+	p_result_idx = TAPE_IO_BLOCK;
+	return;
+
+queue_order_proc:
+     proc (order, count, data_ptr, code);
+
+dcl	code		   fixed bin (35) parameter;
+dcl	count		   fixed bin parameter;
+dcl	data_ptr		   ptr parameter;
+dcl	order		   char (4) parameter;
+
+dcl	order_idx		   fixed bin;
+
+	if tape_ioi_utils$io_in_progress (wksp) then do;
+	     code = error_table_$device_active;
+	     return;
+	end;
+	idcwp = addr (tai.order_idcw);
+	idcw.control = "00"b;			/* in case retries of an EOF had happened */
+
+	do order_idx = hbound (order_mnemonics, 1) to lbound (order_mnemonics, 1) by -1
+	     while (order_mnemonics (order_idx) ^= order);
+	end;
+	goto QUEUE_ORDER (order_idx);
+
+QUEUE_ORDER (-1):					/* unknown order */
+	code = error_table_$no_operation;
+	return;
+
+/* The following orders take a tally */
+
+QUEUE_ORDER (2):					/* backspace record */
+QUEUE_ORDER (4):					/* forwardspace record */
+	if count >= ORDERS_PER_IDCW_TALLY then
+	     idcw.count = "00"b3;			/* do as many as we can */
+	else idcw.count = bit (bin (count, 6), 6);
+	goto QUEUE_ORDER_JOIN_1;
+
+/* The density order is handled specially.  Its command data is the density to set. */
+
+QUEUE_ORDER (15):					/* density */
+	begin;
+
+dcl	density		   fixed bin;
+dcl	density_idx	   fixed bin;
+
+dcl	requested_density	   fixed bin based (data_ptr);
+
+	     density = requested_density;
+	     do density_idx = lbound (densities, 1) to hbound (densities, 1) while (density ^= densities (density_idx));
+	     end;
+	     if density_idx > hbound (densities, 1) then do;
+		code = error_table_$bad_density;
+		return;
+	     end;
+	     idcw.count = "01"b3;
+	     device_command = density_commands (density_idx);
+	     goto QUEUE_ORDER_JOIN_2;
+	end;
+
+/* The following orders need to access the command data in some way.  The command data is copied
+   to the order_data buffer. */
+
+QUEUE_ORDER (21):					/* write control registers */
+	begin;
+
+dcl	error_counters	   (4) bit (36) aligned based;
+
+	     addr (tai.order_data) -> error_counters = data_ptr -> error_counters;
+	     idcw.count = "01"b3;
+	     goto QUEUE_ORDER_JOIN_1;
+	end;
+
+/* The following orders are repeatable, but not by the controller.  So, we build a list of IDCWs in the order data
+   buffer.  If more than 8 repetitions are requested, we'll notice that we're not done when the order completes,
+   and fire up some more until we have done enough. */
+
+QUEUE_ORDER (1):					/* backspace file */
+QUEUE_ORDER (3):					/* forward space file */
+QUEUE_ORDER (5):					/* write EOF */
+QUEUE_ORDER (6):					/* erase */
+	begin;
+
+dcl	idcw_idx		   fixed bin;
+
+	     idcwp = addr (tai.order_data);		/* use a different spot for the IDCWs */
+	     idcw.command = order_commands (order_idx);
+	     idcw.device = addr (tai.order_idcw) -> idcw.device;
+	     idcw.ext = ""b;
+	     idcw.code = "111"b;
+	     idcw.ext_ctl = ""b;
+	     idcw.control = "10"b;			/* continue, no marker */
+	     idcw.chan_cmd = "02"b3;
+	     idcw.count = "01"b3;
+
+/* Now propogate the IDCW thru the order_data buffer.  Then set the last IDCW to show a terminate status. */
+
+	     do idcw_idx = 2 to min (count, hbound (tai.order_data, 1));
+		string (tai.order_data (idcw_idx)) = string (idcw);
+	     end;
+	     addr (tai.order_data (idcw_idx - 1)) -> idcw.control = "00"b;
+	     goto QUEUE_ORDER_JOIN_3;
+	end;
+
+/* The request device status order is handled specially.  First, a call to ioi_$get_detailed_status is
+   made.  If we get valid status from that, we use it.  If not, we actually connect the channel to
+   get the status.  */
+
+QUEUE_ORDER (13):					/* request device status */
+	begin;
+
+dcl	based_detailed_status  bit (216) based (data_ptr);
+
+	     call ioi_$get_detailed_status (tai.ioi_index, status_present, based_detailed_status, code);
+
+	end;
+
+	if code ^= 0 then
+	     return;
+	if status_present then do;
+	     tai.flags.order_done = "1"b;
+	     tai.order_count_done = 1;
+	     goto QUEUE_ORDER_JOIN_4;
+	end;
+	else goto QUEUE_ORDER_REQUEST_DEVICE_STATUS;
+
+/* The following orders do not take a tally, are not repeatable, and access no command data (at least 'til check time) */
+
+QUEUE_ORDER (0):					/* ready pseudo-order */
+	tai.saved_special_status = ""b;
+QUEUE_ORDER (7):					/* data security erase */
+QUEUE_ORDER (8):					/* rewind */
+QUEUE_ORDER (9):					/* rewind/unload */
+QUEUE_ORDER (10):					/* tape load */
+QUEUE_ORDER (11):					/* request status */
+QUEUE_ORDER (12):					/* reset status */
+QUEUE_ORDER_REQUEST_DEVICE_STATUS:			/* request device status */
+QUEUE_ORDER (14):					/* reset device status */
+QUEUE_ORDER (16):					/* set file permit */
+QUEUE_ORDER (17):					/* set file protect */
+QUEUE_ORDER (18):					/* reserve device */
+QUEUE_ORDER (19):					/* release device */
+QUEUE_ORDER (20):					/* read control registers */
+	idcw.count = "01"b3;			/* done only once */
+QUEUE_ORDER_JOIN_1:
+	device_command = order_commands (order_idx);
+QUEUE_ORDER_JOIN_2:					/* density orders enter here */
+	idcw.command = device_command;
+	if order_idx = 7 then
+	     idcw.chan_cmd = "03"b3;			/* data security erase */
+	else idcw.chan_cmd = "02"b3;			/* vanilla non-data transfer command */
+QUEUE_ORDER_JOIN_3:					/* all of the order connects come here */
+	if (order_idx >= 1 & order_idx <= 4) |		/* bsf, bsr, fsf, fsr */
+	     order_idx = 7 then			/* dse */
+	     call set_timeout (tai.max_timeout);
+	else call set_timeout (TIMEOUT_ORDER);
+	call connect (bin (rel (idcwp)), code);
+QUEUE_ORDER_JOIN_4:					/* orders that need no connects enter here */
+	if code = 0 then do;
+	     tai.flags.order_queued = "1"b;
+	     tai.order_count_requested = count;
+	     tai.order_count_done = 0;
+	     tai.order_idx = order_idx;
+	     tai.order_data_ptr = data_ptr;
+	     tai.total_orders = tai.total_orders + 1;
+	end;
+
+     end queue_order_proc;
+
+check_order_proc:
+     proc (count, result, code);
+
+dcl	count		   fixed bin parameter;
+dcl	result		   fixed bin parameter;
+dcl	code		   fixed bin (35) parameter;
+
+dcl	based_special_status   bit (36) aligned based (tai.order_data_ptr);
+
+	if ^tai.order_queued then do;			/* there's nothing to check */
+	     count = 0;
+	     result = TAPE_IO_USER_PROGRAM_ERROR;
+	     code = error_table_$invalid_state;
+	     return;
+	end;
+
+	if tai.order_done then do;			/* queue_order finished for us */
+	     tai.order_done = "0"b;
+	     count = tai.order_count_done;
+	     result = TAPE_IO_SUCCESS;
+	     goto CHECK_ORDER_GOOD_RETURN;
+	end;
+
+/* See if we're awaiting special status.  This will only happen if we got an "SI" status after a "rdy" order */
+
+NEED_SPECIAL_STATUS:
+	if tai.flags.special_status_expected then do;	/* we must be doing a rdy */
+	     call get_special_status (auto_special_status);
+						/* might not return */
+	     tai.saved_special_status = auto_special_status;
+
+	     tai.flags.special_status_expected = "0"b;
+	     call connect (bin (rel (addr (tai.order_idcw))), code);
+	     if code ^= 0 then do;
+		result = TAPE_IO_USER_PROGRAM_ERROR;
+		count = 0;
+		return;
+	     end;
+	end;
+
+/* Not waiting for special status, must be normal status */
+
+	count = 0;
+	call get_status (tai.modes.wait, CHECK_ORDER_MAKE_CALLER_WAIT);
+						/* might not return */
+	goto CHECK_ORDER (tai.order_idx);		/* case by case */
+
+CHECK_ORDER (0):					/* rdy */
+	if status_class = "UE" then do;
+	     code = error_table_$unexpected_device_status;
+	     goto CHECK_ORDER_PROGRAM_ERROR;
+	end;
+	else if status_class = "SI" then do;
+	     tai.special_status_expected = "1"b;
+	     goto NEED_SPECIAL_STATUS;
+	end;
+	else do;
+	     based_special_status = tai.saved_special_status;
+	     count = 1;
+	     result = TAPE_IO_SUCCESS;
+	     goto CHECK_ORDER_GOOD_RETURN;
+	end;
+
+CHECK_ORDER (1):					/* backspace file */
+	do while ("1"b);				/* exitted by a goto somewhere in the loop */
+	     if status_class = "AB" then do;		/* at BOT */
+		result = TAPE_IO_BOT;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_DONE;
+	     end;
+	     else if (status_class = "EF") | (status_class = "OK") then
+		call finish_repeatable_order;
+	     else do;
+CHECK_ORDER_NOT_PERFORMED:
+		code = error_table_$action_not_performed;
+		goto CHECK_ORDER_IO_ERROR;
+	     end;
+	end;
+
+CHECK_ORDER (2):					/* backspace record */
+	idcwp = addr (tai.order_idcw);		/* point at the IDCW */
+	io_status_word_ptr = addr (istat.iom_stat);
+	do while ("1"b);
+	     if status_class = "AB" then do;
+		result = TAPE_IO_BOT;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else if status_class = "EF" then do;
+		result = TAPE_IO_EOF;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else if status_class = "OK" then
+		call finish_repeatable_order;		/* might not return */
+	     else do;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_NOT_PERFORMED;
+	     end;
+	end;
+
+CHECK_ORDER (3):					/* forward space file */
+	do while ("1"b);				/* exit via a goto in the loop */
+	     if status_class = "ET" then do;		/* at EOT */
+		result = TAPE_IO_EOT;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else if (status_class = "EF") | (status_class = "OK") then
+		call finish_repeatable_order;		/* might not return */
+	     else goto CHECK_ORDER_NOT_PERFORMED;
+	end;
+
+CHECK_ORDER (4):					/* forward space record */
+	idcwp = addr (tai.order_idcw);		/* point at the IDCW */
+	io_status_word_ptr = addr (istat.iom_stat);
+	do while ("1"b);
+	     if status_class = "EF" then do;		/* EOF */
+		result = TAPE_IO_EOF;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else if status_class = "ET" then do;
+		result = TAPE_IO_EOT;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else if status_class = "OK" then
+		call finish_repeatable_order;		/* might not return */
+	     else do;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_NOT_PERFORMED;
+	     end;
+	end;
+
+CHECK_ORDER (5):					/* write EOF */
+	do while ("1"b);				/* exitted by goto */
+	     if status_class = "ET" then do;
+		if tai.retry_in_progress & (istat.offset < bin (rel (addr (tai.order_data)))) then
+						/* backspace and erase finished, but not EOF, so reconnect */
+		     call finish_repeatable_order ();
+
+		result = TAPE_IO_EOT;
+		count = repeatable_order_count ();
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else if (status_class = "EF") | (status_class = "OK") then
+		call finish_repeatable_order ();
+	     else if (status_class = "DA") | (status_class = "DE") then do;
+		tai.order_count_done = repeatable_order_count () - 1;
+						/* the last one was in error, so don't count it */
+		tai.order_errors = tai.order_errors + 1;
+		if tai.retry_count < MAX_RETRY_COUNT then do;
+		     tai.retry_count = tai.retry_count + 1;
+		     call refill_order_list ();
+		     call tape_ioi_error_retry$eof (wksp, code);
+		     if code ^= 0 then
+			goto CHECK_ORDER_PROGRAM_ERROR;
+		     call get_status (tai.modes.wait, CHECK_ORDER_MAKE_CALLER_WAIT);
+		end;
+		else do;
+		     if status_class = "DE" then
+			result = TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT;
+		     else result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		     code = error_table_$device_parity;
+		     goto CHECK_ORDER_DONE;
+		end;
+	     end;
+	     else goto CHECK_ORDER_NOT_PERFORMED;
+	end;
+
+CHECK_ORDER (6):					/* erase */
+	if status_class = "OK" then
+	     call finish_repeatable_order ();
+	else if status_class = "ET" then do;
+	     count = repeatable_order_count ();
+	     result = TAPE_IO_EOT;
+	     goto CHECK_ORDER_GOOD_RETURN;
+	end;
+	else goto CHECK_ORDER_NOT_PERFORMED;
+
+/* These orders return data to the caller */
+
+CHECK_ORDER (11):					/* request status */
+	call tape_ioi_hardware_status$hardware_status (unspec (tai.tioi_id), tai.order_data_ptr, code);
+	if code = 0 then do;
+	     count = 1;
+	     result = TAPE_IO_SUCCESS;
+	     goto CHECK_ORDER_GOOD_RETURN;
+	end;
+	else goto CHECK_ORDER_PROGRAM_ERROR;
+
+CHECK_ORDER (13):					/* request device status */
+	count = 1;
+	result = TAPE_IO_SUCCESS;
+
+	begin;
+
+dcl	based_detailed_status  bit (216) based;
+
+	     tai.order_data_ptr -> based_detailed_status = addr (tai.order_data) -> based_detailed_status;
+
+	end;
+
+	goto CHECK_ORDER_GOOD_RETURN;
+
+CHECK_ORDER (20):					/* read control registers */
+	count = 1;
+	if ^((status_class = "AB") | (status_class = "OK")) then
+	     goto CHECK_ORDER_NOT_PERFORMED;
+
+	begin;
+
+dcl	error_counters	   (4) bit (36) aligned based;
+
+	     tai.order_data_ptr -> error_counters = addr (tai.order_data) -> error_counters;
+	     result = TAPE_IO_SUCCESS;
+	     goto CHECK_ORDER_GOOD_RETURN;
+	end;
+
+/* The following orders do not need to return any information, and can only be done once. */
+
+CHECK_ORDER (7):					/* data security erase */
+CHECK_ORDER (8):					/* rewind */
+CHECK_ORDER (9):					/* rewind/unload */
+CHECK_ORDER (10):					/* tape load */
+CHECK_ORDER (12):					/* reset status */
+CHECK_ORDER (14):					/* reset device status */
+CHECK_ORDER (15):					/* set density */
+CHECK_ORDER (16):					/* set file permit */
+CHECK_ORDER (17):					/* set file protect */
+CHECK_ORDER (18):					/* reserve device */
+CHECK_ORDER (19):					/* release device */
+CHECK_ORDER (21):					/* write control registers */
+	if (status_class = "AB") | (status_class = "OK") then do;
+	     count = 1;
+	     result = TAPE_IO_SUCCESS;
+	     goto CHECK_ORDER_GOOD_RETURN;
+	end;
+	else goto CHECK_ORDER_NOT_PERFORMED;
+
+CHECK_ORDER_IO_ERROR:				/* the order is done, but I/O errors occurred */
+	result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+	tai.order_errors = tai.order_errors + 1;
+	if status_class = "DN" then
+	     code = error_table_$bad_density;
+	else code = error_table_$action_not_performed;
+	goto CHECK_ORDER_DONE;
+
+CHECK_ORDER_PROGRAM_ERROR:
+	result = TAPE_IO_USER_PROGRAM_ERROR;
+	goto CHECK_ORDER_DONE;
+
+CHECK_ORDER_GOOD_RETURN:				/* the order is done, no errors */
+	code = 0;
+CHECK_ORDER_DONE:					/* the order is completed, with or without an error */
+	tai.order_queued = "0"b;
+	tai.retry_in_progress = "0"b;
+	return;
+
+/* Routine which is called when special status is expected (for example, when the tape is rewinding).  This routine
+   will go blocked exactly once waiting for the special status.  If no special status is returned after going blocked
+   (i.e. the two minute timer went off), it hands back a special status of "0"b.  It is up to its caller to decide
+   what to do next. */
+
+get_special_status:
+	proc (status);
+
+dcl	status		   bit (36) aligned;
+
+	     call ioi_$get_special_status (tai.ioi_index, status_present, status, code);
+	     if status_present then
+		return;
+
+	     if tai.modes.wait then do;		/* we can block */
+		call block;
+		call ioi_$get_special_status (tai.ioi_index, status_present, status, code);
+	     end;
+	     else goto CHECK_ORDER_MAKE_CALLER_WAIT;	/* no time to wait... */
+
+	end get_special_status;
+
+CHECK_ORDER_MAKE_CALLER_WAIT:
+	result = TAPE_IO_BLOCK;			/* make our caller wait */
+	count = 0;
+	code = 0;
+	return;					/* get out of the loop */
+
+/* This function returns the number of times the order has been executed. */
+
+repeatable_order_count:
+	proc () returns (fixed bin);
+
+	     if (tai.order_idx = 2) | (tai.order_idx = 4) then
+						/* forward or backward space records */
+		if idcw.count = "00"b3 then
+		     return (ORDERS_PER_IDCW_TALLY - bin (io_status_word.rcount) + tai.order_count_done);
+		else return (bin (idcw.count) - bin (io_status_word.rcount) + tai.order_count_done);
+
+	     else return (istat.offset - bin (rel (addr (tai.order_data))) + tai.order_count_done + 1);
+
+	end repeatable_order_count;
+
+/* This routine is called by a repeatable order handler when it is possible that the order is done.
+   If so, it does not return to its caller, but just finishes up and signals success.  If there is
+   still work to be done, it restarts the I/O.  It either blocks, if that is allowed, or signals that
+   it's up to the user to block. */
+
+finish_repeatable_order:
+	proc;
+
+	     tai.order_count_done = repeatable_order_count ();
+	     if tai.order_count_done >= tai.order_count_requested then do;
+		count = tai.order_count_done;
+		result = TAPE_IO_SUCCESS;
+		goto CHECK_ORDER_GOOD_RETURN;
+	     end;
+	     else do;
+		call refill_order_list;
+		call reconnect;
+		call get_status (tai.modes.wait, CHECK_ORDER_MAKE_CALLER_WAIT);
+	     end;
+
+	end finish_repeatable_order;
+
+/* This subroutine sets up the order list to continue from a repeatable order. */
+
+refill_order_list:
+	proc;
+
+	     if (tai.order_idx = 2) | (tai.order_idx = 4) then
+						/* forward or backward space records */
+		if tai.order_count_requested - tai.order_count_done >= ORDERS_PER_IDCW_TALLY then
+		     idcw.count = "00"b3;
+		else idcw.count = bit (bin (tai.order_count_requested - tai.order_count_done, 6), 6);
+	     else					/* If there are at least hbound (tai.order_data, 1) orders left to do, leave the list alone.
+						   If there are less, set the stop bits in the IDCW. */
+		if (tai.order_count_requested - tai.order_count_done) < hbound (tai.order_data, 1) then
+		addr (tai.order_data (tai.order_count_requested - tai.order_count_done)) -> idcw.control = "00"b;
+
+	end refill_order_list;
+
+reconnect:
+	proc;
+
+	     if (tai.order_idx = 2) | (tai.order_idx = 4) then
+		call connect (bin (rel (addr (tai.order_idcw))), code);
+	     else call connect (bin (rel (addr (tai.order_data))), code);
+	     if code ^= 0 then do;
+		goto CHECK_ORDER_PROGRAM_ERROR;
+	     end;
+
+	end reconnect;
+
+     end check_order_proc;
+
+/* This procedure sets up one buffer for reading */
+
+queue_read_proc:
+     proc (buffer_ptr, code);
+
+dcl	buffer_ptr	   ptr parameter;
+dcl	code		   fixed bin (35) parameter;
+
+	if tai.order_queued | tai.write_queued then do;
+	     code = error_table_$invalid_state;
+	     return;
+	end;
+	if buffer_ptr -> tbi.state ^= READY_STATE then do;
+	     code = error_table_$buffer_invalid_state;
+	     return;
+	end;
+
+	buffer_ptr -> tbi.modes = tai.modes;
+	buffer_ptr -> tbi.state = QUEUED_STATE;
+	idcwp = addr (buffer_ptr -> tbi.idcw_word);
+	idcw.command = buffer_ptr -> tbi.modes.data_code; /* type of read command depends on data type */
+	idcw.control = "00"b;			/* terminate */
+	if buffer_ptr -> tbi.modes.recovery then
+	     idcw.chan_cmd = "30"b3;			/* use normal values, auto-retry */
+	else idcw.chan_cmd = buffer_ptr -> tbi.modes.cif_code;
+	idcw.count = "00"b3;
+	buffer_ptr -> tbi.data_len = buffer_ptr -> tbi.buffer_len;
+	call fill_dcw_list (buffer_ptr);
+	call remove_from_list (tai.free_list_offset, buffer_ptr);
+	call add_to_list (semi_queued_offset, bin (rel (buffer_ptr)));
+
+     end queue_read_proc;
+
+check_read_proc:
+     proc (buffer_data_ptr, data_len, result, code);
+
+dcl	buffer_data_ptr	   ptr parameter;
+dcl	data_len		   fixed bin (21) parameter;
+dcl	result		   fixed bin parameter;
+dcl	code		   fixed bin (35) parameter;
+
+dcl	done		   bit (1) aligned;
+dcl	xcode		   fixed bin (35);
+
+	if ^tai.read_queued then do;
+	     buffer_data_ptr = null ();
+	     data_len = 0;
+	     result = TAPE_IO_USER_PROGRAM_ERROR;
+	     code = error_table_$device_not_active;
+	     return;
+	end;
+
+	buffer_ptr = ptr (wksp, tai.queue_list_offset);
+	code = 0;
+
+	done = "0"b;
+	do while (^done);
+	     lost_statuses = -1;			/* so loop will loop */
+	     do while (lost_statuses < 0);
+		call get_status (buffer_ptr -> tbi.modes.wait, CHECK_READ_MAKE_CALLER_WAIT);
+		lost_statuses = missing_statuses (buffer_ptr, isp);
+		if lost_statuses < 0 then
+		     tai.extra_statuses = tai.extra_statuses + 1;
+	     end;
+	     done = "1"b;				/* until proven otherwise... */
+	     if lost_statuses ^= 0 then do;
+		tai.times_status_lost = tai.times_status_lost + 1;
+		if buffer_ptr -> tbi.modes.req_len then do;
+		     addr (buffer_ptr -> tbi.idcw_word) -> idcw.control = "00"b;
+						/* since we missed one, take no chances */
+		     tai.retry_in_progress = "1"b;
+		     do while (istat.run);
+CHECK_READ_STOP_TAPE:
+			call get_status ("0"b, CHECK_READ_STOP_TAPE);
+		     end;
+		     lost_statuses = missing_statuses (buffer_ptr, isp);
+		     tai.order_count_requested = lost_statuses;
+						/* in case we're at EOF and have to try again */
+CHECK_READ_BACKSPACE:
+		     call tape_ioi_error_retry$backspace (wksp, buffer_ptr, isp, lost_statuses, code);
+		     if code = 0 then
+			done = "0"b;
+		     else do;
+			result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+			code = error_table_$lost_device_position;
+		     end;
+		end;
+		else do;				/* we lost it, but we don't care: it was good status */
+		     istat.st = "1"b;
+		     tai.status_entry_idx = mod (tai.status_entry_idx - 1, tai.status_entry_count);
+		     isp = ptr (wksp,
+			tai.status_queue_offset
+			+ mod (tai.status_entry_idx - 1, tai.status_entry_count) * size (istat));
+		     istat.level = IO_MARKER_INTERRUPT_LEVEL;
+						/* we know it must have been */
+		     istat.run = "1"b;
+		     istat.er = "0"b;
+		     status_class = "OK";		/* since it didn't stop, there must have been no error */
+		     result = TAPE_IO_SUCCESS;
+		end;
+	     end;
+	     else if status_class = "OK" then
+		result = TAPE_IO_SUCCESS;
+	     else if status_class = "UE" then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$device_parity;
+	     end;
+	     else if status_class = "AB" then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$unexpected_device_status;
+	     end;
+	     else if status_class = "SI" then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$device_attention;	/* probably */
+	     end;
+	     else if status_class = "DN" then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$bad_density;
+	     end;
+	     else if status_class = "EF" then do;
+		if tai.retry_in_progress then do;
+		     tai.order_count_requested = tai.order_count_requested - 1;
+		     lost_statuses = tai.order_count_requested;
+		     goto CHECK_READ_BACKSPACE;	/* try again */
+		end;
+		else result = TAPE_IO_EOF;
+	     end;
+	     else if status_class = "ET" then do;
+		result = TAPE_IO_EOT;
+		code = error_table_$device_end;
+	     end;
+	     else if status_class = "BT" then do;
+		result = TAPE_IO_EOT;
+		code = error_table_$blank_tape;
+	     end;
+	     else if status_class = "BL" then do;
+		if ^tai.suspect_short_record then do;	/* first time we've had this problem on this buffer */
+		     tai.suspect_short_record = "1"b;
+/**** fell for the short record in the long DCW list trick (3rd time this month) */
+		     semi_queued_offset = bin (rel (buffer_ptr));
+		     tai.queue_list_offset = 0;
+		     call run ("0"b, code);
+		     if code ^= 0 then
+			goto CHECK_READ_LIST_PROBLEM;
+		     else done = "0"b;
+		end;
+		else do;
+CHECK_READ_LIST_PROBLEM:
+		     result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		     code = error_table_$unexpected_device_status;
+		end;
+	     end;
+	     else if (status_class = "DA") | (status_class = "DE") | (status_class = "IP") then do;
+						/* retryable error */
+		if buffer_ptr -> tbi.recovery then do;
+		     tai.retry_in_progress = "1"b;
+		     call tape_ioi_error_retry (wksp, buffer_ptr, isp, code);
+		     if code = 0 then
+			done = "0"b;		/* keep on trying */
+		     else do;
+			result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+			code = error_table_$device_parity;
+		     end;
+		end;
+		else do;				/* user want to handle it without our help */
+		     result = TAPE_IO_RECOVERABLE_IO_ERROR;
+		     code = error_table_$device_parity;
+		end;
+	     end;
+	     else if status_class = "CA" then do;	/* code alert */
+		code = error_table_$device_code_alert;
+		if buffer_ptr -> tbi.modes.data_code = "05"b3 | buffer_ptr -> tbi.modes.data_code = "04"b3
+		     | buffer_ptr -> tbi.modes.data_code = "03"b3 then
+		     result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		else result = TAPE_IO_CODE_ALERT;
+	     end;
+	end;
+
+	call remove_from_list (tai.queue_list_offset, buffer_ptr);
+	if result = TAPE_IO_SUCCESS then do;
+	     recovery_strategy = bin (substr (addr (buffer_ptr -> tbi.idcw_word) -> idcw.chan_cmd, 4, 3));
+	     if recovery_strategy ^= 0 then
+		tai.recovery_succeeded (recovery_strategy) = tai.recovery_succeeded (recovery_strategy) + 1;
+	     call keep_it_going (isp, xcode);
+	     if xcode ^= 0 then
+		code = xcode;
+	end;
+	else do;
+	     begin;
+
+dcl	buffer_ptr	   ptr;
+
+		semi_queued_offset = tai.queue_list_offset;
+		tai.queue_list_offset = 0;
+		do buffer_ptr = ptr (wksp, semi_queued_offset)
+		     repeat ptr (wksp, buffer_ptr -> tbi.next_state_offset) while (rel (buffer_ptr) ^= ""b);
+		     buffer_ptr -> tbi.state = READY_STATE;
+		     tai.total_reads = tai.total_reads - 1;
+		end;
+	     end;
+	     call add_to_list (tai.free_list_offset, semi_queued_offset);
+	     if result ^= TAPE_IO_EOF & result ^= TAPE_IO_EOT then
+		tai.read_errors = tai.read_errors + 1;
+	end;
+
+	buffer_ptr -> tbi.state = READY_STATE;
+	call add_to_list (tai.free_list_offset, bin (rel (buffer_ptr)));
+
+	if buffer_ptr -> tbi.modes.req_len then
+	     data_len = get_io_byte_count (buffer_ptr, isp);
+	buffer_data_ptr = ptr (wksp, buffer_ptr -> tbi.data_offset);
+	tai.read_queued = (tai.queue_list_offset ^= 0);
+	tai.suspect_short_record = "0"b;
+	tai.retry_in_progress = "0"b;
+	return;
+
+CHECK_READ_MAKE_CALLER_WAIT:
+	buffer_data_ptr = null ();
+	data_len = 0;
+	result = TAPE_IO_BLOCK;
+	code = 0;
+	return;
+
+     end check_read_proc;
+
+queue_write_proc:
+     proc (buffer_ptr, data_len, code);
+
+dcl	buffer_ptr	   ptr parameter;
+dcl	data_len		   fixed bin (21) parameter;
+dcl	code		   fixed bin (35) parameter;
+dcl	1 char_position_overlay
+			   based (addr (idcw.count)) unaligned,
+	  2 tcp		   fixed bin (3) unsigned,	/* terminate character position */
+	  2 icp		   fixed bin (3) unsigned;	/* initial character position */
+
+	if tai.order_queued | tai.read_queued then do;
+	     code = error_table_$invalid_state;
+	     return;
+	end;
+
+	if (buffer_ptr -> tbi.state ^= READY_STATE) & (buffer_ptr -> tbi.state ^= SUSPENDED_STATE) then do;
+	     code = error_table_$buffer_invalid_state;
+	     return;
+	end;
+
+	buffer_ptr -> tbi.modes = tai.modes;
+	idcwp = addr (buffer_ptr -> tbi.idcw_word);
+	idcw.command = (buffer_ptr -> tbi.modes.data_code) | "10"b3;
+						/* make a write command out of the mode */
+	idcw.control = "00"b;			/* terminate */
+	idcw.chan_cmd = "00"b3;
+
+/* Length processing is somewhat hairy.  The whole thing is described in MTB-383, pp. 16-17. */
+
+	if buffer_ptr -> tbi.modes.length then do;	/* special length mode, anything goes */
+	     idcw.count = "00"b3;			/* reset both TCP and ICP initially */
+	     if ascii_mode (buffer_ptr) then do;	/* controller is in ASCII mode */
+						/* the ICP is 0, we set only the TCP */
+		if buffer_ptr -> tbi.modes.data_code = "25"b3 then
+		     char_position_overlay.tcp = mod (data_len, CHARS_PER_WORD);
+		else char_position_overlay.tcp = mod (data_len, BYTES_PER_WORD);
+		buffer_ptr -> tbi.data_len = data_len;
+	     end;
+	     else do;				/* no special ICP/TCP hackery */
+		if mod (data_len, BYTES_PER_WORD) ^= 0 then
+		     buffer_ptr -> tbi.data_len = data_len + 1;
+		else buffer_ptr -> tbi.data_len = data_len;
+	     end;
+	end;
+	else do;
+	     if mod (data_len, BYTES_PER_WORD) ^= 0 then do;
+		code = error_table_$invalid_tape_record_length;
+		return;
+	     end;
+	     else do;
+		buffer_ptr -> tbi.data_len = data_len;
+		idcw.count = "00"b3;
+	     end;
+	end;
+
+	if buffer_ptr -> tbi.state = READY_STATE then
+	     call remove_from_list (tai.free_list_offset, buffer_ptr);
+	else call remove_from_list (tai.susp_list_offset, buffer_ptr);
+	call fill_dcw_list (buffer_ptr);
+	buffer_ptr -> tbi.state = QUEUED_STATE;
+	call add_to_list (semi_queued_offset, bin (rel (buffer_ptr)));
+
+     end queue_write_proc;
+
+check_write_proc:
+     proc (buffer_data_ptr, result, code);
+
+dcl	buffer_data_ptr	   ptr parameter;
+dcl	result		   fixed bin parameter;
+dcl	code		   fixed bin (35) parameter;
+
+dcl	done		   bit (1) aligned;
+dcl	xcode		   fixed bin (35);
+
+	if ^tai.write_queued then do;
+	     buffer_data_ptr = null ();
+	     result = TAPE_IO_USER_PROGRAM_ERROR;
+	     code = error_table_$device_not_active;
+	     return;
+	end;
+
+	buffer_ptr = ptr (wksp, tai.queue_list_offset);
+	code = 0;
+
+	done = "0"b;
+	do while (^done);
+	     lost_statuses = -1;			/* so loop will loop */
+	     do while (lost_statuses < 0);
+		call get_status (buffer_ptr -> tbi.modes.wait, CHECK_WRITE_MAKE_CALLER_WAIT);
+		lost_statuses = missing_statuses (buffer_ptr, isp);
+		if lost_statuses < 0 then
+		     tai.extra_statuses = tai.extra_statuses + 1;
+	     end;
+	     done = "1"b;				/* until proven otherwise... */
+	     if lost_statuses ^= 0 then do;
+		tai.times_status_lost = tai.times_status_lost + 1;
+		istat.st = "1"b;			/* save this one for later */
+		tai.status_entry_idx = mod (tai.status_entry_idx - 1, tai.status_entry_count);
+		isp = ptr (wksp,
+		     tai.status_queue_offset + mod (tai.status_entry_idx - 1, tai.status_entry_count) * size (istat));
+		istat.level = IO_MARKER_INTERRUPT_LEVEL;/* we know it must have been */
+		istat.run = "1"b;
+		istat.er = "0"b;
+		status_class = "OK";		/* since it didn't stop, there must have been no error */
+	     end;
+
+	     if status_class = "OK" then
+		result = TAPE_IO_SUCCESS;
+	     else if (status_class = "AB") | (status_class = "EF") then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$unexpected_device_status;
+	     end;
+	     else if status_class = "SI" then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$device_attention;
+	     end;
+	     else if status_class = "UE" then do;
+		result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+		code = error_table_$device_parity;
+	     end;
+	     else if status_class = "ET" then do;
+		if tai.retry_in_progress
+		     & istat.offset < bin (rel (addr (tai.order_data (hbound (tai.order_data, 1))))) then do;
+/**** We were retrying, and the backspace and erase were done, but the write wasn't.  Reconnect it. */
+		     semi_queued_offset = tai.queue_list_offset;
+		     tai.queue_list_offset = 0;
+		     call run ("1"b, code);
+		     if code ^= 0 then
+			result = TAPE_IO_USER_PROGRAM_ERROR;
+		     else done = "0"b;
+		end;
+		else do;
+		     result = TAPE_IO_EOT;
+		     code = error_table_$device_end;
+		end;
+	     end;
+	     else if status_class = "BT" then do;
+		result = TAPE_IO_EOT;
+		code = error_table_$blank_tape;
+	     end;
+	     else if (status_class = "DA") | (status_class = "DE")
+		| ((status_class = "IP") & (buffer_ptr -> tbi.modes.data_code ^= "03"b3)) then do;
+						/* retryable error */
+		tai.write_errors = tai.write_errors + 1;
+		if buffer_ptr -> tbi.recovery then do;
+		     if tai.retry_count < MAX_RETRY_COUNT then do;
+			tai.retry_in_progress = "1"b;
+			tai.retry_count = tai.retry_count + 1;
+			call tape_ioi_error_retry (wksp, buffer_ptr, isp, code);
+			if code = 0 then
+			     done = "0"b;		/* keep on trying */
+			else do;
+CHECK_WRITE_CANT_RECOVER:
+			     if status_class = "DE" then
+				result = TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT;
+			     else result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+			     code = error_table_$device_parity;
+			end;
+		     end;
+		     else do;			/* user wants no help */
+			if status_class = "DE" then
+			     result = TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT;
+			else result = TAPE_IO_RECOVERABLE_IO_ERROR;
+			code = error_table_$device_parity;
+		     end;
+		end;
+		else goto CHECK_WRITE_CANT_RECOVER;
+	     end;
+	     else if (status_class = "CA") | (status_class = "IP") then do;
+						/* code alert */
+		code = error_table_$device_code_alert;
+		if buffer_ptr -> tbi.modes.data_code = "03"b3 | buffer_ptr -> tbi.modes.data_code = "25"b3 then
+		     result = TAPE_IO_CODE_ALERT;
+		else result = TAPE_IO_UNRECOVERABLE_IO_ERROR;
+	     end;
+	end;
+
+	call remove_from_list (tai.queue_list_offset, buffer_ptr);
+	if result = TAPE_IO_SUCCESS then do;
+	     call keep_it_going (isp, xcode);
+	     if xcode ^= 0 then
+		code = xcode;
+	end;
+	else do;					/* suspend all pending writes */
+	     begin;
+
+dcl	buffer_ptr	   ptr;
+
+		semi_queued_offset = tai.queue_list_offset;
+		tai.queue_list_offset = 0;
+		do buffer_ptr = ptr (wksp, semi_queued_offset)
+		     repeat ptr (wksp, buffer_ptr -> tbi.next_state_offset) while (rel (buffer_ptr) ^= ""b);
+		     buffer_ptr -> tbi.state = SUSPENDED_STATE;
+		end;
+	     end;
+	     call add_to_list (tai.susp_list_offset, semi_queued_offset);
+	     if result ^= TAPE_IO_EOT then
+		tai.write_errors = tai.write_errors + 1;
+	end;
+
+	buffer_ptr -> tbi.state = READY_STATE;
+	call add_to_list (tai.free_list_offset, bin (rel (buffer_ptr)));
+
+	buffer_data_ptr = ptr (wksp, buffer_ptr -> tbi.data_offset);
+	tai.write_queued = (tai.queue_list_offset ^= 0);
+	tai.retry_in_progress = "0"b;
+	tai.retry_count = 0;
+	return;
+
+CHECK_WRITE_MAKE_CALLER_WAIT:
+	buffer_data_ptr = null ();
+	result = TAPE_IO_BLOCK;
+	code = 0;
+	return;
+
+     end check_write_proc;
+
+/* This function figures out the number of bytes which were transferred for a given I/O operation.  Note that
+   these are 9-bit bytes.  If the I/O operation transferred 6-bit characters, our calculation may be a
+   little off.  This is known as "too bad". */
+
+get_io_byte_count:
+     proc (buffer_ptr, status_ptr) returns (fixed bin (21));
+
+dcl	buffer_ptr	   ptr parameter;
+dcl	status_ptr	   ptr parameter;
+
+/* First, we have to fudge a little bit on certain statuses.  The justification for this is in
+   the EPS for the MTS0610 Magnetic Tape Subsystem, Spec #58033915.  The fudging is derived from
+   the table on page 38. */
+
+	statp = addr (status_ptr -> istat.iom_stat);
+	if (^writing ()) & (^ascii_mode (buffer_ptr)) & (^status.eo) & (status_tcp () = 1) then do;
+	     status.char_pos = "0"b3;
+	     status.eo = "1"b;
+	end;
+
+/* Next, adjust the LPW residue.  On a marker interrupt, by the time io_manager gets around to picking up the LPW,
+   it has been advanced.  We use the DCW address residue in the status to decide where the LPW was pointing. */
+
+	if status.marker then
+	     substr (status_ptr -> istat.lpw, 1, 18) =
+		bit (
+		bin (bin (rel (addr (buffer_ptr -> tbi.dcw_words)), 18)
+		+ divide (bin (status.address) - (buffer_ptr -> tbi.data_offset), WORDS_PER_DCW_TALLY, 12) + 1, 18),
+		18);
+
+/* If the initiate bit is set in the status, no data was transferred (no tape movement occurred). */
+
+	if status.initiate then
+	     return (0);
+
+/* The calculations have to be done differently depending on whether the operation was a read or a write,
+   and on whether the channel was in ASCII mode or binary mode. */
+
+	if writing () then do;			/* either all was written, or none, we claim... */
+	     if status_ptr -> istat.er then
+		return (0);			/* can't trust what's on the tape */
+	     else return (buffer_ptr -> tbi.data_len);
+	end;
+	else do;					/* reading, we'll trust the counts */
+	     if ascii_mode (buffer_ptr) then do;
+		buffer_ptr -> tbi.data_len =
+		     word_count () * BYTES_PER_WORD - mod (BYTES_PER_WORD - status_tcp (), BYTES_PER_WORD);
+		buffer_ptr -> tbi.bit_len = (buffer_ptr -> tbi.data_len) * BITS_PER_BYTE;
+	     end;
+	     else do;
+		buffer_ptr -> tbi.bit_len =
+		     BITS_PER_WORD * (word_count () - 1 - bin (status.eo))
+		     + BITS_PER_CHAR * (BITS_PER_CHAR - mod (BITS_PER_CHAR - status_tcp (), BITS_PER_CHAR));
+		if (status.major = "0000"b) & ((status.sub & "001010"b) = "000000"b) then
+		     buffer_ptr -> tbi.bit_len = buffer_ptr -> tbi.bit_len - bin (substr (status.sub, 1, 3));
+		buffer_ptr -> tbi.data_len = divide (buffer_ptr -> tbi.bit_len, BITS_PER_BYTE, 21);
+	     end;
+	     return (buffer_ptr -> tbi.data_len);
+	end;
+
+writing:
+	proc () returns (bit (1) aligned);
+
+	     return ((addr (buffer_ptr -> tbi.idcw_word) -> idcw.command & "10"b3) ^= "00"b3);
+
+	end writing;
+
+status_tcp:
+	proc () returns (fixed bin (3));
+
+	     return (bin (status.char_pos, 3));
+
+	end status_tcp;
+
+word_count:
+	proc () returns (fixed bin (19));
+
+dcl	dcw_idx		   fixed bin (9) unsigned;
+dcl	dcw_ptr		   ptr;
+dcl	wc		   fixed bin (19);
+
+	     wc = 0;				/* no words yet */
+	     dcw_idx = 1;				/* start with first DCW */
+	     do dcw_ptr = addr (buffer_ptr -> tbi.dcw_words) repeat addrel (dcw_ptr, 1)
+		while ((dcw_idx <= buffer_ptr -> tbi.ndcws)
+		& (dcw_ptr ^= ptr (wksp, bin (substr (status_ptr -> istat.lpw, 1, 18)))));
+		if dcw_ptr -> dcw.tally then
+		     wc = wc + bin (dcw_ptr -> dcw.tally);
+		else wc = wc + WORDS_PER_DCW_TALLY;	/* handle large tallies */
+		dcw_idx = dcw_idx + 1;
+	     end;
+	     return (wc - bin (status.tally));
+
+	end word_count;
+
+     end get_io_byte_count;
+
+/* This procedure is called after several queue_(read write)s.  It moves the list of semi-queued buffers
+   to the end of the list of queued buffers.  If the queued list was empty, a connect is issued.  The reason
+   we have a concept of semi-queued buffers is so that higher level routines can queue a list and issue
+   one connect on it. */
+
+run:
+     proc (write_flag, code);
+
+dcl	write_flag	   bit (1) aligned parameter;
+dcl	code		   fixed bin (35) parameter;
+
+dcl	bufp		   ptr;
+
+	if tai.queue_list_offset = 0 then do;		/* no I/O currently happening */
+	     call set_timeout (TIMEOUT_IO);
+	     call connect (bin (rel (addr (ptr (wksp, semi_queued_offset) -> tbi.idcw_word))), code);
+	     if code = 0 then do;
+		if write_flag then
+		     tai.write_queued = "1"b;
+		else do;
+		     tai.read_queued = "1"b;
+		end;
+		tai.queue_list_offset = semi_queued_offset;
+	     end;
+	     else do;				/* couldn't connect */
+		do bufp = ptr (wksp, semi_queued_offset) repeat ptr (wksp, bufp -> tbi.next_state_offset)
+		     while (rel (bufp) ^= ""b);
+		     if write_flag then
+			bufp -> tbi.state = SUSPENDED_STATE;
+		     else bufp -> tbi.state = READY_STATE;
+		end;
+		if write_flag then
+		     call add_to_list (tai.susp_list_offset, semi_queued_offset);
+		else call add_to_list (tai.free_list_offset, semi_queued_offset);
+	     end;
+	end;
+	else call add_to_list (tai.queue_list_offset, semi_queued_offset);
+
+     end run;
+
+/* This function is called to keep the tape spinning at top speed.  It reconnects the I/O
+   if the current status shows a termination interrupt and the queued list shows that there is more
+   I/O to be done (some race condition must have caused the IOM to miss the marker request).
+   This routine should only be called if it is OK to continue--if error retries are to be done
+   they should be done before this routine is called.  The buffer which just finished must have been
+   removed from the queued list. */
+
+keep_it_going:
+     proc (status_ptr, code);
+
+dcl	status_ptr	   ptr parameter;
+dcl	code		   fixed bin (35) parameter;
+
+	if (status_ptr -> istat.level = IO_TERMINATE_INTERRUPT_LEVEL) & (tai.queue_list_offset ^= 0) then do;
+	     tai.times_tape_stopped = tai.times_tape_stopped + 1;
+	     semi_queued_offset = tai.queue_list_offset;
+	     tai.queue_list_offset = 0;
+	     call run ((ptr (wksp, semi_queued_offset) -> tbi.idcw_word & "10"b3) ^= "0"b3, code);
+	end;
+	else code = 0;
+
+     end keep_it_going;
+
+/* Procedure to set the timeout value */
+
+set_timeout:
+     proc (time);
+
+dcl	time		   fixed bin (71) parameter;
+
+dcl	code		   fixed bin (35);
+
+	if time ^= tai.cur_timeout then do;
+	     call ioi_$timeout (tai.ioi_index, time, code);
+	     if code = 0 then
+		tai.cur_timeout = time;
+	end;
+
+     end set_timeout;
+
+/* Procedure to do the IOI connect.  It will try to recover from an I/O in progress error. */
+
+connect:
+     procedure (offset, code);
+
+dcl	offset		   fixed bin (18) parameter;
+dcl	code		   fixed bin (35);
+
+dcl	connect_attempt_count  fixed bin;
+dcl	give_up_time	   fixed bin (71);
+
+dcl	TEN_SECONDS	   fixed bin (71) static options (constant) init (10000000);
+
+	give_up_time = clock () + TEN_SECONDS;
+	do while ("1"b);
+	     do connect_attempt_count = 1 to 10;
+		call ioi_$connect (tai.ioi_index, offset, code);
+		if code ^= error_table_$device_active then
+		     return;
+	     end;
+	     if clock () > give_up_time then
+		return;
+	end;
+
+     end connect;
+
+/* Function to return a pointer to the location the TDCW  will occupy.  This location
+   depends on the amount of data in the buffer. */
+
+get_tdcw_ptr:
+     proc (buffer_ptr) returns (ptr);
+
+dcl	buffer_ptr	   ptr parameter;
+
+	return (
+	     addrel (addr (buffer_ptr -> tbi.dcw_words),
+	     divide ((buffer_ptr -> tbi.data_len) - 1, BYTES_PER_DCW_TALLY, 17) + 1));
+
+     end get_tdcw_ptr;
+
+/* This procedure returns a flag signifying whether the specified buffer is to be processed with the
+   controller in ASCII mode.  Currently, only tape9 and ASCII/EBCDIC modes will do so. */
+
+ascii_mode:
+     proc (buffer_ptr) returns (bit (1) aligned);
+
+dcl	buffer_ptr	   ptr parameter;
+
+	return ((buffer_ptr -> tbi.modes.data_code = "03"b3) | (buffer_ptr -> tbi.modes.data_code = "25"b3));
+
+     end ascii_mode;
+
+/* Procedure to fill a DCW list for a given buffer.  Enough DCWs are set to fully describe all the data in the buffer */
+
+fill_dcw_list:
+     proc (buffer_ptr);
+
+dcl	buffer_ptr	   ptr parameter;
+
+dcl	dcw_addr_ptr	   ptr;
+dcl	words_left	   fixed bin (19);
+
+	do dcwp = first_dcwp () repeat next_dcwp () while (full_dcw_tally_needed ());
+	     dcw.address = rel (dcw_addr_ptr);
+	     dcw.char_pos = "0"b3;
+	     dcw.m64 = "0"b;
+	     dcw.type = "01"b;			/* IOTP */
+	     dcw.tally = "0"b;			/* 0 => 4096 */
+	end;
+
+/* Now fill in the last DCW */
+
+	dcw.address = rel (dcw_addr_ptr);
+	dcw.char_pos = "0"b3;
+	dcw.m64 = "0"b;
+	dcw.type = "00"b;				/* IOTD */
+	dcw.tally = bit (bin (words_left, 12), 12);
+	return;
+
+/* various internal functions to make the do loop above work */
+
+first_dcwp:
+	proc returns (ptr);
+
+	     words_left = divide ((buffer_ptr -> tbi.data_len) - 1, BYTES_PER_WORD, 18) + 1;
+	     dcw_addr_ptr = ptr (wksp, buffer_ptr -> tbi.data_offset);
+	     return (addr (buffer_ptr -> tbi.dcw_words));
+
+	end first_dcwp;
+
+next_dcwp:
+	proc returns (ptr);
+
+	     words_left = words_left - WORDS_PER_DCW_TALLY;
+	     dcw_addr_ptr = addrel (dcw_addr_ptr, WORDS_PER_DCW_TALLY);
+	     return (addrel (dcwp, 1));
+
+	end next_dcwp;
+
+full_dcw_tally_needed:
+	proc returns (bit (1) aligned);
+
+	     return (words_left > WORDS_PER_DCW_TALLY);
+
+	end full_dcw_tally_needed;
+
+     end fill_dcw_list;
+
+/* Procedure to add a list of buffers to the end of another list.  This procedure will adjust
+   the IDCW and TDCW of the previously last buffer in the list to point to the list it is adding.
+   The buffers to be added must have their state set correctly (to that of the new list), and should
+   not be on any other list. */
+
+add_to_list:
+     proc (list_head, new_list);
+
+dcl	list_head		   fixed bin (18) unsigned unaligned parameter;
+dcl	new_list		   fixed bin (18) unsigned unaligned parameter;
+
+dcl	cur_buf_ptr	   ptr;
+dcl	prev_buf_ptr	   ptr;
+
+	prev_buf_ptr = null ();
+	do cur_buf_ptr = ptr (wksp, list_head) repeat ptr (wksp, cur_buf_ptr -> tbi.next_state_offset)
+	     while (rel (cur_buf_ptr) ^= ""b);
+	     prev_buf_ptr = cur_buf_ptr;
+	end;
+
+	if prev_buf_ptr = null () then
+	     list_head = new_list;			/* the original list was empty */
+	else do;					/* graft it on */
+	     idcwp = addr (prev_buf_ptr -> tbi.idcw_word);
+	     tdcwp = get_tdcw_ptr (prev_buf_ptr);
+	     prev_buf_ptr -> tbi.next_state_offset = new_list;
+	     string (tdcw) = ""b;
+	     tdcw.address = bit (bin (rel (addr (ptr (wksp, new_list) -> tbi.idcw_word)), 18), 18);
+	     tdcw.type = "10"b;
+
+/* This is a kludge.  If we are adding to the queued list, and it's been more than 20 seconds since
+   we've received a terminate interrupt, don't let the list continue (this allows us to do the multiplexing at the
+   physical channel level). */
+	     if (list_head = tai.queue_list_offset) & (clock () > tai.last_terminate_time + TWENTY_SECONDS) then
+		idcw.control = "00"b;		/* terminate */
+	     else idcw.control = "11"b;		/* continue, marker */
+	end;
+
+     end add_to_list;
+
+/* Procedure to remove a buffer from a given list.  The TDCW and IDCW of the surrounding buffers are
+   adjusted as necessary (as are their list pointers). */
+
+remove_from_list:
+     proc (list_head, buffer_ptr);
+
+dcl	list_head		   fixed bin (18) unsigned unaligned parameter;
+dcl	buffer_ptr	   ptr parameter;
+
+dcl	cbufp		   ptr;
+dcl	pbufp		   ptr;
+
+	pbufp = null ();
+	do cbufp = ptr (wksp, list_head) repeat ptr (wksp, cbufp -> tbi.next_state_offset)
+	     while ((rel (cbufp) ^= ""b) & (cbufp ^= buffer_ptr));
+	     pbufp = cbufp;
+	end;
+	if cbufp ^= buffer_ptr then
+	     return;				/* this is less than deluxe */
+	if pbufp = null () then
+	     list_head = cbufp -> tbi.next_state_offset;	/* don't have to fiddle with DCWs */
+	else do;
+	     pbufp -> tbi.next_state_offset = cbufp -> next_state_offset;
+	     if pbufp -> tbi.next_state_offset = 0 then	/* new end of list */
+		addr (pbufp -> tbi.idcw_word) -> idcw.control = "00"b;
+	     get_tdcw_ptr (pbufp) -> tdcw = get_tdcw_ptr (cbufp) -> tdcw;
+	end;
+	cbufp -> tbi.next_state_offset = 0;
+
+     end remove_from_list;
+
+/* This procedure gets the status from the last tape operation, and sets status_class */
+
+get_status:
+     proc (wait_flag, wait_label);
+
+dcl	wait_flag		   bit (1) parameter;
+dcl	wait_label	   label parameter;
+
+	if tai.modes.wait & (tai.status_entry_idx = 0) then
+						/* drain the channel once in awhile */
+	     call ipc_$drain_chn (tai.event_id, (0));
+
+	isp = tape_ioi_utils$get_status (wksp);
+	do while (isp = null ());			/* wait for the status if that is allowed */
+	     if tai.modes.wait then
+		call ipc_$drain_chn (tai.event_id, (0));
+	     isp = tape_ioi_utils$get_status (wksp);	/* prevent races */
+	     if isp = null () then do;
+		if wait_flag then do;
+		     call block;
+		     isp = tape_ioi_utils$get_status (wksp);
+		end;
+		else goto wait_label;
+	     end;
+	end;
+	if ^istat.run then
+	     tai.last_terminate_time = clock ();
+	status_class = tape_ioi_utils$get_status_class (isp);
+
+     end get_status;
+
+/* Function to determine if the given status and buffer correspond to each other.  It returns the
+   difference (in buffers) between this status and this buffer.  Thus, a result of 0 means that
+   the status describes the I/O operation which was performed on the buffer.  A negative result
+   means that the status is of an earlier I/O operation than the buffer (this should NEVER happen),
+   and a +N result means that the status is for the Nth buffer along in the list.  All of this is
+   determined by examining the DCW residue in the status, unless the status is for a terminate
+   interrupt, in which case the LPW residue is used.  The buffer in question is assumed to be on the queued list. */
+
+missing_statuses:
+     proc (buffer_ptr, status_ptr) returns (fixed bin);
+
+dcl	buffer_ptr	   ptr parameter;
+dcl	status_ptr	   ptr parameter;
+
+dcl	bbuf_idx		   fixed bin;
+dcl	buf_idx		   fixed bin;
+dcl	bufp		   ptr;
+dcl	residue		   fixed bin (18) unsigned;
+dcl	sbuf_idx		   fixed bin;
+
+	statp = addr (status_ptr -> istat.iom_stat);
+	lpwp = addr (status_ptr -> istat.lpw);
+	if status.marker then			/* marker interrupt? */
+	     residue = bin (status.address);		/* yes, use DCW residue */
+	else do;					/* no, use LPW residue */
+	     residue = istat.offset;
+	     if bin (rel (addr (tai.order_data (hbound (tai.order_data, 1))))) >= residue then
+		return (0);			/* must have been a retry, must be for first buffer */
+	end;
+
+	sbuf_idx, bbuf_idx = -1;			/* init to neither found */
+	buf_idx = 0;
+	do bufp = ptr (wksp, tai.queue_list_offset) repeat ptr (wksp, bufp -> tbi.next_state_offset)
+	     while ((rel (bufp) ^= ""b) & ((sbuf_idx = -1) | (bbuf_idx = -1)));
+
+/**** The reason the test is done for one word before the IDCW is a case which occurs when error recovery
+      is in progress.  In this case, IOI's clever handling of the two TDCWs in a row problem causes it to
+      return an offset which is one before the read IDCW (for this problem doesn't arise when write error
+      recovery is done--then the erase IDCW prevents there from being two TDCWs in a row. */
+
+	     if (residue >= bin (rel (addr (bufp -> tbi.idcw_word))) - 1)
+		& (residue <= (bufp -> tbi.data_offset) + divide (bufp -> tbi.buffer_len, BYTES_PER_WORD, 19)) then
+		sbuf_idx = buf_idx;
+	     if bufp = buffer_ptr then
+		bbuf_idx = buf_idx;
+	     buf_idx = buf_idx + 1;
+	end;
+
+	return (sbuf_idx - bbuf_idx);
+
+     end missing_statuses;
+
+/* all blocking is done here */
+
+block:
+     proc;
+
+%include event_wait_channel;
+%include event_wait_info;
+
+dcl	1 auto_event_wait_info aligned like event_wait_info;
+
+dcl	ipc_$block	   entry (ptr, ptr, fixed bin (35));
+dcl	timer_manager_$alarm_wakeup
+			   entry (fixed bin (71), bit (2), fixed bin (71));
+dcl	timer_manager_$reset_alarm_wakeup
+			   entry (fixed bin (71));
+
+dcl	RELATIVE_SECONDS	   bit (2) static options (constant) init ("11"b);
+dcl	TWO_MINUTES	   fixed bin (71) static options (constant) init (120);
+
+	event_wait_channel.channel_id = tai.event_id;
+	if tai.special_status_expected then
+	     call timer_manager_$alarm_wakeup (TWO_MINUTES, RELATIVE_SECONDS, tai.event_id);
+	call ipc_$block (addr (event_wait_channel), addr (auto_event_wait_info), (0));
+	if tai.special_status_expected then
+	     call timer_manager_$reset_alarm_wakeup (tai.event_id);
+						/* remove the extra event */
+
+     end block;
+
+setup:
+     proc;
+
+	call tape_ioi_utils$get_workspace_ptr (p_tioi_id, wksp);
+	if wksp = null () then
+	     call quit (error_table_$bad_arg);
+	code, p_code = 0;
+
+     end setup;
+
+quit:
+     proc (code);
+
+dcl	code		   fixed bin (35);
+
+	p_code = code;
+	goto ERROR_RETURN;
+
+     end quit;
+
+ERROR_RETURN:
+	return;
+
+%include tape_ioi_workspace;
+%page;
+%include iom_pcw;
+%include iom_dcw;
+%page;
+%include iom_lpw;
+%page;
+%include iom_stat;
+%page;
+%include ioi_stat;
+%page;
+%include io_status_word;
+%page;
+%include interrupt_levels;
+%page;
+%include tape_ioi_result_indexes;
+%page;
+%include tape_ioi_buffer_status;
+%page;
+%include io_special_status;
+
+     end tape_ioi_io;

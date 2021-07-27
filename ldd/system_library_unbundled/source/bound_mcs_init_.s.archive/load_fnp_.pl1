@@ -1,0 +1,1137 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(2015-11-26,Swenson), approve(2015-11-26,MCR10000):
+     Remove date/time consistency checks in load_fnp_ allowing images older
+     than 5 years to be loaded and allowing images created in the future to be
+     loaded.
+  2) change(2016-01-15,Swenson), approve(2016-01-15,MCR10003):
+     Fix to support 4-character time zone abbreviations.
+                                                   END HISTORY COMMENTS */
+
+/* format: style4,delnl,insnl,^ifthendo */
+load_fnp_:
+     proc (afnpno, acdtp, a_chan_listp, acksw, code);
+
+/* load_fnp_ is the subroutine which prepares the FNP core image for
+   bootload into the FNP. It was written using parts of LD355,
+   the BOS 355 loader, as a model.
+
+   Coded June 1, 1976 by Mike Grady.
+   Modifed October 28, 1976 by Robert Coren to pass core image name to ring zero .
+   Modified August 1978 by Larry Johnson to take array of channels to boot from caller instead of scanning cdt.
+   Modified 1979 May 9 by Art Beattie to pass FNP memory size to ring zero.
+   Modified May 1981 by Robert Coren to handle COLTS pseudo-channel.
+   Modified April 1982 by Robert Coren to handle speeds up to 72000 baud.
+   Modified June 1982 by Robert Coren to accept memory sizes up to 256K.
+   Modified 83-12-15 BIM to make the abort entry work so it can be called.
+*/
+
+/* Parameters */
+
+dcl  afnpno fixed bin,
+     acdtp ptr,
+     a_chan_listp ptr,				/* pointer to array of cdte entries for channels to boot */
+     acksw bit (1),
+     code fixed bin (35);
+
+/* External Variables */
+
+dcl  gicb$ external;
+
+dcl  error_table_$dev_nt_assnd fixed bin (35) ext;
+dcl  error_table_$action_not_performed fixed bin (35) ext;
+%page;
+/* External procedures */
+
+dcl  get_fnp_name_ entry (fixed binary) returns (character (32));
+dcl  hcs_$initiate_count entry (char (*), char (*), char (*), fixed bin (24), fixed bin (2), ptr, fixed bin (35)),
+     sys_log_ entry options (variable),
+     sys_log_$error_log entry options (variable),
+     expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35)),
+     phcs_$fnp_info entry (fixed bin, fixed bin (24), fixed bin (4), fixed bin (4), fixed bin (35)),
+     get_temp_segment_ entry (char (*), ptr, fixed bin (35)),
+     load_fnp_util_$checksum entry (ptr, fixed bin) returns (bit (36) aligned),
+     load_fnp_util_$fnp_parity entry (ptr),
+     parse_tty_name_ entry (char (*) aligned, fixed bin, bit (1), fixed bin, fixed bin),
+     hcs_$terminate_noname entry (ptr, fixed bin (35)),
+     hphcs_$wire_fnp entry (fixed bin, ptr, fixed bin (24), fixed bin, fixed bin (35)),
+     hphcs_$unwire_fnp entry (fixed bin, fixed bin (35)),
+     hphcs_$load_fnp
+	entry (fixed bin, fixed bin (24), fixed bin (71), char (4), char (168) aligned, fixed bin, ptr, fixed bin (35)),
+     decode_clock_value_
+	entry (fixed bin (71), fixed bin, fixed bin, fixed bin, fixed bin (71), fixed bin, char (4) aligned),
+     release_temp_segment_ entry (char (*), ptr, fixed bin (35));
+
+/* Constants */
+
+dcl  me char (9) int static options (constant) init ("load_fnp_");
+
+dcl  slot_count (4) internal static options (constant) fixed bin init (1, 2, 2, 3);
+dcl  slot_id (4) internal static options (constant) bit (3) init ("000"b, "101"b, "101"b, "001"b);
+
+dcl  first_lsla_ch internal static options (constant) fixed bin init (9);
+dcl  first_hsla_ch internal static options (constant) fixed bin init (6);
+
+dcl  sync_speed (6:15) internal static options (constant) bit (4)
+	init ("0001"b, "0011"b, "0010"b, "0100"b, "0110"b, "0111"b, "1000"b, "1001"b, "1010"b, "1011"b);
+dcl  async_speed (7) internal static options (constant) bit (4)
+	init ("0010"b, "0011"b, "0100"b, "0101"b, "0110"b, "1000"b, "1001"b);
+
+dcl  option_async internal static options (constant) bit (4) init ("1010"b);
+
+dcl  (
+     dia_cs_to_fnp init ("111110"b),
+     dia_disconnect init ("111000"b)
+     ) internal static options (constant) bit (6);
+
+dcl  speed_bit (12) internal static options (constant) fixed bin init (1, 2, 3, 4, 8, 6, 7, 8, 8, 8, 8, 8);
+
+dcl  option_speed_code (12) bit (4) internal static options (constant)
+	init ("0001"b, "0010"b, "0011"b, "0100"b, "0111"b, "1001"b, "1010"b, "1100"b, "1101"b, "1101"b, "1110"b,
+	"1111"b);
+
+dcl  sync_pcw_model bit (18) internal static options (constant) init ("111111000000111110"b);
+dcl  async_pcw_model bit (18) internal static options (constant) init ("100000000000010110"b);
+dcl  bsc_pcw_model bit (18) internal static options (constant) init ("110000000000000100"b);
+
+dcl  sync_char bit (8) internal static options (constant) init ("00010110"b);
+						/* SYNC 026 */
+
+dcl  INIT1 bit (18) int static options (constant) init ("011001100101011001"b);
+dcl  INIT2 bit (18) int static options (constant) init ("110011010000010000"b);
+dcl  min_modules fixed bin int static options (constant) init (7);
+dcl  max_image_age fixed bin int static options (constant) init (5);
+%page;
+/* Automatic Storage */
+
+dcl  (gicb_ptr, prog_ptr) ptr;
+dcl  dirname char (168),
+     ename char (32);
+dcl  (term_cell, emerg_cell) fixed bin (4);
+dcl  (boot_segp, bcap, plp, dcwp, pcwp) ptr;
+dcl  (gicb_len, prog_len) fixed bin;
+dcl  offset fixed bin (21);
+dcl  (mbx_absadr, seg_absadr) fixed bin (24);
+dcl  fnpno fixed bin,
+     (i, j) fixed bin,
+     (fno, ano, chno) fixed bin;
+dcl  (wired, more, type) bit (1);
+dcl  (lsla_count, hsla_count) fixed bin;
+dcl  iom_ch fixed bin;
+dcl  slot fixed bin;
+dcl  nslots fixed bin;
+dcl  sid bit (3);
+dcl  seg_absadr_temp fixed bin (24);
+dcl  amt_left fixed bin;
+dcl  absadr_bits bit (24);
+dcl  copy_len fixed bin (21);
+dcl  dummy_code fixed bin (35);
+dcl  chan_listp ptr;
+dcl  baud_info_size fixed bin;
+dcl  fnp_memory_size fixed bin;
+dcl  cur_chain fixed bin;
+dcl  cur_time fixed bin (71);
+dcl  cur_year fixed bin;
+dcl  image_year fixed bin;
+dcl  image_len fixed bin (24);
+dcl  tandd_configured bit (1);
+%page;
+/* tables to hold config info for LSLAs and HSLAs */
+
+dcl  1 lsla_array (0:5, 0:51) aligned,
+       2 line_type fixed bin (17) unal,
+       2 baud_rate fixed bin (17) unal;
+
+dcl  1 hsla_array (0:2, 0:31) aligned,
+       2 line_type fixed bin (17) unal,
+       2 baud_rate fixed bin (17) unal,
+       2 modem_type fixed bin (17) unal,
+       2 flags unal,
+         3 pl bit (1) unal,
+         3 bsc_ebcdic bit (1) unal,
+         3 bsc_transparent bit (1) unal,
+         3 vip_pollselect bit (1) unal,
+         3 autobaud bit (1) unal,
+         3 pad bit (13) unal;
+
+dcl  lsla_ch (0:5) fixed bin;
+dcl  hsla_ch (0:2) fixed bin;
+
+dcl  pcw bit (36) aligned;
+
+dcl  1 pcw_f18b based,
+       2 type bit (2) unal,
+       2 char_len bit (4) unal,
+       2 pad1 bit (1) unal,
+       2 subch bit (5) unal,
+       2 rcv_parity bit (1) unal,
+       2 xmt_parity bit (1) unal,
+       2 parity_odd bit (1) unal,
+       2 two_icws bit (1) unal,
+       2 cct_enable bit (1) unal,
+       2 pad2 bit (1) unal;
+
+dcl  1 async_pcw aligned based (pcwp),
+       2 f18b unal like pcw_f18b,
+       2 pad3 bit (6) unal,
+       2 two_stop bit (1) unal,
+       2 pad4 bit (3) unal,
+       2 speed bit (8) unal;
+
+dcl  1 sync_pcw aligned based (pcwp),
+       2 f18b unal like pcw_f18b,
+       2 pad bit (10) unal,
+       2 sync_char bit (8) unal;
+
+dcl  1 bsc_pcw aligned based (pcwp),
+       2 f18b unal like pcw_f18b,
+       2 pad3 bit (6) unal,
+       2 crc_type bit (1) unal,
+       2 pad4 bit (2) unal,
+       2 ebcdic bit (1) unal,
+       2 transparent bit (1) unal,
+       2 timers bit (1) unal,
+       2 pad5 bit (6) unal;
+
+/* Based storage */
+
+dcl  fb35 fixed bin (35) based;
+dcl  copy_words (copy_len) fixed bin (35) based;
+
+dcl  1 boot_seg aligned based (boot_segp),		/* segment to hold FNP bootload image */
+       2 boot_dcw like icw,				/* used by DIA during bootload */
+       2 gicb (gicb_len) bit (36),			/* the boot program */
+       2 fnp_prog (prog_len) bit (36);			/* actual program -- MCS */
+
+dcl  1 boot_comm_area aligned based (bcap),		/* area at end of gicb to pass info */
+       2 list_icw like icw,				/* ICW for list to boot the program */
+       2 load_dcw (5) like dcw,			/* the dcws used to load MCS */
+       2 mbx_addr fixed bin (17) unal,			/* mailbox base addr for this FNP */
+       2 pad bit (12) unal,
+       2 term_cell bit (3) unal,			/* terminate interrupt for FNP to use */
+       2 emergency_cell bit (3) unal,			/* emergency to use for crash */
+       2 pad1 bit (36) unal,
+       2 load_limits unal,
+         3 low bit (18) unal,				/* MCS load limits */
+         3 high bit (18) unal,			/* low and high */
+       2 prog_cksum bit (36) unal,			/* checksum for MCS */
+       2 boot_cksum bit (36) unal,			/* checksum for gicb */
+       2 dia_chan_no fixed bin;			/* place where FNP IOM channel number of DIA is stored */
+
+dcl  1 dcw aligned based (dcwp),			/* DIA Data Control Word */
+       2 mult_addr bit (18) unal,			/* low 18 bits of multics address */
+       2 pad1 bit (3) unal,
+       2 parity1 bit (3) unal,			/* parity bits for this 36 bit word */
+       2 mult_addr_ex bit (6) unal,			/* high 6 bits of multics address */
+       2 command bit (6) unal,			/* DIA commond opcode */
+       2 xfer_mode bit (3) unal,			/* transfer mode, bit-36 */
+       2 fnp_addr bit (15) unal,			/* address in fnp mem */
+       2 pad2 bit (3) unal,
+       2 parity2 bit (3) unal,			/* parity for 2nd 36 bit word */
+       2 tally bit (12) unal;				/* xfer tally, 36 bit words */
+
+dcl  1 prog_limits aligned based (plp),			/* limits at end of MCS, by binder */
+       2 low bit (18) unal,
+       2 high bit (18) unal,
+       2 count bit (18) unal,
+       2 entry bit (18) unal;
+
+dcl  1 chan_list aligned based (chan_listp),		/* list of channels to boot */
+       2 count fixed bin,
+       2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+
+dcl  1 mem_array_fb aligned based (memp),
+       2 mem (0:65535) fixed bin (17) unaligned;
+
+/* Builtins */
+
+dcl  (addr, addrel, bit, clock, divide, fixed, null, string, hbound, max, min, rel, substr) builtin;
+%page;
+	cdtp = acdtp;
+	fnpno = afnpno;
+	fnpep = addr (cdt.fnp_entry (fnpno));		/* get ptr to this fnp entry */
+	chan_listp = a_chan_listp;
+
+	lsla_array.line_type (*, *) = -1;
+	hsla_array.line_type (*, *) = -1;
+	lsla_ch (*) = -1;
+	hsla_ch (*) = -1;
+	tandd_configured = "0"b;
+
+	if fnpe.state = FNP_FREE
+	then do;					/* but FNP is not configured */
+	     code = error_table_$dev_nt_assnd;
+	     return;
+	end;
+
+	gicb_ptr = addr (gicb$);
+
+	call expand_pathname_ ((fnpe.coreimage), dirname, ename, code);
+						/* get actual name */
+	if code ^= 0
+	then do;
+	     call sys_log_$error_log (1, code, me, "expand_pathname_ on ^a for FNP ^a.", fnpe.coreimage,
+		get_fnp_name_ (fnpno));
+	     return;
+	end;
+	call hcs_$initiate_count (dirname, ename, "", image_len, 0, prog_ptr, code);
+	if prog_ptr = null ()
+	then do;					/* couldn't find MCS */
+	     call sys_log_$error_log (1, code, me, "Locating ^a>^a for FNP ^a.", dirname, ename, get_fnp_name_ (fnpno));
+	     return;
+	end;
+	image_len = divide (image_len, 36, 24, 0);
+
+	call get_temp_segment_ (me, boot_segp, code);
+	if code ^= 0
+	then do;
+	     call sys_log_$error_log (1, code, me, "Creating boot segment in process directory for FNP ^a.",
+		get_fnp_name_ (fnpno));
+	     return;
+	end;
+
+	copy_len = gicb_ptr -> fb35 + 1;		/* pickup length of gicb from seg */
+	boot_segp -> copy_words = gicb_ptr -> copy_words; /* copy in gicb to temp seg */
+
+	gicb_len = copy_len - 1;
+	gicb_len = (divide (gicb_len + 63, 64, 22, 0) * 64) - 1;
+						/* to next mod 64 in boot seg, note first word */
+
+	copy_len, prog_len = prog_ptr -> fb35;		/* pickup len of MCS from seg */
+	prog_ptr = addrel (prog_ptr, 1);		/* skip word */
+	if copy_len + 1 ^= image_len
+	then do;					/* check bit count of image segment against length in image */
+	     call sys_log_$error_log (1, 0, me, "Invalid core image for FNP ^a (image length error), ^a>^a",
+		get_fnp_name_ (fnpno), dirname, ename);
+	     go to not_done;
+	end;
+	addr (boot_seg.fnp_prog) -> copy_words = prog_ptr -> copy_words;
+						/* copy in prog */
+
+	call hcs_$terminate_noname (prog_ptr, code);
+%page;
+/* reuse gicb_ptr and prog_ptr to point at copies */
+
+	gicb_ptr = addr (boot_seg.gicb);
+	prog_ptr = addr (boot_seg.fnp_prog);
+
+	offset = fixed (boot_dcw.tally, 17) - 17;	/* get offset of boot_comm_area */
+	bcap = addrel (gicb_ptr, offset);		/* make ptr */
+
+	plp = addrel (prog_ptr, prog_len - 2);		/* make ptr to prog limits area */
+
+/* fill in boot_comm_area */
+
+	call phcs_$fnp_info (fnpno, mbx_absadr, term_cell, emerg_cell, code);
+						/* get info about this FNP */
+	if code ^= 0
+	then do;
+	     call sys_log_$error_log (1, code, me, "Getting FNP info for FNP ^a.", get_fnp_name_ (fnpno));
+	     go to exit;
+	end;
+
+	boot_comm_area.mbx_addr = mbx_absadr;		/* base of DIA mailbox */
+	boot_comm_area.term_cell = bit (fixed (term_cell, 3), 3);
+	boot_comm_area.emergency_cell = bit (fixed (emerg_cell, 3), 3);
+
+	boot_comm_area.load_limits.low = prog_limits.low;
+	boot_comm_area.load_limits.high = prog_limits.high;
+
+/* Now scan the channels to be initialized, save info in arrays */
+
+	do i = 1 to chan_list.count;
+	     cdtep = chan_list.cdte_ptr (i);
+	     call parse_tty_name_ (cdte.name, fno, type, ano, chno);
+						/* decode the name to FNP number */
+
+	     if ^type
+	     then do;				/* LSLA */
+		lsla_ch (ano) = 0;			/* indicate the channel is needed */
+		lsla_array (ano, chno).line_type = cdte.line_type;
+		lsla_array (ano, chno).baud_rate = baud_idx (cdte.baud_rate);
+	     end;
+	     else do;				/* HSLA */
+		if ano = 7			/* special pseudo-channel */
+		then tandd_configured = "1"b;		/* we'll deal with this later */
+		else do;
+		     hsla_ch (ano) = 0;		/* indicate that this channel is needed */
+		     hsla_array (ano, chno).line_type = cdte.line_type;
+		     hsla_array (ano, chno).baud_rate = baud_idx (cdte.baud_rate);
+		     hsla_array (ano, chno).modem_type = cdte.modem_type;
+		     hsla_array (ano, chno).flags.pl = cdte.flags.private_line;
+		     hsla_array (ano, chno).flags.bsc_ebcdic = cdte.flags.bsc_ebcdic;
+		     hsla_array (ano, chno).flags.bsc_transparent = cdte.flags.bsc_transparent;
+		     hsla_array (ano, chno).flags.vip_pollselect = cdte.flags.vip_pollselect;
+		     hsla_array (ano, chno).flags.autobaud = cdte.flags.autobaud;
+		end;
+	     end;
+	end;
+%page;
+	memp = prog_ptr;				/* make ptr for mcs memory map dcls */
+
+/* Check for a valid core image. */
+
+/* First check .crmem for valid values. */
+
+	if comm_reg.crmem < 32767 | comm_reg.crmem > 262143 | mod (comm_reg.crmem + 1, 32768) ^= 0
+	then do;
+	     call sys_log_$error_log (1, 0, me,
+		"Invalid core image for FNP ^a (bad .crmem value of ^d in image), ^a>^a", get_fnp_name_ (fnpno),
+		comm_reg.crmem, dirname, ename);
+	     go to not_done;
+	end;
+
+/* Check .crldt for "reasonableness". */
+
+	cur_time = clock ();
+
+/*
+	if comm_reg.crldt > cur_time
+	then do;					*//* give me a break! *//*
+	     call sys_log_$error_log (1, 0, me, "Invalid core image for FNP ^a (.crldt exceeds current time), ^a>^a",
+		get_fnp_name_ (fnpno), dirname, ename);
+	     go to not_done;
+	end;
+*/
+	call decode_clock_value_ (cur_time, 0, 0, cur_year, 0, 0, "");
+	call decode_clock_value_ (comm_reg.crldt, 0, 0, image_year, 0, 0, "");
+
+/*
+	if image_year + max_image_age < cur_year
+	then do;
+	     call sys_log_$error_log (1, 0, me,
+		"Invalid core image for FNP ^a (binding of image was done over ^d years ago), ^a>^a",
+		get_fnp_name_ (fnpno), max_image_age, dirname, ename);
+	     go to not_done;
+	end;
+*/
+
+/* Try chasing through module chain. */
+
+	cur_chain = comm_reg.crmod;
+
+	if cur_chain ^= 0
+	then do i = 1 to 50 while (cur_chain > 0 & cur_chain < comm_reg.crmem);
+
+	     if mem_array_fb.mem (cur_chain) = 0
+	     then go to check_for_init;
+	     cur_chain = mem_array_fb.mem (cur_chain);
+	end;
+
+	call sys_log_$error_log (1, 0, me, "Invalid core image for FNP ^a (bad module chain), ^a>^a",
+	     get_fnp_name_ (fnpno), dirname, ename);
+	go to not_done;
+
+check_for_init:
+	if i < min_modules
+	then do;
+	     call sys_log_$error_log (1, 0, me,
+		"Invalid core image for FNP ^a (found only ^d modules, minimum required is ^d), ^a>^a",
+		get_fnp_name_ (fnpno), i, min_modules, dirname, ename);
+	     go to not_done;
+	end;
+
+	if mem_array.mem (cur_chain + 1) ^= INIT1 | mem_array.mem (cur_chain + 2) ^= INIT2
+	then do;
+	     call sys_log_$error_log (1, 0, me,
+		"Invalid core image for FNP ^a (init module is not last in the module chain), ^a>^a",
+		get_fnp_name_ (fnpno), dirname, ename);
+	     go to not_done;
+	end;
+%page;
+/*
+   Check image memory size against CDT memory size.
+   If different, use minimum of the two and give a warning.
+*/
+
+	i = (comm_reg.crmem + 1) / 1024;		/* make it compatible to fnpe.memory */
+	fnp_memory_size = min (fnpe.memory, i);		/* can only use the minimum of the two */
+
+	if fnpe.memory ^= i
+	then do;					/* not fatal, but give a warning */
+	     call sys_log_$error_log (1, 0, me,
+		"Memory size of ^dK in image does not agree with^/^-memory size of ^dK in CDT for FNP ^a.^/^-Memory size of ^dK from ^[image^;CDT^] will be used."
+		, i, fnpe.memory, get_fnp_name_ (fnpno), fnp_memory_size, (fnpe.memory > i));
+	     comm_reg.crmem = fnp_memory_size * 1024 - 1; /* make sure image is set right */
+	end;
+
+	if comm_reg.crmem = 262143			/* if whole 256K configured */
+	then comm_reg.crmem = 261887;			/* don't use last page */
+
+/* Now scan this configuration and patch the core image */
+
+	itblp = make_ptr ((comm_reg.criom));		/* make a ptr to the iom table */
+
+/* LSLAs will be done first. */
+
+	if fnp_memory_size < 64			/* if at all */
+	then do;
+
+/* Patch IOM table for each LSLA to indicate its existance */
+
+	     lsla_count = 0;			/* init counter */
+	     do ano = 0 to 5;			/* loop over all possible LSLAs */
+		iom_ch = ano + first_lsla_ch;
+
+		if lsla_ch (ano) = 0
+		then do;				/* we would like to use this one */
+		     lsla_count = lsla_count + 1;	/* count it */
+		     if iom_table (iom_ch).dev_type ^= LSLA
+		     then do;			/* but it was not in image */
+			call sys_log_ (1, "load_fnp_: Core image for FNP ^a will not support LSLA #^d; ^a>^a",
+			     get_fnp_name_ (fnpno), ano, dirname, ename);
+			go to not_done;
+		     end;
+		end;
+		else string (iom_table (iom_ch)) = "0"b;/* we dont want it, deconfigure in FNP */
+	     end;
+	     comm_reg.crnls = lsla_count;
+	end;
+	else comm_reg.crnls = 0;
+
+/* Now fill in actual LSLA table by slot */
+
+	do ano = 0 to 5;				/* loop over LSLA to fill slots */
+	     iom_ch = ano + first_lsla_ch;
+
+	     if iom_table (iom_ch).dev_type = LSLA
+	     then do;				/* we are going to use this one */
+		tblp = make_ptr (fixed (iom_table (iom_ch).table, 17));
+						/* get ptr to LSLA table */
+		slot = 1;				/* T&D is zero */
+
+		do i = 0 to 51;			/* loop over possible channels */
+		     if lsla_array (ano, i).line_type ^= LINE_TELNET
+		     then do;			/* have this channel */
+
+			nslots = slot_count (lsla_array (ano, i).baud_rate);
+						/* get number slots for it */
+			sid = slot_id (lsla_array (ano, i).baud_rate);
+						/* and initial slot id */
+
+			if ibm_type (addr (lsla_array (ano, i)))
+			then			/* IBM code channel */
+			     lsla_table (slot).flags.ibm_code = "1"b;
+						/* mark it */
+
+			do j = 1 to nslots;		/* loop on slot count */
+			     lsla_table (slot).flags.slot_id = sid;
+			     sid = bit (fixed (fixed (sid, 17) + 1, 3), 3);
+			     slot = slot + 1;
+			end;
+		     end;
+		end;
+
+		do i = slot to 52;			/* fill rest of LSLA with null slots */
+		     lsla_table (i).flags.slot_id = "111"b;
+		end;
+	     end;
+	end;
+%page;
+/* Process the HSLA information in the same way. */
+
+/* First find which HSLAs we want to use */
+
+	hsla_count = 0;
+	do ano = 0 to 2;				/* loop over HSLAs */
+	     iom_ch = ano + first_hsla_ch;
+
+	     if hsla_ch (ano) = 0
+	     then do;				/* we want to use this one */
+		hsla_count = hsla_count + 1;
+		if iom_table (iom_ch).dev_type ^= HSLA
+		then do;				/* not in core image though */
+		     call sys_log_ (1, "load_fnp_: Core image for FNP ^a will not support HSLA #^d; ^a>^a",
+			get_fnp_name_ (fnpno), ano, dirname, ename);
+		     go to not_done;
+		end;
+	     end;
+	     else string (iom_table (iom_ch)) = "0"b;	/* we dont need this one */
+	end;
+	comm_reg.crnhs = hsla_count;
+
+/* Configure indivual HSLA subchannels */
+
+	pcwp = addr (pcw);				/* so based pcws will work */
+
+	do ano = 0 to 2;
+	     iom_ch = ano + first_hsla_ch;
+
+	     if iom_table (iom_ch).dev_type = HSLA
+	     then do;				/* we will use this one */
+		tblp = make_ptr (fixed (iom_table (iom_ch).table, 17));
+		do i = 0 to 31;			/* loop over subchannels */
+		     if hsla_array (ano, i).line_type ^= LINE_TELNET
+		     then do;			/* this subchannel wanted */
+
+			if check_line_type (addr (hsla_array (ano, i)))
+			then do;			/* SYNC line */
+			     hsla_table (i).flags.async = "0"b;
+						/* fill in HSLA table entry */
+
+			     hsla_table (i).flags.line_type = bit (fixed (hsla_array (ano, i).line_type, 5), 5);
+			     hsla_table (i).flags.dev_speed = sync_speed (hsla_array (ano, i).baud_rate);
+			     hsla_table (i).flags.modem_type = bit (fixed (hsla_array (ano, i).modem_type, 4), 4);
+
+			     hsla_table (i).flags.private_line = hsla_array (ano, i).flags.pl;
+
+			     call process_line_type ((hsla_array (ano, i).line_type));
+			end;
+
+			else do;			/* ASYNC line */
+			     hsla_table (i).flags.async = "1"b;
+						/* fill in HSLA table entry */
+			     hsla_table (i).flags.line_type = bit (fixed (hsla_array (ano, i).line_type, 5), 5);
+			     hsla_table (i).flags.modem_type = bit (fixed (hsla_array (ano, i).modem_type, 4), 4);
+			     if hsla_array (ano, i).flags.autobaud
+			     then do;
+				hsla_array (ano, i).baud_rate = 4;
+						/* 300 baud */
+				hsla_table (i).flags.option1 = "1"b;
+			     end;
+
+			     if hsla_array (ano, i).baud_rate > hbound (async_speed, 1)
+			     then			/* must be option baud */
+				hsla_table (i).flags.dev_speed = option_async;
+			     else hsla_table (i).flags.dev_speed = async_speed (hsla_array (ano, i).baud_rate);
+
+			     pcw = async_pcw_model;	/* build config PCW from model of async pcw */
+
+			     if ibm_type (addr (hsla_array (ano, i)))
+			     then do;		/* if IBM-code line then use */
+				async_pcw.char_len = "1110"b;
+						/* 7 bit chars, 6 data 1 parity */
+				async_pcw.rcv_parity = "0"b;
+						/* don't check parity */
+				async_pcw.xmt_parity = "1"b;
+						/* but do set it */
+				async_pcw.parity_odd = "1"b;
+						/* which is odd */
+			     end;
+			     else async_pcw.char_len = "1111"b;
+						/* for regular chn, 8 bit char, 7 data 1 parity */
+
+			     async_pcw.subch = bit (fixed (i, 5), 5);
+			     if hsla_array (ano, i).baud_rate = 1
+			     then			/* 110 baud gets two stop bits */
+				async_pcw.two_stop = "1"b;
+						/* indicate speed in pcw bits for async channels */
+			     substr (async_pcw.speed, speed_bit (hsla_array (ano, i).baud_rate), 1) = "1"b;
+
+			     if fnpe.type = DN6670	/* for 6670 only */
+			     then if substr (async_pcw.speed, 8, 1)
+						/* option baud rate is specified in PCW */
+				then substr (async_pcw.speed, 1, 4) =
+					option_speed_code (hsla_array (ano, i).baud_rate);
+			end;
+			hsla_mailbox (ano).subchannel (i).config_pcw = pcw;
+		     end;
+		end;
+	     end;
+	end;
+%page;
+/* Process the check argument */
+
+	if acksw
+	then comm_reg.crcon = "0"b;			/* indicate that console I/O is enabled */
+	else comm_reg.crcon = (17)"0"b || "1"b;		/* else inhibit during bootload */
+
+	comm_reg.crbdt = cur_time;			/* set date and time of this bootload */
+
+	comm_reg.crtdt = (17)"0"b || tandd_configured;	/* indicate presence/absence of COLTS channel */
+
+/* Compute checksum on MCS */
+
+	boot_comm_area.prog_cksum = load_fnp_util_$checksum (prog_ptr, prog_len);
+
+/* Setup to fill in the boot dcw and MCS load dcws */
+
+	boot_dcw.xfer_mode = "001"b;			/* 36-bit direct */
+	boot_dcw.fnp_addr = "0"b;			/* first part is done by hphcs_$load_fnp */
+
+	call hphcs_$wire_fnp (fnpno, boot_segp, seg_absadr, 1 + gicb_len + prog_len, code);
+						/* wire the seg */
+	if code ^= 0
+	then do;					/* some bad error has occured */
+	     call sys_log_$error_log (1, code, me, "Wiring memory for FNP ^a bootload.", get_fnp_name_ (fnpno));
+	     go to exit;
+	end;
+	wired = "1"b;				/* remember we have done this */
+%page;
+/* Fill in the load dcws in the boot_comm_area */
+
+	seg_absadr_temp = seg_absadr + fixed (rel (prog_ptr), 17);
+	amt_left = prog_len;
+
+	more = "1"b;
+	do i = 1 to 4 while (more);			/* loop until all dcw built */
+	     absadr_bits = bit (seg_absadr_temp, 24);
+	     dcwp = addr (boot_comm_area.load_dcw (i));
+
+	     dcw.mult_addr_ex = substr (absadr_bits, 1, 6);
+						/* fill in address */
+	     dcw.mult_addr = substr (absadr_bits, 7, 18);
+	     dcw.command = dia_cs_to_fnp;
+
+/* FNP addresses are assembled into gicb */
+
+	     if amt_left > 4096
+	     then do;
+		dcw.tally = "0"b;
+		amt_left = amt_left - 4096;
+		seg_absadr_temp = seg_absadr_temp + 4096;
+	     end;
+	     else do;
+		dcw.tally = bit (fixed (amt_left, 12), 12);
+		more = "0"b;			/* done */
+	     end;
+	     call load_fnp_util_$fnp_parity (dcwp);	/* compute parity on dcw */
+	     call load_fnp_util_$fnp_parity (addrel (dcwp, 1));
+	end;
+
+	if more
+	then do;					/* we cant load this much into 32k */
+	     call sys_log_ (1,
+		"load_fnp_: Unable to load core image into FNP ^a. Core image ^a>^a will not fit in 32K.",
+		get_fnp_name_ (fnpno), dirname, ename);
+	     go to not_done;
+	end;
+
+	dcwp = addr (boot_comm_area.load_dcw (i));	/* ptr to disconnect dcw */
+
+	dcw.mult_addr_ex = "0"b;			/* build disconnect dcw, the last dcw */
+	dcw.mult_addr = "0"b;			/* in the dcw list */
+	dcw.command = dia_disconnect;
+	dcw.xfer_mode = "001"b;
+	dcw.fnp_addr = "0"b;
+	dcw.tally = "0"b;
+
+	call load_fnp_util_$fnp_parity (dcwp);		/* compute parity on dcw */
+	call load_fnp_util_$fnp_parity (addrel (dcwp, 1));
+%page;
+	boot_comm_area.list_icw.xfer_mode = "001"b;	/* same for dia always */
+						/* address is set during gicb assembly */
+	boot_comm_area.list_icw.tally = bit (fixed (i * 2, 12), 12);
+
+	boot_comm_area.boot_cksum = load_fnp_util_$checksum (gicb_ptr, fixed (boot_dcw.tally, 17) - 2);
+						/* use boot_dcw.tally instead of gicb_len, since */
+						/* gicb_len is rounded up to mod 64-1 */
+						/* minus two because we dont include boot_cksum and dia channel */
+
+
+	baud_info_size = max (1, chan_list.count);
+	begin;
+
+dcl  1 load_info aligned,
+       2 count fixed bin,
+       2 entry (baud_info_size),
+         3 devx fixed bin,
+         3 baud fixed bin,
+         3 line_type fixed bin;
+
+	     load_info.count = chan_list.count;
+	     do i = 1 to chan_list.count;
+		cdtep = chan_list.cdte_ptr (i);
+		load_info.devx (i) = cdte.twx;
+		load_info.baud (i) = cdte.baud_rate;
+		load_info.line_type (i) = cdte.line_type;
+	     end;
+
+	     call hphcs_$load_fnp (fnpno, seg_absadr, fnpe.boot_ev_chan, comm_reg.crver, fnpe.coreimage,
+		fnp_memory_size, addr (load_info), code);
+						/* Here goes */
+	end;
+
+	if code ^= 0
+	then do;
+	     call sys_log_$error_log (1, code, me, "During FNP ^a bootload attempt.", get_fnp_name_ (fnpno));
+	     go to exit;
+	end;
+
+	fnpe.boot_segp = boot_segp;
+	return;
+
+
+not_done:
+	code = error_table_$action_not_performed;
+exit:
+	if wired
+	then call hphcs_$unwire_fnp (fnpno, dummy_code);
+	call release_temp_segment_ (me, boot_segp, dummy_code);
+
+	return;
+
+abort:
+     entry (afnpno, acdtp, code);			/* entry to stop a bootload attempt */
+
+	fnpno = afnpno;
+	cdtp = acdtp;
+	fnpep = addr (cdt.fnp_entry (fnpno));
+	boot_segp = fnpe.boot_segp;
+	code = 0;
+	wired = "1"b;
+	go to exit;
+
+%page;
+make_ptr:
+     proc (offset) returns (ptr);			/* make ptr to FNP memory given offset */
+
+dcl  offset fixed bin (17);
+dcl  mp_ptr ptr;
+
+	mp_ptr = addr (mem_array.mem (offset));
+	return (mp_ptr);
+
+     end;
+
+
+ibm_type:
+     proc (lptr) returns (bit (1) aligned);		/* check for IBM-type terminals */
+
+dcl  lptr ptr;
+
+dcl  1 line aligned based (lptr),
+       2 line_type fixed bin (17) unal,
+       2 baud_rate fixed bin (17) unal;
+
+	if line.line_type = LINE_1050 | line.line_type = LINE_2741 | line.baud_rate = 2
+	then return ("1"b);
+	else return ("0"b);
+
+     end;
+
+
+check_line_type:
+     proc (lptr) returns (bit (1) aligned);		/* check if line is SYNC or ASYNC */
+
+dcl  lptr ptr;
+dcl  li fixed bin;
+
+dcl  1 line aligned based (lptr),
+       2 line_type fixed bin (17) unal,
+       2 baud_rate fixed bin (17) unal;
+
+	do li = 1 to n_sync_line_types;
+	     if sync_line_type (li) = line.line_type
+	     then return ("1"b);
+	end;
+	return ("0"b);
+
+     end;
+
+
+baud_idx:
+     proc (rate) returns (fixed bin);			/* get internal baud rate code */
+
+dcl  rate fixed bin (17) unaligned;
+dcl  rix fixed bin;
+
+	do rix = 1 to hbound (baud_table, 1) while (rate ^= baud_table (rix));
+	end;
+	return (rix);
+
+     end;
+%page;
+
+process_line_type:
+     proc (line_type);
+
+dcl  line_type fixed bin;
+
+	if line_type ^= LINE_BSC
+	then do;
+	     pcw = sync_pcw_model;
+	     sync_pcw.sync_char = sync_char;
+	end;
+
+	else do;
+	     pcw = bsc_pcw_model;
+	     if ^hsla_array (ano, i).flags.bsc_ebcdic
+	     then do;				/* ASCII code */
+		bsc_pcw.cct_enable = "1"b;
+		if ^hsla_array (ano, i).flags.bsc_transparent
+		then do;
+		     bsc_pcw.rcv_parity = "1"b;
+		     bsc_pcw.xmt_parity = "1"b;
+		     bsc_pcw.parity_odd = "1"b;
+		end;
+	     end;
+
+	     bsc_pcw.crc_type = "1"b;			/* CRC-16 */
+	     bsc_pcw.ebcdic, hsla_table (i).flags.option1 = hsla_array (ano, i).flags.bsc_ebcdic;
+	     bsc_pcw.transparent = hsla_array (ano, i).flags.bsc_transparent;
+	     bsc_pcw.timers = "1"b;
+	end;
+
+	sync_pcw.subch = bit (fixed (i, 5), 5);
+	return;
+
+     end;
+%page;
+%include mcs_memory_map;
+%include baud_rates;
+%include cdt;
+%include author_dcl;
+%include line_types;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   load_fnp_: ERROR_MESSAGE. expand_pathname_ on IMAGE_PATH for FNP X.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The CDT entry for FNP X specifies a bad path for its core image.
+   The FNP cannot be loaded.
+
+   A:	$inform_sa
+
+
+   Message:
+   load_fnp_: ERROR_MESSAGE. Locating IMAGE_PATH for FNP X.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The system cannot locate the core image for FNP X.
+   The CDT entry for the FNP may be incorrect, or the copy of the MCS may have been deleted.
+   The FNP cannot be loaded.
+
+   A:	$inform_sa
+
+
+   Message:
+   load_fnp_: ERROR_MESSAGE. Creating boot segment in process directory for FNP X.
+
+   S:	$info
+
+   T:	$run
+
+   M:	Ths system was unable to create a temporary segment in the initializer's
+   process directory to hold core image for FNP X.
+   $err
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: ERROR_MESSAGE. Getting FNP info for FNP X.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The system could not obtain information about FNP X from the hardcore.
+   The CDT may disagree with the CONFIG deck.
+   The FNP cannot be loaded.
+
+   A:	$inform_sa
+
+
+   Message:
+   load_fnp_: Core image for FNP X will not support LSLA #N; <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	The CDT specifies that a channel should be used, but the MCS core image
+   for FNP X does not contain support for the indicated LSLA.
+   Either the MCS core image or the CDT must be modified.
+   The FNP cannot be loaded.
+
+   A:	$inform_sa
+
+
+   Message:
+   load_fnp_: Core image for FNP X will not support HSLA #N; <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	The CDT specifies that a channel should be used, but the MCS core image
+   for FNP X does not contain support for the indicated HSLA.
+   Either the MCS core image or the CDT must be modified.
+   The FNP cannot be loaded.
+
+   A:	$inform_sa
+
+
+   Message:
+   load_fnp_: ERROR_MESSAGE. Wiring memory for FNP X bootload.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The system cannot wire down the process directory segment which will be used to boot FNP X.
+   $err
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Unable to load core image into FNP X. Core image <core image pathname> will not fit in 32K.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The MCS core image to be loaded into FNP X larger than 32K.
+   The MCS image is incorrectly constructed or damaged.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: ERROR_MESSAGE. During FNP X bootload attempt.
+
+   S:	$info
+
+   T:	$run
+
+   M:	An error occurred while sending the new core image to FNP X.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Memory size of MK in image does not agree with
+   memory size of NK in CDT for FNP X.
+   Memory size of <min(M, N)> from <CDT or image> will be used.
+
+   S:	$info
+
+   T:     $run
+
+   M:	The memory size specified in the MCS core image does not match the memory size specified in the CDT.
+   The memory size in the MCS core image that is loaded will be set to the minimum value.
+   The FNP load attempt will continue.
+
+   A:	The memory size value in the MCS bind_fnp segment or CDT should be modified by site personnel.
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (bad .crmem value of N in image),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	The value of .crmem should be 24575, 32767 or 65535 in a valid fnp core image.
+   The MCS core image for FNP X will have to be modified.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (.crldt exceeds current time),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	The creation date of the MCS core image for FNP X is past the current time.
+   The MCS core image is probably damaged and will have to be recreated.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (binding of image was done over N years ago),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	The creation date of the MCS core image for FNP X indicates the image is over N years old.
+   The MCS core image is probably damaged and will have to be recreated.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (bad module chain),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	An inconsistency was found in tracing through the module chain of the MCS core image for FNP X.
+   The MCS core image is probably damaged and will have to be recreated.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (found only N modules, minimum required is M),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	Only N program modules were found in the MCS core image for FNP X out of a minimum of M modules.
+   The minimum number of modules is based on the number required to support the smallest FNP configuration.
+   The MCS core image is probably damaged and will have to be recreated.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (init module is not last in the module chain),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	In tracing through the module chain, the last module in the core image for
+   FNP X was not found to be the init module.
+   The init module has to be the last module in the module chain because the init module
+   releases itself and the rest of memory for buffer space when it is finished executing.
+   The MCS core image is probably damaged and will have to be recreated.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   Message:
+   load_fnp_: Invalid core image for FNP X (image length error),  <core image pathname>
+
+   S:	$info
+
+   T:	$run
+
+   M:	The bit count of the image was adjusted and did not compare with the image length found in the core image for FNP X.
+   The first 36 bits of the image segment contains the image length set by bind_fnp_load_.
+   The MCS core image is probably damaged and will have to be recreated.
+   The FNP cannot be loaded.
+
+   A:	$inform
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end load_fnp_;

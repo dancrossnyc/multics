@@ -1,0 +1,255 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+/* MOS_MEMORY_CHECK: This procedure scans memorys to check for MOS memory EDAC errors to be logged. */
+
+/* Written April 1976 by Larry Johnson */
+/* The initial version will check only the low order memory on each controller */
+/* Modified June 1976 by Larry Johnson to check all memories on a controller */
+/* Modified September 1977 by Larry Johnson for new memory board types */
+/* Modified October 1981 by M.R. Jordan for new 64K chip memory */
+/* Modified February 1985 by EJ Sharpe to not log binary value for polling interval, add format */
+
+mos_memory_check: proc (arg_mem, arg_store, arg_data, arg_code);
+
+dcl  arg_mem (0:31) char (1) unal;
+dcl  arg_store (0:31) char (2) unal;
+dcl  arg_data (0:31) fixed bin (71);			/* Array of maintenance registers */
+dcl  arg_code fixed bin (35);
+dcl  arg_time fixed bin;
+
+dcl  port fixed bin;
+dcl  rscr_result fixed bin (71);
+dcl  poll_entry bit (1) init ("0"b);			/* Set if called by polling */
+dcl  time fixed bin;
+dcl  (store_a_index, store_b_index) fixed bin (5);	/* Scas indexes for pmut$rscr */
+dcl  mem char (1);
+dcl  aloud fixed bin;
+
+dcl  spoke (0:31) bit (1) int static init ((32) (1)"0"b);
+
+dcl  never fixed bin (52) int static options (constant)
+	init (1111111111111111111111111111111111111111111111111111b);
+
+
+dcl  letter (0:7) char (1) unal int static options (constant) init ("a", "b", "c", "d", "e", "f", "g", "h");
+
+dcl  privileged_mode_ut$rscr entry (fixed bin (5), fixed bin (6), fixed bin (71));
+dcl  clock_ entry returns (fixed bin (71));
+dcl  syserr entry options (variable);
+dcl  syserr$binary entry options (variable);
+
+dcl  tc_data$mos_polling_time ext fixed bin (52);
+dcl  tc_data$mos_polling_interval ext fixed bin;
+dcl  pds$process_group_id ext char (32) aligned;
+dcl  pds$processid ext bit (36) aligned;
+dcl  error_table_$lock_wait_time_exceeded ext fixed bin (35);
+
+dcl  cleanup condition;
+
+dcl  (addr, stac, stacq) builtin;
+%page;
+/* First, lock the reconfig lock */
+
+	arg_code = 0;
+
+start:
+
+	on cleanup call clean_up;
+
+	if ^stac (addr (scs$reconfig_lock), pds$processid) then do;
+	     if poll_entry then tc_data$mos_polling_time = clock_ () + 60000000; /* Try again in 1 minute */
+	     else arg_code = error_table_$lock_wait_time_exceeded;
+	     return;
+	end;
+	scs$reconfig_locker_id = pds$process_group_id;
+
+/* Now scan looking for memorys */
+
+	scrp = addr (rscr_result);
+
+	do port = 0 to 7;				/* Scan all controlers */
+
+	     if scs$controller_data.online (port) then do;/* Found active memory */
+		if ^scs$controller_data.store_b_is_lower (port) then do; /* Store a lower */
+		     store_a_index = port;		/* Set scas indexes */
+		     store_b_index = port + 8;
+		end;
+		else do;				/* Memory upside down */
+		     store_a_index = port + 8;
+		     store_b_index = port;
+		end;
+
+		mem = letter (port);
+
+		if scs$controller_data.store_a_online (port) then /* Check all stores */
+		     call check_store ("a", store_a_index);
+		if scs$controller_data.store_a1_online (port) then
+		     call check_store ("a1", store_a_index + 16);
+		if scs$controller_data.store_b_online (port) then
+		     call check_store ("b", store_b_index);
+		if scs$controller_data.store_b1_online (port) then
+		     call check_store ("b1", store_b_index + 16);
+
+	     end;
+
+	end;
+
+	if poll_entry then call reschedule;		/* Must schedule next pass */
+	if ^stacq (scs$reconfig_lock, "0"b, pds$processid) then
+	     call syserr (ANNOUNCE, "mos_memory_check: Lock error.");
+	return;
+
+/* Enter here from pxss for polling */
+
+poll: entry;
+
+	if tc_data$mos_polling_interval = 0 then do;	/* Polling was turned off */
+	     tc_data$mos_polling_time = never;
+	     return;
+	end;
+	poll_entry = "1"b;
+	go to start;
+
+
+/* Entry to set the polling interval */
+
+set_poll_time: entry (arg_time);
+
+	time = arg_time;
+	if time < 0 then do;			/* Request to return time */
+	     arg_time = tc_data$mos_polling_interval;
+	     return;
+	end;
+	tc_data$mos_polling_interval = time;
+	call syserr (JUST_LOG, "mos_memory_check: MOS polling ^[disabled^;time ^d minute^[s^]^].",
+	     (time = 0), time, (time ^= 1));
+	call reschedule;
+	return;
+
+
+/* Procedure that will check one store of one memory */
+
+check_store: proc (store_name, scas_index);
+
+dcl  store_name char (2);				/* Name of store being tested */
+dcl  scas_index fixed bin (5);			/* Index in scas for pmut$rscr */
+dcl  id bit (4) aligned;
+
+	call privileged_mode_ut$rscr (scas_index, (SC_SU), rscr_result); /* Read maintence register */
+	if ^poll_entry then do;			/* Called thru gate, so must return data */
+	     arg_mem (scas_index) = mem;
+	     arg_store (scas_index) = store_name;
+	     arg_data (scas_index) = rscr_result;
+	end;
+
+	id = scr_su.identification;			/* copy id for easier access */
+	if (id = "0011"b) | (id = "0100"b) | (id = "1010"b)
+	     | (id = "1011"b) | (id = "1110"b) | (id = "1111"b) then do; /* MOS memory */
+	     if scr_su.syndrome ^= "0"b then do;	/* Some error occured */
+		if spoke (scas_index) then aloud = JUST_LOG; else aloud = ANNOUNCE; /* Mild fuss first time */
+		spoke (scas_index) = "1"b;
+		call syserr$binary (aloud, scrp, SB_mos_err, SBL_mos_err,
+		     "mos_memory_check: EDAC error on mem ^a store ^a.", mem, store_name);
+	     end;
+	end;
+	return;
+
+     end check_store;
+
+/* Procedure to calculate the next time to poll */
+
+reschedule: proc;
+
+	if tc_data$mos_polling_interval = 0 then tc_data$mos_polling_time = never;
+	else tc_data$mos_polling_time = clock_ () + 60000000 * tc_data$mos_polling_interval;
+
+	return;
+
+     end reschedule;
+
+
+clean_up: proc;
+
+dcl  ignore bit (1);
+
+	ignore = stacq (scs$reconfig_lock, "0"b, pds$processid); /* Unlock if I locked it */
+	return;
+
+     end clean_up;
+						/* format: off */
+%page; %include syserr_constants;
+%page; %include syserr_binary_def;
+%page; %include scr;
+%page; %include scs;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   mos_memory_check: Lock error.
+
+   S:	$info
+
+   T:	$run
+
+   M:	After checking the memory controllers for errors,
+   the program mos_memory check attempted to unlock the reconfiguration lock
+   and found it unlocked.
+   The system continues to run.
+
+   A:	$ignore
+
+
+   Message:
+   mos_memory_check: MOS polling disabled
+
+   S:	$log
+
+   T:	$run
+
+   M:	A system administrator has disabled MOS memory polling.
+
+   A:	$ignore
+
+
+   Message:
+   mos_memory_check: MOS polling time NN minutes.
+
+   S:	$log
+
+   T:	$run
+
+   M:	A system administrator has set the MOS memory polling time to NN minutes.
+
+   A:	$ignore
+
+
+   Message:
+   mos_memory_check: EDAC error on mem X store Y.
+
+   S:	$warn
+
+   T:	$run
+
+   M:	MOS memory polling has found that
+   the maintenance register in the system controller
+   shows a nonzero syndrome.
+   The data is logged for use by HEALS or mos_edac_summary.
+   Only the first occurrence of this error is printed online for each box.
+
+   A:	$ignore
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end mos_memory_check;

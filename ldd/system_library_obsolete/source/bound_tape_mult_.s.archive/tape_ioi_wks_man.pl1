@@ -1,0 +1,477 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+/* This program manages the tape_ioi_ workspace. */
+/* Written 3 May 1982 by Chris Jones */
+/* Modified 25 January 1983 by Chris Jones to wait a while on on I/O in progress */
+/* Modified 9 February 1983 by Chris Jones to not deallocate reserved buffers when a deallocate_buffers call is made. */
+/* Modified 30 April 1985 by Chris Jones to always have one more status queue entry than buffers. */
+
+/* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+tape_ioi_wks_man:
+     proc;
+
+/* Parameters */
+
+dcl	p_actual_count	   fixed bin parameter;	/* (O) actual number of buffers allocated */
+dcl	p_actual_length	   fixed bin (21) parameter;	/* (O) actual length (in chars) of each buffer */
+dcl	p_actual_wka_size	   fixed bin (19) parameter;	/* (O) actual size of user workarea */
+dcl	p_buffer_ptrs	   (*) ptr parameter;	/* (O) pointers to the allocated buffers */
+dcl	p_code		   fixed bin (35) parameter;	/* (O) standard system status code */
+dcl	p_requested_count	   fixed bin parameter;	/* (I) desired number of buffers */
+dcl	p_requested_length	   fixed bin (21) parameter;	/* (I) desired length (in chars) of each buffer */
+dcl	p_requested_wka_size   fixed bin (19) parameter;	/* (I) desired size of user workarea */
+dcl	p_tioi_id		   bit (36) aligned parameter;/* (I) tape_ioi_ ID */
+dcl	p_wka_ptr		   ptr parameter;		/* (O) pointer to the user workarea */
+
+/* Automatic variables */
+
+dcl	basic_buffer_header_size
+			   fixed bin;
+dcl	buffer_count	   fixed bin;
+dcl	buffer_idx	   fixed bin;
+dcl	buffer_length	   fixed bin (21);		/* length in characters */
+dcl	buffer_offset	   fixed bin (18);
+dcl	buffer_space_available fixed bin (19);
+dcl	cbufp		   ptr;
+dcl	code		   fixed bin (35);
+dcl	deadline		   fixed bin (71);
+dcl	extra_dcws	   fixed bin;
+dcl	obufp		   ptr;
+dcl	save_workarea_and_reserved_buffers
+			   bit (1) aligned;
+dcl	status_entry_count	   fixed bin (8);
+dcl	status_queue_offset	   fixed bin (18);
+dcl	tries		   fixed bin;
+dcl	user_workarea_offset   fixed bin (18);
+dcl	user_workarea_size	   fixed bin (19);
+dcl	words_left_in_page	   fixed bin;
+dcl	workspace_length	   fixed bin (19);
+dcl	workspace_ptr	   ptr;
+
+/* Constants */
+
+dcl	BITS_PER_WORD	   fixed bin static options (constant) init (36);
+dcl	BYTES_PER_DCW_TALLY	   fixed bin static options (constant) init (16384);
+dcl	BYTES_PER_WORD	   fixed bin static options (constant) init (4);
+dcl	TEN_SECONDS	   fixed bin (71) static options (constant) init (10000000);
+dcl	WORDS_PER_DCW_TALLY	   fixed bin static options (constant) init (4096);
+
+/* Builtins */
+
+dcl	(addr, bin, clock, dim, divide, lbound, max, min, mod, null, ptr, rel, size)
+			   builtin;
+
+/* External entries */
+
+dcl	ioi_$set_status	   entry (fixed bin, fixed bin (18), fixed bin (8), fixed bin (35));
+dcl	ioi_$workspace	   entry (fixed bin, ptr, fixed bin (19), fixed bin (35));
+dcl	tape_ioi_utils$get_workspace_ptr
+			   entry (bit (36) aligned, ptr);
+dcl	tape_ioi_utils$io_in_progress
+			   entry (ptr) returns (bit (1) aligned);
+
+dcl	error_table_$action_not_performed
+			   fixed bin (35) ext static;
+dcl	error_table_$bad_arg   fixed bin (35) ext static;
+dcl	error_table_$device_active
+			   fixed bin (35) ext static;
+dcl	error_table_$out_of_sequence
+			   fixed bin (35) ext static;
+dcl	error_table_$too_many_buffers
+			   fixed bin (35) ext static;
+
+dcl	sys_info$page_size	   fixed bin ext static;
+
+/* Entry to allocate a number of buffers.  All are the same length.  Pointers to the data area
+   of the buffers will be returned. */
+
+allocate_buffers:
+     entry (p_tioi_id, p_requested_length, p_requested_count, p_actual_length, p_actual_count, p_buffer_ptrs, p_code);
+
+	call setup;
+	if tai.workarea_last then			/* if caller has already allocated a workarea... */
+	     call quit (error_table_$out_of_sequence);	/* ...at the end of the workspace, then quit */
+
+/* Figure out what the caller really wants.  If the count is 0, give as many of the requested size as
+   will fit.  If the length is 0, make each buffer as big as possible.  If both are 0, punt. */
+
+	buffer_count = p_requested_count;
+	buffer_length = p_requested_length;
+	if ((buffer_length = 0) & (buffer_count = 0)) | (buffer_length < 0) | (buffer_count < 0) then
+	     call quit (error_table_$bad_arg);
+
+	buffer_space_available = tai.workspace_max - tai.workspace_len;
+
+	if buffer_length ^= 0 then do;		/* caller knows how big the buffers are to be */
+
+/* round up to next two word boundary */
+
+	     if mod (buffer_length, 2 * BYTES_PER_WORD) ^= 0 then
+		buffer_length = buffer_length + 2 * BYTES_PER_WORD - mod (buffer_length, 2 * BYTES_PER_WORD);
+	     extra_dcws = divide (buffer_length - 1, BYTES_PER_DCW_TALLY, 17);
+	     if buffer_count = 0 then			/* we have to figure out how many buffers to grab */
+		buffer_count =
+		     divide (BYTES_PER_WORD * buffer_space_available,
+		     buffer_length + BYTES_PER_WORD * (size (tbi) + extra_dcws), 17);
+	end;
+
+	else do;					/* we have to figure out how big each buffer will be */
+
+/* Now, this turns out to be a sticky problem.  The storage per buffer consists of the storage per header plus the
+   storage per data area.  However, the storage per header is dependent on the storage per data area (because
+   the number of DCWs in the header varies with the storage per data area.  So, given:
+
+   Sh	storage per buffer header
+   Stot	total storage available			(known, it is buffer_space_available)
+   Nb	number of buffers
+   Sho	length of constant part of buffer header	(known)
+   Ds	amount of storage described by one DCW		(known, 4096 words)
+   Sd	amount of storage 1 DCW itself takes up		(known, 1 word)
+   Sb	storage per buffer (header + data)
+   Nd	number of DCWs per buffer
+
+   We want to solve for Nd.
+
+   1. Sb = Stot / Nb
+   2. Sh = Sho + Nd * Sd		or	2a. Sh = Sho + Nd	(since Sd = 1)
+   3. Nd = (Sb - Sh) / Ds
+   4. Nd = (Sb - (Sho + Nd)) / Ds		substituting (2a) into 3
+   5. Ds * Nd = Sb - Sho - Nd			multiplying both sides of (4) by Ds
+   6. Nd * (Ds + 1) = Sb - Sho		adding Nd to both sides and combining factors
+   7. Nd = (Sb - Sho) / (Ds + 1)		dividing both sides by (Ds + 1)
+   8. Nd = ((Stot / Nb) - Sho) / (Ds + 1)	combining (1) and (7)
+*/
+
+	     basic_buffer_header_size = size (tbi) + 1;	/* allow for first word of data */
+	     extra_dcws =
+		divide (divide (buffer_space_available, buffer_count, 17) - (basic_buffer_header_size + size (istat)),
+		WORDS_PER_DCW_TALLY + 1, 17);
+	     buffer_length =
+		BYTES_PER_WORD
+		* (divide (buffer_space_available, buffer_count, 17) - (size (tbi) + size (istat) + extra_dcws));
+	     buffer_length = buffer_length - mod (buffer_length, 2 * BYTES_PER_WORD);
+	     if (buffer_length <= 0) | (extra_dcws < 0) then
+		call quit (error_table_$too_many_buffers);
+	end;
+
+/* Now we have the count and correct length of all the buffers we're going to allocate.
+   Grab a workspace big enough for all of these buffers. */
+
+	if buffer_count = 0 then
+	     call quit (error_table_$bad_arg);
+
+	workspace_length = tai.workspace_len + 1	/* unpack */
+	     + buffer_count * (size (tbi) + size (istat) + extra_dcws + divide (buffer_length, BYTES_PER_WORD, 17));
+
+	call set_workspace (workspace_ptr, workspace_length, code);
+	call quit_if_error;
+	tai.workspace_len = workspace_length - 1;	/* pack */
+
+/* Relocate the status queue to the end of the workspace */
+
+	status_entry_count = tai.buffer_count + buffer_count + 1;	/* allow for the MPC to hiccup */
+	status_queue_offset = workspace_length - size (istat) * status_entry_count;
+	call set_status (status_queue_offset, status_entry_count, code);
+	call quit_if_error;
+
+/**** Remember where the status queue was (this is where the new buffers will begin). */
+	buffer_offset = tai.status_queue_offset;
+
+	tai.status_queue_offset = status_queue_offset;
+	tai.status_entry_idx = 0;
+	tai.status_entry_count = status_entry_count;
+
+/* Now thread the buffers onto the lists.  First, thread all of the newly created buffers together. */
+
+	cbufp = ptr (wksp, buffer_offset);
+	do buffer_idx = 1 to buffer_count;
+	     cbufp -> tbi.data_offset = size (tbi) + extra_dcws + bin (rel (cbufp));
+	     cbufp -> tbi.next_buf_offset = cbufp -> tbi.data_offset + divide (buffer_length, BYTES_PER_WORD, 17);
+	     cbufp -> tbi.next_state_offset = cbufp -> tbi.next_buf_offset;
+	     cbufp -> tbi.state = READY_STATE;
+	     cbufp -> tbi.ndcws = 1 + extra_dcws;
+	     cbufp -> tbi.buffer_len = buffer_length;
+	     cbufp -> tbi.data_len = 0;
+	     cbufp -> tbi.bit_len = 0;
+	     cbufp -> tbi.modes = tai.modes;
+	     idcwp = addr (cbufp -> tbi.idcw_word);
+	     idcw.device = addr (tai.order_idcw) -> idcw.device;
+	     idcw.ext = "0"b;
+	     idcw.code = "111"b;
+	     idcw.ext_ctl = "0"b;
+	     obufp = cbufp;
+	     cbufp = ptr (wksp, cbufp -> tbi.next_buf_offset);
+	end;
+
+	obufp -> tbi.next_buf_offset = 0;		/* unlink the last one */
+	obufp -> tbi.next_state_offset = 0;
+
+	if tai.buffer_list_offset = 0 then
+	     tai.buffer_list_offset = buffer_offset;	/* first buffers allocated */
+	else do;
+	     do obufp = ptr (wksp, tai.buffer_list_offset) repeat ptr (wksp, obufp -> tbi.next_buf_offset)
+		while (obufp -> next_buf_offset ^= 0);
+	     end;
+	     obufp -> tbi.next_buf_offset = buffer_offset;
+	end;
+	if tai.free_list_offset = 0 then
+	     tai.free_list_offset = buffer_offset;	/* first buffers allocated */
+	else do;
+	     do obufp = ptr (wksp, tai.free_list_offset) repeat ptr (wksp, obufp -> tbi.next_state_offset)
+		while (obufp -> next_state_offset ^= 0);
+	     end;
+	     obufp -> tbi.next_state_offset = buffer_offset;
+	end;
+
+/* Update tai to reflect these new buffers */
+
+	obufp = cbufp;
+	cbufp = ptr (wksp, buffer_offset);		/* remember first buffer allocated */
+	tai.buffer_count = tai.buffer_count + buffer_count;
+
+/* Now return all sorts of information to the caller. */
+
+	p_actual_count = buffer_count;
+	p_actual_length = buffer_length;
+	do buffer_idx = 1 to min (buffer_count, dim (p_buffer_ptrs, 1));
+	     p_buffer_ptrs (lbound (p_buffer_ptrs, 1) + buffer_idx - 1) = ptr (wksp, cbufp -> tbi.data_offset);
+	     cbufp = ptr (wksp, cbufp -> tbi.next_buf_offset);
+	end;
+	p_code = 0;
+	return;
+
+/* Entry to allocate a workarea for the caller.  This has the advantage that it will usually be wired,
+   so page faults will be kept to a minimum. */
+
+allocate_work_area:
+     entry (p_tioi_id, p_requested_wka_size, p_actual_wka_size, p_wka_ptr, p_code);
+
+	call setup;
+	if tai.workarea_offset ^= 0 then		/* tsk, tsk */
+	     call quit (error_table_$action_not_performed);
+
+	user_workarea_size = p_requested_wka_size;
+	if tai.buffer_count = 0 then do;		/* no buffers have been allocated yet */
+	     if user_workarea_size = 0 then
+		call quit (error_table_$bad_arg);
+
+	     user_workarea_offset = tai.status_queue_offset;
+	     if mod (user_workarea_offset, 2) ^= 0 then
+		user_workarea_size = user_workarea_size + 1;
+	     workspace_length = user_workarea_size + tai.workspace_len + 1;
+	     call set_workspace (workspace_ptr, workspace_length, code);
+	     call quit_if_error;
+	     status_queue_offset = tai.status_queue_offset + user_workarea_size;
+	     status_entry_count = tai.status_entry_count;
+	     call set_status (status_queue_offset, status_entry_count, code);
+	     call quit_if_error;
+	     tai.workarea_offset = user_workarea_offset;	/* workarea starts where status queue was */
+	     tai.workarea_len = user_workarea_size;
+	     tai.status_queue_offset = status_queue_offset;
+						/* remember where we put the status queue */
+	     tai.status_entry_idx = 0;
+	end;
+	else do;					/* we've already allocated some buffers */
+	     words_left_in_page = sys_info$page_size - mod (tai.workspace_len, sys_info$page_size) - 1;
+	     if user_workarea_size = 0 then		/* user wants all of last page */
+		user_workarea_size = words_left_in_page;
+	     else if user_workarea_size < words_left_in_page - mod (user_workarea_size, 2) then
+		call quit (error_table_$bad_arg);
+
+	     workspace_length = tai.workspace_len + user_workarea_size + 1;
+	     call set_workspace (workspace_ptr, workspace_length, code);
+	     call quit_if_error;
+
+	     tai.workarea_last = "1"b;
+	     user_workarea_offset = tai.workspace_len;	/* so calculation after this clause will be set up */
+	     tai.workarea_offset = tai.workspace_len;
+	     tai.workarea_len = user_workarea_size;
+	end;
+	tai.workspace_len = workspace_length - 1;
+	if mod (user_workarea_offset, 2) ^= 0 then do;	/* ensure it's on an even word boundary */
+	     user_workarea_offset = user_workarea_offset + 1;
+	     user_workarea_size = user_workarea_size - 1;
+	end;
+	p_wka_ptr = ptr (wksp, user_workarea_offset);
+	p_actual_wka_size = user_workarea_size;
+	p_code = 0;
+	return;
+
+/* Entry to deallocate all unreserved buffers and as many status queue entries as we can. */
+
+deallocate_buffers:
+     entry (p_tioi_id, p_code);
+
+	save_workarea_and_reserved_buffers = "1"b;
+	goto DEALLOCATE_COMMON;
+
+/* Entry to deallocate all buffers, the user workarea, and all but one status queue entry. */
+
+deallocate:
+     entry (p_tioi_id, p_code);
+
+	save_workarea_and_reserved_buffers = "0"b;
+DEALLOCATE_COMMON:
+	call setup;
+
+	if (tai.workarea_last | tai.susp_list_offset ^= 0) & save_workarea_and_reserved_buffers then
+	     call quit (error_table_$action_not_performed);
+
+	if ^save_workarea_and_reserved_buffers then do;
+	     tai.buffer_list_offset = 0;
+	     tai.free_list_offset = 0;
+	     tai.susp_list_offset = 0;
+	     tai.buffer_count = 0;
+	     tai.workarea_len = 0;
+	     tai.workarea_offset = 0;
+	     tai.workarea_last = "0"b;
+	     status_queue_offset = size (tai);
+	     status_entry_count = 1;
+	end;
+	else do;
+	     cbufp = ptr (wksp, tai.buffer_list_offset);
+	     buffer_count = 0;
+	     if tai.workarea_offset = 0 then
+		status_queue_offset = size (tai);
+	     else status_queue_offset = tai.workarea_offset + tai.workarea_len + 1;
+	     do while (rel (cbufp));
+		if cbufp -> tbi.reserved then do;
+		     buffer_count = buffer_count + 1;
+		     status_queue_offset =
+			cbufp -> tbi.data_offset + divide (cbufp -> tbi.buffer_len, BYTES_PER_WORD, 17, 0);
+		     cbufp -> tbi.next_state_offset = cbufp -> tbi.next_buf_offset;
+		     obufp = cbufp;
+		     cbufp = ptr (wksp, cbufp -> tbi.next_buf_offset);
+		end;
+		else do;
+		     if buffer_count ^= 0 then do;
+			obufp -> tbi.next_buf_offset = 0;
+			obufp -> tbi.next_state_offset = 0;
+		     end;
+		     cbufp = wksp;			/* this will stop the loop */
+		end;
+	     end;
+	     if buffer_count = 0 then
+		tai.buffer_list_offset, tai.free_list_offset = 0;
+	     else tai.free_list_offset = tai.buffer_list_offset;
+	     status_entry_count = buffer_count + 1;
+	     tai.buffer_count = buffer_count;
+	end;
+
+	call set_status (status_queue_offset, status_entry_count, code);
+	call quit_if_error;
+	tai.status_queue_offset = status_queue_offset;
+	tai.status_entry_count = status_entry_count;
+	tai.status_entry_idx = 0;
+
+	workspace_length = status_queue_offset + size (istat) * tai.status_entry_count;
+	call set_workspace (workspace_ptr, workspace_length, code);
+	call quit_if_error;
+	tai.workspace_len = workspace_length - 1;
+	p_code = 0;
+	return;
+
+/* Routine to change the size of the workspace */
+
+set_workspace:
+     proc (ws_ptr, ws_len, code);
+
+dcl	ws_ptr		   ptr parameter;
+dcl	ws_len		   fixed bin (19) parameter;
+dcl	code		   fixed bin (35) parameter;
+
+	deadline = clock () + TEN_SECONDS;
+	do while ("1"b);
+	     do tries = 1 to 10;
+		call ioi_$workspace (tai.ioi_index, workspace_ptr, workspace_length, code);
+		if code ^= error_table_$device_active then
+		     return;
+	     end;
+	     if clock () > deadline then
+		return;
+	end;
+
+     end set_workspace;
+
+/* Routine to change the size of the status queue */
+
+set_status:
+     proc (q_offset, q_len, code);
+
+dcl	q_offset		   fixed bin (18) parameter;
+dcl	q_len		   fixed bin (8) parameter;
+dcl	code		   fixed bin (35) parameter;
+
+
+/* Clear the status queue */
+
+	begin;
+
+dcl	status_bit_string	   bit (BITS_PER_WORD * q_len * size (istat)) based (ptr (wksp, q_offset));
+
+	     status_bit_string = ""b;
+
+	end;
+
+	deadline = clock () + TEN_SECONDS;
+	do while ("1"b);
+	     do tries = 1 to 10;
+		call ioi_$set_status (tai.ioi_index, q_offset, q_len, code);
+		if code ^= error_table_$device_active then
+		     return;
+	     end;
+	     if clock () > deadline then
+		return;
+	end;
+
+     end set_status;
+
+/* Setup routine.  Verifies p_tioi_id.  Also ensures no I/O is in progress. */
+
+setup:
+     proc;
+
+	call tape_ioi_utils$get_workspace_ptr (p_tioi_id, wksp);
+	if wksp = null () then
+	     call quit (error_table_$bad_arg);
+	if tape_ioi_utils$io_in_progress (wksp) then
+	     call quit (error_table_$device_active);
+
+     end setup;
+
+/* Routine to return to the caller if an error was found. */
+
+quit_if_error:
+     proc;
+
+	if code ^= 0 then
+	     call quit (code);
+
+     end quit_if_error;
+
+quit:
+     proc (code);
+
+dcl	code		   fixed bin (35);
+
+	p_code = code;
+	goto ERROR_RETURN;
+
+     end quit;
+
+ERROR_RETURN:
+	return;
+
+%include tape_ioi_workspace;
+%page;
+%include iom_pcw;
+%page;
+%include tape_ioi_buffer_status;
+%page;
+%include ioi_stat;
+
+     end tape_ioi_wks_man;

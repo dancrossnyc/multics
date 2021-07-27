@@ -1,0 +1,918 @@
+/* ***********************************************************
+   *                                                         *
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   *                                                         *
+   *********************************************************** */
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+/* format: style1,^inddcls,ifthenstmt,ifthendo,ifthen,indcomtxt,dclind5 */
+ta_process_volume_set_: proc (perm_table_ptr, arg_array, table_name, code);
+
+/* This subroutine implements the "go" key of tape_archive.  It is responsible
+   for orchestrating the order in which files are extracted, appended, and so
+   on, and for the bookkeeping of the files on the tape.  Certain duties that
+   are left to subroutines include actual tape mount, dismount, and I/O, and
+   bookkeeping of tape records used and tape file names.
+
+   Written 05/12/77 by C. D. Tavares.
+   Modified 04/11/79 by CDT to fix some problems with error handling.
+   Modified 09/24/79 by CDT to add -long and to fix bug resulting in
+   run-time additions to the volume set failing.
+   Modified 09/03/80 by CDT to implement density selection.
+   Modified 10/24/80 by CDT to add tape_ibm_ capability.
+   Modified 12/9/81 by CDT for highest_mount_type stuff.
+   Last modified 83-03-16 by S. G. Harris (UNCA) for version 4.
+   Modified 6/83 by S. Krupp for conversion to mtape_.
+   Modified 12/83 by T. A. Casey for ssu usage monitoring
+   Modified 01/84 by J. A. Bush to enable referencing dir search rule to find
+   target I/O module
+   Modified: June 1984 by Greg Texada to fix a bug in max volume set size.
+   Modified: 85-2-18 by C Spitzer add test for not finding a file when compacting.
+*/
+
+/* The following constant is the ssu_usage version ID. It should be changed
+   whenever a new version of tape_archive is installed. The version ID decode
+   is as follows:
+   "tbX_mtY_ZZZ"
+   where:
+   X = tape_archive table version number
+   Y = mtape_ I/O module version number
+   ZZZ = either EXL or sss, depending on where this version of tape_archive resides */
+
+dcl  SSU_USAGE_VERSION      char (11) int static options (constant) init
+		        ("tb4_mt1_SSS");		/* change this as defined above */
+
+dcl  perm_table_ptr	        pointer parameter,
+     arg_array	        (*) char (168) parameter,
+     table_name	        char (*) parameter,
+     code		        fixed bin (35) parameter,
+     a_retain_sw	        bit (1) aligned;
+
+/* AUTOMATIC */
+
+dcl  alternate_volume_set   fixed bin,
+     compacting	        bit (1) aligned,
+     cur_time	        bit (36) aligned,
+     debug_sw	        bit (1) aligned,
+     (dlp, sci_ptr)	        pointer,
+     (i, j)	        fixed bin,
+     lock_entry	        bit (1) aligned,
+     max_chars_in_seg       fixed bin (21),
+     prev_retain_sw	        bit (1) aligned,
+     reel_no	        fixed bin,
+     retain_sw	        bit (1) aligned,
+     set_incomplete_bit     bit (1) aligned,
+     system_free_ptr        pointer,
+     tape_has_changed       bit (1) aligned,
+     tape_in_volume_string  char (264),
+     tape_out_volume_string char (264),
+     this_mount_type        fixed bin,
+     varying_reel_id        char (168) varying,
+     volume_no	        fixed bin,
+     volume_string	        char (64) varying;
+
+/* BUILTINS */
+
+dcl  (addr, bit, clock, codeptr, dim, hbound, index, max, null, substr) builtin;
+
+/* STATIC */
+
+dcl  my_lock_id	        bit (36) aligned static initial ((36)"1"b);
+
+/* EXTERNAL STATIC */
+
+dcl  (error_table_$action_not_performed,
+     error_table_$bad_mount_request,
+     error_table_$badopt,
+     error_table_$file_aborted,
+     error_table_$lock_wait_time_exceeded,
+     error_table_$no_file,
+     error_table_$no_next_volume,
+     error_table_$not_attached,
+     error_table_$not_detached,
+     error_table_$not_done,
+     error_table_$unexpired_file,
+     error_table_$unexpired_volume,
+     error_table_$unimplemented_version,
+     error_table_$uninitialized_volume,
+     error_table_$vol_in_use) external fixed bin (35) static;
+
+dcl  sys_info$max_seg_size  external fixed bin (35) static;
+
+/* ENTRIES */
+
+dcl  (com_err_, com_err_$suppress_name, command_query_, command_query_$yes_no) ext entry options (variable),
+     continue_to_signal_    ext entry (fixed bin (35)),
+     debug	        ext entry,
+     delete_$path	        ext entry (char (*), char (*), bit (6), char (*), fixed bin (35)),
+     find_condition_info_   ext entry (pointer, pointer, fixed bin (35)),
+     get_lock_id_	        entry returns (bit (36) aligned),
+     get_system_free_area_  ext entry returns (pointer),
+     get_temp_segments_     ext entry (char (*), pointer dimension (*), fixed bin (35)),
+     ioa_		        ext entry options (variable),
+     ioa_$rsnnl	        ext entry options (variable),
+     release_temp_segments_ ext entry (char (*), pointer dimension (*), fixed bin (35)),
+     set_lock_$lock	        entry (bit (36) aligned, fixed bin, fixed bin (35)),
+     set_lock_$unlock       entry (bit (36) aligned, fixed bin (35)),
+     ssu_$record_usage      entry (ptr, ptr, fixed bin (35)),
+     ssu_$standalone_invocation entry (ptr, char (*), char (*), ptr, ptr, fixed bin (35)),
+     ssu_$destroy_invocation entry (ptr);
+
+dcl  ta_file_io_$append     ext entry (pointer, fixed bin, pointer, fixed bin (35)),
+     ta_file_io_$append_table ext entry (pointer, pointer, fixed bin (35)),
+     ta_file_io_$compact    ext entry (pointer, fixed bin, pointer, fixed bin (35)),
+     ta_file_io_$dismount   ext entry (pointer, pointer, bit (1) aligned, fixed bin (35)),
+     ta_file_io_$extract    ext entry (pointer, fixed bin, pointer, fixed bin (35)),
+     ta_table_mgr_$cancel_request_no ext entry (pointer, fixed bin, fixed bin (35)),
+     ta_table_mgr_$copy_to_perm ext entry (ptr, ptr, fixed bin (35)),
+     ta_table_mgr_$copy_to_temp ext entry (ptr, ptr, fixed bin (35)),
+     ta_table_mgr_$finish_requests ext entry (pointer, fixed bin (35)),
+     ta_table_mgr_$lock     ext entry (ptr, char (*), fixed bin, fixed bin (35)),
+     ta_table_mgr_$unlock   ext entry (pointer, fixed bin (35));
+
+/* CONDITIONS */
+
+dcl  (command_question, cleanup) condition;
+
+/* BASED VARIABLES */
+
+dcl  1 delete_list	        aligned based (dlp),
+       2 n_entries	        fixed bin initial (0),
+       2 entries	        (tape_archive_table.n_queued_requests) aligned,
+         3 dirname	        char (168) unaligned,
+         3 uid	        bit (36) aligned,
+         3 ename	        char (32) unaligned,
+         3 force	        bit (1) aligned;
+
+dcl  system_free_area       area based (system_free_ptr);
+%page;
+%include tape_archive_table_dcl;
+%page;
+dcl  1 tape_archive_io_info aligned automatic,
+%include tape_archive_io_info;
+	;
+%page;
+
+%include condition_info;
+dcl  1 cond_info	        aligned automatic like condition_info;
+%page;
+%include query_info_;
+%page;
+%include iox_dcls;
+%page;
+%include mtape_volume_status;
+%page;
+%include mtape_err_stats;
+%page;
+
+/* ta_process_volume_set_ entry */
+
+	lock_entry = "1"b;
+
+	goto MAIN;
+
+/* ta_process_volume_set_$lock entry */
+
+no_lock: entry (perm_table_ptr, arg_array, table_name, code);
+
+	lock_entry = "0"b;
+
+/* Main procedure. */
+
+MAIN:
+
+/* Record usage in >site>ssudir>tape_archive.ssusage if it exists, if not this is nop */
+/* Each "go" request counts as one use, as it will cause tape I/O to happen */
+
+	call ssu_$standalone_invocation (sci_ptr, "tape_archive", SSU_USAGE_VERSION, null (), null (), (0));
+	call ssu_$record_usage (sci_ptr, codeptr (ta_process_volume_set_), (0));
+	call ssu_$destroy_invocation (sci_ptr);
+
+	table_ptr = perm_table_ptr;
+	debug_sw, tape_archive_io_info.long_sw = "0"b;
+	temp_seg_ptrs = null;
+	max_chars_in_seg = sys_info$max_seg_size * 4;
+	dlp = null;
+	query_info.version = query_info_version_5;
+
+	if my_lock_id = (36)"1"b then
+	     my_lock_id = get_lock_id_ ();
+
+	prev_retain_sw, retain_sw = (tape_archive_table.mount_lock = my_lock_id);
+
+	alternate_volume_set = 3 - tape_archive_table.active_set;
+
+	call iox_$find_iocb ("ta_file_output_", tape_archive_io_info.file_output_switch, code);
+	if code ^= 0 then call abort (code, "");
+
+	call iox_$find_iocb ("ta_file_input_", tape_archive_io_info.file_input_switch, code);
+	if code ^= 0 then call abort (code, "");
+
+	call iox_$find_iocb ("ta_tape_output_", tape_archive_io_info.tape_output_switch, code);
+	if code ^= 0 then call abort (code, "");
+
+	call iox_$find_iocb ("ta_tape_input_", tape_archive_io_info.tape_input_switch, code);
+	if code ^= 0 then call abort (code, "");
+
+/* Process arguments if any */
+
+	do i = 1 to dim (arg_array, 1);
+	     if (arg_array (i) = "-debug" | arg_array (i) = "-db") then
+		debug_sw, tape_archive_io_info.long_sw = "1"b; /* do things loudly on command_question and call db if failure */
+
+	     else if (arg_array (i) = "-long") | (arg_array (i) = "-lg") then
+		tape_archive_io_info.long_sw = "1"b;
+
+	     else if arg_array (i) = "-retain" then do;
+		     if i = dim (arg_array, 1) then retain_sw = "1"b;
+		     else do;
+			     i = i + 1;
+			     if arg_array (i) = "all" then retain_sw = "1"b;
+			     else if arg_array (i) = "none" then retain_sw = ""b;
+			     else do;
+				     call com_err_ (error_table_$badopt, "tape_archive", "Use -retain all or -retain none.");
+				     return;
+				end;
+			end;
+		end;
+
+	     else do;
+		     call com_err_ (error_table_$badopt, "tape_archive", arg_array (i));
+		     return;
+		end;
+	end;
+
+
+	this_mount_type = tape_archive_table.next_mount_type;
+
+	if this_mount_type = None then do;
+		if (^retain_sw &
+		     (tape_archive_table.mount_lock = my_lock_id)) then do; /* wants to dismount tapes */
+
+			call cleanerup;
+
+			tape_archive_table.highest_mount_type = None;
+			call set_lock_$unlock
+			     (tape_archive_table.mount_lock, 0);
+		     end;
+		else do;
+			code = error_table_$not_done;
+			call com_err_ (code, "tape_archive", "No processing is scheduled for ^a.", table_name);
+		     end;
+		return;
+	     end;
+
+	on cleanup call cleanerup;
+
+	call get_temp_segments_ ("tape_archive", based_temp_seg_ptrs (*), code);
+	if code ^= 0 then call abort (code, "");
+
+	if lock_entry
+	then do;
+		call ta_table_mgr_$lock (perm_table_ptr, table_name, Process_tape, code);
+		if code ^= 0 then call abort (code, "Unable to lock the table.");
+	     end;
+
+	call ta_table_mgr_$copy_to_temp (perm_table_ptr, tape_archive_io_info.temp_table_ptr, code);
+	if code ^= 0 then call abort (code, "Unable to copy the table to a temporary work area.");
+
+	table_ptr = tape_archive_io_info.temp_table_ptr;
+
+	call set_lock_$lock (tape_archive_table.mount_lock, 0, code);
+	if code = error_table_$lock_wait_time_exceeded then do;
+		call com_err_ (error_table_$vol_in_use, "tape_archive",
+		     "^a", table_name);
+		call cleanerup;
+		return;
+	     end;
+	if code = 0 then tape_archive_table.highest_mount_type = None;
+
+	perm_table_ptr -> tape_archive_table.mount_lock = my_lock_id;
+
+	tape_archive_table.highest_mount_type =
+	     max (tape_archive_table.highest_mount_type, this_mount_type);
+
+	compacting = (this_mount_type = Compact);
+	if compacting then i = alternate_volume_set;
+	else i = tape_archive_table.active_set;
+
+	if tape_info.n_volumes_in_set (i) = 0 then do;
+		query_info.suppress_name_sw = "1"b;
+		call command_query_ (addr (query_info),
+		     volume_string,
+		     "tape_archive", "Enter volume name of new first volume: ");
+
+		tape_info.volume_set (i).volume_id (1) = volume_string;
+
+		tape_info.n_volumes_in_set (i) = 1;
+	     end;
+
+%page;
+	on command_question begin;
+%skip (3);
+%include command_question_info;
+%include condition_info_header;
+
+dcl  cq_answer	        char (command_question_info.max_answer_lth) based (command_question_info.answer_ptr),
+     cq_callername	        char (command_question_info.name_lth) based (command_question_info.name_ptr);
+dcl  yes_sw	        bit (1) aligned;
+%skip (3);
+
+		call find_condition_info_ (null, addr (cond_info), code);
+		if code ^= 0 then goto resignal;
+
+		cq_info_ptr = cond_info.info_ptr;
+
+		if cq_callername ^= TAPE_ARCHIVE_IO_MODULE then goto resignal;
+
+		else if command_question_info.status_code = error_table_$file_aborted then goto resignal;
+
+		else if command_question_info.status_code = error_table_$unexpired_volume then cq_answer = "yes";
+
+		else if command_question_info.status_code = error_table_$uninitialized_volume then
+		     if command_question_info.query_code = 3 then goto resignal; /* Valid volume but different label */
+		     else cq_answer = "yes";
+
+		else if command_question_info.status_code = error_table_$no_next_volume then do;
+			call command_query_$yes_no (yes_sw, 0, "tape_archive",
+			     "Volume set is now full. Another tape volume will be required to complete the current operation.",
+			     "End of volume reached. Do you wish to extend the volume set?");
+			if yes_sw then cq_answer = "no";
+			else cq_answer = "yes";
+		     end;
+
+		else if command_question_info.status_code = error_table_$unexpired_file then
+		     if perm_table_ptr -> tape_archive_table.incomplete_write_op_last then cq_answer = "yes";
+		     else if compacting then cq_answer = "yes"; /* destroy any old contents of alternate volume set */
+		     else do;
+			     call com_err_ (command_question_info.status_code, "tape_archive",
+				"^/There may be more recent data on the volume set than is reflected in the table.");
+			     call com_err_$suppress_name (0, "tape_archive",
+				"^5xUnless you are sure this is not the case, answer ""no"" to the following
+^5xquestion and perform a ""load_table"" operation on this volume set to regain^/^5xthe most recent table.");
+			     goto resignal;
+			end;
+
+		else if command_question_info.status_code = 0 then do; /* wants name of next tape to mount */
+
+			if compacting then volume_no = 3 - tape_archive_table.active_set;
+			else volume_no = tape_archive_table.active_set;
+
+			reel_no = tape_archive_table.tape_info.n_volumes_in_set (volume_no) + 1;
+			if reel_no > dim (tape_archive_table.volume_set (1).volume_id (*), 2) then do;
+				code = error_table_$no_next_volume;
+				call com_err_ (code, "tape_archive", "Maximum volume set size exceeded.");
+				call abort (code, "");
+			     end;
+
+			call command_query_ (addr (query_info), varying_reel_id,
+			     "tape_archive", "Enter name of new volume to be appended to the volume set: ");
+
+			tape_info.n_volumes_in_set (volume_no) = reel_no;
+			cq_answer, tape_info.volume_set (volume_no).volume_id (reel_no) = varying_reel_id;
+		     end;
+
+		command_question_info.question_sw,
+		     command_question_info.answer_sw = debug_sw;
+						/* blab only if user wants to know */
+		command_question_info.answer_lth = index (cq_answer, " ") - 1;
+		command_question_info.preset_sw = "1"b;
+
+		goto endblock;
+
+resignal:		call continue_to_signal_ (0);
+
+endblock:	     end;					/* of begin block, command_question handler */
+%page;
+
+/* Make lists of input and output volume sets. */
+
+	do i = tape_archive_table.active_set, alternate_volume_set;
+	     call ioa_$rsnnl ("^v(^a ^)", tape_out_volume_string, 0,
+		tape_archive_table.n_volumes_in_set (i), tape_archive_table.volume_set (i).volume_id (*));
+	     if i = tape_archive_table.active_set then tape_in_volume_string = tape_out_volume_string;
+	end;
+
+/* Mount necessary volume sets. */
+
+/* Always try to attach the input switch (mount the active volume set)
+   because the table might indicate that the user has retained when he
+   really hasn't. */
+
+	call attach_switch (tape_archive_io_info.tape_input_switch,
+	     tape_in_volume_string, tape_archive_table.active_set,
+	     (this_mount_type = Write | retain_sw), code);
+	if code = error_table_$not_detached & prev_retain_sw
+	then ;
+	else if code = error_table_$bad_mount_request
+	then call abort (code, "Drive unavailable.");
+	else if code ^= 0
+	then call abort (code, "Unable to mount active volume set.");
+
+/* Now attach the output switch, if necessary. */
+
+	if this_mount_type >= Write
+	then do;
+		if compacting
+		then do;
+			call attach_switch (tape_archive_io_info.tape_output_switch,
+			     tape_out_volume_string, alternate_volume_set,
+			     compacting, code);
+			if code = error_table_$not_detached
+			then ;
+			else if code = error_table_$bad_mount_request
+			then call abort (code, "Drive unavailable.");
+			else if code ^= 0
+			then call abort (code, "Unable to mount alternate volume set.");
+		     end;
+		else tape_archive_io_info.tape_output_switch = tape_archive_io_info.tape_input_switch;
+	     end;
+
+/* Find the correct open description templates for the tape input and
+   output switches.  In conversion to mtape_ -create and -clear have
+   been left out of the open descriptions because their jobs are implicitly
+   done by mtape_. */
+
+	call ioa_$rsnnl ("-format ^[sb^;vbs^] -block 8192 -mode ^^a -name ^^a -number ^^d",
+	     tape_archive_io_info.input_opd_template, 0, (tape_archive_table.io_module_name = "tape_ansi_"));
+
+	if this_mount_type >= Write
+	then call ioa_$rsnnl ("-expires 12/31/99 -format ^[sb^;vbs^] -block 8192 -mode ^^a -record ^d -name ^^a -number ^^d",
+		tape_archive_io_info.output_opd_template, 0, (tape_archive_table.io_module_name = "tape_ansi_"), sys_info$max_seg_size * 4);
+	else tape_archive_io_info.output_opd_template = "";
+
+/* Perform deletions */
+
+	cur_time = substr (bit (clock ()), 20, 36);
+
+	do i = 1 to tape_archive_table.n_component_slots;
+
+	     component_ptr = addr (component_table (i));
+
+	     if component.valid then
+		if component.date_time_deleted then do;
+			component.valid = ""b;
+			component.date_time_deleted = cur_time;
+			tape_archive_table.n_components = tape_archive_table.n_components - 1;
+			if tape_archive_io_info.long_sw then
+			     call ioa_ ("Deleting component ^a", component.entry_name);
+		     end;
+
+	end;
+
+/* All deletions are done, now do the extractions */
+
+	if this_mount_type >= Read then do;
+		if compacting then
+		     tape_archive_table.last_tape_file_no,
+			tape_archive_table.last_table_no,
+			tape_archive_table.total_records,
+			tape_archive_table.dead_records = 0;
+
+		if retain_sw then do;		/* mark the table so we remember */
+			perm_table_ptr -> tape_archive_table.mount_lock
+			     = tape_archive_table.mount_lock;
+						/* the tapes stay up regardless of invocation-specific errors */
+			perm_table_ptr -> tape_archive_table.highest_mount_type
+			     = tape_archive_table.highest_mount_type;
+		     end;
+
+		do i = 1 to tape_archive_table.n_component_slots;
+
+		     component_ptr = addr (component_table (i));
+
+		     if component.valid then
+			if component.associated_request_index > 0 then
+			     if request_queue (component.associated_request_index).extract then do;
+				     j = component.associated_request_index;
+				     call ta_file_io_$extract (table_ptr, i, addr (tape_archive_io_info), code);
+				     if code = 1
+				     then ;	/* special case: cancel deletion, msg already issued */
+				     else if code ^= 0
+				     then call com_err_ (code, "tape_archive", "^a could not be extracted ^[and was not deleted^].",
+					     component.entry_name, request_queue (j).delete);
+				     else do;	/* extraction ok, check if deletion requested */
+					     if request_queue (j).delete then do;
+						     component.valid = ""b;
+						     component.date_time_deleted = cur_time;
+						     tape_archive_table.n_components = tape_archive_table.n_components - 1;
+						     if tape_archive_io_info.long_sw then
+							call ioa_ ("Deleting component ^a", component.entry_name);
+						     request_queue (j).delete = ""b; /* tell cancel_request_no extract/delete ok */
+						end;
+					end;
+				     call ta_table_mgr_$cancel_request_no (table_ptr, j, code);
+				     call ta_table_mgr_$cancel_request_no (perm_table_ptr, j, code);
+						/* file successfully extracted, might as well note it in perm table */
+				end;
+			     else ;		/* must be a replace pending, don't copy it */
+			else if compacting then do;
+				call ta_file_io_$compact (table_ptr, i, addr (tape_archive_io_info), code);
+				if code ^= 0
+				then if code = error_table_$no_file
+				     then do;
+					call com_err_ (code, "tape_archive",
+					     "Unable to read ^a from the original tape, it will not appear on the compacted tape.",
+					     component.entry_status_descriptor.file_info.entry_name);
+					component.entry_status_descriptor.valid = "0"b;
+					component.date_time_deleted = cur_time;
+					tape_archive_table.n_components = tape_archive_table.n_components - 1;
+					end;
+				     else call abort (code, "");
+			     end;
+		end;
+	     end;
+
+/* All the extractions are done, now do the replacements and appendings. */
+
+	if this_mount_type >= Write then do;
+
+
+		set_incomplete_bit = "1"b;
+
+/* The incomplete_write_op_last will be set the first time we successfully
+   append something.  This is a hedge in case the user or system crashes
+   before table is consistent again.  What this means is that the tape may
+   very well have files on the end which are not reflected in the table.  When
+   we re-run this table, the tape I/O module will ask whether we want to
+   destroy these unexpired files.  If the bit is on, we say yes.  On the other
+   hand, if someone's online table gets backed-up (an earlier version
+   retrieved), the same situation will occur, and this bit being off will tell
+   us that the tape is probably MORE recent than the table, and that the user
+   must take remedial action (a load_table or a reconstruct op) to recover
+   without losing data.  */
+
+
+		system_free_ptr = get_system_free_area_ ();
+		allocate delete_list set (dlp) in (system_free_area);
+
+		do i = 1 to tape_archive_table.n_request_slots;
+
+		     request_ptr = addr (request_queue (i));
+
+		     if request.valid then do;
+			     call ta_file_io_$append (table_ptr, i, addr (tape_archive_io_info), code);
+			     if code = error_table_$unexpired_file
+			     then do;
+				     call com_err_ (code, "tape_archive", "Terminating processing of this volume.");
+				     call cleanerup;
+				     return;
+				end;
+			     else if code ^= 0
+			     then do;
+				     call com_err_ (code, "tape_archive", "^a>^a could not be appended to volume set; removing request.",
+					request.directory_name, request.entry_name);
+				     call ta_table_mgr_$cancel_request_no (table_ptr, i, code);
+						/* remove request; if "rdf" specified, we don't want to delete it! */
+				end;
+			     else do;		/* successful append */
+				     if request.delete then do;
+					     delete_list.n_entries, j = delete_list.n_entries + 1;
+					     delete_list.dirname (j) = request.directory_name;
+					     delete_list.ename (j) = request.entry_name;
+					     delete_list.uid (j) = request.uid;
+					     delete_list.force (j) = request.force;
+					end;
+				     if set_incomplete_bit then do;
+					     tape_archive_table.incomplete_write_op_last = "1"b;
+					     perm_table_ptr -> tape_archive_table.incomplete_write_op_last = "1"b;
+					     set_incomplete_bit = ""b;
+					end;
+				end;
+			end;
+		end;
+	     end;
+
+
+	tape_has_changed = compacting | tape_archive_table.incomplete_write_op_last; /* next call resets incomplete_write_op_last */
+	call ta_table_mgr_$finish_requests (table_ptr, code);
+	if tape_archive_table.n_components = 0 then
+	     call ioa_ ("tape_archive: All components of ^a have been deleted.", table_name);
+
+	if tape_has_changed then do;			/* here, output the table to tape */
+		tape_archive_table.mount_lock = ""b;	/* wouldn't do to have locked table on tape */
+		call ta_file_io_$append_table (table_ptr, addr (tape_archive_io_info), code);
+		if code ^= 0 then call abort (code, "");
+	     end;
+
+/* Copy the new table into permanent storage */
+
+	if (tape_archive_table.highest_mount_type >= Read &
+	     retain_sw) then
+	     tape_archive_table.mount_lock = my_lock_id;	/* don't bother with set_lock_, it's in the [pd] */
+	else tape_archive_table.mount_lock = ""b;	/*  note we no longer have volumes retained */
+
+	call ta_table_mgr_$copy_to_perm (tape_archive_io_info.temp_table_ptr, perm_table_ptr, code);
+	if code ^= 0 then call abort (code, "");
+
+	if dlp ^= null then
+	     do i = 1 to delete_list.n_entries;
+		if delete_list.uid (i) = tape_archive_table.perm_table_uid then /* avoid disaster */
+		     call ioa_ ("tape_archive: Deletion of active table ^a has been suppressed.", table_name);
+		else do;
+			if tape_archive_io_info.long_sw then
+			     call ioa_ ("Deleting ^a>^a.", delete_list.dirname (i), delete_list.ename (i));
+			call delete_$path (delete_list.dirname (i), delete_list.ename (i), delete_list.force (i) || "11111"b,
+			     "tape_archive", code);	/* force if asked, otherwise delete anything that moves,
+						   and chase links. */
+			if code ^= 0 then
+			     call com_err_ (code, "tape_archive", "Unable to delete ^a>^a.",
+				delete_list.dirname (i), delete_list.ename (i));
+		     end;
+	     end;
+
+	table_ptr = perm_table_ptr;
+
+	call cleanerup;
+	return;
+%page;
+cleanerup: proc;
+
+	call dismount_tapes (perm_table_ptr, retain_sw, code);
+
+	if (^retain_sw | (retain_sw & code ^= 0)) & perm_table_ptr -> tape_archive_table.lock = get_lock_id_ ()
+	then do;
+		perm_table_ptr -> tape_archive_table.highest_mount_type = None;
+		call set_lock_$unlock (perm_table_ptr -> tape_archive_table.mount_lock, code);
+	     end;
+
+	if lock_entry
+	then call ta_table_mgr_$unlock (perm_table_ptr, code);
+
+	call release_temp_segments_ ("tape_archive", based_temp_seg_ptrs (*), code);
+
+	if dlp ^= null then free delete_list in (system_free_area);
+
+	return;
+     end cleanerup;
+%skip (5);
+abort: proc (code, msg) options (non_quick);
+
+/* Parameter */
+
+dcl  code		        fixed bin (35);
+dcl  msg		        char (*);
+
+	call com_err_ (code, "tape_archive", msg);
+	if debug_sw then do;
+		call ioa_ ("Calling debug...");
+		call debug;
+	     end;
+	call cleanerup;
+	goto returner;
+     end abort;
+
+returner: return;
+
+%page;
+
+dismount: entry (perm_table_ptr, a_retain_sw, code);
+
+	retain_sw = a_retain_sw;
+
+	call iox_$find_iocb ("ta_tape_output_", tape_archive_io_info.tape_output_switch, code);
+	if code ^= 0 then call abort (code, "");
+
+	call iox_$find_iocb ("ta_tape_input_", tape_archive_io_info.tape_input_switch, code);
+	if code ^= 0 then call abort (code, "");
+
+	call dismount_tapes (perm_table_ptr, retain_sw, code);
+
+	if ^(retain_sw | (retain_sw & code ^= 0)) & perm_table_ptr -> tape_archive_table.lock = get_lock_id_ ()
+	then do;
+		perm_table_ptr -> tape_archive_table.highest_mount_type
+		     = None;
+		call set_lock_$unlock
+		     (perm_table_ptr -> tape_archive_table.mount_lock, 0);
+	     end;
+
+	code = 0;
+	return;
+
+
+%page;
+
+/* This procedure dismounts the volume sets by detaching the
+   tape input and output switches.
+
+   If -retain was specified somewhere along the way,
+   dismount_tapes tries to do the right thing.  It first
+   checks to see if the tape input and output switches need adjustment.
+   Tape_archive likes the tape input switch to talk about the active
+   volume set.  If for example, we have just done a compaction, this will
+   not be the case and we will have to adjust the switches.  If the switches
+   cannot be properly adjusted, nothing will be retained.  Otherwise,
+   the active set and possibly the alternate set (if used) are
+   retained (i.e., the tape input and output switches are left attached).
+
+   Also, we want to take our best shot at dismounting the tapes so we don't
+   just return when we get a nonzero error code, we try to keep going.
+   We do, however, save the first interesting error code we get and return
+   it when we are done. */
+
+dismount_tapes: proc (perm_table_ptr, retain_sw, code);
+
+/* Automatic */
+
+dcl  temp_code	        fixed bin (35);
+
+/* Parameter */
+
+dcl  code		        fixed bin (35);
+dcl  retain_sw	        bit (1) aligned;
+dcl  perm_table_ptr	        ptr;
+
+	if retain_sw
+	then do;
+		call adjust_switches (perm_table_ptr, retain_sw, code);
+		if code = 0
+		then return;
+	     end;
+
+	call iox_$detach_iocb (tape_archive_io_info.tape_input_switch, temp_code);
+	call save_code (temp_code, code);
+
+	call iox_$detach_iocb (tape_archive_io_info.tape_output_switch, temp_code);
+	if temp_code = error_table_$not_attached
+	then ;
+	else call save_code (temp_code, code);
+
+     end dismount_tapes;
+
+
+save_code: proc (code1, code2);
+
+/* Parameter */
+
+dcl  code1	        fixed bin (35);
+dcl  code2	        fixed bin (35);
+
+	if code2 = 0
+	then code2 = code1;
+
+     end save_code;
+%page;
+
+/* This procedure makes sure that the tape input switch is talking
+   about the active volume set.  If this is not the case (an example
+   is, just after a compaction), it will adjust the switches. */
+
+adjust_switches: proc (perm_table_ptr, retain_sw, code);
+
+/* Automatic */
+
+dcl  active_vol_set_ptr     ptr;
+dcl  input_sw	        ptr;
+dcl  n_active_vols	        fixed bin;
+dcl  output_sw	        ptr;
+dcl  temp_iocb_ptr	        ptr;
+dcl  vol_name_len	        fixed bin (21);
+dcl  which_set	        fixed bin;
+
+/* Parameter */
+
+dcl  code		        fixed bin (35);
+dcl  retain_sw	        bit (1) aligned;
+dcl  perm_table_ptr	        ptr;
+
+/* Based */
+
+dcl  active_vol_set	        (n_active_vols) char (vol_name_len) aligned based (active_vol_set_ptr);
+
+	code = 0;
+
+	input_sw = tape_archive_io_info.tape_input_switch;
+	output_sw = tape_archive_io_info.tape_output_switch;
+
+/* Check to see if we need to adjust at all.  If we aren't retaining or
+   if we haven't compacted it is not necessary to adjust the switches.
+   Just return. */
+
+	if ^retain_sw
+	then do;
+		code = error_table_$action_not_performed;
+		return;
+	     end;
+
+	if perm_table_ptr -> tape_archive_table.highest_mount_type < Compact
+	then return;
+
+	if input_sw = output_sw
+	then return;				/* Compaction occurred, but not this time around. */
+
+/* Looks like we need to adjust the switches.  Get information
+   on the volume set assocated with the tape output switch and the
+   volume set that we consider to be the active volume set. */
+
+	vsst_ptr = null;
+
+	call iox_$control (output_sw, "volume_set_status", vsst_ptr, code);
+	if code = error_table_$not_attached /* Compaction occurred, but not this time around. */
+	then do;
+		code = 0;
+		return;
+	     end;
+	else if code ^= 0
+	then return;
+
+	if mtape_vsst.version ^= vsst_version_1
+	then do;
+		code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	which_set = perm_table_ptr -> tape_archive_table.active_set;
+	n_active_vols = perm_table_ptr -> tape_archive_table.n_volumes_in_set (which_set);
+	vol_name_len = length (perm_table_ptr -> tape_archive_table.volume_set (which_set).volume_id (1));
+	active_vol_set_ptr = addr (perm_table_ptr -> tape_archive_table.volume_set (which_set));
+
+/* If the active set is associated with the tape output switch,
+   move it to the tape input switch and the alternate to the
+   tape output switch. */
+
+	if same_volume_set (mtape_vsst.vs_stat.volume_name (*), active_vol_set (*))
+	then do;					/* Need adjustment */
+		call iox_$find_iocb ("ta_temp_iocb_", temp_iocb_ptr, code);
+		if code ^= 0
+		then return;
+		call iox_$move_attach (output_sw, temp_iocb_ptr, code);
+		if code ^= 0
+		then return;
+		call iox_$move_attach (input_sw, output_sw, code);
+		if code ^= 0
+		then return;
+		call iox_$move_attach (temp_iocb_ptr, input_sw, code);
+		if code ^= 0
+		then return;
+	     end;
+
+	free mtape_vsst;
+
+     end adjust_switches;
+
+
+same_volume_set: proc (set_1, set_2) returns (bit (1) aligned);
+
+/* Parameter */
+
+dcl  set_1	        (*) char (*) aligned;
+dcl  set_2	        (*) char (*) aligned;
+
+/* Automatic */
+
+dcl  n_set_1	        fixed bin;
+dcl  n_set_2	        fixed bin;
+
+	n_set_1 = hbound (set_1, 1);
+	n_set_2 = hbound (set_2, 1);
+
+	do i = 1 by 1 while (i <= n_set_1 & i <= n_set_2 & set_1 (i) = set_2 (i));
+	end;
+
+	return (i > n_set_1 & i > n_set_2);
+
+     end same_volume_set;
+
+%page;
+
+/* This procedure determines the necessary attach description with the given
+   information.  It then tries to attach the specified I/O switch with
+   the attach description. */
+
+attach_switch: proc (iocb_ptr, vol_list_str, vol_set_num, write_sw, code);
+
+/* Parameter */
+
+dcl  code		        fixed bin (35);
+dcl  iocb_ptr	        ptr;
+dcl  vol_list_str	        char (*);
+dcl  vol_set_num	        fixed bin;
+dcl  write_sw	        bit (1) aligned;
+
+/* Automatic */
+
+dcl  atd		        char (520);
+
+	atd = "";
+
+	call ioa_$rsnnl ("^a ^a -volume_type ^[ansi^;ibm^] -density ^d ^[-ring^;^]", atd, 0,
+	     TAPE_ARCHIVE_IO_MODULE, vol_list_str,
+	     (tape_archive_table.io_module_name = "tape_ansi_"), tape_archive_table.density (vol_set_num),
+	     write_sw);
+
+	call iox_$attach_ptr (iocb_ptr, atd, codeptr (ta_process_volume_set_), code);
+
+     end attach_switch;
+
+
+     end ta_process_volume_set_;

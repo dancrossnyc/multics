@@ -1,0 +1,1666 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* I/O Module for communications with a HASP host: This I/O module is designed
+   for use by the I/O daemon's workstation simulator (hasp_ws_sim_driver_).  
+   It communicates with the HASP host through a TTY channel controlled by the 
+   ring-0 HASP demultiplexer.
+
+   As each TTY channel connected through the HASP demultiplexer communicates 
+   with only a single device of the physical HASP host, this I/O module will
+   ensure that all I/O switches attached to a given channel have the same
+   device type.  (Multiple I/O switches are allowed to support multiple 
+   request types being attached to the same channel.) 
+
+   Note: The signon_record control order does not validate that supplied IPC
+         channel is an event-wait channel */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(80-02-01,GPalter), approve(), audit(), install():
+     Created.
+     Modified: 1 September 1980 by G. Palter to remove stream mode support.
+     Modified: 2 December 1980 by G. Palter to properly set return code for
+        io_call control order.
+     Modified: 18 December 1980 by G. Palter to support -terminal_type for
+        input/output translations.
+     Modified: 13 January 1981 by G. Palter to pass the representation of a
+        space in the transmission medium's character code to hasp_util_.
+     Modified: 22 July 1981 by G. Palter to convert to version 2
+        dial_manager_, invoke release_channel when done with a particular
+        channel, and convert -signon/-no_signon from attach parameters to
+        control orders.
+     Modified: 26 July 1982 by G. Palter to add get_channel_info control order.
+     Modified: October 1982 by G. Palter to drastically improve write_record
+        performance by changing the order of calls to hcs_$tty_order,
+        hcs_$tty_write, and ipc_$block and to use mvt_ rather than the PL/I
+        translate builtin where appropriate.
+     Modified: 14 December 1982 by G. Palter to fix bugs in the read_record
+        entrypoint's handling of partial or very long input records
+        (HASP #001 and HASP #002) and to insure proper behavior of the
+        read_record entrypoint when the input record will not fit in the
+        caller's buffer.
+  2) change(87-03-17,LJAdams), approve(87-04-03,MCR7646),
+     audit(87-05-05,Gilcrease), install(87-05-14,MR12.1-1030):
+     Changed ttd_version to ttd_version_3.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: on,style4,delnl,insnl,ifthenstmt,ifthen */
+
+hasp_host_:
+     procedure ();
+
+	return;					/* not an entry */
+
+
+/* Parameters */
+
+dcl  P_iocb_ptr pointer parameter;			/* *: -> I/O switch being operated upon */
+dcl  P_code fixed binary (35) parameter;
+
+dcl  P_attach_options (*) character (*) varying parameter;	/* attach: attachment arguments */
+dcl  P_loud_sw bit (1) parameter;			/* attach: ON => attachment errors should call com_err_ */
+
+dcl  P_open_mode fixed binary parameter;		/* open: opening mode */
+dcl  P_open_sw bit (1) parameter;			/* open: obsolete parameter */
+
+dcl  P_record_lth fixed binary (21) parameter;		/* read_record: set to size of terminal_io_record read into
+						   buffer in characters;
+						   get_chars: set to # of characters read into buffer;
+						   write_record, put_chars: size of terminal_io_record to be
+						   written in characters */
+
+dcl  P_buffer_ptr pointer parameter;			/* read_record, get_chars: -> area to place result of read */
+dcl  P_buffer_lth fixed binary (21) parameter;		/* read_record, get_chars: size of area in characters */
+
+dcl  P_record_ptr pointer parameter;			/* write_record, put_chars: -> terminal_io_record
+						   to be written */
+
+dcl  P_order character (*) parameter;			/* control: name of control order to be performed */
+dcl  P_info_ptr pointer parameter;			/* control: -> additional information required to execute the
+						   control order */
+
+dcl  P_new_modes character (*) parameter;		/* modes: new modes to be set */
+dcl  P_old_modes character (*) parameter;		/* modes: set to modes in effect before change */
+
+
+/* Local copies of parameters */
+
+dcl  iocb_ptr pointer;
+dcl  code fixed binary (35);
+
+dcl  argument character (argument_lth) based (argument_ptr);/* based on attach options */
+dcl  argument_lth fixed binary (21);
+dcl  argument_ptr pointer;
+
+dcl  loud_sw bit (1) aligned;
+
+dcl  open_mode fixed binary;
+
+dcl  order character (32);
+dcl  info_ptr pointer;
+
+
+/* Remaining declarations */
+
+dcl  system_area area aligned based (system_area_ptr);
+dcl  system_area_ptr pointer;
+
+dcl  argument_idx fixed binary;			/* # of attach option being processed */
+
+dcl  (tty_channel, device_name) character (32);		/* required components of attach description */
+dcl  have_comm bit (1) aligned;			/* ON => -comm option given (required) */
+dcl  terminal_type character (32);			/* terminal type specifying translations (optional) */
+dcl  other_attach_options character (256) varying;	/* optional portions supplied by caller */
+
+dcl  device_type fixed binary;			/* local copy used for argument processing */
+dcl  idx fixed binary;
+
+dcl  character_value character (32);			/* unused values from argument processing */
+dcl  numeric_value fixed binary (35);
+
+dcl  1 ttd aligned like terminal_type_data;		/* used to call ttt_info_$terminal_data */
+
+dcl  1 dma aligned like dial_manager_arg;		/* used to attach the channel */
+
+dcl  1 local_event_wait_info aligned like event_wait_info;	/* for calls to ipc_$block */
+
+dcl  dialup_msg_channel character (32);			/* arguments to convert_dial_message_ */
+dcl  1 dialup_msg_flags aligned,
+       2 dialed_up bit (1) unaligned,
+       2 hungup bit (1) unaligned,
+       2 control bit (1) unaligned,
+       2 pad bit (33) unaligned;
+
+dcl  state fixed binary;				/* MCS channel state value */
+
+dcl  multiplexer_device_type fixed binary;		/* for "get_device_type" control order */
+
+dcl  1 tty_modes aligned,				/* used to change MCS modes */
+       2 modes_lth fixed binary,
+       2 modes character (256);
+
+dcl  1 read_status aligned,				/* for "read_status" control order */
+       2 event_channel fixed binary (71),		/* channel to block on waiting for input to arrive */
+       2 input_available bit (1);			/* ON => data in ring-0 waiting to be read */
+
+dcl  1 write_status aligned,				/* for "write_status" control order */
+       2 event_channel fixed binary (71),		/* channel to block on waiting for write to complete */
+       2 output_pending bit (1);			/* ON => data in ring-0 waiting to be sent */
+
+dcl  ips_mask bit (36);				/* IPS mask */
+
+dcl  cv_string_buffer character (cv_string_buffer_lth) based (cv_string_buffer_ptr);
+dcl  cv_string_buffer_used character (cv_string_buffer_used_lth) based (cv_string_buffer_ptr);
+dcl  (cv_string_buffer_lth, cv_string_buffer_used_lth) fixed binary (21);
+dcl  (cv_string_buffer_ptr, new_cv_string_buffer_ptr) pointer;
+
+dcl  io_buffer character (io_buffer_lth) unaligned based (io_buffer_ptr);
+dcl  (io_buffer_lth, io_buffer_used, io_buffer_read) fixed binary (21);
+dcl  io_buffer_ptr pointer;				/* buffer for I/O to/from the channel */
+
+dcl  cv_string_buffer_space character (384);		/* local space large enough for most conversions */
+dcl  io_buffer_space character (256) unaligned;		/* local space large enough for most I/O */
+
+dcl  (compress_code, expand_code) fixed binary (35);	/* code from hasp_util_$compress_text/expand_text */
+
+dcl  terminal_io_record_header_lth fixed binary (21);
+
+dcl  previous_data character (64) varying;		/* large enough for an SCB and associated data */
+
+dcl  (have_srcb, more_data_needed) bit (1) aligned;
+
+dcl  srcb_read character (1);				/* SRCB read from the device */
+
+dcl  srcb character (1) unaligned based (srcb_ptr);	/* SRCB character being constructed/interpreted */
+dcl  srcb_ptr pointer;
+
+dcl  1 hasp_printer_srcb unaligned based (srcb_ptr) like hasp_printer_srcb_byte;
+
+dcl  1 read_status_info aligned like read_status based (info_ptr);
+						/* data used by "read_status" control order */
+
+dcl  1 hangup_proc_info aligned based (info_ptr),		/* data used by "hangup_proc" control order */
+       2 procedure entry variable,			/* procedure to invoke when line is hungup */
+       2 data_ptr pointer,				/* user's data to be supplied to said procedure */
+       2 priority fixed binary;			/* priority of this event call channel */
+
+dcl  1 get_channel_info aligned based (info_ptr) like tty_get_channel_info;
+
+dcl  NAME character (32) static options (constant) initial ("hasp_host_");
+
+/* format: off */
+dcl (NUL		initial (" "),
+     ASCII_SPACE	initial (" "),
+     EBCDIC_SPACE	initial ("@"))
+	character (1) static options (constant);
+
+dcl (LOWERCASE	initial ("abcdefghijklmnopqrstuvwxyz"),
+     UPPERCASE	initial ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+	character (26) static options (constant);
+
+dcl  ascii_to_ebcdic_$ae_table character (128) external;
+dcl  ebcdic_to_ascii_$ea_table character (256) external;
+
+dcl (error_table_$action_not_performed, error_table_$bad_conversion, error_table_$bad_mode, error_table_$badopt,
+     error_table_$device_type_unknown, error_table_$eof_record, error_table_$improper_data_format,
+     error_table_$incorrect_device_type, error_table_$invalid_read,
+     error_table_$invalid_write, error_table_$io_no_permission, error_table_$long_record, error_table_$noalloc,
+     error_table_$noarg, error_table_$not_attached, error_table_$not_closed, error_table_$not_detached,
+     error_table_$not_open, error_table_$null_info_ptr, error_table_$short_record, error_table_$smallarg,
+     error_table_$undefined_order_request, error_table_$unimplemented_version, error_table_$wrong_no_of_args)
+	fixed binary (35) external;
+/* format: on */
+
+dcl  com_err_ entry () options (variable);
+dcl  continue_to_signal_ entry (fixed binary (35));
+dcl  convert_dial_message_
+	entry (bit (72) aligned, character (*), character (*), fixed binary, 1 aligned like dialup_msg_flags,
+	fixed binary (35));
+dcl  convert_ipc_code_ entry (fixed binary (35));
+dcl  cu_$arg_list_ptr entry () returns (pointer);
+dcl  cu_$arg_ptr entry (fixed binary, pointer, fixed binary (21), fixed binary (35));
+dcl  cv_dec_check_ entry (character (*), fixed binary (35)) returns (fixed binary (35));
+dcl  dial_manager_$privileged_attach entry (pointer, fixed binary (35));
+dcl  dial_manager_$release_channel entry (pointer, fixed binary (35));
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  hasp_util_$compress_text
+	entry (pointer, fixed binary (21), fixed binary (21), pointer, fixed binary (21), fixed binary (21),
+	character (1) aligned, fixed binary (35));
+dcl  hasp_util_$expand_text
+	entry (pointer, fixed binary (21), fixed binary (21), pointer, fixed binary (21), fixed binary (21),
+	character (1) aligned, fixed binary (35));
+dcl  hcs_$assign_channel entry (fixed binary (71), fixed binary (35));
+dcl  hcs_$reset_ips_mask entry (bit (36), bit (36));
+dcl  hcs_$set_ips_mask entry (bit (36), bit (36));
+dcl  hcs_$tty_abort entry (fixed binary, fixed binary, fixed binary, fixed binary (35));
+dcl  hcs_$tty_attach entry (character (*), fixed binary (71), fixed binary, fixed binary, fixed binary (35));
+dcl  hcs_$tty_detach entry (fixed binary, fixed binary (71), fixed binary, fixed binary (35));
+dcl  hcs_$tty_order entry (fixed binary, character (*), pointer, fixed binary, fixed binary (35));
+dcl  hcs_$tty_read
+	entry (fixed binary, pointer, fixed binary (21), fixed binary (21), fixed binary (21), fixed binary,
+	fixed binary (35));
+dcl  hcs_$tty_write
+	entry (fixed binary, pointer, fixed binary (21), fixed binary (21), fixed binary (21), fixed binary,
+	fixed binary (35));
+dcl  ioa_$general_rs entry (pointer, fixed binary, fixed binary, character (*), fixed binary (21), bit (1), bit (1));
+dcl  iox_$err_no_operation entry ();
+dcl  iox_$propagate entry (pointer);
+dcl  ipc_$block entry (pointer, pointer, fixed binary (35));
+dcl  ipc_$create_ev_chn entry (fixed binary (71), fixed binary (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed binary (71), entry, pointer, fixed binary, fixed binary (35));
+dcl  ipc_$decl_ev_wait_chn entry (fixed binary (71), fixed binary (35));
+dcl  ipc_$delete_ev_chn entry (fixed binary (71), fixed binary (35));
+dcl  mvt_ entry (pointer, pointer, fixed binary (21), character (512) aligned);
+dcl  timer_manager_$alarm_wakeup entry (fixed binary (71), bit (2), fixed binary (71));
+dcl  ttt_info_$terminal_data entry (character (*), fixed binary, fixed binary, pointer, fixed binary (35));
+
+dcl  (any_other, area, cleanup) condition;
+
+dcl  (addr, binary, copy, currentsize, divide, dimension, hbound, lbound, length, max, min, mod, null, rel,
+     rtrim, string, substr, translate, unspec) builtin;
+%page;
+
+/* Data describing a single switch attached through this I/O module */
+
+dcl  1 had aligned based (had_ptr),
+       2 attach_description character (256) varying,	/* attach description for this I/O switch */
+       2 open_description character (24) varying,		/* open description (mode) */
+       2 channel_info_ptr pointer,			/* -> description of the channel */
+       2 translations,
+         3 input character (512),			/* received data -> ASCII translate table */
+         3 output character (512),			/* ASCII -> transmittable data translate table */
+         3 space character (1),			/* an ASCII space in remote device's character code */
+       2 chain,					/* chain of I/O switches attached to this channel */
+         3 next pointer,
+         3 previous pointer;
+
+dcl  had_ptr pointer;
+
+
+/* Data describing a single TTY channel attached through this I/O module */
+
+dcl  1 channel_info aligned based (channel_info_ptr),
+       2 name character (32),				/* name of channel described by this entry */
+       2 device_type fixed binary,			/* type of device attached on this channel */
+       2 devx fixed binary,				/* MCS identifier of this channel */
+       2 event_channel fixed binary (71),		/* MCS signals events via this ipc_ channel */
+       2 attach_event_channel fixed binary (71),		/* used to obtain the channel from the Answering Service */
+       2 hads,					/* chain of I/O switches attached to this channel */
+         3 first pointer,
+         3 last pointer,
+       2 held_input_ptr pointer,			/* -> input from this channel waiting for processing */
+       2 chain,					/* chain of channels attached via this I/O module */
+         3 previous pointer,
+         3 next pointer,
+       2 flags,
+         3 attached bit (1) unaligned,			/* ON => channel has been attached from answering service */
+         3 attach_channel_is_call bit (1) unaligned,	/* ON => attach channel has been converted to call channel */
+         3 eof_pending bit (1) unaligned,		/* ON => next read should return error_table_$eof_record */
+         3 pad bit (33) unaligned;
+
+dcl  channel_info_ptr pointer;
+
+dcl  first_channel_info_ptr pointer internal static initial (null ());
+dcl  last_channel_info_ptr pointer internal static initial (null ());
+
+
+/* Held input:  The read_record operation may read more data from ring-0 than necessary; this data is held in this
+   structure for later processing */
+
+dcl  1 held_input aligned based (held_input_ptr),
+       2 n_elements_used fixed binary (21),		/* # of characters still being held */
+       2 n_elements_allocated fixed binary (21),		/* # of characters initially held */
+       2 data character (held_input_n_elements_allocated refer (held_input.n_elements_allocated));
+
+dcl  held_input_ptr pointer;
+dcl  held_input_n_elements_allocated fixed binary (21);
+%page;
+/* Attach an I/O switch to a device of a HASP host */
+
+hasp_host_attach:
+     entry (P_iocb_ptr, P_attach_options, P_loud_sw, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	loud_sw = P_loud_sw;
+	code = 0;					/* assume no errors yet */
+
+	had_ptr = null ();				/* avoid freeing garbage if I/O switch already attached */
+
+	if iocb_ptr -> iocb.attach_descrip_ptr ^= null () then do;
+	     P_code = error_table_$not_detached;	/* special case this error */
+	     if loud_sw then call com_err_ (P_code, NAME, "For switch ^a.", iocb_ptr -> iocb.name);
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	on condition (cleanup) call cleanup_attachment ((0));
+
+
+/* Process attachment options */
+
+	if hbound (P_attach_options, 1) < 1 then
+	     call abort_attachment (error_table_$noarg,
+		"At least ""-comm"", ""-tty"", and  ""-device"" must be supplied.");
+
+	allocate had in (system_area) set (had_ptr);
+
+	have_comm = "0"b;				/* haven't seen -comm yet */
+	tty_channel = "";				/* haven't seen -tty yet */
+	device_name = "";				/* haven't seen -device yet */
+	terminal_type = "";				/* haven't seen -terminal_type yet */
+
+	other_attach_options = "";			/* optional stuff goes here */
+
+	had.open_description = "";
+	call set_translation (had.translations.input,	/* assume input is EBCDIC */
+	     addr (ebcdic_to_ascii_$ea_table), length (ebcdic_to_ascii_$ea_table));
+	call set_translation (had.translations.output, addr (ascii_to_ebcdic_$ae_table),
+	     length (ascii_to_ebcdic_$ae_table));
+	had.translations.space = EBCDIC_SPACE;		/* default translations */
+	had.channel_info_ptr = null ();		/* prevents abort from prematurely detaching channel */
+
+
+	do argument_idx = lbound (P_attach_options, 1) to hbound (P_attach_options, 1);
+
+	     argument_ptr = substraddr (P_attach_options (argument_idx), 1);
+						/* make accessing simpler */
+	     argument_lth = length (P_attach_options (argument_idx));
+
+	     if substr (argument, 1, 1) ^= "-" then	/* do not allow non-control arguments */
+		call abort_attachment (error_table_$wrong_no_of_args, "All options must be control arguments.");
+
+	     if (argument = "-comm") then do;		/* communications module: must be "hasp" */
+		character_value = get_string_argument ();
+		if (argument ^= "hasp") then call abort_attachment (0, "Communications module must be ""hasp"".");
+		have_comm = "1"b;			/* got the right value */
+	     end;
+
+	     else if (argument = "-tty") then		/* specification of TTY channel */
+		tty_channel = get_string_argument ();
+
+	     else if (argument = "-device") then do;	/* type of device on other end of channel */
+		device_name = get_string_argument ();
+		device_type = -1;
+		do idx = lbound (HASP_DEVICE_NAMES, 1) to hbound (HASP_DEVICE_NAMES, 1) while (device_type = -1);
+		     if HASP_DEVICE_NAMES (idx) = device_name then device_type = idx;
+		end;
+		if device_type = -1 then		/* unknown type */
+		     call abort_attachment (error_table_$device_type_unknown,
+			"Device type must be one of ^v(""^a"", ^)or ""^a""; not ""^a"".",
+			(dimension (HASP_DEVICE_NAMES, 1) - 1), HASP_DEVICE_NAMES, device_name);
+	     end;
+
+	     else if (argument = "-terminal_type") | (argument = "-ttp") then do;
+						/* terminal type: specifies input/output translations */
+		terminal_type = get_string_argument ();
+		terminal_type = translate (terminal_type, UPPERCASE, LOWERCASE);
+		ttd.version = ttd_version_3;		/* try to get input/output translations */
+		call ttt_info_$terminal_data (terminal_type, -1, 0, addr (ttd), code);
+		if code ^= 0 then call abort_attachment (code, "-terminal_type ^a", terminal_type);
+		if (ttd.tables.input_tr_ptr = null ()) | (ttd.tables.output_tr_ptr = null ()) then
+		     call abort_attachment (0, "Terminal type ""^a"" does not specify input and output translations.",
+			terminal_type);
+		call set_translation (had.translations.input,
+		     addr (ttd.tables.input_tr_ptr -> cv_trans_struc.cv_trans.value),
+		     dimension (ttd.tables.input_tr_ptr -> cv_trans_struc.cv_trans.value, 1));
+		call set_translation (had.translations.output,
+		     addr (ttd.tables.output_tr_ptr -> cv_trans_struc.cv_trans.value),
+		     dimension (ttd.tables.output_tr_ptr -> cv_trans_struc.cv_trans.value, 1));
+		had.translations.space = translate (ASCII_SPACE, had.translations.output);
+	     end;
+
+	     else if (argument = "-physical_line_length") | (argument = "-pll") then do;
+						/* supplied by calling I/O module:  ignored here */
+		numeric_value = get_numeric_argument ();
+		other_attach_options = other_attach_options || " -physical_line_length ";
+		other_attach_options = other_attach_options || argument;
+	     end;
+
+	     else if (argument = "-ebcdic") then	/* supplied by calling I/O module:  ignored here */
+		other_attach_options = other_attach_options || " -ebcdic";
+
+	     else if (argument = "-ascii") then		/* hasp_host_ doesn't support ASCII data */
+		call abort_attachment (0, "ASCII is not supported by this I/O module.");
+
+	     else if (argument = "-horizontal_tab") | (argument = "-htab") then
+		call abort_attachment (0, "Horizontal tabs are not supported by this I/O module.");
+
+	     else call abort_attachment (error_table_$badopt, """^a""", argument);
+	end;					/* of argument processing loop */
+
+
+/* Validate that all required information has been supplied and apply any needed defaults */
+
+	if ^have_comm then				/* must specify -comm */
+	     call abort_attachment (error_table_$noarg, """-comm""");
+
+	if (tty_channel = "") then			/* must specify -tty */
+	     call abort_attachment (error_table_$noarg, """-tty""");
+
+	if (device_name = "") then			/* must specify -device */
+	     call abort_attachment (error_table_$noarg, """-device""");
+
+
+/* Build the attach description */
+
+	had.attach_description = rtrim (NAME);
+	had.attach_description = had.attach_description || " -comm hasp -tty ";
+	had.attach_description = had.attach_description || rtrim (tty_channel);
+	had.attach_description = had.attach_description || " -device ";
+	had.attach_description = had.attach_description || rtrim (device_name);
+	if (terminal_type ^= "") then do;		/* optional -terminal_type was given */
+	     had.attach_description = had.attach_description || " -terminal_type ";
+	     had.attach_description = had.attach_description || rtrim (terminal_type);
+	end;
+	had.attach_description = had.attach_description || other_attach_options;
+
+
+/* Find the description of this channel:  Validate that all I/O switches attached to this channel are of for the same type
+   of I/O daemon device (printer, reader, etc.) */
+
+	do channel_info_ptr = first_channel_info_ptr repeat (channel_info.chain.next)
+	     while (channel_info_ptr ^= null ());
+	     if channel_info.name = tty_channel then go to FOUND_CHANNEL;
+	end;
+
+FOUND_CHANNEL:
+	if (channel_info_ptr = null ()) then do;	/* first use of the channel */
+	     allocate channel_info in (system_area) set (channel_info_ptr);
+	     channel_info.name = tty_channel;
+	     channel_info.device_type = device_type;
+	     channel_info.devx, channel_info.event_channel, channel_info.attach_event_channel = -1;
+	     channel_info.hads = null ();		/* no switches connected yet */
+	     channel_info.held_input_ptr = null ();	/* no read ahead yet */
+	     string (channel_info.flags) = ""b;		/* no special conditions yet */
+	     if first_channel_info_ptr = null () then
+		first_channel_info_ptr = channel_info_ptr;
+	     else last_channel_info_ptr -> channel_info.chain.next = channel_info_ptr;
+	     channel_info.chain.previous = last_channel_info_ptr;
+	     channel_info.chain.next = null ();
+	     last_channel_info_ptr = channel_info_ptr;
+	end;
+
+	else					/* channel in use: insure that device type is correct */
+	     if channel_info.device_type ^= device_type then
+	     call abort_attachment (error_table_$incorrect_device_type, "Device type of ^a is ""^a""; not ""^a"".",
+		tty_channel, HASP_DEVICE_NAMES (channel_info.device_type), HASP_DEVICE_NAMES (device_type));
+
+	if channel_info.hads.first = null () then
+	     channel_info.hads.first = had_ptr;		/* first switch for this channel */
+	else channel_info.hads.last -> had.chain.next = had_ptr;
+	had.chain.previous = channel_info.hads.last;
+	had.chain.next = null ();
+	channel_info.hads.last = had_ptr;
+
+	had.channel_info_ptr = channel_info_ptr;
+
+
+/* Acquire and attach the channel if necessary */
+
+	if channel_info.devx = -1 then do;
+
+/* Request the TTY channel from the Answering Service */
+
+	     call ipc_$create_ev_chn (channel_info.attach_event_channel, code);
+	     if code ^= 0 then call convert_ipc_code_ (code);
+	     if code ^= 0 then call abort_attachment (code, "Creating ipc_ channel.");
+
+	     dma.version = dial_manager_arg_version_2;
+	     dma.dial_channel = channel_info.attach_event_channel;
+	     dma.channel_name = tty_channel;
+	     dma.dial_qualifier, dma.dial_out_destination, dma.reservation_string = "";
+
+	     call dial_manager_$privileged_attach (addr (dma), code);
+	     if code = error_table_$action_not_performed then go to ASSUME_ATTACHED;
+	     if code ^= 0 then call abort_attachment (code, "Attempting to attach ^a.", tty_channel);
+
+	     event_wait_channel.n_channels = 1;
+	     event_wait_channel.channel_id (1) = channel_info.attach_event_channel;
+
+WAIT_FOR_ANSWERING_SERVICE:
+	     call ipc_$block (addr (event_wait_channel), addr (local_event_wait_info), code);
+						/* wait for answering service to give it to us */
+	     if code ^= 0 then call convert_ipc_code_ (code);
+	     if code ^= 0 then call abort_attachment (code, "Waiting for attachment to ^a.", tty_channel);
+
+	     call convert_dial_message_ (unspec (local_event_wait_info.message), dialup_msg_channel, ((32)" "), (0),
+		dialup_msg_flags, code);
+	     if code ^= 0 then call abort_attachment (code, "Interpreting attachment to ^a.", tty_channel);
+
+	     if ^dialup_msg_flags.dialed_up then do;
+		call com_err_ (0, NAME,
+		     "For switch ^a: Unexpected signal from answering service - ^[hangup^;control^] for channel ^a.",
+		     iocb_ptr -> iocb.name, dialup_msg_flags.hungup, dialup_msg_channel);
+		go to WAIT_FOR_ANSWERING_SERVICE;
+	     end;
+
+
+/* Create the event channel for ring-0:  try using a special channel first */
+
+ASSUME_ATTACHED:
+	     channel_info.attached = "1"b;		/* we have the channel from the answering service now */
+
+	     call hcs_$assign_channel (channel_info.event_channel, code);
+
+	     if code ^= 0 then do;			/* couldn't get fast channel: try standard one */
+		call ipc_$create_ev_chn (channel_info.event_channel, code);
+		if code ^= 0 then call convert_ipc_code_ (code);
+		if code ^= 0 then call abort_attachment (code, "Creating ipc_ channel.");
+	     end;
+
+
+/* Attach the channel through the ring-0 HASP multiplexer in MCS, validate the supplied device type, and set it's modes
+   to "rawi,rawo" */
+
+	     call hcs_$tty_attach (tty_channel, channel_info.event_channel, channel_info.devx, state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if code ^= 0 then call abort_attachment (code, "Unable to attach to ^a.", tty_channel);
+
+	     call hcs_$tty_order (channel_info.devx, "get_device_type", addr (multiplexer_device_type), state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if (code = 0) then
+		if (channel_info.device_type = multiplexer_device_type) then
+		     ;				/* proper device type for this channel */
+		else call abort_attachment (error_table_$incorrect_device_type,
+			"Device type of ^a is ""^a""; not ""^a"".", tty_channel,
+			HASP_DEVICE_NAMES (multiplexer_device_type), HASP_DEVICE_NAMES (channel_info.device_type));
+	     else if (code = error_table_$undefined_order_request) then
+		call abort_attachment (0, "^a is not connected to a HASP multiplexer.", tty_channel);
+	     else call abort_attachment (code, "Unable to determine device type of ^a.", tty_channel);
+
+	     tty_modes.modes = "rawi,rawo";
+	     tty_modes.modes_lth = length (tty_modes.modes);
+	     call hcs_$tty_order (channel_info.devx, "modes", addr (tty_modes), state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if code ^= 0 then call abort_attachment (code, "Unable to set initial modes for ^a.", tty_channel);
+	end;
+
+
+/* Mask and complete construction of the IOCB */
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (((36)"0"b), ips_mask);
+
+	iocb_ptr -> iocb.attach_descrip_ptr = addr (had.attach_description);
+	iocb_ptr -> iocb.attach_data_ptr = had_ptr;
+	iocb_ptr -> iocb.open = hasp_host_open;
+	iocb_ptr -> iocb.detach_iocb = hasp_host_detach;
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+RETURN_FROM_ATTACH:
+	P_code = code;
+	return;
+%page;
+/* Open an I/O switch connected to a HASP host:  only record oriented openings are supported */
+
+hasp_host_open:
+     entry (P_iocb_ptr, P_open_mode, P_open_sw, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+
+	if iocb_ptr -> iocb.open_descrip_ptr ^= null () then do;
+	     P_code = error_table_$not_closed;
+	     return;
+	end;
+
+	open_mode = P_open_mode;
+
+	if ^((open_mode = Sequential_input) | (open_mode = Sequential_output) | (open_mode = Sequential_input_output))
+	then do;
+	     P_code = error_table_$bad_mode;
+	     return;
+	end;
+
+	had_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	channel_info_ptr = had.channel_info_ptr;
+
+	if (channel_info.device_type = HASP_PRINTER) | (channel_info.device_type = HASP_PUNCH) then
+	     if (open_mode = Sequential_output) then do;	/* printer/punch opened for output only */
+		P_code = error_table_$bad_mode;
+		return;
+	     end;
+
+	if (channel_info.device_type = HASP_READER) then
+	     if (open_mode = Sequential_input) then do;	/* reader opened for input only */
+		P_code = error_table_$bad_mode;
+		return;
+	     end;
+
+	had.open_description = rtrim (iox_modes (open_mode));
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (((36)"0"b), ips_mask);
+
+	if ((open_mode = Sequential_input) | (open_mode = Sequential_input_output)) then
+	     iocb_ptr -> iocb.read_record = hasp_host_read_record;
+
+	if ((open_mode = Sequential_output) | (open_mode = Sequential_input_output)) then
+	     iocb_ptr -> iocb.write_record = hasp_host_write_record;
+
+	iocb_ptr -> iocb.control = hasp_host_control;
+	iocb_ptr -> iocb.modes = hasp_host_modes;
+
+	iocb_ptr -> iocb.close = hasp_host_close;
+	iocb_ptr -> iocb.detach_iocb = hasp_host_detach;
+
+	iocb_ptr -> iocb.open_descrip_ptr = addr (had.open_description);
+						/* it's now open */
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = 0;
+	return;
+%page;
+/* Close an I/O switch connected to a HASP host */
+
+hasp_host_close:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+
+	if iocb_ptr -> iocb.open_descrip_ptr = null () then do;
+	     P_code = error_table_$not_open;
+	     return;
+	end;
+
+	ips_mask = ""b;
+
+	on condition (cleanup) call any_other_handler ();
+
+	call hcs_$set_ips_mask (((36)"0"b), ips_mask);
+
+	iocb_ptr -> iocb.open_descrip_ptr = null ();
+
+	iocb_ptr -> iocb.open = hasp_host_open;
+	iocb_ptr -> iocb.detach_iocb = hasp_host_detach;
+
+	iocb_ptr -> iocb.control, iocb_ptr -> iocb.modes, iocb_ptr -> iocb.read_record, iocb_ptr -> iocb.write_record =
+	     iox_$err_no_operation;
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = 0;
+
+	return;
+%page;
+/* Detach an I/O switch from a device of a HASP host */
+
+hasp_host_detach:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+
+	if iocb_ptr -> iocb.attach_descrip_ptr = null () then do;
+	     P_code = error_table_$not_attached;
+	     return;
+	end;
+
+	if iocb_ptr -> iocb.open_descrip_ptr ^= null () then do;
+	     P_code = error_table_$not_closed;
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	had_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	channel_info_ptr = had.channel_info_ptr;
+
+	call cleanup_attachment (code);		/* remove this switch and the channel if necessary */
+
+	ips_mask = ""b;
+
+	on condition (any_other) call any_other_handler ();
+
+	call hcs_$set_ips_mask (((36)"0"b), ips_mask);
+
+	iocb_ptr -> iocb.attach_descrip_ptr = null ();	/* it's detached */
+
+	call iox_$propagate (iocb_ptr);
+
+	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+
+	P_code = code;				/* in case trouble freeing the channel */
+	return;
+%page;
+/* Read a record:  read a single record from the device, returning a "standard" terminal_io_record structure */
+
+hasp_host_read_record:
+     entry (P_iocb_ptr, P_buffer_ptr, P_buffer_lth, P_record_lth, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	had_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	channel_info_ptr = had.channel_info_ptr;
+	code = 0;
+
+	if (channel_info.device_type = HASP_READER) then do;
+	     P_code = error_table_$invalid_read;	/* can't read from the reader */
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+	cv_string_buffer_ptr = null ();		/* for cleanup handler */
+
+	on condition (cleanup)
+	     begin;
+		if cv_string_buffer_ptr ^= null () then
+		     if cv_string_buffer_ptr ^= addr (cv_string_buffer_space) then
+			free cv_string_buffer in (system_area);
+	     end;
+
+
+/* Check if last read_record operation read an EOF record containing some carriage control; if so, indicate the EOF
+   condition on this read as previous read just returned the slew control */
+
+	if channel_info.eof_pending then do;
+	     channel_info.eof_pending = "0"b;		/* only do this once per EOF */
+	     P_code = error_table_$eof_record;
+	     return;
+	end;
+
+
+/* Validate that there is room in the buffer to hold some actual data in addition to a terminal_io_record header */
+
+	terminal_io_record_ptr = P_buffer_ptr;
+
+	terminal_io_record_header_lth =		/* # of characters of buffer occupied by record's header */
+	     4 * (binary (rel (addr (terminal_io_record.data)), 18, 0) - binary (rel (terminal_io_record_ptr), 18, 0));
+
+	if terminal_io_record_header_lth >= P_buffer_lth then do;
+	     P_code = error_table_$smallarg;		/* supplied buffer is just TOO small */
+	     return;
+	end;
+
+	terminal_io_record_n_elements = P_buffer_lth - terminal_io_record_header_lth;
+						/* # of actual characters that will fit into the buffer */
+
+
+/* Obtain and unpack a record:  a record is constructed from any data obtained in prior calls to read_record in addition
+   to whatever data must be read from ring-0 in this call to complete the record.  Unpacking is performed on the data in
+   256 character sections until hasp_util_$expand_text detects the end-of-record sequence in the stream */
+
+	cv_string_buffer_ptr = addr (cv_string_buffer_space);
+	cv_string_buffer_lth = length (cv_string_buffer_space);
+	cv_string_buffer_used_lth = 0;		/* start putting data into automatic */
+
+	previous_data = "";				/* piece left from previous read */
+
+	srcb_ptr = addr (srcb_read);			/* a place to put the SRCB ... */
+	have_srcb = "0"b;				/* ... which hasn't been found yet */
+
+	more_data_needed = "1"b;
+
+
+	do while (more_data_needed);
+
+/* Select source of data for this time around:  if necessary, data will be read from ring-0 */
+
+	     if channel_info.held_input_ptr ^= null () then do;
+						/* read ahead: process as much of the block as can be used */
+		io_buffer_ptr = addr (channel_info.held_input_ptr -> held_input.data);
+		io_buffer_lth = channel_info.held_input_ptr -> held_input.n_elements_allocated;
+		io_buffer_read = channel_info.held_input_ptr -> held_input.n_elements_used;
+	     end;
+
+	     else do;				/* no more read ahead: obtain more data from ring-0 */
+		io_buffer_ptr = addr (io_buffer_space);
+		io_buffer_lth = length (io_buffer_space);
+		call read_io_buffer ();		/* sets io_buffer_read */
+		if code ^= 0 then go to RETURN_FROM_READ_RECORD;
+	     end;
+
+	     if length (previous_data) > 0 then do;	/* some data left over from previous junk: merge them */
+		held_input_n_elements_allocated = length (previous_data) + io_buffer_read;
+		allocate held_input in (system_area) set (held_input_ptr);
+		held_input.n_elements_used = held_input.n_elements_allocated;
+		substr (held_input.data, 1, length (previous_data)) = previous_data;
+		substr (held_input.data, (length (previous_data) + 1), io_buffer_read) =
+		     substr (io_buffer, 1, io_buffer_read);
+		if io_buffer_ptr ^= addr (io_buffer_space) then
+		     free channel_info.held_input_ptr -> held_input in (system_area);
+		channel_info.held_input_ptr = held_input_ptr;
+		io_buffer_ptr = addr (held_input.data);
+		io_buffer_lth, io_buffer_read = held_input.n_elements_used;
+		previous_data = "";
+	     end;
+
+
+/* Unpack the data:  stop when an end-of-record indicator is found */
+
+	     if have_srcb then
+		io_buffer_used = 0;			/* in middle of record: first character in buffer is SCB */
+	     else do;				/* first part of record: first character is SRCB */
+		srcb = substr (io_buffer, 1, 1);
+		io_buffer_used = 1;
+		have_srcb = "1"b;
+	     end;
+
+	     do while (more_data_needed & (io_buffer_used < io_buffer_read));
+
+		call hasp_util_$expand_text (substraddr (io_buffer, 1), io_buffer_read, io_buffer_used,
+		     substraddr (cv_string_buffer, 1), cv_string_buffer_lth, cv_string_buffer_used_lth,
+		     had.translations.space, expand_code);
+
+		if expand_code = 0 then more_data_needed = "0"b;
+						/* found end of record indicator */
+
+		else if expand_code = error_table_$short_record then ;
+						/* took entire buffer but need more */
+
+		else if expand_code = error_table_$long_record then do;
+						/* overflowed the output buffer: grow it and continue */
+		     cv_string_buffer_lth = 2 * cv_string_buffer_lth;
+		     on condition (area)
+			begin;			/* can't get enough room: record is not readable */
+			     code = error_table_$noalloc;
+			     go to RETURN_FROM_READ_RECORD;
+			end;
+		     allocate cv_string_buffer in (system_area) set (new_cv_string_buffer_ptr);
+		     revert condition (area);
+		     new_cv_string_buffer_ptr -> cv_string_buffer_used = cv_string_buffer_used;
+		     if cv_string_buffer_ptr ^= addr (cv_string_buffer_space) then
+			free cv_string_buffer in (system_area);
+		     cv_string_buffer_ptr = new_cv_string_buffer_ptr;
+		end;
+
+		else if (io_buffer_read - io_buffer_used) <= (HASP_MAX_NOT_COMPRESSED_TEXT_LTH + 1) then do;
+						/* possibly need to read more data from ring-0 */
+		     previous_data = substr (io_buffer, (io_buffer_used + 1), (io_buffer_read - io_buffer_used));
+		     io_buffer_used = io_buffer_read;	/* force to read some more data */
+		end;
+
+		else do;				/* data is definitely improperly formatted */
+		     code = error_table_$improper_data_format;
+		     go to RETURN_FROM_READ_RECORD;
+		end;
+	     end;
+
+	     if io_buffer_used = io_buffer_read then	/* have exhausted this buffer ... */
+		if io_buffer_ptr ^= addr (io_buffer_space) then do;
+		     free channel_info.held_input_ptr -> held_input in (system_area);
+		     channel_info.held_input_ptr = null ();
+		end;				/* ... so get rid of it so we can read some more */
+	end;
+
+	if io_buffer_used < io_buffer_read then do;	/* some data left over: save it */
+	     held_input_n_elements_allocated = io_buffer_read - io_buffer_used;
+	     allocate held_input in (system_area) set (held_input_ptr);
+	     held_input.n_elements_used = held_input.n_elements_allocated;
+	     held_input.data = substr (io_buffer, (io_buffer_used + 1), (io_buffer_read - io_buffer_used));
+	     if io_buffer_ptr ^= addr (io_buffer_space) then free channel_info.held_input_ptr -> held_input;
+	     channel_info.held_input_ptr = held_input_ptr;
+	end;
+
+
+/* Check for end of file:  An EOF record is a zero length record.  If an EOF record is found, check if the SRCB contains
+   carriage control information (line printer only), delay indicating the EOF until the next call to read_record and
+   return a zero length record with appropriate slew control; otherwise, return error_table_$eof_record.  If no EOF is
+   present, convert the data in the record to ASCII */
+
+	if (cv_string_buffer_used_lth = 0) then do;
+	     if (channel_info.device_type = HASP_PRINTER) then
+		if (srcb = substr (TEMPLATE_HASP_EOF_RECORD, 1, 1)) then
+		     code = error_table_$eof_record;
+		else do;
+		     channel_info.eof_pending = "1"b;
+		     terminal_io_record.n_elements = 0; /* no data in the record, just slew */
+		end;
+	     else code = error_table_$eof_record;
+	     if (code = error_table_$eof_record) then go to RETURN_FROM_READ_RECORD;
+	end;
+
+	else do;					/* data seems OK: convert it */
+	     terminal_io_record.n_elements = min (terminal_io_record_n_elements, cv_string_buffer_used_lth);
+	     if cv_string_buffer_used_lth > 0 then
+		call mvt_ (addr (cv_string_buffer_used), addr (terminal_io_record_data_chars),
+		     (terminal_io_record.n_elements), had.translations.input);
+	     if cv_string_buffer_used_lth > terminal_io_record_n_elements then code = error_table_$long_record;
+	end;					/* ... return as much as will fit */
+
+
+/* Control reaches here iff the record is read/converted successfully:  complete the terminal_io_record structure */
+
+	terminal_io_record.version = terminal_io_record_version_1;
+
+	if (channel_info.device_type = HASP_CONSOLE) then terminal_io_record.device_type = TELEPRINTER_DEVICE;
+	else if (channel_info.device_type = HASP_PRINTER) then terminal_io_record.device_type = PRINTER_DEVICE;
+	else if (channel_info.device_type = HASP_PUNCH) then terminal_io_record.device_type = PUNCH_DEVICE;
+
+	string (terminal_io_record.flags) = ""b;
+
+	if (channel_info.device_type = HASP_CONSOLE) | (channel_info.device_type = HASP_PUNCH) then do;
+						/* console or punch: slewing is fixed */
+	     terminal_io_record.slew_type = SLEW_BY_COUNT;
+	     terminal_io_record.slew_count = 1;
+	     terminal_io_record.preslew = "0"b;
+	end;
+
+	else do;					/* printer: interpret the SRCB */
+	     if hasp_printer_srcb.skip_to_channel then
+		terminal_io_record.slew_type = SLEW_TO_CHANNEL;
+	     else terminal_io_record.slew_type = SLEW_BY_COUNT;
+	     terminal_io_record.slew_count = hasp_printer_srcb.number;
+	     terminal_io_record.preslew = hasp_printer_srcb.prespace;
+	end;
+
+	terminal_io_record.element_size = 9;
+
+	P_record_lth = terminal_io_record_header_lth + terminal_io_record.n_elements;
+
+
+/* Cleanup */
+
+RETURN_FROM_READ_RECORD:
+	if cv_string_buffer_ptr ^= null () then
+	     if cv_string_buffer_ptr ^= addr (cv_string_buffer_space) then free cv_string_buffer in (system_area);
+
+	P_code = code;
+	return;
+%page;
+/* Write a record:  write a single record to the device.  This record represents part or all of a single line and should
+   be the output of the prt_conv_ module using the remote_conv_ conversion coroutine, presently named hasp_host_conv_ */
+
+hasp_host_write_record:
+     entry (P_iocb_ptr, P_record_ptr, P_record_lth, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	had_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	channel_info_ptr = had.channel_info_ptr;
+	code = 0;
+
+	if (channel_info.device_type = HASP_PRINTER) | (channel_info.device_type = HASP_PUNCH) then do;
+	     P_code = error_table_$invalid_write;	/* can't write printer or punch */
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+	io_buffer_ptr = null ();			/* for cleanup handler */
+
+	on condition (cleanup)
+	     begin;				/* free any temporary buffers */
+		if io_buffer_ptr ^= null () then
+		     if io_buffer_ptr ^= addr (io_buffer_space) then free io_buffer in (system_area);
+	     end;
+
+
+/* Validate input:  insure that the caller has supplied a complete terminal I/O record; insure that the terminal input
+   record contains character as opposed to binary data */
+
+	terminal_io_record_ptr = P_record_ptr;
+
+	if terminal_io_record.version ^= terminal_io_record_version_1 then do;
+	     P_code = error_table_$unimplemented_version;
+	     return;
+	end;
+
+	if mod (P_record_lth, 4) = 0 then		/* X+4-mod(X,4) fails when X is already a multiple of 4 */
+	     if (4 * currentsize (terminal_io_record)) = P_record_lth then
+		;				/* user supplied length agrees with computed length */
+	     else do;
+		P_code = error_table_$improper_data_format;
+		return;
+	     end;
+	else					/* supplied length not multiple of 4:  must round it up */
+	     if (4 * currentsize (terminal_io_record)) ^= (P_record_lth + 4 - mod (P_record_lth, 4)) then do;
+	     P_code = error_table_$improper_data_format;
+	     return;
+	end;
+
+	if terminal_io_record.binary | terminal_io_record.preslew | (terminal_io_record.element_size ^= 9) then do;
+	     P_code = error_table_$improper_data_format;
+	     return;
+	end;
+
+
+/* Convert the data to the remote system's character code (in place) */
+
+	call mvt_ (addr (terminal_io_record_data_chars), addr (terminal_io_record_data_chars),
+	     (terminal_io_record.n_elements), had.translations.output);
+
+
+/* Compute size of I/O buffer required assuming no compression can be performed on the record.  If this size is not too
+   large, the automatic buffer will be used; otherwise, a buffer will be allocated */
+
+	io_buffer_lth =
+	     max (terminal_io_record.n_elements, 1)
+	     +
+	     divide ((terminal_io_record.n_elements + HASP_MAX_NOT_COMPRESSED_TEXT_LTH - 1),
+	     HASP_MAX_NOT_COMPRESSED_TEXT_LTH, 17, 0) +	/* SCBs for the text */
+	     2;					/* SRCB and end-of-record SCB */
+
+	if io_buffer_lth <= length (io_buffer_space) then do;
+						/* space needed availabe in automatic */
+	     io_buffer_ptr = addr (io_buffer_space);
+	     io_buffer_lth = length (io_buffer_space);
+	end;
+	else do;					/* space required larger than automatic buffer */
+	     on condition (area)
+		begin;
+		     code = error_table_$noalloc;	/* just TOO much */
+		     go to RETURN_FROM_WRITE_RECORD;
+		end;
+	     allocate io_buffer in (system_area) set (io_buffer_ptr);
+	end;
+
+
+/* Create the record:  construct the SRCB for the record, compress the record (insuring that some data is present in the
+   record), and add the terminating end-of-record SCB */
+
+	io_buffer_used = 0;				/* nothing in the output yet */
+
+	if (channel_info.device_type = HASP_CONSOLE) then call add_character_to_io_buffer (HASP_CONSOLE_SRCB);
+	else if (channel_info.device_type = HASP_READER) then call add_character_to_io_buffer (TEMPLATE_HASP_CARD_SRCB);
+
+	if terminal_io_record.n_elements = 0 then	/* no data:  supply some to avoid lossage with RSCS */
+	     call hasp_util_$compress_text (addr (had.translations.space), 1, (0), addr (io_buffer), length (io_buffer),
+		io_buffer_used, had.translations.space, compress_code);
+
+	else call hasp_util_$compress_text (addr (terminal_io_record.data), (terminal_io_record.n_elements), (0),
+		addr (io_buffer), length (io_buffer), io_buffer_used, had.translations.space, compress_code);
+
+	if compress_code ^= 0 then do;		/* failed:  yet above code insured there'd enough room */
+WRITE_RECORD_BAD_DATA:
+	     code = error_table_$improper_data_format;
+	     go to RETURN_FROM_WRITE_RECORD;
+	end;
+
+	call add_character_to_io_buffer (HASP_EOR_SCB);
+
+
+/* Transmit the I/O block and return to the caller */
+
+	call write_io_buffer ();			/* needed in end_write_mode control order */
+
+RETURN_FROM_WRITE_RECORD:
+	if io_buffer_ptr ^= null () then
+	     if io_buffer_ptr ^= addr (io_buffer_space) then free io_buffer in (system_area);
+
+	P_code = code;
+	return;
+%page;
+/* Perform control operations on an I/O switch connected to a HASP host */
+
+hasp_host_control:
+     entry (P_iocb_ptr, P_order, P_info_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	had_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	channel_info_ptr = had.channel_info_ptr;
+
+	order = P_order;
+	info_ptr = P_info_ptr;
+	code = 0;
+
+
+	if (order = "io_call") then do;
+
+/* io_call command interface:  translate the supplied info into an ordinary control order */
+
+	     if info_ptr = null () then do;		/* need the order name */
+		P_code = error_table_$undefined_order_request;
+		return;
+	     end;
+
+	     order = info_ptr -> io_call_info.order_name;
+	     info_ptr = null ();
+	end;
+
+
+	if (order = "signon_record") then do;
+
+/* Send a SIGNON record to the host system: validate that the user supplied an event-wait channel, convert the SIGNON
+   record itself to uppercase and the remote system's character code, and pass the control order to MCS for actual
+   processing */
+
+	     if info_ptr = null () then
+		code = error_table_$null_info_ptr;
+
+	     else do;
+		signon_record_info_ptr = info_ptr;
+
+		if signon_record_info.version ^= SIGNON_RECORD_INFO_VERSION_1 then
+		     code = error_table_$unimplemented_version;
+						/* FINISH ME: validate IPC channel... */
+		else do;				/* proper version */
+		     signon_record_info.record = translate (signon_record_info.record, UPPERCASE, LOWERCASE);
+		     signon_record_info.record = translate (signon_record_info.record, had.translations.output);
+		     call hcs_$tty_order (channel_info.devx, "signon_record", signon_record_info_ptr, state, code);
+		     if state ^= 5 then code = error_table_$io_no_permission;
+		end;
+	     end;
+	end;
+
+
+	else if (order = "runout") then do;
+
+/* Wait for all output to leave the FNP:  for HASP channels, we only wait for the output to leave the TTY channel and
+   enter the multiplexer */
+
+	     write_status.output_pending = "1"b;	/* need do until */
+
+	     do while (write_status.output_pending);
+
+		call hcs_$tty_order (channel_info.devx, "write_status", addr (write_status), state, code);
+		if state ^= 5 then code = error_table_$io_no_permission;
+		if code ^= 0 then go to RETURN_FROM_CONTROL;
+
+		if write_status.output_pending then do;
+		     event_wait_channel.n_channels = 1;
+		     event_wait_channel.channel_id (1) = channel_info.event_channel;
+		     call ipc_$block (addr (event_wait_channel), addr (local_event_wait_info), code);
+		     if code ^= 0 then call convert_ipc_code_ (code);
+		     if code ^= 0 then go to RETURN_FROM_CONTROL;
+		end;
+	     end;
+	end;
+
+
+	else if (order = "end_write_mode") then do;
+
+/* End a write operation:  for a card reader write an EOF record.  For all output devices, wait for all output to enter
+   the multiplexer */
+
+	     if (channel_info.device_type = HASP_PRINTER) | (channel_info.device_type = HASP_PUNCH) then do;
+		code = error_table_$invalid_write;
+		go to RETURN_FROM_CONTROL;
+	     end;
+
+	     if (channel_info.device_type = HASP_CONSOLE) then
+		;				/* don't write an EOF record */
+
+	     else do;
+		io_buffer_ptr = addr (TEMPLATE_HASP_EOF_RECORD);
+		io_buffer_lth, io_buffer_used = length (TEMPLATE_HASP_EOF_RECORD);
+		call write_io_buffer ();		/* send it */
+		if code ^= 0 then go to RETURN_FROM_CONTROL;
+	     end;
+
+	     call hasp_host_control (iocb_ptr, "runout", (null ()), code);
+	end;
+
+
+	else if (order = "read_status") then do;
+
+/* Indicate if input is available:  check local buffers before checking with ring-0 */
+
+	     if (info_ptr = null ()) then
+		code = error_table_$null_info_ptr;
+
+	     else do;
+		read_status_info.event_channel = channel_info.event_channel;
+
+		if (channel_info.held_input_ptr ^= null ()) | channel_info.eof_pending then
+		     read_status_info.input_available = "1"b;
+						/* got some here */
+
+		else do;
+		     call hcs_$tty_order (channel_info.devx, "read_status", info_ptr, state, code);
+		     if state ^= 5 then code = error_table_$io_no_permission;
+		end;
+	     end;
+	end;
+
+
+	else if (order = "resetread") then do;
+
+/* Flush pending input:  throw out any input being held locally and then perform an appropriate "abort" control on the
+   channel */
+
+	     if channel_info.held_input_ptr ^= null () then
+		free channel_info.held_input_ptr -> held_input in (system_area);
+	     channel_info.held_input_ptr = null ();
+	     channel_info.eof_pending = "0"b;
+
+	     call hcs_$tty_abort (channel_info.devx, (1), state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	end;
+
+
+	else if (order = "resetwrite") then do;
+
+/* Flush pending output:  perform the appropriate "abort" control order on the channel */
+
+	     call hcs_$tty_abort (channel_info.devx, (2), state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	end;
+
+
+	else if (order = "hangup_proc") then do;
+
+/* Caller supplies a procedure to be invoked when the channel used by this switch is hungup */
+
+	     if (info_ptr = null ()) then
+		code = error_table_$null_info_ptr;
+
+	     else do;
+		call ipc_$decl_ev_call_chn (channel_info.attach_event_channel, hangup_proc_info.procedure,
+		     hangup_proc_info.data_ptr, hangup_proc_info.priority, code);
+		if code ^= 0 then call convert_ipc_code_ (code);
+		if code = 0 then channel_info.attach_channel_is_call = "1"b;
+	     end;
+	end;
+
+
+	else if (order = "get_channel_info") then do;
+
+/* Return the name and MCS device index of the channel attached via this switch */
+
+	     if (info_ptr = null ()) then code = error_table_$null_info_ptr;
+
+	     else if get_channel_info.version ^= tty_get_channel_info_version then
+		code = error_table_$unimplemented_version;
+
+	     else do;
+		get_channel_info.devx = channel_info.devx;
+		get_channel_info.channel_name = channel_info.name;
+	     end;
+	end;
+
+
+	else if (order = "select_device") then ;	/* select a specific output device: ignored */
+
+	else if (order = "reset") then ;		/* reset the switch to a well-known state: ignored */
+
+
+	else do;
+
+/* Unrecognized control order or "no_signon_record" order: pass it on to MCS */
+
+	     call hcs_$tty_order (channel_info.devx, order, info_ptr, state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	end;
+
+RETURN_FROM_CONTROL:
+	P_code = code;
+	return;
+%page;
+/* Change modes:  only the "non_edited" and "default" modes are recognized */
+
+hasp_host_modes:
+     entry (P_iocb_ptr, P_new_modes, P_old_modes, P_code);
+
+	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+	had_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	P_old_modes = "";				/* no modes are reflected to caller */
+	code = 0;
+
+	if (P_new_modes = "non_edited") | (P_new_modes = "default") then
+	     ;
+	else code = error_table_$bad_mode;
+
+	P_code = code;
+	return;
+%page;
+/* Remove an I/O switch which might be attached to the channel:  if this switch is the only one attached to the channel,
+   the channel itself is detached */
+
+cleanup_attachment:
+     procedure (P_code);
+
+dcl  P_code fixed binary (35) parameter;		/* a parameter to allow callers to ignore it */
+
+	P_code = 0;
+
+	if had_ptr ^= null () then do;		/* there is an I/O switch */
+
+	     if had.channel_info_ptr ^= null () then do;	/* there is knowledge of the channel */
+
+		channel_info_ptr = had.channel_info_ptr;
+
+		if (had.chain.previous = null ()) then
+		     channel_info.hads.first = had.chain.next;
+		else had.chain.previous -> had.chain.next = had.chain.next;
+
+		if (had.chain.next = null ()) then
+		     channel_info.hads.last = had.chain.previous;
+		else had.chain.next -> had.chain.previous = had.chain.previous;
+
+		if (channel_info.hads.first = null ()) then call release_channel ();
+						/* last switch connected to the channel */
+	     end;
+
+	     free had in (system_area);
+	     had_ptr = null ();			/* just to be sure */
+	end;
+
+	return;
+
+
+
+/* Internal to cleanup_attachment:  release the knowledge associated with a TTY channel */
+
+release_channel:
+	procedure ();
+
+	     if channel_info.devx ^= -1 then call hcs_$tty_detach (channel_info.devx, (0), (0), P_code);
+
+	     if channel_info.event_channel ^= -1 then call ipc_$delete_ev_chn (channel_info.event_channel, (0));
+
+	     if channel_info.attached then do;		/* give the channel back to the answering service */
+		if channel_info.attach_channel_is_call then
+		     call ipc_$decl_ev_wait_chn (channel_info.attach_event_channel, (0));
+		dma.version = dial_manager_arg_version_2;
+		dma.dial_channel = channel_info.attach_event_channel;
+		dma.channel_name = channel_info.name;
+		dma.dial_qualifier, dma.dial_out_destination, dma.reservation_string = "";
+		call dial_manager_$release_channel (addr (dma), (0));
+		channel_info.attached = "0"b;		/* assume success */
+	     end;
+
+	     if channel_info.attach_event_channel ^= -1 then
+		call ipc_$delete_ev_chn (channel_info.attach_event_channel, (0));
+
+	     if (channel_info.chain.previous = null ()) then
+		first_channel_info_ptr = channel_info.chain.next;
+	     else channel_info.chain.previous -> channel_info.chain.next = channel_info.chain.next;
+
+	     if (channel_info.chain.next = null ()) then
+		last_channel_info_ptr = channel_info.chain.previous;
+	     else channel_info.chain.next -> channel_info.chain.previous = channel_info.chain.previous;
+
+	     free channel_info in (system_area);
+	     channel_info_ptr = null ();
+
+	     return;
+
+	end release_channel;
+
+     end cleanup_attachment;
+%page;
+/* Wrapper to protect against errors while IPS interrupts are masked */
+
+any_other_handler:
+     procedure () options (non_quick);
+
+	if ips_mask then call hcs_$reset_ips_mask (ips_mask, ips_mask);
+	ips_mask = ""b;
+
+	call continue_to_signal_ ((0));		/* not interested, */
+
+	return;
+
+     end any_other_handler;
+
+
+
+/* Abort a call to the attach entry:  print an error message if requested */
+
+abort_attachment:
+     procedure () options (variable, non_quick);
+
+dcl  the_code fixed binary (35) based (the_code_ptr);
+dcl  the_code_ptr pointer;
+
+dcl  caller_message character (256);
+
+	call cu_$arg_ptr (1, the_code_ptr, (0), (0));
+
+	if loud_sw then do;				/* an error message is requested */
+	     call ioa_$general_rs (cu_$arg_list_ptr (), 2, 3, caller_message, (0), "1"b, "0"b);
+	     call com_err_ (the_code, NAME, "For switch ^a: ^a", iocb_ptr -> iocb.name, caller_message);
+	end;
+
+	call cleanup_attachment ((0));		/* get rid of anything that was accomplished */
+
+	if the_code = 0 then
+	     code = error_table_$action_not_performed;
+	else code = the_code;			/* save the error code */
+
+	go to RETURN_FROM_ATTACH;
+
+     end abort_attachment;
+%page;
+/* Fetch the next argument from the attach options and validate that it is a non-null character string */
+
+get_string_argument:
+     procedure () returns (character (*));
+
+dcl  option_name character (32);
+
+	option_name = argument;			/* about to move on to the next one */
+
+	if (argument_idx = hbound (P_attach_options, 1)) then
+	     call abort_attachment (error_table_$noarg, "Character string following ""^a"".", option_name);
+
+	argument_idx = argument_idx + 1;
+
+	argument_ptr = substraddr (P_attach_options (argument_idx), 1);
+	argument_lth = length (P_attach_options (argument_idx));
+
+	if (argument = "") then
+	     call abort_attachment (0, "Character string following ""^a"" must be non-null.", option_name);
+
+	return (argument);
+
+     end get_string_argument;
+
+
+
+/* Fetch the next argument from the attach options and verify that it is a number */
+
+get_numeric_argument:
+     procedure () returns (fixed binary (35));
+
+dcl  option_name character (32);
+dcl  the_value fixed binary (35);
+
+	option_name = argument;			/* about to move on to the next one */
+
+	if (argument_idx = hbound (P_attach_options, 1)) then
+	     call abort_attachment (error_table_$noarg, "Number following ""^a"".", option_name);
+
+	argument_idx = argument_idx + 1;
+
+	argument_ptr = substraddr (P_attach_options (argument_idx), 1);
+	argument_lth = length (P_attach_options (argument_idx));
+
+	the_value = cv_dec_check_ (argument, code);
+
+	if code ^= 0 then
+	     call abort_attachment (error_table_$bad_conversion, """^a"" must be followed by a number; not ""^a"".",
+		option_name, argument);
+
+	return (the_value);
+
+     end get_numeric_argument;
+%page;
+/* Set input/output translation to the given string:  If the string supplied is less than 512 characters, the out of range
+   characters are translated to NULs */
+
+set_translation:
+     procedure (P_translate_table, P_translate_string_ptr, P_translate_string_lth);
+
+dcl  P_translate_table character (512) aligned parameter;	/* translate table */
+dcl  P_translate_string_ptr pointer parameter;		/* -> translation string */
+dcl  P_translate_string_lth fixed binary (21) parameter;	/* length of translation string */
+
+dcl  translate_string character (P_translate_string_lth) based (P_translate_string_ptr);
+
+	P_translate_table = translate_string;
+
+	if length (translate_string) < length (P_translate_table) then
+	     substr (P_translate_table, (length (translate_string) + 1)) =
+		copy (NUL, (length (P_translate_table) - length (translate_string)));
+
+	return;
+
+     end set_translation;
+%page;
+/* Read an I/O buffer:  block until some data arrives and perform a single read from ring-0 */
+
+read_io_buffer:
+     procedure ();
+
+	io_buffer_read = 0;				/* need do until here */
+
+	do while (io_buffer_read = 0);
+
+	     read_status.input_available = "0"b;	/* again, no do until */
+
+	     do while (^read_status.input_available);
+
+		call hcs_$tty_order (channel_info.devx, "read_status", addr (read_status), state, code);
+		if state ^= 5 then code = error_table_$io_no_permission;
+		if code ^= 0 then return;		/* punt! */
+
+		if ^read_status.input_available then do;/* need to wait for some input */
+		     event_wait_channel.n_channels = 1;
+		     event_wait_channel.channel_id (1) = channel_info.event_channel;
+		     call ipc_$block (addr (event_wait_channel), addr (local_event_wait_info), code);
+		     if code ^= 0 then call convert_ipc_code_ (code);
+		     if code ^= 0 then return;
+		end;
+	     end;
+
+	     call hcs_$tty_read (channel_info.devx, addr (io_buffer), (0), io_buffer_lth, io_buffer_read, state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if code ^= 0 then return;
+	end;
+
+	return;
+
+     end read_io_buffer;
+%page;
+/* Add the specified character to the I/O buffer for later output */
+
+add_character_to_io_buffer:
+     procedure (P_character);
+
+dcl  P_character character (1) aligned parameter;
+
+	if io_buffer_used = length (io_buffer) then	/* no room in buffer */
+	     go to WRITE_RECORD_BAD_DATA;
+
+	io_buffer_used = io_buffer_used + 1;
+
+	substr (io_buffer, io_buffer_used, 1) = P_character;
+
+	return;
+
+     end add_character_to_io_buffer;
+%page;
+/* Write an I/O buffer:  blocks until the entire buffer has been taken by ring-0 MCS */
+
+write_io_buffer:
+     procedure ();
+
+dcl  (transmitted, sent_on_call) fixed binary (21);
+
+
+	transmitted = 0;				/* do until needed here */
+
+	do while (transmitted < io_buffer_used);
+
+	     call hcs_$tty_write (channel_info.devx, substraddr (io_buffer, (transmitted + 1)), (0),
+		(io_buffer_used - transmitted), sent_on_call, state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if code ^= 0 then return;		/* punt! */
+
+	     transmitted = transmitted + sent_on_call;	/* got some more through */
+
+	     if transmitted < io_buffer_used then do;	/* not done yet: wait 'till we should try again */
+		call hcs_$tty_order (channel_info.devx, "write_status", addr (write_status), state, code);
+		if state ^= 5 then code = error_table_$io_no_permission;
+		if code ^= 0 then return;		/* punt! */
+
+		if write_status.output_pending then do; /* must really and truly wait */
+		     event_wait_channel.n_channels = 1;
+		     event_wait_channel.channel_id (1) = channel_info.event_channel;
+		     call timer_manager_$alarm_wakeup (1, "11"b, event_wait_channel.channel_id (1));
+		     call ipc_$block (addr (event_wait_channel), addr (local_event_wait_info), code);
+		     if code ^= 0 then call convert_ipc_code_ (code);
+		     if code ^= 0 then return;	/* punt! */
+		end;
+	     end;
+	end;
+
+	return;					/* this return taken only on success */
+
+     end write_io_buffer;
+%page;
+/* substraddr:  Return a pointer to the specified character of a varying or nonvarying string.  When the substraddr
+   builtin function is finally implemented, these internal procedures should be removed */
+
+dcl  substraddr
+	generic (substraddr_nonvarying when (character (*) nonvarying, fixed binary precision (1:35)),
+	substraddr_varying when (character (*) varying, fixed binary precision (1:35)));
+
+
+substraddr_nonvarying:
+     procedure (P_string, P_position) returns (pointer);
+
+dcl  P_string character (*) nonvarying parameter;
+dcl  P_position fixed binary (21) parameter;
+
+dcl  string_overlay (length (P_string)) character (1) unaligned based (addr (P_string));
+
+	return (addr (string_overlay (P_position)));
+
+     end substraddr_nonvarying;
+
+
+substraddr_varying:
+     procedure (P_string, P_position) returns (pointer);
+
+dcl  P_string character (*) varying parameter;
+dcl  P_position fixed binary (21) parameter;
+
+dcl  1 string_overlay aligned based (addr (P_string)),
+       2 lth fixed binary (21),
+       2 characters (0 refer (string_overlay.lth)) character (1) unaligned;
+
+	return (addr (string_overlay.characters (P_position)));
+
+     end substraddr_varying;
+%page;
+%include terminal_io_record;
+%page;
+%include hasp_device_data;
+
+%include hasp_srcb_scb_bytes;
+
+%include hasp_signon_record_info;
+%page;
+%include iocb;
+%page;
+%include iox_modes;
+%page;
+%include io_call_info;
+%page;
+%include dial_manager_arg;
+
+%include event_wait_channel;
+
+%include event_wait_info;
+%page;
+%include terminal_type_data;
+
+%include tty_convert;
+
+%include tty_get_channel_info;
+
+     end hasp_host_;

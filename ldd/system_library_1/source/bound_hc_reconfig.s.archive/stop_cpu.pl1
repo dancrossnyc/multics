@@ -1,0 +1,326 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* STOP_CPU - Remove a Central Processor.
+   modified 3/5/76 by Noel I. Morris for new reconfig
+   modified 03/01/77 by THVV for prds with branch
+   modified 02/05/79 by BSG for port expanders
+   modified September 1981 by J. Bongiovanni for set_procs_required
+   modified April 1984 by Chris Jones to update config deck to its partition when changed
+   except during shutdown (added shutdown entry too)
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-09-23,Beattie), approve(86-08-11,MCR7517),
+     audit(86-10-23,Fawcett), install(86-11-03,MR12.0-1206):
+     No BOS support for MR12.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+stop_cpu:
+     proc (tag, rcode);
+
+dcl	tag		   fixed bin (3);
+dcl	rcode		   fixed bin (35);
+
+dcl	pdp		   ptr;			/* pointer to correct element of processor data */
+dcl	new_pdp		   ptr;			/* pointer to correct element of processor data */
+dcl	new_tag		   fixed bin (3);		/* tag of another CPU */
+dcl	found		   bit (1) aligned;		/* useful switch */
+dcl	mask_temp		   fixed bin (71);		/* for call to wire_and_mask */
+dcl	ptp		   ptr;			/* for call to wired_and_mask */
+dcl	cpu_mask		   bit (8) aligned;		/* for set_procs_required */
+dcl	code		   fixed bin (35);		/* error code */
+dcl	timnow		   fixed bin (52);		/* time when waiting for CPU to stop */
+dcl	shutdown_entry	   bit (1) aligned;
+
+dcl	LETTERS		   char (8) static options (constant) init ("ABCDEFGH");
+dcl	my_name		   char (8) static options (constant) init ("stop_cpu");
+
+dcl	prds$simulated_mask	   ext,
+	tc_data$ncpu	   fixed bin ext;
+
+dcl	set_procs_required	   entry (bit (8) aligned, fixed bin (35)),
+	pxss$unthread_apte	   entry (ptr),
+	privileged_mode_ut$cioc
+			   entry (ptr),
+	privileged_mode_ut$wire_and_mask
+			   entry (fixed bin (71), ptr),
+	privileged_mode_ut$unwire_unmask
+			   entry (fixed bin (71), ptr),
+	wire_proc$wire_me	   entry,
+	wire_proc$unwire_me	   entry,
+	scr_util$set_mask	   entry (fixed bin (3), fixed bin (3), bit (72) aligned),
+	scr_util$reassign_mask entry (fixed bin (3), fixed bin (3)),
+	scr_util$set_port_enable
+			   entry (fixed bin (3), bit (1) unal),
+	scr_util$update_export_xipmsk
+			   entry (fixed bin (3)),
+	scr_util$set_export_enable
+			   entry (fixed bin (3), fixed bin (3), bit (1) aligned),
+	mask_instruction$staq  entry returns (bit (36) aligned),
+	mask_instruction$ldaq  entry returns (bit (36) aligned),
+	config_$find_2	   entry (char (4) aligned, fixed bin (35), ptr),
+	config_$update	   entry (),
+	syserr$error_code	   entry options (variable),
+	syserr		   entry options (variable);
+
+dcl	1 pdata		   based (pdp) like scs$processor_data aligned;
+dcl	1 npdata		   based (new_pdp) like scs$processor_data aligned;
+
+dcl	(addr, clock, substr, unspec)
+			   builtin;
+
+
+	shutdown_entry = "0"b;
+	goto SHUTDOWN_COMMON;
+
+shutdown:
+     entry (tag, rcode);
+
+	shutdown_entry = "1"b;
+
+SHUTDOWN_COMMON:					/* The following code effects the first steps in removing a processor. */
+	pdp = addr (scs$processor_data (tag));		/* Get ptr to data for CPU to be deleted. */
+	fgbxp = addr (flagbox$);			/* Get pointer to BCE flagbox segment. */
+
+
+/* If the bootload processor is being removed, find another CPU
+   to be the bootload processor.				*/
+
+	if tag = scs$bos_processor_tag then do;
+	     found = "0"b;				/* Initialize switch. */
+	     do new_tag = 0 to 7 while (^found);
+		new_pdp = addr (scs$processor_data (new_tag));
+						/* If booload processor, look for another. */
+
+		if npdata.online then		/* If online ... */
+		     if new_tag ^= tag then		/* ... and we're not looking at CPU to be removed ... */
+			if npdata.interrupt_cpu	/* ... and CPU can take interrupts */
+			     & ^npdata.expanded_port then do;
+						/* ...and not on expander */
+			     found = "1"b;		/* Found candidate to be bootload processor. */
+			     scs$bos_processor_tag = new_tag;
+			     call syserr (ANNOUNCE, "^a: CPU ^a is now the bootload processor.", my_name,
+				substr (LETTERS, new_tag + 1, 1));
+			     fgbx.hc_dbr = unspec (scs$idle_aptep (new_tag) -> apte.dbr);
+			end;			/* Save DBR of new bootload processor's idle process. */
+	     end;
+	     if ^found then do;
+		rcode = rcerr_delcpu_no_good_blcpu;
+		return;
+	     end;
+	end;
+
+
+/* Issue connect for processor to remove itself (it will reset procs
+   required when it goes offline) */
+
+	cpu_mask = "0"b;
+	substr (cpu_mask, scs$bos_processor_tag + 1, 1) = "1"b;
+	call set_procs_required (cpu_mask, code);
+	if code ^= 0 then do;			/* Couldn't run on bootload processor */
+	     rcode = rcerr_sprq_failed;
+	     return;
+	end;
+
+	pdata.delete_cpu = "1"b;			/* Set flag telling CPU to delete itself. */
+	call privileged_mode_ut$cioc (addr (scs$cow (tag).cow));
+						/* Send connect to the CPU. */
+
+	call set_procs_required ("0"b, code);		/* Run on any processor now. */
+
+/* Wait for processor to come to a stop. */
+
+	timnow = clock;				/* Get time now. */
+	do while (^pdata.halted_cpu);			/* Wait for processor to stop itself. */
+	     if clock - timnow > 30000000 then do;	/* Allow 30 seconds. */
+		rcode = rcerr_delcpu_no_stop;		/* Then return error code. */
+		return;
+	     end;
+	end;
+
+/* The following code effects the final steps in removing a processor.
+   The processor has already stopped itself.			*/
+
+	pdp = addr (scs$processor_data (tag));		/* Get pointer to processor data. */
+
+/* Now update config info. */
+
+	scs$nprocessors = scs$nprocessors - 1;		/* Keep count of number of CPU's. */
+	tc_data$ncpu = tc_data$ncpu - 1;
+
+	call syserr (ANNOUNCE, "^a: Removed CPU ^a.", my_name, substr (LETTERS, tag + 1, 1));
+	go to destroy;
+
+destroy_1:
+     entry (tag, rcode);
+
+	shutdown_entry = "0"b;
+
+destroy:
+	pdp = addr (scs$processor_data (tag));		/* Get pointer to data for stopped processor. */
+
+/* Update the config deck. */
+
+	if ^shutdown_entry then do;
+	     call config_$find_2 (CPU_CARD_WORD, tag + 1, cpu_cardp);
+						/* Get pointer to correct config card. */
+	     cpu_card.state = "off ";
+	     call config_$update ();
+	end;
+
+/* Destroy the idle process belonging to the stopped processor. */
+
+	call pxss$unthread_apte ((scs$idle_aptep (tag))); /* Unthread APTE from idle queue */
+
+/* Disable all interrupts to the removed processor.  Turn off
+   the port enable bit for this processor in all controllers.	*/
+
+	call scr_util$set_mask (scs$interrupt_controller, (pdata.controller_port), scs$sys_level);
+						/* Mask interrupts to stopped CPU. */
+
+	if ^pdata.expanded_port			/* Vanilla port? */
+	     then
+	     call scr_util$set_port_enable ((pdata.controller_port), "0"b);
+						/* Disable the port in all controllers. */
+	else call scr_util$set_export_enable ((pdata.controller_port), (pdata.expander_port), "0"b);
+						/* Leave gross disabling and interrupt disabling 'till last */
+
+
+/* If another running processor needs a controller mask, and the removed
+   processor had one, give the mask to the running processor.	*/
+
+	found = "0"b;				/* Initialize flag. */
+	if pdata.interrupt_cpu then do;		/* If removed processor took interrupts ... */
+	     do new_tag = 0 to 7 while (^found);	/* Search for CPU to give interrupts to. */
+		new_pdp = addr (scs$processor_data (new_tag));
+
+		if npdata.online & ^npdata.interrupt_cpu then do;
+
+
+		     call scr_util$reassign_mask (tag, new_tag);
+						/* Assign mask to new CPU. */
+
+		     cpu_mask = "0"b;
+		     substr (cpu_mask, new_tag + 1, 1) = "1"b;
+		     call set_procs_required (cpu_mask, code);
+						/* Run on specified CPU */
+		     if code ^= 0 then
+			call syserr$error_code (CRASH, code, "^a: Unable to run on CPU ^a", my_name,
+			     substr (LETTERS, new_tag + 1, 1));
+		     else do;
+			found = "1"b;		/* Found a candidate */
+			call wire_proc$wire_me;	/* Wire this code down. */
+			call privileged_mode_ut$wire_and_mask (mask_temp, ptp);
+						/* Don't allow interrupts now. */
+
+			scs$mask_ptr (new_tag) = scs$mask_ptr (tag);
+						/* Set mask pointer. */
+			scs$set_mask (new_tag) = scs$set_mask (tag);
+						/* Set SMCM instruction. */
+			scs$read_mask (new_tag) = scs$read_mask (tag);
+						/* Set RMCM instruction. */
+			npdata.interrupt_cpu = "1"b;	/* CPU can now receive interrupts. */
+			call privileged_mode_ut$unwire_unmask (mask_temp, ptp);
+			call wire_proc$unwire_me;	/* No longer need to be wired and masked. */
+			call set_procs_required ("0"b, code);
+						/* Can continue running on any CPU. */
+
+			pdata.interrupt_cpu = "0"b;	/* This processor no longer will get interrupts. */
+			scs$mask_ptr (tag) = addr (prds$simulated_mask);
+						/* Set pointer to simulated mask. */
+			scs$set_mask (tag) = mask_instruction$staq ();
+						/* Make SMCM into STAQ. */
+			scs$read_mask (tag) = mask_instruction$ldaq ();
+						/* Make RMCM into LDAQ. */
+		     end;
+		end;
+	     end;
+	end;
+
+/* Set the port expander XIP enable bits the new way;
+   maybe disable entire SC port. */
+
+	if pdata.expanded_port then do;
+	     call scr_util$update_export_xipmsk ((pdata.controller_port));
+	     call scr_util$set_export_enable ((pdata.controller_port), (pdata.expander_port), "0"b);
+	     found = "0"b;				/* Look for major port users */
+	     do new_tag = 0 to 7 while (^found);
+		new_pdp = addr (scs$processor_data (new_tag));
+		if npdata.controller_port = pdata.controller_port & npdata.online & tag ^= new_tag then
+		     found = "1"b;
+	     end;
+	     if ^found then
+		call scr_util$set_port_enable ((pdata.controller_port), "0"b);
+	end;
+
+	rcode = 0;
+
+	return;
+
+%include rcerr;
+%page;
+%include config_cpu_card;
+%page;
+%include flagbox;
+%page;
+%include scs;
+%page;
+%include apte;
+%page;
+%include syserr_constants;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   stop_mpx: CPU CPUTAG is now the bootload processor.
+
+   S: $info
+
+   T: In response to an operator "rcf dl cpu CPUTAG" command.
+
+   M: The CPU whose tag is CPUTAG is now the processor on which
+   BCE will run at system shutdown or crash time, unless some
+   other processor is so designated in this way before the next
+   shutdown or crash time. Unless BCE is rebooted after
+   shutdown, that CPU will be the bootload processor of the next
+   bootload.
+
+   A: $ignore
+
+   Message:
+   stop_cpu: Removed CPU CPUTAG.
+
+   S: $info
+
+   T: In response to an operator "rcf dl cpu CPUTAG" command.
+
+   M: The system has successfully deleted the CPU whose tag is CPUTAG
+   from the configuration. The CPU is now halted at a DIS instruction.
+
+   A: The operator can, but need not, physically remove the CPU from
+   the configuration by disabling appropriate ports if desired.
+
+   Message:
+   stop_cpu: Unable to run on CPU X ERRORMESSAGE
+
+   S: $crash
+
+   T: When deleting a CPU.
+
+   M: The system has just deleted a CPU which owned an interrupt mask.
+   In trying to assign the mask to a different CPU (X), it was unable to
+   run on that CPU.  This indicates hardware or software malfunction.
+
+   A: $recover
+
+   END MESSAGE DOCUMENTATION */
+     end stop_cpu;

@@ -1,0 +1,273 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-12-17,Lippard), approve(87-08-24,MCR7760),
+     audit(88-02-03,Fawcett), install(88-02-16,MR12.2-1022):
+     Make reset_soos work on segments.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind35,^indcomtxt */
+
+/* Initial coding by Kobziar July 74 */
+/* Modified 750523 by LJS to add protection auditing */
+/* Modified 06/01/76 by R. Bratt to call find_$finished */
+/* Modified 07/77 by THVV for bad_dir_ check */
+/* Modified 06/84 by Keith Loepere to use the new dc_find. */
+/* Modified 84-12-03 by EJ Sharpe for access_audit_ */
+/* Modified 85-04-01 by Keith Loepere for access_audit_check_ep_. */
+
+access_class_check: proc (a_dirname, a_ename, a_code);
+
+/* This procedure turns security_oosw off if dir consistent within AI rules */
+
+dcl  a_code			fixed bin (35) parameter;
+dcl  a_dirname			char (*) parameter;
+dcl  a_ename			char (*) parameter;
+
+dcl  access_class			bit (72) aligned;
+dcl  code				fixed bin (35);
+dcl  crunch_sw			bit (1) init ("0"b);
+dcl  d_access_class			bit (72) aligned;
+dcl  dep				ptr;
+dcl  dirname			char (168);
+dcl  dirlocked			bit (1) aligned init ("0"b);
+dcl  ename			char (32);
+dcl  entries_in_dir			fixed bin;
+dcl  1 event_flags			aligned like audit_event_flags;
+dcl  got_branch			bit (1) init ("0"b);
+dcl  i				fixed bin;
+dcl  len				fixed bin;
+dcl  pathname			char (168);
+dcl  pdep				ptr;
+dcl  1 qcell			like quota_cell aligned auto;
+dcl  relp				bit (18);
+dcl  segment			bit (1) aligned;
+dcl  unlock_parent_parent		bit (1) init ("1"b);
+
+dcl  access_audit_check_ep_$self	entry (bit (36) aligned, bit (36) aligned, ptr) returns (bit (1));
+dcl  access_audit_$log_entry_ptr	entry options (variable);
+dcl  aim_check_$equal		entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned) reducible;
+dcl  aim_check_$greater		entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned) reducible;
+dcl  lock$dir_unlock		entry (ptr);
+dcl  level$get			entry () returns (fixed bin);
+dcl  status_$get_access_class		entry (char (*), char (*), bit (72) aligned, fixed bin (35));
+dcl  sum$dirmod			entry (ptr);
+dcl  sum$getbranch			entry (ptr, bit (36) aligned, ptr, fixed bin (35));
+dcl  sum$getbranch_root_my		entry (ptr, bit (36) aligned, ptr, fixed bin (35));
+dcl  vtoc_attributes$get_quota	entry (bit (36) aligned, bit (36) aligned, fixed bin (17), ptr, fixed bin, fixed bin (35));
+
+dcl  access_operations_$fs_obj_set_soos ext bit (36) aligned;
+dcl  error_table_$ai_son_less		ext fixed bin (35);
+dcl  error_table_$argerr		ext fixed bin (35);
+dcl  error_table_$bad_dir		ext fixed bin (35);
+dcl  error_table_$notadir		ext fixed bin (35);
+dcl  error_table_$root		ext fixed bin (35);
+dcl  error_table_$rqover		ext fixed bin (35);
+dcl  pds$processid			bit (36) aligned ext;
+
+dcl  (addr, fixed, length, null, ptr, rtrim, string, substr) builtin;
+
+dcl  bad_dir_			condition;
+
+dcl  CHASE			fixed bin (1) aligned internal static options (constant) init (1);
+%page;
+START:	segment = "0"b;
+	dirname = a_dirname;
+	ename = a_ename;
+						/* get full dirname into pathname */
+	len = length (rtrim (dirname));		/* Find length. Accept imbedded blanks. */
+	if ename ^= "" then do;
+	     if len + length (rtrim (ename)) + 1 > length (pathname) then do; /* path name too long */
+bad_path:		code = error_table_$argerr;
+		goto early_fail;
+	     end;
+	     if len = 1 then pathname = substr (dirname, 1, 1) || ename; /* dir is root */
+	     else pathname = substr (dirname, 1, len) || ">" || ename;
+	end;
+	else do;					/* no ename */
+	     if len >= length (pathname) then goto bad_path; /* enough checking */
+	     pathname = dirname;			/* only dirname valid */
+	end;
+						/* get access class of dir */
+	call status_$get_access_class (pathname, "", access_class, code);
+	if code ^= 0 then if code = error_table_$root then access_class = "0"b;
+	     else goto early_fail;			/* map root's imaginary value */
+
+	call dc_find$dir_read (pathname, dp, code);
+	if code = error_table_$notadir then do;
+	     call dc_find$obj_status_read (dirname, ename, CHASE, ep, code);
+	     segment = "1"b;
+	end;
+	if code ^= 0 then goto early_fail;
+	dirlocked = "1"b;
+
+	if ^segment then do;
+	     i = 0;
+	     entries_in_dir = dir.seg_count + dir.dir_count + dir.lcount;
+	     do relp = dir.entryfrp repeat entry.efrp while (relp);
+						/* see if  equal class */
+		ep = ptr (dp, relp);
+		i = i + 1;
+		if i > entries_in_dir then signal bad_dir_;
+		if ^entry.bs then go to loop_cont;	/* skip links */
+		if entry.owner ^= dir.uid
+		     | (entry.type ^= SEG_TYPE & entry.type ^= DIR_TYPE) then signal bad_dir_;
+		if ^aim_check_$equal (access_class, entry.access_class) then do;
+		     if ^entry.multiple_class then goto err; /* if not equal then check for consistent upgrade */
+		     if ^aim_check_$greater (entry.access_class, access_class) then goto err;
+		     if ^entry.dirsw then do;		/* a segment can be upgraded only if in ring 1 */
+			if fixed (entry.ring_brackets (3)) > 1 then goto err;
+			else goto loop_cont;
+		     end;
+						/* a directory */
+		     else do;
+			call vtoc_attributes$get_quota (entry.uid, (entry.pvid), (entry.vtocx),
+			     addr (qcell), 0, code);
+			if code ^= 0 then goto fail;
+			if ^qcell.terminal_quota_sw then do;
+			     code = error_table_$rqover;
+			     goto fail;
+			end;
+		     end;
+		end;
+		else if entry.multiple_class then goto err; /* can't be multiple class if equal */
+loop_cont:     end;
+	end;					/* directory */
+
+	if segment then dp = ptr (ep, 0);
+
+	call sum$getbranch (dp, "1"b, dep, code);
+	if code ^= 0 then goto fail1;
+	got_branch = "1"b;
+
+	if segment then do;
+	     if ^aim_check_$equal (entry.access_class, dep -> entry.access_class) then
+		if ^entry.multiple_class | ^aim_check_$greater (entry.access_class, dep -> entry.access_class) then do;
+		     code = error_table_$ai_son_less;
+		     goto fail1;
+		end;
+
+	     if entry.security_oosw then do;		/* If it was out of service, we are making it in-service */
+		entry.security_oosw = "0"b;
+		string (event_flags) = ""b;
+		event_flags.special_op = "1"b;
+		event_flags.grant = "1"b;
+		event_flags.priv_op = "1"b;
+		if access_audit_check_ep_$self (string (event_flags), access_operations_$fs_obj_set_soos, dep) then
+		     call access_audit_$log_entry_ptr ("access_class_check", level$get (), string (event_flags),
+			access_operations_$fs_obj_set_soos, dep, code, null (), 0, "switch turned off");
+		ptr (dep, 0) -> dir.modify = "0"b;
+		call sum$dirmod (dp);
+	     end;
+	     goto unlock3;
+	end;
+
+	call sum$getbranch_root_my (ptr (dep, 0), "0"b, pdep, code); /* get the parent's access_class */
+	if code ^= 0 then				/* up to the root ? */
+	     if code = error_table_$root then do;
+		unlock_parent_parent = "0"b;
+		d_access_class = "0"b;		/* root at 0 */
+		code = 0;				/* clear for return */
+	     end;
+	     else goto unlock3;			/* no other err acceptable */
+						/* successful */
+	else d_access_class = pdep -> entry.access_class; /* save this */
+
+	if unlock_parent_parent then call lock$dir_unlock (ptr (pdep, 0));
+
+	if aim_check_$greater (access_class, d_access_class) then do; /* this is an upgraded dir */
+	     call vtoc_attributes$get_quota (dep -> entry.uid, (dep -> entry.pvid), (dep -> entry.vtocx),
+		addr (qcell), 0, code);
+	     if code ^= 0 then goto fail;
+	     if ^qcell.terminal_quota_sw then do;
+		code = error_table_$rqover;
+		goto fail;
+	     end;
+	end;
+	else if ^aim_check_$equal (access_class, d_access_class) then do;
+	     code = error_table_$bad_dir;
+	     goto fail;
+	end;
+						/* success */
+	if dep -> entry.security_oosw then do;		/* If it was out of service, we are making it in-service */
+	     ptr (dep, 0) -> dir.modify = pds$processid;
+	     dep -> entry.security_oosw = "0"b;
+	     string (event_flags) = ""b;
+	     event_flags.special_op = "1"b;
+	     event_flags.grant = "1"b;
+	     event_flags.priv_op = "1"b;
+	     if access_audit_check_ep_$self (string (event_flags), access_operations_$fs_obj_set_soos, dep) then
+		call access_audit_$log_entry_ptr ("access_class_check", level$get (), string (event_flags),
+		     access_operations_$fs_obj_set_soos, dep, code, null (), 0, "switch turned off");
+	end;
+	ptr (dep, 0) -> dir.modify = "0"b;
+
+	call sum$dirmod (ptr (dep, 0));		/* Must be done with dir locked */
+unlock3:
+	call lock$dir_unlock (ptr (dep, 0));
+
+fail1:	call dc_find$finished (dp, dirlocked);
+early_fail: a_code = code;
+	return;
+
+err:
+	code = error_table_$bad_dir;
+fail:	if crunch_sw then do;			/* FAILURE. If requested we will set out of service */
+	     if ^got_branch then call sum$getbranch (dp, "1"b, dep, (0));
+	     got_branch = "1"b;
+	     ptr (dep, 0) -> dir.modify = pds$processid;
+	     dep -> entry.security_oosw = "1"b;
+	     string (event_flags) = ""b;
+	     event_flags.special_op = "1"b;
+	     event_flags.grant = "1"b;
+	     event_flags.priv_op = "1"b;
+	     if access_audit_check_ep_$self (string (event_flags), access_operations_$fs_obj_set_soos, dep) then
+		call access_audit_$log_entry_ptr ("access_class_check", level$get (), string (event_flags),
+		     access_operations_$fs_obj_set_soos, dep, code, null (), 0, "switch turned on");
+	     ptr (dep, 0) -> dir.modify = "0"b;
+	     call sum$dirmod (ptr (dep, 0));
+	end;
+	if got_branch then call lock$dir_unlock (ptr (dep, 0));
+	go to fail1;
+
+aim_check_soos: entry (a_dirname, a_ename, a_code);
+
+	crunch_sw = "1"b;
+	go to START;
+%page; %include access_audit_eventflags;
+%page; %include dc_find_dcls;
+%page; %include dir_header;
+%page; %include dir_entry;
+%page; %include fs_obj_access_codes;
+%page; %include fs_types;
+%page; %include quota_cell;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   AUDIT (access_class_check): GRANTED modification of security out_of_service ADDED_INFO
+
+   S:	$access_audit
+
+   T:	$run
+
+   M:	The soos switch for the specified path has been turned on or
+off  by the security administrator as indicated.
+
+   A:	$ignore
+
+   END MESSAGE DOCUMENTATION */
+
+     end access_class_check;

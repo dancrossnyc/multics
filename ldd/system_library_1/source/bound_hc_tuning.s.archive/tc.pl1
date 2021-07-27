@@ -1,0 +1,327 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+tc:  proc;
+
+/* This program includes those scheduler functions which
+   are used infrequently enough that the code is appropriately
+   written in pl1 and not permanently wired-down */
+
+/* Coded May 1975 by RE Mullen for priority scheduler */
+/* tune_work_class entry added RE Mullen for deadline scheduler */
+/* Modified 29 October by M. Pierret for pin_weight and io_priority */
+/* Modified June 1981 by J. Bongiovanni for governed work classes */
+/* Modified May 1982 by J. Bongiovanni for interactive_q */
+/* Modified November 1984 by M. Pandolf to include hc_lock. */
+
+% include tcm;
+% include hc_lock;
+% include apte;
+
+dcl 1 wci aligned like work_class_info;
+
+% include work_class_info;
+dcl (i, max_wc, wct_base) fixed bin;
+dcl  hundth_of_credits fixed bin;
+dcl  hundth_of_scatter fixed bin;
+dcl (apte_count, sum, wcnum, size_of_wct_entry) fixed bin (35);
+dcl  ptwp ptr;
+dcl  oldmask fixed bin (71);
+dcl  code fixed bin (35);
+
+dcl  tc_data$ external;
+
+dcl (
+     error_table_$action_not_performed,
+     error_table_$obsolete_function,
+     error_table_$bad_work_class,
+     error_table_$bad_arg)
+     external static fixed bin (35);
+
+dcl  clock_ entry returns (fixed bin (71));
+dcl (pxss$lock_apt, pxss$unlock_apt) entry ();		/* only way to touch apt lock */
+
+dcl  pmut$wire_and_mask entry (fixed bin (71), ptr);
+dcl  pmut$unwire_unmask entry (fixed bin (71), ptr);
+dcl  wire_proc$wire_me entry ();
+dcl  wire_proc$unwire_me entry ();
+
+dcl (addr, addrel, bin, divide, fixed, rel, size) builtin;
+
+/* END DCLS */
+
+/*  */
+
+
+tune_work_class: entry (a_wctup, a_code);
+
+dcl  a_wctup ptr;
+dcl  wctup ptr;
+
+dcl 1 wctu_info aligned like work_class_tune_info;
+
+	wctup = a_wctup;
+	code = 0;
+	tcmp = addr (tc_data$);
+	wctu_info = wctup -> work_class_tune_info;
+	if wctu_info.version < WCTI_version_3 then do;
+	     code = error_table_$obsolete_function;
+	     go to TWC_RETURN;
+	end;
+	i = wctu_info.wc_number;
+	if (i<0) | (i>16) then do;
+	     code = error_table_$bad_work_class;
+	     go to TWC_RETURN;
+	end;
+	if ^tcm.wcte (i).defined then do;
+	     code = error_table_$bad_work_class;
+	     go to TWC_RETURN;
+	end;
+
+	if wctu_info.set.governed then
+	     if wctu_info.max_percent < 0 | wctu_info.max_percent > 100
+	     then do;
+		code = error_table_$bad_arg;
+		goto TWC_RETURN;
+	     end;
+	     
+
+/* Now set the new parameters for this work_class. */
+
+	call WIRE_LOCK;				/* TRAFFIC CONTROLLER LOCKED */
+
+	if wctu_info.set.resp1 then
+	     tcm.wcte (i).resp1 = wctu_info.resp1;
+	if wctu_info.set.resp2 then
+	     tcm.wcte (i).resp2 = wctu_info.resp2;
+	if wctu_info.set.quantum1 then
+	     tcm.wcte (i).quantum1 = wctu_info.quantum1;
+	if wctu_info.set.quantum2 then
+	     tcm.wcte (i).quantum2 = wctu_info.quantum2;
+	if wctu_info.set.purging then
+	     if wctu_info.flags.purging then tcm.wcte (i).purging = 1;
+	     else tcm.wcte (i).purging = 0;
+	if wctu_info.set.realtime then
+	     if wctu_info.flags.realtime then tcm.wcte (i).realtime = 1;
+	     else tcm.wcte (i).realtime = 0;
+	if wctu_info.set.maxel then
+	     tcm.wcte (i).maxel = wctu_info.maxel;
+	if wctu_info.set.pin_weight then
+	     tcm.wcte (i).pin_weight = wctu_info.pin_weight;
+	if wctu_info.set.io_priority then
+	     tcm.wcte (i).io_priority = wctu_info.flags.io_priority;
+	if wctu_info.set.governed then do;
+	     if wctu_info.max_percent = 0 then
+	          tcm.wcte (i).flags.governed = "0"b;
+	     else do;
+		hundth_of_scatter = divide (tcm.credits_per_scatter, 100, 17);
+		tcm.wcte (i).maxf = hundth_of_scatter * wctu_info.max_percent;
+		tcm.wcte (i).governing_credits = 0;
+		tcm.wcte (i).flags.governed = "1"b;
+		end;
+	     if ^wctu_info.set.interactive_q		/* Use default */
+		then tcm.wcte (i).flags.interactive_q = ^tcm.wcte (i).flags.governed;
+	     end;
+	     if wctu_info.set.interactive_q
+		then tcm.wcte (i).flags.interactive_q = wctu_info.flags.interactive_q;
+	     
+
+	call UNLOCK_UNWIRE;				/* TRAFFIC CONTROLLER LOCKED */
+
+TWC_RETURN:
+	a_code = code;
+	return;
+
+
+
+define_work_classes: entry (a_wcip, a_code);
+
+dcl  a_wcip ptr;
+dcl  a_code fixed bin (35);
+
+
+/* First copy args */
+
+	wcip = a_wcip;
+
+	wci = work_class_info;
+	wci.error_process_id = ""b;
+	wci.error_work_class = 0;
+	code = 0;
+
+/* If setting user workclasses then compute sum and max_wc */
+/* In any case validate arguments */
+
+	if wci.set_user_wc then do;
+	     sum = 0;				/* Compute the sum of the "percents" */
+	     max_wc = 0;				/* Assume only  zeroth exists */
+
+	     do i = 1 to 16;
+		if wci.user_wc_defined (i) then do;
+		     if wci.user_wc_min_pct (i) <= 0
+			| (wci.governed (i) 
+			     & (wci.user_wc_max_pct (i) <= 0 | wci.user_wc_max_pct (i) > 100))
+		     then do;
+			code = error_table_$bad_arg;
+			go to DWC_RETURN;
+		     end;
+		     sum = sum + wci.user_wc_min_pct (i);
+		     max_wc = i;
+		end;
+	     end;
+	end;
+
+	if wci.set_system_wc then do;
+	     if wci.system_wc_min_pct <= 0 then do;
+		code = error_table_$bad_arg;
+		go to DWC_RETURN;
+	     end;
+	end;
+
+	call WIRE_LOCK;				/* TRAFFIC CONTROLLER LOCKED */
+
+
+/* Verify that existing processes will belong to defined work classes */
+
+	aptep = addr (tcm.apt);
+	apte_count = tcm.apt_size;
+	size_of_wct_entry = size (wct_entry);
+	wct_base = fixed (rel (addr (tcm.wcte (0))), 18);
+
+	if wci.set_user_wc then do;
+	     do i = 1 to apte_count;
+		if ^ apte.flags.idle then		/* Idle processes are not in wc's */
+		     if bin (apte.flags.state, 18) ^= 0 then /* Dont worry about empties */
+			if bin (apte.flags.state, 18) ^= 5 then do; /* Dont worry about stopped */
+			     wcnum = divide (fixed (apte.wct_index, 18) - wct_base, size_of_wct_entry, 17, 0);
+			     if wcnum > 0 then do;
+				if ^ wci.user_wc_defined (wcnum) then do;
+				     wci.error_process_id = apte.processid;
+				     wci.error_work_class = wcnum;
+				     go to DWC_UU_RETURN;
+				end;
+			     end;
+			end;
+		aptep = addrel (aptep, tcm.apt_entry_size); /* Move to next APTE */
+	     end;
+
+	     tcm.max_wct_index = rel (addr (tcm.wcte (max_wc)));
+
+	     if sum ^= 0 then			/* Scheduler algorithm requires normalization to 100% */
+		hundth_of_credits = divide (tcm.credits_per_scatter, sum, 17, 0);
+	     else hundth_of_credits = 0;		/* no user_work_classes defined */
+	     hundth_of_scatter = divide (tcm.credits_per_scatter, 100, 17, 0);
+	     
+
+/* Set per-work_class parameters as specified */
+
+	     do i = 1 to 16;
+		if wci.user_wc_defined (i) then do;
+		     tcm.wcte (i).flags.defined = "1"b;
+		     tcm.wcte (i).minf = fixed (wci.user_wc_min_pct (i), 7) * hundth_of_credits;
+						/* Set credits to a modest amount. */
+		     tcm.wcte (i).credits = tcm.wcte (i).minf + tcm.telast;
+		end;
+		else do;
+		     tcm.wcte (i).flags.defined = "0"b;
+		     tcm.wcte (i).credits,
+			tcm.wcte (i).minf = 0;
+		end;
+		tcm.wcte (i).purging = 1;
+		tcm.wcte (i).maxel = 0;
+		if wci.version >= 2 & wci.user_wc_defined (i) then do;
+		     if wci.realtime (i) then tcm.wcte.realtime (i) = 1;
+		     else tcm.wcte (i).realtime = 0;
+		     tcm.wcte (i).resp1 = wci.resp1 (i);
+		     tcm.wcte (i).quantum1 = wci.quantum1 (i);
+		     tcm.wcte (i).resp2 = wci.resp2 (i);
+		     tcm.wcte (i).quantum2 = wci.quantum2 (i);
+		end;
+		else do;				/* set default parms for this wc */
+		     tcm.wcte (i).resp1 = 4000000;	/* 4sec */
+		     tcm.wcte (i).quantum1 = 500000;	/* half sec */
+		     tcm.wcte (i).resp2 = 32000000;	/* 32 sec */
+		     tcm.wcte (i).quantum2 = 1000000;	/* one sec */
+		     tcm.wcte (i).realtime = 0;
+		end;
+		if wci.version >= 3 & wci.user_wc_defined (i) 
+		     & wci.governed (i) then do;
+		     tcm.wcte (i).flags.governed = "1"b;
+		     tcm.wcte (i).maxf = hundth_of_scatter * wci.user_wc_max_pct (i);
+		end;
+		else tcm.wcte (i).flags.governed = "0"b;
+		tcm.wcte (i).flags.interactive_q = ^tcm.wcte (i).flags.governed;
+		tcm.wcte (i).governing_credits = 0;
+	     end;
+	end;
+
+/* Set global parameters if requested. */
+
+
+	if wci.set_sked_mode then tcm.deadline_mode = bin (wci.deadline_mode, 1);
+	if wci.set_max_batch_elig then tcm.max_batch_elig = wci.max_batch_elig;
+
+	if wci.set_system_wc then do;
+	     tcm.wcte (0).minf = fixed (wci.system_wc_min_pct, 7)
+		* divide (tcm.credits_per_scatter, 100, 17, 0);
+	     tcm.wcte (0).credits = tcm.wcte (0).minf + tcm.telast;
+	end;
+
+
+/* Re-initialize metering data */
+	if wci.set_user_wc | wci.set_system_wc then do;
+	     do i = 0 to 16;
+		tcm.wcte (i).cpu_sum,
+		     tcm.wcte (i).eligibilities = 0;
+	     end;
+	     tcm.define_wc_time = clock_ ();
+	     tcm.processor_time_at_define_wc = tcm.processor_time;
+	end;
+
+DWC_UU_RETURN:
+	call UNLOCK_UNWIRE;				/* TRAFFIC CONTROLLER UNLOCKED */
+
+
+DWC_RETURN:
+	work_class_info = wci;
+	if code = 0 then
+	     if (wci.error_work_class ^= 0) | (wci.error_process_id ^= ""b)
+	     then code = error_table_$action_not_performed;
+	a_code = code;
+	return;
+
+
+/*  */
+
+/* -------------------------------------------------------------------- */
+
+WIRE_LOCK: proc;
+
+	     call wire_proc$wire_me ();
+	     call pmut$wire_and_mask (oldmask, ptwp);
+	     tcmp = addr (tc_data$);
+	     call pxss$lock_apt ();			/* TRAFFIC CONTROLLER LOCKED HERE */
+
+	end WIRE_LOCK;
+
+/* -------------------------------------------------------------------- */
+
+UNLOCK_UNWIRE: proc;
+
+	     call pxss$unlock_apt ();			/* TRAFFIC CONTROLLER UNLOCKED HERE */
+	     call pmut$unwire_unmask (oldmask, ptwp);
+	     call wire_proc$unwire_me ();
+
+	end UNLOCK_UNWIRE;
+
+
+     end tc;

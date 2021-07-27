@@ -1,0 +1,1157 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-05,GJohnson), approve(86-06-05,MCR7387),
+     audit(86-06-10,Martinson), install(86-07-17,MR12.0-1091):
+     Correct error message documentation.
+  2) change(86-06-30,Fawcett), approve(86-06-30,MCR7383),
+     audit(86-06-30,LJAdams), install(86-07-17,MR12.0-1097):
+     Add support for subvolumes, 3380 and 3390.
+                                                   END HISTORY COMMENTS */
+
+/* format: indattr,inddcls,dclind5,idind30,struclvlind5,ifthenstmt,ifthendo,^inditerdo,^indnoniterend,case,^tree,^indproc,^indend,^delnl,^insnl,comcol81,indcom,linecom,^indcomtxt */
+mdx:
+     proc;
+
+	/* Guts of volume management.
+
+   This program is the brains behind disk_table_.
+   We run in ring 1 here and can mess with the disk table - but we don't print any messages.
+
+   system_startup_ and sc_command_ call disk_table_ which can run in any ring and print.
+   disk_table_ calls us through initializer_mdc_.
+
+   THVV
+   4/2/76 by Greenberg for demount and auto lv/pv vanishing
+   12/4/76 by Greenberg for new lv vanish including demounted bits
+   03/8/77 by Greenberg for static ac/dc disks and random refcount bugs
+   July 1977 by T. Casey to add set_lv_pdir_bit entry
+   Jan 1978 by B. Greenberg for prev_bootload bit, making lvs "mounting" at startup.
+   July 1978 by B. Greenberg for hardcore RLV acceptance.
+   July 1981 by J. Bongiovanni to validate lv indices
+   March 1982 by J. Bongiovanni for new PVTE
+   '82 for english disk error codes 
+   831122 by E. A. Ranzenbach for set_vacate_pdirs_bit entry.
+   August 1984 by Chris Jones to tell IOI when we add or delete a drive.
+   84-09-04 by EJ Sharpe to change hdx refs to volume_registration_mgr_
+	also changed check_hv entry to check_lv
+   85-01-31 by EJ Sharpe to force-init DT entries for: 1) root PVs not on the
+	ROOT config card (i.e. not in PVT at init time); and 2) root PVs
+	have moved to a different drive (these used to be done incorrectly
+	by "forgetter").  Also, clear all lve.pdirs_ok bits at initialization.
+   1985-04-02, BIM: Indicate to caller of "take" when this call has completed
+	     the rlv, so that the last add_vol of an root PV's crows
+	     with success.
+   05/07/85 by Chris Jones to let IOI decide when a drive can or cannot be reconfigured.
+   08/28/85 by Rich Fawcett to support sub-volumes.
+*/
+
+	dcl  found		     bit (1);
+	dcl  must_term		     bit (1) init ("0"b);
+	dcl  (sdtp, stat_pvtp)	     ptr static init (null);
+	dcl  ROOT			     char (168) static init (">");
+	dcl  SL1			     char (168) static init (">system_library_1");
+	dcl  i			     fixed bin;
+	dcl  dvn			     char (8);
+	dcl  (tpvtx, a_tpvtx)	     fixed bin;
+	dcl  lvx			     fixed bin;
+	dcl  prev_state		     bit (1);
+	dcl  oldlev		     fixed bin;
+	dcl  num_pic		     pic "99";
+	dcl  pvt_n_entries		     fixed bin;
+	dcl  xec			     fixed bin (35);
+	dcl  reasonable_time	     fixed bin (71) int static init (2276881905645328);
+
+	dcl  (addr, fixed, null, max, rel, rtrim, substr, unspec) builtin;
+
+	dcl  admin_gate_$ioi_add_device    entry (char (*), fixed bin (35));
+	dcl  admin_gate_$ioi_delete_device entry (char (*), fixed bin (35));
+	dcl  (cu_$level_set, cu_$level_get) entry (fixed bin);
+	dcl  initializer_gate_$add_pv_to_lv entry (bit (36) aligned, bit (36) aligned, fixed bin (35));
+	dcl  initializer_gate_$read_disk   entry (fixed bin, fixed bin, ptr, fixed bin (35));
+	dcl  initializer_gate_$define_lv   entry (ptr, fixed bin (35));
+	dcl  initializer_gate_$delete_lv   entry (bit (36) aligned, fixed bin (35));
+	dcl  initializer_gate_$set_disk_table_loc entry (ptr, fixed bin (35));
+	dcl  initializer_gate_$accept_fs_disk entry (fixed bin, fixed bin (35));
+	dcl  initializer_gate_$demount_pv  entry (fixed bin, fixed bin (35));
+	dcl  initializer_gate_$vol_salv    entry (fixed bin, bit (36) aligned, fixed bin (35));
+	dcl  initializer_gate_$ss_io_reconfigure entry (fixed bin, bit (1) aligned, fixed bin (35));
+	dcl  verify_label_		     entry (ptr, ptr, fixed bin, fixed bin (35));
+	dcl  volume_registration_mgr_$init entry (ptr);
+	dcl  volume_registration_mgr_$test entry (char (*));
+	dcl  volume_registration_mgr_$check_volume_registration entry (ptr, fixed bin (35));
+	dcl  volume_registration_mgr_$get_lv_pvinfo entry (char (*), ptr, fixed bin, fixed bin, fixed bin (35));
+	dcl  volume_registration_mgr_$find entry (ptr, fixed bin (35));
+	dcl  hcs_$initiate		     entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+	dcl  hcs_$terminate_noname	     entry (ptr, fixed bin (35));
+	dcl  hcs_$make_seg		     entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+	dcl  hcs_$truncate_seg	     entry (ptr, fixed bin, fixed bin (35));
+	dcl  hcs_$add_acl_entries	     entry (char (*), char (*), ptr, fixed bin, fixed bin (35));
+	dcl  rcp_control_$ss_io_interchange entry (char (*), bit (1) aligned, bit (1) aligned, fixed bin (35));
+	dcl  admin_gate_$syserr	     ext entry options (variable);
+
+	dcl  1 label_buffer		     like label;
+
+	dcl  1 adte		     like dte aligned based (aux_dtep);
+	dcl  1 alve		     like lve aligned based (aux_lvep);
+	dcl  (aux_dtep, aux_lvep)	     ptr;
+
+	dcl  1 aa			     aligned int static,
+		2 name		     char (32) init ("*.*.*"),
+		2 mode		     bit (36) init ("111"b),
+		2 mbz		     bit (36) init ((36)"0"b),
+		2 code		     fixed bin (35);
+
+	dcl  sys_info$access_class_ceiling bit (72) ext;
+	dcl  error_table_$fsdisk_not_salv  fixed bin (35) ext;
+	dcl  error_table_$no_label	     fixed bin (35) ext;
+	dcl  error_table_$invalid_state    fixed bin (35) ext;
+	dcl  error_table_$bad_label	     fixed bin (35) ext;
+	dcl  error_table_$argerr	     fixed bin (35) ext;
+	dcl  error_table_$action_not_performed fixed bin (35) ext;
+	dcl  error_table_$io_still_assnd   fixed bin (35) ext;
+	dcl  error_table_$logical_volume_not_defined fixed bin (35) ext;
+	dcl  error_table_$mount_not_ready  fixed bin (35) ext;
+	dcl  error_table_$private_volume   fixed bin (35) ext;
+
+	/* -------------------------------------------------------- */
+
+	/* This entry is the guts of disk_table_$init. Actually we could call ioa_ here but don't. */
+
+init: entry (a_dtp, new, ec);
+
+	dcl  a_dtp		     ptr, new bit (1), ec fixed bin (35);
+
+	ec = 0;
+	new = "0"b;
+	call hcs_$make_seg (ROOT, "disk_table", "", 1010b, dtp, xec);
+	if dtp = null then do;					/* Must have one */
+		ec = xec;						/* quelle horreur */
+		return;
+	     end;
+	call hcs_$add_acl_entries (ROOT, "disk_table", addr (aa), 1, xec);
+
+	call initializer_gate_$set_disk_table_loc (dtp, xec);		/* Tell BOS where it is (fsout too) */
+
+	call hcs_$initiate (SL1, "pvt", "", 0, 1, pvtp, xec);
+	if pvtp = null then do;
+		ec = xec;						/* system is broken */
+		return;
+	     end;
+	stat_pvtp = pvtp;						/* save value for use in copying pvt.salv bit */
+	sdtp = dtp;						/* Save static copy for other ep's */
+	call volume_registration_mgr_$init (dtp);
+	a_dtp = dtp;
+
+	/* Does the PVT match the Disk Table? */
+
+	pvt_n_entries = pvt.n_entries;
+	pvt_arrayp = addr (pvt.array);
+
+	if dt.version ^= 1 then ec = 3;
+	else if pvt_n_entries = dt.n_entries then do;			/* Must be same size */
+
+		do i = 1 to dt.n_lv_entries;				/* Cause lv table to be garbage-collected */
+		     lvep = addr (dt.lv_array (i));
+		     lve.mounting = "0"b;				/* As to not induce mhv's */
+		     lve.demounted_only = "0"b;			/* develop this later */
+		     lve.demounting = "0"b;				/* As to not induce dhv's */
+		     lve.used = "0"b;				/* So that gc will work */
+		     lve.hv_mounted = "0"b;				/* not until we know better */
+		     lve.pdirs_ok = "0"b;				/* site should set these each bootload */
+		end;
+
+		do i = 1 to pvt_n_entries;				/* Find hardcore-accepted volumes, scratch old DT entries. */
+		     pvtep = addr (pvt_array (i));
+		     dtep = addr (dt.array (i));
+		     dte.rpv = "0"b;				/* Will be set by make_root_pve if true */
+		     if pvte.used then call make_root_pve;
+		     else dte.hc_accepted = "0"b;
+		end;
+
+		do i = 1 to pvt_n_entries;				/* check all entries xcept PD */
+		     pvtep = addr (pvt_array (i));
+		     dtep = addr (dt.array (i));
+		     dte.need_salvage = "0"b;
+		     if pvte.storage_system ^= dte.storage_system then do;
+			     dte.known, dte.used, dte.demounted, dte.pre_accepted = "0"b;
+			     dte.storage_system = pvte.storage_system;
+			end;
+		     if dte.deleted | ^dte.storage_system
+		     then dte.used, dte.known, dte.pre_accepted, dte.demounted = "0"b;
+		     num_pic = pvte.logical_area_number;
+		     dvn = pvte.devname || "_" || num_pic;
+		     if pvte.is_sv then dvn = rtrim (dvn) || rtrim (pvte.sv_name);
+		     lvx = dte.lvx;					/* Can't be TOO bad. */
+		     lvep = addr (dt.lv_array (lvx));
+		     if dvn ^= dte.drive_name then ec = 4;
+		     else if pvte.device_type ^= dte.device_type then ec = 5;
+		     else if dte.deleted then dte.deleted = "0"b;		/* Cancel previous "deld" */
+		     else if lvx <= 0 then goto skip_lv;		/* invalid index -- don't diddle lve		*/
+		     else if dte.used then do;			/* good thing last time? */
+			     if dte.hc_accepted
+			     then call volume_registration_mgr_$check_volume_registration (dtep, xec); /* re-register root pack */
+			     else if dte.lvx = 1 then do;
+								/* root PV that is not on ROOT card */
+				     call admin_gate_$syserr (BEEP, "disk_table_: Deleted root PV ""^a"" on ^a.", dte.pvname, dte.drive_name);
+				     call force_init_dte (i);
+				end;
+			     else do;				/* Other volumes are "pre-accepted" (ie assumed) */
+estab_lv:				     call make_assumed;
+				     lve.demounted_only = "0"b;
+				     if dte.lvx ^= 1 then lve.mounting = "1"b;
+				     lve.prev_bootload = "1"b;
+suggest_lv:			     lve.used = "1"b;
+				     dt.n_lv_entries = max (dt.n_lv_entries, dte.lvx);
+				end;
+			end;
+		     else if dte.known | dte.pre_accepted then go to estab_lv;
+		     else if dte.demounted then do;
+			     if ^lve.used then lve.demounted_only = "1"b;
+			     go to suggest_lv;			/* good vol will turn off, */
+								/* bad vols wont turn on */
+			end;
+		     else ;					/* Idle last time */
+skip_lv:
+		end;
+		if ec = 0 then return;				/* If disk config didn't change we exit normally */
+	     end;
+
+	else if dt.n_entries = 0 then do;				/* Did we create a new disk table */
+		ec = 1;						/*  Yes */
+	     end;
+
+	else do;							/* Some other mismatch */
+		ec = 2;						/* disk config changed. rebuild whole thing */
+	     end;
+
+	call hcs_$truncate_seg (dtp, 0, xec);				/* Throw away all old stuff */
+	dt.version = 1;						/* .. and make new */
+	new = "1"b;
+	dt.n_entries = pvt_n_entries;					/*  Discount the paging device */
+	dt.max_n_entries = pvt.max_n_entries;
+	dt.n_lv_entries = 0;
+	do i = 1 to dt.n_entries;					/* Make new table */
+	     pvtep = addr (pvt_array (i));
+	     dtep = addr (dt.array (i));
+	     call force_init_dte (i);
+	     if pvte.used then do;
+		     call make_root_pve;				/* Kosher by definition */
+		     call volume_registration_mgr_$check_volume_registration (dtep, xec);
+								/* Make sure the rpv is registered */
+		end;
+	end;
+
+	return;
+
+	/* --------------------------------------------------------- */
+
+take: entry (a_pvname, a_indx, took, ec);
+
+	dcl  a_pvname		     char (*);
+	dcl  a_indx		     fixed bin;
+	dcl  took			     bit (1);
+
+	ec = 0;
+	dtp = sdtp;
+	i = a_indx;
+	dtep = addr (dt.array (i));
+	took = "0"b;
+	if ^dte.storage_system | dte.deleted | dte.used then do;
+fail:		ec = error_table_$argerr;
+		return;
+	     end;
+
+	call verify_drive_vanish_pve (dtep, a_pvname, ec);
+	if ec ^= 0 then return;					/* Consistentize disk table */
+
+	dte.pvname = a_pvname;
+	if ^dte.known then do;
+		call volume_registration_mgr_$find (dtep, ec);
+		if ec ^= 0 then do;
+			call make_demounted;
+			return;
+		     end;
+		if ^get_it_known (i, ec) then do;
+			call make_demounted;
+			return;
+		     end;
+	     end;
+	lvep = addr (dt.lv_array (dte.lvx));
+	if lve.hv_mounted then do;					/* Adding vol to live lv (eg root) */
+		call initializer_gate_$accept_fs_disk (i, ec);
+		if ec = error_table_$fsdisk_not_salv then do;		/* salvage if needed */
+			call initializer_gate_$vol_salv (i, ""b, ec);
+			call initializer_gate_$accept_fs_disk (i, ec);
+		     end;
+		if ec = 0 then do;
+			call make_used;
+			call initializer_gate_$add_pv_to_lv (lve.lvid, dte.pvid, ec);
+		     end;
+		call check_lv_complete (xec);				/* Always try to announce success in completing the RLV */
+		if xec = 0 then do;
+			call verify_whole_lv (1, xec);
+			took = (xec = 0);
+		     end;
+	     end;
+	else do;
+		i = dte.lvx;
+		call check_lv_complete (xec);
+		if xec = 0 & lve.mounting then do;			/* If vol complete AND mhv was called */
+			call verify_whole_lv (i, ec);
+			if ec = 0 then took = "1"b;
+		     end;
+	     end;
+	return;
+
+	/* ------------------------------------------------------ */
+
+assert: entry (a_pvname, a_indx, ec);
+
+	ec = 0;
+	dtp = sdtp;
+	i = a_indx;
+	dtep = addr (dt.array (i));
+	if ^dte.storage_system | dte.deleted | dte.used then go to fail;
+	call verify_drive_vanish_pve (dtep, a_pvname, ec);
+	if ec ^= 0 then return;
+
+	dte.pvname = a_pvname;
+	call volume_registration_mgr_$find (dtep, ec);
+	if ec = 0 then call make_assumed;
+	else call make_blank;
+	return;
+
+	/* --------------------------------------------------------- */
+
+forget: entry (a_indx, ec);
+
+	ec = 0;
+	dtp = sdtp;
+	i = a_indx;
+	dtep = addr (dt.array (i));
+	if ^dte.storage_system | dte.deleted | dte.used then go to fail;
+	call make_blank;
+	return;
+
+	/* -------------------------------------------------------- */
+
+volsalv: entry (a_pvname, a_indx, opt, ec);
+
+	dcl  opt			     bit (36) aligned;
+
+	ec = 0;
+	dtp = sdtp;
+	i = a_indx;
+	dtep = addr (dt.array (i));
+	if ^dte.storage_system | dte.deleted | dte.used then go to fail;
+
+	call verify_drive_vanish_pve (dtep, a_pvname, ec);
+	if ec ^= 0 then return;
+
+	dte.pvname = a_pvname;
+	call volume_registration_mgr_$find (dtep, ec);
+	if ec ^= 0 then return;
+	call verify_label_ (dtp, dtep, i, ec);
+	if ec ^= 0 then return;
+	call make_known;
+
+	call initializer_gate_$vol_salv (i, opt, ec);
+	return;
+
+	/* ---------------------------------------------------------- */
+
+rlvolcheck: entry (a_indx, a_pvtx, opt, ec);				/* allow connection volsalv of copies of rlv members */
+								/* a_pvtx is copy, a_indx is real one */
+
+	dcl  a_pvtx		     fixed bin,
+	     rdtep		     ptr;
+
+	i = a_pvtx;
+	dtp = sdtp;
+	dtep = addr (dt.array (i));					/* dtep -> copy being salved */
+	rdtep = addr (dt.array (a_indx));				/* rdtep is place where live one lives */
+
+	if dte.deleted | ^dte.storage_system | dte.used then go to fail;
+	if ^(rdtep -> dte.used | rdtep -> dte.known) then go to fail;
+
+
+	call verify_label_ (dtp, rdtep, i, ec);				/* LIE to verify_label_: info for live, read phony */
+	if ec ^= 0 then return;
+
+	call make_blank;						/* Bash away stuff, can't be right */
+
+
+	call initializer_gate_$vol_salv (i, opt, ec);
+
+	return;
+
+	/* --------------------------------------------------------- */
+
+mhv: entry (a_indx, a_tpvtx, ec);
+
+	ec = 0;
+	tpvtx, a_tpvtx = 0;
+	dtp = sdtp;
+	lvep = addr (dt.lv_array (a_indx));
+
+	if (lve.hv_mounted & ^(a_indx = 1))				/* ok doublemount rlv */
+	     | (lve.mounting & ^lve.prev_bootload)			/* autograb last-time's */
+	     | lve.demounting | ^lve.used then go to fail;
+
+	if a_indx ^= 1 then lve.mounting = "1"b;
+	call check_lv_complete (ec);
+	if ec = 0 | ec = -1 then do;					/* Complete or completeable? */
+		call verify_whole_lv (a_indx, ec);
+	     end;
+	a_tpvtx = tpvtx;
+	return;
+
+	/* --------------------------------------------------------- */
+
+reregister: entry (a_pvname, a_indx, ec);				/* Called when opr asserts disk is ok */
+
+	ec = 0;
+	dtp = sdtp;
+	dtep = addr (dt.array (a_indx));
+
+	if ^dte.storage_system | dte.used | dte.deleted then go to fail;
+
+	call verify_drive_vanish_pve (dtep, a_pvname, ec);
+	if ec ^= 0 then return;
+
+	labelp = addr (label_buffer);
+	call initializer_gate_$read_disk (a_indx, LABEL_ADDR, labelp, ec);
+	if ec ^= 0 then return;
+
+	ec = error_table_$no_label;
+	if label.Multics ^= Multics_ID_String then return;
+	if label.version ^= 1 then return;
+	if label.time_registered < reasonable_time then return;
+	ec = error_table_$bad_label;
+	if label.pv_name ^= a_pvname then return;
+	dte.pvname = label.pv_name;
+	dte.pvid = label.pvid;
+	do i = 1 to dt.n_lv_entries while (^dt.lv_array (i).used | dt.lv_array (i).lvname ^= label.lv_name); end;
+	dte.lvx = i;
+	lvep = addr (dt.lv_array (dte.lvx));
+	if dte.lvx > dt.n_lv_entries then do;
+		dt.n_lv_entries = dt.n_lv_entries + 1;
+		unspec (lve) = ""b;
+		lve.lvname = label.lv_name;
+		lve.lvid = label.lvid;
+		lve.max_access_class = label.max_access_class;
+		lve.min_access_class = label.min_access_class;
+		lve.public = ^label.private;
+		lve.used = "1"b;
+	     end;
+	call volume_registration_mgr_$check_volume_registration (dtep, ec);
+	if ec ^= 0 then return;
+	call make_known;
+	return;
+
+
+	/* --------------------------------------------------------- */
+
+read_disk_table: entry (spacep, ec);
+
+	dcl  spacep		     ptr;
+	dcl  move_len		     fixed bin (18);
+	dcl  move_table		     (move_len) fixed bin (35) aligned based;
+
+	if ^get_local_dtp () then return;
+	ec = 0;
+	move_len = fixed (rel (addr (dt.lv_array (dt.n_lv_entries + 1))), 18);
+	spacep -> move_table = dtp -> move_table;
+	go to term_exit;
+
+
+	/* --------------------------------------------------------- */
+
+check_pv: entry (a_pvname, ec);
+
+	if ^get_local_dtp () then return;
+
+	found = "0"b;
+	do i = 1 to dt.n_entries while (^found);
+	     dtep = addr (dt.array (i));
+	     if a_pvname = dte.pvname & (dte.used | dte.known) then found = "1"b;
+								/* oughtta take out of tbl here */
+	end;
+	go to found_exit;
+
+	/* ------------------------------------------------------- */
+
+
+check_lv: entry (a_hvname, ec);
+
+	dcl  a_hvname		     char (*);
+
+	if ^get_local_dtp () then return;
+
+	found = "0"b;
+	do i = 1 to dt.n_lv_entries while (^found);
+	     if dt.lv_array (i).lvname = a_hvname & dt.lv_array (i).used & dt.lv_array (i).hv_mounted then found = "1"b;
+	end;
+found_exit:
+	if ^found then ec = error_table_$mount_not_ready;
+	else ec = 0;
+term_exit:
+	if must_term then do;
+		call cu_$level_set (oldlev);
+		call hcs_$terminate_noname (dtp, (0));
+	     end;
+	return;
+
+	/* --------------------------------------------------------- */
+
+
+set_lv_pdir_bit: entry (a_hvname, a_bit, ec);
+
+	dcl  a_bit		     bit (1) aligned;
+
+	ec = 0;							/* until something goes wrong */
+	if ^get_local_dtp () then return;
+	found = ""b;
+	do i = 1 to dt.n_lv_entries while (^found);
+	     if dt.lv_array (i).lvname = a_hvname & dt.lv_array (i).used then do;
+		     found = "1"b;
+		     if dt.lv_array (i).public then
+			dt.lv_array (i).pdirs_ok = a_bit;
+		     else ec = error_table_$private_volume;
+		end;
+	end;
+	if ^found then
+	     ec = error_table_$mount_not_ready;
+	return;
+
+
+	/* --------------------------------------------------------- */
+
+
+set_vacate_pdirs_bit: entry (a_hvname, a_bit, ec);
+
+	ec = 0;							/* until something goes wrong */
+	if ^get_local_dtp () then return;
+	found = ""b;
+	do i = 1 to dt.n_lv_entries while (^found);
+	     if dt.lv_array (i).lvname = a_hvname & dt.lv_array (i).used then do;
+		     found = "1"b;
+		     if dt.lv_array (i).public then do;
+			     dt.lv_array (i).vacate_pdirs = a_bit;
+			     if dt.lv_array (i).pdirs_ok & a_bit then dt.lv_array (i).pdirs_ok = "0"b;
+			end;
+		     else ec = error_table_$private_volume;
+		end;
+	end;
+	if ^found then
+	     ec = error_table_$mount_not_ready;
+	return;
+
+
+	/* --------------------------------------------------------- */
+
+add_del: entry (a_device_name, a_adding_drive, true_if_found, ec);
+
+	dcl  a_device_name		     char (*),
+	     a_adding_drive		     bit (1) aligned,
+	     true_if_found		     bit (1) aligned;
+	dcl  adding_drive		     bit (1);			/* "0"b if deleting device "1"b if adding device */
+
+	adding_drive = a_adding_drive;
+	dtp = sdtp;
+	ec = 0;
+	true_if_found = "0"b;
+	do i = 1 to dt.n_entries;
+	     dtep = addr (dt.array (i));
+	     if dte.drive_name = a_device_name then do;
+		     true_if_found = dte.storage_system;
+		     if dte.used | dte.known then ec = error_table_$io_still_assnd;
+		     else if dte.deleted ^= adding_drive then ec = error_table_$action_not_performed;
+		     else do;
+			     if adding_drive then
+				call admin_gate_$ioi_add_device ((dte.drive_name), ec);
+			     else call admin_gate_$ioi_delete_device ((dte.drive_name), ec);
+			     if ec = 0 then do;
+				     dte.deleted = ^adding_drive;
+				     if dte.storage_system then do;
+					     call make_blank;
+					     call admin_gate_$syserr
+						(ANNOUNCE, "disk_table_: ^[Added^;Deleted^] drive ^a.", (adding_drive), (a_device_name));
+					end;
+			        end;
+			end;
+		end;
+	end;
+	return;
+
+	/* -------------------------------------------------------- */
+
+ss_io_reconfig: entry (a_pvtx, a_from_ss, ec);
+
+	dcl  a_from_ss		     bit (1);
+	dcl  from_ss		     bit (1) aligned;
+
+	from_ss = a_from_ss;
+	i = a_pvtx;
+	dtp = sdtp;
+	dtep = addr (dt.array (i));
+	xec = 0;
+	if from_ss ^= dte.storage_system then do;
+		ec = error_table_$invalid_state;
+		return;
+	     end;
+	if from_ss then if dte.known | dte.used then do;
+		     ec = error_table_$io_still_assnd;
+		     return;
+		end;
+	call make_blank;
+	call cu_$level_get (oldlev);
+	call cu_$level_set (1);
+	if dte.is_sub_vol then do;
+								/* if this is a drive that contains subvolumes only tell rcp about the last one */
+		if dte.sv_num = (dte.num_of_sv - 1) then
+								/* This should be the last one */
+		     call rcp_control_$ss_io_interchange ((substr (dte.drive_name, 1, 7)), from_ss, (dte.deleted), xec);
+	     end;
+	else call rcp_control_$ss_io_interchange ((dte.drive_name), from_ss, (dte.deleted), xec);
+	call cu_$level_set (oldlev);
+	if xec = 0 then call initializer_gate_$ss_io_reconfigure (i, from_ss, xec);
+	if xec = 0 then dte.storage_system = ^from_ss;
+	ec = xec;
+	return;
+
+	/* --------------------------------------------------------- */
+
+demount_pv: entry (a_pvtx, ec);
+
+	dtp = sdtp;
+	dtep = addr (dt.array (a_pvtx));
+
+	if ^dte.storage_system | ^dte.used then do;
+		ec = error_table_$action_not_performed;
+		return;
+	     end;
+
+	lvx = dte.lvx;
+	if lvx < 0 | lvx > dt.n_lv_entries then do;
+		ec = error_table_$action_not_performed;
+		return;
+	     end;
+	lvep = addr (dt.lv_array (lvx));
+
+	if ^lve.demounting then do;
+		ec = error_table_$io_still_assnd;
+		return;
+	     end;
+
+	call initializer_gate_$demount_pv (a_pvtx, ec);
+
+	if ec = 0 then call make_demounted;
+
+	return;
+
+	/* --------------------------------------------------------- */
+
+demount_lv: entry (a_lvx, a_dhv_act, ec);
+
+	dcl  a_lvx		     fixed bin, a_dhv_act fixed bin;
+
+	dtp = sdtp;
+	lvx = a_lvx;
+	lvep = addr (dt.lv_array (lvx));
+	if ^lve.used then do;
+		lve.hv_mounted, lve.demounting, lve.mounting = "0"b;	/* for robustness */
+		ec = error_table_$action_not_performed;
+		return;
+	     end;
+
+	if lvx = dt.array (dt.rpvx).lvx
+	     | (lve.pdirs_ok & lve.hv_mounted) then do;
+		ec = error_table_$action_not_performed;
+		return;
+	     end;
+
+	ec = 0;							/* Unless otherwise */
+
+	if a_dhv_act = 1 then do;					/* Stop a mhv */
+		if ^lve.mounting then go to fail;			/* argerr */
+		lve.mounting = "0"b;
+		do i = 1 to dt.n_entries while (^(dt.array (i).used & dt.array (i).lvx = lvx)); end;
+		if i <= dt.n_entries then lve.demounting = "1"b;
+	     end;
+	else if a_dhv_act = 2 then do;				/* Demount start, take out of r0 */
+		if lve.mounting then go to fail;
+		if ^lve.hv_mounted then go to fail;
+		call initializer_gate_$delete_lv (lve.lvid, ec);
+		if ec = error_table_$logical_volume_not_defined then ec = 0;/* Ignore not-there */
+		lve.demounting = "1"b;
+		lve.hv_mounted = "0"b;
+	     end;
+	else if a_dhv_act = 3 then do;				/* Turn off demounting */
+		if ^lve.demounting then go to fail;
+		lve.demounting = "0"b;
+	     end;
+
+	if ec ^= 0 then return;
+
+	do i = 1 to dt.n_entries;					/* Make Ops happy, erase the thing. */
+	     dtep = addr (dt.array (i));
+	     if dte.pre_accepted & (dte.lvx = lvx) then call make_demounted;
+	end;
+	if ^lve.used then return;
+
+	lve.mounting = "0"b;					/* General principles, minimize screwups */
+	call develop_lve_status_anon;					/* Check for weird case */
+
+	return;
+%page;
+	/*	SUBROUTINES AND OTHER UTILE CONSTRUCTIONS	*/
+
+
+get_it_known: proc (b_dtx, b_ec) returns (bit (1));
+
+	/* Call verify_label, leave drive hungry or known */
+
+	dcl  b_dtx		     fixed bin;			/* passed for convenience */
+	dcl  b_ec			     fixed bin (35);
+
+	call verify_label_ (dtp, dtep, b_dtx, b_ec);
+	if b_ec = 0 then do;
+		call make_known;
+		return ("1"b);
+	     end;
+	return ("0"b);
+
+     end get_it_known;
+
+
+verify_drive_vanish_pve: proc (b_dtep, b_pvname, ec);
+	dcl  ec			     fixed bin (35);
+	dcl  b_dtep		     ptr;
+	dcl  b_pvname		     char (*);
+	dcl  bpk			     fixed bin;
+	dcl  save_dtep		     ptr;
+	dcl  k			     fixed bin;
+
+	do k = 1 to dt.n_entries;
+	     aux_dtep = addr (dt.array (k));
+	     if aux_dtep = b_dtep then bpk = k;
+	     else do;
+		     if (adte.used | adte.known) & adte.pvname = b_pvname
+		     then do;
+			     ec = error_table_$io_still_assnd;
+			     return;
+			end;
+		     if (adte.pre_accepted | adte.demounted) & adte.pvname = b_pvname then call forgetter (k);
+		end;
+	end;
+	aux_dtep = b_dtep;
+	if adte.used | adte.known then if adte.pvname = b_pvname then ec = 0;
+	     else ec = error_table_$io_still_assnd;
+	else if adte.pre_accepted | adte.demounted then call forgetter (bpk);
+	if ec = 0 then do;
+		save_dtep = dtep;
+		dtep = b_dtep;					/* This is what lambda was invented for */
+		call make_blank;
+		dtep = save_dtep;
+	     end;
+     end;
+
+
+forgetter: entry (a_indx);						/* recursive only */
+	dtp = sdtp;
+	dtep = addr (dt.array (a_indx));
+	call make_blank;
+	return;
+%page;
+
+make_root_pve:
+     proc;
+
+	dcl  mrpve_pvtx		     fixed bin;
+
+	/* This procedure is called to construct DT PV entries for volumes
+   accepted by the hardcore during initialization.  PVT and DT pointers
+   are valid. */
+
+	dte.storage_system = "1"b;					/* Get good params going */
+	dte.deleted = "0"b;
+	dte.rpv = pvte.rpv;						/* Get rpv bit */
+	dte.pvid = pvte.pvid;
+	if dte.rpv then dt.rpvx = i;
+	dte.lvx = 1;
+	dte.permanent = "1"b;
+	call make_root_lve;
+	call verify_label_ (dtp, dtep, i, ec);
+
+	/* Special kludge in verify_label_ will cause name fillin into DT instead of check.  lvname = root triggers this. */
+
+	dte.hc_accepted = "1"b;					/* Cause comparator to ignore. */
+	call make_used;
+
+	do mrpve_pvtx = 1 to dt.n_entries;
+
+	     /* Since this is the first pass of mdx init, flush all other claims to this volume, regardless of
+   how strong they are. */
+
+	     aux_dtep = addr (dt.array (mrpve_pvtx));
+	     if aux_dtep ^= dtep then do;				/* Don't consider self */
+		     if adte.pvname = dte.pvname | adte.pvid = dte.pvid
+		     then do;
+			     call admin_gate_$syserr (ANNOUNCE, "disk_table_: Root PV ""^a"" moved from ^a to ^a.",
+				dte.pvname, adte.drive_name, dte.drive_name);
+			     call force_init_dte (mrpve_pvtx);
+			end;
+		end;
+	end;
+     end;
+
+
+make_root_lve: proc;
+
+	lvep = addr (dt.lv_array (1));
+	if lve.lvname ^= "root" | ^lve.used then do;
+		dt.n_lv_entries = 1;
+		unspec (lve) = ""b;
+		lve.public = "1"b;
+		lve.lvid = pvte.lvid;
+		lve.lvname = "root";
+		lve.min_access_class = ""b;
+		lve.max_access_class = sys_info$access_class_ceiling;
+	     end;
+	lve.used = "1"b;						/* gc turned off */
+	lve.hv_mounted = "1"b;
+
+     end make_root_lve;
+
+
+force_init_dte:							/* procedure used during disk_table initialzation to clear a particular entry */
+     proc (dte_index);
+
+	dcl  dte_index		     fixed bin parameter;
+	dcl  l_dtep		     ptr;
+	dcl  1 l_dte		     aligned like dte based (l_dtep);
+	dcl  l_pvtep		     ptr;
+	dcl  1 l_pvte		     aligned like pvte based (l_pvtep);
+
+	l_dtep = addr (dt.array (dte_index));
+	l_pvtep = addr (pvt_array (dte_index));
+	unspec (l_dte) = ""b;
+	num_pic = l_pvte.logical_area_number;
+	l_dte.is_sub_vol = l_pvte.is_sv;
+	l_dte.sv_num = l_pvte.sv_num;
+	l_dte.drive_name = l_pvte.devname || "_" || num_pic;
+	if l_dte.is_sub_vol then l_dte.drive_name = rtrim (l_dte.drive_name) || rtrim (l_pvte.sv_name);
+	l_dte.device_type = l_pvte.device_type;
+	l_dte.storage_system = l_pvte.storage_system;
+	l_dte.permanent = l_pvte.permanent;
+	l_dte.num_of_sv = l_pvte.num_of_svs;
+	l_dte.sv_name = l_pvte.sv_name;
+	return;
+
+     end force_init_dte;
+%page;
+
+verify_whole_lv: proc (desired_lvx, ec);
+
+	/* This procedure is called when it is desired to mount an entire hierarchy volume,
+   and all constituent pv's are either pre_accepted, known, or
+   in use (from a previous failing attempt).  It tries to accept them all, promoting
+   all drives up through the states.  As is the convention in mdx, any time
+   a label is read which contradicts a pre_accepted, the latter is turned off. No volumes
+   are promoted to used (ring 0 called) unless all labels check. */
+
+
+	dcl  desired_lvx		     fixed bin, ec fixed bin (35);
+
+	dcl  i			     fixed bin;
+	dcl  1 local_lvte		     aligned like lvte;
+
+	lvep = addr (dt.lv_array (desired_lvx));
+	do i = 1 to dt.n_entries;
+	     dtep = addr (dt.array (i));
+	     if dte.lvx = desired_lvx & dte.pre_accepted then do;
+		     if ^get_it_known (i, ec) then do;
+			     tpvtx = i;
+			     call make_assumed;
+			     return;
+			end;
+		end;
+	end;
+	do i = 1 to dt.n_entries;
+	     dtep = addr (dt.array (i));
+	     if dte.lvx = desired_lvx & dte.known then do;
+		     call initializer_gate_$accept_fs_disk (i, ec);
+		     if ec = error_table_$fsdisk_not_salv then do;	/* salvage if needed */
+			     call initializer_gate_$vol_salv (i, ""b, ec);
+			     call initializer_gate_$accept_fs_disk (i, ec);
+			end;
+
+		     if ec ^= 0 then do;
+			     tpvtx = i;
+			     return;
+			end;
+		     call make_used;
+		     if lve.hv_mounted then call initializer_gate_$add_pv_to_lv (lve.lvid, dte.pvid, ec);
+		end;
+	end;
+	if ^lve.hv_mounted then do;					/* Want to mount new vol? */
+		unspec (local_lvte) = "0"b;
+		local_lvte.lvid = lve.lvid;
+		local_lvte.access_class.min = lve.min_access_class;
+		local_lvte.access_class.max = lve.max_access_class;
+		local_lvte.public = lve.public;
+		call initializer_gate_$define_lv (addr (local_lvte), ec);
+		if ec = 0 then do;
+			lve.hv_mounted = "1"b;
+			lve.mounting = "0"b;
+		     end;
+	     end;
+
+     end verify_whole_lv;
+%page;
+
+check_lv_complete: proc (ec);
+
+	/* This procedure checks the registration for a given LV, and determines if they are all in the
+   disk table. */
+
+	dcl  ec			     fixed bin (35);
+
+	dcl  pvap			     ptr;
+	dcl  npv			     fixed bin;
+	dcl  (i, j)		     fixed bin;
+	dcl  (found, ready)		     bit (1);
+	dcl  1 pva		     (100) based (pvap) aligned,
+		2 pvname		     char (32),
+		2 device_type	     fixed bin,
+		2 pad		     fixed bin;
+
+	pvap = addr (dt.lv_array (dt.max_n_entries + 1));
+	call volume_registration_mgr_$get_lv_pvinfo ((lve.lvname), pvap, npv, (0), ec);
+	if ec ^= 0 then return;
+
+	ec = 0;
+	ready = "1"b;
+	do i = 1 to npv while (ec = 0);				/* Look for any unmounted vol */
+	     found = "0"b;
+	     do j = 1 to dt.n_entries while (^found);
+		dtep = addr (dt.array (j));
+		if dte.pvname = pva (i).pvname
+		then if dte.used | dte.known then found = "1"b;
+		     else if dte.pre_accepted then do;
+			     found = "1"b;
+			     ready = "0"b;
+			end;
+	     end;
+	     if ^found then ec = 1;
+	end;
+	if ec = 0 & ^ready then ec = -1;
+
+     end check_lv_complete;
+%page;
+
+	/*	SUBROUTINES TO PERFORM STATE TRANSIT		*/
+
+	/* All assume dtep is set */
+
+make_blank: proc;
+
+	call hold_status;
+	dte.pre_accepted, dte.used, dte.known, dte.demounted = "0"b;
+	call develop_lve_status;
+     end;
+
+make_assumed: proc;
+
+	dte.used, dte.known, dte.demounted, dte.used = "0"b;
+	dte.pre_accepted = "1"b;
+	if dte.lvx > 0 & dte.lvx <= dt.n_lv_entries then
+	     dt.lv_array (dte.lvx).demounted_only = "0"b;
+     end;
+
+make_demounted: proc;
+
+	prev_state = "1"b;						/* lvx must be good */
+	dte.pre_accepted, dte.used, dte.known = "0"b;
+	dte.demounted = "1"b;
+	call develop_lve_status;
+     end;
+
+make_known: proc;
+
+	dte.pre_accepted, dte.used, dte.demounted = "0"b;
+	dte.known = "1"b;
+	if dte.lvx > 0 & dte.lvx <= dt.n_lv_entries then
+	     dt.lv_array (dte.lvx).demounted_only = "0"b;
+     end;
+
+make_used: proc;
+
+	dte.pre_accepted, dte.demounted, dte.known = "0"b;
+	if ^dte.used then call admin_gate_$syserr
+		(LOG, "disk_table_: accepted PV ^a on ^a.", dte.pvname, dte.drive_name);
+	dte.used = "1"b;
+	if dte.lvx > 0 & dte.lvx <= dt.n_lv_entries then
+	     dt.lv_array (dte.lvx).demounted_only = "0"b;
+     end;
+
+hold_status: proc;
+	prev_state = dte.used | dte.pre_accepted | dte.known | dte.demounted;
+     end;
+
+develop_lve_status: proc;
+
+	dcl  ii			     fixed bin;
+	dcl  l_lvx		     fixed bin;
+	dcl  hold			     bit (1) init ("0"b);
+
+	if ^prev_state then do;
+		dte.lvx = -2;					/* sure asdmp */
+		return;						/* dont check garbage */
+	     end;
+	l_lvx = dte.lvx;
+	go to join;
+
+develop_lve_status_anon: entry;
+	l_lvx = lvx;						/* global */
+join:	if l_lvx < 0 | l_lvx > dt.n_lv_entries then return;
+	aux_lvep = addr (dt.lv_array (l_lvx));
+	do ii = 1 to dt.n_entries;
+	     aux_dtep = addr (dt.array (ii));
+	     if adte.lvx = l_lvx then do;
+		     if adte.demounted then hold = "1"b;
+		     else if adte.used | adte.known | adte.pre_accepted then do;
+			     alve.demounted_only = "0"b;
+			     return;
+			end;
+		end;
+	end;
+
+	if hold then do;						/* He thinks its vanished */
+		alve.demounted_only = "1"b;
+		alve.prev_bootload = "0"b;				/* No more special privileges */
+	     end;
+	if alve.mounting then return;
+	if ^hold then do;
+		alve.used = "0"b;
+		alve.lvid = "0"b;
+	     end;
+
+     end develop_lve_status;
+%page;
+
+get_local_dtp: proc returns (bit (1));
+
+	dtp = sdtp;
+	must_term = "0"b;
+	if dtp = null () then do;					/* we're not Inz */
+		call cu_$level_get (oldlev);
+		call cu_$level_set (1);
+		call hcs_$initiate (ROOT, "disk_table", "", 0, 1, dtp, ec);
+		if dtp = null () then do;
+			call cu_$level_set (oldlev);
+			return ("0"b);
+		     end;
+		must_term = "1"b;
+	     end;
+	return ("1"b);
+
+     end;
+test: entry (aroot);
+
+	dcl  aroot		     char (*);
+
+	SL1, ROOT = aroot;
+	call volume_registration_mgr_$test (aroot);
+	return;
+								/* format: off */
+%page; %include disk_table;
+%page; %include lvt;
+%page; %include pvt;
+%page; %include pvte;
+%page; %include fs_vol_label;
+%page; %include disk_pack;
+%page; %include syserr_constants;
+%page;
+	/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   disk_table_: Added drive DSKX_NN
+
+   S:	$info
+
+   T:	$response
+
+   M:	The operator has added a storage system disk drive with adddev.
+
+   A:	$ignore
+
+   Message:
+   disk_table_: Deleted drive DSKX_NN
+
+   S:	$info
+
+   T:	$response
+
+   M:	The operator has deleted a storage system disk drive with deldev.
+
+   A:	$ignore
+
+   Message:
+   disk_table_: accepted PV PVNAME on DSKX_NN
+
+   S:	$log
+
+   T:	$response
+   $init
+
+   M:	A storage system physical volume has been placed in use.
+   The volume and drive name are identified.
+
+   A:	$ignore
+   This message is provided for the benefit of
+   automatic error analysis and logging.
+
+
+   Message:
+   disk_table_: Deleted root PV "PV_NAME" on DSKX_NN.
+
+   S:	$beep
+
+   T:	$init
+
+   M:	The specified drive did not appear in the ROOT config card.  Thus,
+   it was removed from the disk_table_.  This will also occur when the
+   volume is intentionally deleted.
+
+   A:	$notify
+
+
+   Message:
+   disk_table_: Root PV "PV_NAME" moved from DSKX_NN to DSKX_NN.
+
+   S:	$info
+
+   T:	$init
+
+   M:	The specified root volume has been moved to a different drive
+   since the last shutdown.
+
+   A:	$ignore
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end mdx;

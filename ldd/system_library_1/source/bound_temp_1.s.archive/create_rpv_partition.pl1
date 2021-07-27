@@ -1,0 +1,402 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  2) change(86-05-29,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-05-29,GDixon), install(86-07-17,MR12.0-1097):
+     Implement support of devices using 512 word IO.
+                                                   END HISTORY COMMENTS */
+
+create_rpv_partition: proc (rpv_pvtx, rpv_labelp, n_records, part_name, code);
+
+/* routine to move pages around on the rpv (as yet not by any means
+accepted for paging) so as to be able to create the named partition.
+
+This program is very cautious about moving pages around and always writes
+everything once it modifies it.
+
+The idea is to find where the partition must go (high only), find segments
+with pages in that area, move them elsewhere, update their vtoces and file
+maps accordingly, and then get to updating the label to show the partition.
+
+Everything is done so as to be interruptable without affecting the state of
+the disk, with the possible exception of marking a few extra pages as used.
+
+Initially coded by Keith Loepere, March 1983, against everyone's better 
+judgment, including mine. */
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+
+dcl  ME			        char (20) init ("create_rpv_partition") static options (constant);
+dcl  bit_map_string		        bit (32) var;	/* a word of a bit map; used for counting bits therein */
+dcl  bottom_to_vacate	        fixed bin;		/* lowest record in area to become new partition */
+dcl  code			        fixed bin (35) parameter; /* standard */
+dcl  error_table_$noalloc	        fixed bin (35) ext;
+dcl  filemap_checksum_	        entry (ptr, fixed bin, bit (36) aligned);
+dcl  first_free_rec		        fixed bin;		/* first record after low partitions */
+dcl  have_vtoce		        bit (1) aligned;	/* true => rpv_vtoce_page contains the current vtoce */
+dcl  last_free_rec		        fixed bin;		/* record just at start of high partitions */
+dcl  n_records		        fixed bin parameter;	/* how big to make partition */
+dcl  new_disk_record	        fixed bin;		/* record number to where to move page */
+dcl  old_disk_record	        fixed bin;		/* of page we are to move */
+dcl  part_name		        char (4) parameter;	/* for new partition */
+dcl  part_num		        fixed bin;		/* loop counter on partitions */
+dcl  read_disk$read_disk_no_test      entry (fixed bin, fixed bin, ptr, fixed bin (35));
+dcl  1 rpv_label		        aligned like label based (rpv_labelp); /* label of rpv */
+dcl  rpv_labelp		        ptr parameter;
+dcl  rpv_page		        (1024) bit (36) aligned; /* page being moved around */
+dcl  rpv_pvtx		        fixed bin parameter;	/* we trust this to point into pvt */
+dcl  1 rpv_vol_map		        aligned like vol_map; /* work copy of vol_map */
+dcl  1 rpv_vtoc_map		        aligned like vtoc_map;/* work copy of this */
+dcl  rpv_vtoce_page		        (1024) bit (36) aligned; /* area to read a page of vtoces into */
+dcl  seg_rec_num		        fixed bin;		/* loop counter on record num in a segment */
+dcl  syserr		        entry options (variable);
+dcl  syserr$error_code	        entry options (variable);
+dcl  top_to_vacate		        fixed bin;		/* address of last record in area to become new partition */
+dcl  vol_map_bit		        fixed bin;		/* bit in vol_map bit map word for record being considered */
+dcl  vol_map_page		        fixed bin;		/* which page of vol_map we are putting used page bit into */
+dcl  vol_map_word		        fixed bin;		/* pts to vol_map word being considered to find free page */
+dcl  vtoc_filemap_checksum	        bit (36) aligned;	/* what checksum should be for vtoce test */
+dcl  vtoc_map_bit		        fixed bin;		/* bit in vtoc bit map for this vtoce */
+dcl  vtoc_map_word		        fixed bin;		/* word in vtoc bit map containing bit for this vtoce */
+dcl  vtoc_num		        fixed bin;		/* loop counter thereon */
+dcl  vtoc_record		        fixed bin;		/* record containing vtoce being considered */
+dcl  vtoce_mod		        bit (1) aligned;	/* true => we moved a page of this seg and need to update vtoce on disk */
+dcl  write_disk$write_disk_no_test    entry (fixed bin, fixed bin, ptr, fixed bin (35));
+
+dcl (addr, addrel, bin, bit, dimension, divide, fixed, index, min, mod, size, substr) builtin;
+
+	pvt_arrayp = addr (pvt$array);		/* so we can look at the device_type */
+
+
+/* start by reading appropriate parts of disk header into work areas */
+
+	call read_disk$read_disk_no_test (rpv_pvtx, VOLMAP_ADDR, addr (rpv_vol_map), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR);	/* first page */
+	call read_disk$read_disk_no_test (rpv_pvtx, VOLMAP_ADDR + 1, addrel (addr (rpv_vol_map), 1024), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR + 1);	/* 2nd page thereof */
+	call read_disk$read_disk_no_test (rpv_pvtx, VOLMAP_ADDR + 2, addrel (addr (rpv_vol_map), 2048), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR + 2);	/* 3rd page thereof */
+	call read_disk$read_disk_no_test (rpv_pvtx, VTOC_MAP_ADDR, addr (rpv_vtoc_map), code);
+	if code ^= 0 then call bad_io (VTOC_MAP_ADDR);
+
+	if rpv_label.nparts >= dimension (rpv_label.parts, 1) then do;
+	     call syserr (ANNOUNCE, "^a: No room in partition map for ^a.", ME, part_name);
+	     code = error_table_$noalloc;
+	     return;
+	end;
+
+/* Now we want to find where this space must go.  We do this completely from
+the partition map.  The obvious method of just shaving the space from the
+paging region described in the vol map may not work if we are on a second
+try through this and have updated the vol map (shrunk it) but not updated
+the partition map.  We would then reshrink the paging region.  So, we 
+determine the partition's location from the last thing we would have written
+before, the volume label. */
+
+	first_free_rec = rpv_label.vtoc_size;		/* beginning of paging region or low partition area */
+update_first:
+
+/* this loop will try to find the end of the last low partition */
+
+	do part_num = 1 to rpv_label.nparts;		/* look for low partitions */
+	     if rpv_label.parts (part_num).frec = first_free_rec then do;
+		first_free_rec = rpv_label.parts (part_num).frec + rpv_label.parts (part_num).nrec;
+						/* where next low part should start */
+		goto update_first;			/* start again to find a later low part */
+	     end;
+	end;
+
+/* we now know the end of the last low partition and can therefore see
+which partitions are high, in particular, which of them is lowest. */
+
+	last_free_rec = rpv_label.vol_size;		/* end of paging or high part region */
+	do part_num = 1 to rpv_label.nparts;
+	     if rpv_label.parts (part_num).frec > first_free_rec then
+						/* a high partition */
+		last_free_rec = min (last_free_rec, rpv_label.parts (part_num).frec);
+	end;
+
+	bottom_to_vacate = last_free_rec - n_records;
+	top_to_vacate = last_free_rec - 1;		/* these are the limits of the new partition */
+
+	if rpv_vol_map.base_add < first_free_rec then do;
+	     call syserr (ANNOUNCE, "^a: Paging region starts below end of low partitions.", ME);
+	     code = error_table_$noalloc;
+	     return;
+	end;
+	if rpv_vol_map.base_add + rpv_vol_map.n_rec > last_free_rec then do;
+	     call syserr (ANNOUNCE, "^a: Paging region ends past start of high partitions.", ME);
+	     code = error_table_$noalloc;
+	     return;
+	end;
+
+	call compute_free_recs;			/* make sure we fit */
+	if n_records > rpv_vol_map.n_free_rec then go to out_of_disk;
+
+/* Mark as used all pages in this new partition region.  Some of these are
+already so marked.  This marking helps keep future boots of a previous
+release following our failure from grabbing them. */
+
+	vol_map_word = divide (bottom_to_vacate - rpv_vol_map.base_add, 32, 17) + 1;
+						/* start of bits for partition */
+	if vol_map_word <= rpv_vol_map.bit_map_n_words then do;
+	     vol_map_bit = mod (bottom_to_vacate - rpv_vol_map.base_add, 32) + 2;
+	     substr (rpv_vol_map.bit_map (vol_map_word), vol_map_bit) = "0"b;
+	     do vol_map_word = vol_map_word + 1 to rpv_vol_map.bit_map_n_words;
+		rpv_vol_map.bit_map (vol_map_word) = "0"b; /* all used */
+	     end;
+	end;
+	call compute_free_recs;			/* write this out */
+	call write_disk$write_disk_no_test (rpv_pvtx, VOLMAP_ADDR, addr (rpv_vol_map), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR);	/* first page */
+	call write_disk$write_disk_no_test (rpv_pvtx, VOLMAP_ADDR + 1, addrel (addr (rpv_vol_map), 1024), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR + 1);	/* 2nd page thereof */
+	call write_disk$write_disk_no_test (rpv_pvtx, VOLMAP_ADDR + 2, addrel (addr (rpv_vol_map), 2048), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR + 2);	/* 3rd page thereof */
+
+/* we don't ask at this time if vol_map shows enough room since we may have 
+left its count bad from the last attempt through here so we just march on */
+
+/* start up to look at segments */
+
+	vol_map_word = 1;				/* place to start looking for free pages */
+	vtoc_record = VTOC_ORIGIN - 1;		/* we'll read the next record for vtoces */
+
+	have_vtoce = "0"b;
+	vtocep = addr (rpv_vtoce_page);
+	do vtoc_num = 0 to rpv_vtoc_map.n_vtoce - 1;
+
+/* loop, getting vtoces, to look at segments */
+
+	     if mod (vtoc_num, VTOCES_PER_RECORD (pvt_array (rpv_pvtx).device_type)) = 0 then do;
+		have_vtoce = "0"b;			/* read in a set next time we need one */
+		vtocep = addr (rpv_vtoce_page);
+		vtoc_record = vtoc_record + 1;
+	     end;
+	     else vtocep = addrel (vtocep, size (vtoce));
+	     vtoc_map_word = divide (vtoc_num, 32, 17);
+	     vtoc_map_bit = mod (vtoc_num, 32) + 2;	/* find map bit */
+	     if substr (rpv_vtoc_map.bit_map (vtoc_map_word), vtoc_map_bit, 1) then ; /* free vtoce */
+	     else do;
+		if have_vtoce then ;
+		else do;				/* need to read */
+		     call read_disk$read_disk_no_test (rpv_pvtx, vtoc_record, addr (rpv_vtoce_page), code);
+		     if code ^= 0 then call bad_io (vtoc_record);
+		     have_vtoce = "1"b;
+		end;
+
+		vtoce_mod = "0"b;			/* check out vtoce */
+		call filemap_checksum_ (addr (vtoce.fm), fixed (vtoce.csl, 9), vtoc_filemap_checksum);
+		if vtoce.fm_damaged | (vtoce.fm_checksum_valid & vtoc_filemap_checksum ^= vtoce.fm_checksum) then do;
+		     call syserr (ANNOUNCE, "^a: vtoce ^d's file map is damaged.  Volume will need salvaging.", ME, vtoc_num);
+		     code = error_table_$noalloc;
+		     return;
+		end;
+
+/* now that we have found a real segment on disk, does it have pages in the
+new partition area to be moved? */
+
+		do seg_rec_num = 0 to fixed (vtoce.csl, 9) - 1;
+		     if substr (vtoce.fm (seg_rec_num), 1, 1) then ; /* null page */
+		     else do;
+			old_disk_record = bin (substr (vtoce.fm (seg_rec_num), 2, 17), 17);
+			if old_disk_record >= bottom_to_vacate & old_disk_record <= top_to_vacate then do; /* must move page out of region */
+
+/* find a free page on the disk */
+
+			     do vol_map_word = vol_map_word to rpv_vol_map.bit_map_n_words
+				while (substr (rpv_vol_map.bit_map (vol_map_word), 2, 32) = "0"b); end;
+			     if vol_map_word > rpv_vol_map.bit_map_n_words then go to out_of_disk;
+			     vol_map_bit = index (substr (rpv_vol_map.bit_map (vol_map_word), 2, 32), "1"b) + 1;
+			     new_disk_record = rpv_vol_map.base_add + (vol_map_word - 1) * 32 + vol_map_bit - 2;
+			     if new_disk_record >= bottom_to_vacate then go to out_of_disk;
+
+/* found a free page */
+
+			     substr (rpv_vol_map.bit_map (vol_map_word), vol_map_bit, 1) = "0"b; /* use up page */
+			     vol_map_page = divide (vol_map_word + 63, /* get wordno in vol_map */ 1024, 17);
+			     call write_disk$write_disk_no_test (rpv_pvtx, VOLMAP_ADDR + vol_map_page, addrel (addr (rpv_vol_map), vol_map_page * 1024), code);
+			     if code ^= 0 then call bad_io (VOLMAP_ADDR + vol_map_page); /* paranoid - force bit change out */
+
+/* now move page of segment from old to new */
+
+			     call read_disk$read_disk_no_test (rpv_pvtx, old_disk_record, addr (rpv_page), code);
+			     if code ^= 0 then call bad_io (old_disk_record);
+			     call write_disk$write_disk_no_test (rpv_pvtx, new_disk_record, addr (rpv_page), code);
+			     if code ^= 0 then call bad_io (new_disk_record);
+
+/* now to get vtoce updated */
+
+			     vtoce_mod = "1"b;
+			     vtoce.fm (seg_rec_num) = bit (fixed (new_disk_record, 18), 18);
+			end;
+		     end;
+		end;
+
+/* update vtoce on disk */
+
+		if vtoce_mod then do;
+		     vtoce.fm_checksum_valid = "1"b;
+		     call filemap_checksum_ (addr (vtoce.fm), fixed (vtoce.csl, 9), vtoce.fm_checksum);
+		     call write_disk$write_disk_no_test (rpv_pvtx, vtoc_record, addr (rpv_vtoce_page), code);
+		     if code ^= 0 then call bad_io (vtoc_record);
+		end;
+	     end;
+	end;
+
+/* update vol_map header */
+
+	rpv_vol_map.n_rec = bottom_to_vacate - rpv_vol_map.base_add;
+	rpv_vol_map.bit_map_n_words = divide (rpv_vol_map.n_rec + 31, 32, 17);
+
+/* we will count free records to avoid case where we just subtract records used
+on each attempt and thereby screw up totals */
+
+	call compute_free_recs;
+
+/* update disk */
+
+	call write_disk$write_disk_no_test (rpv_pvtx, VOLMAP_ADDR, addr (rpv_vol_map), code);
+	if code ^= 0 then call bad_io (VOLMAP_ADDR);	/* updated volmap */
+
+/* now we can put partition into header! */
+
+	rpv_label.nparts = rpv_label.nparts + 1;
+	rpv_label.parts (rpv_label.nparts).part = part_name;
+	rpv_label.parts (rpv_label.nparts).frec = bottom_to_vacate;
+	rpv_label.parts (rpv_label.nparts).nrec = n_records;
+
+/* done!!! */
+
+	code = 0;
+	return;
+
+out_of_disk:
+
+/* help out next bootload of previous release that must free some disk */
+
+	call compute_free_recs;
+	call write_disk$write_disk_no_test (rpv_pvtx, VOLMAP_ADDR, addr (rpv_vol_map), code);
+	call syserr (ANNOUNCE, "^a: Out of disk.", ME);
+	code = error_table_$noalloc;
+TERMINATE:
+	return;
+%page;
+bad_io: proc (record_num);
+dcl  record_num		        fixed bin parameter;
+	call syserr$error_code (ANNOUNCE, code, "^a: Error accessing record ^d.", ME, record_num);
+	goto TERMINATE;
+     end;
+
+compute_free_recs: proc;
+
+/* look through bits to see new free figure */
+
+	rpv_vol_map.n_free_rec = 0;
+	do vol_map_word = 1 to rpv_vol_map.bit_map_n_words;
+	     if vol_map_word < rpv_vol_map.bit_map_n_words then bit_map_string = substr (rpv_vol_map.bit_map (vol_map_word), 2, 32);
+	     else bit_map_string = substr (rpv_vol_map.bit_map (vol_map_word), 2, mod (rpv_vol_map.n_rec - 1, 32) + 1);
+	     vol_map_bit = index (bit_map_string, "1"b);
+	     do while (vol_map_bit > 0);
+		rpv_vol_map.n_free_rec = rpv_vol_map.n_free_rec + 1;
+		bit_map_string = substr (bit_map_string, vol_map_bit + 1);
+		vol_map_bit = index (bit_map_string, "1"b);
+	     end;
+	end;
+	return;
+     end;
+%page;
+%include disk_pack;
+%include fs_vol_label;
+%include pvte;
+%include syserr_constants;
+%include vol_map;
+%include vtoc_map;
+%include vtoce;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   create_rpv_partition: Paging region starts below end of low partitions.
+
+   S: $crash
+
+   T: $init
+
+   M: An inconsistency was found in the partition map when adding a new 
+   partition to the rpv.
+
+   A: The rpv will need to be rebuilt.
+
+   Message:
+   create_rpv_partition: Paging region ends past start of high partitions.
+
+   S: $crash
+
+   T: $init
+
+   M: An inconsistency was found in the partition map when adding a new
+   partition to the rpv.
+
+   A: The rpv will need to be rebuilt.
+
+   Message:
+   create_rpv_partition: vtoce NNN's file map is damaged.  Volume will need salvaging.
+
+   S: $crash
+
+   T: $init
+
+   M: The vtoce named was found to be damaged when adding a new partition
+   to the rpv.
+
+   A: Salvage the rpv using a boot of the previous release.
+
+   Message:
+   create_rpv_partition: No room in partition map for NAME.
+
+   S: $crash
+
+   T: $init
+
+   M: The partition map of the rpv was full.  The partition could not be 
+   added.
+
+   A: The rpv will need to be rebuilt.
+
+   Message:
+   create_rpv_partition: Out of disk.
+
+   S: $crash
+
+   T: $init
+
+   M: Not enough free space existed on the rpv to add the new partition.
+
+   A: The rlv will have to be rebuilt.
+
+   Message:
+   create_rpv_partition: Error accessing record NNN.
+
+   S: $crash
+
+   T: $init
+
+   M: An i/o error occured when accessing record NNN of the rpv while 
+   attempting to add a new partition.
+
+   A: Try again.  IF the error persists, the rpv will need to be rebuilt.
+
+   END MESSAGE DOCUMENTATION */
+
+     end;

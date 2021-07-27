@@ -1,0 +1,653 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1985 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-06-12,Swenson), approve(86-07-25,MCR7302),
+     audit(86-08-13,EJSharpe), install(86-09-04,MR12.0-1147):
+     Fixed setting of highest_in_use counter when messages are deleted from db.
+  2) change(85-08-01,Swenson), approve(86-07-25,MCR7302),
+     audit(86-08-13,EJSharpe), install(86-09-04,MR12.0-1147):
+     Fixed to correctly perform access checks for unprivileged read entries.
+  3) change(87-05-31,GDixon), approve(87-07-07,MCR7719),
+     audit(87-06-24,Hartogs), install(87-08-04,MR12.1-1055):
+     Sort destination_am entries by message_id in admin_search, so that entries
+     can be read out in successive calls by message_id.
+  4) change(87-06-24,GDixon), approve(87-07-07,MCR7719),
+     audit(87-06-24,Hartogs), install(87-08-04,MR12.1-1055):
+     Change calling sequence of priv_delete_process_id to properly declare
+     the process_id as bit(36) aligned.
+                                                   END HISTORY COMMENTS */
+
+
+/* asum_read_delete_ops_.pl1 -- all entries that read and/or delete
+   messages. */
+
+/* format: style2 */
+
+asum_read_delete_ops_:
+     procedure;
+
+/***** Modification history:
+
+       Created 1985-02-11, BIM
+       Modified 1985-04, BIM: new mseg_ calling sequence
+       Modified 1985-05-17, EJS: Fixed failure to unlock when no message
+          is found for a user.
+*/
+
+/**** This procedure contains all the entries that have to search
+      the database. They are collected here to share internal procedures
+      that search the handle/pid associative memory. */
+
+/**** ENTRIES HERE ARE GATE TARGETS! */
+
+
+%include asum_data_;
+
+	declare aim_check_$equal	 entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+	declare aim_check_$greater_or_equal
+				 entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+	declare asum_find_segment_	 entry (fixed binary, pointer);
+	declare asum_error_		 entry () options (variable);
+	declare match_star_name_	 entry (character (*), character (*), fixed binary (35));
+	declare get_group_id_	 entry () returns (char (32));
+	declare get_process_authorization_
+				 entry () returns (bit (72) aligned);
+	declare get_privileges_	 entry () returns (bit (36) aligned);
+	declare set_lock_$lock	 entry (bit (36) aligned, fixed binary, fixed binary (35));
+	declare set_lock_$unlock	 entry (bit (36) aligned, fixed binary (35));
+
+
+	declare 1 admin_read_info	 aligned like as_user_message_admin_read_info;
+	declare 1 read_info		 aligned like as_user_message_info;
+	declare 1 search		 aligned,
+		2 process_id	 bit (36) aligned,	/** 777777777777 for ANY */
+		2 ring		 fixed bin (3) aligned,
+						/** -1 for ANY */
+		2 handle		 bit (72) aligned,	/** zero for ANY */
+		2 message_id	 bit (72) aligned,
+		2 read_this_one	 bit (1) aligned,
+		2 read_the_next_one	 bit (1) aligned,
+		2 aim_privileged	 bit (1) aligned,
+		2 authorization	 bit (72) aligned,
+		2 delete		 bit (1) aligned,
+		2 group_id	 char (32) unaligned;
+
+	declare 1 mop		 aligned like mseg_operation;
+
+	declare g_message_id	 bit (72) aligned;
+	declare g_process_id	 bit (36) aligned;
+	declare delete_the_message	 bit (1) aligned;
+
+	declare P_area_ptr		 pointer;
+	declare P_admin_read_info_ptr	 pointer;
+	declare area_ptr		 pointer;
+	declare P_read_info_ptr	 pointer;
+	declare read_info_ptr	 pointer;
+	declare P_message_id	 bit (72) aligned;
+	declare P_process_id	 bit (36) aligned;
+	declare P_code		 fixed bin (35);
+	declare code		 fixed bin (35);
+
+	declare sys_info$ring1_privilege
+				 bit (36) aligned ext;
+	declare error_table_$notalloc	 fixed bin (35) ext static;
+	declare error_table_$unimplemented_version
+				 fixed bin (35) ext static;
+	declare error_table_$bad_arg	 fixed bin (35) ext static;
+	declare error_table_$no_message
+				 fixed bin (35) ext static;
+
+	dcl     addr		 builtin;
+	dcl     divide		 builtin;
+	dcl     max		 builtin;
+	dcl     stacq		 builtin;
+	dcl     unspec		 builtin;
+
+
+user_read_message:
+     entry (P_area_ptr, P_read_info_ptr, P_code);
+
+	code = 0;
+
+/**** COPY PARAMETERS IN */
+
+	area_ptr = P_area_ptr;
+	read_info_ptr = P_read_info_ptr;
+	read_info = read_info_ptr -> as_user_message_info;
+
+	as_user_message_system_info_ptr = asum_data_$system_info_ptr;
+
+	if read_info.version ^= AS_USER_MESSAGE_INFO_VERSION_1
+	then call error_return (error_table_$unimplemented_version, USER_READ_ERROR);
+
+
+/****+ What search criteria do we have? 
+         Process_id         --- this process
+         Handle             --- as given (if any)
+         Prev_message_id    --- as given (if any)
+         Ring               --- as given (if any)
+         */
+
+/**** The structure "search" is used as an implicit parameter by 
+      search table to describe the search information. */
+
+	unspec (search) = ""b;
+	search.process_id = asum_data_$process_id;
+	search.group_id = get_group_id_ ();
+	if read_info.no_handle_given
+	then search.handle = ""b;
+	else if read_info.message_handle = ""b
+	then call error_return (error_table_$bad_arg, USER_READ_ERROR);
+	else search.handle = read_info.message_handle;
+	if read_info.read_message_id & read_info.read_after_message_id
+	then call error_return (error_table_$bad_arg, USER_READ_ERROR);
+	if read_info.read_message_id
+	then do;
+		search.message_id = read_info.message_id;
+		search.read_this_one = "1"b;
+	     end;
+	if read_info.read_after_message_id
+	then do;
+		search.message_id = read_info.message_id;
+		search.read_the_next_one = "1"b;
+	     end;
+	search.delete = ^read_info.dont_delete;		/* if message is to be deleted, take it out of the list NOW */
+	if read_info.ring_given
+	then search.ring = max (asum_data_$entry_ring, read_info.message_ring);
+	else search.ring = asum_data_$entry_ring;	/*  so that only one process can read it */
+	search.authorization = get_process_authorization_ ();
+	search.aim_privileged = ((get_privileges_ () & sys_info$ring1_privilege) ^= ""b);
+
+	call lock_database;				/* This could all be done locklessly, but that efficiency is */
+						/*  not neccessary for MR11 */
+
+	g_message_id = search_table ();		/* Look for a message; delete_message is also set to the index in the table */
+
+	if g_message_id = ""b
+	then do;
+		call unlock_database;
+		call error_return (error_table_$no_message, USER_READ_ERROR);
+	     end;
+
+/**** we know which message we want by ID. It has not been deleted from the mseg yet, even if it is to be. */
+
+	call read_out_message (g_message_id, code);	/* sets fields in read_info, allocates in area, deletes as needed */
+
+	if code ^= 0 & code ^= error_table_$notalloc
+	then call asum_error_ (code, "asum_read_delete_ops_", "Message ^.3b missing.", g_message_id);
+
+	call unlock_database;
+
+	P_code = code;
+	read_info_ptr -> as_user_message_info = read_info;
+	return;
+
+USER_READ_ERROR:
+	return;
+
+
+priv_delete_message_id:
+     entry (P_message_id, P_code);
+
+	code = 0;
+	g_message_id = P_message_id;
+
+	as_user_message_system_info_ptr = asum_data_$system_info_ptr;
+
+	call lock_database;
+
+	call delete$$message_id (code);
+
+	call unlock_database;
+
+	P_code = code;
+	return;
+
+
+priv_delete_process_id:
+     entry (P_process_id, P_code);
+
+	code = 0;
+	g_process_id = P_process_id;
+
+	as_user_message_system_info_ptr = asum_data_$system_info_ptr;
+
+	call lock_database;
+
+	call delete$$process_id (code);
+
+	call unlock_database;
+
+
+	code = P_code;
+	return;
+
+
+admin_read:
+     entry (P_admin_read_info_ptr, P_read_info_ptr, P_area_ptr, P_code);
+
+	code = 0;
+	as_user_message_admin_read_info_ptr = P_admin_read_info_ptr;
+	as_user_message_info_ptr = P_read_info_ptr;
+	area_ptr = P_area_ptr;
+
+	admin_read_info = as_user_message_admin_read_info;
+	read_info = as_user_message_info;
+	as_user_message_system_info_ptr = asum_data_$system_info_ptr;
+
+	if admin_read_info.version ^= AS_USER_MESSAGE_ADMIN_READ_INFO_VERSION_1
+	     | read_info.version ^= AS_USER_MESSAGE_INFO_VERSION_1
+	then do;
+		P_code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	call lock_database;
+	call admin_search;
+	call unlock_database;
+	P_code = code;
+	as_user_message_info = read_info;
+	return;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+delete$$message_id:
+     procedure (code);
+
+	declare code		 fixed bin (35);
+	declare delete_by		 fixed bin (1);
+	declare (
+	        MID		 init (0),
+	        PID		 init (1)
+	        )			 fixed bin int static options (constant);
+	declare 1 am		 aligned like as_user_message_system_info.destination_am based (amep);
+	declare amep		 pointer;
+	declare hx		 fixed bin;
+
+	delete_by = MID;
+	go to COMMON;
+
+delete$$process_id:
+     entry (code);
+
+	delete_by = PID;
+
+COMMON:
+	code = error_table_$no_message;
+	do hx = 1 to as_user_message_system_info.highest_in_use;
+	     amep = addr (as_user_message_system_info.destination_am (hx));
+	     if am.process_id = ""b
+	     then ;
+	     else if delete_by = PID
+	     then do;
+		     if am.process_id = g_process_id
+		     then do;
+			     call delete_mseg_msg (am.message_id);
+			     call delete_am_entry (hx);
+			     code = 0;		/* got one */
+			end;
+		end;
+	     else if delete_by = MID
+	     then do;
+		     if am.message_id = g_message_id
+		     then do;
+			     call delete_mseg_msg (am.message_id);
+			     call delete_am_entry (hx);
+			     code = 0;		/* got one */
+			     return;		/* only one per */
+			end;
+		end;
+	end;
+	return;					/* no_message */
+     end delete$$message_id;
+
+search_table:
+     procedure returns (bit (72) aligned);
+
+/**** This procedure searches for destination matches, looking for the
+      oldest message that matches. Since this implementation keeps the
+      table locked for the duration, this can assume that nothing will
+      change. */
+
+	declare youngest_message_id	 bit (72) aligned;
+	declare amep		 pointer;
+	declare 1 am		 aligned like as_user_message_system_info.destination_am based (amep);
+	declare am_real_message_id	 bit (72) aligned;
+	declare search_real_message_id bit (72) aligned;
+	declare x			 fixed bin;
+	declare message_x		 fixed bin;
+
+	youngest_message_id = (72)"1"b;
+
+	delete_the_message = "0"b;
+
+	unspec (as_user_message_id) = search.message_id;
+	as_user_message_id.segment_index = 0;
+	search_real_message_id = unspec (as_user_message_id);
+
+	do x = 1 to as_user_message_system_info.highest_in_use;
+	     amep = addr (as_user_message_system_info.destination_am (x));
+	     if am.process_id = ""b
+	     then go to TRY_NEXT;
+
+	     if (am.process_id ^= (36)"1"b) & (search.process_id ^= am.process_id)
+	     then go to TRY_NEXT;
+	     if (am.process_id = (36)"1"b) & ^group_match (am.group_id, search.group_id)
+	     then go to TRY_NEXT;
+	     if (search.ring >= 0) & (search.ring ^= am.ring)
+	     then go to TRY_NEXT;
+	     if (search.handle ^= ""b) & (search.handle ^= am.handle)
+	     then go to TRY_NEXT;
+
+	     if ^check_aim ()
+	     then goto TRY_NEXT;
+
+	     else if search.read_this_one
+	     then /* No other matching required */
+		if am.message_id = search.message_id
+		then return (SET_RETURN_INFO_AND_MAYBE_DELETE (x));
+		else ;
+	     else do;
+		     unspec (as_user_message_id) = am.message_id;
+		     as_user_message_id.segment_index = 0;
+		     am_real_message_id = unspec (as_user_message_id);
+
+		     if (search.read_the_next_one & am_real_message_id > search_real_message_id)
+			| ^search.read_the_next_one
+		     then if am_real_message_id < youngest_message_id
+			then do;
+				youngest_message_id = am_real_message_id;
+				message_x = x;
+			     end;
+		end;
+TRY_NEXT:
+	end;
+
+	if youngest_message_id = (72)"1"b
+	then return (""b);
+	else return (SET_RETURN_INFO_AND_MAYBE_DELETE (message_x));
+%page;
+check_aim:
+     procedure returns (bit (1) aligned);
+
+	if search.aim_privileged
+	then return ("1"b);
+	if aim_check_$greater_or_equal (search.authorization, am.access_class)
+	then return ("1"b);				/* Deletion AIM later on */
+	return ("0"b);
+     end check_aim;
+
+SET_RETURN_INFO_AND_MAYBE_DELETE:
+     procedure (P_message_index) returns (bit (72) aligned);
+
+	dcl     P_message_index	 fixed bin parameter;
+	dcl     message_id		 bit (72) aligned automatic;
+
+	amep = addr (as_user_message_system_info.destination_am (P_message_index));
+	read_info.destination_info.group_id = am.group_id;
+	read_info.destination_info.process_id = am.process_id;
+	read_info.destination_info.ring = am.ring;
+	read_info.message_info.message_handle = am.handle;
+	message_id = am.message_id;
+
+	if am.reader_deletes & search.delete
+	then do;
+		if search.aim_privileged | aim_check_$equal (search.authorization, am.access_class)
+		then do;
+			call delete_am_entry (P_message_index);
+			delete_the_message = "1"b;
+		     end;
+	     end;
+	return (message_id);
+
+     end SET_RETURN_INFO_AND_MAYBE_DELETE;
+
+     end search_table;
+
+group_match:
+     procedure (star, try) returns (bit (1) aligned);
+
+	declare (star, try)		 char (32);
+	declare code		 fixed bin (35);
+
+	if star = ""
+	then return ("1"b);
+	call match_star_name_ (try, star, code);
+	return (code = 0);
+     end group_match;
+
+read_out_message:
+     procedure (a_mid, code);
+	declare a_mid		 bit (72) aligned;
+	declare code		 fixed bin (35);
+	declare fx		 fixed bin;
+	declare mseg_ptr		 pointer;
+
+	unspec (as_user_message_id) = a_mid;
+	fx = as_user_message_id.segment_index;
+	as_user_message_id.segment_index = 0;
+	mop = addr (mseg_data_$template_operation) -> mseg_operation;
+	mop.message_info.message_code = MSEG_READ_SPECIFIED;
+	mop.message_info.control_flags = ""b;
+	mop.message_info.delete = delete_the_message;
+	mop.message_info.ms_id = unspec (as_user_message_id);
+	mop.suppress_access_checks = "1"b;
+	mop.message_info_valid = "1"b;
+	call asum_find_segment_ (fx, mseg_ptr);
+	mop.mseg_ptr = mseg_ptr;
+	mop.mseg_ptr_valid = "1"b;
+	call mseg_$read_message (addr (mop), area_ptr, code);
+	read_info.message_ptr = mop.message_info.ms_ptr;
+	read_info.message_length = divide (mop.message_info.ms_len, 36, 18, 0);
+	read_info.message_id = mop.message_info.ms_id;
+	read_info.message_info.message_access_class = mop.message_info.ms_access_class;
+	read_info.message_info.message_ring = mop.message_info.sender_level;
+						/* messages don't have rings */
+	read_info.sender_info.group_id = mop.message_info.sender_id;
+	read_info.sender_info.process_id = mop.message_info.sender_process_id;
+	return;
+
+     end read_out_message;
+
+delete_mseg_msg:
+     procedure (a_mid);
+
+	declare a_mid		 bit (72) aligned;
+	declare code		 fixed bin (35);
+	declare fx		 fixed bin;
+	declare mseg_ptr		 pointer;
+
+	unspec (as_user_message_id) = a_mid;
+	fx = as_user_message_id.segment_index;
+	as_user_message_id.segment_index = 0;
+	call asum_find_segment_ (fx, mseg_ptr);
+	mop = addr (mseg_data_$template_operation) -> mseg_operation;
+	mop.message_info.ms_id = unspec (as_user_message_id);
+	mop.message_info_valid = "1"b;
+	mop.suppress_access_checks = "1"b;
+	call asum_find_segment_ (fx, mseg_ptr);
+	mop.mseg_ptr = mseg_ptr;
+	mop.mseg_ptr_valid = "1"b;
+
+	call mseg_$delete_message (addr (mop), code);
+	if code ^= 0
+	then call asum_error_ (code, "asum_read_delete_ops_", "Failed to delete message ^.3b from message segment ^d.",
+		a_mid, fx);
+	return;
+     end delete_mseg_msg;
+
+error_return:
+     procedure (code, return_label);
+	declare code		 fixed bin (35);
+	declare return_label	 label;
+
+	P_code = code;
+	go to return_label;
+     end error_return;
+
+
+admin_search:
+     procedure;
+
+/**** DUMB program to search against the admin_search data structure */
+
+	declare 1 am		 aligned based (amep)
+				 like as_user_message_system_info.destination_am;
+	declare amep		 pointer;
+	declare hx		 fixed bin;
+	declare mid_mask		 bit (72) aligned init ("000777777777777777777777"b3) int static
+				 options (constant);
+	declare 1 min_am		 aligned based (min_amep)
+				 like as_user_message_system_info.destination_am;
+    	declare min_amep		 pointer;
+          declare minx		 fixed bin;
+	declare 1 temp_am		 aligned like as_user_message_system_info.destination_am automatic;
+
+	if as_user_message_system_info.highest_in_use = 0 then
+	code = error_table_$no_message;
+
+/**** This algorithm depends upon the destination_am being sorted in message_id
+      order, so we can step through from one id to the next in successive
+      admin_read calls. */
+
+	do minx = 1 to as_user_message_system_info.highest_in_use-1;
+	     min_amep = addr (as_user_message_system_info.destination_am (minx));
+	     do hx = minx to as_user_message_system_info.highest_in_use;
+		amep = addr (as_user_message_system_info.destination_am (hx));
+		if min_am.message_id > am.message_id then do;
+		     temp_am = am;
+		     am = min_am;
+		     min_am = temp_am;
+		end;
+	     end;
+	end;
+
+	search.authorization = get_process_authorization_ ();
+	search.aim_privileged = ((get_privileges_ () & sys_info$ring1_privilege) ^= ""b);
+
+	do hx = 1 to as_user_message_system_info.highest_in_use;
+	     amep = addr (as_user_message_system_info.destination_am (hx));
+	     if am.process_id = ""b
+	     then go to TRY_NEXT;
+	     if admin_read_info.after_message_id ^= ""b
+	     then if (am.message_id & mid_mask) <= (admin_read_info.after_message_id & mid_mask)
+		then go to TRY_NEXT;
+	     if admin_read_info.target_handle ^= ""b
+	     then if am.handle ^= admin_read_info.target_handle
+		then go to TRY_NEXT;
+	     if admin_read_info.target_process_id ^= ""b
+	     then if am.process_id ^= admin_read_info.target_process_id
+		then go to TRY_NEXT;
+	     if admin_read_info.target_group_id ^= ""
+	     then if ^group_match (admin_read_info.target_group_id, am.group_id)
+		then go to TRY_NEXT;
+
+	     if ^search.aim_privileged
+	     then if ^aim_check_$greater_or_equal (search.authorization, am.access_class)
+		then go to TRY_NEXT;
+
+/**** Well, the target spec matches. If there is a source spec, we have to
+      read the message out to see who sent it. Pain, as they say, in the ass.
+*/
+
+	     delete_the_message = "0"b;
+	     call read_out_message (am.message_id, code);
+	     if code ^= 0 & code ^= error_table_$notalloc
+	     then call asum_error_ (code, "asum_read_delete_ops_", "Failed to read out message ^.3b", am.message_id);
+	     if code ^= 0
+	     then return;				/* Caller area too small */
+
+	     if (admin_read_info.source_group_id ^= ""
+		& ^group_match (admin_read_info.source_group_id, mop.message_info.sender_id))
+		| (admin_read_info.source_process_id ^= ""b
+		& admin_read_info.source_process_id ^= mop.message_info.sender_process_id)
+	     then begin;
+		     declare to_free	      bit (mop.message_info.ms_len) based (mop.message_info.ms_ptr);
+		     free to_free;
+		     go to TRY_NEXT;
+		end;
+
+	     read_info.destination_info.group_id = am.group_id;
+	     read_info.destination_info.process_id = am.process_id;
+	     read_info.destination_info.ring = am.ring;
+	     read_info.sender_info.group_id = mop.message_info.sender_id;
+	     read_info.sender_info.process_id = mop.message_info.sender_process_id;
+	     read_info.message_handle = am.handle;
+	     read_info.dont_delete = ^am.reader_deletes;
+	     return;
+TRY_NEXT:
+	end;
+	code = error_table_$no_message;
+	return;
+     end admin_search;
+%page;
+delete_am_entry:
+     procedure (amx);
+
+	declare amx		 fixed bin;
+	declare hx		 fixed bin;
+
+	declare q			 bit (1) aligned;
+
+	q = stacq (as_user_message_system_info.destination_am (amx).process_id, ""b,
+	     (as_user_message_system_info.destination_am (amx).process_id));
+	if amx = as_user_message_system_info.highest_in_use
+	then do;
+		do hx = amx to 1 by -1 while (as_user_message_system_info.destination_am (hx).process_id = ""b);
+		end;				/* hx is 0 or index of last in use */
+		as_user_message_system_info.highest_in_use = hx;
+	     end;
+	return;
+     end delete_am_entry;
+
+lock_database:
+     procedure;
+
+	if ^stacq (as_user_message_system_info.lock, asum_data_$lock_id, ""b)
+	then call set_lock_$lock (as_user_message_system_info.lock, -1, (0));
+	asum_data_$db_locked = "1"b;
+	return;
+     end lock_database;
+
+unlock_database:
+     procedure;
+
+	if ^stacq (as_user_message_system_info.lock, ""b, asum_data_$lock_id)
+	then call set_lock_$unlock (as_user_message_system_info.lock, (0));
+	asum_data_$db_locked = "0"b;
+	return;
+     end unlock_database;
+
+/* format: off */
+%page; %include as_user_message_system;
+%page; %include mseg_message_info;
+%page; %include as_user_message_info;
+%page; %include as_user_message_aread;
+%page; %include mseg_operation;
+%page; %include mseg_access_operation;
+%page; %include mseg_wakeup_state;
+%page; %include entry_access_info;
+%page; %include mseg_entries;
+%page; %include mseg_data_;
+
+     end asum_read_delete_ops_;

@@ -1,0 +1,780 @@
+/* ***********************************************************
+   *                                                         *
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   *                                                         *
+   *********************************************************** */
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+lsm_fs_: proc; return;
+
+/* coded by Edwin W. Meyer, Jr. on 041069 */
+/* modified on 3/29/71 by C. D. Tavares */
+/* modified on 6/25/73 by Lee J. Scheffler to clean up a little.
+   This program is about due for an overhaul. */
+/* Modified 08/79 by CDT as part of the general lsm_ overhaul that we've been
+   promising ourselves since 1973.  Some of the specific changes were: getting
+   compaction to work; making the segment-to-segment structure moves compact
+   the contents of the structure; and fixing the previous hashing algorithm,
+   which sometimes used to depend on hashing garbage.  */
+/* Modified 11/79 by CDT to make pull entry remember to bump
+   length of all version 6 symbol tables down by one when copying them. */
+/* Modified 01/80 by CDT to fix bug causing rejection (for node OOB)
+   of almost all operations on version 6 segments where there was a symbol in
+   symtab slot 0.  This word coincided with what is now lsm.component_slots. */
+/* Last modified 07/21/80 by CDT to implement graphic search paths. */
+
+dcl (from_segptr, to_segptr, temp_segptr) pointer,
+    (from_segptr_arg, to_segptr_arg) pointer parameter,
+    (from_node_arg, to_node_arg) fixed bin (18) parameter,
+     err_code fixed bin (35);
+
+dcl  move_array (move_len) fixed bin (35) based,
+     move_len fixed bin (18);				/* for moving large blocks of words */
+
+/* EXTERNAL STATIC */
+
+dcl (graphic_error_table_$bad_node,
+     graphic_error_table_$not_a_structure,
+     graphic_error_table_$lsm_node_ob,
+     graphic_error_table_$struc_duplication) fixed bin (35) external static;
+
+dcl (error_table_$segknown,
+     error_table_$unimplemented_version,
+     error_table_$bad_arg) ext fixed bin (35) static;
+
+dcl  sys_info$max_seg_size fixed bin (35) external static;
+
+/* ENTRIES */
+
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35)),
+     hcs_$fs_get_path_name ext entry (pointer, char (*), fixed bin, char (*), fixed bin (35)),
+     hcs_$truncate_seg entry (ptr, fixed bin (18), fixed bin (35)),
+     hcs_$initiate entry (char (*), char (*), char (*), fixed bin (17), fixed bin (17), ptr, fixed bin (35));
+
+dcl (get_temp_segment_, release_temp_segment_) ext entry (char (*), pointer, fixed bin (35)),
+     search_paths_$find_dir ext entry (char (*), pointer, char (*), char (*), char (*), fixed bin (35)),
+     sub_err_ ext entry options (variable);
+
+/* BUILTINS AND CONDITIONS */
+
+dcl (addr, addrel, codeptr, currentsize, divide, mod,
+     null, pointer, rel, size, unspec) builtin;
+
+dcl  cleanup condition;
+
+/* CONSTANTS */
+
+dcl (On_dup_error initial (0),			/* Various merge codes */
+     On_dup_source initial (1),
+     On_dup_target_then_nulls initial (2),
+     On_dup_target_then_source initial (3)) fixed bin static options (constant);
+%page;
+%include lsm_entry_dcls;
+%page;
+%include lsm_formats;
+%page;
+%include sl_info;
+%page;
+init:	entry (lsm_segptr, err_code);
+
+/* the entry init creates a fresh lsm segment in the process directory
+   if the supplied pointer "pr" is null. If not, it assumes that "pr" is a
+   valid base pointer to an lsm segment and truncates and re-initializes it */
+
+	call init (lsm_segptr, err_code);
+	return;
+%skip (5);
+
+/* ------------------------- */
+
+init:	proc (lsm_segptr, err_code);
+
+dcl  lsm_segptr pointer parameter,
+     err_code fixed bin (35) parameter;
+
+	     if lsm_segptr = null then do;		/* get a temp segment */
+		call get_temp_segment_ ("graphic lsm_ temp", lsm_segptr, err_code);
+		if err_code ^= 0 then return;
+	     end;
+
+	     call init_lsm_header (lsm_segptr, err_code);
+	     return;
+	end init;
+
+/* ------------------------- */
+%skip (5);
+
+/* ------------------------- */
+
+init_lsm_header: proc (lsm_segptr, code);
+
+dcl  lsm_segptr pointer parameter,
+     code fixed bin (35) parameter;
+
+	     if rel (lsm_segptr) ^= ""b then do;
+		err_code = error_table_$bad_arg;
+		call sub_err_ (code, "lsm_", "h", null, 0,
+		     "Supplied segment pointer (^p) contains nonzero offset.
+Please notify graphics system maintenance personnel.",
+		     lsm_segptr);
+		return;
+	     end;
+
+	     lsm_segptr -> lsm.version = LSM_version_7;
+	     lsm_segptr -> lsm.root_symtab = 0;
+	     lsm_segptr -> lsm.lock = "0"b;
+	     lsm_segptr -> lsm.component_slots = lsm_constants.initial_component_slots;
+	     lsm_segptr -> lsm.components = 0;
+	     lsm_segptr -> lsm.pad = -1;
+	     lsm_segptr -> lsm.component_ptrs = null;
+
+	     lsm_segptr -> lsm.free = currentsize (lsm_segptr -> lsm);
+
+	     call hcs_$truncate_seg (lsm_segptr, lsm_segptr -> lsm.free, code); /* truncate the existing seg */
+	     if code ^= 0 then return;
+
+	     return;
+	end init_lsm_header;
+
+/* ------------------------- */
+%page;
+init_seg:	entry (lsm_segptr, dir_path, entry, icv_sw, err_code);
+
+/* init_seg attempts to initiate the specified LSM segment.
+   If not found and 'icv_sw' = 1, an empty LSM segment is created.
+   If 'icv_sw' = 2 the segment is cleared (made empty) */
+
+dcl  dir_path char (*),				/* directory of LSM segment */
+     entry char (*),				/* entry name of LSM */
+     icv_sw fixed bin (17);				/* 0 - init, 1 - create, 2 - clear */
+
+	call init_seg (lsm_segptr, dir_path, entry, icv_sw, err_code);
+	return;
+%skip (5);
+
+/* ------------------------- */
+
+init_seg:	proc (lsm_segptr, dir_path, entry, icv_sw, err_code);
+
+dcl (lsm_segptr pointer,
+    (dir_path, entry) char (*),
+     icv_sw fixed bin,
+     err_code fixed bin (35)) parameter;
+
+	     if dir_path = "" then
+		call find_via_search_paths (entry, lsm_segptr, err_code);
+	     else call hcs_$initiate (dir_path, entry, "", 0, 1 /* no copy */, lsm_segptr, err_code);
+
+	     if err_code = error_table_$segknown then err_code = 0; /* innocuous */
+
+	     if icv_sw = Find_seg then do;
+		if lsm_segptr ^= null then		/* tiny gullibility checks */
+		     if lsm.version ^= LSM_version_7 then
+			if lsm.version ^= LSM_version_6 then
+			     err_code = error_table_$unimplemented_version;
+		return;				/* whether or not it worked */
+	     end;
+
+	     if err_code ^= 0 then do;
+		call hcs_$make_seg (dir_path, entry, "", 1010b /* rw */, lsm_segptr, err_code);
+		if err_code ^= 0 then
+		     if err_code = error_table_$segknown then err_code = 0; /* innocuous */
+		     else return;			/* can't do it, give up */
+		call init_lsm_header (lsm_segptr, err_code);
+		return;
+	     end;
+
+	     if icv_sw = Clear_seg then call init_lsm_header (lsm_segptr, err_code);
+	     return;
+
+	end init_seg;
+
+/* ------------------------- */
+%page;
+free:	entry (lsm_segptr, err_code);
+
+/* free truncates to zero the supplied segment and returns it to
+   the free temporary segment list */
+
+	call free_seg (lsm_segptr, err_code);
+	return;
+%skip (5);
+
+/* ------------------------- */
+
+free_seg:	proc (lsm_segptr, err_code);
+
+dcl  lsm_segptr pointer parameter,
+     err_code fixed bin (35) parameter;
+
+	     call hcs_$truncate_seg (lsm_segptr, 0, err_code);
+	     if err_code ^= 0 then return;		/* something funny, don't fiddle further */
+
+	     call release_temp_segment_ ("graphic lsm_ temp", lsm_segptr, err_code);
+	     if err_code ^= 0 then return;
+
+	     lsm_segptr = null;
+	     return;
+
+	end free_seg;
+
+/* ------------------------- */
+%page;
+pull:	entry (to_segptr_arg, dir_path, entry, err_code);
+
+/* pull "pulls" into the temp segment the list structure of the lsm segment in dir_path>entry. */
+
+dcl  temp_table_node fixed bin (18);
+
+	to_segptr = to_segptr_arg;
+
+	call init_seg (from_segptr, dir_path, entry, Find_seg, err_code);
+	if from_segptr = null then return;		/* can't get at it, return */
+
+	call init_lsm_header (to_segptr, err_code);	/* destroy previous contents of target seg */
+	if err_code ^= 0 then return;
+
+	if from_segptr -> lsm.version = LSM_version_7 then do;
+	     move_len = from_segptr -> lsm.free;
+	     unspec (to_segptr -> move_array) = unspec (from_segptr -> move_array); /* Move bunch of data */
+	     err_code = 0;
+	     return;
+	end;
+
+	else do;					/* pulling an old version LSM segment */
+	     call lsm_sym_$find_table (from_segptr, temp_table_node, err_code);
+	     if err_code ^= 0 then return;
+
+	     call move_substruc (from_segptr, temp_table_node, to_segptr, to_segptr -> lsm.root_symtab,
+		On_dup_error, err_code);
+	     return;
+	end;
+%page;
+push:	entry (from_segptr_arg, dir_path, entry, err_code);
+
+	from_segptr = from_segptr_arg;
+
+	call init_seg (to_segptr, dir_path, entry, Clear_seg, err_code);
+	if err_code ^= 0 then return;
+
+	call move_substruc (from_segptr, from_segptr -> lsm.root_symtab, to_segptr, to_segptr -> lsm.root_symtab,
+	     On_dup_error, err_code);
+	return;
+%page;
+compact:	entry (lsm_segptr, count, err_code);
+
+dcl  count fixed bin (18);				/* gc threshold */
+
+	if count > lsm_segptr -> lsm.free then do;	/* garbage collection threshold not yet reached */
+	     err_code = 0;
+	     return;
+	end;
+
+	temp_segptr = null;
+	call init (temp_segptr, err_code);		/* Initiate a temp seg for copying */
+	if err_code ^= 0 then return;
+	call move_substruc (lsm_segptr, lsm_segptr -> lsm.root_symtab, temp_segptr, temp_segptr -> lsm.root_symtab,
+	     On_dup_error, err_code);			/* Move the structure into the temp seg */
+	if err_code ^= 0 then return;
+
+	move_len = temp_segptr -> lsm.free;		/* Compute length of compacted version */
+	lsm_segptr -> move_array = temp_segptr -> move_array; /* Copy compacted version back */
+
+	call hcs_$truncate_seg (lsm_segptr, move_len, err_code); /* Truncate the original */
+	if err_code ^= 0 then return;
+
+	call free_seg (temp_segptr, err_code);		/* Free up the temporary */
+	return;
+%page;
+move_struc: entry (from_segptr_arg, to_segptr_arg, from_node_arg, to_node_arg, err_code);
+
+/* Copies list structure subsidiary to from_node in "from" segment
+   into "to" segment and returns new value of root_node */
+
+	call move_substruc (from_segptr_arg, from_node_arg, to_segptr_arg, to_node_arg, On_dup_error, err_code);
+						/* Get common code to do work */
+	return;
+%page;
+merge_symbol: entry (from_segptr_arg, to_segptr_arg, from_node_arg, merge, merge_code, err_code);
+
+/* Copy list structure subordinate to from_node_arg and replace subordinate symbols or overwrite them */
+
+dcl  merge bit (1) aligned,				/* ON iff merging symbol tables */
+     merge_code fixed bin;
+
+	call move_substruc (from_segptr_arg, from_node_arg, to_segptr_arg, 0, merge_code, err_code);
+	return;
+%page;
+move_substruc: procedure (from_segptr, from_node, to_segptr, to_node, merge_code, err_code);
+
+/* Internal procedure to move a node (and its substructure)
+   from segment "from_p" to segment "to_p" */
+
+/* Movement is done recursively on list and array type nodes, iteratively on others.
+
+   If merge_code = On_dup_error then all subordinate named substructures are copied from the
+   original into the copy, and entered into the copy symbol table.
+   If a name already exists in the copy symbol table, copying is aborted, and
+   and error message is returned.
+
+   If merge_code = On_dup_source then operation is identical to 0, but symbols already in the
+   copy symbol table are overwritten by identically named substructures
+   from the original.
+
+   If merge_code = On_dup_target_then_nulls, subordinate named substructures in the original are
+   replaced with identically named substructures in the copy.
+   If a name does not yet exist in the copy symbol table, it is created with
+   a value node of 0.
+
+   If merge_code = On_dup_target_then_source, operation is identical to 2, but when a name doesn't exist
+   in the copy symbol table, the named substrucuture from the original is copied. */
+
+dcl  from_node fixed bin (18),			/* node number in lsm_ segment pointed to by
+						   "from_segptr" to be moved */
+     to_node fixed bin (18),				/* node number in lsm_ segment pointed to by
+						   "to_segptr" where from_node has been moved */
+     from_segptr pointer,				/* pointer to lsm_segment contining structure to be moved */
+     to_segptr pointer,				/* pointer to lsm_ segment into which structure is to be moved */
+     merge_code fixed bin,				/* see above for description */
+     err_code fixed bin (35);
+						/* if on, overwrite symbols in "to" segment */
+dcl 1 scratch_seg based (scratch_ptr) aligned,
+    2 lsm_header (size (null -> lsm)) bit (36) aligned,
+    2 old_new_table (0 : sys_info$max_seg_size - 1) fixed bin (18) unsigned unaligned,
+    2 sym_list_array (divide (sys_info$max_seg_size, 2, 18, 0) - currentsize (scratch_ptr -> lsm)) fixed bin (18) aligned;
+
+dcl  scratch_ptr pointer initial (null),
+     old_copy_ptr pointer initial (null);
+
+dcl  upgrading_version_6_seg bit (1) aligned;
+
+dcl  old_new_tab_p pointer,				/* Points to table of old-new node correspondences */
+     old_new_tab (0 : sys_info$max_seg_size - 1) fixed bin (18) unsigned unaligned based (old_new_tab_p);
+						/* Table of node correspondences between old and new copies */
+dcl  sym_list_array_p pointer,
+     sym_list_array (divide (sys_info$max_seg_size, 2, 18, 0) - currentsize (scratch_ptr -> lsm)) fixed bin (18) based (sym_list_array_p);
+
+dcl  hcs_$fs_get_mode ext entry (pointer, fixed bin, fixed bin (35)),
+     error_table_$moderr ext fixed bin (35),
+     effmode fixed bin;
+
+/* First, check to see that we can read from the from_seg and write to the to_seg.
+   This should save a lot of faults. */
+
+	     call hcs_$fs_get_mode (from_segptr, effmode, err_code);
+	     if err_code ^= 0 then return;
+
+	     if effmode ^> 111b /* no read permission */ then do;
+bad_access_mode:	err_code = error_table_$moderr;
+		return;
+	     end;
+
+	     call hcs_$fs_get_mode (to_segptr, effmode, err_code);
+	     if err_code ^= 0 then return;
+
+	     if mod (effmode, 4) ^= 10b /* no write permission */ then goto bad_access_mode;
+
+	     if to_segptr -> lsm.version ^= LSM_version_7 then do;
+		err_code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	     on cleanup begin;
+		if scratch_ptr ^= null then call free_seg (scratch_ptr, 0);
+		if old_copy_ptr ^= null then call free_seg (old_copy_ptr, 0);
+	     end;
+
+	     call init (scratch_ptr, err_code);
+	     if err_code ^= 0 then return;
+
+	     old_new_tab_p = addr (scratch_seg.old_new_table);
+	     sym_list_array_p = addr (scratch_seg.sym_list_array);
+						/* so as not to destroy header */
+
+	     call init (old_copy_ptr, err_code);	/* we will store old contents in case of error */
+	     move_len = from_segptr -> lsm.free;
+	     unspec (old_copy_ptr -> move_array) = unspec (to_segptr -> move_array);
+
+	     if from_segptr -> lsm.version = LSM_version_7 then
+		upgrading_version_6_seg = ""b;
+	     else if from_segptr -> lsm.version = LSM_version_6 then
+		upgrading_version_6_seg = "1"b;
+	     else do;
+		err_code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	     call move_substruc_recurse (from_node, to_node, "1"b, err_code); /* Get friend to do work */
+
+	     if err_code ^= 0 then do;		/* something wrong, clean up seg like we found it */
+		unspec (to_segptr -> move_array) = unspec (old_copy_ptr -> move_array);
+		call hcs_$truncate_seg (to_segptr, to_segptr -> lsm.free, 0);
+	     end;
+
+	     call free_seg (scratch_ptr, 0);		/* Free up temporary segs */
+	     call free_seg (old_copy_ptr, 0);
+	     return;
+%page;
+move_substruc_recurse: procedure (from_node, to_node, top_level, err_code);
+
+/* "from_p" and "to_p" are already assumed to point to proper lsm_ segments */
+
+dcl  from_node fixed bin (18),			/* node number in from seg to be moved */
+     to_node fixed bin (18),				/* node no. of copied node in to seg (output ) */
+     top_level bit (1) aligned parameter,		/* ON if this is top level structure */
+     err_code fixed bin (35) parameter;
+
+dcl  actual_node fixed bin (18),			/* Current node being moved */
+     node_ptr pointer,				/* pointer to node in lsm segment */
+     cur_type fixed bin (4),				/* lsm_ type of same */
+     symtab_node_no fixed bin (18);
+
+
+		if from_node = 0 then do;		/* the null node, be happy about it */
+		     err_code, to_node = 0;
+		     return;
+		end;
+
+		call chase_indirect (from_node, actual_node, node_ptr, cur_type, err_code);
+						/* Find out all about the node */
+						/* and chase any indirects */
+		if err_code ^= 0 then return;
+
+		to_node = old_new_tab (actual_node);
+						/* See if it has already been copied */
+		if to_node ^= 0 then return;		/* already been copied, wonderful */
+
+/* If not, we have to copy it over now. */
+
+		if (cur_type <= bit_type) | (cur_type = char_type) then /* vanilla nodes */
+		     call move_simple_node (node_ptr, actual_node, to_node);
+
+		else if (cur_type = list_type) | (cur_type = array_type) then
+		     call move_list_node (node_ptr, actual_node, to_node, err_code);
+
+		else if cur_type = symbol_type then
+		     call merge_symbol_node (node_ptr, actual_node, to_node, top_level, err_code);
+						/* then move it as specified by "merge_code" */
+		else if cur_type = symtab_type then do;
+		     call lsm_sym_$find_table (from_segptr, symtab_node_no, err_code);
+		     if err_code ^= 0 then return;
+
+		     if (^top_level | (from_node ^= symtab_node_no)) then do;
+						/* we should NEVER encounter a symtab at a lower level */
+			err_code = graphic_error_table_$not_a_structure;
+			return;
+		     end;
+
+		     else call move_symtab_node (node_ptr, actual_node, to_node, err_code);
+		end;
+
+		else do;
+		     err_code = graphic_error_table_$bad_node;
+		     return;
+		end;
+
+		if actual_node ^= from_node then
+		     old_new_tab (from_node) = to_node;
+		return;
+%skip (5);
+move_simple_node:	procedure (node_ptr, from_node, to_node);
+
+/* This subroutine moves nodes that contain no node references */
+
+dcl (from_node, to_node) fixed bin (18),		/* old and new node numbers */
+     node_ptr ptr;					/* pointer to current node being moved */
+
+dcl  to_p pointer;
+
+		     to_node = to_segptr -> lsm.free;	/* Allocate new space for it */
+		     to_p = addrel (to_segptr, to_node);
+		     unspec (to_p -> any_node.header) = unspec (node_ptr -> any_node.header);
+		     if upgrading_version_6_seg then
+			to_p -> any_node.allocated_len = to_p -> any_node.allocated_len - 1;
+		     unspec (to_p -> any_node.data_space) = unspec (node_ptr -> any_node.data_space);
+		     to_segptr -> lsm.free = to_segptr -> lsm.free + currentsize (to_p -> any_node);
+						/* Up allocation count */
+		     old_new_tab (from_node) = to_node; /* Save number of new node for later references */
+
+		     return;
+		end;
+%skip (5);
+move_list_node:	procedure (node_ptr, from_node, to_node, err_code);
+
+dcl  from_node fixed bin (18),			/* node being moved */
+     err_code fixed bin (35),
+     to_node fixed bin (18),				/* place it is moved to */
+     node_ptr pointer,
+     to_node_p pointer,
+     elem_node fixed bin (18),
+     elem_to_node fixed bin (18);
+
+dcl  i fixed bin;					/* iteration index */
+
+		     call move_simple_node (node_ptr, from_node, to_node); /* Get a friend to move list itself */
+		     old_new_tab (from_node) = to_node;
+
+		     to_node_p = addrel (to_segptr, to_node); /* Get pointer to request */
+
+		     do i = 1 to node_ptr -> list_node.data_len; /* Iterate down list */
+
+			elem_node = node_ptr -> list_node.node (i);
+
+			if old_new_tab (elem_node) = 0 then do;
+			     call chase_indirect (elem_node, actual_node, null, 0, err_code);
+			     if err_code ^= 0 then return;
+
+			     if old_new_tab (actual_node) = 0 then do;
+				call move_substruc_recurse (elem_node, elem_to_node, ""b, err_code);
+				if err_code ^= 0 then return;
+
+				old_new_tab (actual_node) = elem_to_node;
+			     end;
+			     else old_new_tab (elem_node) = old_new_tab (actual_node);
+			end;
+
+			to_node_p -> list_node.node (i) = old_new_tab (elem_node);
+		     end;
+
+		     return;
+		end;
+%skip (5);
+move_symtab_node:	proc (node_ptr, from_node, to_symtab_node, err_code);
+
+/* This procedure moves the contents of a (the) symbol table from one
+   LSM segment to another.  This is incidentally how compaction gets done. */
+
+dcl (node_ptr pointer,
+     from_node fixed bin (18),
+     to_symtab_node fixed bin (18),
+     err_code fixed bin (35)) parameter;
+
+dcl  i fixed bin,
+     array_len fixed bin,
+     to_node fixed bin (18),
+     new_len fixed bin,
+     symbol_ptr pointer,
+     actual_node fixed bin (18);
+
+dcl  Not_top_level bit (1) aligned initial ("0"b) static options (constant);
+
+		     new_len = node_ptr -> symtab_node.allocated_len;
+		     if upgrading_version_6_seg then	/* old lengths all 1 too high */
+			new_len = new_len - 1;
+
+		     call lsm_$make_blk (to_segptr, to_symtab_node, symtab_type,
+			new_len, null, err_code);
+						/* Make a symbol table in the new LSM segment */
+		     if err_code ^= 0 then return;
+
+		     old_new_tab (to_symtab_node) = from_node;
+
+		     call lsm_sym_$sym_list (from_segptr, sym_list_array, array_len, err_code);
+		     if err_code ^= 0 then return;
+
+		     do i = 1 to array_len;
+			if old_new_tab (sym_list_array (i)) = 0 then do;
+			     call chase_indirect (sym_list_array (i), actual_node, symbol_ptr, 0, err_code);
+			     if err_code ^= 0 then return;
+
+			     if old_new_tab (actual_node) = 0 then do;
+				call merge_symbol_node (symbol_ptr, actual_node, to_node, Not_top_level, err_code);
+				if err_code ^= 0 then return;
+
+				if sym_list_array (i) ^= actual_node then
+				     old_new_tab (sym_list_array (i)) = to_node;
+			     end;
+
+			     else old_new_tab (sym_list_array (i)) = old_new_tab (actual_node);
+			end;
+		     end;
+
+		     return;
+
+		end move_symtab_node;
+%skip (5);
+merge_symbol_node:	procedure (node_ptr, from_node, to_node, top_level, err_code);
+
+dcl (node_ptr pointer,				/* pointer to symbol node in "from" seg */
+     from_node fixed bin (18),			/* node number of same */
+     to_node fixed bin (18),				/* node no of copy in "to" seg */
+     top_level bit (1) aligned,			/* ON means moving top level structure */
+     err_code fixed bin (35)) parameter;
+
+dcl (to_val_n, from_val_n) fixed bin (18),		/* value node nos in "to" and "from" segs */
+     to_sym_n fixed bin (18),				/* symbol node no in "to" seg */
+     from_val_p pointer,
+     from_val_type fixed bin (4),
+     name_node_ptr pointer,
+     not_in_to bit (1) aligned;			/* switch indicates that symbol is not found in "to" seg */
+
+		     if node_ptr -> any_node.type ^= symbol_type then do;
+			err_code = graphic_error_table_$bad_node;
+			return;
+		     end;
+
+
+		     name_node_ptr = pointer (node_ptr, node_ptr -> symbol_node.name_node);
+
+		     call lsm_sym_$symk (to_segptr, Find_symbol, name_node_ptr -> char_node.string,
+			to_sym_n, to_val_n, 0);
+		     not_in_to = (to_sym_n = 0);	/* ON if symbol is not in symbol table of "to" seg */
+
+		     go to merge_symbol (merge_code);
+
+merge_symbol (0):	     if not_in_to then
+			call copy_from_symbol;
+		     else do;
+			err_code = graphic_error_table_$struc_duplication;
+			return;
+		     end;
+		     goto merge_end;
+
+merge_symbol (1):	     call copy_from_symbol;
+		     goto merge_end;
+
+
+merge_symbol (2):	     if top_level then
+			call copy_from_symbol;	/* this is direct user request, move it whether there or not */
+		     else if not_in_to then do;	/* tagalong subsymbol, create it, make it empty */
+			call lsm_sym_$symk (to_segptr, Create_symbol, name_node_ptr -> char_node.string,
+			     to_sym_n, to_node, err_code);
+			to_node = to_sym_n;
+		     end;
+		     else to_node = to_sym_n;		/* else already there, mirror */
+		     goto merge_end;
+
+merge_symbol (3):	     if (top_level | not_in_to)
+		     then call copy_from_symbol;
+		     else to_node = to_sym_n;
+
+merge_end:	     old_new_tab (from_node) = to_node; /* note that this node now known */
+		     return;
+%skip (5);
+copy_from_symbol:	     procedure;
+
+/* Utility routine to copy the value node of a symbol in the "from" segment
+   into to "to" segment, and insert the symbol name and value in to "to" symbol table */
+
+			from_val_n = node_ptr -> symbol_node.value_node; /* Get "from" value node */
+			call chase_indirect (from_val_n, from_val_n, from_val_p, from_val_type, err_code);
+						/* Get its type, leng, pointer to it */
+			if err_code ^= 0 then return;
+
+			to_val_n = old_new_tab (from_val_n); /* See if already copied */
+
+			if from_val_n ^= 0 then	/* not the dummy null node */
+			     if to_val_n = 0 then do; /* never previously copied */
+				call move_substruc_recurse (from_val_n, to_val_n, ""b, err_code);
+				if err_code ^= 0 then return;
+			     end;
+
+			call lsm_sym_$symk (to_segptr, Create_symbol, name_node_ptr -> char_node.string,
+			     to_node, to_val_n, err_code);
+						/* Make new or write old symbol in copy symtab */
+
+			return;
+		     end copy_from_symbol;
+
+		end merge_symbol_node;
+%skip (5);
+chase_indirect:	procedure (start_node, actual_node, node_ptr, cur_type, err_code);
+
+
+/* This subroutine chases down LSM indirections and returns info about the real McCoy node. */
+dcl  start_node fixed bin (18),			/* Start here */
+     actual_node fixed bin (18),			/* Final number of node */
+						/* SHOULD THIS BE HERE ? */
+     node_ptr pointer,				/* pointer to node specificstions */
+     cur_type fixed bin (4),				/* type of node found */
+     err_code fixed bin (35);
+
+		     if start_node = 0 then do;
+			actual_node = 0;
+			node_ptr = null;
+			cur_type = -1;
+			return;
+		     end;
+		     actual_node = start_node;
+		     cur_type = indirect_type;
+
+		     do while (cur_type = indirect_type);
+			call in_bounds_check (actual_node, err_code);
+			if err_code ^= 0 then return;
+			node_ptr = addrel (from_segptr, actual_node);
+			cur_type = node_ptr -> any_node.type;
+			if cur_type <= 0 | cur_type > lsm_constants.n_types
+			then do;
+			     err_code = graphic_error_table_$bad_node;
+			     return;
+			end;
+			if cur_type = indirect_type then actual_node = node_ptr -> indirect_node.new_node;
+		     end;
+
+		     return;
+%skip (5);
+in_bounds_check:	     procedure (node_no, err_code);
+
+dcl  node_no fixed bin (18) parameter,
+     err_code fixed bin (35) parameter;
+
+			if node_no = 0 then err_code = 0;
+			else if (node_no < currentsize (from_segptr -> lsm)) then
+			     if from_segptr -> lsm.version = LSM_version_6 then do;
+						/* check ameliorating circumstances */
+				if node_no = 3 then
+				     err_code = 0;	/* symtab in version 6 segment */
+				else if node_no ^< currentsize (from_segptr -> lsm)
+				- from_segptr -> lsm.component_slots then
+				     err_code = 0;	/* symbol in slot 0 of v6 lsm_ makes header look huge */
+				else err_code = graphic_error_table_$lsm_node_ob;
+			     end;
+			     else err_code = graphic_error_table_$lsm_node_ob;
+			else if node_no > sys_info$max_seg_size - 1 then
+			     err_code = graphic_error_table_$lsm_node_ob;
+			else err_code = 0;
+
+			return;
+
+		     end in_bounds_check;
+		end chase_indirect;
+	     end move_substruc_recurse;
+	end move_substruc;
+%page;
+find_via_search_paths: proc (ename, segptr, code);
+
+dcl  ename char (*) parameter,
+     segptr pointer parameter,
+     code fixed bin (35) parameter;
+
+dcl  dname char (168);
+
+dcl  my_own_dirname char (168) static initial ("");
+
+	     if my_own_dirname = "" then do;
+this_label:	call hcs_$fs_get_path_name (codeptr (this_label),
+		     my_own_dirname, 0, "", code);
+		if code ^= 0 then return;
+	     end;
+
+	     segptr = null;
+
+	     call search_paths_$find_dir ("graphics", null, ename, my_own_dirname, dname, code);
+	     if code ^= 0 then return;
+
+	     call hcs_$initiate (dname, ename, "", 0, 1, segptr, code);
+	     return;
+
+	end find_via_search_paths;
+
+     end lsm_fs_;

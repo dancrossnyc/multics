@@ -1,0 +1,749 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Bull Inc., 1987                *
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+" *                                                         *
+" ***********************************************************
+
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"							"
+"	BOOTLOAD_LOADER: Subroutine to read			"
+"	collection 0.5 (tape fw) or collection 1.		"
+"							"
+"	tsx2	bootload_loader$load_collection		"
+"         tsx2	bootload_loader$skip_collection		"
+"	tsx2	bootload_loader$init			"
+"							"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+" HISTORY COMMENTS:
+"  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+"     audit(86-03-05,GDixon), install(86-03-21,MR12.0-1033):
+"      Support IMU and FIPS.
+"  2) change(87-03-12,Farley), approve(87-07-06,MCR7717),
+"     audit(87-07-15,Fawcett), install(87-07-17,MR12.1-1043):
+"     Corrected adjust_tape_device routine to only alter the IDCW if dealing
+"     with a non-cold MPC.  Also added reset&mask to POF retry.
+"  3) change(87-07-23,Farley), approve(87-07-23,PBF7717),
+"     audit(87-07-24,Fawcett), install(87-07-28,MR12.1-1047):
+"     Changed POF retry to only unwedge the tape controller one time.  Found
+"     that more than once causes the IMU to fault..
+"                                                      END HISTORY COMMENTS
+
+
+" Created  10/02/80, W. Olin Sibert, from bootstrap1 and assorted oddments
+" Modified 11/12/80, WOS, to add automatic tape firmware finder/loader.
+" Modified 12/16/80, WOS, to construct SDWs for both ADP and Level 68, and
+"  to eliminate check_overflow, on the assumption that the MST checker
+"  should do that checking instead.
+" Modified 04/21/81, Chris Jones for simplified I/O
+" Modified 9/83, Keith Loepere for adp and paged wired segs.
+" Modified 12/83, Keith Loepere for breakpoint_page support.
+" Modified June-July 1984 by Paul Farley for IMU support.
+" Modified 7/84, Keith Loepere to not clobber bkpt page.
+" Modified 5/85, Chris Jones to calculate position of trailer correctly for
+"  padded records.
+	
+	name	bootload_loader
+
+	include	bootload_equs
+	include	bootload_cpu_macros
+	include	coll0_segnos
+	include	hc_definitions_seg
+	include	hc_linkage_seg
+	include_nolist	iom_word_macros
+	include_nolist	make_data_macros
+	include	mstr
+	include	sdw_info
+	include	slt
+	include	slte
+	include	system_types
+	include_nolist	tape_io_commands
+	include	unpaged_page_tables
+" 
+	equ	prb.ctl,0
+	equ	prb.data,1
+	equ	prb.nameptr,1041
+	equ	prb.hdr,1042
+
+
+	Bentry	init
+init:
+	Bpush
+
+	absa_au	prb|prb.data
+	stca	read_tape_ddcw,70
+	neg	0		" adjust prb pointer
+	sba	mst_label.head,du	" correct for MSTRH
+	asa	prb|prb.ctl
+
+" Note (ahem) that the following code depends on the fact that:
+"  1. data_bits_used and data_bit_len are in the same word (upper and lower),
+"  2. they are both multiples of 36 so the division leaves word oriented values
+"     in qu and ql, and
+"  3. the upper half of ndata is the amount of real data, BUT
+"     the lower half is the actual amount of data read (including the pad)
+
+	ldq	prb|prb.data+mstr_header.data_bits_used
+	div	36,dl
+	stq	ndata
+
+	lda	prb|prb.data+mstr_header_size+mstr_trailer.tot_rec_word,ql
+				" current record
+	ada	1,dl
+	sta	exprec
+	stz	unwedged		" reset flag word
+	Breturn
+
+
+	segdef	finish
+
+finish:	eax7	3*2
+setclr:	epp	seg,clptrs,x7*
+	epbp	seg2,seg|0
+	spri6	seg2|hc_linkage_seg.next_free_ptr
+	eax7	-2,x7		" on to next
+	tpl	setclr
+
+	epp	seg,cdptr,*
+	epbp	seg2,seg|0
+	spri6	seg2|definitions.next_free_ptr
+
+	tra	0,x2
+"
+	Bentry	skip_collection
+
+skip_collection:
+	Bpush
+
+	tsx2	adjust_tape_device
+
+skip_next:
+	tsx2	readcw		" Look at next control word
+	tra	something_to_skip	" data
+	tsx0	bootload_error$bad_cw
+
+load.cmark:
+	tsx2	skip		" skip the collection mark
+	arg	k1
+	Breturn
+
+something_to_skip:			" First skip the SLTE
+	tsx2	skip		" grab the header
+	arg	cw
+
+	tsx2	readcw		" Now read the CW
+	tsx0	bootload_error$bad_cw
+	tra	skip.data
+	tsx0	bootload_error$bad_cw
+
+skip.data:tsx2	skip
+	arg	cw
+	tra	skip_next		" and again
+" 
+	Bentry	load_collection
+
+load_collection:
+	Bpush
+
+	tsx2	adjust_tape_device
+
+load.text:tsx2	read_header	" read the header
+	tra	load.cmark	" we are done
+
+	lda	prb|prb.hdr-1+slte.link_sect_word
+				" make sure this is the text
+	cana	slte.link_sect+slte.defs,dl
+	tnz	bootload_error$bad_sequence
+
+	tsx2	bootload_slt_manager$build_entry	" build the SLTE
+	arg	hcw
+	arg	hdrp,*
+	tra	bootload_error$too_many_segs
+
+	spri1	segptr			" save pointer to it
+	spri6	lastsltptr
+
+"	check to see if this is an 'interesting' segment.
+
+	ldx7	seg|slte.names_ptr
+	lda	nt|segnam.name,x7	get first 2 words of first name.
+	ldq	nt|segnam.name+1,x7	"
+	eax6	interesting_names	" x6 -> table of interesting names
+	rpt	no_interesting_names,4,tze	search the table
+	cmpaq	0,x6		compare first 8 characters
+	ttn	load_segment	skip if no compare
+
+	lxl0	seg|slte.segno		get segment number again
+	stx0	-1,x6*		store segment number for later use
+
+"	Make SDW for segment and load it.
+
+load_segment:
+	tsx7	allocate		routine to allocate core
+
+	tsx2	read  		" read the segment from tape
+	arg	segptr,*
+	arg	cw		and store it in
+
+	tsx7	setaccess  	now set access on loaded segment
+
+	lda	prb|prb.hdr-1+slte.link_provided_word
+	cana	slte.link_provided,dl " linkage to read?
+	tze	load.text		" no
+" 
+"	Process linkage segment.
+
+	tsx2	read_header
+	tsx0	bootload_error$bad_sequence
+
+	lda	prb|prb.hdr+slte.link_sect_word-1 test for linkage segment
+	cana	slte.link_sect,dl	..
+	tze	bootload_error$bad_sequence
+
+	eax7	lastsltptr,*	get index of text SLT entry
+	eax0	0		X0 will contain index to combined lkg ptr
+	lda	slt|slte.init_seg_word,x7	init_seg?
+	cana	slte.init_seg,dl	..
+	tze	*+2		if so,
+	eax0	4,x0		increment index
+	lda	slt|slte.link_sect_wired_word,x7  wired linkage?
+	cana	slte.link_sect_wired,dl  ..
+	tze	*+2		if so,
+	eax0	2,0		increment index
+
+	epp	seg,clptrs,x0*	pr6 -> correct linkage segment free 
+				" word
+	spri6	tempptr		" save it
+	lxl1	slt|slte.segno,x7	X1 contains segment number of text segment
+	sprp	seg,bootload_info$lot_ptr,*x1	set lot entry
+
+	lxl6	cw		length of linkage in X6
+	adx6	1,du		add one to size of this linkage
+	anx6	=o777776,du	rounded up to next even
+	asx6	clptrs+1,x0	" update pointer
+
+	tsx2	read		" read in the linkage
+	arg	tempptr,*
+	arg	cw
+
+	ldx7	segptr		segment number of text in X7
+	epp	seg,tempptr,*	linkage header
+	stx7	seg|7		set text pointer in linkage header
+" 
+"	Process definitions segment.
+
+	tsx2	read_header
+	tsx0	bootload_error$bad_sequence
+
+	lda	prb|prb.hdr+slte.defs_word-1 test for defs segment
+	cana	slte.defs,dl	..
+	tze	bootload_error$bad_sequence
+
+	epbp	seg,cdptr,*	get ptr to base of defs
+	lda	cw		get length of defs section
+	ana	=o777777,dl	..
+	ora	cdptr+1		insert offset of place for defs
+	ldx7	segptr		segment number of text in X7
+	sta	seg|0,x7		add entry to definitions offset table
+
+	epp	seg,cdptr,*	pr6 -> place for defs
+	spri6	tempptr,*		" save it in linkage
+	spri6	tempptr		" and for reading
+	lxl6	cw		get length of defs in X6
+	asx6	cdptr+1		set pointer for next time
+
+	tsx2	read  		" read the defs
+	arg	tempptr,*
+	arg	cw
+
+	tra	load.text		and loop
+" 
+"	read in segment header information
+
+read_header:
+	Bpush
+	tsx2	readcw		" read the control word
+	tra	rh.header
+	tsx0	bootload_error$bad_cw
+
+	Breturn
+
+rh.header:lda	cw		" save away CW
+	sta	hcw
+	tsx2	read		  " read in the logical segment header.
+	arg	hdrp,*
+	arg	hcw		number of words wanted
+
+	tsx2	readcw		  " get cw of the segment
+	tsx0	bootload_error$bad_cw
+	tra	read_header_returns
+	tsx0	bootload_error$bad_cw
+
+read_header_returns:
+	Breturn	1
+
+
+readcw:	Bpush
+	tsx2	read
+	arg	cw
+	arg	k1
+	ldx7	cw		" get CW type
+	tze	rcw.0		" type 0
+	ersx7	cw		" clear the word
+	cmpx7	1,du
+	tze	rcw.1		" type 1
+	cmpx7	2,du		" type 2
+	tnz	bootload_error$bad_cw
+	Breturn	2
+rcw.1:	Breturn	1
+rcw.0:	Breturn	0
+" 
+	segdef	segptr
+
+	even
+segptr:	its	-1,1
+tempptr:	its	-1,1
+lastsltptr:
+	its	-1,1
+clptrs:	its	-1,hc_linkage_seg.free_area	active_sup_linkage
+	its	-1,hc_linkage_seg.free_area	wired_sup_linkage
+	its	-1,hc_linkage_seg.free_area	active_init_linkage
+	its	-1,hc_linkage_seg.free_area	wired_init_linkage
+cdptr:	its	-1,definitions.first_free_word  definitions_
+
+hdrp:	itp	prb,prb.hdr-1
+
+si:	bss	,sdw_info_size
+hcw:	dec	0		control word for logical header
+cw:	dec	0		control word
+k1:	dec	1		" constant one
+bit_count_mask:
+	oct	000077777777	" mask for slte.bit_count
+" 
+	macro	int_name
+	maclist	object,save
+	aci	@&1@,8
+	zero	&l2,0
+	arg	&3
+	maclist	restore
+&end
+
+"	Table of 'interesting' names.
+
+	even
+interesting_names:
+
+	int_name	bootload,bootload_1,bootload_info$bootload_1_ptr
+
+	int_name	lot,lot,bootload_info$lot_ptr
+
+	int_name	as_linka,as_linkage,clptrs
+	int_name	ws_linka,ws_linkage,clptrs+2
+	int_name	ai_linka,ai_linkage,clptrs+4
+	int_name	wi_linka,wi_linkage,clptrs+6
+
+	int_name	definiti,definitions_,cdptr
+
+	int_name	sys_boot,sys_boot_info,bootload_info$sys_boot_info_ptr
+
+	equ	no_interesting_names,(*-interesting_names)/4
+" 
+"	ALLOCATE
+"
+"	This subroutine is called (via TSX7) to allocate storage for the segment
+"	described by the SLTE currently in the headersegment buffer. An sdw_info
+"	is constructed (si), and bootload_dseg$make_sdw is called to fabricate
+"	the SDW. The SDW is initially constructed with RW access, so the segment
+"	contents can be read in. After the segment is read in, the set_access
+"	entrypoint is called, the SDW is refabricated with the appropriate access,
+"	and is stored into the DSEG again. The sdw_info is constructed in the area
+"	called "si".
+"
+"	Segments are allocated according to the following rules. X1 is used
+"	as a flag to indicate where the segment is to be allocated.
+"
+"	 * If the segment is zero length on the tape, it gets an all zero
+"	   SDW. This case is handled first.
+"
+"	 * If the segment is a paged supervisor segment, or any sort of
+"	   init-seg, it is allocated in a contiguous region of high order
+"	   memory, on a 1024 word boundary.  Its page table is put in
+"	   int_unpaged_page_tables.
+"
+"	 * If the segment is an unpaged supervisor segment, it is allocated
+"	   on a 1024 word boundary starting from the low end of memory.  Its
+"	   page table is put in unpaged_page_tables.
+"
+"	If the segment has e access, we add the breakpoint_page as an
+"	extra page to the end.
+
+running_address:
+	dec	0
+seg_text_length:
+	dec	0
+
+allocate:
+	mlr	(),(),fill(000)	" Clear out sdw_info
+	desc9a	0,0
+	desc9a	si,4*sdw_info_size
+
+	ldq	seg|slte.bit_count_word " Find out how big it is
+	anq	bit_count_mask
+	adq	35,dl		" Round up to a word
+	div	36,dl		" and figure out how many words it is
+
+	tze	allocate_empty_seg	" If nothing there, give up now
+
+	adq	1023,dl		" round up to 1024 words
+	anq	=o776000,dl
+	stq	si+sdw_info.bound	" Save the length
+	stq	seg_text_length	" amount to clear (doesn't count bkpt page)
+
+	lda	slt|slt.free_core_size " See if we've got room
+	sba	si+sdw_info.bound
+	sba	1024,dl		" subtract a page to allow for slop
+	tmi	bootload_error$out_of_main_memory
+
+	lda	seg|slte.firmware_seg_word
+	cana	slte.firmware_seg,du
+	tnz	allocate_seg_low
+
+	lda	seg|slte.paged_word " Is seg to be paged?
+	cana	slte.paged,du
+	tnz	allocate_seg_high
+
+	lda	seg|slte.init_seg_word	" Or is it an init-seg, maybe?
+	cana	slte.init_seg,dl
+	tnz	allocate_seg_high	" Yup, place with paged segments
+
+allocate_seg_low:
+	lda	slt|slt.free_core_start	" Get space in low memory
+	sta	running_address	 	" Save the address
+	ada	si+sdw_info.bound		" Add the length, and adjust the
+	sta	slt|slt.free_core_start	" beginning of free core
+	lda	slt|slt.free_core_size	" Also adjust the size
+	sba	si+sdw_info.bound
+	sta	slt|slt.free_core_size
+	epp	seg2,=its(upt_segno_,0),*
+	tra	have_seg_address
+
+allocate_seg_high:
+	lda	slt|slt.free_core_start	" Assume these are already
+	ada	slt|slt.free_core_size	" 1024 word aligned.
+	sba	si+sdw_info.bound		" Adjust down by the seg lth.
+	sta	running_address	 	" Save the address
+	sba	slt|slt.free_core_start	" and calculate the new size
+	sta	slt|slt.free_core_size	" of free core -- free_core_start
+	epp	seg2,=its(iupt_segno_,0),*
+	tra	have_seg_address		" is unchanged
+
+have_seg_address:				" pr(seg2) -> upt (unpaged page table)
+	lda	seg|slte.access_word " see if we should add breakpoint_page
+	ana	=o200000,du	" e permission
+	tze	non_bkpt
+	lda	slte.breakpointable,du
+	orsa	seg|slte.breakpointable_word
+	lda	1024,dl		" lengthen for bkpt page
+	asa	si+sdw_info.bound
+	lda	1,dl
+	als	slte.cur_length_shift
+	adla	seg|slte.cur_length_word
+	sta	seg|slte.cur_length_word " record as lengthened
+	lda	1,dl
+	als	slte.max_length_shift
+	adla	seg|slte.max_length_word
+	sta	seg|slte.max_length_word
+non_bkpt:
+	ldq	seg2|upt.current_length
+	lda	si+sdw_info.bound
+	ars	10			" # of pages
+	eax3	0,al
+
+	ada	3,dl
+	ars	1
+	als	1			" round to next size upt entry
+	ada	seg2|upt.current_length
+	sta	seg2|upt.current_length	" allocated page table
+	cmpa	seg2|upt.max_length
+	tmoz	2,ic
+	tsx0	bootload_error$upt_overflow
+	epp	seg2,seg2|0,ql		" -> upt_entry
+
+	lda	segptr
+	ars	18			" segno
+	sta	seg2|upt_entry.segno
+	stz	seg2|upt_entry.size
+	sxl3	seg2|upt_entry.size
+	epp	seg2,seg2|upt_entry.ptws
+	absa_al	seg2|0
+	sta	si+sdw_info.address
+
+	lda	seg|slte.breakpointable_word
+	cana	slte.breakpointable,du
+	tze	2,ic
+	eax3	-1,x3			" last ptw is special for bkpt page
+
+	lda	running_address
+gen_ptw:
+	tsx2	bootload_dseg$make_core_ptw
+	stq	seg2|0
+	ada	1024,dl
+	epp	seg2,seg2|1
+	eax3	-1,x3
+	tnz	gen_ptw
+
+	lda	seg|slte.breakpointable_word " add bkpt ptw if necessary
+	cana	slte.breakpointable,du
+	tze	no_add_bkpt_ptw
+	lda	bkpt_absloc,dl
+	tsx2	bootload_dseg$make_core_ptw
+	stq	seg2|0
+
+no_add_bkpt_ptw:
+	lda	sdw_info.paged,du
+	orsa	si+sdw_info.flags
+
+	lda	sdw_info.read+sdw_info.write,du " Set RW access
+	sta	si+sdw_info.access
+
+	epp	seg,si
+	tsx2	bootload_dseg$make_sdw
+
+	ldx3	segptr		" segno * 2 in X3
+	adlx3	segptr
+	staq	ds|0,x3		" Ka-ching!
+	lda	bootload_info$system_type
+	cmpa	ADP_SYSTEM,dl
+	tze	2,ic
+	cams	0
+
+	lda	seg_text_length	" now clear the segment
+	als	2		" characters
+	epp	seg,segptr,*
+	mlr	(),(pr,rl),fill(0)
+	desc9a	0
+	desc9a	seg|0,al
+	tra	0,x7		" and return
+
+
+allocate_empty_seg:
+	lda	sdw_info.faulted,du " Make the segment empty
+	sta	si+sdw_info.flags	" All the rest of si is still zero
+	ldx3	segptr		" segno * 2 in X3
+	adlx3	segptr
+	stz	ds|0,x3		" Ka-ching!
+	stz	ds|1,x3		" Ka-ching!
+	tra	0,x7		" and return
+" 
+"	SETACCESS
+"
+"	This entry is called to set the proper access for the segment, once it
+"	has been read in. This is also where the encacheable bit is set.
+"
+
+setaccess:
+	lda	si+sdw_info.flags	" Is it worth it?
+	cana	sdw_info.faulted,du
+	tnz	0,x7		" Nope, SDW is unusable
+
+	epp	seg,prb|prb.hdr-1	" PR6 -> slte
+
+	lda	seg|slte.cache_word " Set the encacheability bit
+	ana	slte.cache,du
+	tze	3,ic
+	lda	sdw_info.cache,du
+	orsa	si+sdw_info.flags
+
+	lda	seg|slte.access_word " Set the correct access
+	arl	slte.access_shift	" To low 4 bits
+	als	36-4		" Now to high 4 bits
+	sta	si+sdw_info.access	" and store it
+
+	epp	seg,si		" Make the SDW again
+	tsx2	bootload_dseg$make_sdw
+
+	ldx3	segptr		" segno * 2 in X3
+	adlx3	segptr
+	staq	ds|0,x3		" Ka-ching!
+	lda	bootload_info$system_type
+	cmpa	ADP_SYSTEM,dl
+	tze	2,ic
+	cams	0
+	tra	0,x7		" and return
+" 
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"							"
+"	read: subroutine to read the input.			"
+"							"
+"	calling sequence:	tsx2	read	 		"
+"			arg	loc			"
+"			arg	=nwords			"
+"							"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	even
+	segdef	tape_status
+tape_status:
+	bss	,2
+ndata:	bss	,1
+exprec:	dec	0
+length:	dec	0
+read_skip:dec	0
+
+read:	stc1	read_skip		" this is read
+	epp	seg,0,x2*		" get ptr to data loc
+	lxl7	1,x2*		get length
+	tra	read_join
+
+skip:	stz	read_skip		" this is skip
+	lxl7	0,x2*		" length
+
+read_join:
+	stx7	length
+	Bpush
+
+readloop:
+	ldx6	ndata		get data length of tape record
+	sblx6	prb|prb.ctl	compute # of words remaining in buffer
+	tze	readp		read next record if no more words left
+	cmpx6	length		get min (length, words_remaining)
+	tmoz	*+2		..
+	ldx6	length		..
+
+	szn	read_skip		" reading?
+	tze	no_read		" no
+
+	ldq	prb|prb.ctl	tape buffer offset in QU
+	eaa	0,x6		words to copy in AU
+	lls	2		generate character count and offset
+	mlr	(pr,rl,qu),(pr,rl)	copy data from tape buffer
+	desc9a	prb|prb.data+mstr_header_size,au
+	desc9a	seg|0,au
+
+	epp	seg,seg|0,x6	bump pr6 by # of words copied
+
+no_read:
+	eaa	0,x6		words copied in AU
+	asa	prb|prb.ctl	bump record index
+	neg	0		complement
+	asa	length		decrement length
+	tpnz	readloop		loop if more data to copy
+
+read_return:
+	szn	read_skip		" return to caller
+	tze	skip.return	" skip
+	Breturn	2
+skip.return:
+	Breturn	1
+" 
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"							"
+"	Subroutine to read one physical record from tape		"
+"							"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+readp:	rscr	32			" get time
+	staq	io_start_time		" and save it
+	stz	prb|prb.ctl		reset pointer on PRB to zero wds xmitted.
+	stz	prb|prb.data+mstr_header.c1	and smash the magic word
+try_readp_again:
+	tsx2	bootload_io$connect 	" Read a record
+	arg	bootload_info$tape_iom_number
+	arg	bootload_info$tape_channel_number
+	arg	tape_io_pcw
+	arg	read_tape_idcw
+
+	staq	tape_status
+	cana	bootload_info$status_mask
+	tnz	tape_error
+	canq	=o7777,dl			" tally residue?
+	tnz	readp			" yes, skip it
+
+	ldq	prb|prb.data+mstr_header.c1	" a quick spot check of the record.
+	cmpq	magic_first		we know the first and last words.
+	tnz	readp			it is probably just noise
+
+" See the longish comment earlier about the dependencies between data_bits_used
+" and data_bit_len, and why the following code works despite its bad habits.
+
+	ldq	prb|prb.data+mstr_header.data_bits_used	" get bit count of data bits
+	div	36,dl		compute data word count
+	stq	ndata		and save
+
+	eax2	0,ql		x2 is trailer pointer
+	ldq	prb|prb.data+mstr_header_size+mstr_trailer.c2,x2
+	cmpq	magic_last
+	tnz	readp		" bad record
+
+	lda	prb|prb.data+mstr_header_size+mstr_trailer.tot_rec_word,x2 currec
+	cmpa	exprec		expected record?
+	tnz	bootload_error$bad_mst
+
+	aos	exprec		save for next read
+	tra	readloop		" keep reading
+
+tape_error:
+	ana	=o770000,du	" get just major/minor status
+	cmpa	=o440000,du	" EOF?
+	tze	readp		" yes, skip it
+	cmpa	=o600000,du	" POF?
+	tze	retry_pof		" try again
+	tra	bootload_error$tape_error
+
+retry_pof:
+	szn	bootload_info$cold_tape_mpc	" F/W yet?
+	tze	chk_pof_time	" yes, leave it alone
+	szn	unwedged		" has unwedging been done
+	tnz	chk_pof_time	" yes, just chk time & retry I/O
+	tsx2	bootload_tape_fw$reset_and_mask " no, do the unwedging
+	stc1	unwedged		" show that it has been done
+
+chk_pof_time:
+	rscr	32		" get the time
+	sbaq	io_start_time	" rel-a-tize
+	cmpaq	thirty_sec_limit	" is thirty seconds up?
+	tmi	try_readp_again	" NO, try one mo time
+	tra	bootload_error$tape_error " report error
+
+adjust_tape_device:
+
+	szn	bootload_info$cold_tape_mpc	" F/W yet?
+	tnz	0,x2			" no, leave it alone
+	lda	bootload_info$tape_device_number
+	als	24
+	stca	read_tape_idcw,20
+	lda	=o3000,dl
+	stca	read_tape_idcw,2
+	tra	0,x2		" return
+" 
+magic_first:
+	oct	670314355245	magic number at word 1 of record
+magic_last:
+	oct	265221631704	magic number at end of record
+
+unwedged: bss	,1
+	even
+io_start_time:
+	bss	,2
+thirty_sec_limit:
+	dec	0,30000000	" thirty seconds (in micros)
+
+	make_pcw	tape_io_pcw,	" PCW to reset status before tape I/O
+		TAPE.reset_status,
+		0,
+		0,
+		nondata,
+		terminate,
+		1
+
+read_tape_idcw:
+	vfd	6/TAPE.read_binary_record,6/0,6/0,3/7,1/0,2/0,6o/0,6/0
+
+	make_ddcw	read_tape_ddcw,	" DDCW describing physical_record_buffer
+		0,
+		mstr_header_size+1024+mstr_trailer_size,
+		iotd
+
+	end

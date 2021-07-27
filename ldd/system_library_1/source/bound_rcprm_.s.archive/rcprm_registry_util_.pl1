@@ -1,0 +1,399 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1985 *
+        *                                                         *
+        *********************************************************** */
+/* Various common operations on RCP registries. */
+/* Written January 1985 by Chris Jones */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+rcprm_registry_util_:
+     proc;
+
+	return;
+
+dcl	p_code		   fixed bin (35) parameter;	/* (O) status code */
+dcl	p_gk_header_ptr	   ptr;			/* (I) pointer to a gk_header structure to be filled in */
+dcl	p_iocb_ptr	   ptr;			/* (I/O) pointer to an IOCB we're manipulating */
+dcl	p_key		   char (*) parameter;	/* (O) the key we construct */
+dcl	p_owner		   char (*) parameter;	/* (I) the owner for whom we will construct a key */
+dcl	p_privileges_string	   bit (36) aligned parameter;/* (I/O) privileges that were on before we diddled them */
+dcl	p_project		   char (*) parameter;	/* (I) the project for whome we will construct a key */
+dcl	p_record_ptr	   ptr;			/* (O) pointer to a registry record */
+dcl	p_registry_dir	   char (*) parameter;	/* (I) directory registries are stored in */
+dcl	p_resource_type	   char (*) parameter;	/* (I) resource type (for knowing which registry to use) */
+dcl	p_resource_name	   char (*) parameter;	/* (I) name of a resource */
+dcl	p_uid		   bit (36) aligned parameter;/* (I) UID of a resource */
+
+dcl	1 cbi		   like create_branch_info aligned automatic;
+dcl	code		   fixed bin (35);
+dcl	create_sw		   bit (1) aligned;
+dcl	cur_level		   fixed bin;
+dcl	i		   fixed bin;
+dcl	io_module		   char (32);
+dcl	iocb_ptr		   ptr;
+dcl	registry_dir	   char (168);
+dcl	resource_name	   char (32);
+dcl	resource_type	   char (32);
+dcl	suffix		   char (4);
+dcl	temp_string	   char (256);
+
+dcl	1 get_key_info	   aligned,
+	  2 header	   like gk_header,
+	  2 key		   char (40) unaligned;
+
+dcl	1 record_status	   like rs_info aligned;
+
+dcl	Relative_useconds	   bit (2) initial ("10"b) static options (constant);
+dcl	Sleep_times	   (5) fixed bin (71) static options (constant) initial (.25f6, .50f6, .75f6, 1.5f6, 3.0f6);
+dcl	TRANSACTION_CONTROL_FILE_NAME
+			   char (7) static options (constant) init ("rcp.tcf");
+
+dcl	admin_gate_$reset_privileges
+			   entry (bit (36) aligned);
+dcl	admin_gate_$set_privileges
+			   entry (bit (36) aligned, bit (36) aligned);
+dcl	cu_$level_get	   entry (fixed bin);
+dcl	hcs_$create_branch_	   entry (char (*), char (*), ptr, fixed bin (35));
+dcl	ioa_$rsnnl	   entry () options (variable);
+dcl	pathname_		   entry (char (*), char (*)) returns (char (168));
+dcl	suffixed_name_$make	   entry (char (*), char (*), char (32), fixed bin (35));
+dcl	timer_manager_$sleep   entry (fixed bin (71), bit (2));
+dcl	unique_chars_	   entry (bit (*)) returns (char (15));
+
+dcl	error_table_$file_busy fixed bin (35) ext static;
+dcl	error_table_$lock_wait_time_exceeded
+			   fixed bin (35) ext static;
+
+dcl	sys_info$access_class_ceiling
+			   bit (72) aligned ext static;
+dcl	sys_info$dir_privilege bit (36) aligned ext static;
+
+dcl	cleanup		   condition;
+
+dcl	(addr, after, before, hbound, lbound, length, null, rtrim, unspec)
+			   builtin;
+
+free_key:
+     entry (p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_full_key (REGISTRY_FREE_KEY);
+	return;
+
+name_key:
+     entry (p_resource_name, p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_full_key (REGISTRY_NAME_KEY_HEAD || rtrim (p_resource_name));
+	return;
+
+owner_key:
+     entry (p_owner, p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_full_key (REGISTRY_OWNER_KEY_HEAD || flip_person_and_project (p_owner));
+	return;
+
+project_key:
+     entry (p_project, p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_partial_key (REGISTRY_OWNER_KEY_HEAD || rtrim (p_project) || ".");
+	return;
+
+skeleton_key:
+     entry (p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_partial_key (REGISTRY_NAME_KEY_HEAD);
+	return;
+
+skeleton_acquisition_key:
+     entry (p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_partial_key (REGISTRY_OWNER_KEY_HEAD);
+	return;
+
+system_key:
+     entry (p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call set_full_key (REGISTRY_SYSTEM_KEY);
+	return;
+
+uid_key:
+     entry (p_uid, p_gk_header_ptr, p_key);
+
+	call init_gk_header;
+	call ioa_$rsnnl ("^a^w", temp_string, (0), REGISTRY_UID_KEY_HEAD, p_uid);
+	call set_full_key (rtrim (temp_string));
+	return;
+
+create_transaction_control_file:
+     entry (p_registry_dir, p_code);
+
+	registry_dir = p_registry_dir;
+	iocb_ptr = null ();
+	call fillin_cbi;
+	call hcs_$create_branch_ (registry_dir, TRANSACTION_CONTROL_FILE_NAME, addr (cbi), code);
+	if code ^= 0 then
+	     goto CREATE_TCF_RETURN;
+
+/* Make this file be an MSF by creating and deleting an arbitrary record */
+
+	call grab_transaction_control_file_create (iocb_ptr, registry_dir, code);
+	if code ^= 0 then
+	     goto CREATE_TCF_RETURN;
+
+/* force this file into an MSF by creating and deleting an arbitrary record. */
+
+	call iox_$seek_key (iocb_ptr, "garbage", (0), (0));
+	call iox_$write_record (iocb_ptr, addr (iocb_ptr), 8, code);
+	if code ^= 0 then
+	     goto CREATE_TCF_RETURN;
+	call iox_$delete_record (iocb_ptr, code);
+	if code ^= 0 then
+	     goto CREATE_TCF_RETURN;
+
+CREATE_TCF_RETURN:
+	call toss_iocb (iocb_ptr);
+	p_code = code;
+	return;
+
+grab_transaction_control_file:
+     entry (p_iocb_ptr, p_registry_dir, p_code);
+
+	create_sw = "0"b;
+	goto GRAB_TCF_COMMON;
+
+grab_transaction_control_file_create:
+     entry (p_iocb_ptr, p_registry_dir, p_code);
+
+	create_sw = "1"b;
+
+GRAB_TCF_COMMON:
+	registry_dir = p_registry_dir;
+	call ioa_$rsnnl ("vfile_ ^a^[ -old^] -exclusive", temp_string, (0),
+	     pathname_ (registry_dir, TRANSACTION_CONTROL_FILE_NAME), ^create_sw);
+	iocb_ptr = null ();
+
+	on cleanup call toss_iocb (iocb_ptr);
+
+	call iox_$attach_name ("rcp_transactions_", iocb_ptr, temp_string, null (), code);
+	if code ^= 0 then
+	     goto GRAB_TCF_RETURN;
+
+	code = error_table_$file_busy;
+	do i = lbound (Sleep_times, 1) to hbound (Sleep_times, 1) while (code = error_table_$file_busy);
+	     call iox_$open (iocb_ptr, Keyed_sequential_update, "0"b, code);
+	     if code = error_table_$file_busy then
+		call timer_manager_$sleep (Sleep_times (i), Relative_useconds);
+	end;
+
+	if code = error_table_$file_busy then
+	     code = error_table_$lock_wait_time_exceeded;
+	if code ^= 0 then
+	     call toss_iocb (iocb_ptr);
+
+GRAB_TCF_RETURN:
+	p_iocb_ptr = iocb_ptr;
+	p_code = code;
+	return;
+
+release_transaction_control_file:
+     entry (p_iocb_ptr, p_code);
+
+release_registry:
+     entry (p_iocb_ptr, p_code);
+
+	iocb_ptr = p_iocb_ptr;
+	call iox_$close (iocb_ptr, code);
+	if code ^= 0 then
+	     goto RELEASE_TCF_RETURN;
+	call iox_$detach_iocb (iocb_ptr, code);
+	if code ^= 0 then
+	     goto RELEASE_TCF_RETURN;
+	call iox_$destroy_iocb (p_iocb_ptr, code);
+
+RELEASE_TCF_RETURN:
+	p_code = code;
+	return;
+
+grab_registry:
+     entry (p_iocb_ptr, p_registry_dir, p_resource_type, p_code);
+
+	create_sw = "0"b;
+	io_module = "rcprm_journal_file_";
+	suffix = "rcpr";
+	goto GRAB_REGISTRY_COMMON;
+
+grab_registry_no_journalize:
+     entry (p_iocb_ptr, p_registry_dir, p_resource_type, p_code);
+
+	create_sw = "0"b;
+	io_module = "vfile_";
+	suffix = "rcpr";
+	goto GRAB_REGISTRY_COMMON;
+
+grab_registry_old:
+     entry (p_iocb_ptr, p_registry_dir, p_resource_type, p_code);
+
+	create_sw = "0"b;
+	io_module = "rcprm_journal_file_";
+	suffix = "old";
+	goto GRAB_REGISTRY_COMMON;
+
+grab_registry_create:
+     entry (p_iocb_ptr, p_registry_dir, p_resource_type, p_code);
+
+	create_sw = "1"b;
+	io_module = "rcprm_journal_file_";
+	suffix = "rcpr";
+
+GRAB_REGISTRY_COMMON:
+	registry_dir = p_registry_dir;
+	resource_type = p_resource_type;
+	iocb_ptr = null ();
+	on cleanup call toss_iocb (iocb_ptr);
+
+	call suffixed_name_$make (resource_type, suffix, resource_type, code);
+	if code ^= 0 then
+	     goto GRAB_REGISTRY_RETURN;
+
+	call ioa_$rsnnl ("^a ^a ^[-old ^]-exclusive -stationary -dup_ok", temp_string, (0), io_module,
+	     pathname_ (registry_dir, resource_type), ^create_sw);
+
+	call iox_$attach_name (unique_chars_ ("0"b), iocb_ptr, temp_string, null (), code);
+	if code ^= 0 then
+	     goto GRAB_REGISTRY_RETURN;
+
+	call iox_$open (iocb_ptr, Keyed_sequential_update, "0"b, code);
+
+GRAB_REGISTRY_RETURN:
+	if code ^= 0 then
+	     call toss_iocb (iocb_ptr);
+	p_iocb_ptr = iocb_ptr;
+	p_code = code;
+	return;
+
+find_resource_record:
+     entry (p_iocb_ptr, p_resource_name, p_record_ptr, p_code);
+
+	iocb_ptr = p_iocb_ptr;
+	resource_name = p_resource_name;
+	call name_key (resource_name, addr (get_key_info.header), get_key_info.key);
+	unspec (record_status) = ""b;
+	record_status.version = rs_info_version_2;
+	record_status.record_ptr = null ();
+	call iox_$control (iocb_ptr, "get_key", addr (get_key_info), code);
+	if code ^= 0 then
+	     goto find_record_return;
+
+	call iox_$control (iocb_ptr, "record_status", addr (record_status), code);
+
+find_record_return:
+	p_record_ptr = record_status.record_ptr;
+	p_code = code;
+	return;
+
+turn_on_privs:
+     entry (p_privileges_string);
+
+	call admin_gate_$set_privileges (sys_info$dir_privilege, p_privileges_string);
+	return;
+
+turn_off_privs:
+     entry (p_privileges_string);
+
+	call admin_gate_$reset_privileges (p_privileges_string);
+	return;
+
+init_gk_header:
+     proc;
+
+	gk_info_ptr = p_gk_header_ptr;
+	if gk_info_ptr ^= null () then do;
+	     unspec (gk_header) = ""b;		/* start clean */
+	     gk_header.version = gk_info_version_0;
+	     gk_header.input_key = "1"b;
+	end;
+
+     end init_gk_header;
+
+set_full_key:
+     proc (key);
+
+dcl	key		   char (*) varying parameter;
+
+	if gk_info_ptr ^= null () then
+	     gk_header.head_size, gk_header.key_len = length (p_key);
+	p_key = key;
+	return;
+
+set_partial_key:
+     entry (key);
+
+	if gk_info_ptr ^= null () then
+	     gk_header.head_size, gk_header.key_len = length (key);
+	p_key = key;
+
+     end set_full_key;
+
+flip_person_and_project:
+     proc (personid) returns (char (*));
+
+dcl	personid		   char (*) parameter;
+
+	return (before (after (rtrim (personid), "."), ".") || "." || before (personid, "."));
+
+     end flip_person_and_project;
+
+toss_iocb:
+     proc (iocb_ptr);
+
+dcl	iocb_ptr		   ptr;
+
+	if iocb_ptr ^= null () then do;
+	     call iox_$close (iocb_ptr, (0));
+	     call iox_$detach_iocb (iocb_ptr, (0));
+	     call iox_$destroy_iocb (iocb_ptr, (0));
+	end;
+	iocb_ptr = null ();
+
+     end toss_iocb;
+
+fillin_cbi:
+     proc;
+
+	call cu_$level_get (cur_level);
+	unspec (cbi) = ""b;
+	cbi.version = create_branch_version_2;
+	cbi.priv_upgrade_sw = (cur_level = 1);		/* want this to be a multiclass seg */
+	cbi.parent_ac_sw = ^cbi.priv_upgrade_sw;
+	cbi.mode = RW_ACCESS;
+	cbi.rings (*) = cur_level;
+	cbi.userid = "*.*.*";
+	cbi.access_class = sys_info$access_class_ceiling;
+
+     end fillin_cbi;
+
+%include rcprm_registry_keys;
+%page;
+%include ak_info;
+%page;
+%include rs_info;
+%page;
+%include iox_dcls;
+%page;
+%include iox_modes;
+%page;
+%include create_branch_info;
+%page;
+%include access_mode_values;
+%page;
+
+     end rcprm_registry_util_;

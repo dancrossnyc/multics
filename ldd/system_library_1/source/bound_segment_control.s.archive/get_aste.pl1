@@ -1,0 +1,523 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+get_aste:
+     procedure (csl) returns (ptr);
+
+dcl csl fixed bin (17) parameter;
+
+/*
+   astep = get_aste (csl)
+   astep = get_aste$synchronized (csl);
+
+   FUNCTION -
+
+   The procedure "get_aste" returns a pointer to  a  free  ASTE  whose  page  table
+   length  is  equal to or greater than the input argument "csl". If it cannot find
+   such an ASTE, it returns a null pointer.
+
+   "get_aste" does not concern itself with the AST lock. It  assumes  there  is  no
+   race  condition.  It is the responsibility of the caller to issue the call after
+   the AST has been locked and to unlock it upon return, as soon as it is  safe  to
+   do  so.  Of  course,  the  initializer  or  shutdown may call "get_aste" without
+   locking the AST since they know they are alone.
+
+   The ASTE is threaded in the circular list, at the end.
+
+   All items of the ASTE are zero with the exception of fb and bp which thread  the
+   ASTE  in  the  circular list, and ptsi and marker which are engraved in the ASTE
+   forever.
+
+   All PTW's are initialized with a page not in core flag and  with  a  coded  null
+   device address.
+
+   IMPLEMENTATION -
+
+   First,  the  argument "csl" is used to determine what is the appropriate size of
+   the page table. Then the circular list associated with the  determined  size  is
+   scanned,  starting  from  the ASTE which happens to be pointed to by the current
+   pointer associated with this list.
+
+   If there is a free ASTE at the head of the list, it will be selected.
+   Otherwise, the list is searched for an ASTE which is not entry-held,
+   has no inferiors, no pages in memory, and aste.init not set.  ASTE's
+   which are rejected have their file maps updated if aste.fmchanged = "1"b.
+
+   If no ASTE's are found above, a much more careful search is done.
+   The estimated cost of deactivating each segment is computed by computing
+   a 'cost' equal to the sum of pages used, pages modified, and 1 for the
+   VTOCE I/O.  The cost for a directory also includes the sum of the costs
+   of its inferiors.  The segment with the lowest cost will be selected.
+
+   The selected segment is deactivated with the "deactivate" routine.
+   If this segment is a directory with active inferiors, all inferiors
+   are also deactivated (in a bottom-up manner, thereby adhering to the
+   dictum that all ancestor segments of an active segment must be active).
+
+   No matter if the selected ASTE was free or if it has been deactivated, it is now
+   threaded in the list, at the FIRST position. It is  put  at  the  last  position
+   merely by moving the current position forward by 1 position.
+
+   Synchronized segments are special-cased. If the per-pool limit on these
+   is exceeded, only synchronized segments are considered for deactivation.
+
+   MODIFICATIONS -
+
+   04/08/75 Totally rewritten by Andre Bensoussan for the new storage system.
+   06/76 by D.Vinograd to skip ast entries in use by the volume dumper
+   03/23/77 by Greenberg for get_aste$flush_ast_pool
+   10/07/80 by C. Hornig for new replacement algorithm
+   03/21/81 W. Olin Sibert, for ADP PTWs
+   04/19/81 by W. Olin Sibert, to get rid of aste.ic
+   05/31/81 by J. Bongiovanni to return null ptr on invalid csl
+   10/25/82 by J. Bongiovanni for synchronized segments
+*/
+
+dcl N_PROTECTED_ASTES fixed bin static options (constant) init (4);
+
+dcl (fastep, lastep, mp_astep) ptr;
+dcl aste_count fixed bin;
+dcl (cost_total, best_cost) fixed bin;
+dcl pts fixed bin;
+dcl code fixed bin (35);
+dcl ptsi fixed bin (3);
+dcl ptp pointer;
+dcl synchronized_call bit (1) aligned;
+dcl synchronized_only bit (1) aligned;
+
+dcl error_table_$deact_in_mem fixed bin (35) external;
+dcl pds$process_group_id char (32) external;
+dcl sys_info$system_type fixed bin external static;
+
+dcl deactivate entry (ptr, fixed bin (35));
+dcl hc_dm_util$check_activate entry (fixed bin (3), fixed bin (35));
+dcl hc_dm_util$activate entry (fixed bin (3));
+dcl syserr entry options (variable);
+dcl syserr$error_code entry options (variable);
+dcl update_vtoce entry (ptr);
+
+dcl (addr, addrel, binary, hbound, lbound, null, pointer, rel) builtin;
+
+%page;
+/* * * * * * * * * * GET_ASTE * * * * * * * * */
+
+          synchronized_call = "0"b;
+          goto common;
+
+synchronized:
+	entry (csl) returns (ptr);
+
+	synchronized_call = "1"b;
+
+common:	
+	sstp = addr (sst_seg$);			/* get a pointer to the SST */
+
+	do ptsi = hbound (sst.pts, 1) by -1 to lbound (sst.pts, 1) + 1 while (csl <= sst.pts (ptsi - 1));
+	end;					/* search for the correct index */
+
+	pts = sst.pts (ptsi);			/* save real size of the page table array */
+
+	if csl > pts then do;			/* invalid csl				*/
+	     call syserr (0, "get_aste: Invalid csl ^d", csl);
+	     return (null());
+	end;
+
+
+	sst.aneedsize (ptsi) = sst.aneedsize (ptsi) + 1;	/* meter */
+
+	if sst.ausedp (ptsi) = ""b then goto err_out;	/* none on the list */
+
+	synchronized_only = "0"b;
+	if synchronized_call then do;
+	     sst.synch_activations = sst.synch_activations + 1;
+	     call hc_dm_util$check_activate (ptsi, code);
+	     if code ^= 0 then synchronized_only = "1"b;
+	end;
+
+/*   First, check the beginning of the aste list for a free aste.				
+     During deactivation, put_aste threads the newly-freed aste				
+     to the beginning of the list								
+											*/
+	
+
+	fastep, lastep, astep = pointer (sstp, sst.ausedp (ptsi));
+				
+
+	if ^aste.usedf & ^synchronized_only then do;
+	     sst.stepsa = sst.stepsa + 1;
+	     sst.asteps (ptsi) = sst.asteps (ptsi) + 1;
+return_aste:
+	     sst.ausedp (ptsi) = aste.fp;		/* Move current ptr forward by 1 position */
+	     if synchronized_call
+		then call hc_dm_util$activate (ptsi);
+	     return (astep);			/* Return astep - ASTE is now last in list */
+	     end;
+
+/*   Next, protect a number of aste's from being deactivated during this
+     this call to get_aste.  The number of protected aste's is given
+     by the constant N_PROTECTED_ASTES; the aste's protected are those
+     in the list immediately preceding the current position (and hence,
+     the protected aste's are those activated most recently).  The purpose
+     of this protection is to prevent "ping-ponging" of aste's, a phenomenon
+     wherein the system hangs on a single instruction (e.g., a multi-word EIS
+     instruction referencing multiple segments alternately taking segment
+     faults on two segments, where the segment fault of one causes
+     deactivation of the other segment).							*/
+
+	do aste_count = 1 to N_PROTECTED_ASTES;		/* walk back to protect */
+	     astep = pointer (astep, aste.bp);		/* recently used ASTE's */
+	     if ^aste.usedf & ^synchronized_only then goto return_aste;
+	     if astep = fastep then goto small_ast;	/* ridiculous */
+	end;
+small_ast:
+	lastep = astep;
+
+/*   This is the main loop of aste allocation.  The entire list is walked
+     (except for aste's which have been protected above) until one of the
+     following happens:
+
+          1. an aste is found which can be deactivated (entry-hold-switch,
+             dumper-in-use, ddnp, and deact_error all off), is not in
+             "grace" lap (the first lap after activation), has no active
+             inferiors, and no pages in memory.
+
+          2. the end of the list is reached.
+
+     With reasonable number of aste's in the pools (set via the SST card),
+     and normal system behavior, an aste should almost always be found
+     in this loop										*/
+	
+
+	do astep = fastep repeat (pointer (astep, aste.fp)) while (aste.fp ^= rel (lastep));
+	     if ^aste.usedf & ^synchronized_only then goto return_aste;  /* aste free -allocate it			*/
+	     
+
+	     sst.stepsa = sst.stepsa + 1;		/* count total steps			*/
+	     sst.asteps (ptsi) = sst.asteps (ptsi) + 1;	/* count steps for this size */
+
+	     if aste.dius then do;			/* volume dumper is using it */
+		sst.askipdius = sst.askipdius + 1;
+		goto skip;
+		end;
+
+	     if aste.ehs | aste.ddnp | aste.deact_error then do;
+						/* Check for ehs = entry_hold, or ddnp
+						   without that, which = being prewithdrawn. */
+		sst.askipsehs = sst.askipsehs + 1;
+		go to skip;
+		end;
+
+	     if aste.init then do;			/* check for grace lap flag */
+		aste.init = "0"b;			/* turn off flag */
+		sst.askipsinit = sst.askipsinit + 1;
+		go to skip;
+		end;
+
+	     if (aste.np ^= ""b) | (aste.infp ^= ""b) then do; /* check for no inferiors, no pages in memory*/
+		sst.askipslevel = sst.askipslevel + 1;
+		goto skip;
+		end;
+
+	     if synchronized_only & ^aste.synchronized then do;	/* check for synch seg restrictions */
+		sst.synch_skips = sst.synch_skips + 1;
+		goto skip;
+	     end;
+
+	     sst.ausedp (ptsi) = rel (astep);
+	     call my_deactivate (astep, code);
+	     if code = 0 then goto return_aste;
+
+skip:
+	     if aste.fmchanged & ^aste.per_process then do;
+						/* check for AST trickle */
+		call update_vtoce (astep);		/* update the vtoc entry */
+		sst.updates = sst.updates + 1;
+		end;
+	end;
+%page;
+/*   This is the tough search.  At this point we are willing to do a lot
+     more work to find the right aste to deactivate.  We assume that this
+     search is rarely needed, and so we are not concerned with the overhead
+     involved.  
+
+     In this search, the entire aste list is walked (again, excepting aste's
+     which are protected for this call to get_aste), and a cost is computed
+     for deactivating each aste which can be deactivated.  Since we are in
+     desparate straights, we are willing to deactivate inferiors (if necessary).
+     However, the restrictions of entry-hold switch, dumper-in-use, ddnp,
+     and deact_error still apply; further, an aste cannot be deactivated if
+     any of these conditions prevent an inferior from being deactivated.
+     After a walk of the entire list, the aste with the lowest cost is
+     deactivated (following a bottom-up deactivation of all of its inferiors).
+
+     Synchronized segments are special-cased if the per-pool limit on these
+     is exceeded. The first such segment which can be deactivated is deactivated.
+     This logic is a hedge against flooding the system with de-facto entry-held
+     segments. It is expected to be executed rarely.
+*/
+
+deact_error:
+	best_cost = 1f16b;
+	mp_astep = null ();
+	do astep = fastep repeat (pointer (astep, aste.fp)) while (aste.fp ^= rel (lastep));
+	     cost_total = 0;
+	     if ^synchronized_only then do;		/* Normal case */
+		call check (astep, code);		/* calculate the cost */
+		if code ^= 0 then goto ddir_loop;
+		call walk_ast (check, code);		/* check the inferior hierarchy */
+		if code ^= 0 then goto ddir_loop;
+		
+		if cost_total < best_cost then do;
+		     best_cost = cost_total;
+		     mp_astep = astep;
+		end;
+	     end;
+	     else do;				/* Synchronized only */
+		call check (astep, code);
+		if code ^= 0 then goto ddir_loop;
+		sst.ausedp (ptsi) = rel (astep);
+		call my_deactivate (astep, code);
+		if code = 0 then goto return_aste;
+	     end;
+ddir_loop:
+	end;
+
+	if mp_astep = null () then do;		/* didn't find anything */
+err_out:
+	     if ^synchronized_only then
+		call syserr (0, "get_aste: No removable ^dk AST entries.", pts);
+	     else call syserr (4, "get_aste: No removable ^dk synchronized AST entries.", pts);
+	     return (null ());
+	     end;
+
+	astep = mp_astep;
+	call walk_ast (my_deactivate, code);		/* deactivate all inferiors */
+	if code ^= 0 then goto deact_error;
+
+	sst.ausedp (ptsi) = rel (astep);
+	call my_deactivate (astep, code);
+	if code ^= 0 then goto deact_error;
+
+	sst.asearches = sst.asearches + 1;
+	sst.acost = sst.acost + best_cost;
+
+	goto return_aste;
+
+/* * * * * * * * * * WALK_AST * * * * * * * * * */
+
+walk_ast:
+     procedure (Proc, Code);
+dcl Proc variable entry (ptr, fixed bin (35)) parameter;
+dcl Code fixed bin (35) parameter;
+dcl inf_astep ptr;
+dcl next_astep ptr;
+dcl brother bit (1) aligned;
+
+/* This procedure walks the tree of active inferiors of an active directory,
+   calling the supplied procedure on each branch.  The branches are processed
+   bottom-up. */
+
+	Code = 0;
+	inf_astep = astep;
+find_son:						/* walk to the bottom of the subtree */
+	do while (inf_astep -> aste.infp ^= ""b);
+	     inf_astep = pointer (inf_astep, inf_astep -> aste.infp);
+	end;
+process_aste:
+	if inf_astep = astep then return;		/* we have walked the whole tree */
+	if inf_astep -> aste.infl ^= ""b then do;	/* next do his brother */
+	     next_astep = pointer (inf_astep, inf_astep -> aste.infl);
+	     brother = "1"b;	
+	     end;
+	else do;
+	     next_astep = pointer (inf_astep, inf_astep -> aste.par_astep);
+	     brother = "0"b;
+	     end;
+	call Proc (inf_astep, Code);			/* process the branch */
+	if Code ^= 0 then return;
+	inf_astep = next_astep;
+	if brother then goto find_son;
+	else goto process_aste;
+     end walk_ast;
+
+%page;
+
+/* * * * * * * * * * CHECK * * * * * * * * * * */
+
+check:
+     procedure (Astep, Code);
+dcl Astep ptr parameter;
+dcl Code fixed bin (35) parameter;
+
+dcl pn fixed bin;
+
+/* check makes sure that a directory can be deactivated safely 
+   It also increments the cost function.  At the same time, it checks
+   whether this aste (an inferior to the one being considered for
+   deactivation) is in the same aste pool as the aste being considered.
+   If it is, a non-zero code is returned, since we know that there is
+   an aste in the pool with lower cost than the one being considered currently
+   (namely, this one).									*/
+     
+
+	if (Astep -> aste.ehs) | (Astep -> aste.ddnp) | (Astep -> aste.dius) | (Astep -> aste.deact_error)
+	then goto cant_do_it;
+	if synchronized_only & ^(Astep -> aste.synchronized)
+	then goto cant_do_it;
+	if (binary (Astep -> aste.ptsi) = ptsi) & (astep ^= Astep) then do;
+cant_do_it:
+	     Code = -1;
+	     return;
+	     end;
+
+	Code = 0;
+	ptp = addrel (Astep, sst.astsize);		/* Start with page zero */
+	cost_total = cost_total + 1;			/* Costs one for the ASTE itself */
+
+	do pn = 1 to pts;
+	     cost_total = cost_total + ptw_cost (ptp);
+	     ptp = addrel (ptp, 1);
+	     end;
+
+	if cost_total > best_cost then Code = -1;	/* aste being considered cannot win		*/
+
+     end check;
+%page;
+
+/* * * * * * * * * * PTW_COST * * * * * * * * * */
+
+ptw_cost: proc (Ptwp) returns (fixed bin);
+
+/* This procedure returns the "cost" of flushing one PTW. If the PTW
+   has not been used or modified, the cost is zero. If it has been either
+   used or modified, the cost is one. If it has been both, the cost is two.
+   */
+
+dcl  Ptwp pointer parameter;
+
+dcl  used bit (1) aligned;
+dcl  mod bit (1) aligned;
+
+
+	if sys_info$system_type = ADP_SYSTEM then
+	     used = (Ptwp -> adp_ptw.phu) | (Ptwp -> adp_ptw.phu1);
+	else used = (Ptwp -> l68_ptw.phu) | (Ptwp -> l68_ptw.phu1);
+
+	if sys_info$system_type = ADP_SYSTEM then
+	     mod = (Ptwp -> adp_ptw.phm) | (Ptwp -> adp_ptw.phm1);
+	else mod = (Ptwp -> l68_ptw.phm) | (Ptwp -> l68_ptw.phm1);
+
+	if (used & mod) then return (2);
+	else if (used | mod) then return (1);
+	else return (0);
+
+	end ptw_cost;
+
+
+%page;
+
+/* * * * * * * * * * MY_DEACTIVATE * * * * * * * * * * */
+
+/* Internal procedure to deactivate an aste.
+   If an error of any sort occurs here, a message is printed on the console,
+   and the flag aste.deact_error is set so that this aste will be skipped
+   in the aste replacement search.  This flag is reset by flush_ast_pool.				*/
+     
+
+my_deactivate:
+     procedure (Astep, Code);
+dcl Astep ptr parameter;
+dcl Code fixed bin (35) parameter;
+
+	call deactivate (Astep, Code);
+	if Code ^= 0 then 
+	     if ^(Astep -> aste.synchronized) | (Code ^= error_table_$deact_in_mem) then do;
+	     Astep -> aste.deact_error = "1"b;
+	     call syserr$error_code (3, Code,
+		"get_aste: Error deactivating ^w (VTOCE ^o on pvt ^o) to free ^dK ASTE for ^a.", Astep -> aste.uid,
+		Astep -> aste.vtocx, Astep -> aste.pvtx, pts, pds$process_group_id);
+	     end;
+     end my_deactivate;
+
+%page; %include sst;
+%page; %include aste;
+%page; %include system_types;
+%page; %include "ptw.l68";
+%page; %include "ptw.adp";
+
+/*  */
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   get_aste: no removable XXXk ast entries
+
+   S: $info
+
+   T: $run
+
+   M: An AST entry was needed for a segment of size XXX k, but no free
+   entries of that size were present, and no segments occupying such
+   entries could be deactivated. This could be symptomatic of a
+   logic problem, but may also indicate a grossly mistuned AST.
+
+   A: 
+   Substantially increase the number of AST entries of this size as
+   given on the SST CONFIG card. If the problem persists, contact the
+   system programming staff.
+
+   Message:
+   get_aste: no removable XXXk synchronized AST entries
+
+   S: $log
+
+   T: $run
+
+   M: An AST entry was needed for a synchronized segment of size XXX k, and
+   the per-ASTE-pool limit on synchronized segments was reached. No synchronized
+   segments in that pool could be deactivated.
+
+   A: Contact the system programming staff.
+
+   Message:
+   get_aste: Invalid csl x
+
+   S:     $log
+
+   T:     $run
+
+   M:     get_aste was called to activate a segment with x pages,
+which is larger than the maximum segment size.  This is indicative
+of hardware or software failure (a typical problem is an invalid
+VTOCE).
+
+   A:     If the problem persists, contact the system programming staff.
+
+
+   Message:
+   get_aste: Error deactivating UUUU (vtoc V of pvt PV) to free XXXk ASTE for USERNAME.
+
+   S: $log
+
+   T: $run
+
+   M: The system encountered an error deactivating an AST entry which was
+   selected for deactivation by the AST replacement algorithm.  The AST
+   on which the error was encountered will be flagged to be ingored by
+   further passes of the algorithm; this flag will be reset during the next
+   run of flush_ast_pool.
+
+   A: If the problem persists, contact the system programming staff.
+
+   END MESSAGE DOCUMENTATION */
+
+     end get_aste;

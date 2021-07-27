@@ -1,0 +1,446 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+init_toehold: procedure;
+
+/* init_toehold.pl1 -- fills in the static data in toehold.alm and saves the
+   bootload Multics image. */
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+
+/* This program is IOM/IMU dependent. */
+
+/* BIM 11/82 */
+/* Modified 8/83 Keith Loepere for absolute mode toehold, saving of "crash" image to disk */
+/* Modified 3/84 kpl for saving safe_config_deck */
+/* Modified 8/84 Chris Jones for new disk dim. */
+/* Modified 10/84 kpl to fix stupid bug in loop limits. */
+/* Modified 3/85 Keith Loepere to fix config deck saving now that 
+   move_non_perm_wired_segs works. */
+/* Modified 4/85 by RAF to support the larger 3380 disk drives */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Fawcett), approve(85-09-09,MCR6979),
+     audit(86-02-13,GDixon), install(86-03-21,MR12.0-1033):
+     Support IBM FIPS disk drives.
+  2) change(86-03-12,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-07,GDixon), install(86-07-17,MR12.0-1097):
+     Add support for subvolumes, MSU3380 and MSU3390.
+  3) change(87-04-14,Farley), approve(87-07-06,MCR7717),
+     audit(87-07-13,Lippard), install(87-07-17,MR12.1-1043):
+     Changed to make sure toehold.seeks_used was set to the higher of the two
+     dcw lists.
+                                                   END HISTORY COMMENTS */
+
+dcl  Config_deck_size	        fixed bin init (4) static options (constant);
+dcl  Max_pages_in_segment	        fixed bin init (256) static options (constant);
+dcl  Pages_per_dcw		        fixed bin init (4) static options (constant);
+dcl  Toehold_size		        fixed bin init (2) static options (constant);
+dcl  Hardware_low_mem_page_size       fixed bin init (2) static options (constant);
+dcl  absadr		        entry (pointer, fixed (35)) returns (fixed bin (26));
+dcl  pc$flush		        entry;
+dcl  pmut$camp		        entry;
+dcl  ptw_util_$make_core	        entry (ptr, fixed bin (26));
+dcl  save_handler_mc	        entry (ptr);
+dcl  sdw_util_$get_address	        entry (ptr, fixed bin (26));
+dcl  syserr		        entry options (variable);
+dcl  syserr$error_code	        entry options (variable);
+dcl  write_disk$write_disk_no_test    entry (fixed bin, fixed bin (18), ptr, fixed bin (35));
+
+dcl  abs_seg0$		        (0:255) bit (36 * 1024) aligned external;
+dcl  config_deck$		        external;
+dcl  dseg$		        (0:2047) fixed bin (71) external aligned;
+dcl  emergency_shutdown$	        external;
+dcl  fault_vector$		        external;
+dcl  int_unpaged_page_tables$	        external;
+dcl  pvt$root_pvtx		        fixed bin external static;
+dcl  safe_config_deck$	        external;
+dcl  sys_boot_info$bce_part_frec      fixed bin external static;
+dcl  sys_boot_info$config_part_frec   fixed bin external static;
+dcl  sys_boot_info$safe_config_deck_frec fixed bin external static;
+dcl  toehold_data$		        external static bit (36) aligned;
+
+dcl  abs_seg_pt_abs_addr	        fixed bin (26);
+dcl  code			        fixed bin (35);
+dcl  disk_channel_number	        fixed bin (7);
+dcl  disk_iom_number	        fixed bin (3);
+dcl  disk_iom_port_number	        fixed bin (3);
+dcl  disk_device_number	        fixed bin (6);
+dcl  fault_vector_abs_addr	        fixed bin (26);
+dcl  iom_mailbox_abs_addr	        fixed bin (26);
+dcl  old_memory_state	        fixed bin;
+dcl  records_to_do		        fixed bin (18);
+dcl  rpv_devt		        fixed bin;
+dcl  running_address	        fixed bin;
+dcl  running_seeks		        fixed bin;
+dcl  running_record		        fixed bin (18);
+dcl  sx			        fixed bin;
+dcl  toehold_abs_addr	        fixed bin (18);
+dcl  toehold_page_addr	        fixed bin;
+
+dcl  abs_seg_pt		        (0:255) bit (36) aligned based (abs_seg_pt_ptr); /* for abs_seg0 */
+dcl  abs_seg_pt_ptr		        ptr;
+
+dcl  1 (seek_idcw_template, data_idcw_template)
+			        aligned like idcw;
+
+dcl  (addr, addrel, currentsize, dimension, divide, hbound, lbound, max, min, mod, ptr, segno, unspec) builtin;
+%page;
+	if sys_boot_info$bce_part_frec = -1
+	     then call syserr (CRASH, "init_toehold: No ""bce"" partition on rpv. Rebuild the RPV to add one.");
+
+	toehold_abs_addr = absadr (addr (toehold$), (0));
+	toehold_page_addr = divide (toehold_abs_addr, 1024, 17);
+	toehold_ptr = addr (toehold$);
+	fault_vector_abs_addr = absadr (addr (fault_vector$), (0));
+	iom_mailbox_abs_addr = absadr (addr (iom_mailbox$), (0));
+
+	sys_boot_info$safe_config_deck_frec = divide (absadr (addr (safe_config_deck$), (0)), 1024, 16)
+	     + sys_boot_info$bce_part_frec + CRASH_HANDLER_RECORDX;
+						/* find this before safe_config_deck is moved in memory */
+
+	toehold.memory_state = 0;			/* contents invalid */
+
+	call find_rpv;				/* io paths to rpv */
+
+	toehold.esd_segnum = segno (addr (emergency_shutdown$));
+
+	unspec (seek_idcw_template) = IDCW_INIT_STRING;
+	seek_idcw_template.command = seek_command (rpv_devt); /* Seek */
+	seek_idcw_template.device = disk_device_number;
+	seek_idcw_template.ext_ctl = "0"b;
+	seek_idcw_template.control = PROCEED;
+	seek_idcw_template.chan_cmd = SINGLE_RECORD;
+	unspec (data_idcw_template) = unspec (seek_idcw_template);
+
+/* write command = "31"b3; read command = "25"b3 */
+
+	data_idcw_template.ext_ctl = "1"b;		/* data is anyplace */
+	data_idcw_template.control = TERMINATE;
+
+	unspec (toehold.save_dcws) = ""b;
+	unspec (toehold.handler_dcws) = ""b;
+
+	dcw_list_ptr = addr (toehold.save_dcws);
+	toehold.dcws_per_cyl = divide (rec_per_cyl (rpv_devt) + (Pages_per_dcw - 1), Pages_per_dcw, 17);
+	toehold.seeks_used = 1;			/* set here so that the dcw_list_size will be correct */
+	toehold.dcw_list_size = currentsize (dcw_list);	/* this is used by toehold */
+	running_seeks = 0;
+	running_address = Hardware_low_mem_page_size;
+	running_record = sys_boot_info$bce_part_frec + SAVED_IMAGE_RECORDX + running_address;
+	records_to_do = toehold_page_addr - running_address;
+
+/* don't save, restore iom_mailbox or toehold */
+
+	do while (records_to_do > 0);
+	     running_seeks = running_seeks + 1;
+	     call process_one_cylinder (running_seeks, addr (toehold.save_dcws));
+	end;
+
+	running_address = toehold_page_addr + Toehold_size;
+	running_record = sys_boot_info$bce_part_frec + SAVED_IMAGE_RECORDX + running_address;
+	records_to_do = Max_pages_in_segment + Max_pages_in_segment - running_address;
+
+	do while (records_to_do > 0);
+	     running_seeks = running_seeks + 1;
+	     call process_one_cylinder (running_seeks, addr (toehold.save_dcws));
+	end;
+
+	toehold.seeks_used = running_seeks;		/* remember seeks used for save_dcws */
+
+/* now list to read in config deck and handler */
+
+	running_seeks = 0;
+	running_record = sys_boot_info$config_part_frec;
+	running_address = divide (absadr (addr (config_deck$), (0)), 1024, 18);
+	records_to_do = Config_deck_size;
+
+	do while (records_to_do > 0);
+	     running_seeks = running_seeks + 1;
+	     call process_one_cylinder (running_seeks, addr (toehold.handler_dcws));
+	end;
+
+	running_address = toehold_page_addr + Toehold_size;
+	running_record = sys_boot_info$bce_part_frec + CRASH_HANDLER_RECORDX + running_address;
+	records_to_do = Max_pages_in_segment + Max_pages_in_segment - running_address;
+
+	do while (records_to_do > 0);
+	     running_seeks = running_seeks + 1;
+	     call process_one_cylinder (running_seeks, addr (toehold.handler_dcws));
+	end;
+
+	toehold.seeks_used = max (running_seeks, toehold.seeks_used);
+						/* remember longest of the two lists */
+%page;
+
+/* save fault_vector and iom_mailbox in toehold_data for handler */
+
+	unspec (addrel (addr (toehold_data$), fault_vector_abs_addr) -> fv) =
+	     unspec (addr (fault_vector$) -> fv);
+
+	unspec (addrel (addr (toehold_data$), iom_mailbox_abs_addr) -> iom_mailbox_seg) =
+	     unspec (addr (iom_mailbox$) -> iom_mailbox_seg);
+
+/* save "crash" handler to disk */
+
+	call pc$flush;
+	call sdw_util_$get_address (addr (dseg$ (segno (addr (abs_seg0$)))), abs_seg_pt_abs_addr); /* build segment onto high 256k mem */
+	abs_seg_pt_ptr = ptr (addr (int_unpaged_page_tables$), abs_seg_pt_abs_addr - absadr (addr (int_unpaged_page_tables$), (0)));
+
+	do running_address = 0 to Max_pages_in_segment - 1;
+	     call ptw_util_$make_core (addr (abs_seg_pt (running_address)), (running_address + Max_pages_in_segment) * 1024);
+	end;
+	call pmut$camp;
+
+	do running_address = Max_pages_in_segment + Max_pages_in_segment - 1 to Max_pages_in_segment by -1; /* save backwards is faster */
+	     running_record = sys_boot_info$bce_part_frec + CRASH_HANDLER_RECORDX + running_address;
+	     call write_disk$write_disk_no_test (pvt$root_pvtx, running_record, addr (abs_seg0$ (running_address - Max_pages_in_segment)), code);
+	     if code ^= 0 then call syserr$error_code (CRASH, code, "init_toehold: Unable to save bootload Multics image to disk.");
+	end;
+
+	do running_address = 0 to Max_pages_in_segment - 1; /* low mem */
+	     call ptw_util_$make_core (addr (abs_seg_pt (running_address)), running_address * 1024);
+	end;
+	call pmut$camp;
+
+	do running_address = Max_pages_in_segment - 1 to toehold_page_addr + Toehold_size by -1; /* don't save toehold (or what's below it) */
+	     running_record = sys_boot_info$bce_part_frec + CRASH_HANDLER_RECORDX + running_address;
+	     call write_disk$write_disk_no_test (pvt$root_pvtx, running_record, addr (abs_seg0$ (running_address)), code);
+	     if code ^= 0 then call syserr$error_code (CRASH, code, "init_toehold: Unable to save bootload Multics image to disk.");
+	end;
+
+	call save_handler_mc (addr (toehold$));
+
+/* must be done as soon as possible after disk save */
+
+/* We get here at two different times.  The first case is when init_toehold
+was called from real_initializer.  At this time, we simply continue on from
+this point with filling in the toehold.  In the second case, we have just
+crashed/shut down, and the toehold has restarted bce.  When restarting bce, it
+transfers to the last location it knows, which was the last instruction in
+save_handler_mc, thus returning us here.  In this case, we must quickly get out
+of here and back to real_initializer, who will know what to do (reinitialize
+bce).  Thus, this operation is the last thing done here in init_toehold.
+
+This whole thing is done since bce must be restarted with the stack history
+basically intact, since from the reinitialized bce we may want to re-boot
+Multics, which depends on the normal flow of control, including the sequence
+of calls leading up to real_initializer. */
+
+/* toehold will be declared valid (memory_state set) in real_initializer */
+
+	return;
+%page;
+save_safe_config_deck: entry;
+
+/* Save the safe config deck into the crash handler for future possible 
+failure of bce */
+
+	toehold_ptr = addr (toehold$);
+
+	old_memory_state = toehold.memory_state;
+	toehold.memory_state = 0;			/* while finding rpv */
+
+	call find_rpv;				/* find new io paths */
+
+	toehold.memory_state = old_memory_state;
+
+	do running_record = sys_boot_info$safe_config_deck_frec + Config_deck_size - 1 to sys_boot_info$safe_config_deck_frec by -1;
+	     call write_disk$write_disk_no_test (
+		pvt$root_pvtx, running_record,
+		addrel (addr (safe_config_deck$), 1024 * (running_record - sys_boot_info$safe_config_deck_frec)), code);
+	     if code ^= 0 then call syserr$error_code (BEEP, code, "init_toehold: Unable to save safe_config_deck to disk.");
+	end;
+	return;
+%page;
+process_one_cylinder:
+     procedure (cx, p_dcw_list_ptr);
+dcl  cx			        fixed bin;		/* dcw_list cylinder index */
+dcl  p_dcw_list_ptr		        ptr;
+dcl  full_tallys		        fixed bin;
+dcl  i			        fixed bin;
+dcl  records_to_do_here	        fixed bin (18);
+dcl  residue		        fixed bin;
+
+	dcw_list_ptr = p_dcw_list_ptr;
+	dcw_list (cx).seek_idcw = unspec (seek_idcw_template);
+	data_idcw_template.ext = ext_value (running_address);
+	dcw_list (cx).data_idcw = unspec (data_idcw_template);
+	dcw_list (cx).seek_addresses = sector (running_record);
+	dcw_ptr = addr (dcw_list (cx).seek_dcw);
+	unspec (dcw) = IOTD_INIT_STRING;
+	dcw.address = absadr (addr (dcw_list.seek_addresses (cx)), (0));
+	dcw.tally = 1;
+
+/**** First calculate the limit of records we can write into the */
+/**** current cylinder. This cannot come out 0 */
+
+	records_to_do_here = min (records_to_do, rec_per_cyl (rpv_devt) - mod (running_record, rec_per_cyl (rpv_devt)));
+
+/**** Then correct for the 256K boundary, which occurs when we go from page */
+/**** 255 to page 256. */
+
+	if ext_value (running_address) < 1 & ext_value (running_address + records_to_do_here) ^< 1
+	     then records_to_do_here = Max_pages_in_segment - running_address; /* if running_addr is 255 (256'th page), do that 1 record */
+
+/**** Now fill in the dcws */
+
+	if mod (records_to_do_here, Pages_per_dcw) = 0
+	then do;
+	     full_tallys = divide (records_to_do_here, Pages_per_dcw, 18, 0);
+	     residue = 0;
+	end;
+	else do;
+	     full_tallys = divide (records_to_do_here, Pages_per_dcw, 18, 0);
+	     residue = mod (records_to_do_here, Pages_per_dcw);
+	end;
+
+	do i = 1 to full_tallys;
+	     dcw_ptr = addr (dcw_list (cx).data_dcws (i));
+	     unspec (dcw) = IOTP_INIT_STRING;
+	     dcw.address = mod (running_address, Max_pages_in_segment) * 1024;
+	     dcw.tally = 0;				/* 4096 */
+	     running_address = running_address + Pages_per_dcw;
+	     running_record = running_record + Pages_per_dcw;
+	end;
+	if residue = 0
+	     then dcw.type = IOTD;			/* ptr left at last one */
+	else do;
+	     dcw_ptr = addr (dcw_list (cx).data_dcws (i));/* i is 1 past */
+	     unspec (dcw) = IOTD_INIT_STRING;
+	     dcw.address = mod (running_address, Max_pages_in_segment) * 1024;
+	     dcw.tally = residue * 1024;
+	     running_address = running_address + residue;
+	     running_record = running_record + residue;
+	end;
+
+	records_to_do = records_to_do - records_to_do_here;
+
+/***** WHEW --- all set up */
+     end process_one_cylinder;
+
+
+
+
+/* rpv_devt is a global parameter of this */
+
+sector:
+     procedure (Record) returns (fixed bin (35));
+dcl  Record		        fixed bin (18);
+dcl  devadd		        fixed bin (18);
+dcl  record_offset		        fixed bin (18);
+	if pvte.is_sv then do;
+						/* convert the subvolume devadd to the real devadd */
+
+	     record_offset = mod (Record, pvte.records_per_cyl);
+	     devadd = ((Record - record_offset) * pvte.num_of_svs) +
+		pvte.record_factor + record_offset;
+	end;
+	else devadd = Record;
+	return ((divide (devadd, rec_per_cyl (rpv_devt), 18, 0) * sect_per_cyl (rpv_devt))
+	     + (mod (devadd, rec_per_cyl (rpv_devt)) * sect_per_rec (rpv_devt)));
+     end sector;
+
+ext_value:
+     procedure (Address) returns (fixed bin);
+dcl  Address		        fixed bin;
+
+	return (divide (Address, Max_pages_in_segment, 18, 0));
+     end ext_value;
+%page;
+find_rpv: proc;
+
+/* find out about rpv, in particular, paths to it */
+
+	pvt_arrayp = addr (pvt$array);
+	pvtep = addr (pvt_array (pvt$root_pvtx));
+	rpv_devt = pvte.device_type;
+	disk_device_number = pvte.logical_area_number;
+
+/* find the main channel to this disk. */
+
+	disksp = addr (disk_seg$);
+	iom_data_ptr = addr (iom_data$);
+	do sx = 1 to disk_data.subsystems while (disk_data.name (sx) ^= pvte.devname);
+	end;
+	diskp = ptr (disksp, disk_data.offset (sx));
+
+	do toehold.n_paths_used = 1 to min (dimension (toehold.paths, 1), disktab.nchan);
+	     cp = addr (ptr (disksp, disktab.channels) -> disk_channel_table (toehold.n_paths_used));
+	     disk_iom_number = iom_data.per_device (chantab.chx).iom;
+	     disk_channel_number = iom_data.per_device (chantab.chx).channel;
+
+	     do disk_iom_port_number = lbound (scs$port_data, 1) to hbound (scs$port_data, 1)
+		while (scs$port_data (disk_iom_port_number).assigned ^= IOM_PORT
+		| scs$port_data (disk_iom_port_number).iom_number ^= disk_iom_number);
+	     end;
+
+	     toehold.paths (toehold.n_paths_used).port_number = disk_iom_port_number;
+	     toehold.paths (toehold.n_paths_used).iom_number = disk_iom_number;
+	     toehold.paths (toehold.n_paths_used).channel_number = disk_channel_number;
+
+	     pcw_ptr = addr (toehold.paths (toehold.n_paths_used).pcw);
+	     unspec (pcw) = PCW_INIT_STRING;
+	     pcw.command = "40"b3;			/* reset status */
+	     pcw.device = disk_device_number;
+	     pcw.ext = 0;
+	end;
+	toehold.n_paths_used = toehold.n_paths_used - 1;	/* do went 1 too far */
+	return;
+     end;
+%page; %include dskdcl;
+%page; %include fault_vector;
+%page; %include fs_dev_types;
+%page; %include io_chnl_util_dcls;
+%page; %include iom_chan_control_words;
+%page; %include iom_data;
+%page; %include pvte;
+%page; %include scs;
+%page; %include syserr_constants;
+%page; %include toehold_save_dcls_;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   init_toehold: No "bce" partition on rpv. Rebuild the RPV to add one.
+
+   S: $crash
+
+   T: $init
+
+   M:  The partition used to hold the bootload command environment is
+   missing from the rpv.  
+
+   A:  A rebuild of the rpv is necessary.
+
+   Message:
+   init_toehold: Unable to save bootload Multics image to disk.
+
+   S: $crash
+
+   T: $init
+
+   M: An i/o error prevented the establishment of the bce crash handler.
+
+   Message:
+   init_toehold: Unable to save safe_config_deck to disk.
+
+   S: $beep
+
+   T: $init
+
+   M: The safe_config_deck, used to re-establish bce when a failure of bce 
+   itself occurs, could not be updated to disk.  A future failure of bce may 
+   be catastrophic.
+
+   A: Try performing a reinitialize operation, making sure that the config 
+   deck is perfect.
+
+   END MESSAGE DOCUMENTATION */
+
+     end init_toehold;

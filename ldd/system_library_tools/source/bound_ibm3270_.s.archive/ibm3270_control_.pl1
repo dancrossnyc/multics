@@ -1,0 +1,1183 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* IBM3270_CONTROL_ - Implements the control entry (and the guts of) the ibm3270_ I/O module */
+/* Written October 1977 by Larry Johnson */
+
+ibm3270_control_: proc;
+
+/* Paramaters */
+
+dcl  arg_iocbp ptr;
+dcl  arg_order char (*);
+dcl  arg_info_ptr ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_event_call_infop ptr;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  state fixed bin;
+dcl  order char (32);
+dcl  info_ptr ptr;
+dcl  iocbp ptr;
+dcl  event_call_infop ptr;
+
+dcl 1 auto_read_ctl like read_ctl aligned automatic;
+
+dcl 1 event_info aligned,				/* For ipc_$block */
+    2 channel_id fixed bin (71),
+    2 message fixed bin (71),
+    2 sender bit (36),
+    2 origon,
+      3 dev_signal bit (18) unal,
+      3 ring bit (18) unal,
+    2 channel_index fixed bin (17);
+
+/* Based */
+
+dcl  based_chan fixed bin (71) based;			/* Event_info order */
+dcl  poll_device fixed bin based (info_ptr);		/* Argument for poll order */
+
+dcl 1 event_call_info aligned based (event_call_infop),
+    2 channel_id fixed bin (71),
+    2 message fixed bin (71),
+    2 sender bit (36),
+    2 origon,
+      3 dev_signal bit (18) unal,
+      3 ring bit (18) unal,
+    2 data_ptr ptr;
+
+dcl 1 msg unal based (ad.text_buf_ptr),			/* Start of standard reply */
+    2 address,
+      3 pad1 bit (3),
+      3 controller bit (6),
+      3 pad2 bit (3),
+      3 device bit (6),
+    2 pad3 bit (3),
+    2 aid bit (6),					/* Action code */
+    2 cursor char (2);
+
+dcl  out_reqp ptr;					/* Pointer to current output request */
+
+dcl 1 out_req aligned based (out_reqp),			/* Output is a queue of these structures */
+    2 next_out_reqp ptr,				/* Forward pointer */
+    2 out_msgp ptr,					/* Pointer to text */
+    2 out_msgl fixed bin,				/* Its length */
+    2 sent_len fixed bin,				/* Amount of data actually sent */
+    2 req_time fixed bin (71),			/* Time request queued */
+    2 device fixed bin,				/* Device this message is for */
+    2 retry_count fixed bin,				/* Times this output has been tried */
+    2 eot_sent bit (1);				/* Send once eot sent for this request */
+
+dcl  out_msg char (out_req.out_msgl) based (out_req.out_msgp);
+
+dcl  poll_reqp ptr;					/* Pointer to poll queue block */
+
+dcl 1 poll_req aligned based (poll_reqp),
+    2 next_poll_reqp ptr,
+    2 device fixed bin;
+
+/* Constants */
+
+
+/* The following 2 arrays map the low order 5 bits of an ebcdic aid byte into the values required
+   in read_info.key and sub_key */
+
+dcl  aid_to_key (0:31) fixed bin (8) unal int static options (constant) init (
+     0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 5, 5, 6, 5, 0,
+     9, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 8, 0);
+
+dcl  aid_to_sub_key (0:31) fixed bin (8) unal int static options (constant) init (
+     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 0, 2, 0,
+     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 0, 0);
+
+/* The following map values of write_info.command to the command code */
+
+dcl  command_codes (6) bit (8) unal int static options (constant) init (
+     "f1"b4, "f5"b4, "f7"b4, "6f"b4, "f6"b4, "f2"b4);
+
+/* External */
+
+dcl  hcs_$tty_read entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35));
+dcl  hcs_$tty_order entry (fixed bin, char (*), ptr, fixed bin, fixed bin (35));
+dcl  hcs_$tty_write entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35));
+dcl  ibm3270_translate_$ascii_to_ebcdic entry (ptr, fixed bin);
+dcl  ibm3270_translate_$ebcdic_to_ascii entry (ptr, fixed bin);
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl  ibm3270_io_call_ entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$mask_ev_calls entry (fixed bin (35));
+dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+
+dcl  error_table_$bad_arg ext fixed bin (35);
+dcl  error_table_$no_operation ext fixed bin (35);
+dcl  error_table_$request_pending ext fixed bin (35);
+dcl  error_table_$unimplemented_version ext fixed bin (35);
+dcl  error_table_$line_status_pending ext fixed bin (35);
+dcl  error_table_$long_record ext fixed bin (35);
+
+dcl (addr, addrel, bin, clock, divide, hbound, index, lbound, length, low, max, min, mod, null, string, substr, unspec) builtin;
+
+dcl  cleanup condition;
+
+%include ibm3270_attach_data;
+
+%include ibm3270_io_info;
+
+%include iocb;
+
+%include bisync_line_data;
+
+
+/* The control entry point */
+
+control:	entry (arg_iocbp, arg_order, arg_info_ptr, arg_code);
+
+	iocbp = arg_iocbp -> iocb.actual_iocb_ptr;
+	adp = iocbp -> iocb.attach_data_ptr;
+	order = arg_order;
+	info_ptr = arg_info_ptr;
+	read_ctlp = addr (auto_read_ctl);
+
+/* Following orders are allowed before open */
+
+	if order = "event_info" then do;
+	     info_ptr -> based_chan = ad.user_channel;
+	     code = 0;
+	     go to control_return;
+	end;
+	if order = "io_call" then do;
+	     call ibm3270_io_call_ (iocbp, info_ptr, code);
+	     go to control_return;
+	end;
+
+	if iocbp -> iocb.open_descrip_ptr = null then do; /* Not open yet */
+	     code = error_table_$no_operation;
+	     go to control_return;
+	end;
+
+/* Orders allowed after switch is open */
+
+	if order = "general_poll" then do;
+	     ad.general_poll = "1"b;			/* We want to be polling */
+	     call worker;
+	     code = 0;
+	end;
+
+	else if order = "stop_general_poll" then do;
+	     ad.general_poll = "0"b;
+	     call stop_auto_poll;
+	     code = 0;
+	end;
+
+	else if order = "poll" then do;
+	     call queue_poll_req (poll_device);
+	     call worker;
+	     code = 0;
+	end;
+
+	else if order = "read" then do;		/* Get next data block */
+	     read_ctlp = info_ptr;
+	     if read_ctl.version ^= 1 then do;
+		code = error_table_$unimplemented_version;
+		go to control_return;
+	     end;
+	     if ad.first_read_infop = null then call worker; /* Look harder if none yet */
+	     do while (ad.first_read_infop = null);	/* Then, block until available */
+		ad.wakeup_needed = "1"b;
+		if ad.async then do;		/* Cant block here */
+		     code = error_table_$request_pending;
+		     go to control_return;
+		end;
+		call ipc_$block (addr (ad.wait_list), addr (event_info), code);
+		if code ^= 0 then do;
+		     call convert_ipc_code_ (code);
+		     go to control_return;
+		end;
+		ad.wakeup_needed = "0"b;
+	     end;
+
+	     read_ctlp = info_ptr;			/* This may have been changed */
+	     read_ctl.read_infop = ad.first_read_infop;	/* Return first block */
+	     ad.first_read_infop = read_info.next_read_infop;
+	     if ad.first_read_infop = null then ad.last_read_infop = null;
+	     read_info.next_read_infop = null;		/* Don't let caller see this */
+	     code = 0;
+	     read_ctl.areap = ad.work_areap;
+	     read_ctl.max_len = read_info.max_len;
+	     read_ctl.max_fields = read_info.max_fields;
+	end;
+
+	else if order = "write" then do;
+	     write_infop = info_ptr;
+	     if write_info.device < 0 | write_info.device > 31 then do;
+		code = error_table_$bad_arg;
+		go to control_return;
+	     end;
+	     call format_write_msg;			/* Setup real output */
+	     if code ^= 0 then go to control_return;
+	     call queue_out_req;
+	     call worker;
+	     code = 0;
+	end;
+
+	else do;
+retry_order:   call hcs_$tty_order (ad.tty_index, order, info_ptr, state, code);
+	     if code ^= 0 then do;
+		call check_error_code;
+		if code ^= 0 then go to control_return; /* Serious error */
+		if ad.input_line_status ^= 0 | ad.output_line_status ^= 0 then call worker; /* If line status returned */
+		go to retry_order;			/* Then do callers work */
+	     end;
+	end;
+control_return:
+	arg_code = code;
+	return;
+
+/* This entry is the event call handler for wakeups on the communications channel */
+
+wakeup_handler: entry (arg_event_call_infop);
+
+	event_call_infop = arg_event_call_infop;
+	iocbp = event_call_info.data_ptr;
+	adp = iocbp -> iocb.attach_data_ptr;
+	read_ctlp = addr (auto_read_ctl);
+	if ad.close_in_progress then return;
+
+	call worker;
+
+	if ad.wakeup_needed & (ad.first_read_infop ^= null) then /* Got good data for caller */
+	     call hcs_$wakeup (ad.processid, ad.user_channel, 0, code);
+
+	return;
+
+/* Handler for wakeups on the timer channel */
+
+timer_handler: entry (arg_event_call_infop);
+
+	event_call_infop = arg_event_call_infop;
+	iocbp = event_call_info.data_ptr;
+	adp = iocbp -> iocb.attach_data_ptr;
+	read_ctlp = addr (auto_read_ctl);
+	if ad.close_in_progress then return;
+
+	call unpend_out_req;			/* Unpend all requests */
+
+	return;
+
+/* Procedure to do as much I/O as can be done right now */
+
+worker:	proc;
+
+	     call ipc_$mask_ev_calls (code);
+	     on cleanup call ipc_$unmask_ev_calls (code);
+worker_loop:
+	     call scan_more_input;
+
+	     call send_more_output;
+
+	     if ad.input_line_status ^= 0 then go to worker_loop; /* In case read error reported during output */
+
+	     call poll_more_devices;
+
+	     if ad.input_line_status ^= 0 | ad.output_line_status ^= 0 then go to worker_loop;
+
+	     call ipc_$unmask_ev_calls (code);
+
+	     return;
+
+	end worker;
+
+/* Procedure that parses the input data stream at the bisync level */
+
+scan_more_input: proc;
+
+dcl (i, j) fixed bin ;
+
+check_input_status:
+	     if ad.input_line_status ^= 0 then do;	/* Some bad condition */
+		call queue_error (ad.last_device_polled, (ad.input_line_status));
+		ad.input_line_status = 0;
+		ad.polling_in_progress = "0"b;
+	     end;
+
+get_more_data: if ad.unscanned_data_len = 0 then do;	/* First need some data */
+retry_read:	call hcs_$tty_read (ad.tty_index, ad.input_buf_ptr, 0, ad.input_buf_len, ad.unscanned_data_len,
+		     state, code);
+		if code ^= 0 then do;
+		     call check_error_code;
+		     if code ^= 0 then do;		/* Bad error */
+			call queue_error (-1, code);
+			return;
+		     end;
+		     if ad.input_line_status ^= 0 then go to check_input_status;
+		     else go to retry_read;
+		end;
+		if ad.unscanned_data_len = 0 then return;
+		ad.unscanned_data_ptr = ad.input_buf_ptr;
+	     end;
+
+/* Now dispatch of current state of input scan and the data type */
+
+	     go to get_data (ad.input_state);
+
+get_data (1):					/* Looking for stx in non_transparent mode */
+	     if substr (unscanned_data, 1, 1) = ad.stx then do; /* Found data */
+		ad.input_state = 2;
+		call advance_unscanned_data (1);
+		go to get_more_data;
+	     end;
+	     if substr (unscanned_data, 1, 1) = ad.soh then do; /* Found header */
+		ad.input_state = 4;
+		call advance_unscanned_data (1);
+		go to get_more_data;
+	     end;
+	     if substr (unscanned_data, 1, 1) = ad.eot then call process_eot;
+	     call advance_unscanned_data (1);		/* Move over eot */
+	     go to get_more_data;
+
+get_data (2):					/* In middle of block, looking for etb or etx */
+	     i = index (unscanned_data, ad.etx);
+	     if i = 1 then do;			/* End of block */
+get_data_2a:	call advance_unscanned_data (1);	/* Move over etx */
+		call process_input;
+		ad.input_state = 3;			/* To skip lrc */
+		go to get_more_data;
+	     end;
+
+	     j = index (unscanned_data, ad.etb);	/* Check for etb too */
+	     if j = 1 then do;			/* Found etb before etx */
+get_data_2b:	call advance_unscanned_data (1);	/* Over etb */
+		ad.input_state = 3;			/* Skip lrc */
+		go to get_more_data;
+	     end;
+	     if i = 0 then i = j;			/* If not etx, use etb answer */
+	     else if j ^= 0 then i = min (i, j);	/* If both, use first */
+	     if i = 0 then do;			/* All data is good */
+		call move_data (addr (ad.text_data), ad.unscanned_data_len);
+		go to get_more_data;
+	     end;
+	     call move_data (addr (ad.text_data), i-1);	/* Move stuff before etb or etx */
+	     if substr (unscanned_data, 1, 1) = ad.etx then go to get_data_2a;
+	     else go to get_data_2b;
+
+get_data (3):					/* Skip over lrc character after etx or etb */
+	     if ad.ascii then call advance_unscanned_data (1);
+	     ad.input_state = 1;
+	     go to get_more_data;
+
+get_data (4):					/* Scanning data in header */
+	     i = index (unscanned_data, ad.etx);	/* Look for etx */
+	     if i = 1 then do;			/* Etx first */
+get_data_4a:	call advance_unscanned_data (1);	/* Skip over etxx */
+		ad.input_state = 3;
+		call process_input;
+		go to get_more_data;
+	     end;
+	     j = index (unscanned_data, ad.etb);	/* Also look for etb */
+	     if i = 0 then i = j;			/* If no etx, use etb */
+	     else if j ^= 0 then i = min (i, j);	/* Otherwise use what comes first */
+	     if i = 1 then do;			/* Etb is first */
+get_data_4b:	call advance_unscanned_data (1);	/* Ignore etb */
+		ad.input_state = 3;
+		go to get_more_data;
+	     end;
+	     j = index (unscanned_data, ad.stx);	/* This may also terminate header */
+	     if i = 0 then i = j;			/* If no etb or etx, use stx */
+	     else if j ^= 0 then i = min (i, j);	/* Otherwise use what comes first */
+	     if i = 1 then do;			/* Stx is first */
+get_data_4c:	call advance_unscanned_data (1);
+		ad.input_state = 2;
+		go to get_more_data;
+	     end;
+	     if i = 0 then do;			/* Didnt find any special chars */
+		call move_data (addr (ad.header_data), ad.unscanned_data_len);
+		go to get_more_data;
+	     end;
+	     call move_data (addr (ad.header_data), i-1);
+	     i = 1;				/* First char is now control char */
+	     if substr (unscanned_data, 1, 1) = ad.etx then go to get_data_4a;
+	     else if substr (unscanned_data, 1, 1) = ad.etb then go to get_data_4b;
+	     else go to get_data_4c;			/* Looking at stx */
+
+
+	end scan_more_input;
+
+/* Internal procedure to move chars to header or text */
+
+move_data: proc (p, n);
+
+dcl  i fixed bin;
+dcl  n fixed bin;
+dcl  p ptr;					/* Points to header data or text data */
+
+dcl 1 data aligned based (p),
+    2 data_buf_ptr ptr,
+    2 data_buf_len fixed bin,
+    2 data_len fixed bin;
+
+dcl  data_chars char (data.data_buf_len) based (data.data_buf_ptr);
+
+	     i = min (n, data.data_buf_len - data.data_len); /* Move what fits */
+	     if i > 0 then substr (data_chars, data.data_len + 1, i) = substr (unscanned_data, 1, i);
+	     call advance_unscanned_data (n);		/* Move past chars moved */
+	     data.data_len = data.data_len + i;
+	     return;
+
+	end move_data;
+
+/* Procedure to move the pointer in the unscanned data area */
+
+advance_unscanned_data: proc (amt);
+
+dcl  amt fixed bin ;
+
+	     ad.unscanned_data_ptr = substraddr (unscanned_data, amt+1);
+	     ad.unscanned_data_len = ad.unscanned_data_len - amt;
+	     return;
+
+	end advance_unscanned_data;
+
+/* Routine to process input data once it is found */
+
+process_input: proc;
+
+dcl (i, j) fixed bin;
+dcl  fldi (256) fixed bin;
+dcl  nf fixed bin;
+dcl  max_fldl fixed bin;
+dcl  scanp ptr;
+dcl  scanl fixed bin;
+dcl  scan_data char (scanl) based (scanp);
+
+	     if ad.header_len > 0 then do;		/* Header means some special format */
+		if ^ad.ascii then call ibm3270_translate_$ebcdic_to_ascii (ad.header_buf_ptr, ad.header_len);
+		if header_data = "%R" then do;	/* Status information */
+		     if ad.text_len < 4 then go to process_input_end; /* Not enough data, ignore */
+		     call get_read_info (0, 0);	/* Setup  input structure */
+		     call extract_address;		/* Get device address */
+		     read_info.key = STATUS;
+		     substr (read_info.bits, 1, 6) = substr (unspec (substr (text_data, 3, 1)), 4, 6);
+		     substr (read_info.bits, 7, 6) = substr (unspec (substr (text_data, 4, 1)), 4, 6);
+		     if read_info.bits = "0200"b3 then	/* Ready device */
+			ad.pend_time (read_info.device) = 0; /* This unpends output for this device */
+		     go to queue_standard;
+		end;
+		else if header_data = "%/" then do;	/* Test request */
+		     call get_read_info (1, ad.text_len);
+		     read_info.key = TEST_REQ;
+		     read_info.mod_fields = 1;
+		     if ^ad.ascii then call ibm3270_translate_$ebcdic_to_ascii (ad.text_buf_ptr, ad.text_len);
+		     read_info.contents (1) = text_data;
+		     read_info.field_position (1) = 0;
+		     go to queue_standard;
+		end;
+		go to process_input_end;		/* Bad header */
+	     end;
+
+/* Data has no header, so standard input text is assumed */
+
+	     if ad.text_len < 2 then go to process_input_end;
+	     if ad.text_len > 5 then do;		/* There is data */
+		scanp = substraddr (text_data, 6);
+		scanl = ad.text_len - 5;
+		if substr (scan_data, 1, 1) ^= ad.sba then do; /* Unformatted */
+		     call get_read_info (1, scanl);	/* One unformated string */
+		     read_info.field_position (1) = -1;
+		     call ibm3270_translate_$ebcdic_to_ascii (scanp, scanl);
+		     read_info.contents (1) = scan_data;
+		     read_info.mod_fields = 1;
+		end;
+		else do;				/* Formatted screen */
+		     nf = 0;
+		     max_fldl = 1;
+		     i = 1;
+		     do while ((i <= scanl) & (nf < 256)); /* Find all sba's */
+			j = index (substr (scan_data, i), ad.sba);
+			if j ^= 0 then do;		/* Found one */
+			     nf = nf + 1;
+			     fldi (nf) = i + j - 1;
+			     i = i + j;
+			     max_fldl = max (max_fldl, j-3);
+			end;
+			else do;
+			     max_fldl = max (max_fldl, scanl - i - 1);
+			     i = scanl+1;		/* To stop scan */
+			end;
+		     end;
+		     call get_read_info (nf, max_fldl);
+		     do i = 1 to nf;		/* Insert positions */
+			read_info.field_position (i) = get_position (substr (scan_data, fldi (i)+1, 2));
+		     end;
+		     call ibm3270_translate_$ebcdic_to_ascii (scanp, scanl);
+		     do i = 1 to nf;		/* Get data */
+			if i < nf then j = fldi (i+1) - fldi (i) - 3;
+			else j = scanl - fldi (i) - 2;
+			read_info.contents (i) = substr (scan_data, fldi (i)+3, j);
+		     end;
+		     read_info.mod_fields = nf;
+		end;
+	     end;
+	     else call get_read_info (0, 0);		/* No data */
+	     call extract_address;
+	     if ad.text_len < 3 then go to queue_standard; /* No aid */
+	     i = bin (substr (msg.aid, 2, 5));		/* Low order 5 bits of aid */
+	     read_info.key = aid_to_key (i);
+	     read_info.sub_key = aid_to_sub_key (i);
+	     if ad.text_len < 5 then go to queue_standard; /* No cursor */
+	     read_info.cursor_position = get_position (msg.cursor);
+queue_standard:
+	     call queue_read_info;
+	     ad.device_responded = "1"b;		/* Means device answered poll */
+process_input_end:
+	     ad.text_len, ad.header_len = 0;		/* Start new data */
+	     return;
+
+	end process_input;
+
+process_eot: proc;
+
+	     ad.polling_in_progress = "0"b;		/* These means polling finished */
+	     if ad.last_device_polled >= 0 & ^ad.device_responded then do;
+						/* Last poll was to specific device that answered EOT */
+		call get_read_info (0, 0);		/* Build dummy ready status */
+		read_info.controller = ad.controller;
+		read_info.device = ad.last_device_polled;
+		read_info.key = STATUS;
+		read_info.status.bits = "0200"b3;
+		call queue_read_info;
+	     end;
+
+	end process_eot;
+
+/* Allocate a read_info structure */
+
+get_read_info: proc (max_fields, max_len);
+
+dcl (max_fields, max_len);
+
+	     read_ctl.max_fields = max_fields;
+	     read_ctl.max_len = max_len;
+	     allocate read_info in (work_area);
+	     read_info.version = 1;
+	     read_info.next_read_infop = null;
+	     read_info.controller = 0;
+	     read_info.device = -1;
+	     read_info.reason = 0;
+	     read_info.status = "0"b;
+	     read_info.cursor_position = 0;
+	     read_info.mod_fields = 0;
+	     return;
+
+	end get_read_info;
+
+/* Procudure to add a complete read_info structure to the chain */
+
+queue_read_info: proc;
+
+	     read_info.next_read_infop = null;
+	     if ad.first_read_infop = null then		/* Only one */
+		ad.first_read_infop, ad.last_read_infop = addr (read_info);
+	     else do;
+		ad.last_read_infop -> read_info.next_read_infop = addr (read_info);
+		ad.last_read_infop = addr (read_info);
+	     end;
+	     return;
+
+	end queue_read_info;
+
+/* Extract device address from input text */
+
+extract_address: proc;
+
+	     read_info.controller = bin (msg.controller);
+	     read_info.device = bin (msg.device);
+	     return;
+
+	end extract_address;
+
+/* Get address out of 2 character seqyence */
+
+get_position: proc (c) returns (fixed bin);
+
+dcl  c char (2);
+
+	     return (bin (substr (unspec (c), 4, 6) || substr (unspec (c), 13, 6)));
+
+	end get_position;
+
+/* Procedure to set up polling address and initiate a poll operation */
+
+poll:	proc (device);
+
+dcl  device fixed bin;
+dcl  controller_char char (1);			/* Controller address, in char form */
+dcl  device_char char (1);				/* Device address, in char form */
+dcl  select_sw bit (1) init ("0"b);
+dcl  auto bit (1) init ("0"b);
+
+poll_join:     if device ^= ad.last_device_polled then do;	/* Skip if fnp already has address */
+select_join:	if ^select_sw then controller_char = ad.bit6_char (ad.controller);
+		else controller_char = ad.bit6_char (ad.controller + 32);
+		if device = -1 then			/* General poll */
+		     unspec (device_char) = "177"b3;
+		else device_char = ad.bit6_char (device);
+
+		if select_sw then line_ctl.op = SET_SELECT_ADDR;
+		else line_ctl.op = SET_POLLING_ADDR;
+		valchar.data_len = 4;
+		substr (valchar.data, 1, 1), substr (valchar.data, 2, 1) = controller_char;
+		substr (valchar.data, 3, 1), substr (valchar.data, 4, 1) = device_char;
+retry_addr:	call hcs_$tty_order (ad.tty_index, "line_control", addr (line_ctl), state, code);
+		if code ^= 0 then do;
+		     call check_error_code;
+		     if code ^= 0 then return;
+		     else go to retry_addr;
+		end;
+		if select_sw then do;
+		     ad.last_device_selected = device;
+		     return;
+		end;
+		else ad.last_device_polled = device;
+	     end;
+
+	     line_ctl.op = START_POLL;		/* Now, poll */
+	     line_ctl.val = 0;
+	     if auto then line_ctl.val (1) = 1;
+retry_poll:    call hcs_$tty_order (ad.tty_index, "line_control", addr (line_ctl), state, code);
+	     if code ^= 0 then do;
+		call check_error_code;
+		if code ^= 0 then return;
+		else go to retry_poll;
+	     end;
+	     if line_ctl.op = START_POLL then do;
+		ad.polling_in_progress = "1"b;
+		ad.device_responded = "0"b;		/* No answwer yet */
+	     end;
+	     return;
+
+select:	     entry (device);
+
+	     if ad.last_device_selected = device then return;
+	     select_sw = "1"b;
+	     go to select_join;
+
+auto_poll:     entry (device);
+
+	     auto = "1"b;
+	     go to poll_join;
+
+stop_auto_poll: entry;
+
+	     line_ctl.op = STOP_AUTO_POLL;
+	     line_ctl.val = 0;
+	     go to retry_poll;
+
+	end poll;
+
+/* This procedure is responsible for keeping output moving */
+
+send_more_output: proc;
+
+dcl  i fixed bin;
+dcl  moved fixed bin;
+dcl 1 wstat aligned,
+    2 chan fixed bin (71),
+    2 pending bit (1);
+
+check_output_status:
+	     if ad.output_line_status ^= 0 then do;	/* Error to handle first */
+		if ad.output_in_progress then do;	/* May be end of output */
+		     out_reqp = ad.cur_out_reqp;
+		     if out_req.eot_sent then do;	/* Done output */
+			if ad.output_line_status = IBM3270_WACK_SELECT then do; /* Device busy, pend output */
+			     call pend_out_req;
+			     ad.output_in_progress = "0"b;
+			     ad.cur_out_reqp = null;
+			end;
+			else if ad.output_line_status = IBM3270_WACK_MESSAGE then do; /* Device is going to be busy */
+			     ad.output_in_progress = "0"b;
+			     ad.cur_out_reqp = null;
+			     i = out_req.device;
+			     call free_out_req;	/* Current output has completed ok */
+			     if ad.first_out_reqp (i) ^= null then do; /* If more, pend it - otherwise select will
+						   just get wack */
+				out_reqp = ad.first_out_reqp (i);
+				call pend_out_req;
+			     end;
+			end;
+			else if ad.output_line_status = REVERSE_INTERRUPT then do; /* Device has status */
+			     i = out_req.device;
+			     if ad.retry_limit > 0 then /* If we should give up eventually */
+				if out_req.retry_count >= ad.retry_limit then /* And the time is now */
+				     call free_out_req;
+				else do;
+				     out_req.retry_count = out_req.retry_count + 1;
+				     call pend_out_req;
+				end;
+			     else call pend_out_req;	/* Retry forever */
+			     call queue_poll_req_first (i); /* Must poll this device first */
+			     ad.output_in_progress = "0"b;
+			     ad.cur_out_reqp = null;
+			end;
+			else do;
+			     if ad.output_line_status ^= IBM3270_WRITE_COMPLETE then
+						/* Inform user of other serious error before deleting data */
+				call queue_error (out_req.device, (ad.output_line_status));
+			     ad.output_in_progress = "0"b;
+			     ad.cur_out_reqp = null;
+			     call free_out_req;
+			end;
+		     end;
+		end;
+		ad.output_line_status = 0;
+	     end;
+
+	     if ^ad.output_in_progress then do;		/* Not currently doing output */
+		if ad.first_poll_reqp ^= null then return; /* If polling to do, don't do output */
+		if ad.polling_in_progress then	/* If polling specific device, dont write yet */
+		     if ad.last_device_polled ^= -1 then return;
+		call get_next_out_req;		/* Find something to do */
+		if ad.cur_out_reqp = null then return;
+		call select (out_req.device);		/* Tell fnp who to talk to */
+		if code ^= 0 then return;
+		out_req.eot_sent = "0"b;
+		out_req.sent_len = 0;
+		ad.output_in_progress = "1"b;
+	     end;
+	     out_reqp = ad.cur_out_reqp;		/* Pickup current block */
+	     if out_req.eot_sent then return;
+continue_output:
+retry_write_status:
+	     call hcs_$tty_order (ad.tty_index, "write_status", addr (wstat), state, code);
+	     if code ^= 0 then do;
+		call check_error_code;		/* Check for line status */
+		if code ^= 0 then go to fatal_output_error; /* Something bad */
+		if ad.output_line_status ^= 0 then go to check_output_status; /* Must process status */
+		else go to retry_write_status;
+	     end;
+	     if wstat.pending then return;		/* Cant take more now */
+	     if out_req.sent_len = out_req.out_msgl then do; /* Written all data */
+retry_eot:	call hcs_$tty_write (ad.tty_index, addr (ad.eot), 0, 1, moved, state, code);
+		if code ^= 0 then do;
+		     call check_error_code;
+		     if code ^= 0 then go to fatal_output_error;
+		     if ad.output_line_status ^= 0 then go to check_output_status;
+		     else go to retry_eot;
+		end;
+		if moved = 1 then out_req.eot_sent = "1"b; /* Eot accepted */
+		return;
+	     end;
+
+retry_write:   call hcs_$tty_write (ad.tty_index, out_req.out_msgp, out_req.sent_len,
+		out_req.out_msgl - out_req.sent_len, moved, state, code);
+	     if code ^= 0 then do;
+		call check_error_code;
+		if code ^= 0 then go to fatal_output_error;
+		if ad.output_line_status ^= 0 then go to check_output_status;
+		else go to retry_write;
+	     end;
+	     if moved = 0 then return;		/* Can't take it now, try later */
+	     out_req.sent_len = out_req.sent_len + moved; /* Accumulate length sent */
+	     go to continue_output;			/* Keep trying */
+
+fatal_output_error:
+	     call queue_error (-1, code);
+	     return;
+
+	end send_more_output;
+
+/* Queue an output request */
+
+queue_out_req: proc;
+
+dcl  i fixed bin;
+
+	     out_req.next_out_reqp = null;
+	     out_req.eot_sent = "0"b;
+	     out_req.req_time = clock;		/* Remebr time queued */
+
+	     i = out_req.device;
+	     if ad.first_out_reqp (i) = null then do;	/* No other output for this device */
+		ad.first_out_reqp (i), ad.last_out_reqp (i) = out_reqp;
+		ad.pend_time (i) = 0;
+		if ad.min_dev = -1 then		/* No other devices have output queued */
+		     ad.min_dev, ad.max_dev = i;
+		else do;
+		     ad.min_dev = min (i, ad.min_dev);
+		     ad.max_dev = max (i, ad.max_dev);
+		end;
+	     end;
+	     else do;				/* Thread on end */
+		ad.last_out_reqp (i) -> out_req.next_out_reqp = out_reqp;
+		ad.last_out_reqp (i) = out_reqp;
+	     end;
+
+	     return;
+
+	end queue_out_req;
+
+/* Procedure to pend the current output request */
+
+pend_out_req: proc;
+
+dcl  i fixed bin;
+
+	     i = out_req.device;
+	     ad.pend_time (i) = clock + ad.pend_interval; /* Time to retry */
+	     call schedule_timer;
+	     out_reqp, ad.cur_out_reqp = null;
+	     ad.output_in_progress = "0"b;
+	     return;
+
+	end pend_out_req;
+
+/* Procedure to select the next output request to perform. The oldest unpended request is used */
+
+get_next_out_req: proc;
+
+dcl  i fixed bin;
+dcl  j fixed bin init (-1);
+dcl  min_time fixed bin (71) init (10000000000000000000000000000000000000000000000000000b); /* 2**52 */
+
+	     ad.cur_out_reqp, out_reqp = null;		/* Answer if nothing found */
+	     if ad.min_dev = -1 then return;		/* Nothing queued */
+	     do i = ad.min_dev to ad.max_dev;
+		if (ad.first_out_reqp (i) ^= null) & (ad.pend_time (i) = 0) then do;
+						/* This device has unpended request */
+		     if ad.first_out_reqp (i) -> out_req.req_time < min_time then do;
+			min_time = ad.first_out_reqp (i) -> out_req.req_time;
+			j = i;			/* Remebert index */
+		     end;
+		end;
+	     end;
+	     if j = -1 then return;			/* All requests are pended */
+	     ad.cur_out_reqp, out_reqp = ad.first_out_reqp (j);
+	     return;
+
+	end get_next_out_req;
+
+/* Procedure to free an output request */
+
+free_out_req: proc;
+
+dcl  i fixed bin;
+dcl (min_dev, max_dev) fixed bin;
+
+	     i = out_req.device;
+	     ad.first_out_reqp (i) = out_req.next_out_reqp;
+	     if ad.first_out_reqp (i) = null then do;	/* No more for this device */
+		ad.last_out_reqp (i) = null;
+		if (i = ad.min_dev) | (i = ad.max_dev) then do; /* If request is for one of limits, must adjust */
+		     min_dev, max_dev = -1;
+		     do i = ad.min_dev to ad.max_dev;
+			if ad.first_out_reqp (i) ^= null then do;
+			     if min_dev = -1 then min_dev = i;
+			     max_dev = i;
+			end;
+		     end;
+		     ad.min_dev = min_dev;
+		     ad.max_dev = max_dev;
+		end;
+	     end;
+	     free out_msg;
+	     free out_req;
+	     return;
+
+	end free_out_req;
+
+/* Schuduler error recovery timer */
+
+schedule_timer: proc;
+
+	     call timer_manager_$alarm_wakeup (ad.pend_interval, "10"b, ad.timer_channel);
+	     return;
+
+	end schedule_timer;
+
+/* Procedure that is invoked on timer wakeups to unpend all output whose time has come */
+
+unpend_out_req: proc;
+
+dcl  req_pending bit (1) init ("0"b);			/* Set if pended requests are found */
+dcl  req_unpended bit (1) init ("0"b);			/* Set if some output released */
+dcl  now fixed bin (71);
+dcl  i fixed bin;
+
+	     if ad.min_dev = -1 then return;
+	     now = clock;
+	     do i = ad.min_dev to ad.max_dev;
+		if (ad.first_out_reqp (i) ^= null) & (ad.pend_time (i) ^= 0) then do;
+		     req_pending = "1"b;
+		     if now >= ad.pend_time (i) then do; /* Found one */
+			ad.pend_time (i) = 0;
+			req_unpended = "1"b;
+		     end;
+		end;
+	     end;
+	     if req_unpended & ^ad.output_in_progress then call worker; /* Fire up output */
+	     if req_pending & ^req_unpended then call schedule_timer;
+	     return;
+
+	end unpend_out_req;
+
+/* Procedure to perform queued device polling */
+
+poll_more_devices: proc;
+
+dcl  i fixed bin;
+
+	     if ad.output_in_progress then return;	/* Must finish output first */
+
+	     if ad.first_poll_reqp ^= null then do;	/* If there is request */
+		if ad.polling_in_progress then do;	/* Already polling */
+		     if ad.last_device_polled = -1 then call stop_auto_poll; /* Stop polling if general poll */
+		     return;			/* Cant do  more polling while polling in progress */
+		end;
+		poll_reqp = ad.first_poll_reqp;	/* Get firrst request */
+		ad.first_poll_reqp = poll_req.next_poll_reqp;
+		if ad.first_poll_reqp = null then ad.last_poll_reqp = null;
+		i = poll_req.device;
+		free poll_req;			/* Dont need this anymore */
+		call poll (i);			/* Poll indicated device */
+		return;
+	     end;
+
+	     else if ^ad.polling_in_progress then	/* If not polling */
+		if ad.general_poll then call auto_poll (-1); /* Restart auto general poll */
+	     return;
+
+	end poll_more_devices;
+
+/* Queue a poll request */
+
+queue_poll_req: proc (device);
+
+dcl  device fixed bin;
+dcl  first bit (1) init ("0"b);			/* If set, entry goes to head of queue */
+
+queue_poll_join:
+	     allocate poll_req in (work_area);
+	     poll_req.next_poll_reqp = null;
+	     poll_req.device = device;
+
+	     if ad.first_poll_reqp = null then		/* Only request in queue */
+		ad.first_poll_reqp, ad.last_poll_reqp = poll_reqp;
+	     else if first then do;			/* Must queue at head */
+		poll_req.next_poll_reqp = ad.first_poll_reqp;
+		ad.first_poll_reqp = poll_reqp;
+	     end;
+	     else do;				/* Must queue at end */
+		ad.last_poll_reqp -> poll_req.next_poll_reqp = poll_reqp;
+		ad.last_poll_reqp = poll_reqp;
+	     end;
+	     return;
+
+queue_poll_req_first: entry (device);			/* Satart here to put entry at head of queue */
+
+	     first = "1"b;
+	     go to queue_poll_join;
+
+	end queue_poll_req;
+
+/* Procedure to build the output data messages from the write_info structure */
+
+format_write_msg: proc;
+
+dcl  seq char (4);					/* For short control sequences */
+dcl (i, j) fixed bin;
+dcl  ch char (1);
+dcl  msg_len fixed bin;
+dcl  bc char (j) based (addr (substr (output_buf, msg_len+1, 1)));
+
+	     msg_len = 0;
+	     substr (seq, 1, 1) = ad.stx;		/* Standard start */
+	     call move_seq (1);
+
+	     substr (seq, 1, 1) = ad.esc;		/* Start command sequence */
+	     unspec (ch) = "0"b || command_codes (write_info.command);
+	     substr (seq, 2, 1) = ch;
+	     if write_info.command = COPY then do;
+		i = bin (substr (string (write_info.write_ctl_char.bits), 1, 4) || write_info.copy_bits);
+		substr (seq, 3, 1) = ad.bit6_char (i);	/* The copy control char */
+		substr (seq, 4, 1) = ad.bit6_char (write_info.from_device);
+		call move_seq (4);
+		go to end_format_write;
+	     end;
+	     if write_info.command = READ_BUFFER | write_info.command = READ_MODIFIED then do;
+		call move_seq (2);			/* No wcc for read type commands */
+		go to end_format_write;
+	     end;
+	     substr (seq, 3, 1) = ad.bit6_char (bin (string (write_info.write_ctl_char.bits)));
+	     call move_seq (3);			/* Move esc-cmd-wcc */
+
+	     do i = 1 to write_info.mod_fields;		/* Rest of message is per/field */
+		if write_info.set_buffer_addr (i) then do;
+		     substr (seq, 1, 1) = ad.sba;	/* Set buffer address code */
+		     substr (seq, 2, 2) = make_addr (write_info.field_position (i));
+		     call move_seq (3);
+		end;
+		if write_info.start_field (i) then do;	/* New fields */
+		     substr (seq, 1, 1) = ad.sf;
+		     substr (seq, 2, 1) = ad.bit6_char (bin (string (write_info.attributes (i))));
+		     call move_seq (2);
+		end;
+		if write_info.insert_cursor (i) then do;
+		     substr (seq, 1, 1) = ad.ic;
+		     call move_seq (1);
+		end;
+		if write_info.program_tab (i) then do;
+		     substr (seq, 1, 1) = ad.pt;
+		     call move_seq (1);
+		end;
+		if write_info.repeat_to_addr (i) then do;
+		     substr (seq, 1, 1) = ad.ra;	/* Repeat to address code */
+		     substr (seq, 2, 2) = make_addr (write_info.field_position (i));
+		     if length (write_info.contents (i)) = 0 then substr (seq, 4, 1) = low (1); /* Default char */
+		     else do;
+			ch = substr (write_info.contents (i), 1, 1);
+			if ^ad.ascii then call ibm3270_translate_$ascii_to_ebcdic (addr (ch), 1);
+			substr (seq, 4, 1) = ch;
+		     end;
+		     call move_seq (4);
+		end;
+		if write_info.erase_to_addr (i) then do;
+		     substr (seq, 1, 1) = ad.eua;
+		     substr (seq, 2, 2) = make_addr (write_info.field_position (i));
+		     call move_seq (3);
+		end;
+		j = length (write_info.contents (i));
+		if ^write_info.repeat_to_addr (i) & j > 0 then do;
+		     if j > (length (output_buf) - msg_len) then go to big_write_err;
+		     substr (output_buf, msg_len+1, j) = write_info.contents (i);
+		     if ^ad.ascii then call ibm3270_translate_$ascii_to_ebcdic (substraddr (output_buf, msg_len+1), j);
+		     msg_len = msg_len + j;
+		end;
+	     end;
+
+end_format_write:
+	     substr (seq, 1, 1) = ad.etx;
+	     call move_seq (1);
+
+	     allocate out_req in (work_area);
+	     out_req.out_msgl = msg_len;
+	     allocate out_msg in (work_area);
+	     out_msg = substr (output_buf, 1, msg_len);	/* Copy to smaller buffer */
+	     out_req.req_time = 0;
+	     out_req.device = write_info.device;
+	     out_req.sent_len = 0;
+	     out_req.eot_sent = "0"b;
+	     out_req.req_time = 0;
+	     out_req.retry_count = 0;
+	     code = 0;
+
+	     return;
+
+big_write_err:
+	     code = error_table_$long_record;
+	     return;
+
+/* Procedure to move short control sequqnces into the output stream. These cannot be split between data blocks */
+
+move_seq:	     proc (n);
+
+dcl  n fixed bin;
+
+		if n > (length (output_buf) - msg_len) then go to big_write_err;
+		substr (output_buf, msg_len+1, n) = substr (seq, 1, n);
+		msg_len = msg_len + n;
+		return;
+
+	     end move_seq;
+
+	end format_write_msg;
+
+/* Build 2 character address from a position */
+
+make_addr: proc (pos) returns (char (2));
+
+dcl  pos fixed bin;
+dcl (i, j) fixed bin;
+
+	     i = divide (pos, 64, 17, 0);
+	     j = mod (pos, 64);
+	     return (ad.bit6_char (i) || ad.bit6_char (j));
+
+	end make_addr;
+
+/* This procedure checks errors on calls to the ring0 tty dim. If the error indicates that line
+   status is present, it is picked up and classified according to whehter it affects input or output */
+
+check_error_code: proc;
+
+	     if code ^= error_table_$line_status_pending then return; /* More serious error */
+	     ad.polling_in_progress = "0"b;		/* Any line status error stops polling */
+	     call hcs_$tty_order (ad.tty_index, "line_status", addr (line_stat), state, code); /* Pick up status */
+	     if code ^= 0 then return;		/* Seriout error */
+
+	     if line_stat.op < lbound (line_stat_lab, 1) | line_stat.op > hbound (line_stat_lab, 1) then return;
+	     go to line_stat_lab (line_stat.op);
+
+line_stat_lab (1):					/* Input codes */
+line_stat_lab (4):
+	     ad.input_line_status = line_stat.op;
+	     return;
+
+line_stat_lab (2):					/* Output codes */
+line_stat_lab (3):
+line_stat_lab (6):
+line_stat_lab (7):
+line_stat_lab (8):
+line_stat_lab (9):
+line_stat_lab (10):
+line_stat_lab (11):
+line_stat_lab (12):
+	     ad.output_line_status = line_stat.op;
+	     return;
+
+line_stat_lab (5):					/* Codes to ignore */
+	     return;
+
+	end check_error_code;
+
+/* The following procedure queues up an error condition so the input reader will see it. */
+/* This is done because the error may be detected by the event call handler who has no-one to tell. */
+
+queue_error: proc (device, code);
+
+dcl  device fixed bin;
+dcl  code fixed bin (35);
+
+	     call get_read_info (0, 0);
+	     read_info.device = device;
+	     read_info.code = code;
+	     read_info.key = ERROR;
+	     call queue_read_info;
+	     return;
+
+	end queue_error;
+
+/* Builtin function substraddr until it is real */
+
+substraddr: proc (c, n) returns (ptr);
+
+dcl  c char (*);
+dcl  n fixed bin;
+dcl  ca (n) char (1) based (addr (c));
+
+	     return (addr (ca (n)));
+
+	end substraddr;
+
+
+     end ibm3270_control_;

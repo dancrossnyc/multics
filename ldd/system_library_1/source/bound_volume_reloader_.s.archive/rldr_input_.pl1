@@ -1,0 +1,1140 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-11,GWMay), approve(), audit(), install():
+     old history comments:
+         Modified 5/79 by D. Vinograd to correct calling sequence to read_page
+                       so that variable already_there is passed as arg, and to
+                       correctly handle pages which are non null but contain all
+                       zeros. These are not writen out by the dumper and so must be
+                       fabricated by the reloader.
+         Modified April 1982 by J. Bongiovanni for new label.
+         Modified June 1982 by GA Texada to report read errors.
+         Modified July 1982 by GA Texada to fix phx13000 and fix a bug
+                       introduced above.
+         Modified Sept 1982 by Texada to get volume names via command_query_.
+         Modified: 12/2/82 by GAT for emergency MR10.1 fix for phx14335.
+         Modified Nov. 1982 by GAT to provide the pv name of last object read
+                       sucessfully when skipping objects due to tape problems.
+         Modified 03/01/83 by GA Texada for multiple physical volume reloading.
+     DONT FORGET TO REMOVE THE pvolid CODE!!!
+         Modified 03/12/85 by Greg Texada to fix phx19165, don't give up so
+                       soon when resynching (D. Kitson).
+  2) change(86-02-11,GWMay), approve(86-07-10,MCR7445), audit(86-11-19,GDixon),
+     install(86-11-21,MR12.0-1223):
+     changed position of call to rldr_vtoc_buffer_$write before do loop to
+     support changes in the subroutine.  Removed all error message
+     documentation.  This module is not covered by the policy for error
+     message doc.
+  3) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  4) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Changed the routine read_page to be read_object.  Because of changes to
+     the format of volume dump tapes, entire segments are read from the tape
+     with null pages handled when writing to disk.
+     
+     Installed a completely new read routine to handle tapes which contain
+     incomplete data.
+  5) change(90-02-06,Farley), approve(90-05-09,MCR8174),
+     audit(90-04-02,WAAnderson), install(90-06-12,MR12.4-1014):
+     Modified skip_chars procedure to account for times when the data is
+     "DELIMITED", when calling the read procedure.
+  6) change(90-10-12,WAAnderson), approve(90-10-12,MCR8214),
+     audit(90-10-15,Schroth), install(90-10-17,MR12.4-1047):
+     The volume reloader may fail when skipping over segments not pertaining to
+     the physical volume being loaded.
+                                                   END HISTORY COMMENTS */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+
+rldr_input_: proc;
+
+/* This routine provides  all necessary input functions for the volume reloader. It
+   generates the list of dump volumes  necessary to recreate the physical volume, and then reads them
+   in the correct order(reverse chronological). It uses the control seg as a look aside memory to determine if a
+   vtoce has already been reloaded from a newer dump volume. If so we skip the older copy. We return to the
+   caller only when a new object has been found. If the object supeerceeds an existant object we set a flag. */
+
+dcl (pattern_match_label, retry_attach_label) label;
+dcl avolname	     char (32) var;
+dcl (already_there, resynching_completed, resynching, new_volume, YES, a_new_volume, new_info, skip_next_header_check, ring_1) bit (1);
+dcl (code, ignore, words_skipped) fixed bin (35);
+dcl att_desc	     char (256);
+dcl resynch_retry_count  fixed bin;
+dcl rets		     char (79) varying;
+dcl rets_len	     fixed bin (21);
+dcl (incr_open_time, cons_open_time, comp_open_time, time_unmounted) fixed bin (71);
+dcl (comp_cycle_uid, cons_cycle_uid, volid) bit (36);
+dcl (entry, vtocx, vlx, a_pvindex, pvindex, idx, sortx, num_pos) fixed bin;
+dcl (nel, nelt)	     fixed bin (21);
+dcl char_buf	     char (256 * CHARS_PER_PAGE) based (rldr_data_.data_object_bp);
+dcl word		     (size (backup_volume_header)) bit (36) based (recordp);
+dcl input_buf	     (divide (nelt, CHARS_PER_WORD, 17, 0)) bit (36) based (recordp);
+dcl string	     bit (BITS_PER_WORD * size (backup_volume_header)) based (recordp);
+dcl (char_num, pvname, lvname, volname) char (32);
+
+dcl warning_printed	     bit (1) static init ("0"b);
+dcl get_object	     fixed bin static init (1) options (constant);
+dcl read_object	     fixed bin static init (2) options (constant);
+dcl init		     fixed bin static init (3) options (constant);
+dcl collect_stats	     fixed bin static init (4) options (constant);
+dcl myname	     char (32) var int static init ("rldr_input_") options (constant);
+dcl DELIMITED	     bit (1) aligned internal static options (constant)
+		     init ("1"b);
+dcl DELIM_LEN	     fixed bin (21) internal static options (constant) init (8);
+dcl rldr_vtoc_buffer_$write entry (ptr, fixed bin (35));
+dcl hc_backup_$decode_uidpath entry ((0:15) bit (36) aligned, char (*), char (*), fixed bin (35));
+dcl get_group_id_	     entry returns (char (32));
+dcl hcs_$level_get	     entry returns (fixed bin);
+dcl timer_manager_$alarm_call entry (fixed bin (71), bit (2), entry);
+dcl timer_manager_$reset_alarm_call entry (entry);
+dcl mdc_$find_volname    entry (bit (36), char (*), char (*), fixed bin (35));
+dcl cv_dec_check_	     entry (char (*), fixed bin (35)) returns (fixed bin);
+dcl ioa_		     entry options (variable);
+dcl ioa_$rsnnl	     entry () options (variable);
+dcl command_query_	     entry options (variable);
+dcl command_query_$yes_no entry () options (variable);
+dcl set_lock_$lock	     entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl set_lock_$unlock     entry (bit (36) aligned, fixed bin (35));
+dcl rldr_vtoc_header_$update entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_volume_map_$update entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl rldr_report_$online_output entry options (variable);
+
+dcl error_table_$action_not_performed fixed bin (35) ext static;
+dcl error_table_$data_loss fixed bin (35) ext static;
+dcl error_table_$device_end fixed bin (35) ext static;
+dcl error_table_$root    fixed bin (35) ext static;
+dcl error_table_$resource_unavailable ext fixed bin (35);
+dcl error_table_$end_of_info ext fixed bin (35);
+dcl error_table_$bad_volid ext fixed bin (35);
+
+dcl seg_fault_error	     condition;
+
+dcl (addcharno, addr, fixed, index, size, null, unspec, bin,
+  divide, length, maxlength, min, mod, rtrim, search, ptr, substr) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get_object: entry (rldr_datap, skip_next_header_check, vtocep, vtocx, already_there, a_pvindex, code);
+
+/* This entry reads dump volumes until it encounters a vtoce that either has not been read or is newer
+   then the already read.  It returns to the caller with this info. The parameter pvindex is output
+ index into rldr_data_.pvname on which the object belongs.
+*/
+
+/* set local variables */
+    entry = get_object;
+    a_pvindex, vtocx = -1;
+    code = 0;
+    already_there = "0"b;
+    recordp = rldr_data_.volume_record_bp;
+
+/* if switch not attached do so */
+    if rldr_data_.inputvol_iocbp = null then call attach;	/*  return label for int proc if errors */
+search_loop:
+						/* set flags */
+    resynching_completed = "0"b;
+    resynching = "0"b;
+    new_info = "0"b;
+						/* read till we fail or find new data */
+    do while (^new_info & code = 0);
+      call read_volume_record;
+    end;
+						/* copy vtoc entry */
+    if pvindex >= 1 then do;
+        controlp = rldr_data_.controlp (pvindex);
+        vtocep -> vtoce = backup_volume_record.vtoce;
+        a_pvindex = pvindex;
+      end;
+get_object_ret:
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+read_object: entry (rldr_datap, a_pvindex, a_new_volume, skip_next_header_check, pages_returned, code);
+
+dcl (pad_chars, pages_returned) fixed bin;
+
+    entry = read_object;
+    pvindex = a_pvindex;
+    a_new_volume = "0"b;
+    resynching_completed = "0"b;
+    resynching = "0"b;
+    skip_next_header_check = "0"b;
+    pages_returned, nelt, code = 0;
+    recordp = rldr_data_.volume_record_bp;
+    controlp = rldr_data_.controlp (pvindex);
+    nel = backup_volume_record.rec2_len;
+
+    call read (rldr_data_.data_object_bp, nel, nelt,
+         (backup_volume_record.version > 1), code);
+
+    pages_returned = divide (nelt + CHARS_PER_PAGE - 1, CHARS_PER_PAGE, 17);
+    pad_chars = CHARS_PER_PAGE - mod (nelt, CHARS_PER_PAGE);
+    if pad_chars < CHARS_PER_PAGE then
+      unspec (substr (char_buf, nelt + 1, pad_chars)) = "0"b;
+
+    call check_input_error;
+
+    if new_volume then do;
+        rldr_control (backup_volume_record.vtocx).uid = "0"b; /* clean up */
+        rldr_control (backup_volume_record.vtocx).volid = "0"b;
+        a_new_volume = new_volume;
+        return;
+      end;
+
+    skip_next_header_check = resynching_completed;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+init_volume_list: entry (rldr_datap, code);
+
+/* This entry scans the volume log and builds the list of dump volumes required to recreate the
+   physical volume(s). This list is referred to as a reload group. */
+
+    entry = init;
+    code = 0;
+    skip = rldr_data_.skip;
+
+    vlx = 0;
+    do pvindex = 1 to rldr_data_.npvs;
+      labelp, old_labelp = rldr_data_.labelp (pvindex);
+      bvlp = rldr_data_.bvlp (pvindex);
+      if label.volmap_version = 1 | label.volmap_version = 2
+	 then time_unmounted = label.time_unmounted;
+      else time_unmounted = old_label.time_unmounted;
+      if rldr_data_.manual then return;			/* if manual mode don't need volume list */
+      call lock_volume_log;				/* lock volume log for scan */
+      if code ^= 0 then return;
+
+/* Back scan the volume log to develop the list of dump volumes necessary to recreate the physical volume. This
+   list is referred to as a reload group. The basic scheme is touse incremental duymp volumes until they are superceeded
+   by consolidated dump volumes and consolidated dump volumes until a complete dump volume is found. Care must
+   be taken for the case where the dumping process overlapped, as well as for the multi volume consolidated
+   or complete dump. Dump volumes not closed are not used, else we might try to use a still mounted incremental dump
+   volume. */
+
+      incr_open_time = 0;
+      cons_open_time = 0;
+      comp_open_time = 0;
+      comp_cycle_uid = "0"b;
+      cons_cycle_uid = "0"b;
+      do idx = backup_volume_log.next to 1 by -1;
+        bvlep = addr (backup_volume_log.array (idx));
+        if bvle.dump_type = incr then do;
+	  if cons_open_time ^= 0 | comp_open_time ^= 0 then do;
+	      if (cons_open_time ^= 0 & cons_open_time < bvle.close_time)
+		 | (comp_open_time ^= 0 & comp_open_time < bvle.close_time)
+		 then call log_volume_name;
+	    end;
+	  else do;
+	      call log_volume_name;
+	      incr_open_time = open_time ();
+	    end;
+	end;
+        else if bvle.dump_type = cons then do;
+	  if comp_open_time ^= 0 then do;
+	      if comp_open_time < bvle.close_time
+		 | cons_cycle_uid = bvle.cycle_uid then call log_volume_name;
+	    end;
+	  else do;
+	      call log_volume_name;
+	      cons_open_time = open_time ();
+	      cons_cycle_uid = bvle.cycle_uid;
+	    end;
+	end;
+        else if bvle.dump_type = comp then do;
+	  if comp_cycle_uid ^= "0"b then do;
+	      if comp_cycle_uid = bvle.cycle_uid then call log_volume_name;
+	      comp_open_time = open_time ();
+	    end;
+	  else do;
+	      comp_cycle_uid = bvle.cycle_uid;
+	      comp_open_time = open_time ();
+	      call log_volume_name;
+	    end;
+	end;
+      end;
+      call unlock_volume_log;				/* all done so unlock */
+    end;
+    rldr_input_volume_list.num_entries = vlx;
+    rldr_input_volume_list.curn_entry = 0;
+
+/* If we are restarting search the control seg for the volume name/position in the list			*/
+/*   of dump volumes to be read.								*/
+/* If we ARE restarting, then we only need to look at ONE control because we forced them all to be the same	*/
+    if rldr_data_.common.restart then do;		/* find out where we were */
+        controlp = rldr_data_.controlp (1);
+        do idx = rldr_input_volume_list.curn_entry + 1 to rldr_input_volume_list.num_entries
+	   while (rldr_input_volume_list (idx).volname ^= rldr_control.curn_volname);
+        end;
+        if idx > rldr_input_volume_list.num_entries then do;
+	  code = error_table_$bad_volid;
+	  call rldr_report_$error_output (rldr_datap, code, myname, "Error locating restart volume");
+	  return;
+	end;
+        rldr_input_volume_list.curn_entry = idx - 1;
+      end;
+    if rldr_input_volume_list.num_entries <= 0 then do;	/* check for null list			*/
+        call rldr_report_$error_output (rldr_datap, 0, myname,
+	   "No dump volumes selected for this reload.");	/* see error message doc at end		*/
+        code = error_table_$action_not_performed;
+      end;
+    else do;
+        if ^rldr_data_.brief then do;			/* Tell operator ahead of time what dump volumes we want */
+	  call rldr_report_$online_output (rldr_datap, 0, myname, "Please get the following input volumes");
+	  rets = "";
+	  do idx = rldr_input_volume_list.curn_entry + 1 to rldr_input_volume_list.num_entries;
+	    call ioa_$rsnnl ("^(^a,^)", rets, rets_len, (rets) || " " || rldr_input_volume_list (idx).volname);
+	    if idx ^= rldr_input_volume_list.num_entries then
+	      if (rets_len + (length (rtrim (rldr_input_volume_list (idx + 1).volname))) + 2
+		 > maxlength (rets)) then do;
+						/* avoid problems if writing to the Operator Console*/
+		call rldr_report_$online_output (rldr_datap, 0, "", "^a", rtrim (rets, ","));
+		rets = "";
+	        end;
+	  end;
+	  if rets ^= "" then call rldr_report_$online_output (rldr_datap, 0, "", "^a", rtrim (rets, ","));
+	end;
+      end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+collect_stats: entry (rldr_datap, a_pvindex);
+
+/* This entry collects statistics about what is being reloaded. We collect statistics on a per dump volume
+   read basis as well as summary statistics about the entire reload. */
+
+    entry = collect_stats;
+    pvindex = a_pvindex;
+    recordp = rldr_data_.volume_record_bp;
+    controlp = rldr_data_.controlp (pvindex);
+
+
+/* if non-null object */
+    if backup_volume_record.uid ^= "0"b then do;
+						/* if directory */
+        if backup_volume_record.dirsw then do;
+	  rldr_control.dir_num = rldr_control.dir_num + 1;
+	  rldr_control.dir_rec = rldr_control.dir_rec + fixed (backup_volume_record.records);
+	  rldr_control.input_vol_dir_num = rldr_control.input_vol_dir_num + 1;
+	  rldr_control.input_vol_dir_rec = rldr_control.input_vol_dir_rec +
+	       fixed (backup_volume_record.records);
+	end;
+        else do;					/* or segment */
+	  rldr_control.seg_num = rldr_control.seg_num + 1;
+	  rldr_control.input_vol_seg_num = rldr_control.input_vol_seg_num + 1;
+	  rldr_control.input_vol_seg_rec = rldr_control.input_vol_seg_rec +
+	       fixed (backup_volume_record.records);
+	  rldr_control.seg_rec = rldr_control.seg_rec + fixed (backup_volume_record.records);
+	end;
+      end;
+    else rldr_control.num_null_vtoce = rldr_control.num_null_vtoce + 1;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+log_volume_name: proc;
+
+/* This proc is called to add a dump volume to the volume list of a reload group. It is added to the list
+   if it has segments or directories from this volume and if it not already part
+   of the list. If the dump volume was created with a different io module then the one
+   that will be used to read it, the operator is queried as to whether he wants to use it. */
+
+    if bvle.dir_num = 0 & bvle.seg_num = 0 then return;
+    if rldr_data_.save & bvle.open_time < time_unmounted then return;
+
+    do sortx = 1 to vlx;
+      if rldr_input_volume_list (sortx).volname = bvle.volname
+	 & rldr_input_volume_list (sortx).volid = bvle.volid then return; /* already in list */
+    end;
+
+    do sortx = 1 to rldr_skip_list.next;
+      if rldr_skip_list (sortx).volname = bvle.volname then return;
+    end;
+
+    if bvle.io_module ^= rldr_data_.io_module then do;
+        query_info.version = query_info_version_5;
+        call command_query_$yes_no (YES, 0, myname, "",
+	   "io outer module ^a which wrote volume ^a is different than that specified to read the volume.
+ Do you wish to use the volume ?", bvle.io_module, bvle.volname);
+        if ^YES then do;
+	  rldr_skip_list.next = rldr_skip_list.next + 1;
+	  rldr_skip_list (rldr_skip_list.next).volname = bvle.volname;
+	  return;
+	end;
+      end;
+
+    vlx = vlx + 1;
+    rldr_input_volume_list (vlx).volname = bvle.volname;
+    rldr_input_volume_list (vlx).volid = bvle.volid;
+
+  end log_volume_name;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+read_volume_record: proc;
+
+/* This proc reads a logical record from a dump volume and determines if the object is newer
+   then the one previously found(if any). It does this by using a look aside memory stored in the control seg,
+   indexed by vtoc index, with the dump volume id as the field. */
+
+/* set non-local retrun label */
+    pattern_match_label = pattern_match;
+    new_volume = "0"b;
+						/* read logical record header */
+    if skip_next_header_check then do;
+        skip_next_header_check = "0"b;
+        goto pattern_match_label;
+      end;
+    nel = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+    if new_volume then return;
+						/* check record header */
+    if backup_volume_record.pattern1 ^= pattern1
+         | backup_volume_record.pattern2 ^= pattern2
+         | backup_volume_record.pattern3 ^= pattern3 then do;
+        code = -1;
+        call check_input_error;			/* treat as bad read */
+        if new_volume then return;
+      end;
+
+pattern_match:
+    new_volume = "0"b;
+						/* read rest of header */
+    nel = backup_volume_record.rec1_len - size (backup_volume_header) * CHARS_PER_WORD;
+    call read (ptr (recordp, size (backup_volume_header)),
+         nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+    if new_volume then return;
+						/* if info data then safe store */
+    if backup_volume_record.rec1_type = info_type then do;
+        call record_info;
+        if code ^= 0 then return;
+      end;
+						/* otherwise if not object then skip */
+    if backup_volume_record.rec1_type ^= vtoce_type then do;
+        nel = backup_volume_record.rec2_len;
+        if nel ^= 0 then call skip_chars;
+        return;
+      end;
+						/* skip if version is different */
+    if backup_volume_record.version ^= backup_volume_record_version_1 &
+         backup_volume_record.version ^= backup_volume_record_version_2 then do;
+bad_record: call rldr_report_$error_output (rldr_datap, 0, myname, "Invalid volume record on dump volume",
+	   volname);
+        nel = backup_volume_record.rec2_len;
+        if nel ^= 0 then call skip_chars;
+        return;
+      end;
+						/* record last valid uid */
+    if backup_volume_record.uid ^= "0"b then do;
+        rldr_data_.last_valid_puid = backup_volume_record.uid_path;
+        rldr_data_.last_valid_vtoce_ename = backup_volume_record.primary_name;
+        rldr_data_.last_pvid = backup_volume_record.pvid;
+        rldr_data_.last_vtocx = backup_volume_record.vtocx;
+      end;
+						/* inform operator of last valid object read */
+    if resynching_completed & backup_volume_record.uid ^= "0"b then do;
+        resynching_completed = "0"b;
+        call find_volname ((backup_volume_record.pvid), pvname, lvname, code);
+        if code = 0 then
+	call rldr_report_$error_output (rldr_datap, 0, myname,
+	     "first object after resynching ^a on pv ^a ^[(vtocx = ^d)^;^s^] of logical volume ^a",
+	     convert_puid_ (), pvname, (backup_volume_record.pvid ^= (36)"0"b),
+	     backup_volume_record.vtocx, lvname);
+        else call rldr_report_$error_output (rldr_datap, 0, myname,
+	        "first object after resynching ^a", convert_puid_ ());
+      end;
+    do pvindex = 1 to rldr_data_.npvs;
+						/* if this object was from any physical volumes */
+      if backup_volume_record.pvid = rldr_data_.pvid (pvindex) then do;
+						/* on our list				*/
+	if rldr_data_.abandoned (pvindex) then goto exit_pvid_check;
+						/* but not these				*/
+	controlp = rldr_data_.controlp (pvindex);
+	vtocx = backup_volume_record.vtocx;		/* pick up index */
+	if vtocx > rldr_control.n_vtoce - 1 then do;
+	    call rldr_report_$error_output (rldr_datap, 0, myname, "VTOCE index out of range on pv ^a",
+	         rldr_data_.pvname (pvindex));
+	    nel = backup_volume_record.rec2_len;
+	    if nel ^= 0 then call skip_chars;
+	    return;
+	  end;
+
+/* Check to see if this vtocx has already been encountered. If so
+   then skip it. If its a null vtoce then flag it as seen but don't treat it as new info.  If encountered
+   but the time_dumped is latter then this copy is newer so its new info. If never encountered its new info. */
+
+	already_there = "0"b;
+	if rldr_control (vtocx).time_dumped < bin (backup_volume_record.time_dumped || (16)"0"b, 52) then do;
+	    already_there = (rldr_control (vtocx).uid ^= "0"b & rldr_control (vtocx).time_dumped ^= 0);
+	    rldr_control (vtocx).time_dumped = bin (backup_volume_record.time_dumped || (16)"0"b, 52);
+	    rldr_control (vtocx).uid = backup_volume_record.uid;
+	    new_info = "1"b;
+	    return;
+	  end;
+	goto exit_pvid_check;
+        end;
+    end;
+exit_pvid_check:
+    do pvindex = 1 to rldr_data_.npvs;			/* make them all look alike			*/
+      controlp = rldr_data_.controlp (pvindex);
+      rldr_control.num_rejected = rldr_control.num_rejected + 1;
+    end;
+    pvindex = 0;					/* flag					*/
+    nel = backup_volume_record.rec2_len;
+    call skip_chars;
+    return;
+
+  end read_volume_record;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+skip_chars: proc;
+
+/* This proc  skips forward on the dump volume the number of characters specified by nel.
+*/
+
+    nelt = nel;
+    call read (recordp, nel, nelt, (backup_volume_record.rec1_type = vtoce_type & backup_volume_record.version > backup_volume_record_version_1), code);
+    call check_input_error;
+    if entry = get_object & new_volume then goto search_loop;
+
+  end skip_chars;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+check_input_error: proc;
+
+/* This proc checks for error after a read of a dump volume. If we have reached the end of the dump volume then
+   we detach the volume, update the volume map and vtoc header on the physical volume and attach a new dump
+   volume.  If an error has occurred we attemp to recover by repositioning the dump volume at the beginning
+   of the next logical dump record. If we are already recovering we pretend the error never happened.
+   Of course if no error has occured we return. */
+
+dcl i		     fixed bin;
+
+    new_volume = "0"b;
+    if code ^= 0 | nel ^= nelt then do;
+        if (code = error_table_$end_of_info | code = error_table_$device_end) then do;
+	  if resynching then do;
+	      call rldr_report_$error_output (rldr_datap, 0, myname, "Resynchronization terminated by end of volume");
+	      call rldr_report_$error_output (rldr_datap, 0, myname, "^d words skipped", words_skipped);
+	    end;
+detach_and_continue:
+	  call detach;
+	  do i = 1 to rldr_data_.npvs;		/* for each pv that had something on this dump volume*/
+	    controlp = rldr_data_.controlp (i);
+	    if (rldr_control.dir_rec ^= 0 | rldr_control.seg_rec ^= 0
+	         | rldr_control.num_null_vtoce ^= 0) then do;
+	        call rldr_vtoc_header_$update (rldr_datap, i, code);
+	        if code ^= 0 then
+		call rldr_report_$error_output (rldr_datap, code, myname, "Error updating vtoc header on pv ^a",
+		     rldr_data_.pvname (i));
+	        call rldr_volume_map_$update (rldr_datap, i, code);
+	        if code ^= 0 then
+		call rldr_report_$error_output (rldr_datap, code, myname, "Error updating volume map on pv ^a",
+		     rldr_data_.pvname (i));
+	      end;
+	  end;
+	  call attach;
+	  new_volume = "1"b;
+	  return;
+	end;
+        else do;
+	  if ^resynching then do;
+	      if nel ^= nelt then
+	        call rldr_report_$error_output (rldr_datap, 0, myname, "Read did not complete on ^a",
+		   rldr_data_.controlp (1) -> rldr_control.curn_volname);
+	      if code = -1 then
+	        call rldr_report_$error_output (rldr_datap, 0, myname, "Invalid dump record header on ^a",
+		   rldr_data_.controlp (1) -> rldr_control.curn_volname);
+	      else call rldr_report_$error_output (rldr_datap, code, myname, "I/O error reading input volume ^a",
+		      rldr_data_.controlp (1) -> rldr_control.curn_volname);
+	      call find_volname ((rldr_data_.last_pvid), pvname, lvname, code);
+	      if code ^= 0 then
+	        call rldr_report_$error_output (rldr_datap, 0, myname, "bad input record after ^a - resynching started",
+		   convert_puid_ ());
+	      else call rldr_report_$error_output (rldr_datap, 0, myname,
+		      "bad input record after ^a on pv ^a ^[(vtocx = ^d)^;^s^] of logical volume ^a - resynching started",
+		      convert_puid_ (), pvname, (rldr_data_.last_pvid ^= (36)"0"b),
+		      rldr_data_.last_vtocx, lvname);
+	      resynch_retry_count = 0;
+	      call resynch_input_volume;
+
+	      if entry = get_object then do;
+		if resynching_completed then goto pattern_match_label;
+		else if new_volume then goto search_loop;
+	        end;
+	      else if entry = read_object then do;
+		code = -1;
+		return;
+	        end;
+	    end;
+	  else do;				/* already had an error			*/
+	      resynch_retry_count = resynch_retry_count + 1;
+						/* keep track so we don't try this forever	*/
+	      if resynch_retry_count > 64 then do;
+		call rldr_report_$error_output (rldr_datap, code, myname,
+		     "Resynchronization failed due to I/O error during resynching on volume ^a.",
+		     rldr_data_.controlp (1) -> rldr_control.curn_volname);
+		goto detach_and_continue;
+	        end;
+	    end;
+	end;
+      end;
+
+  end check_input_error;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+attach: proc;
+
+/* This proc attaches the next dump volume either on the list or as specified by the operator. If we are
+   in the manual mode we treat each dump volume as coming from a list of one item. If the operator has specified
+   an alternate input attach description then we use it, else we use the default. We also initialize some per dump
+   volume counters. */
+
+dcl i		     fixed bin;
+
+retry_attach:
+    retry_attach_label = retry_attach;
+						/* use dump volume list */
+    if ^rldr_data_.manual then do;
+        rldr_input_volume_list.curn_entry = rldr_input_volume_list.curn_entry + 1;
+        if rldr_input_volume_list.curn_entry > rldr_input_volume_list.num_entries then do;
+no_more:	  code = error_table_$end_of_info;
+	  goto get_object_ret;
+	end;
+        volid = rldr_input_volume_list (rldr_input_volume_list.curn_entry).volid;
+        volname = rldr_input_volume_list (rldr_input_volume_list.curn_entry).volname;
+
+        do i = 1 to rldr_data_.npvs;			/* make all controls look the same		*/
+	controlp = rldr_data_.controlp (i);
+	rldr_control.curn_volname = volname;
+	rldr_control.curn_volid = volid;
+        end;
+      end;
+    else do;					/* operator will tell us which to use */
+        query_info.yes_or_no_sw = "0"b;			/* query_info is ok, except for this		*/
+request: call command_query_ (addr (query_info), avolname, myname, "Type input volume name: ");
+        volname = avolname;				/* make it the right type			*/
+        if volname = "" then goto request;
+        if volname = "." then goto no_more;
+        volid = get_volid_ (volname);
+        if code ^= 0 then do;
+	  call ioa_ ("invalid volume identifier ^a", volname);
+	  goto request;
+	end;
+        query_info.yes_or_no_sw = "1"b;			/* back to normal				*/
+        do i = 1 to rldr_data_.npvs;			/* make them all look the same		*/
+	controlp = rldr_data_.controlp (i);
+	rldr_control.curn_volname = volname;
+	rldr_control.curn_volid = volid;
+        end;
+        rldr_input_volume_list.curn_entry = 1;
+        rldr_input_volume_list (rldr_input_volume_list.curn_entry).volname = volname;
+        rldr_input_volume_list (rldr_input_volume_list.curn_entry).volid = volid;
+      end;
+						/* use supplied attach description if it exists */
+    if rldr_data_.input_volume_desc ^= "" then
+      call ioa_$rsnnl (rldr_data_.input_volume_desc, att_desc, (0), volname);
+    else call ioa_$rsnnl ("tape_mult_ ^a -system", att_desc, (0), volname);
+						/* attach dump volume */
+    if get_group_id_ () = "Initializer.SysDaemon.z" & hcs_$level_get () = 1 then ring_1 = "1"b;
+    else ring_1 = "0"b;
+retry: if ring_1 then call timer_manager_$alarm_call (180, "11"b, attach_timer);
+    call iox_$attach_name ("input_volume", rldr_data_.inputvol_iocbp, att_desc, null, code);
+    if ring_1 then call timer_manager_$reset_alarm_call (attach_timer);
+    if code ^= 0 then do;
+        if code = error_table_$resource_unavailable then do;
+	  query_info.version = query_info_version_5;
+	  call command_query_$yes_no (YES, 0, myname, "", "
+The physical drive or dump volume is not available or is in use by an other process.
+Do you wish to retry the attachment");
+	  if YES then goto retry;
+	end;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Unable to attach dump volume ^a", volname);
+        goto retry_attach_label;
+      end;
+						/* open switch for reading */
+    call iox_$open (rldr_data_.inputvol_iocbp, Stream_input, "0"b, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error on opening dump volume ^a", volname);
+        call iox_$detach_iocb (rldr_data_.inputvol_iocbp, ignore);
+        goto retry_attach;
+      end;
+    do i = 1 to rldr_data_.npvs;			/* again, make them all look the same		*/
+      controlp = rldr_data_.controlp (i);		/* reset per dump volume counters */
+      rldr_control.input_vol_seg_num = 0;
+      rldr_control.input_vol_seg_rec = 0;
+      rldr_control.input_vol_dir_num = 0;
+      rldr_control.input_vol_dir_rec = 0;
+    end;
+    return;
+
+  end attach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+detach: proc;
+
+/* This proc detaches a dump volume and reports what infomation on it was reloaded */
+dcl i		     fixed bin;
+						/* close dump volume */
+    call iox_$close (rldr_data_.inputvol_iocbp, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Unable to close dump volume ^a", volname);
+						/* and detach */
+    call iox_$detach_iocb (rldr_data_.inputvol_iocbp, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Unable to detach dump volume ^a", volname);
+    rldr_data_.inputvol_iocbp = null;			/* be sure */
+						/* tell operator what we did */
+    call rldr_vtoc_buffer_$write (rldr_datap, ignore);
+    do i = 1 to rldr_data_.npvs;
+      controlp = rldr_data_.controlp (i);
+      if (rldr_control.input_vol_dir_rec ^= 0 | rldr_control.input_vol_seg_rec ^= 0) then do;
+	call rldr_report_$online_output (rldr_datap, 0, myname,
+	     "reloaded from input volume ^a ^d records of ^d directories and ^d records of ^d segments on pv ^a",
+	     rldr_control.curn_volname, rldr_control.input_vol_dir_rec, rldr_control.input_vol_dir_num,
+	     rldr_control.input_vol_seg_rec, rldr_control.input_vol_seg_num, rldr_data_.pvname (i));
+						/* reset per dump volume counters */
+
+	rldr_control.input_vol_seg_num = 0;
+	rldr_control.input_vol_seg_rec = 0;
+	rldr_control.input_vol_dir_num = 0;
+	rldr_control.input_vol_dir_rec = 0;
+        end;
+    end;
+
+    return;
+
+  end detach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+lock_volume_log: proc;
+
+/* This proc locks the volume log */
+
+    call set_lock_$lock (backup_volume_log.lock, -1, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error locking volume log ^a.volog",
+	 rldr_data_.pvname (pvindex));
+    return;
+
+  end lock_volume_log;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+resynch_input_volume: proc;
+
+/* This proc  resynchronizes a dump volume by stepping through the input one word at a time until it
+   recognizes the volume header unique pattern or until we get to the end of the volume. An upper
+   bound of one million words is placed on the loop so it will finish */
+
+/* set flag */
+    resynching = "1"b;
+    resynching_completed = "0"b;
+						/* clear buffer and set flag */
+    input_buf (*) = "0"b;
+    new_volume = "0"b;
+						/* read logical record header */
+    nel = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+						/* if end of dump volume we are done */
+    if new_volume then return;
+						/* count words skipped */
+    words_skipped = 0;
+						/* test for pattern match */
+test: if word (1) = pattern1 & word (4) = pattern2 & word (7) = pattern3 then do;
+        call rldr_report_$error_output (rldr_datap, 0, myname, "Synchronization completed ^d words skipped on dump volume ^a",
+	   words_skipped, rldr_data_.controlp (1) -> rldr_control.curn_volname);
+        resynching = "0"b;
+        resynching_completed = "1"b;
+        return;
+      end;
+						/* shift buffer right 1 word and read next word */
+    string = substr (string, 37, (size (backup_volume_header) - 1) * BITS_PER_WORD);
+    new_volume = "0"b;
+    nel = CHARS_PER_WORD;
+    call read (addr (word (size (backup_volume_header))),
+         nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+    if new_volume then return;
+						/* count words skipped and test for limit */
+    words_skipped = words_skipped + 1;
+    if words_skipped > 256 * WORDS_PER_PAGE then do;	/* put a limit on it */
+        call rldr_report_$error_output (rldr_datap, 0, myname, "Resynchronization failed on dump volume ^a",
+	   rldr_data_.controlp (1) -> rldr_control.curn_volname);
+        code = error_table_$end_of_info;
+        call check_input_error;
+        return;
+      end;
+    goto test;
+
+  end resynch_input_volume;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+unlock_volume_log: proc;
+
+/* This proc unlocks the volume log */
+
+    call set_lock_$unlock (backup_volume_log.lock, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error unlocking volume log ^a.volog",
+	 rldr_data_.pvname (pvindex));
+  end unlock_volume_log;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+record_info: proc;
+dcl reattach	     bit (1);
+
+/* This proc picks up data stored in the info record on the dump volume. For the first dump volume
+   we just collect the info. For subsequent dump volumes checks are made to see that the
+   dump volume comes from this site or  is not out of chronological order. In addition we check for disk type
+   conversion. */
+
+    reattach = "0"b;
+    infop = rldr_data_.infop;
+    infop -> backup_info = recordp -> backup_info;
+    if backup_info.version = backup_info_version_2 &
+         rldr_data_.controlp (1) -> rldr_control.curn_volname ^= backup_info.dump_volname
+    then do;
+        call rldr_report_$error_output (rldr_datap, 0, myname, "Attempt to mount unrequested dump volume ^a",
+	   backup_info.dump_volname);
+        reattach = "1"b;
+        rldr_input_volume_list.curn_entry = rldr_input_volume_list.curn_entry - 1;
+      end;
+    if rldr_data_.rpv then do;
+        if (rldr_data_.rpv_disk_type ^= backup_info.rpv_disk_type) & ^warning_printed then do;
+	  warning_printed = "1"b;
+	  call rldr_report_$online_output (rldr_datap, 0, myname, "Warning - new disk type for rpv");
+	end;
+      end;
+    else do;					/* ensure same system for now...		*/
+        if (rldr_data_.rpv_pvid ^= backup_info.rpv_pvid) then do;
+	  call rldr_report_$error_output (rldr_datap, 0, myname,
+	       "Attempt to use non local site dump volume ^a", backup_info.dump_volname);
+	  reattach = "1"b;
+	end;
+      end;
+    if reattach then do;
+        call detach;				/* get rid of bad dump volume */
+        call attach;				/* get new one */
+        goto search_loop;
+      end;
+    return;
+  end record_info;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get_volid_: proc (name) returns (bit (36));
+
+/* This proc constructs a volume id from a volume name. This is a interim measure until all dump volume are registered
+   and have a unique id. This construction restricts the volume name to two or less non numeric characters followed
+   by any numeric value less then 262144. */
+
+dcl name		     char (32);
+dcl 1 volid	     aligned,
+    2 char	     char (2) unaligned,
+    2 num		     fixed bin unaligned;
+
+/* util rcp_ interface defined
+   call rcp_$volname_info (volname, volid, code);
+   if code ^= 0 then do;
+   call rldr_report_$error_output (rldr_datap, code, myname, "Unknown volname specified");
+
+   we' fudge it */
+
+    volid.char = "";
+    num_pos = search (name, "0123456789");
+    if num_pos > 3 | num_pos = 0 then do;
+bad_volid: code = error_table_$bad_volid;
+        return (""b);
+      end;
+    else do;
+        if num_pos = 2 then substr (volid.char, 2, 1) = substr (name, 1, 1);
+        else volid.char = substr (name, 1, 2);
+        char_num = substr (name, num_pos, length (name) - num_pos);
+        num = cv_dec_check_ (char_num, code);
+        if code ^= 0 then goto bad_volid;
+        volid.num = num;
+      end;
+    return (unspec (volid));
+
+  end get_volid_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+open_time: proc returns (fixed bin (71));
+
+/* This proc retruns the open(start) time of a single or multi volume dump volume */
+
+dcl temp		     fixed bin (71);
+dcl jdx		     fixed bin;
+    if bvle.dump_type = incr then return (bvle.open_time);
+    do jdx = idx to 1 by -1;
+      if backup_volume_log.array (jdx).cycle_uid = bvle.cycle_uid then
+        temp = backup_volume_log.array (jdx).open_time;
+    end;
+    return (temp);
+
+  end open_time;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+attach_timer: proc;
+
+/* This proc is the query portion of the remount/refusal mechanism described above */
+
+    call command_query_$yes_no (YES, 0, myname, "", "Attachment of dump volume ^a not completed. Do you wish to retry ?",
+         rldr_control.curn_volname);
+    if YES then rldr_input_volume_list.curn_entry = rldr_input_volume_list.curn_entry - 1;
+    goto retry_attach_label;
+  end attach_timer;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+convert_puid_: proc returns (char (168));
+
+/* This proc is used to convert a unique id pathname to an ascii pathname  */
+
+dcl dn		     char (168);
+dcl en		     char (32);
+dcl ret_dn	     char (168);
+dcl ec		     fixed bin (35);
+
+    if rldr_data_.stranger then goto ret_unk;		/* can't possible tell him this		*/
+    on seg_fault_error goto ret_unk;
+    call hc_backup_$decode_uidpath (rldr_data_.last_valid_puid, dn, en, ec);
+    if ec = error_table_$root then ;
+    else if ec ^= 0 then
+ret_unk: return ("UNKNOWN");
+    call ioa_$rsnnl ("^a^[>^]^[^a>^;^s^]^a", ret_dn, (0), dn, dn ^= ">", en ^= "", en, rldr_data_.last_valid_vtoce_ename);
+    revert seg_fault_error;
+    return (ret_dn);
+  end convert_puid_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+find_volname:
+  proc (apvid, apvname, alvname, acode);
+dcl acode		     fixed bin (35),
+  (apvname, alvname)     char (32),
+  apvid		     bit (36);
+
+    acode = 0;
+    apvname, alvname = "UNKNOWN";
+    if rldr_data_.stranger then acode = -1;		/* can't possibly help			*/
+    else call mdc_$find_volname (apvid, apvname, alvname, acode);
+
+  end find_volname;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+read: proc (return_buffer_ptr,
+       Nrequested_chars,
+       Nreturned_chars,
+       Sdelimited,
+       code);
+
+dcl return_buffer_ptr    ptr,
+  Nrequested_chars	     fixed bin (21),
+  Nreturned_chars	     fixed bin (21),
+  Sdelimited	     bit (1) aligned,
+  code		     fixed bin (35);
+
+dcl input_buffer	     char (256 * CHARS_PER_PAGE)
+		     based (rldr_data_.input_buffer_ptr);
+
+dcl return_string	     char (Nrequested_chars)
+		     based (return_buffer_ptr);
+
+dcl Nassign_chars	     fixed bin (21),
+  Nread_chars	     fixed bin (21),
+  end_of_record	     fixed bin,
+  tape_check1 /* bit (72) */ char (DELIM_LEN),
+  tape_check2 /* bit (72) */ char (DELIM_LEN);
+
+    Nreturned_chars, Nread_chars, code = 0;
+
+    do while (Nreturned_chars < Nrequested_chars & code = 0);
+      if rldr_data_.input_buffer_len = 0 then do;
+	rldr_data_.input_buffer_start = 1;
+
+	if Sdelimited & Nreturned_chars = 0 then do;
+	    call iox_$get_chars (rldr_data_.inputvol_iocbp,
+	         addr (tape_check1), DELIM_LEN, Nread_chars, code);
+	    if code ^= 0 then return;
+	  end;
+
+	call iox_$get_chars (rldr_data_.inputvol_iocbp,
+	     addcharno (return_buffer_ptr, Nreturned_chars),
+	     Nrequested_chars - Nreturned_chars, Nread_chars, code);
+	Nreturned_chars = Nreturned_chars + Nread_chars;
+	if code ^= 0 then return;
+
+	if Sdelimited then do;
+	    call iox_$get_chars (rldr_data_.inputvol_iocbp,
+	         addr (tape_check2), DELIM_LEN, Nread_chars, code);
+	    if code ^= 0 then
+	      return;
+
+	    if tape_check1 ^= tape_check2 then do;
+						/* found a short segment, move       */
+						/* return string into the temp input */
+						/* buffer and start parsing          */
+	        rldr_data_.input_buffer_len = Nreturned_chars + DELIM_LEN;
+	        substr (input_buffer, 1, Nreturned_chars) = return_string;
+	        substr (input_buffer, Nreturned_chars + 1, DELIM_LEN) = tape_check2;
+	      end;
+	  end;
+        end;
+
+      else
+	 if Sdelimited then do;
+	tape_check1 = substr (input_buffer,
+	     rldr_data_.input_buffer_start, DELIM_LEN);
+	tape_check2 = "";
+	rldr_data_.input_buffer_start =
+	     rldr_data_.input_buffer_start + DELIM_LEN;
+	rldr_data_.input_buffer_len =
+	     rldr_data_.input_buffer_len - DELIM_LEN;
+        end;
+
+      if rldr_data_.input_buffer_len > 0 then do;
+	Nassign_chars =
+	     min (rldr_data_.input_buffer_len, Nrequested_chars);
+
+	if Sdelimited then do;
+	    if tape_check1 ^= tape_check2 then do;
+	        end_of_record = index (substr (input_buffer, rldr_data_.input_buffer_start,
+		   rldr_data_.input_buffer_len), tape_check1);
+	        if end_of_record > 0 then do;
+		  Nassign_chars = end_of_record - 1;
+		  if Nrequested_chars ^= Nassign_chars then
+		    code = error_table_$data_loss;
+		end;
+	      end;
+	  end;
+
+	return_string = substr (input_buffer,
+	     rldr_data_.input_buffer_start, Nassign_chars);
+	Nreturned_chars = Nassign_chars;
+
+	rldr_data_.input_buffer_start =
+	     rldr_data_.input_buffer_start + Nassign_chars;
+	rldr_data_.input_buffer_len =
+	     rldr_data_.input_buffer_len - Nassign_chars;
+
+	if Sdelimited & rldr_data_.input_buffer_len > 0 then do;
+   	    rldr_data_.input_buffer_start =
+	          rldr_data_.input_buffer_start + DELIM_LEN;
+	    rldr_data_.input_buffer_len =
+	         rldr_data_.input_buffer_len - DELIM_LEN;
+	    substr (input_buffer, 1, rldr_data_.input_buffer_len) =
+	         substr (input_buffer, rldr_data_.input_buffer_start,
+	         rldr_data_.input_buffer_len);
+	    rldr_data_.input_buffer_start = 1;
+	  end;
+        end;
+    end;
+
+    return;
+  end read;
+
+%include rldr_input_volume_list;
+%include backup_info;
+
+%include backup_volume_log;
+%include backup_pvol_info;
+
+%include fs_vol_label;
+
+%include old_fs_vol_label;
+
+%include backup_static_variables;
+%include backup_volume_header;
+%include backup_volume_record;
+
+%include rldr_data_;
+
+%include vtoce;
+
+%include rldr_control;
+
+%include vol_map;
+%include vtoc_header;
+
+%include iox_modes;
+
+%include iox_dcls;
+
+%include rldr_skip_list;
+%include query_info;
+
+%include system_constants;
+
+  end rldr_input_;

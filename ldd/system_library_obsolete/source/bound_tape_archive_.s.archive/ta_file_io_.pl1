@@ -1,0 +1,614 @@
+/* ***********************************************************
+   *                                                         *
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   *                                                         *
+   *********************************************************** */
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ta_file_io_: proc; return;
+
+/* This module does tape and file I/O for tape_archive.
+   Written 06/06/77 by C. D. Tavares
+   Modified 04/11/79 by CDT to handle unexpired file abort better and to
+   clean up garbage error message printed when processing table of contents.
+   Modified 10/24/80 by CDT to add tape_ibm_ capability.
+   Modified 12/05/80 by CDT to diagnose error_table_$short_record from
+   vfile_ as no_final_newline, not an error.
+   Last modified 83-03-25 by S. G. Harris for version 4.
+*/
+
+
+/* AUTOMATIC */
+
+dcl  attribute_file_name char (17) aligned,
+     binary_mode bit (1) aligned,
+     bit_count fixed bin (24),
+     cancel_deletion bit (1) aligned,
+     char_count fixed bin (21),
+     compacting bit (1) aligned,
+     dirname char (168),
+     ename char (32),
+     extracting bit (1) aligned,
+     i fixed bin,
+     input_atd char (520),
+     j fixed bin,
+     max_chars_in_seg fixed bin (21),
+     msf_fcb_ptr pointer,
+     n_chars_read fixed bin (21),
+     n_words_read fixed bin (18),
+     output_atd char (520),
+     readin_ptr pointer,
+     seg_ptr pointer,
+     temp_file_no fixed bin;
+
+/* ENTRIES */
+
+dcl  com_err_ ext entry options (variable),
+     hcs_$set_bc_seg ext entry (pointer, fixed bin (24), fixed bin (35)),
+     hcs_$truncate_seg ext entry (pointer, fixed bin (18), fixed bin (35)),
+    (ioa_, ioa_$rsnnl) ext entry options (variable),
+     msf_manager_$close ext entry (pointer),
+     msf_manager_$get_ptr ext entry (pointer, fixed bin, bit (1) aligned, pointer, fixed bin (24), fixed bin (35)),
+     msf_manager_$open ext entry (char (*), char (*), pointer, fixed bin (35));
+
+dcl  iox_$attach_ptr ext entry (pointer, char (*), pointer, fixed bin (35)),
+     iox_$close ext entry (pointer, fixed bin (35)),
+     iox_$detach_iocb ext entry (pointer, fixed bin (35)),
+     iox_$get_line ext entry (pointer, pointer, fixed bin (21), fixed bin (21), fixed bin (35)),
+     iox_$open ext entry (pointer, fixed bin, bit (1) aligned, fixed bin (35)),
+     iox_$read_record ext entry (pointer, pointer, fixed bin (21), fixed bin (21), fixed bin (35)),
+     iox_$put_chars ext entry (pointer, pointer, fixed bin (21), fixed bin (35)),
+     iox_$write_record ext entry (pointer, pointer, fixed bin (21), fixed bin (35));
+
+dcl  ta_filesys_util_$create_attribute_file ext entry (pointer, fixed bin, pointer, bit (1) aligned, fixed bin (35)),
+     ta_filesys_util_$prepare_extraction ext entry (pointer, fixed bin, fixed bin (35)),
+     ta_filesys_util_$replace_attributes ext entry (pointer, fixed bin, pointer, fixed bin (35));
+
+/* CONSTANTS */
+
+dcl  Legal_name_chars_ansi char (128) static options (constant) initial
+    ("//////////////////////////////////""//%&'()*+,-./0123456789:;<=>?/ABCDEFGHIJKLMNOPQRSTUVWXYZ////-/ABCDEFGHIJKLMNOPQRSTUVWXYZ/////"),
+     Legal_name_chars_ibm char (128) static options (constant) initial
+    ("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@""#$@@@@@@@@@@@0123456789@@@@@@@ABCDEFGHIJKLMNOPQRSTUVWXYZ@@@@@@ABCDEFGHIJKLMNOPQRSTUVWXYZ@@@@@"),
+     Upper_case char (26) static options (constant) initial
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+     Newline char (1) static options (constant) initial ("
+");
+
+/* EXTERNAL STATIC */
+
+dcl (error_table_$end_of_info,
+     error_table_$short_record) ext fixed bin (35) static;
+
+dcl  sys_info$max_seg_size fixed bin (35) external static;
+
+/* BASED */
+
+dcl 1 tape_archive_io_info aligned based (tii_ptr),
+%include tape_archive_io_info;
+     ;
+
+dcl  based_segment (n_words_read) bit (36) aligned based (seg_ptr),
+     buffer char (max_chars_in_seg) based (buffer_ptr);
+
+/* INCLUDE FILES */
+
+%include tape_archive_table_dcl;
+%include tape_archive_attributes;
+%include create_branch_info;
+%include iox_modes;
+
+/* BUILTINS */
+
+dcl (addr, binary, collate, divide, length, max, mod, null, substr, translate, unspec) builtin;
+
+/* CONDITION */
+
+dcl  cleanup condition;
+
+extract:	entry (table_ptr, component_no, tii_ptr, code);
+
+/* PARAMETERS */
+
+dcl  component_no fixed bin parameter,
+     tii_ptr pointer parameter,
+     code fixed bin (35) parameter;
+
+	compacting = (output_atd_template ^= "");
+	extracting = "1"b;
+	goto extract_compact_common;
+
+
+compact:	entry (table_ptr, component_no, tii_ptr, code);
+
+	compacting = "1"b;
+	extracting = "0"b;
+
+extract_compact_common:
+	component_ptr = addr (component_table (component_no));
+	request_ptr = addr (request_queue (component.associated_request_index));
+	if extracting then				/* Don't copy it if it's going to be deleted */
+	     if request.delete then compacting = "0"b;
+	cancel_deletion = "0"b;
+	max_chars_in_seg = sys_info$max_seg_size * 4;
+	temp_file_no = tape_archive_table.last_tape_file_no;
+
+	dirname = "";
+	ename = component.entry_name;
+
+/* We close the switches upon arrival and leave them open on departure.  Seems
+   sloppy,  but  we  can  dismount the tapes more easily if we leave them open
+   when  we  are  done.   Also, the -retain option fits right into this way of
+   doing things.  */
+
+	if compacting then call close_switch (tape_output_switch);
+	call close_switch (tape_input_switch);
+
+/* first, open the attribute file for this component */
+
+	attribute_file_name = make_filename ("ATTRIBUTEFILE", component.attribute_file_no);
+	call ioa_$rsnnl (input_atd_template, input_atd, 0,
+	     attribute_file_name, component.attribute_file_no, "binary");
+
+	if tape_archive_io_info.long_sw then
+	     call ioa_ ("Searching for ^a for^[ extraction^[-deletion^]^;^s^]^[ and^;^]^[ compaction^;^].",
+	     component.entry_name, extracting, request.delete, (extracting & compacting), compacting);
+
+	call iox_$attach_ptr (tape_input_switch, input_atd, null, code);
+	if code ^= 0 then return;
+
+	on cleanup call abort_silent;
+
+	call iox_$open (tape_input_switch, Sequential_input, ""b, code);
+	if code ^= 0 then call abort;
+
+	if compacting then do;			/* create a new attribute file on the new tape */
+	     temp_file_no = temp_file_no + 1;
+	     attribute_file_name = make_filename ("ATTRIBUTEFILE", temp_file_no);
+	     call open_tape_output_file (attribute_file_name, temp_file_no, "binary");
+	end;
+
+	call iox_$read_record (tape_input_switch, attribute_seg_ptr, max_chars_in_seg, n_chars_read, code);
+						/* The whole attributes file is one large record */
+	if code = error_table_$short_record then code = 0;
+	if code ^= 0 then call abort;
+
+	call close_switch (tape_input_switch);
+
+	if compacting then do;			/* copy the attribute file onto new tape */
+
+	     call iox_$write_record (tape_output_switch, attribute_seg_ptr, n_chars_read, code);
+	     if code ^= 0 then call abort;
+
+	     call close_switch (tape_output_switch);
+	end;
+
+/* Keep the attribute file aside for a moment and read in the segment */
+
+	call ioa_$rsnnl (input_atd_template, input_atd, 0,
+	     component.tape_file_name, component.attribute_file_no + 1,
+	     component.recording_mode);
+
+	call iox_$attach_ptr (tape_input_switch, input_atd, null, code);
+	if code ^= 0 then call abort;
+
+	call iox_$open (tape_input_switch, Sequential_input, ""b, code);
+	if code ^= 0 then call abort;
+
+	if compacting then do;			/* create a new file on new tape to copy this into also */
+	     temp_file_no = temp_file_no + 1;
+	     component.tape_file_name = make_filename (substr (component.tape_file_name, 1, 13), temp_file_no);
+	     call open_tape_output_file (component.tape_file_name, temp_file_no, component.recording_mode);
+	end;
+
+	dirname = request.directory_name;
+
+	if extracting then do;			/* we may be just compacting;
+						   otherwise, check for namedups, noaccess, etc. */
+	     call ta_filesys_util_$prepare_extraction (table_ptr, component.associated_request_index, code);
+	     if code ^= 0 then call cant_extract;
+	end;
+
+/* Now  we must figure out where and how to read in the file.  If we are truly
+   extracting,  we  should read the file right into place;  otherwise, we will
+   read  it  into a buffer just long enough to write it back out.  Also, if it
+   is  binary, we want to treat records a bit differently than if it is one of
+   the character mode.  */
+
+/* Note  that  at  any  time an error is noticed on extraction, the extracting
+   switch  will  be  turned  off  so  that  extraction  will  cease,  although
+   compaction may continue to take place.  */
+
+	if extracting then
+	     if component.recording_mode = "binary" then do; /* records represent segments and not lines */
+		binary_mode = "1"b;
+		call msf_manager_$open (dirname, ename, msf_fcb_ptr, code);
+		if msf_fcb_ptr = null then call cant_extract;
+	     end;
+
+	     else do;				/* ascii or ebcdic mode */
+						/* open the target file right in place */
+		binary_mode = ""b;
+		call ioa_$rsnnl ("vfile_ ^a>^a ", output_atd, 0, dirname, ename);
+
+		call iox_$attach_ptr (file_output_switch, output_atd, null, code);
+		if code ^= 0 then call cant_extract;
+
+		call iox_$open (file_output_switch, Stream_output, ""b, code);
+		if code ^= 0 then call cant_extract;
+	     end;
+
+/* Now read in the file itself.  If this is a binary file, we will read records and make segments out of each one.
+   If it is a character file, we will treat individual records as lines. */
+
+	if /* still */ extracting then
+	     if tape_archive_io_info.long_sw then
+		call ioa_ ("Reading ^a.", component.entry_name);
+
+	do j = 1 by 1 to component.n_tape_records while (extracting | compacting);
+
+	     if (extracting & binary_mode) then do;
+		call msf_manager_$get_ptr (msf_fcb_ptr, j-1, "1"b /* create */, seg_ptr, 0, code);
+						/* create an SSF or an MSF component to put the data into */
+		if seg_ptr = null then do;
+		     call cant_extract;
+		     readin_ptr = buffer_ptr;
+		end;
+		else readin_ptr = seg_ptr;
+	     end;
+
+	     else readin_ptr = buffer_ptr;
+
+/* Read one record from the tape */
+
+	     if (extracting | compacting) then do;
+		call iox_$read_record (tape_input_switch, readin_ptr, max_chars_in_seg, n_chars_read, code);
+		if code = error_table_$short_record then code = 0;
+		if code ^= 0 then call abort;
+	     end;
+
+	     if compacting then do;
+		call iox_$write_record (tape_output_switch, readin_ptr, n_chars_read, code);
+		if code ^= 0 then call abort;
+	     end;
+
+	     if extracting then do;
+		if binary_mode then do;
+		     n_words_read = divide (n_chars_read + 3, 4, 18, 0);
+		     call hcs_$truncate_seg (seg_ptr, n_words_read, 0);
+
+		     i = mod (n_chars_read, 4);
+		     if i > 0 then substr (based_segment (n_words_read), i*9+1) = ""b;
+
+		     call hcs_$set_bc_seg (seg_ptr, ta_attributes.component_bc (j-1), code);
+		end;
+
+		else do;				/* add a final newline and pump out the line */
+		     n_chars_read = n_chars_read + 1;
+		     substr (buffer, n_chars_read, 1) = Newline;
+
+/* Special hack: If the file had no final newline, don't add one */
+
+		     if j = component.n_tape_records then
+			if component.no_final_newline then n_chars_read = n_chars_read - 1;
+
+		     call iox_$put_chars (file_output_switch, buffer_ptr, n_chars_read, code);
+		     if code ^= 0 then call abort;
+		end;
+	     end;
+	end;
+
+/* Everything's off the tape (and/or on the new tape);  clean up */
+
+	if (extracting & binary_mode) then call msf_manager_$close (msf_fcb_ptr);
+	else call close_switch (file_output_switch);
+
+/* Now apply the attributes (ACL, names, etc.) to our newly extracted file. */
+
+	if extracting then do;
+	     call ta_filesys_util_$replace_attributes (table_ptr, component.associated_request_index, attribute_seg_ptr, code);
+	     if code ^= 0 then call abort;
+	end;
+
+	if compacting then component.attribute_file_no = temp_file_no - 1; /* remember to reset the attribute file no. */
+	tape_archive_table.last_tape_file_no = temp_file_no;
+
+	if cancel_deletion then code = 1; else code = 0;	/* tell caller if deletion cancelled */
+	return;
+%skip(5);
+cant_extract: proc;
+
+/* This  internal procedure will print out whatever error caused extraction to
+   fail,  reset  the  extraction  flag,  and the RETURN so that compaction, if
+   being done, may continue to completion.  
+
+   Special handling is required if the component is to be deleted. If the
+   request is for an extraction only, then the deletion request can simply be
+   cancelled. If a compaction is also taking place, however, then it has
+   already been suppressed.  Now that the extraction has failed, an attempt
+   must be made to go back and recover this component for the compacted volume
+   set.
+
+   Since the request.delete flag is used by ta_table_mgr_ for dead record
+   management, it cannot be used to cancel the deletion. The caller must be
+   notified through a code indicating this special case. */
+
+	     extracting = "0"b;
+	     call com_err_ (code, "tape_archive", "^a>^a^/^5xExtraction^[-deletion^] request will be ignored.",
+		dirname, ename, request.delete);
+	     if request.delete then
+		if output_atd_template ^= "" then do;	/* if compacting, try to recover component */
+		     cancel_deletion = "1"b;
+		     compacting = "1"b;
+		     goto extract_compact_common;
+		end;
+		else cancel_deletion = "1"b;		/* just extracting -- cancel deletion */
+	end cant_extract;
+
+append:	entry (table_ptr, request_no, tii_ptr, code);
+
+/* PARAMETER */
+
+dcl  request_no fixed bin parameter;
+
+/* ENTRY */
+
+dcl  clock_ ext entry returns (bit (72) aligned);
+
+	request_ptr = addr (request_queue (request_no));
+	max_chars_in_seg = sys_info$max_seg_size * 4;
+	temp_file_no = tape_archive_table.last_tape_file_no;
+
+	dirname = request.directory_name;
+	ename = request.entry_name;
+
+	call close_switch (tape_input_switch);		/* if extract was last operation we must clean up input side */
+	call close_switch (tape_output_switch);		/* see entry above for explanation */
+
+/* Create  an attribute file for this file, which will contain the ACL, names,
+   etc.   for  replacement  purposes  when the time comes to recreate the file
+   online */
+
+	if request.recording_mode = "" then
+	     request.recording_mode = "binary";
+
+	binary_mode = (request.recording_mode = "binary");
+
+	call ta_filesys_util_$create_attribute_file (table_ptr, request_no,
+	     attribute_seg_ptr, binary_mode, code);
+	if code ^= 0 then return;
+
+/* Choose  the  proper  recording  mode  for this file, based on what the user
+   requested and what the data really is */
+
+	if binary_mode then				/* seg is not legal ASCII */
+	     if request.recording_mode ^= "binary" then do;
+		call com_err_ (0, "tape_archive",
+		     "^a cannot be recorded in ^a mode;  using binary mode.",
+		     ename, request.recording_mode);
+		request.recording_mode = "binary";
+	     end;
+
+/* End of fun and games, now comes the serious work of getting it out there */
+
+	request.date_time_archived = substr (clock_ (), 21, 36); /* standard file system time */
+	request.no_final_newline = ""b;
+
+	on cleanup call abort_silent;
+
+/* Put the attribute file out to tape first */
+
+	if tape_archive_io_info.long_sw then
+	     call ioa_ ("Appending ^a.", request.entry_name);
+
+	temp_file_no = temp_file_no + 1;
+	request.attribute_file_no = temp_file_no;
+	attribute_file_name = make_filename ("ATTRIBUTEFILE", temp_file_no);
+	call open_tape_output_file (attribute_file_name, temp_file_no, "binary");
+
+/* Write out the attribute file as one huge record */
+
+	call iox_$write_record (tape_output_switch, attribute_seg_ptr, ta_attributes.own_length_in_chars, code);
+	if code ^= 0 then call abort;
+
+	call close_switch (tape_output_switch);
+
+/* Now, down to the business of recording the file itself */
+
+	temp_file_no = temp_file_no + 1;
+	request.tape_file_name =
+	     make_filename (substr (ename, 1, 12), temp_file_no);
+	call open_tape_output_file (request.tape_file_name, temp_file_no, request.recording_mode);
+
+	if request.recording_mode = "binary" then do;
+	     call msf_manager_$open (dirname, ename, msf_fcb_ptr, code);
+						/* Nice that msf_manager_ works on SSF's too! */
+	     if code ^= 0 then call abort;
+
+	     do i = 1 to max (ta_attributes.n_components, 1);
+		call msf_manager_$get_ptr (msf_fcb_ptr, i-1, ""b /* don't create */, seg_ptr, bit_count, code);
+		if code ^= 0 then call abort;
+
+		char_count = divide (bit_count, 9, 21, 0);
+
+		call iox_$write_record (tape_output_switch, seg_ptr, char_count, code);
+		if code ^= 0 then call abort;
+	     end;
+
+	     request.n_tape_records = i - 1;
+	     call msf_manager_$close (msf_fcb_ptr);
+	end;
+
+	else do;
+
+	     call ioa_$rsnnl ("vfile_ ^a>^a", output_atd, 0, dirname, ename);
+
+	     call iox_$attach_ptr (file_input_switch, output_atd, null, code);
+	     if code ^= 0 then call abort;
+
+	     call iox_$open (file_input_switch, Stream_input, ""b, code);
+	     if code ^= 0 then call abort;
+
+	     do i = 1 by 1 while (code ^= error_table_$end_of_info);
+
+		call iox_$get_line (file_input_switch, buffer_ptr, max_chars_in_seg, n_chars_read, code);
+
+		if code = 0 then			/* strip newline */
+		     n_chars_read = n_chars_read- 1;
+		else if code = error_table_$short_record then do;
+		     if substr (buffer, n_chars_read, 1) = Newline then
+			call abort;		/* shouldn't! */
+		     request.no_final_newline = "1"b;
+		     code = 0;
+		end;
+		else if code = error_table_$end_of_info then
+		     request.n_tape_records = i - 1;
+		else call abort;
+
+		if code = 0 then do;
+		     call iox_$write_record (tape_output_switch, buffer_ptr, n_chars_read, code);
+		     if code ^= 0 then call abort;
+		end;
+	     end;
+
+	     call close_switch (file_input_switch);
+	end;
+
+	tape_archive_table.last_tape_file_no = temp_file_no;
+	code = 0;
+	return;
+
+append_table: entry (table_ptr, tii_ptr, code);
+
+/* This entry writes the tape archive table out to tape. */
+
+/* AUTOMATIC */
+
+dcl  tablefile_name char (17) aligned;
+
+	call close_switch (tape_output_switch);
+
+	tape_archive_table.last_table_no = tape_archive_table.last_table_no + 1;
+	tablefile_name = make_filename ("ONLINE-TABLE-", tape_archive_table.last_table_no);
+
+	tape_archive_table.last_tape_file_no = tape_archive_table.last_tape_file_no + 1;
+						/* bump for file taken up by the table */
+	dirname = "";				/* for error messages */
+	ename = "tape copy of online table";
+	call open_tape_output_file (tablefile_name, tape_archive_table.last_tape_file_no, "binary");
+
+	char_count = divide (length (unspec (tape_archive_table)), 9, 21, 0);
+
+	call iox_$write_record (tape_output_switch, table_ptr, char_count, code);
+
+	return;
+
+dismount:	entry (table_ptr, switch_ptr, retain_sw, code);
+
+/* This entry dismounts and detaches a tape */
+
+dcl  switch_ptr pointer parameter,
+     retain_sw bit (1) aligned parameter;
+
+dcl  iox_$control ext entry (pointer, char (*), pointer, fixed bin (35));
+
+	call iox_$close (switch_ptr, code);
+
+	if ^retain_sw then call iox_$control (switch_ptr, "retain_none", null, code);
+
+	call iox_$detach_iocb (switch_ptr, code);
+	return;
+
+open_tape_output_file: proc (file_name, file_no, mode);
+
+dcl  file_name char (17) aligned parameter,
+     file_no fixed bin parameter,
+     mode char (8) aligned parameter;
+
+	     call ioa_$rsnnl (output_atd_template, output_atd, 0,
+		file_name, file_no, (file_no = 1), mode);
+
+	     call iox_$attach_ptr (tape_output_switch, output_atd, null, code);
+	     if code ^= 0 then call abort;
+
+	     call iox_$open (tape_output_switch, Sequential_output, ""b, code);
+	     if code ^= 0 then call abort;
+
+	     return;
+
+	end open_tape_output_file;
+%skip(5);
+make_filename: entry (table_ptr, arg_filename_part, arg_file_no) returns (char (17) aligned);
+
+dcl  arg_filename_part char (13) parameter,
+     arg_file_no fixed bin parameter;
+
+	return (make_filename (arg_filename_part, arg_file_no));
+%skip (3);
+make_filename: proc (filename_part, file_no) returns (char (17) aligned);
+
+dcl  filename_part char (13) parameter,
+     file_no fixed bin parameter;
+
+dcl  complete_filename char (17) aligned,
+     file_no_picture pic "9999";
+
+	     file_no_picture = file_no;
+
+	     if tape_archive_table.io_module_name = "tape_ansi_" then
+		complete_filename = translate (filename_part, Legal_name_chars_ansi, collate ()) || file_no_picture;
+
+	     else do;
+		if filename_part = "ONLINE-TABLE-" then
+		     complete_filename = "ONLINE#TABLE#" || file_no_picture;
+		else complete_filename = translate (filename_part, Legal_name_chars_ibm, collate ()) || file_no_picture;
+		substr (complete_filename, 9, 1) = ".";
+		if index (Upper_case, substr (complete_filename, 10, 1)) = 0 then
+		     substr (complete_filename, 10, 1) = "X";
+	     end;
+
+	     return (complete_filename);
+
+	end make_filename;
+%skip(5);
+close_switch: proc (switch_ptr);
+
+dcl  switch_ptr pointer parameter;
+
+	     call iox_$close (switch_ptr, 0);
+
+	     call iox_$detach_iocb (switch_ptr, 0);
+
+	end close_switch;
+%skip(5);
+abort_silent: proc;
+
+dcl  temp_ptr pointer;
+
+	     do temp_ptr = file_input_switch, file_output_switch;
+
+		call iox_$close (temp_ptr, 0);
+		call iox_$detach_iocb (temp_ptr, 0);
+	     end;
+	end abort_silent;
+%skip(5);
+abort:	proc options (non_quick);
+
+	     call com_err_ (code, "tape_archive", "Unexpected error while processing ^[^s^;^a>^]^a", (dirname = ""), dirname, ename);
+	     call abort_silent;
+	     goto returner;
+	end abort;
+
+returner:	return;
+
+     end ta_file_io_;

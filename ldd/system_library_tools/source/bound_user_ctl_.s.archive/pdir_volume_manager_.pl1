@@ -1,0 +1,931 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1991   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+pdir_volume_manager_: proc;
+
+/* This procedure manages the placement of process directories on logical volumes.
+   It also manages the quota on >pdd, to prevent it from running out or overflowing.
+
+   PDIR VOLUME MANAGEMENT:
+
+   The intention is to spread the space requirements and paging load for process
+   directory segments among several logical volumes, to increase system performance
+   and to eliminate the need for a site to have one logical volume large enough to
+   accomodate all process directory segments.
+
+   The segments of a process directory are placed on a particular logical volume
+   by setting the sons volume of >pdd to that volume just before creating
+   the process directory. It takes its sons volume from its parent (>pdd) and
+   retains that sons volume even when the sons volume of >pdd is changed at the
+   time of the next process creation. Thus all the segments in a process directory
+   reside on the same logical volume. The directories themselves are on the root
+   logical volume, as are all directories. We will speak of a process directory
+   being on a volume, for brevity, when we really mean that the segments of the
+   process directory are on that volume.
+
+   The placement algorithm could be arbitrarily complex, taking into account
+   the size and current space available of each logical volume, the current
+   distribution of process directories among logical volumes, and even the amount
+   of recent paging activity on each volume. Different groups of users could
+   be restricted to having their process directory segments on certain logical
+   volumes only. It is unclear which, if any, of these criteria would lead to the
+   best improvement in system performance. Therefore the algorithm used in this
+   initial implementation is the simplest possible one. It is expected to result
+   in a measurable performance improvement. Refinements to the placement algorithm
+   can be made later if they are found to be necessary and effective.
+
+   A list of logical volumes available for process directory segments is kept by
+   using a bit in the disk table. Thus only mounted logical volumes can be in
+   the list, and the list must be initialized at each bootload. Process directories
+   are placed on the volumes in this list in proportion to the number of physical
+   volumes in each logical volume. The proportion is observed only in the creation
+   of process directories. It is assumed that process destructions will be
+   spread evenly over the entire set of processes, and so the proportion of
+   process directories on each logical volume will remain as desired even though the
+   deletion of process directories is not recorded and used by the placement algorithm.
+
+   The desired proportion is achieved by going through the physical volume entries
+   in the disk table, in rotation, and if a pv is part of an lv available for
+   pdirs, choosing that lv. A static variable remembers the last pv entry used,
+   so that the rotation can be resumed with that entry at the next process creation.
+
+   The index in the disk table of the logical volume on which a user's process
+   directory is placed is recorded in the process's user table entry, so that it
+   is possible to determine where all the process directories are (as_who will
+   print this information if requested), but searching all 3 user tables at each
+   process creation to count the process directories on each volume would be impractical.
+
+   Volumes can be added to or deleted from the list of process directory volumes
+   during system operation. To demount a volume containing process directory
+   segments, it is necessary to remove it from the list, thus halting the placing
+   of new process directories on it, and then wait for processes whose process
+   directories are already on it to be destroyed (by logout, new_proc, or bump).
+   The pdir volume indices in the user tables are the means by which these
+   processes can be identified.
+
+   Alternately, the process directories may be force evacuated to another
+   logical volume via the vacate_pdir_volume operator command entry. This
+   command takes any number of specified logical volumes, suspending further
+   process directory creation on them and then calling a routine which will
+   find users with process directories on the volumes and walk their process
+   directories, force moving the segments contained therein. It should be
+   noted that this operation may cause an imbalance as established in the
+   normal process directory allocation scheme.
+
+   The system administrator must ensure that volumes placed in the pdir
+   volume list have enough space available on them to accomodate the expected
+   number of process directories. We do not monitor space available in this
+   initial implementation.
+
+   PDD QUOTA MANAGEMENT:
+
+   The problem is that quota is a fixed bin (17) unaligned variable in the ASTE, limiting it to 131,071 (2**17-1).
+   With large numbers of processes, or larger than normal quotas on some pdirs, >pdd could easily
+   run out of quota. This procedure is called just before each process creation and destruction.
+   It keeps track of the quota on >pdd, and sets it higher or lower if it is in danger of running out or overflowing
+   because of the process directory that is about to be created or deleted. Whenever the quota on
+   >pdd must be changed, it is set to half the maximum quota, to attempt to minimize the
+   number of times it has to be set.
+
+   USER RING DISK TABLE MANAGEMENT:
+
+   There is a little magic that goes on here that one should be aware of.
+   The disk_table resides in ring 1 and this procedure works with a copy of
+   it, residing in our process directory, as provided by disk_table_$get_dtp.
+   Those entries contained herin that modify the disk_table do so by calling
+   the disk_table_ procedure.  That procedure, after modifying the disk_table_
+   calls the appropriate routine, (mdx$...) to update our copy.
+
+   ENTRYPOINTS:
+
+   This procedure contains 10 entry points:
+
+   $init		    called by as_init_ at startup time
+   $select_pdir_volume  called by cpg_ before a process directory is created; sets sons volume of >pdd to the selected volume,
+   .		    updates pdd quota records, and sets >pdd quota if necessary
+   $set_pdir_volumes    operator command; replaces the list of pdir volumes
+   $add_pdir_volume     operator command; adds a pdir volume to the list
+   $del_pdir_volume     operator command; deletes a pdir volume from the list
+   $note_pdir_deletion  called by dpg_ at process destruction time; updates pdd quota records; sets >pdd quota if necessary
+   $print_pdq	    operator command; prints internal variables, for debugging
+   $shared_spindle_on   operator command; turns on optimization for shared-spindle
+   devices (this is the default)
+   $shared_spindle_off  operator command; turns off optimization for shared-spindle
+   devices (emergency bypass)
+
+   $vacate_pdir_volume  operator command; suspends creation of pdirs on the specified
+   volumes and then moves perprocess segments off of those volumes.
+
+   Modification history:
+
+   Initial coding by T. Casey, August 1977
+
+   Modified by T. Casey, October 1977 to put while clause on both sections of disk table search, in select_pdir_volume
+   Modified by T. Casey, January 1978 to check used bit before turning off pdirs_ok, in set_pdir_volumes
+   Modified by T. Casey, May 1978, to add >pdd quota management.
+   Modified by J. Bongiovanni, April 1981, for shared spindle devices
+   Modified by J. Bongiovanni, September 1981, for emergency bypass of shared
+   spindle optimization
+   Modified November 1981, E. N. Kittlitz.  user_table_entry conversion.
+   Modified March 1982, E. N. Kittlitz. added xxx_pdv as synonyms for xxx_pdir_volume.
+   Modified April 1982, E. N. Kittlitz. New AS initialization.
+   Modified 831122 for PDIR vacating... -E. A. Ranzenbach
+   <<< NOTE >>> THIS PROCEDURE CONTAINS QUESTIONABLE PROGRAMMING TECHNIQUES AND
+   SHOULD BE REWRITTEN AS TIME PERMITS... -ear
+
+   Modified 83-12-06 BIM to check AIM for LV.
+   Modified 84-12-27 Keith Loepere for pdir dir_quota.
+   Modified 85-01-17 E. A. Ranzenbach to change vac_pdv to ignore lve.pdirs_ok
+     and to only print one message per directory...
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-12,Fawcett), approve(86-05-12,MCR7383),
+     audit(86-05-21,Coppola), install(86-07-18,MR12.0-1098):
+     Changed because of a compiler warning found during recompile.
+  2) change(87-04-26,GDixon), approve(87-07-13,MCR7741),
+     audit(87-07-27,Hartogs), install(87-08-04,MR12.1-1055):
+     Upgraded for change to answer_table.incl.pl1 and user_table_entry.incl.pl1
+  3) change(88-04-27,GDixon), approve(88-08-15,MCR7969),
+     audit(88-08-03,Lippard), install(88-08-29,MR12.2-1093):
+      A) Set ename identifier variable at print_pdq ep to avoid garbage in
+         error messages. (phx17303)
+  4) change(91-03-11,Vu), approve(91-03-11,MCR8243), audit(91-12-09,Zimmerman),
+     install(91-12-12,MR12.5-1009):
+     Bad argument list for call to sys_log_.
+                                                   END HISTORY COMMENTS */
+
+
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  a_atep ptr;
+dcl  a_code fixed bin (35);
+
+/* Constants */
+
+dcl  HALF_MAXQ fixed bin int static options (constant) init (65535); /* half of largest possible quota */
+dcl  MAXQ fixed bin int static options (constant) init (131071); /* largest possible quota */
+dcl  SAFETY_MARGIN fixed bin int static options (constant) init (1024); /* let >pdd's quota get only this close to limits */
+dcl  zzBB char (20) int static options (constant) init (">pdd>!zzzzzzzbBBBBBB"); /* pathname of initializer's pdir */
+
+/* Internal Static Variables */
+
+dcl  already_init bit (1) aligned int static init (""b);
+dcl  (cur_lvix, cur_pvix, n_pdir_volumes) fixed bin int static;
+dcl  static_dtp ptr int static init (null);
+dcl  shared_spindle_hack bit (1) aligned int static init ("1"b);
+
+dcl  default_pddir_q fixed bin int static;		/* default pdir dir_quota */
+dcl  default_pdq fixed bin int static;			/* the default pdir quota that we think hardcore is using */
+dcl  npd fixed bin int static;			/* number of pdirs we know about */
+dcl  pdddir_q fixed bin int static;			/* current dir_quota on >pdd (we think) */
+dcl  pddq fixed bin int static;			/* current quota on >pdd (we think) */
+dcl  pddir_q fixed bin int static;			/* sum of dir_quotas on all pdirs */
+dcl  pdq fixed bin int static;			/* sum of quotas on all pdirs */
+dcl  pddq_known bit (1) aligned int static init (""b);	/* "1"b if we think we know >pdd's quota */
+dcl  more_than_one_pdir_vol bit (1);			/* true until we run out...		*/
+
+/* External Static */
+
+dcl  error_table_$action_not_performed ext fixed bin (35);
+dcl  error_table_$out_of_sequence fixed bin (35) ext static;
+dcl  error_table_$badopt fixed bin (35) ext static;
+
+/* External Entries */
+
+dcl  absolute_pathname_ entry (char (*), char (*), fixed bin (35));
+dcl  cu_$arg_count entry (fixed bin);
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  disk_table_$get_dtp entry (ptr);
+dcl  disk_table_$set_lv_pdir_bit entry (char (*), bit (1) aligned, fixed bin (35));
+dcl  disk_table_$set_vacate_pdirs_bit entry (char (*), bit (1) aligned, fixed bin (35));
+dcl  hcs_$dir_quota_read entry (char (*), fixed bin, fixed bin (71), fixed bin (35), bit (36),
+	fixed bin (1), fixed bin, fixed bin (35));
+dcl  hcs_$quota_read entry (char (*), fixed bin, fixed bin (71), fixed bin (35), bit (36),
+	fixed bin (1), fixed bin, fixed bin (35));
+dcl  hphcs_$dir_quota_set entry (char (*), fixed bin, fixed bin (35));
+dcl  hphcs_$quota_set entry (char (*), fixed bin, fixed bin (35));
+dcl  hphcs_$pv_move_file entry (char (*), char (*), fixed bin (35));
+dcl  hphcs_$set_sons_lvid entry (char (*), char (*), bit (36), fixed bin (35));
+dcl  hphcs_$set_pdir_sons_lvid entry (char (*), char (*), bit (36), fixed bin (35));
+dcl  read_allowed_ entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  sub_err_ entry () options (variable);
+dcl  (sys_log_, sys_log_$error_log) entry options (variable);
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+dcl  sweep_disk_$dir_list entry (char (168) aligned, entry);
+dcl  write_allowed_ entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+
+/* Automatic */
+
+dcl  ename char (32);
+dcl  loud fixed bin;				/* sys_log_ severity... */
+dcl  code fixed bin (35);
+dcl  i fixed bin;
+dcl  n_new_pdir_volumes fixed bin;
+dcl  pvix fixed bin;
+dcl  idx fixed bin (17);				/* miscellaneous index...		*/
+dcl  pdir char (168) aligned;
+dcl  pdir_to_move char (168);
+dcl  pdir_vol_name char (32);
+dcl  pdir_lvid bit (36);
+dcl  proc_lvix fixed bin (17);
+
+dcl  (argl, argno, nargs) fixed bin;
+dcl  argp ptr;
+dcl  dir_discrepancy fixed bin;
+dcl  discrepancy fixed bin;
+dcl  pass_number fixed bin;
+dcl  pddq_was_known bit (1) aligned;
+dcl  just_got_quota bit (1) aligned init (""b);
+dcl  long_sw bit (1);
+dcl  (dir_quota, quota, qused) fixed bin, tpp fixed bin (71), uptime fixed bin (35),
+     slvid bit (36), qswitch fixed bin (1);		/* args for quota_read call */
+
+/* Based */
+
+dcl  arg char (argl) based (argp);
+
+/* Builtin */
+
+dcl  (addr, index, max, min, null, rtrim) builtin;
+%page;
+
+/* PROCEDURE */
+
+init: entry;
+
+	ename = "pdir_volume_manager_$init";
+	if ^sc_stat_$Multics_typed | sc_stat_$Go_typed then
+	     call sub_err_ (error_table_$out_of_sequence, ename, "s");
+
+	already_init = "0"b;			/* indicate that we are initializing */
+
+	call disk_table_$get_dtp (static_dtp);		/* and disk table ptr */
+	cur_pvix = 1;				/* start with first pv in disk table */
+	cur_lvix = 0;				/* most recently selected lv; none right now */
+
+	dtp = static_dtp;				/* we are about to reference disk_table */
+	n_pdir_volumes = count_pdir_volumes ();		/* to count pdir volumes left from last bootload */
+
+	npd = 1;					/* zzBB (initializer's pdir) */
+	call get_pdd_quota;				/* initialize our copy of >pdd's quota, and get zzBB's quota */
+
+	already_init = "1"b;
+	return;					/* all done */
+
+
+select_pdir_volume: entry (a_atep, a_code);
+
+	ename = "select_pdir_volume";
+	if ^valid_call () then return;		/* check for init and copy static ptrs */
+	utep = a_atep;
+	a_code = 0;
+	code = 0;
+
+	if ^pddq_known then call get_pdd_quota;		/* if we have lost track of >pdd's quota, go read it */
+
+	if (pddq - ute.pdir_quota - SAFETY_MARGIN < 0)	/* if >pdd's quota is in danger of going negative */
+	     | (pdddir_q - ute.pdir_dir_quota - SAFETY_MARGIN < 0) then 
+	     call set_pdd_quota;			/* set it higher */
+
+	if ute.pdir_quota > 0 then do;		/* if we know the quota of the pdir about to be created */
+	     pddq = pddq - ute.pdir_quota;		/* update our records */
+	     pdq = pdq + ute.pdir_quota;
+	end;
+	else do;					/* if not, */
+	     pddq_known = ""b;			/* we may have just lost track of >pdd's quota */
+	     pddq = pddq - default_pdq;		/* but we can make a good guess */
+	     pdq = pdq + default_pdq;
+	end;
+	if ute.pdir_dir_quota > 0 then do;		/* if we know the dir quota of the new pdir */
+	     pdddir_q = pdddir_q - ute.pdir_dir_quota;	/* update our records */
+	     pddir_q = pddir_q + ute.pdir_dir_quota;
+	end;
+	else do;
+	     pddq_known = ""b;			/* we may have lost track */
+	     pdddir_q = pdddir_q - default_pddir_q;	/* pdir dir_quota */
+	     pddir_q = pddir_q + default_pddir_q;
+	end;
+
+	npd = npd + 1;				/* count pdirs */
+
+	if n_pdir_volumes = 0 then do;		/* if none, avoid time-wasting search of all pvs */
+	     ute.pdir_lvix = 0;			/* we don't know the sons volume of >pdd */
+	     return;				/* but it's probably ok the way it is */
+	end;
+
+	call select_pdir_vol (pdir_vol_name, proc_lvix, pdir_lvid, code);
+	if code ^= 0 then do;
+	     a_code = code;
+	     return;
+	end;
+	if cur_lvix ^= proc_lvix then do;
+	     call hphcs_$set_sons_lvid (">", "pdd", pdir_lvid, code); /* set sons lvid for the new one...	*/
+	     if code ^= 0 then do;
+		a_code = code;
+		return;
+	     end;
+	     cur_lvix = proc_lvix;
+	end;
+
+	ute.pdir_lvix = proc_lvix;			/* note PDIR LV for the process...	*/
+
+	return;
+
+
+note_pdir_deletion: entry (a_atep);
+
+	ename = "note_pdir_deletion";
+	if ^valid_call () then return;		/* check that we are initialized, and copy static pointers */
+	utep = a_atep;
+
+	if ^pddq_known then call get_pdd_quota;		/* if we lost track of >pdd's quota, go read it */
+
+	if (pddq + ute.pdir_quota + SAFETY_MARGIN > MAXQ)	/* if >pdd's quota is in danger of overflowing */
+	     | (pdddir_q + ute.pdir_dir_quota + SAFETY_MARGIN > MAXQ) then
+	     call set_pdd_quota;			/* set it lower */
+
+	if ute.pdir_quota > 0 then do;		/* if we know the quota of the pdir that is about to be deleted */
+	     pddq = pddq + ute.pdir_quota;		/* update our records */
+	     pdq = pdq - ute.pdir_quota;
+	end;
+	else do;					/* if not, */
+	     pddq_known = ""b;			/* we may have just lost track of >pdd's quota */
+	     pddq = pddq + default_pdq;		/* but we can make a good guess */
+	     pdq = pdq - default_pdq;
+	end;
+	if ute.pdir_dir_quota > 0 then do;		/* if we know how much is being deleted */
+	     pdddir_q = pdddir_q + ute.pdir_dir_quota;	/* update ourt records */
+	     pddir_q = pddir_q - ute.pdir_dir_quota;
+	end;
+	else do;
+	     pddq_known = ""b;			/* we may have lost track */
+	     pdddir_q = pdddir_q + default_pddir_q;	/* dir_quota */
+	     pddir_q = pddir_q - default_pddir_q;
+	end;
+
+	npd = npd - 1;				/* count pdirs */
+
+	return;
+
+
+print_pdq: entry;					/* operator command, for debugging */
+
+	ename = "pdir_volume_manager_$print_pdq";
+	pddq_was_known = pddq_known;			/* remember if it was known */
+	call get_pdd_quota;				/* be sure we have correct value */
+	call sys_log_ (-1, "pddq = ^d, pdq = ^d, npd = ^d,^[ ^[un^]expected discrepancy was ^d^;^s^s^]^/pdddir_q = ^d, pddir_q = ^d,^[ ^[un^]expected discrepancy was ^d^]",
+	     pddq, pdq, npd, (discrepancy ^= 0), pddq_was_known, discrepancy,
+	     pdddir_q, pddir_q, (dir_discrepancy ^= 0), pddq_was_known, dir_discrepancy);
+	call sys_log_ (-1, "lvix = ^d, pvix = ^d, npdv = ^d", cur_lvix, cur_pvix, n_pdir_volumes);
+	return;
+
+
+add_pdir_volume: entry;
+add_pdv: entry;
+
+	ename = "add_pdir_volume";
+
+	if ^valid_call () then return;
+
+	call cu_$arg_count (nargs);
+	if nargs ^= 1 then do;
+one_arg_wanted: call sys_log_ (2, "^a: one argument required: logical volume name", ename);
+	     return;
+	end;
+
+	call cu_$arg_ptr (1, argp, argl, code);
+	if code ^= 0 then do;
+err_log_no_msg: call sys_log_$error_log (2, code, "^a", ename);
+	     return;
+	end;
+
+	if ^find_lve (arg) then do;
+vol_not_found: call sys_log_ (2, "^a: volume ""^a"" not in disk table", ename, arg);
+	     return;
+	end;
+
+	if ^lve.hv_mounted | ^lve.public then do;
+	     call sys_log_ (2, "^a: volume ""^a"" must be mounted and public to be used for pdirs", ename, arg);
+	     return;
+	end;
+
+	call disk_table_$set_lv_pdir_bit (arg, ("1"b), code);
+	if code ^= 0 then goto err_log_no_msg;
+
+	n_pdir_volumes = count_pdir_volumes ();		/* update static pdir volume count */
+
+	return;
+
+
+del_pdir_volume: entry;
+del_pdv: entry;
+
+	ename = "del_pdir_volume";
+
+	if ^valid_call () then return;
+
+	call cu_$arg_count (nargs);
+	if nargs ^= 1 then goto one_arg_wanted;
+
+	call cu_$arg_ptr (1, argp, argl, code);
+	if code ^= 0 then goto err_log_no_msg;
+
+	if ^find_lve (arg) then goto vol_not_found;
+
+	if ^lve.pdirs_ok then do;
+	     call sys_log_ (2, "^a: volume ""^a"" is not a pdir volume", ename, arg);
+	     return;
+	end;
+
+	if count_pdir_volumes () ^> 1 then do;		/* if there is only one pdir volume */
+	     call sys_log_ (2, "^a: deleting volume ""^a"" would leave no pdir volumes", ename, arg);
+	     return;
+	end;
+
+	call disk_table_$set_lv_pdir_bit (arg, (""b), code);
+	if code ^= 0 then goto err_log_no_msg;
+
+	n_pdir_volumes = count_pdir_volumes ();
+	return;
+
+
+set_pdir_volumes: entry;
+set_pdv: entry;
+
+	ename = "set_pdir_volumes";
+	if ^valid_call () then return;
+
+	call cu_$arg_count (nargs);
+	if nargs ^> 0 then do;
+	     call sys_log_ (2, "^a: names of pdir volumes must be given", ename);
+	     return;
+	end;
+
+/* Check the specified volumes for suitability */
+
+	n_new_pdir_volumes = 0;
+	do argno = 1 to nargs;
+	     call cu_$arg_ptr (argno, argp, argl, code);
+	     if code ^= 0 then goto err_log_no_msg;
+	     if ^find_lve (arg) then
+		call sys_log_ (2, "^a: volume ""^a"" not in disk table", ename, arg);
+	     else if ^lve.hv_mounted | ^lve.public then
+		call sys_log_ (2, "^a: volume ""^a"" must be mounted and public to be used for pdirs", ename, arg);
+	     else n_new_pdir_volumes = n_new_pdir_volumes + 1;
+	end;
+
+	if n_new_pdir_volumes = 0 then return;
+	if n_new_pdir_volumes < nargs then
+	     call sys_log_ (2, "^a: ^d of ^d specified volumes unusable for pdirs; the others will be used",
+		ename, nargs - n_new_pdir_volumes, nargs);
+
+/* Clear current pdir volumes */
+
+	do i = 1 to dt.n_lv_entries;
+	     if dt.lv_array (i).used & dt.lv_array (i).pdirs_ok then do;
+		call disk_table_$set_lv_pdir_bit ((dt.lv_array (i).lvname), (""b), code);
+		if code ^= 0 then
+		     call sys_log_$error_log (2, code, ename, dt.lv_array (i).lvname);
+	     end;
+	end;
+
+/* Set new pdir volumes */
+
+	do argno = 1 to nargs;
+	     call cu_$arg_ptr (argno, argp, argl, code);
+	     if code ^= 0 then goto err_log_no_msg;
+	     if find_lve (arg) then do;
+		if lve.hv_mounted & lve.public then do;
+		     call disk_table_$set_lv_pdir_bit (arg, ("1"b), code);
+		     if code ^= 0 then
+			call sys_log_$error_log (2, code, ename, arg);
+		end;
+	     end;
+	end;
+
+	n_pdir_volumes = count_pdir_volumes ();
+
+	return;
+
+vacate_pdir_volume:
+     entry;
+vac_pdv: entry;
+
+	ename = "vacate_pdir_volume";
+	if ^valid_call () then return;
+
+	call cu_$arg_count (nargs);
+	if nargs < 1 then do;
+	     call sys_log_ (2, "^a: At least one logical volume must be specified.", ename);
+	     return;
+	end;
+
+	more_than_one_pdir_vol = "1"b;
+	long_sw = "0"b;
+
+	loud = 0;					/* log only...			*/
+
+	do argno = 1 to nargs while (more_than_one_pdir_vol);
+	     call cu_$arg_ptr (argno, argp, argl, code);
+	     if code ^= 0 then go to err_log_no_msg;
+	     if index (arg, "-") = 1 then do;
+		if arg = "-long" | arg = "-lg" then loud = 2;
+		else do;
+		     call sys_log_$error_log (2, error_table_$badopt,"^a",  arg);
+		     return;
+		end;
+	     end;
+	     else do;
+		if ^find_lve (arg) then call sys_log_ (2, "^a: ^a is not a logical volume and will not be processed.", ename, arg);
+		else do;
+		     if lve.pdirs_ok & (count_pdir_volumes () ^>1) then do;
+			call sys_log_ (2, "^a: Deleting volume ^a would leave no pdir volumes.^/Further volume processing suspended.", ename, arg);
+			more_than_one_pdir_vol = "0"b;
+		     end;
+		     else do;
+			call disk_table_$set_vacate_pdirs_bit (arg, ("1"b), code);
+			if code ^= 0 then call sys_log_$error_log (2, code, "^a: Processing of this volume suspended.",
+			     ename);
+		     end;
+		end;
+	     end;
+	end;
+
+	do i = 1 to dt.n_lv_entries;			/* do each lv that needs vacating...	*/
+	     if dt.lv_array (i).used & dt.lv_array (i).vacate_pdirs then do; /* this one needs working...		*/
+		lvep = addr (dt.lv_array (i));
+		call find_user_move_pdir (i);		/* move the user's pdir...		*/
+		call disk_table_$set_vacate_pdirs_bit ((dt.lv_array (i).lvname), "0"b, code);
+		if code ^= 0 then call sys_log_ (2, "^a: Unable to clear vacate_pdirs switch for logical volume ^a.",
+			ename, dt.lv_array (i).lvname);
+	     end;
+	end;
+
+	return;
+
+shared_spindle_on: entry;
+
+	ename = "pdir_volume_manager_";
+	call set_shared_spindle ("1"b);
+	return;
+
+shared_spindle_off: entry;
+
+	ename = "pdir_volume_manager_";
+	call set_shared_spindle ("0"b);
+	return;
+
+count_pdir_volumes: proc returns (fixed bin);
+
+dcl  nvol fixed bin;
+dcl  i fixed bin;
+
+	nvol = 0;
+	do i = 1 to dt.n_lv_entries;
+	     if dt.lv_array (i).used & dt.lv_array (i).public & dt.lv_array (i).hv_mounted
+		& dt.lv_array (i).pdirs_ok then nvol = nvol + 1;
+	end;
+	return (nvol);
+
+     end count_pdir_volumes;
+
+/* ---------- */
+
+find_lve: proc (a_lvname) returns (bit (1) aligned);
+
+dcl  a_lvname char (*);
+dcl  i fixed bin;
+
+	do i = 1 to dt.n_lv_entries;
+	     if dt.lv_array (i).used & dt.lv_array (i).lvname = a_lvname then do;
+		lvep = addr (dt.lv_array (i));
+		return ("1"b);
+	     end;
+	end;
+
+	return (""b);
+
+     end find_lve;
+
+find_user_move_pdir:
+     proc (lv_idx);
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+/*										*/
+/* Internal procedure to walk the answer_table looking for users whose process directory is on the	*/
+/* logical volume specified by lv_idx. These users process directories are then seg_moved to a	*/
+/* different logical volume.								*/
+/*										*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+dcl  lv_idx fixed bin (17) parameter;			/* index of the LV to vacate...	*/
+
+/* START_find_user_move_pdir: */
+          ansp = as_data_$ansp;
+	do idx = 1 to anstbl.current_size;		/* search the answer_table...		*/
+	     utep = addr (anstbl.entry (idx));		/* -> user_table_entry...		*/
+	     if ute.active = NOW_HAS_PROCESS & ute.pdir_lvix = lv_idx then do; /* this one must be moved...		*/
+		pdir = ">pdd>" || unique_chars_ ((ute.proc_id));
+		call sys_log_ (loud, "vacate_pdir_volume:  Processing ^a (^a.^a) on ^a.",
+		     pdir, ute.person, ute.project, lve.lvname);
+		call select_pdir_vol (pdir_vol_name, proc_lvix, pdir_lvid, code);
+		if code ^= 0 then return;
+		call hphcs_$set_pdir_sons_lvid (">pdd", unique_chars_ ((ute.proc_id)), pdir_lvid, code);
+		if code ^= 0 then do;
+		     call sys_log_$error_log (2, code, "Unable to set sons lvid for ^a.", pdir);
+		     return;
+		end;
+		call sweep_disk_$dir_list ((pdir), move_pdir_segs);
+		ute.pdir_lvix = proc_lvix;
+	     end;
+	end;
+
+          autp = as_data_$autp;
+	do idx = 1 to autbl.current_size;		/* search the absentee_user_table...	*/
+	     utep = addr (autbl.entry (idx));		/* -> user_table_entry...		*/
+	     if ute.active = NOW_HAS_PROCESS & ute.pdir_lvix = lv_idx then do; /* this one must be moved...		*/
+		pdir = ">pdd>" || unique_chars_ ((ute.proc_id));
+		call sys_log_ (loud, "vacate_pdir_volume:  Processing ^a (^a.^a) on ^a.",
+		     pdir, ute.person, ute.project, lve.lvname);
+		call select_pdir_vol (pdir_vol_name, proc_lvix, pdir_lvid, code);
+		if code ^= 0 then return;
+		call hphcs_$set_pdir_sons_lvid (">pdd", unique_chars_ ((ute.proc_id)), pdir_lvid, code);
+		if code ^= 0 then do;
+		     call sys_log_$error_log (2, code, "Unable to set sons lvid for ^a.", pdir);
+		     return;
+		end;
+		call sweep_disk_$dir_list ((pdir), move_pdir_segs);
+		ute.pdir_lvix = proc_lvix;
+	     end;
+	end;
+
+          dutp = as_data_$dutp;
+	do idx = 1 to dutbl.current_size;		/* search the daemon_user_table...	*/
+	     utep = addr (dutbl.entry (idx));		/* -> user_table_entry...		*/
+	     if ute.active = NOW_HAS_PROCESS & ute.pdir_lvix = lv_idx then do; /* this one must be moved...		*/
+		pdir = ">pdd>" || unique_chars_ ((ute.proc_id));
+		call sys_log_ (loud, "vacate_pdir_volume:  Processing ^a (^a.^a) on ^a.",
+		     pdir, ute.person, ute.project, lve.lvname);
+		call select_pdir_vol (pdir_vol_name, proc_lvix, pdir_lvid, code);
+		if code ^= 0 then return;
+		call hphcs_$set_pdir_sons_lvid (">pdd", unique_chars_ ((ute.proc_id)), pdir_lvid, code);
+		if code ^= 0 then do;
+		     call sys_log_$error_log (2, code, "Unable to set sons lvid for ^a.", pdir);
+		     return;
+		end;
+		call sweep_disk_$dir_list ((pdir), move_pdir_segs);
+		ute.pdir_lvix = proc_lvix;
+	     end;
+	end;
+
+	return;
+
+     end find_user_move_pdir;
+
+move_pdir_segs:
+     proc (containing_dir, dir, level, entry, branch_ptr, names_ptr);
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+/*										*/
+/* Internal procedure to demand segment move all of the segments in the current directory.	*/
+/*										*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+dcl  containing_dir char (32) aligned parameter;		/* containing directory...		*/
+dcl  dir char (32) aligned parameter;			/* directory we're in...		*/
+dcl  entry char (32) aligned parameter;			/* entry that we will examine...	*/
+dcl  level fixed bin (17) parameter;			/* directory depth...		*/
+dcl  branch_ptr ptr parameter;			/* -> star_dir_list_branch...		*/
+dcl  names_ptr ptr parameter;				/* -> star_list_names...		*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+
+/* START_move_pdir_segs: */
+
+	star_list_branch_ptr = branch_ptr;
+
+/* Only interseted in the first branch entry type,
+  and the next two statments keep the compiler happy */
+          star_branch_count = 1;
+          star_link_count = 0;
+
+	if star_list_branch.type (star_branch_count) ^= star_SEGMENT then return; /* ignore all but segments...		*/
+
+	call absolute_pathname_ (rtrim (containing_dir) || ">" || rtrim (dir),
+	     pdir_to_move, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, "^a", rtrim (containing_dir) || ">" || rtrim (dir));
+	     return;
+	end;
+
+	call hphcs_$pv_move_file (pdir_to_move, (entry), code);
+	if code ^= 0 then call sys_log_$error_log (2, code, "vacate_pdir_volume: Unable to move ^a.",
+		rtrim (pdir_to_move) || ">" || rtrim (entry));
+
+	return;
+
+     end move_pdir_segs;
+
+select_pdir_vol:
+     proc (lvol_name, lvol_idx, lvol_id, code);
+
+dcl  lvol_name char (32) parameter;
+dcl  lvol_idx fixed bin (17) parameter;
+dcl  lvol_id bit (36) parameter;
+dcl  code fixed bin (35) parameter;
+
+/* go through mounted physical volumes in rotation, using shared_spindle_flip
+   to hit shared spindle devices half as often as others, since they use
+   two physical devices for a single actuator.  Two passes are necessary,
+   to cover the case where all pdir volumes are shared spindle type					*/
+
+	code = 0;
+	do pass_number = 1 to 2;			/* rotate thru all physical volumes..	*/
+	     do pvix = cur_pvix + 1 to dt.n_entries, 1 to cur_pvix; /* until we have selected a pdir volume */
+		dtep = addr (dt.array (pvix));	/* get ptr to pv entry */
+		if dte.device_type > 0 & dte.device_type <= maxdevt
+		     & shared_spindle (dte.device_type) /* shared spindle device			*/
+		     & shared_spindle_hack		/* and we're optimizing */
+		then dte.shared_spindle_flip = ^dte.shared_spindle_flip; /* hit half as often	*/
+		else dte.shared_spindle_flip = "1"b;	/* not shared spindle - hit every time		*/
+
+		if dte.used & dte.storage_system	/* see if it is ok */
+		     & dte.shared_spindle_flip
+		     & dte.lvx >= 1 & dte.lvx <= dt.n_lv_entries then do; /* be absolutely sure */
+		     lvep = addr (dt.lv_array (dte.lvx)); /* get ptr to its lv entry */
+		     if lve.used & lve.hv_mounted & lve.public & lve.pdirs_ok & read_allowed_ (ute.process_authorization, lve.min_access_class) &
+			write_allowed_ (ute.process_authorization, lve.max_access_class) then do; /* if it is usable for pdirs */
+			cur_pvix = pvix;		/* remember index of pv that we stopped on */
+			lvol_idx = dte.lvx;
+			lvol_name = lve.lvname;
+			lvol_id = lve.lvid;
+			return;
+		     end;				/* end lv selected */
+		end;				/* end pv in a pdir volume */
+	     end;					/* end rotation thru pvs */
+	end;
+
+	call sys_log_ (2, "^a: Unable to select volume for pdir of ^a.^a", ename, ute.person, ute.project);
+	code = error_table_$action_not_performed;
+
+     end select_pdir_vol;
+
+/* ---------- */
+
+get_pdd_quota: proc;
+
+	call gq (">pdd");
+	if code ^= 0 then do;
+	     call sys_log_ (2, code, ename, "reading quota of >pdd");
+	     return;
+	end;
+
+	discrepancy = pddq - quota;			/* positive if there was a pdir creation we did not record */
+	dir_discrepancy = pdddir_q - dir_quota;
+	if already_init & discrepancy ^= 0 then do;	/* log discrepancy unless we are just initializing */
+	     call sys_log_ (0, "^a: ^[un^]expected discrepancy of ^d in >pdd quota: actual = ^d, recorded = ^d",
+		ename, pddq_known, discrepancy, quota, pddq);
+	     if ^pddq_known then			/* if previous call had ute.pdir_quota = 0, update our records */
+		pdq = pdq + discrepancy;
+	end;
+	if already_init & dir_discrepancy ^= 0 then do;	/* log discrepancy unless we are just initializing */
+	     call sys_log_ (0, "^a: ^[un^]expected discrepancy of ^d in >pdd dir_quota: actual = ^d, recorded = ^d",
+		ename, pddq_known, dir_discrepancy, dir_quota, pdddir_q);
+	     if ^pddq_known then			/* update our records */
+		pddir_q = pddir_q + dir_discrepancy;
+	end;
+
+	pddq = quota;
+	pdddir_q = dir_quota;
+	pddq_known = "1"b;
+	just_got_quota = "1"b;			/* for the benefit of set_pdd_quota */
+
+	if ^already_init then do;			/* if we are initializing */
+	     call gq (zzBB);			/* get quota of initializer's pdir */
+	     if code ^= 0 then do;
+		call sys_log_$error_log (2, code, ename, "reading quota of ^a", zzBB);
+		return;
+	     end;
+	     default_pdq = quota;			/* sneaky way of copying out active_hardcore_data$pdir_quota */
+	     default_pddir_q = dir_quota;
+	     pdq = quota;				/* initialize sum of all pdir quotas */
+	     pddir_q = dir_quota;
+	end;
+
+	return;
+
+     end get_pdd_quota;
+
+/* ---------- */
+
+gq:  proc (dir);
+
+dcl  dir char (*);
+
+	call hcs_$quota_read (dir, quota, tpp, uptime, slvid, qswitch, qused, code);
+	call hcs_$dir_quota_read (dir, dir_quota, tpp, uptime, slvid, qswitch, qused, code);
+	return;
+
+     end gq;
+
+/* ---------- */
+
+set_pdd_quota: proc;
+
+	if ^just_got_quota then call get_pdd_quota;	/* might as well look before we change it */
+
+	if ename = "note_pdir_deletion" then do;
+	     quota = max (0,			/* avoid going negative */
+		min (HALF_MAXQ,			/* set quota to HALF_MAXQ */
+		MAXQ - ute.pdir_quota - SAFETY_MARGIN));/* unless we are about to delete a very large pdir */
+	     dir_quota = max (0,			/* avoid going negative */
+		min (HALF_MAXQ,			/* set quota to HALF_MAXQ */
+		MAXQ - ute.pdir_dir_quota - SAFETY_MARGIN));/* unless we are about to delete a very large pdir */
+	end;
+	else do;
+	     quota = min (MAXQ,			/* avoid overflowing the quota cell */
+		max (HALF_MAXQ,			/* set quota to HALF_MAXQ */
+		ute.pdir_quota + SAFETY_MARGIN));	/* unless we are about to create a very large pdir */
+	     dir_quota = min (MAXQ,			/* avoid overflowing the quota cell */
+		max (HALF_MAXQ,			/* set quota to HALF_MAXQ */
+		ute.pdir_dir_quota + SAFETY_MARGIN));	/* unless we are about to create a very large pdir */
+	end;
+	call hphcs_$quota_set (">pdd", quota, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, ename, "setting >pdd quota to ^d", quota);
+	     return;
+	end;
+	call hphcs_$dir_quota_set (">pdd", dir_quota, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, ename, "setting >pdd dir_quota to ^d", dir_quota);
+	     return;
+	end;
+
+	call sys_log_ (0, "^a: changed >pdd quota from ^d to ^d", ename, pddq, quota);
+	pddq = quota;
+	call sys_log_ (0, "^a: changed >pdd dir_quota from ^d to ^d", ename, pdddir_q, dir_quota);
+	pdddir_q = dir_quota;
+
+	return;
+     end set_pdd_quota;
+
+/* ---------- */
+
+set_shared_spindle: proc (on_or_off);
+
+dcl  on_or_off bit (1);
+
+	call sys_log_ (2, "^a: Shared-spindle optimization changed from ^[on^;off^] to ^[on^;off]",
+	     ename, shared_spindle_hack, on_or_off);
+	shared_spindle_hack = on_or_off;
+
+
+
+     end set_shared_spindle;
+
+
+/* ---------- */
+
+valid_call: proc returns (bit (1) aligned);
+
+	if ^already_init then do;
+	     call sys_log_ (2, "^a: Called before answering service initialization", ename);
+	     return (""b);
+	end;
+
+	dtp = static_dtp;
+	return ("1"b);
+
+     end valid_call;
+
+%page; %include absentee_user_table;
+%page; %include answer_table;
+%page; %include as_data_;
+%page; %include as_data_definitions_;
+%page; %include daemon_user_table;
+%page; %include dialup_values;
+%page; %include disk_table;
+%page; %include fs_dev_types;
+%page; %include sc_stat_;
+%page; %include star_structures;
+%page; %include user_attributes;
+%page; %include user_table_entry;
+%page; %include user_table_header;
+
+     end pdir_volume_manager_;

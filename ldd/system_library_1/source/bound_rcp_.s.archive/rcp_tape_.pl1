@@ -1,0 +1,1351 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-10-14,Farley), approve(85-10-14,MCR6979),
+     audit(85-12-17,CLJones), install(86-03-21,MR12.0-1033):
+     Issue request_status
+     to FIPS devices. Allow for long unload connect time for FIPS.
+  2) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  3) change(86-12-03,GWMay), approve(86-12-03,PBF7552),
+     audit(86-12-09,Martinson), install(86-12-17,MR12.0-1250):
+     Changed to go ahead and read the tape label so that the caller can display
+     the "real" id and density of the tape when being run as the Initializer or
+     if the authentication_level installation parameter is set to none.
+  4) change(86-12-23,GDixon), approve(86-12-23,PBF7552),
+     audit(86-12-23,Farley), install(87-01-05,MR12.0-1253):
+     Don't change caller's volume label when rcp_tape_ was unable to read a
+     label from the tape.  Set automatic write_flag in TAPE_STATE(4).
+                                                   END HISTORY COMMENTS */
+
+/* format: style4,delnl,insnl,ifthen */
+rcp_tape_:
+     procedure (arg_rcse_ptr, arg_ecode);
+
+/*	This program is an internal interface of RCP.
+   *	Created on 02/20/75 by Bill Silver.
+   *	Changed on 11/01/76 by Bill Silver to set/reset mount timer.
+   *	Changed on 09/19/77 by R.J.C. Kissel to check tape labels.
+   *	Modified on 04/26/78 by Michael R. Jordan to allow preloaded tape volumes.
+   *	Modified on 01/31/79 by Michael R. Jordan to return label and density info,
+   *	  to stop label reading on manual halt.
+   *	Modified 4/79 by R.J.C. Kissel to handle 6250 bpi tapes.
+   *	Modified 3/79 by Michael R. Jordan for MR7.0R
+   *	Modified 04/79 by C. D. Tavares tor internal label authentication.
+   *	Modified 01/02/81 by J. A. Bush for bootable Multics standard tapes
+   *	Modified 3/82 by R.J.C. Kissel for FIPS level 1 by checking the accessibility code in an ANSI label
+   *	Modified 7/82 by B. Braun to check 32 chars of the tape label and not just the first 16 characters.
+   *                See TRs phx13431, phx12222.
+   *	Modified 1/83 by J. A. Bush the set the rcse.label_type directly from the workspace
+   *      Modified 12/83 by B. Braun to correct unnecessary authentication of tapes (phx14557 phx14837 phx16233).
+   *	Modified 11/84 by Paul Farley to issue request_status to FIPS devices
+   *	instead of set_write_permit, because the latter is not supported.
+   *	Modified 10/85 by Paul Farley to extend the default IOI timeout during
+   *	an unload of a FIPS tape to include a possible full rewind time.
+   *
+   *	This program is called to perform special tape attachment processing.
+*/
+
+/*		ARGUMENT  DATA		*/
+
+dcl  arg_ecode fixed bin (35);			/* (O) Return error_table_ code. */
+dcl  arg_rcse_ptr ptr;				/* (I) Pointer to attachment RCS entry. */
+
+
+/*		AUTOMATIC  DATA		*/
+
+dcl  command bit (6);				/* Initial IDCW command to device. */
+dcl  device_off bit (18) aligned;			/* RCPD device entry offset. */
+dcl  drive_num fixed bin;				/* Tape drive number. */
+dcl  (ecode, scode) fixed bin (35);			/* error_table_ code. */
+dcl  ioi_index fixed bin;				/* IOI internal device index. */
+dcl  special_status_bits bit (7) aligned;		/* Used to isolate the special status bits we need. */
+dcl  users_requested_volume_name char (32);
+dcl  workspace_ptr ptr;				/* Pointer to our workspace. */
+dcl  write_flag bit (1) aligned;
+
+
+/*		BASED  DATA		*/
+
+dcl  1 wspace based (workspace_ptr) aligned,		/* Overlay of IOI workspace. */
+       2 idcw bit (36),				/* Tape IDCW. */
+       2 read_idcw bit (36),
+       2 read_dcw bit (36),
+       2 rewind_idcw bit (36),
+       2 state fixed bin,				/* Index that => current state of attachment. */
+       2 get_authentication_state fixed bin,
+       2 read_label_state fixed bin,
+       2 read_record_state fixed bin,
+       2 rewind_state fixed bin,
+       2 set_density_state fixed bin,
+       2 tape_state_4_state fixed bin,
+       2 mount_state fixed bin,			/* Save state used to wait for mounts. */
+       2 i fixed bin,				/* read_label loop counter. */
+       2 j fixed bin,				/* read_record loop counter. */
+       2 retry_count fixed bin,			/* Number of REREADYs we have issued. */
+       2 ring_comment char (8),			/* Used in tape mount messages. */
+       2 special_flag bit (1),			/* ON => special interrupt. */
+       2 special_status_word bit (36),			/* One word of special status. */
+       2 label_name char (32) unaligned,		/* label read from tape. */
+       2 label_type fixed bin,			/* see label_msg below for meaning. */
+       2 flags,
+         (
+         3 bad_mode bit (1),
+         3 blank_tape bit (1),
+         3 den_set bit (1),
+         3 nrzi_den_set bit (1),
+         3 label_match bit (1),
+         3 unreadable_tape bit (1),
+         3 record_read bit (1),
+         3 wait bit (1),
+         3 manual_halt bit (1),
+         3 ansi_non_blank_access bit (1),
+         3 pad bit (26)
+         ) unaligned,
+       2 pad_ptr ptr,				/* Pad so status queue starts at even offset. */
+       2 istatq like istat,				/* Our status queue - only 1 entry. */
+       2 label_buffer (32) bit (36);			/* Place to put the first few words for label checking. */
+
+
+/*		INTERNAL STATIC DATA	*/
+
+dcl  max_num_retries fixed bin options (constant)		/* Number of times we will ready a tape drive. */
+	internal static init (5);
+
+dcl  template_idcw bit (36) options (constant) /* Template of the IDCW we will use. */ internal static
+	init ("000000700201"b3);
+
+dcl  template_read_idcw bit (36) options (constant) internal static init ("050000700000"b3);
+						/* Read record binary command. */
+
+dcl  template_read_dcw bit (36) options (constant) internal static init ("000000000000"b3);
+						/* We will set the address and tally later. */
+
+dcl  template_rewind_idcw bit (36) options (constant) internal static init ("700000700201"b3);
+
+dcl  rewind_command bit (6) options (constant) /* IDCW command. */ internal static init ("70"b3);
+
+dcl  rewind_unload_command bit (6) options (constant) /* IDCW command. */ internal static init ("72"b3);
+
+dcl  reset_status_command bit (6) options (constant) /* IDCW command. */ internal static init ("40"b3);
+
+dcl  request_status_command bit (6) options (constant) /* IDCW command. */ internal static init ("00"b3);
+
+dcl  set_write_permit_command bit (6) options (constant) /* IDCW command. */ internal static init ("63"b3);
+
+dcl  density (5) bit (6) options (constant) /* Set density commands */ internal static
+	init ("60"b3, "61"b3, "64"b3, "65"b3, "41"b3);	/* 800, 556, 200, 1600, and 6250 bpi */
+
+dcl  DENSITY_INDEX (5) fixed bin options (constant) /* Volume density index */ internal static init (3, 2, 1, 4, 5);
+						/* 800, 556, 200, 1600, 6250 */
+
+dcl  FIPS_UNLOAD_TIMEOUT fixed bin (71) options (constant) /* MAX time for connect */ internal static init (90000000);
+
+
+/*		EXTERNAL ENTRIES CALLED	*/
+
+dcl  (addr, fixed, null, rel, size, substr, bin, ptr, dim, translate) builtin;
+dcl  (bit, collate9, divide, hbound, lbound, length, min) builtin;
+
+dcl  (
+     error_table_$action_not_performed,
+     error_table_$device_attention,
+     error_table_$invalid_state
+     ) fixed bin (35) external;
+
+dcl  admin_gate_$ioi_set_to_max entry (fixed bin, fixed bin (71), fixed bin (35));
+dcl  admin_gate_$syserr entry options (variable);
+dcl  cv_dec_ entry (char (*), fixed bin);
+dcl  ioi_$connect entry (fixed bin, fixed bin, fixed bin (35));
+dcl  ioi_$get_special_status entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+dcl  ioi_$set_status entry (fixed bin, fixed bin (18), fixed bin, fixed bin (35));
+dcl  ioi_$timeout entry (fixed bin, fixed bin (71), fixed bin (35));
+dcl  ioi_$workspace entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  rcp_auto_register_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  rcp_ioi_attach_ entry (ptr, fixed bin (35));
+dcl  rcp_mount_timer_$reset entry (bit (18) aligned, fixed bin (35));
+dcl  rcp_mount_timer_$set entry (bit (18) aligned, bit (1) aligned, fixed bin (35));
+dcl  rcp_pointers_$data entry () returns (ptr);
+dcl  bcd_to_ascii_ entry (bit (*), char (*));
+dcl  ebcdic8_to_ascii_ entry (bit (*), char (*));
+dcl  canon_for_volume_label_ entry (char (*), char (*), char (*), fixed bin, fixed bin (35));
+dcl  authenticate_ ext entry (char (*)) returns (char (3) aligned);
+
+%include rcp_com_seg;
+
+%include rcp_data;
+
+%include rcp_volume_formats;
+
+%include iom_pcw;
+
+%include iom_dcw;
+
+%include ioi_stat;
+
+%include iom_stat;
+
+%include resource_control_desc;
+
+%include rcp_resource_types;
+
+%include mstr;
+
+
+/*	Begin special tape attachment processing.
+*/
+	rcse_ptr = arg_rcse_ptr;			/* Copy argument. */
+	rcs_ptr = ptr (rcse_ptr, "0"b);
+
+	rcpd_ptr = rcp_pointers_$data ();
+
+	workspace_ptr = rcse.workspace_ptr;		/* Get pointer to current workspace. */
+	ecode = 0;
+
+	if workspace_ptr ^= null ()			/* Have we set up a workspace yet? */
+	then do;					/* Yes. */
+	     ioi_index = rcse.ioi_index;		/* We will need this to call IOI. */
+	     isp = addr (wspace.istatq);		/* Almost every state needs this pointer. */
+	     goto TAPE_STATE (wspace.state);		/* Go do next step in tape attachment. */
+	end;
+
+
+/*	No workspace implies that this is the first call to rcp_$check_attach.
+   *	We must attach the tape drive in ring 0 via IOI.
+*/
+	call rcp_ioi_attach_ (rcse_ptr, ecode);
+	if ecode ^= 0				/* Now check for any error at all. */
+	then do;					/* Yes, abort attachment. */
+	     arg_ecode = ecode;
+	     return;
+	end;
+	ioi_index = rcse.ioi_index;			/* Get IOI index for this attachment. */
+
+/*	We have just attached the tape drive to IOI.  We must get an IOI workspace.
+   *	Then we will try to unload any volume mounted on this tape drive.
+   *	For T&D attachments we don't want to do any of this special processing.
+*/
+	if rcse.flags.t_and_d			/* Is this a special T&D attachment? */
+	then do;					/* Yes, nothing to do. */
+	     rcse.state = 4;			/* Tell caller that tape is ready for use. */
+	     arg_ecode = 0;
+	     return;
+	end;
+
+	call ioi_$workspace (ioi_index, workspace_ptr, size (wspace), ecode);
+	if ecode ^= 0 then do;
+	     arg_ecode = ecode;
+	     return;
+	end;
+
+	rcse.workspace_ptr = workspace_ptr;		/* Save workspace pointer for this attachment. */
+	wspace.idcw = template_idcw;			/* Set up template IDCWs. */
+	wspace.read_idcw = template_read_idcw;
+	wspace.read_dcw = template_read_dcw;
+	wspace.rewind_idcw = template_rewind_idcw;
+	call cv_dec_ (substr (rcse.device_name, 6, 2), drive_num);
+
+/* Set the device code in the IDCWs. */
+
+	addr (wspace.idcw) -> idcw.device = bit (fixed (drive_num, 6));
+	addr (wspace.read_idcw) -> idcw.device = bit (fixed (drive_num, 6));
+	addr (wspace.rewind_idcw) -> idcw.device = bit (fixed (drive_num, 6));
+
+/* Set the buffer address and a tally count in the read DCW. */
+
+	addr (wspace.read_dcw) -> dcw.address = rel (addr (wspace.label_buffer));
+	addr (wspace.read_dcw) -> dcw.tally = bit (bin (dim (wspace.label_buffer, 1), 12), 12);
+	wspace.state,				/* Initialize the state variable that controls all. */
+	     wspace.mount_state, wspace.retry_count = 0;	/* Initialize retry count. */
+	if rcse.flags.writing			/* Set up mount comment. */
+	     then
+	     wspace.ring_comment = "with";
+	else wspace.ring_comment = "without";
+
+	isp = addr (wspace.istatq);			/* Call IOI to set up our status queue. */
+	call ioi_$set_status (ioi_index, fixed (rel (isp), 18), 1, ecode);
+	if ecode ^= 0 then do;			/* Can't go on without a status queue. */
+	     arg_ecode = ecode;
+	     return;
+	end;
+
+	if rcse.flags.preloaded then do;
+	     wspace.state = 2;
+	     wspace.mount_state = 2;
+	     command = rewind_command;
+	end;
+	else do;
+
+/*	If we are unloading a FIPS tape drive, then we need to allow for the
+   *	case where a rewind is in progress and the FIPS adapter holds onto the
+   *	unload connect till the rewind completes. This is because the tape
+   *	subsystem does not allow the unload, because the rewind has it busy.
+*/
+	     if rcse.flags.fips then do;
+		call admin_gate_$ioi_set_to_max (ioi_index, FIPS_UNLOAD_TIMEOUT, ecode);
+		if ecode ^= 0 then do;
+		     arg_ecode = ecode;
+		     return;
+		end;
+		call ioi_$timeout (ioi_index, FIPS_UNLOAD_TIMEOUT, ecode);
+		if ecode ^= 0 then do;
+		     arg_ecode = ecode;
+		     return;
+		end;
+	     end;
+	     wspace.state = 1;
+	     command = rewind_unload_command;
+	end;
+
+	istat.completion.st = "0"b;			/* Try to rewind or rewind and unload the current volume. */
+	addr (wspace.idcw) -> idcw.command = command;
+	call ioi_$connect (ioi_index, 0, ecode);
+	arg_ecode = ecode;
+	return;
+
+
+/*	Somehow or other we are trying to use the workspace out of sequence.
+*/
+TAPE_STATE (0):					/* INVALID STATE */
+	arg_ecode = error_table_$invalid_state;
+	return;
+
+
+/*	The connect issued to perform the rewind & unload has terminated.
+   *	We don't really care whether or not the rewind & unload operation worked.
+   *	We will tell the operator to mount the tape volume being attached.
+   *	Then we will wait for any special interrupts generated by a rewind & unload
+   *	or the mounting.
+*/
+TAPE_STATE (1):					/* REWIND & UNLOAD TERMINATION */
+	if ^istat.completion.st			/* There should at least be some status. */
+	     then
+	     return;				/* None, so ignore. */
+						/* REQUEST TAPE MOUNT */
+	call Print_Mount_Message ();			/* Print a mount message for the operator. */
+	wspace.state,				/* Wait for special from tape mounting. */
+	     wspace.mount_state = wspace.state + 1;	/* Remember state used to wait for mount. */
+						/* Turn ON the mount timer. */
+	device_off = rcse.device_off;			/* Need RCPD device entry offset. */
+	write_flag = rcse.flags.writing;		/* Pass on write flag. */
+	call rcp_mount_timer_$set (device_off, write_flag, ecode);
+	arg_ecode = ecode;
+	return;
+
+
+/*	We should come here because we have received a special interrupt.
+   *	We will check to see if it is from a rewind & unload or from
+   *	a mount.  The special status bits we will test are:
+   *	REWIND, UNLOAD, READY, STANDBY, LOADED, RELEASED, MALFUNCTIONED.
+*/
+TAPE_STATE (2):					/* SPECIAL from REWIND, REWIND & UNLOAD or from MOUNT. */
+	call ioi_$get_special_status (ioi_index, special_flag, special_status_word, ecode);
+	if (ecode ^= 0) then do;
+	     arg_ecode = ecode;
+	     return;
+	end;
+	if ^special_flag then
+	     if rcse.flags.preloaded then do;		/* No special and we thought the tape was there, ask for it */
+		if ^istat.completion.st then do;	/* REWIND has not been processed yet, just wait a while */
+		     arg_ecode = 0;
+		     return;
+		end;
+		if istat.completion.er | /* If there was an error ... */ (istat.level ^= 3) then
+						/* or this is not a terminate ... */
+		     call REREADY_TAPE ("0"b);	/* ask to have the tape rereadied. */
+		else do;				/* turn on mount timer to make sure we don't loose this user. */
+		     device_off = rcse.device_off;	/* Get RCPD offset of this device. */
+		     write_flag = rcse.flags.writing;	/* Pass on write flag. */
+		     call rcp_mount_timer_$set (device_off, write_flag, ecode);
+		end;
+		arg_ecode = ecode;
+		return;
+	     end;
+	     else do;				/* No special and not preloaded, just wait for it. */
+		arg_ecode = 0;
+		return;
+	     end;
+	if rcse.model = 400				/* Special case 400 type drives. */
+	     then
+	     goto CHECK_READY;
+
+/* Get the special status bits we need. */
+	special_status_bits = substr (special_status_word, 30, 7);
+
+	if special_status_bits = "0101000"b then do;	/* If special is from UNLOAD wait for another. */
+	     arg_ecode = 0;
+	     return;
+	end;
+
+	if substr (special_status_bits, 1, 1)		/* REWIND COMPLETE is ON. */
+	     then
+	     goto CHECK_READY;
+
+	if ^substr (special_status_bits, 3, 1)		/* READY must be ON. */
+	then do;					/* We got special but tape still not ready. */
+	     call REREADY_TAPE ("0"b);
+	     arg_ecode = ecode;
+	     return;
+	end;
+
+CHECK_READY:
+	if rcse.flags.preloaded then			/* This is a preloaded volume, let the operator know. */
+	     call admin_gate_$syserr (0, "RCP: Using Reel ^a on ^a for ^a", rcse.volume_name, rcse.device_name,
+		rcse.group_id);
+	istat.completion.st = "0"b;			/* TAPE READY - check its current state. */
+	if rcse.flags.fips then
+	     addr (wspace.idcw) -> idcw.command = request_status_command;
+	else addr (wspace.idcw) -> idcw.command = set_write_permit_command;
+	call ioi_$connect (ioi_index, 0, ecode);
+	wspace.state = wspace.state + 1;		/* Wait for command to terminate. */
+	device_off = rcse.device_off;			/* Turn OFF mount timer. */
+	call rcp_mount_timer_$reset (device_off, scode);
+	if ecode = 0 then
+	     ecode = scode;
+	arg_ecode = ecode;
+	return;
+
+
+/*	Check the status from the (request status, reset status or set write
+   *      permit) operation.  We must check that the write ring is correct.
+   *	If everything is OK we will indicate that the attachment has been
+   *	completed.
+*/
+TAPE_STATE (3):					/* SET WRITE PERMIT TERMINATION. */
+	if ^istat.completion.st			/* Is there any status. */
+	then do;					/* No, ignore. */
+	     arg_ecode = 0;
+	     return;
+	end;
+
+	statp = addr (istat.iom_stat);		/* Get pointer to IOM status. */
+
+	if (istat.completion.er) | /* Is there an error? */ (istat.level ^= 3)
+						/* Or is this not a terminate? */
+	then do;					/* Yes, try to ready tape again. */
+	     if (status.major = "0101"b) /* Command Reject */ & ((status.sub & "71"b3) = "01"b3)
+						/* Invalid OP Code */
+		& (addr (wspace.idcw) -> idcw.command = set_write_permit_command) then do;
+						/* We probably tries to set permit when there was no ring */
+		addr (wspace.idcw) -> idcw.command = reset_status_command;
+		call ioi_$connect (ioi_index, 0, ecode);
+		arg_ecode = ecode;
+		return;
+	     end;
+	     call REREADY_TAPE ("0"b);
+	     arg_ecode = ecode;
+	     return;
+	end;
+
+	if (status.sub & "000010"b) ^= "000010"b then do; /* Tape not at BOT. */
+	     call REREADY_TAPE ("0"b);
+	     arg_ecode = ecode;
+	     return;
+	end;
+
+	if rcse.flags.writing = ((status.sub & "001001"b) = "000001"b) then do;
+						/* Write ring is not correct. */
+	     call REREADY_TAPE ("1"b);
+	     arg_ecode = ecode;
+	     return;
+	end;
+
+
+/* Initialize the internal procedure states for label checking. */
+
+	wspace.state = 4;
+	wspace.read_label_state = 1;
+	wspace.get_authentication_state = 1;
+	wspace.tape_state_4_state = 1;
+
+/* Initialize the flags used by the label checking procedures. */
+
+	wspace.den_set = "0"b;
+	wspace.nrzi_den_set = "0"b;
+	wspace.record_read = "0"b;
+	wspace.unreadable_tape = "0"b;
+	wspace.bad_mode = "0"b;
+	wspace.wait = "0"b;
+	wspace.label_match = "0"b;
+	wspace.label_name = "";
+	wspace.blank_tape = "0"b;
+	wspace.manual_halt = "0"b;
+	wspace.ansi_non_blank_access = "0"b;
+
+/* Initialize the authentication bits in the rcse. */
+
+	rcse.flags.have_auth = "0"b;
+	rcse.flags.need_auth = "0"b;
+	rcse.flags.auth_set = "0"b;
+
+/* Now we will enter the label checking state.  It has a number of internal states
+   which are remembered by the state variables in our workspace.
+*/
+
+TAPE_STATE (4):
+	write_flag = rcse.flags.writing;
+	goto STATE (wspace.tape_state_4_state);		/* get to the proper internal state. */
+
+STATE (1):
+	wspace.tape_state_4_state = 1;
+	call read_label ();
+
+	if wspace.wait then
+	     goto RETURN;				/* let our caller wait for an event. */
+
+	users_requested_volume_name = rcse.volume_name;
+
+	call validate_tape_label (addr (wspace.label_buffer), rcse.volume_name, wspace.label_match, wspace.label_name,
+	     wspace.label_type);
+
+	rcse.flags.label_type = wspace.label_type;	/* copy label type */
+	if (wspace.label_match & ^rcse.must_auto_register) | rcpd.modes.authentication_level = No_authentication
+	     | rcse.group_id = "Initializer.SysDaemon.z" then do;
+						/* We are done */
+	     wspace.rewind_state = 1;
+STATE (2):
+	     wspace.tape_state_4_state = 2;
+	     call rewind ();
+
+	     if wspace.wait then
+		goto RETURN;
+
+	     call ioi_$set_status (ioi_index, 0, 0, ecode);
+	     if ecode = 0 then do;
+		rcse.state = 4;
+		wspace.state = 0;
+
+		if ^write_flag & wspace.label_name ^= "" then
+		     rcse.volume_name = wspace.label_name;
+		rcse.flags.volume_density_index = DENSITY_INDEX (wspace.i);
+						/* return density */
+		rcse.flags.label_type = wspace.label_type;
+						/* and label type */
+	     end;
+	end;
+
+	else do;					/* label did not match. */
+STATE (3):
+	     wspace.tape_state_4_state = 3;
+	     call get_authentication ();
+
+	     if wspace.wait then
+		goto RETURN;
+
+	     if rcse.flags.have_auth then do;		/* We are done */
+		wspace.rewind_state = 1;
+STATE (4):
+		wspace.tape_state_4_state = 4;
+		call rewind ();
+
+		if wspace.wait then
+		     goto RETURN;
+
+		call ioi_$set_status (ioi_index, 0, 0, ecode);
+		if ecode = 0 then do;
+		     rcse.state = 4;
+		     wspace.state = 0;
+		     if ^write_flag & wspace.label_name ^= "" then
+			rcse.volume_name = wspace.label_name;
+		     rcse.flags.volume_density_index = DENSITY_INDEX (wspace.i);
+						/* return density */
+		     rcse.flags.label_type = wspace.label_type;
+						/* and label type */
+		end;
+		if rcse.flags.must_auto_register	/* Must ask RCPRM to register this volume for this user. */
+		     then
+		     call rcp_auto_register_ (VOLUME_TYPE (TAPE_VOL_VTYPEX), (users_requested_volume_name),
+			(rcse.group_id), ecode);
+	     end;
+
+	     else do;				/* authentication was denied. */
+		call admin_gate_$syserr (0, "RCP: Authentication code for ^a does not match.", rcse.device_name);
+		wspace.retry_count = 0;		/* start over with a new tape. */
+		call REREADY_TAPE ("1"b);		/* Remount the (hopefully) correct tape. */
+	     end;
+	end;
+
+RETURN:
+	arg_ecode = ecode;
+	return;
+
+/**/
+REREADY_TAPE:
+     procedure (remount_flag);
+
+/*	This procedure is called to tell the operator to ready the tape again.
+   *	We will have to wspace.wait for the special again.
+*/
+dcl  remount_flag bit (1);				/* ON => remount,  OFF => reready. */
+
+	if wspace.retry_count = max_num_retries		/* Have we retried too many times. */
+	then do;					/* Yes, abort attachment. */
+	     ecode = error_table_$device_attention;
+	     return;
+	end;
+	wspace.retry_count = wspace.retry_count + 1;
+
+/* Turn ON mount timer. */
+	device_off = rcse.device_off;			/* Get RCPD offset of this device. */
+	write_flag = rcse.flags.writing;		/* Pass on write flag. */
+	call rcp_mount_timer_$set (device_off, write_flag, ecode);
+	if ecode ^= 0 then
+	     return;
+
+	if remount_flag				/* Remount or reready? */
+	then do;					/* Remount. */
+	     istat.completion.st = "0"b;		/* Unload reel for operator. */
+	     addr (wspace.idcw) -> idcw.command = rewind_unload_command;
+	     call ioi_$connect (ioi_index, 0, ecode);
+	     call admin_gate_$syserr (3, "RCP: Remount Reel ^[scratch^s^;^a^] ^a ring on ^a", (rcse.volume_name = ""),
+		rcse.volume_name, wspace.ring_comment, rcse.device_name);
+	end;
+	else if rcse.flags.preloaded then
+	     call admin_gate_$syserr (3, "RCP: Reready Reel ^a on ^a for ^a", rcse.volume_name, rcse.device_name,
+		rcse.group_id);
+	else call admin_gate_$syserr (3, "RCP: Reready ^a", rcse.device_name);
+
+	wspace.state = wspace.mount_state;		/* Wait for special(s) again. */
+
+     end REREADY_TAPE;
+
+/**/
+read_label:
+     proc;
+
+	goto STATE (wspace.read_label_state);
+
+STATE (1):
+	wspace.read_label_state = 1;
+	wspace.record_read = "0"b;
+	wspace.unreadable_tape = "0"b;
+	wspace.i = 1;				/* Start at NRZI density of 800 bpi. */
+	wspace.nrzi_den_set = "0"b;			/* Haven't sucessfully set one yet. */
+try_next_density:					/* There is only one transfer to this label. */
+	wspace.set_density_state = 1;
+STATE (2):
+	wspace.read_label_state = 2;
+	call set_density ();
+
+	if wspace.wait then
+	     return;
+
+	if wspace.den_set then do;
+
+	     wspace.nrzi_den_set = "1"b;
+
+	     wspace.read_record_state = 1;
+STATE (3):
+	     wspace.read_label_state = 3;
+	     call read_record ();
+
+	     if wspace.wait then
+		return;
+
+	     if wspace.bad_mode then do;		/* May be PE mode, 1600 bpi. */
+try_pe:
+		wspace.rewind_state = 1;
+STATE (4):
+		wspace.read_label_state = 4;
+		call rewind ();			/* Back to load point to set new density. */
+
+		if wspace.wait then
+		     return;
+
+		wspace.set_density_state = 1;
+STATE (5):
+		wspace.read_label_state = 5;
+		wspace.i = 4;			/* Code for 1600 bpi. */
+		call set_density ();
+
+		if wspace.wait then
+		     return;
+
+		if wspace.den_set then do;
+		     wspace.read_record_state = 1;
+STATE (6):
+		     wspace.read_label_state = 6;
+		     call read_record ();
+
+		     if wspace.wait then
+			return;
+
+		     if wspace.bad_mode then do;	/* Must be GCR mode, 6250  bpi. */
+try_gcr:
+			wspace.rewind_state = 1;
+STATE (8):
+			wspace.read_label_state = 8;
+			call rewind ();		/* Back to load point to set new density. */
+
+			if wspace.wait then
+			     return;
+
+			wspace.set_density_state = 1;
+STATE (9):
+			wspace.read_label_state = 9;
+			wspace.i = 5;		/* Code for 6250 bpi. */
+			call set_density ();
+
+			if wspace.wait then
+			     return;
+
+			if wspace.den_set then do;
+			     wspace.read_record_state = 1;
+STATE (10):
+			     wspace.read_label_state = 10;
+			     call read_record ();
+
+			     if wspace.wait then
+				return;
+
+			     if wspace.bad_mode then do;
+						/* This should never happen. */
+				wspace.unreadable_tape = "1"b;
+						/* Tried NRZI, PE, and GCR modes and still got bad mode. */
+			     end;
+
+			     else if wspace.blank_tape | wspace.record_read then do;
+						/* Success. */
+				wspace.unreadable_tape = "0"b;
+			     end;
+
+			     else if wspace.manual_halt then do;
+						/* Drive in standby. */
+				wspace.unreadable_tape = "1"b;
+			     end;
+
+			     else do;		/* Tape is unreadable at the only GCR density. */
+				wspace.unreadable_tape = "1"b;
+			     end;
+			end;
+
+			else do;			/* Could'nt try the only available GCR density. */
+			     wspace.unreadable_tape = "1"b;
+			end;
+		     end;				/* Must be GCR mode, 6250 bpi. */
+
+		     else if wspace.blank_tape | wspace.record_read then do;
+						/* Success. */
+			wspace.unreadable_tape = "0"b;
+		     end;
+
+		     else if wspace.manual_halt then do;/* Drive in standby. */
+			wspace.unreadable_tape = "1"b;
+		     end;
+
+		     else do;			/* Tape is unreadable at the only PE density. */
+			wspace.unreadable_tape = "1"b;
+		     end;
+		end;
+
+		else do;				/* Could'nt try the only available PE density. */
+		     goto try_gcr;			/* Maybe it is GCR, 6250 bpi. */
+		end;
+	     end;					/* May be PE mode, 1600 bpi. */
+
+	     else if wspace.blank_tape | wspace.record_read then do;
+						/* Success. */
+		wspace.unreadable_tape = "0"b;
+	     end;
+
+	     else if wspace.manual_halt then do;	/* Drive in standby. */
+		wspace.unreadable_tape = "1"b;
+	     end;
+
+	     else do;				/* Unreadable at this NRZI density. */
+wrong_density:					/* There is only one transfer to this label. */
+		wspace.unreadable_tape = "1"b;
+
+		wspace.i = wspace.i + 1;		/* Try all 3 NRZI densities */
+		if wspace.i <= 3			/* before giving up. */
+		then do;
+		     wspace.rewind_state = 1;
+STATE (7):
+		     wspace.read_label_state = 7;
+		     call rewind ();		/* Back to load point to set new density. */
+
+		     if wspace.wait then
+			return;
+
+		     goto try_next_density;		/* This is the only transfer to this label. */
+		end;
+
+		else do;				/* Maybe no NRZI density could be set. */
+		     if ^wspace.nrzi_den_set then
+			goto try_pe;
+		end;
+	     end;
+	end;
+
+	else goto wrong_density;			/* Could'nt use this NRZI density. */
+						/* This is the only transfer to this label. */
+
+     end read_label;
+
+/**/
+set_density:
+     proc;
+
+/* This procedure uses wspace.i to pick out the density that it is supposed to set. */
+
+	goto STATE (wspace.set_density_state);
+
+STATE (1):
+	wspace.set_density_state = 1;
+	addr (wspace.idcw) -> idcw.command = density (wspace.i);
+	istat.completion.st = "0"b;
+	call ioi_$connect (ioi_index, 0, ecode);	/* Initiate the set density command. */
+
+STATE (2):
+	wspace.set_density_state = 2;
+	if istat.completion.st & istat.level = 3 then do; /* We have some status back */
+	     wspace.wait = "0"b;			/* Don't need to wait any more. */
+
+	     if istat.completion.er then
+		wspace.den_set = "0"b;		/* Some error setting the density. */
+	     else wspace.den_set = "1"b;		/* Everything is OK. */
+	end;
+
+	else wspace.wait = "1"b;			/* Must let our caller wait for an event. */
+
+     end set_density;
+
+/**/
+read_record:
+     proc;
+
+/*
+   This procedure tries to read the first good record on the tape.  The first
+   record is assumed to be the tape label.
+   Notice that even though the Multics Standard Tape (MST) format normally
+   will write up to 64 records to get a good copy for the label record it
+   always backspaces and rewrites until it gets a good label as the first
+   record on the tape.
+*/
+
+	goto STATE (wspace.read_record_state);
+
+STATE (1):
+	wspace.read_record_state = 1;
+	wspace.j = 1;
+
+	wspace.record_read = "0"b;
+	wspace.bad_mode = "0"b;
+	wspace.blank_tape = "0"b;
+	wspace.manual_halt = "0"b;
+	istat.completion.st = "0"b;
+	call ioi_$connect (ioi_index, 1, ecode);	/* Initiate the read record binary command. */
+
+STATE (2):
+	wspace.read_record_state = 2;
+	if istat.completion.st & istat.level = 3 then do;
+	     wspace.wait = "0"b;			/* Don't need to wait anymore. */
+
+	     if istat.completion.er then do;		/* Some error occured while reading. */
+		statp = addr (istat.iom_stat);
+
+		if status.major = "1010"b /* MPC Device Attention */ & status.sub = "001000"b
+						/* Incompatible Mode */
+		then do;
+		     wspace.bad_mode = "1"b;
+		end;
+
+		else if status.major = "0011"b /* Device Data Alert */ & status.sub = "000010"b
+						/* Blank Tape on Read */
+		then do;
+		     wspace.blank_tape = "1"b;
+		end;
+
+		else if status.major = "0010"b /* Device attention */ & (status.sub & "100110"b) = "000100"b
+						/* Device in standby */
+		then do;
+		     wspace.manual_halt = "1"b;
+		end;
+
+		else ;				/* Some other error, give up. */
+	     end;
+
+	     else do;				/* Good read. */
+		wspace.record_read = "1"b;
+	     end;
+	end;
+
+	else wspace.wait = "1"b;			/* Let our caller wait for an event. */
+
+     end read_record;
+
+/**/
+rewind:
+     proc;
+
+	goto STATE (wspace.rewind_state);
+
+STATE (1):
+	wspace.rewind_state = 1;
+	istat.completion.st = "0"b;
+	call ioi_$connect (ioi_index, 3, ecode);	/* Initiate the rewind command */
+
+STATE (2):
+	wspace.rewind_state = 2;
+	if istat.completion.st & istat.level = 3 then do; /* We got the status from start of rewind. */
+	     if istat.completion.er then do;
+		call admin_gate_$syserr (3, "RCP: Manually rewind and reready ^a.", rcse.device_name);
+		call rcp_mount_timer_$set ((rcse.device_off), (rcse.flags.writing), ecode);
+	     end;
+
+STATE (3):
+	     wspace.rewind_state = 3;
+	     call ioi_$get_special_status (ioi_index, special_flag, special_status_word, ecode);
+
+	     if ecode ^= 0 | ^special_flag then
+		wspace.wait = "1"b;			/* wait some more for the special. */
+	     else do;				/* tape is finished rewinding. */
+		call rcp_mount_timer_$reset ((rcse.device_off), ecode);
+		wspace.wait = "0"b;
+	     end;
+	end;
+	else wspace.wait = "1"b;			/* Let our caller wait for an event. */
+
+     end rewind;
+
+/**/
+get_authentication:
+     proc;
+
+dcl  authentication_label_name char (32);
+
+	goto STATE (wspace.get_authentication_state);
+
+STATE (1):
+	wspace.get_authentication_state = 1;
+	rcse.flags.need_auth = "1"b;
+	rcse.flags.have_auth = "0"b;
+	rcse.flags.auth_set = "0"b;
+
+/* Get rid of non-printable chars by replacing with ".", 208+208 = 416 because of implementation restriction */
+
+	authentication_label_name =
+	     translate (wspace.label_name, (208)"." || (208)".",
+	     substr (collate9 (), 1, 32) || substr (collate9 (), 128));
+	call admin_gate_$syserr (3,
+	     "RCP: Authenticate ^a.  It has ^a label ^[(Manual Halt)^2s^;^a^[ (with non-blank accessibility code)^]^].^[
+RCP: WARNING!!  IF YOU AUTHENTICATE THIS REQUEST ^a WILL OWN VOLUME ^a!^]", rcse.device_name,
+	     Tape_volume_types (wspace.label_type), wspace.manual_halt, authentication_label_name,
+	     wspace.ansi_non_blank_access, rcse.flags.must_auto_register, rcse.group_id, rcse.volume_name);
+
+	device_off = rcse.device_off;
+	write_flag = rcse.flags.writing;
+	call rcp_mount_timer_$set (device_off, write_flag, ecode);
+
+STATE (2):
+	wspace.get_authentication_state = 2;
+	if rcse.flags.auth_set then do;		/* The operator has responded. */
+	     wspace.wait = "0"b;
+	     device_off = rcse.device_off;
+	     call rcp_mount_timer_$reset (device_off, ecode);
+	end;
+
+	else wspace.wait = "1"b;			/* Let our caller wait for an event. */
+
+     end get_authentication;
+
+/**/
+validate_tape_label:
+     proc (label_ptr, user_label, label_match, label_name, label_type);
+
+dcl  (
+     label_ptr ptr,					/* pointer to label record from tape. */
+     user_label char (*) aligned,			/* user specified volume id. */
+     label_match bit (1),				/* true if labels match, false otherwise. */
+     label_name char (32),				/* volume id from tape label record. */
+     label_type fixed bin
+     ) parameter;					/* type of label. */
+
+dcl  user_name char (32),				/* fixed length user label. */
+     canon_user_name char (32),			/* canonicalized user name. */
+     canon_label_name char (32),			/* canonicalized label name. */
+     label_auth char (3),				/* authentication code from label */
+     computed_auth_code char (3) aligned;		/* computer from user name */
+
+
+/* TAPE LABEL FORMATS */
+
+dcl  1 mult based (label_ptr) unaligned,		/* Multics standard version 1 label structure */
+       2 lab_id bit (36),				/* this will be 670314355245 in octal */
+       2 pad (15) bit (36),				/* we ignore this */
+       2 vol_id char (32);				/* this is in ascii */
+
+dcl  1 gcos based (label_ptr) unaligned,
+       2 lab_id bit (12 * 6),				/* this will be "GE  600 BTL " in bcd */
+       2 installation_id bit (6 * 6),			/* we ignore this */
+       2 pad_vol_id bit (6),				/* pad first bit of vol_id as it is not used	*/
+       2 vol_id bit (6 * 6),				/* this is in bcd */
+       2 (file_ser, reel_seq, creation_date, retention_days, file_name) bit (6 * 6),
+						/* we don't use these */
+       2 label_auth bit (3 * 6);			/* authentication code */
+
+dcl  1 ibm based (label_ptr) unaligned,
+       2 lab_id bit (4 * 8),				/* this will be "VOL1" in ebcdic */
+       2 vol_id bit (6 * 8),				/* this is in ebcdic */
+       2 reserved bit (31 * 8),			/* we don't use these */
+       2 label_auth bit (10 * 8);			/* authentication code */
+
+dcl  1 ansi based (label_ptr) unaligned,
+       2 lab_id bit (4 * 8),				/* this will be "VOL1" in ascii (8 bit) */
+       2 vol_id bit (6 * 8),				/* this is in 8 bit ascii */
+       2 accessibility bit (1 * 8),			/* this is in 8 bit ascii, blank--OK, non-blank--authenticate */
+       2 reserved bit (26 * 8),			/* we don't use these */
+       2 label_auth bit (14 * 8);			/* authentication code */
+
+
+
+
+/*
+   Now see if we can find a volume id on this tape label.
+*/
+
+	label_name = "";
+	label_auth = "";
+	label_type = Volume_unknown_format;
+	user_name = user_label;
+
+	if wspace.blank_tape then
+	     label_type = Volume_blank;
+
+	else if wspace.unreadable_tape | wspace.manual_halt then
+	     label_type = Volume_unreadable;
+
+	else if mult.lab_id = header_c1 then do;	/* Version 1 Multics standard label? */
+	     label_type = Volume_multics_tape;
+	     label_name = mult.vol_id;		/* get the volume id. */
+	     label_auth = "***";
+	end;
+	else if mult.lab_id = label_c1		/* Version 2 Multics standard label? */
+	     then
+	     if (label_ptr -> mst_label.head.c1 = header_c1 & label_ptr -> mst_label.head.label)
+						/* if all this is true yes */
+	     then do;
+		label_type = Volume_multics_tape;
+		label_name = label_ptr -> mst_label.tape_reel_id;
+						/* get the volume id. */
+		label_auth = "***";
+	     end;
+	     else ;
+
+	else if gcos.lab_id = "272520200600002022634320"b3 then do;
+						/* "GE  600 BTL " in bcd */
+	     label_type = Volume_gcos_tape;
+	     call bcd_to_ascii_ (string (gcos.vol_id), label_name);
+	     call bcd_to_ascii_ (string (gcos.label_auth), label_auth);
+	end;
+
+	else if ibm.lab_id = "E5D6D3F1"b4 then do;	/* "VOL1" in 8 bit ebcdic */
+	     label_type = Volume_ibm_tape;
+	     call ebcdic8_to_ascii_ (string (ibm.vol_id), label_name);
+	     call ebcdic8_to_ascii_ (string (ibm.label_auth), label_auth);
+	end;
+
+	else if ansi.lab_id = "564F4C31"b4 then do;	/* "VOL1"b in 8 bit ascii */
+	     label_type = Volume_ansi_tape;
+	     call unpack (ansi.vol_id, label_name);
+	     call unpack (ansi.label_auth, label_auth);
+
+	     if ansi.accessibility ^= "20"b4 then
+		wspace.ansi_non_blank_access = "1"b;
+	end;
+
+	else label_type = Volume_unknown_format;	/* Doesn't look like a recognizable label */
+
+
+/* Now see if the tape label we found matches the user specified label. */
+
+	if label_name = "" then do;
+	     label_match = ""b;
+	     return;
+	end;
+
+	label_match = "1"b;				/* assume so unless we turn it off */
+
+	if rcpd.modes.authentication_level = Manual_authentication then do;
+	     label_match = ""b;
+	     return;
+	end;
+
+/* nominal authentication mechanism is here */
+
+	if wspace.ansi_non_blank_access then do;	/* Always authenticate this. */
+	     label_match = "0"b;
+	     return;
+	end;
+
+/* canonicalize the tape label just read */
+
+	call canon_for_volume_label_ (VOLUME_TYPE (TAPE_VOL_VTYPEX), label_name, canon_label_name, label_type, ecode);
+	if ecode ^= 0 then
+	     label_match = ""b;
+	else do;					/* canonicalize the user name  */
+	     call canon_for_volume_label_ (VOLUME_TYPE (TAPE_VOL_VTYPEX), user_name, canon_user_name, label_type, ecode)
+		;
+	     if ecode ^= 0 then
+		label_match = ""b;
+	     else if canon_user_name ^= canon_label_name then
+		label_match = ""b;
+	end;
+
+	if rcpd.modes.authentication_level = Nominal_authentication
+	     | rcpd.modes.authentication_level = No_authentication | rcse.group_id = "Initializer.SysDaemon.z" then do;
+	     label_name = canon_label_name;
+	     return;
+	end;
+
+/* full, secure automatic authentication mechanism is here */
+
+	if label_type = Volume_multics_tape then
+	     return;				/* no further checks necessary */
+
+	computed_auth_code = authenticate_ (user_name);
+	if computed_auth_code ^= label_auth then
+	     label_match = ""b;
+
+	return;
+
+     end validate_tape_label;
+
+/**/
+unpack:
+     proc (input, output);
+
+dcl  input bit (*);
+dcl  output char (*);
+
+dcl  char_code fixed bin (17);
+dcl  char_limit fixed bin;
+dcl  input_chars (1:divide (length (input), 8, 24)) bit (8) based (addr (input));
+dcl  char_index fixed bin;
+
+	output = "";
+	char_limit = min (hbound (input_chars, 1), length (output));
+
+	do char_index = lbound (input_chars, 1) to char_limit by 1;
+	     char_code = fixed (input_chars (char_index), 17);
+	     substr (output, char_index, 1) = substr (collate9 (), char_code + 1, 1);
+	end;
+
+     end unpack;
+
+Print_Mount_Message:
+     proc ();
+
+
+dcl  rcp_pointers_$data entry () returns (ptr);
+dcl  rcprm_find_resource_$status entry (ptr, char (*), fixed bin (35));
+
+
+	if ^rcp_pointers_$data () -> rcpd.modes.resource_mgmt_enabled then
+	     call admin_gate_$syserr (3, "RCP: Mount Reel ^[scratch^s^;^a^] ^a ring on ^a for ^a",
+		(rcse.volume_name = ""), rcse.volume_name, wspace.ring_comment, rcse.device_name, rcse.group_id);
+	else do;
+	     Resource_count = 1;
+	     begin;
+
+dcl  garbage (size (resource_descriptions)) bit (36);
+
+		string (garbage) = ""b;
+		resource_desc_ptr = addr (garbage);
+
+		resource_descriptions.version_no = resource_desc_version_1;
+		resource_descriptions.n_items = 1;
+		resource_descriptions.item (1).type = VOLUME_TYPE (TAPE_VOL_VTYPEX);
+		resource_descriptions.item (1).name = rcse.volume_name;
+		resource_descriptions.item (1).given.name = "1"b;
+
+		call rcprm_find_resource_$status (resource_desc_ptr, (rcs.acs_directory), ecode);
+
+		if ecode = error_table_$action_not_performed then
+		     ecode = resource_descriptions.item (1).status_code;
+
+		if ecode ^= 0			/* We won't try to print location if we can't get it. */
+		then do;
+		     resource_descriptions.item (1).location = "";
+		     ecode = 0;
+		end;
+
+		call admin_gate_$syserr (3, "RCP: Mount ^[(from ""^a"") ^;^s^]Reel ^a ^a ring on ^a for ^a",
+		     (resource_descriptions.item (1).location ^= ""), resource_descriptions.item (1).location,
+		     rcse.volume_name, wspace.ring_comment, rcse.device_name, rcse.group_id);
+	     end;
+	end;
+
+
+	return;
+
+
+     end Print_Mount_Message;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   RCP: Mount Reel REELID with(out) ring on DRIVE for PERSON.PROJ.T.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	A user process has requested the mounting of
+   tape reel REELID on drive DRIVE.
+
+   A:	Locate the requested reel.
+   Check to make sure that the user PERSON.PROJ is allowed to use the reel.
+   Insert or remove a write ring as specified.
+   Mount the reel on the specified drive.
+
+   If the reel cannot be mounted, either because it
+   cannot be located,
+   access is incorrect,
+   or the drive is down,
+   use the "x deny" function to reject the mount request.
+
+
+   Message:
+   RCP: Remount Reel REELID with(out) ring on DRIVE.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The system found a write
+   ring when one was not required,
+   or did not find one when one was needed.
+   Or the authentication code did not match.
+   The tape is unloaded.
+
+   A:	Correct the write ring status or mount the correct tape and reready the tape.
+
+
+   Message:
+   RCP: Reready DRIVE.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	DRIVE has dropped out of ready status.
+
+   A:	Reready it.
+
+
+   Message:
+   RCP: Authentication code for DRIVE does not match.
+
+   S:	$info
+
+   T:     $run
+
+   M:	The authentication code typed for the
+   volume on DRIVE does no match the user
+   specified volume name.
+
+   A:	$ignore
+
+
+   Message:
+   RCP: Authenticate DRIVE. It has LABEL_TYPE label LABEL.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The system cannot determine that the volume on DRIVE is the one
+   requested.  The operator must authenticate the volume.  The label read from
+   the tape on DEVICE was of type LABEL_TYPE and was LABEL.  If LABEL is
+   "(Manual Halt)" this indicates that the tape drive was found in standby
+   while trying to read/verify the label.  If LABEL_TYPE is ANSI and LABEL is
+   "<label> (with non-blank accessibility code)" this indicates that the label
+   is an ANSI label with a non-blank character in the accessibility field, the
+   operator must consult the site standards for authenticating such tapes
+   before doing the authentication.  Any non-printable characters in the label
+   are represented by ".".
+
+   A:	If the volume is correct then
+   use the "x auth" function to input the DRIVE number and
+   the authentication code on the tape volume, or "***" if there is no
+   authentication code.  If authentication was requested due to the drive being in standby,
+   the tape should be rewound manually and rereadied manually and the above procedure
+   for authentication followed.
+
+
+   Message:
+   RCP: Authenticate DRIVE. It has LABEL_TYPE label LABEL and is UNREGISTERED.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The tape volume requested is not a registered tape volume. In addittion, the system may
+   not have been able to determine that the volume loaded is in fact the one requested. The
+   label read from the tape on DEVICE was of type LABEL_TYPE and was LABEL. If LABEL is
+   "(Manual Halt)" this indicates that the tape drive was found in standby while trying to
+   read/verify the label. Any non-printable characters in the label are represented by ".".
+
+   A:	If the volume is correct and is to be registered to the user requesting this attachment
+   use the "x auth" function to input the DRIVE number and the authentication code on the
+   tape volume, or "***" if there is no authentication code. If authentication was requested
+   due to the drive being in standby, the tape should be rewound manually and rereadied
+   manually and the above procedure for authentication followed.
+
+
+   Message:
+   RCP: Using Reel REELID on DRIVE for PERSON.PROJ.T.
+
+   S:	$info
+
+   T:	$run
+
+   M:	Using a preloaded volume.
+
+   A:	$ignore
+
+
+   Message:
+   RCP: Reready Reel REELID on DRIVE for PERSON.PROJ.T.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	A preloaded volume was not ready.
+
+   A:	Make the volume ready.
+
+
+   Message:
+   RCP: WARNING!!  IF YOU AUTHENTICATE THIS REQUEST <USER> WILL OWN VOLUME <VOLUME>!
+
+   S:	$beep
+
+   T:	$run
+
+   M:	This is a warning to the operator.  IHe should be very careful to check the
+   physical label of the volume before authenticating this request.  As the message states,
+   if the request is autheticated, <VOLUME> will be registered and acquired to <USER>.
+
+   A:	Check the physical label of the tape volume.  If it is the property of
+   <USER>, authenticate the request.  If it is not the property of <USER> deny the
+   request by typing "x auth no".
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end rcp_tape_;

@@ -1,0 +1,401 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+device_acct_: proc;
+
+/* DEVICE_ACCT_ - program to account for process device usage  */
+/* Written by VanVleck ---
+   Modified 8/1/77 by Greenberg for $broom
+   .            and by T. Casey to lock the pdt entry while modifying it
+   Modified Feb 1980 by M. B. Armstrong to implement multiple rate structures (UNCA).
+   Modified June 1981 by E. N. Kittlitz for UNCA rate structures
+   Modified November 1981, E. N. Kittlitz.  user_table_entry conversion.
+   Modified May 1982, E. N. Kittlitz. New AS initialization.
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-04-26,GDixon), approve(87-07-13,MCR7741),
+     audit(87-07-23,Brunelle), install(87-08-04,MR12.1-1055):
+     Upgraded for change to answer_table.incl.pl1 and user_table_entry.incl.pl1
+  2) change(87-07-20,GDixon), approve(87-07-20,MCR7741),
+     audit(87-07-23,Brunelle), install(87-08-04,MR12.1-1055):
+      A) Add operator message documentation.
+      B) Use sys_log_constants.incl.pl1 for severity parameter to sys_log_.
+                                                   END HISTORY COMMENTS */
+
+
+dcl  (addr, clock, null) builtin;
+
+dcl  cur_rs_ptr ptr;
+dcl  devep ptr;					/* ptr to entry in device table */
+dcl  pdtep ptr;					/* ptr to entry in pdt to be charged */
+dcl  (dix, dix1) fixed bin;				/* subscript in device table */
+dcl  cost float bin;				/* cost, for setup operation. */
+
+dcl  unlock_pdte_sw bit (1) aligned;			/* to remember to unlock the pdt entry */
+dcl  ec fixed bin (35);				/* errcode */
+
+dcl  error_table_$lock_wait_time_exceeded ext fixed bin (35);
+dcl  error_table_$locked_by_this_process ext fixed bin (35);
+dcl  error_table_$out_of_sequence fixed bin (35) ext static;
+
+
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl  hcs_$truncate_seg entry (ptr, fixed bin, fixed bin (35));
+dcl  (sys_log_$error_log, sys_log_) entry options (variable);
+dcl  (ipc_$mask_ev_calls, ipc_$unmask_ev_calls) entry (fixed bin (35));
+dcl  set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+dcl  sub_err_ entry () options (variable);
+
+
+/* =======================================================  */
+
+on:  entry (a_dev, a_devname, a_utep);
+
+dcl  a_dev fixed bin,				/* device type number */
+     a_devname char (*),				/* device identifier */
+     a_utep ptr;					/* ptr ot answer table entry */
+
+	if a_dev = 0 then return;			/* see comments in devid.incl.pl1 */
+	ansp = as_data_$ansp;
+	anstbl.current_time = clock ();		/* use accurate clock value to start charging */
+	if devtab.freep = 0 then do;			/* Allocate new device table entry. */
+	     dix, devtab.current_size = devtab.current_size + 1;
+	     devep = addr (devtab.entry (dix));		/* Grew new entry. */
+	end;
+	else do;					/* Re-use free entry from free chain. */
+	     dix = devtab.freep;
+	     devep = addr (devtab.entry (dix));
+	     devtab.freep = process_chain_f;		/* Shorten free chain by one. LIFO */
+	end;
+
+	utep = a_utep;				/* Copy ptr to anstbl */
+	ute.ndevices = ute.ndevices + 1;		/* Count devices. */
+	deve.process_chain_f = ute.device_head;		/* Set up chain pointers in new entry. */
+	deve.process_chain_b = 0;			/* Add new entry to front of chain. */
+	ute.device_head = dix;			/* Make anstbl entry point at new entry. */
+	if ute.device_tail = 0 then ute.device_tail = dix;
+	if deve.process_chain_f ^= 0
+	then addr (devtab.entry (deve.process_chain_f)) -> deve.process_chain_b = dix;
+
+	deve.mount_time, deve.update_time = anstbl.current_time; /* Fill in device entry. */
+	deve.devid = a_dev;
+	deve.dev_name = a_devname;
+	deve.pdtep = ute.pdtep;			/* set pointer to accounting data. */
+	deve.state = 1;
+
+	return;
+
+/* -------------------------------------------------------- */
+
+setup: entry (a_dev, a_devname, a_utep);
+
+dcl  devtab_ix fixed bin;				/* id of device that the setup is being done on */
+
+	if a_dev = 0 then return;			/* see comments in devid.incl.pl1 */
+	utep = a_utep;				/* Copy ptr to anstbl entry. */
+	pdtep = ute.pdtep;				/* Extract ptr to pdt entry. */
+	if lock_pdte () then do;			/* if we can't lock PDT entry, user gets out of being charged */
+	     if a_dev = devtab_ix_tape then devtab_ix = devtab_ix_tape_mt; /* tape setup */
+	     else if a_dev = devtab_ix_disk then devtab_ix = devtab_ix_disk_mt; /* io disk setup */
+	     else devtab_ix = 0;			/* something else - should never happen */
+	     if devtab_ix ^= 0 then do;		/* see comments in devid.incl.pl1 */
+		devtab.usage_total (devtab_ix) = devtab.usage_total (devtab_ix) + 1;
+		ansp = as_data_$ansp;
+		cost = rs_ptrs (ute.rs_number) -> rate_structure.device_price (devtab_ix, anstbl.shift); /* Obtain price for setup operation. */
+		user.devices (devtab_ix) = user.devices (devtab_ix) + cost;
+		user.dollar_charge = user.dollar_charge + cost;
+		user.absolute_spent = user.absolute_spent + cost;
+		ute.session_cost = ute.session_cost + cost;
+	     end;
+	     call unlock_pdte;
+	end;
+	return;					/* All done. */
+
+/* -------------------------------------------------------- */
+
+off: entry (a_dev, a_devname, a_utep);
+
+	if a_dev = 0 then return;			/* see comments in devid.incl.pl1 */
+	utep = a_utep;				/* Copy ptr to anstbl entry. */
+	do dix = ute.device_head repeat (deve.process_chain_f) while (dix ^= 0); /* Scan chain */
+	     devep = addr (devtab.entry (dix));
+	     if deve.devid = a_dev & deve.dev_name = a_devname then do; /* got it */
+	          ansp = as_data_$ansp;
+		anstbl.current_time = clock ();	/* use accurate clock value to compute charges */
+		call upcharge;
+		call free_devtab_entry;
+		return;
+	     end;
+	end;
+
+	call sys_log_ (SL_LOG_SILENT,
+	     "device_acct_$off: device ^d (^a, ^a) not in device table for ^a.^a",
+	     a_dev, installation_parms.devtab (a_dev).device_id, a_devname, ute.person, ute.project);
+	return;					/* device table probably messed up. nothing operator can do */
+
+
+/* ------------------------------------------------------- */
+
+update: entry (a_utep);				/* called by act_ctl_ */
+
+	utep = a_utep;				/* Copy ptr to anstbl entry. */
+	ansp = as_data_$ansp;
+	if ute.ndevices = 0 then return;		/* If no device chain, quit. */
+	do dix = ute.device_head repeat (deve.process_chain_f) while (dix ^= 0);
+	     devep = addr (devtab.entry (dix));
+	     call upcharge;				/* $$$$$ */
+	end;
+
+	return;					/* All through. */
+
+/* ------------------------------------------------------- */
+
+broom: entry (a_utep);				/* Charge and clean up all process entries. */
+
+	utep = a_utep;
+	if ute.ndevices = 0 then return;		/* avoid some paging */
+
+	ansp = as_data_$ansp;
+	anstbl.current_time = clock ();		/* use accurate clock value to compute charges */
+	do dix = ute.device_head repeat dix1 while (dix ^= 0); /* dix1 is set by the free_devtab_entry internal procedure */
+	     devep = addr (devtab.entry (dix));
+	     call upcharge;				/* charge to this point */
+	     call free_devtab_entry;
+	end;
+	return;
+
+/* -------------------------------------------------------- */
+
+init: entry;					/* Called by as_init_ */
+
+	if ^sc_stat_$Multics_typed | sc_stat_$Go_typed then do;
+	     ec = error_table_$out_of_sequence;
+	     go to init_sub_err;
+	end;
+          ansp = as_data_$ansp;
+	call hcs_$make_seg (anstbl.sysdir, "device_table", "", 1010b, devtabp, ec);
+	if devtabp = null then go to init_error;
+
+	call hcs_$truncate_seg (devtabp, 0, ec);	/* zero the entire segment */
+	if ec ^= 0 then go to init_error;
+	devtab.current_size = 0;			/* Clean up device table. */
+	devtab.freep = 0;				/* Make it all empty. */
+	devtab.version = DEVTAB_version;		/* Set state. */
+	devtab.n_devices = 0;
+
+/* Look up the devtab entries for tape, tape_mt, disk, and disk_mt, and remember their indices in static variables */
+
+	do devtab_ix_tape = 1 to installation_parms.ndevices /* look up tape in devtab */
+	     while (installation_parms.devtab (devtab_ix_tape).device_id ^= dev_id (dev_tape));
+	end;
+	if devtab_ix_tape = installation_parms.ndevices + 1 then /* if not there, we won't charge for tape */
+	     devtab_ix_tape = 0;
+
+	do devtab_ix_tape_mt = 1 to installation_parms.ndevices /* look up tape_mt in devtab */
+	     while (installation_parms.devtab (devtab_ix_tape_mt).device_id ^= dev_id (dev_tape_mt));
+	end;
+	if devtab_ix_tape_mt = installation_parms.ndevices + 1 then /* if not there, we won't charge for tape mounts */
+	     devtab_ix_tape_mt = 0;
+
+	do devtab_ix_disk = 1 to installation_parms.ndevices /* look up disk in devtab */
+	     while (installation_parms.devtab (devtab_ix_disk).device_id ^= dev_id (dev_disk));
+	end;
+	if devtab_ix_disk = installation_parms.ndevices + 1 then /* if not there, we won't charge for disk */
+	     devtab_ix_disk = 0;
+
+	do devtab_ix_disk_mt = 1 to installation_parms.ndevices /* look up disk_mt in devtab */
+	     while (installation_parms.devtab (devtab_ix_disk_mt).device_id ^= dev_id (dev_disk_mt));
+	end;
+	if devtab_ix_disk_mt = installation_parms.ndevices + 1 then /* if not there, we won't charge for disk mounts */
+	     devtab_ix_disk_mt = 0;
+
+	return;
+
+init_error: call sys_log_$error_log (SL_LOG_BEEP, ec, "device_acct_$init",
+	     "device_table");
+init_sub_err: call sub_err_ (ec, "device_acct_$init", "s");
+
+/* ------------------------------------------------------- */
+
+upcharge: proc;
+
+dcl  delta fixed bin (71),				/* Delta time for usage. */
+     cost float bin (63);				/* Charge for the time. */
+
+	pdtep = deve.pdtep;				/* Get ptr to place where charges go. */
+	if pdtep ^= ute.pdtep then do;		/* trap bug in maintenance of device table threads */
+	     call sys_log_ (SL_LOG_BEEP,
+	          "device_acct_: deve.pdtep (^p) not = ute.pdtep (^p) for ^a.^a",
+		pdtep, ute.pdtep, ute.person, ute.project);
+	     return;
+	end;
+
+	if lock_pdte () then do;			/* if we can't lock PDT entry, user gets out of being charged */
+	     delta = anstbl.current_time - deve.update_time; /* Calculate time mounted. */
+	     deve.update_time = anstbl.current_time;
+	     devtab.usage_total (deve.devid) = devtab.usage_total (deve.devid) + delta;
+	     cost = rs_ptrs (ute.rs_number) -> rate_structure.device_price (deve.devid, anstbl.shift) * delta / 36e8;
+	     user.devices (deve.devid) = user.devices (deve.devid) + cost;
+	     user.dollar_charge = user.dollar_charge + cost;
+	     user.absolute_spent = user.absolute_spent + cost;
+	     ute.session_cost = ute.session_cost + cost;
+	     call unlock_pdte;
+	end;
+	return;
+
+     end upcharge;
+
+/* ---------- */
+
+free_devtab_entry: proc;
+
+	dix1 = deve.process_chain_f;			/* Save for broom loop. */
+
+	if deve.process_chain_f = 0 then ute.device_tail = deve.process_chain_b;
+	else addr (devtab.entry (deve.process_chain_f)) -> deve.process_chain_b = deve.process_chain_b;
+
+	if deve.process_chain_b = 0 then ute.device_head = deve.process_chain_f;
+	else addr (devtab.entry (deve.process_chain_b)) -> deve.process_chain_f = deve.process_chain_f;
+
+	ute.ndevices = ute.ndevices - 1;		/* Decrement count in ATE */
+	deve.state = 0;				/* free */
+	deve.process_chain_f = devtab.freep;		/* thread to free list */
+	deve.process_chain_b = -1;			/* watch for bugs */
+	devtab.freep = dix;
+	return;
+
+     end free_devtab_entry;
+
+/* ---------- */
+
+lock_pdte: proc returns (bit (1) aligned);
+
+	unlock_pdte_sw = "1"b;			/* remember to unlock it */
+	call ipc_$mask_ev_calls ((0));		/* in case we have to wait on the lock */
+	call set_lock_$lock (user.lock, 15, ec);	/* wait 15 seconds only */
+	call ipc_$unmask_ev_calls ((0));		/* unmask before doing anything else, so we don't forget */
+
+/* an undocumented feature of ipc_ masking is that it counts mask and unmask calls,
+   and does the right thing - so we can unmask here without worrying about whether
+   the caller of device_acct_ was already masked (which he sometines is).
+   If he is, the process stays masked in spite of our unmasking.
+*/
+
+	if ec = error_table_$lock_wait_time_exceeded then do; /* if we could not lock it */
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "device_acct_",
+		"Attempting to lock PDT entry of ^a.^a",
+		ute.person, ute.project);		/* tell the operator */
+	     unlock_pdte_sw = ""b;			/* don't try to unlock it */
+	     return (""b);				/* tell our caller what happened */
+	end;
+
+	else if ec = error_table_$locked_by_this_process then /* caller of device_acct_ already had it locked */
+	     unlock_pdte_sw = ""b;			/* so remember to leave it that way */
+
+	return ("1"b);				/* tell caller that it is locked */
+
+     end lock_pdte;
+
+/* ---------- */
+
+unlock_pdte: proc;
+
+	if unlock_pdte_sw then
+	     call set_lock_$unlock (user.lock, (0));
+
+	return;
+
+     end unlock_pdte;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   device_acct_: deve.pdtep (PTR1) not = ute.pdtep (PTR2) for PERSON.PROJECT.
+
+   A:	$as2
+
+   T:	$run
+
+   M:	The Project Definition Table entry pointer (PTR1) stored in the
+   device table for PERSON.PROJECT differs from the PDT entry pointer stored
+   in that user's User Table Entry (UTE).  $err
+
+   A:	$notify
+
+
+   Message:
+   device_acct_: ERROR_MESSAGE.  Attempting to lock PDT entry of PERSON.PROJECT
+
+   S:	$as2
+
+   T:	$run
+
+   M:	An attempt was made to lock the Project Definition Table (PDT) entry
+   for PERSON.PROJECT to update device usage charges for the user.  Locking
+   did not succeed within 15 seconds, so the charges were not updated.  If
+   the attempt occurred during an accounting update, the charges will continue
+   to accrue until the next update, at which time locking the PDT entry is
+   again attempted.  If the original attempt occurred as part of a
+   logout or new_proc operation, the device charges are lost.
+
+   A:    $notify_sa
+
+
+   Message:
+   device_acct_$init: ERROR_MESSAGE.  device_table
+
+   S: 	$as2
+
+   T:	$init
+
+   M:	An error occurred which initializing the device_table.  ERROR_MESSAGE
+   is the text associated with the error code describing the error.  Device
+   accounting is disabled, and system initialization fails.
+
+   A:	$notify
+
+
+   Message:
+   device_acct_$off: device N (ACCT_TYPE_NAME, DEV_NAME) not in device table for PERSON.PROJECT
+
+   S: 	$as0
+
+   T:	$run
+
+   M:	Device DEV_NAME, which has device accounting type number N associated
+   with ACCT_TYPE_NAME devices, was not found in PERSON.PROJECT's device 
+   table entries.  Probable cause is damage to the device table.
+
+   A:	$notify_sa
+
+   END MESSAGE DOCUMENTATION */
+
+%page; %include answer_table;
+%page; %include as_data_;
+%page; %include as_data_definitions_;
+%page; %include devid;
+%page; %include devtab;
+%page; %include installation_parms;
+%page; %include pdt;
+
+dcl  pdtp ptr automatic init (null);			/* pdt needs it. */
+%page; %include rate_structure;
+%page; %include sc_stat_;
+%page; %include sys_log_constants;
+%page; %include user_attributes;
+%page; %include user_table_entry;
+%page; %include user_table_header;
+
+     end device_acct_;

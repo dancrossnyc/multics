@@ -1,0 +1,473 @@
+/* **************************************************************
+   *                                                            *
+   * Copyright, (C) Massachusetts Institute of Technology, 1973 *
+   *                                                            *
+   ************************************************************** */
+lisp_default_handler_: proc(a_mcp, cond_name, wcptr, infoptr, continue) options(support);
+				/* This isn't actually a `support' procedure,
+				   but there is a bug in default_error_handler_... */
+
+/* procedure for receiving most faults and signals
+ * which occur during a lisp program execution.
+ * Coded by DPR 8/14/72.
+ * alarmclock bug fixed DAMoon 18 Aug 72
+ * changed 10 March 1973 by DAM to allow for case where a fault
+ * has occurred while signalling a previous fault.  The machine
+ * conditions of the previous fault are used.
+ * Modified 16 January 1974 by DAM to stop using find_fault_frame_
+ * and use find_condition_frame_ and find_condition_info_ instead.
+ * Modified by DPR on 20 Feb. 1974 to fix problems in continuing signal introduced with
+ * deletion of listener wall. Also fixed uninitialized vars in continue_signal_aa.
+ * Modified 29 November 1979 to fix alarm clock bug while executing in 
+ * pl/1 code so timers will operate properly.  -- Richard S. Lamson
+ */
+
+dcl (wcptr, infoptr) ptr,
+    fault_type fixed bin,
+    cond_name char(*),
+    continue bit(1) aligned,
+    lisp_static_vars_$ignore_faults bit(36) aligned ext,
+    lisp_static_vars_$binding_reversal_flag bit(36) aligned external,
+    signal_ entry(char(*), ptr, ptr),
+    temp ptr,
+    stack_base ptr,
+    temp_rel bit(18),
+    lisp_fault_handler_ entry(fixed bin, ptr, fixed bin),
+    convert_status_code_ entry(fixed bin(35), char(8) aligned, char(100) aligned),
+    brief_msg char(8) aligned,
+    long_msg char(100) aligned,
+    based_ptr pointer aligned based,
+    based_lisp_data bit(72) aligned based,
+    sp pointer,
+    ioa_$ioa_switch entry options(variable),
+    iox_$error_output ext ptr,
+    nop_0_du bit(36) static init("000000000000000000000001001000000011"b),
+    (null, hbound, lbound, baseno, baseptr, addr, addrel, substr, rel, ptr, bit, fixed, unspec, add) builtin,
+    in_pl1_code_flag bit(36),
+    fault_pbr ptr,
+    action fixed bin,
+    a_mcp ptr,
+    find_condition_frame_ entry(pointer) returns(pointer),
+    find_condition_info_ entry(pointer, pointer, fixed bin(35)),
+    short_name(4:6) char(4) aligned static init("quit", "mme4", "faul"),
+    full_names(4:6) char(12) aligned static init("quit", "mme4", "fault_tag_3"),
+    insts(0:1) bit(36) aligned based;
+
+dcl flonum float bin(63),
+    based_flonum_1 float bin(27) aligned based,
+    based_flonum_2 float bin(63) aligned based,
+    fixedb fixed bin aligned based,
+
+    1 instruction aligned,
+      2 address bit(18) unaligned,
+      2 opcode bit(10) unaligned,
+      2 modifiers bit(8) unaligned,
+    1 based_instruction based aligned structure like instruction,
+
+    lisp_fault_handler_$wipe_stack entry,
+    lisp_fault_handler_$stack_loss entry(fixed bin),
+    which_stack fixed bin,
+    lisp_segment_manager_$grow_stacks entry(fixed bin(35)),
+
+    lisp_static_vars_$divov_flag fixed bin(71) external,
+     lisp_static_vars_$zunderflow fixed bin(71) external,
+    code fixed bin(35);
+
+dcl 1 fault_tag_3_pointer aligned based,
+      2 fault_code fixed bin(17) unaligned,
+      2 fault_tag_3 fixed bin(17) unaligned;
+
+
+dcl 1 cond_info automatic aligned structure,
+%include cond_info;
+%include lisp_free_storage;
+%include lisp_faults;
+dcl unm pointer;		/* not actually used anywhere.  This is just to keep the compiler happy */
+%include mc;
+%include lisp_common_vars;
+%include lisp_stack_seg;
+%include lisp_atom_fmt;
+
+
+
+	stack_base = ptr(unmkd_ptr, "0"b);
+	in_pl1_code_flag = stack_base -> stack_seg.in_pl1_code;
+
+
+	do fault_type = lbound(short_name, 1) to hbound(short_name, 1);
+	     if substr(cond_name,1,4) = short_name(fault_type)
+	     then if cond_name = full_names(fault_type)
+		then go to is_ours;
+	end;
+	fault_type = -1;			/* not found, not our fault */
+
+is_ours:
+join:
+	if lisp_static_vars_$binding_reversal_flag ^= ""b		/* can't interrupt while reversing bindings */
+	then if fault_type >= 5 then go to continue_signal;	/* but do allow bad faults through */
+	     else do;
+		if fault_type < 0 then go to check_mc;		/* ?? */
+		lisp_static_vars_$binding_reversal_flag = lisp_static_vars_$binding_reversal_flag | bit(fixed(fault_type, 36), 36);
+		return;
+		end;
+	if lisp_alloc_$alloc_fault_word ^= "0"b
+	  then if fault_type >= 5 then go to continue_signal;	/* should never happen anyway */
+	   else do;
+
+		if fault_type < 0 then go to check_mc;
+		call lisp_alloc_$set_fault(fault_type);
+		dcl lisp_alloc_$set_fault entry(fixed bin);
+		return;
+	     end;
+	mcp = a_mcp;
+check_mc:
+	scup = null;			/* Just in case */
+	if mcp = null() then go to no_machine_conditions;
+	sp = mcp -> mc.prs(spx);	/* get sp at time of fault */
+	scup = addr(mcp -> mc.scu);
+
+
+
+	if in_pl1_code_flag = "0"b				/* we are executing with ap, and ab|0,x7 */
+	then do;
+		if baseno(stack_ptr) ^= baseno(mcp->mc.prs(apx)) then go to something_fishy;
+		if stack_base ^= mcp ->mc.prs(abx) then go to something_fishy;
+		unmkd_ptr = addrel(stack_base, mcp -> mc.regs.x(7));
+		stack_ptr = mcp -> mc.prs(apx);
+	     end;
+
+no_machine_conditions:
+	if lisp_static_vars_$ignore_faults then go to continue_signal;
+
+	if fault_type ^= -1 then go to our_fault;		/* if it really was ours */
+							/* if it wasn't, we wanted to
+							   go through the above code to
+							   update stack_ptr, unmkd_ptr
+							   before going to continue_signal
+							    and letting the fault out of lisp */
+
+	if mcp = null() then go to continue_signal;		/* can't do this stuff without machine conditions */
+
+	/* check for zerodivide and stackoverflow */
+
+	if cond_name = "zerodivide"
+	then if in_pl1_code_flag then go to continue_signal;	/* not lisp */
+	     else  go to zerodivide_handler;
+	else if cond_name = "underflow"
+	then if in_pl1_code_flag then go to continue_signal;	/* not lisp */
+	     else go to underflow_handler;
+	else if cond_name = "out_of_bounds"  
+	     then if "000"b || scu.tpr.tsr = baseno(stack_ptr) then go to marked_stack_oob;
+	          else if "000"b || scu.tpr.tsr = baseno(unmkd_ptr) then go to unmarked_stack_oob;
+
+continue_signal:
+return_tv(2):
+	if fault_type >= 0 then if fault_type < 4	/* can't set continue bit for timer faults */
+	then do;
+		call ioa_$ioa_switch(iox_$error_output,
+			"lisp: Timer ignored, no lisp environment was present.");	/* let user know this happened */
+		return;
+	     end;
+continue_signal_aa:
+	if lisp_static_vars_$ignore_faults
+	then do;				/* we must just pass things through */
+		/* set continue flag, and restore state, then return to signal_ */
+		continue = "1"b;
+		stack_base -> stack_seg.in_pl1_code = in_pl1_code_flag;
+		return;
+	     end;
+	else do;				/* we have to change lisp_static_vars_$ignore_faults,
+					   but have to have a stack frame around to to restore
+					   it if the ultimate handler chooses to return */
+		lisp_static_vars_$ignore_faults = (36) "1"b;
+
+		/* now if we resignal the same thing, will get back past lisp's default handler */
+
+		call signal_ (cond_name, a_mcp, infoptr);
+		lisp_static_vars_$ignore_faults = (36) "0"b;	/* restore state back */
+		stack_base -> stack_seg.in_pl1_code = in_pl1_code_flag;
+		return;
+	     end;
+
+our_fault:
+	stack_base -> stack_seg.in_pl1_code = "1"b;		/* set up for lisp_fault_handler_ call */
+	action = 0;
+	if mcp ^= null()
+	then fault_pbr = addrel(baseptr("000"b||scup->scu.ppr.psr), scup -> scu.ilc);
+	else fault_pbr = null;			/* Ah well */
+
+	/* for fault_tag_3 faults, the fault code comes from the
+	   segment number field of the faulted pointer */
+
+	if fault_type = Car_cdr_fault then do;
+	   code = addrel(baseptr("000"b||scup->scu.tpr.tsr), scup->scu.ca) -> fault_tag_3_pointer.fault_code;
+	   if code = 1 then fault_type = Old_store_fault;
+	   else if code = 2 then fault_type = Array_fault;
+	   end;
+
+	call lisp_fault_handler_(fault_type, fault_pbr, action);
+
+	stack_base -> stack_seg.in_pl1_code = in_pl1_code_flag;
+	go to return_tv(action);
+
+return_tv(1):						/* move to new address */
+
+	scup -> scu.ppr.psr = substr(baseno(fault_pbr),4,15);			/* get seg # */
+	scup -> scu.ilc = rel(fault_pbr);	/* force ilc to addr */
+	scup -> scu.cu.rfi = "1"b;
+return_tv(0):
+	return;
+
+return_tv(3):		/* old array store kludge - redo the store with new address */
+
+	fault_pbr -> based_lisp_data = mcp -> mc.a || mcp -> mc.q;	/* store aq */
+	scup -> scu.ilc = bit(fixed(fixed(scup -> scu.ilc, 18)+1, 18), 18);	/* skip over staq inst. */
+	scup -> scu.cu.rfi = "1"b;
+	return;
+
+program_interrupt:	entry;
+
+	lisp_static_vars_$ignore_faults = "0"b;	/* considered to be in lisp now */
+	action = 0;
+	call lisp_fault_handler_ ((Pi_fault), null(), action);
+	go to process_quit_return;
+
+deferred_quit:	entry;
+
+dcl quit condition;
+
+handle_defer_quit:
+	lisp_static_vars_$ignore_faults = "0"b;	/* if pi, we're back in lisp now */
+	action = 0;
+	call lisp_fault_handler_((Quit_fault), null(), action);
+process_quit_return:
+	if action ^= 0 then do;
+		dcl lisp_static_vars_$transparent bit(1) external;
+
+		lisp_static_vars_$ignore_faults = "1"b;
+		lisp_static_vars_$transparent = "1"b;			/* to let this one quit get through */
+		signal quit;		/* after a great struggle, this will get you out to command level */
+		lisp_static_vars_$ignore_faults = "0"b;
+		end;
+	return;
+
+
+alarm:	entry(a_mcp, cond_name);			/* called by timer_manager_ for lisp 'alarmclock' function */
+
+	mcp = a_mcp;
+	stack_base = ptr(unmkd_ptr, "0"b);
+	in_pl1_code_flag = stack_base -> stack_seg.in_pl1_code;
+
+	if cond_name = "alrm" then fault_type = 2;
+	else if cond_name = "cput" then fault_type = 1;
+	else fault_type = 3;		/* shouldn't happen, lisp_fault_handler_ will give the err msg */
+
+	go to join;
+
+alloc_fault:	entry(fault_bits);
+
+dcl fault_bits bit(36) aligned;
+
+	if fault_bits & alrm_fault then call lisp_fault_handler_(2, null, 0);
+	if fault_bits & cput_fault then call lisp_fault_handler_(1, null, 0);
+	if fault_bits & quit_fault then go to handle_defer_quit;
+	return;
+
+
+
+/*
+  There's something fishy going on here:
+  in_pl1_code is zero, yet ab is not pointing at the stack.
+   This could because no lisp is around, or because lisp has a bug
+  in it and took some kind of fault and then a timer went off,
+  or because a timer went off while some other fault was being
+  signalled.  In the latter case, we want to use the machine conditions
+  of the original fault, i.e. lisp's machine conditions not signal_'s.
+  In the other two cases we go to continue_signal to let default_error_handler_
+  handle it or else to ignore a timer fault that occurs at an inopportune time.
+ */
+
+something_fishy:
+
+	sp = find_condition_frame_(sp);
+	if sp = null then go to continue_signal;		/* no fault frame was found */
+	cond_info.version = 1;	/* varsion number of structure I allocate */
+	call find_condition_info_(sp, addr(cond_info), code);
+	if code ^= 0 then go to continue_signal;	/* not of interest */
+	mcp = cond_info.mcptr;		/* machine conditions at previous fault */
+	if cond_info.condition_name ^= "quit"
+	then if cond_info.condition_name ^= "cput"
+	then if cond_info.condition_name ^= "alrm"
+	then if cond_info.condition_name ^= "mme4"
+	then if cond_info.condition_name ^= "fault_tag_3"
+	then go to continue_signal;		/* some bad fault happened - probably a bug in lisp
+						   so we don't want to reenter it because that might
+						   terminate the process. */
+	go to check_mc;	/*** found a previous fault, so go look at its machine conditions (mcp has been changed) */
+
+/* come here to see if we have a stack overflow (oob fault caused by setting max length) */
+
+marked_stack_oob:
+	which_stack = 2;
+	go to stack_oob;
+unmarked_stack_oob:		/* for now, assume any oob on these segments is an overflow */
+	which_stack = 3;
+
+stack_oob:
+
+	stack_base -> stack_seg.in_pl1_code = "1"b;		/* set up for lisp_fault_handler_ call */
+	call lisp_segment_manager_$grow_stacks(code);	/* make stacks big enough to handle fail-act */
+	if code ^= 0 then do;
+	   call convert_status_code_(code, brief_msg, long_msg);
+	   call ioa_$ioa_switch(iox_$error_output, "lisp:  Stack overflow.  (^a)^/^-An automatic ctrl/g occurs.", long_msg);
+	   call lisp_fault_handler_$wipe_stack;
+	   end;
+	/* take a fail-act. */
+
+	call lisp_fault_handler_$stack_loss(which_stack);
+
+	/* come here attempting to restart program after stack overflow.
+	   assume that a simple rcu is sufficient because max length of stack segs has changed. */
+
+	stack_base -> stack_seg.in_pl1_code = in_pl1_code_flag;
+	return;
+
+
+
+/* come here to do (status divov) hack when a zerodivide interrupt occurs */
+
+zerodivide_handler:
+	stack_base -> stack_seg.in_pl1_code = "1"b;		/* set up for lisp_fault_handler_ call */
+
+	/* see if user has done (sstatus divov t), which turns on the hackery below */
+
+	if lisp_static_vars_$divov_flag = nil then go to zerodivide_fail_act;	/* no special hackery desired */
+zerodivide_hackery:
+
+	/* first get the instruction being executed at the time.
+	   Because the 6180 carefully clobbers the instruction
+	   register on a zerodivide fault, we have to fetch it ourselves */
+
+	instruction = ptr(baseptr("000"b || scu.ppr.psr), scu.ilc) -> based_instruction;
+hack_instruction:
+
+	/* now hack the registers to make the result of the divide be the numerator plus 1 */
+
+	if instruction.opcode = "1010001100"b 	/* div */
+	then do;
+	     addr(mc.q) -> fixedb = addr(mc.q) -> fixedb + 1;
+	     mc.a = (36)"0"b;
+	     end;
+	else if instruction.opcode = "1011101010"b | instruction.opcode = "1011101110"b	/* fdv, dfdv */
+	then do;
+	     unspec(flonum) = mc.e || mc.a || mc.q;	/* more or less a double-precision floating point number */
+hack_flonum:
+	     flonum = flonum + 1.0;
+	     mc.e = substr(unspec(flonum), 1, 8);
+	     mc.a = substr(unspec(flonum), 9, 36);
+	     mc.q = substr(unspec(flonum), 45, 28) || (8)"0"b;
+	     end;
+	else if instruction.opcode = "1010101010"b	/* fdi */
+	then do;
+	     flonum = ptr(baseptr("000"b || scu.tpr.tsr), scu.ca) -> based_flonum_1;
+	     go to hack_flonum;
+	     end;
+	else if instruction.opcode = "1010101110"b	/* dfdi */
+	then do;
+	     flonum = ptr(baseptr("000"b || scu.tpr.tsr), scu.ca) -> based_flonum_2;
+	     go to hack_flonum;
+	     end;
+	else if instruction.opcode = "1110011100"b	/* xec - used by lisp_utils_ */
+	then do;
+		call compute_effective_address;
+		instruction = temp -> based_instruction;
+		go to hack_instruction;
+		end;
+	else if instruction.opcode = "111001111"b	/* xed - used by lisp_utils_ */
+	then do;
+		call compute_effective_address;
+		if scu.cu.xdo then temp = addrel(temp, 1);	/* divide was odd instruction */
+		else if scu.cu.xde then;			/* divide was even instruction */
+		else go to continue_signal;			/* not xed??? - something lost. */
+		instruction = temp -> based_instruction;
+		go to hack_instruction;
+		end;
+	else go to continue_signal;			/* some random instruction we don't know about,
+						   such as decimal divide.  Let loser see error message */
+
+	/* resume processing with next instruction after divide, the registers have been hacked */
+
+	scu.ilc = bit(add(fixed(scu.ilc,18), 1, 18, 0), 18);	/* resume with instruction after divide */
+	scu.cu.rfi = "1"b;
+	stack_base -> stack_seg.in_pl1_code = in_pl1_code_flag;
+	return;
+
+/* internal proc to compute effective address of instruction.
+   this is simplified version which works with those cases
+   that appear in the LISP arithmetic routines in connection with xec and xed instructions */
+
+compute_effective_address: proc;
+
+dcl modif fixed bin(8);
+
+	temp = baseptr("000"b || scu.ppr.psr);		/* -> seg containing instruction */
+	modif = fixed(instruction.modifiers, 8);
+	if modif >= 16 then go to continue_signal;	/* unknown */
+
+	/* simple r or n modification, no abr */
+
+	if modif = 0 then temp = ptr(temp, instruction.address);
+	else if modif >= 8 then temp = ptr(temp, fixed(instruction.address, 18) +
+					 fixed(mc.regs.x(modif-8), 18));	/* ,x_n */
+	else go to continue_signal;			/* can't hack ,ic ,du etc. */
+	end;
+
+
+	/* gve (quotient 0) fail-act for zerodivide */
+
+zerodivide_fail_act:
+	call lisp_fault_handler_(Zerodivide_fault, (null), (0));
+	go to zerodivide_hackery;		/* if it returns, we are to hack the instruction even though (status divov) was nil */
+
+/***** underflow handling - depends on value of zunderflow *****/
+
+underflow_handler:
+	stack_base -> stack_seg.in_pl1_code = "1"b;		/* set up for lisp_fault_handler_ call */
+
+	if addr(lisp_static_vars_$zunderflow) -> based_ptr -> atom.value = nil then go to underflow_error;
+
+hack_underflow:
+		/* magically change underflow into a non-error by setting the eaq to zero and proceeding
+		   with the next instruction. */
+
+/* declare a name by which we can refer to the opcode field of the current instruction
+   field in the scu data.  Note:  the name even is a misnomer left over from the 645 */
+
+declare 1 current_instruction aligned based(addr(scup -> scu.even_inst)),
+	2 address_part bit(18) unaligned,
+	2 current_op_code bit(10) unaligned,
+	2 inhibit_bit bit(1) unaligned,
+	2 ptr_reg_tab bit(1) unaligned,
+	2 modifier bit(6) unaligned;
+
+	     mcp -> mc.regs.a, mcp -> mc.regs.q = (36)"0"b;	/* actually the fim does this, but I'm */
+	     mcp -> mc.regs.e = "10000000"b;			/* not going to rely on anyone as untrustworthy */
+							/* as the fim! */
+	     if current_op_code ^= "1001100000"b 		/* check for store instructions */
+	     then if current_op_code ^= "1001110100"b		/* which are retried.  Other instructions */
+	     then if current_op_code ^= "1001011010"b
+	     then if current_op_code ^= "1001011110"b then
+	     scup -> scu.ilc =
+		bit(fixed(fixed(scup -> scu.ilc, 18)		/* increment the ilc to skip over the */
+		     + 1, 18), 18);				/* instruction that underflew */
+	scup -> scu.cu.rfi = "1"b;		/* set this bit and CPU does everything else */
+
+	stack_base -> stack_seg.in_pl1_code = in_pl1_code_flag;
+	return;
+
+underflow_error:
+
+	call lisp_fault_handler_(Underflow_fault, (null), (0));
+	go to hack_underflow;		/* return indicates should go make result zero */
+
+end lisp_default_handler_;

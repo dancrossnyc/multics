@@ -1,0 +1,399 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+g115_io_$write: proc (a_ddp, a_msgp, a_code);
+
+/* this procedure handles the actual read and writing of the
+   data to the L6-RBF via hcs_$tty calls. */
+
+/* Coded 4/30/74 by Mike Grady */
+
+/* Modified 06/10/75 by Bob Adsit to move line_status to MCS/355 */
+
+/* Modified 04/10/77 by Bob Franklin to fix many bugs. Now multiple
+   blocks must be unpacked on input in g115_message, special control
+   records must be ignored, etc. Ignore Quit error on Writes. */
+
+/* Modified to handle multiple buffers, line control orders and
+   fit into the iox_ based total g115 package June 1978 by D. Vinograd */
+
+/* Modified by J. Nicholls 7/78 to count records instead of characters */
+
+/*   Modified by J. Nicholls Sept 78 to buffer input in ring 4, since the fnp dia channel may
+   become clogged if the input sets in ring 0.  Thus if output is pending and input is available,
+   we will read a record and buffer it, and keep trying until output is not pending and input is completed.
+   If no more input, we'll go blocked; if no output pending, task is accomplished and we'll continue. */
+
+/* Modified by J. C. Whitmore, 9/79, renamed g115_message_ to g115_io_ and restructured completely */
+
+dcl  a_ddp ptr parameter;
+dcl  a_msgp ptr parameter;
+dcl  a_infop ptr parameter;
+dcl  a_code fixed bin (35) parameter;
+
+dcl  msg_block_ptr ptr;
+dcl  nelemt fixed bin;
+dcl  nelem fixed bin;
+dcl  offset fixed bin;
+dcl  idx fixed bin;
+dcl  state fixed bin;
+dcl  code fixed bin (35);
+dcl  ec fixed bin (35);
+dcl  send_wakeup bit (1) init ("0"b);			/* set if we should send a wakeup to previous (if any) invocation */
+dcl  read_status_entry bit (1);
+
+
+dcl  quit_code fixed bin (35) int static init (3000005) options (constant); /* quit occurred */
+
+
+dcl 1 line_status aligned,
+   (2 value,
+    2 mbz1,
+    2 mbz2,
+    2 mbz3) fixed bin unal;
+
+dcl 1 info aligned based,
+    2 pad fixed bin (71),
+    2 input_available bit (1);
+
+dcl 1 io_status aligned,
+    2 pad fixed bin (71),
+    2 io_pending bit (1);
+
+dcl 1 event_info aligned,				/* wakeup information */
+    2 channel_id fixed bin (71) aligned,		/* channel over which to send wakeup */
+    2 message char (8) aligned,			/* event message */
+    2 sender bit (36) aligned,			/* process id of sending process */
+    2 origin,
+      3 dev_signal bit (18) unaligned,			/* ON if event occurred as result of i/o interrupt */
+      3 ring bit (18) unaligned,			/* sender's validation level */
+    2 wait_list_index fixed bin aligned;
+
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  hcs_$tty_write entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35));
+dcl  hphcs_$tty_write_force entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35));
+dcl  hcs_$tty_get_line entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, bit (1), fixed bin, fixed bin (35));
+dcl  hcs_$tty_order entry (fixed bin, char (*), ptr, fixed bin, fixed bin (35));
+dcl  hcs_$tty_event entry (fixed bin, fixed bin (71), fixed bin, fixed bin (35));
+dcl  hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl  ipc_$mask_ev_calls entry (fixed bin (35));
+dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+
+dcl  error_table_$net_timeout ext fixed bin (35);
+dcl  error_table_$line_status_pending ext fixed bin (35);
+dcl  error_table_$io_no_permission ext fixed bin (35);
+dcl  error_table_$improper_data_format ext fixed bin (35);
+
+
+dcl (addr, null, unspec) builtin;
+
+%include g115_device_data;
+
+%include g115_message;
+
+%include G115;
+
+/* g115_io_$write:	proc (a_ddp, a_msgp, a_code);	*/
+
+/* This procedure writes messages to the L6-RBF and will read input if output is still pending. */
+
+	read_status_entry = "0"b;			/* this is not the read_status entry */
+	a_code, code = 0;				/* set error code to 0 */
+	msgp = a_msgp;
+	device_data_p = a_ddp;
+
+	if g115_message.text_char_count = 0 | g115_message.being_changed then do;
+	     a_code = error_table_$improper_data_format;
+	     return;
+	end;
+
+	nelem = g115_message.text_char_count + 8;	/* add in header-trailer to get actual length of message */
+	msg_block_ptr = addr (msgp -> g115_msg_block);	/* get addr for tty_write */
+	offset = 0;
+
+	if g115_device_data.as_priv_no_block then go to ANS_SERVICE; /* special section for answering service */
+
+check_write_completion:
+
+	call check_write_status (code);		/* set the io_status structure */
+	if code ^= 0 then go to RETURN;
+
+	do while (io_status.io_pending);		/* if output is still in Ring 0, check for input */
+	     call hcs_$tty_order (g115_device_data.devx, "read_status", addr (io_status), state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if line_status_pending (code) then go to check_write_completion;
+	     if code ^= 0 then go to RETURN;
+
+	     if io_status.io_pending then do;		/* if we have input, get it out of Ring 0 */
+		allocate g115_message in (buffer_area) set (msgp);
+		unspec (g115_message) = "0"b;		/* be sure it is clear */
+		g115_message.next_bp = null;
+		g115_device_data.last_bp -> g115_message.next_bp = msgp; /* add to chain */
+		g115_device_data.last_bp = msgp;
+
+		send_wakeup = "1"b;			/* tell reader about input */
+
+		call read_message (msgp, code);	/* read one message and verify it */
+		if code ^= 0 then go to RETURN;
+	     end;
+	     else do;				/* output pending and no input, so just wait */
+
+		call block (code);
+		if code ^= 0 then go to RETURN;;
+	     end;
+
+	     call check_write_status (code);		/* check for output pending and loop back */
+	     if code ^= 0 then go to RETURN;
+	end;
+
+try_write:
+	nelemt, state = 0;
+	call hcs_$tty_write (g115_device_data.devx, msg_block_ptr, offset, nelem, nelemt, state, code);
+	if state ^= 5 then code = error_table_$io_no_permission;
+	if code = quit_code then go to try_write;	/* ignore quit error its been reset */
+	if line_status_pending (code) then go to try_write;
+	if code ^= 0 then go to RETURN;
+
+	if nelem = nelemt then go to RETURN;		/* all data was accepted by ring 0 */
+
+	nelem = nelem - nelemt;			/* only a portion was sent, try to send remainder */
+	offset = offset + nelemt;
+	go to check_write_completion;
+
+
+
+/* ===== SPECIAL SECTION FOR THE ANSWERING SERVICE ===== */
+
+ANS_SERVICE:
+
+/* We cannot allow the answering service to block on output indefinitely. So we use a timeout of 3 seconds
+   if there is already output pending.  The event channel we block on must be different from
+   the normal answering service channel so we change it each time. */
+
+	call hcs_$tty_event (g115_device_data.devx, g115_device_data.tty_ev_channel, state, code);
+	if state ^= 5 then code = error_table_$io_no_permission;
+	if line_status_pending (code) then go to ANS_SERVICE; /* try all over */
+	if code ^= 0 then go to RETURN;
+
+	call check_write_status (code);		/* Check for output pending */
+	if code ^= 0 then go to ANS_RETURN;		/* really screwed up, will have to be dropped */
+
+	do while (io_status.io_pending);		/* if told to wait */
+	     call ipc_$mask_ev_calls (ec);		/* stop answering service for a second */
+
+	     call ipc_$drain_chn (g115_device_data.timeout_ev_channel, ec); /* be sure it is clear */
+
+	     call timer_manager_$alarm_wakeup (3, "11"b, g115_device_data.timeout_ev_channel); /* 3 seconds max */
+
+	     call block (code);			/* wait for completion or timeout */
+
+	     call ipc_$unmask_ev_calls (ec);		/* ALWAYS reset the event call mask */
+
+	     if code ^= 0 then go to ANS_RETURN;	/* check code from block, timeout is fatal */
+
+	     call timer_manager_$reset_alarm_wakeup (g115_device_data.timeout_ev_channel); /* made it */
+
+	     call check_write_status (code);
+	     if code ^= 0 then go to ANS_RETURN;
+	end;
+
+	call hphcs_$tty_write_force (g115_device_data.devx, msg_block_ptr, offset, nelem, nelemt, state, code);
+	if state ^= 5 then code = error_table_$io_no_permission;
+	if line_status_pending (code) then go to ANS_SERVICE; /* start all over */
+
+ANS_RETURN:
+
+/* ALWAYS attempt to return the normal event channel to Ring 0 - error or not */
+
+	call hcs_$tty_event (g115_device_data.devx, g115_device_data.as_ev_chan, state, ec);
+
+	if code = 0 then code = ec;			/* give other errors priority */
+	go to RETURN;				/* common return code (See read entry) */
+
+check_write_status: proc (code);
+
+dcl  code fixed bin (35);
+
+	     call ipc_$drain_chn (g115_device_data.tty_ev_channel, code); /* clear wakeups? */
+
+
+retry_ws:	     call hcs_$tty_order (g115_device_data.devx, "write_status", addr (io_status), state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+
+	     if line_status_pending (code) then go to retry_ws;
+
+	     return;
+
+	end check_write_status;
+
+
+
+line_status_pending: proc (code) returns (bit (1));
+
+/* this procedure simply clears any pending line status and throws it away */
+
+dcl  code fixed bin (35);
+
+	     if code = 0 then return ("0"b);		/* avoid a loop for normal case */
+
+	     do while (code = error_table_$line_status_pending);
+		call hcs_$tty_order (g115_device_data.devx, "line_status", addr (line_status), state, code);
+		if state ^= 5 then code = error_table_$io_no_permission;
+	     end;
+
+	     if code = 0 then return ("1"b);		/* OK to retry the operation */
+
+	     return ("0"b);				/* do not attempt a retry */
+
+	end line_status_pending;
+
+
+
+block:	proc (code);
+
+/* this procedure blocks on the pre-defined wait list for the device and waits for a wakeup from ring 0 */
+
+dcl  code fixed bin (35);
+
+	     event_info.wait_list_index = 0;		/* initialize test value */
+
+	     call ipc_$block (addr (g115_device_data.wait_list), addr (event_info), code);
+
+	     if event_info.wait_list_index = 2 then code = error_table_$net_timeout;
+
+	     else if code ^= 0 then call convert_ipc_code_ (code);
+
+	     send_wakeup = "1"b;			/* we may have stolen a wakeup, so give it back */
+
+	     return;
+
+	end block;
+
+read:	entry (a_ddp, a_msgp, a_code);
+
+/* This entry reads a message from ring 0 and puts it into the message buffer defined by a_msgp */
+
+	device_data_p = a_ddp;			/* define the g115_device_data for this invocation */
+	msgp = a_msgp;
+	read_status_entry = "0"b;			/* this is not the read_status entry */
+
+	go to READ_COMMON;
+
+
+read_status: entry (a_ddp, a_infop, a_code);
+
+/* This entry tries to read a message from ring zero (if available) and saves it in the last input buffer of the chain.
+   It sets the input_available flag in the structure a_infop -> info if there is a valid record
+   count in the message read.
+*/
+
+	device_data_p = a_ddp;			/* define the g115_device_data for this invocation */
+
+	msgp = g115_device_data.last_bp;		/* get ptr to tail buffer of chain */
+	if g115_message.rec_count > 0 then do;		/* something there? */
+	     a_infop -> info.input_available = "1"b;	/* tell caller */
+	     a_code = 0;
+	     return;
+	end;
+
+	read_status_entry = "1"b;			/* this is the read_status entry */
+
+
+READ_COMMON:
+
+	a_code, code = 0;
+
+
+	call read_message (msgp, code);
+	if code ^= 0 then go to RETURN;
+
+	if read_status_entry then			/* see if the message was good */
+	     if g115_message.rec_count > 0 then
+		a_infop -> info.input_available = "1"b; /* OK to read */
+
+RETURN:						/* this is the common exit point for this external procedure */
+
+	a_code = code;				/* copy back any status */
+
+/*	If we went blocked, we may have taken a wakeup from a read_status then block sequence. */
+/*	So we will send back a wakeup unconditionally if we went blocked at all, just in case.		*/
+
+	if send_wakeup then call hcs_$wakeup (g115_device_data.process_id, g115_device_data.tty_ev_channel, 0, code);
+
+	return;
+
+read_message: proc (msgp, code);
+
+dcl  msgp ptr;
+dcl  code fixed bin (35);
+dcl  msg_len fixed bin;
+dcl  offset fixed bin;
+dcl  read_ptr ptr;
+dcl  max_len fixed bin;
+dcl  etx_found bit (1);
+
+	     msgp -> g115_message.last_char_read = 0;	/* reset state variables */
+	     msgp -> g115_message.text_char_count = 0;
+	     msgp -> g115_message.rec_count = 0;
+
+	     offset = 0;				/* hardcore read offset */
+	     max_len = G115.max_msg_len + 8;		/* SOH -> STX = 7, ETX = 1, total = 8 chars */
+	     read_ptr = addr (msgp -> g115_message.g115_msg_block); /* where ring 0 should put the message */
+try_read:
+	     etx_found = "0"b;
+	     msg_len, state = 0;
+
+	     call hcs_$tty_get_line (g115_device_data.devx, read_ptr, offset, max_len - offset, msg_len,
+		etx_found, state, code);
+	     if state ^= 5 then code = error_table_$io_no_permission;
+	     if line_status_pending (code) then go to try_read;
+	     if code ^= 0 then return;
+
+	     if msg_len < 1 then do;			/* no meat to the message */
+		if g115_message.text_char_count = 0 then /* on partial read wait for complete msg */
+		     if read_status_entry | g115_device_data.as_priv_no_block then return;
+						/* for these cases, don't wait for a message */
+
+		call block (code);			/* wait for the message (or remainder) to arrive */
+		if code ^= 0 then return;
+		go to try_read;			/* should get it this time */
+	     end;
+
+	     if msgp -> g115_message.text_char_count = 0 then /* allow for message header? (SOH -> STX = 7 chars) */
+		msgp -> g115_message.text_char_count = msg_len - 7;
+	     else msgp -> g115_message.text_char_count = msgp -> g115_message.text_char_count + msg_len;
+
+	     if etx_found then			/* when complete, take the ETX char out of the count */
+		msgp -> g115_message.text_char_count = msgp -> g115_message.text_char_count - 1;
+	     else do;
+		offset = msgp -> g115_message.text_char_count + 7; /* next read follows last char read */
+		go to try_read;
+	     end;
+
+/* count the records in the message */
+
+	     do idx = 1 to g115_message.text_char_count;
+		if g115_message.text (idx) = G115.RS then /* look for record separators (RS) */
+		     g115_message.rec_count = g115_message.rec_count + 1; /* add up full records */
+	     end;
+	     if g115_message.text (g115_message.text_char_count) ^= G115.RS then
+						/* if last char is not RS, record is split */
+		g115_message.rec_count = g115_message.rec_count + 1; /* add partial record to count */
+
+	     return;
+
+	end read_message;
+
+
+
+     end g115_io_$write;

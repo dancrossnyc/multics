@@ -1,0 +1,348 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind35,^indcomtxt */
+
+initiate_search_rules: proc (a_ptr, a_code);
+
+/* Last Modified: (Date and Reason)
+   10/15/84 by Keith Loepere for auditing info.
+   06/22/84 by Keith Loepere to use the new dc_find (including access checks).
+   03/77 by M. Weaver to put search rules in user ring
+   07/76 by THVV for Bicentennial
+   04/03/75 by R. Bratt for new kst / rnt system
+   08/11/71 by Richard H. Gumpertz to make length of pds$process_dir_name = 32 instead of 52
+   08/04/71 by Mosley Meer for new KST format
+   originally coded by Mosley Meer
+*/
+
+/* This routine is called to initiate and insert the search rules
+   passed to it through the pointer argument
+   USAGE:
+   call initiate_search_rules(ptr, code);
+
+   1) ptr		pointer to a data array. (Input)
+   2) code	return status code. (Output)
+
+   NOTE: the data array is of the form
+   dcl 1 input_arg based aligned,
+   2 number fixed bin,
+   2 name (22) char (168) unal;
+
+   All search rules are checked to be directories. */
+
+/* Parameters */
+
+dcl  a_code			fixed bin (35) parameter; /* return status code */
+dcl  a_ptr			ptr parameter;	/* pointer to input search rule array */
+dcl  syscode			fixed bin (35) parameter;
+dcl  sysptr			ptr parameter;
+
+/* Based */
+
+dcl  based_area			area based;
+dcl  1 input_arg			based (ap) aligned, /* form of input name structure array */
+       2 number			fixed bin,
+       2 name			(22) char (168) unal;
+dcl  1 search_rules			(22) based (srp) aligned,
+     ( 2 base			bit (18),
+       2 offset			bit (18),
+       2 uid			bit (36)) unaligned;
+
+/* Variables */
+
+dcl  ap				ptr;		/* input array pointer */
+dcl  1 arg			aligned like input_arg;
+dcl  code				fixed bin (35);
+dcl  count			fixed bin;	/* count of rules in pointer array */
+dcl  firstarg			fixed bin;	/* first arg to scan (2 for ssd, else 1) */
+dcl  i				fixed bin;
+dcl  new_ring			bit (1);
+dcl  old_ep			ptr;
+dcl  ring				fixed bin;
+dcl  1 search_rule_temp		(22) aligned like search_rules; /* Stack copy */
+dcl  segnum			fixed bin (15);	/* segment number from pointer */
+dcl  srp				ptr;		/* pointer to a single search rule in KST */
+dcl  1 ssd_dft_rules		(22) aligned like search_rules;
+dcl  ssd_wdir_index			fixed bin;	/* location of rule after WDIR rule */
+dcl  xcode			fixed bin (35);
+
+/* Entries */
+
+dcl  get_kstep			entry (fixed bin (15), ptr, fixed bin (35));
+dcl  level$get			entry returns (fixed bin);
+dcl  lock$dir_unlock		entry (ptr);
+dcl  lock$lock_fast			entry (ptr);
+dcl  lock$unlock_fast		entry (ptr);
+dcl  segno_usage$decrement		entry (fixed bin (15), fixed bin (35));
+
+/* External */
+
+dcl  ahd$n_sr_tags			fixed bin ext;
+dcl  ahd$n_sys_rules		fixed bin ext;
+dcl  1 ahd$search_rule		(50) aligned ext,
+       2 name			char (168) unal,
+       2 flag			bit (36);
+dcl  1 ahd$sr_tag			(10) aligned ext,
+       2 name			char (32),
+       2 flag			bit (36);
+dcl  ahd$search_rules_lock		ext;
+dcl  error_table_$bad_arg		ext fixed bin (35);
+dcl  error_table_$bad_string		ext fixed bin (35);
+dcl  error_table_$root		ext fixed bin (35);
+dcl  error_table_$too_many_sr		ext fixed bin (35);
+dcl  pds$home_dir			ext char (168) aligned;
+dcl  pds$process_dir_name		ext char (32) aligned;
+dcl  pds$stacks			(0:7) ptr ext;
+
+/* Misc */
+
+dcl  (addr, baseptr, binary, bit, hbound, null, segno, substr) builtin;
+%page;
+	new_ring = "0"b;				/* entry used by ssr command */
+	goto join;
+
+
+init_ring: entry (a_ptr, a_code);
+
+	new_ring = "1"b;				/* called by makestack */
+
+join:	ap = a_ptr;				/* copy the array pointer */
+	arg = input_arg;				/* Copy whole input structure */
+	code = 0;
+	ring = level$get ();			/* get ring for this search rule set */
+	rntp = pds$stacks (ring) -> stack_header.rnt_ptr;
+	count = 1;				/* count of elements in pointer array */
+	firstarg = 1;
+	if arg.number < 1 | arg.number >= hbound (search_rules, 1) then do;
+	     a_code = error_table_$bad_arg;
+	     return;
+	end;
+
+	call lock$lock_fast (addr (ahd$search_rules_lock));
+	if arg.name (1) = "default" then do;
+	     call process_rule ("default", 0, code);	/* Get all rules tagged "default" */
+	     if code ^= 0 then go to fin;		/* .. might have changed since proc created */
+	     count = count + 1;
+	     go to thru;
+	end;
+
+	if arg.name (1) = "set_search_directories" then do; /* Set default rules but with extras after wdir */
+	     call process_rule ("default", 0, code);	/* Expand default rules */
+	     if code ^= 0 then go to fin;
+	     search_rule_temp (count + 1).offset = END_RULE; /* Flag end of list */
+	     do count = 1 to hbound (search_rules, 1) while (search_rule_temp (count).offset ^= WDIR_RULE); end;
+	     if count > hbound (search_rules, 1) then go to too_many_err;
+	     ssd_wdir_index, count = count + 1;		/* Note pos of wdir */
+	     ssd_dft_rules = search_rule_temp;		/* Save spare copy of defaults */
+	     firstarg = 2;				/* Scan from rule 2 on */
+	end;
+
+	do i = firstarg to arg.number;		/* Scan strings in user input */
+	     call process_rule (arg.name (i), 0, code);	/* Expand each rule */
+	     if code = 1 then i = arg.number;		/* Force end of loop */
+	     else if code ^= 0 then go to fin;
+
+	     count = count + 1;
+	     if count > hbound (search_rules, 1) then go to too_many_err; /* too many search rules */
+	end;
+
+	if arg.name (1) = "set_search_directories" then do; /* Did user rules, now finish sandwich */
+	     do i = ssd_wdir_index to hbound (search_rules, 1); /* Finish copy of default search rules */
+		if count > hbound (search_rules, 1) then go to too_many_err;
+		search_rule_temp (count) = ssd_dft_rules (i);
+		if search_rule_temp (count).offset = END_RULE then go to thru;
+		count = count + 1;
+	     end;
+	     go to too_many_err;			/* shouldn't get here */
+	end;
+
+/* Insert search termination code */
+
+thru:	search_rule_temp (count).uid = "0"b;		/* Put in an end marker */
+	search_rule_temp (count).base = "0"b;
+	search_rule_temp (count).offset = END_RULE;	/* insert the code */
+
+/* check if space allocated for these search rules (this ring) */
+
+	srp = rnt.srulep;				/* ptr to list for current ring */
+	if srp = null then do;			/* First time in a virgin ring */
+	     allocate search_rules in (rnt.areap -> based_area) set (srp);
+	     rnt.srulep = srp;			/* put it in pointer list */
+	end;
+	else do i = 1 to hbound (search_rules, 1) while (search_rules (i).offset ^= END_RULE);
+	     if search_rules (i).uid ^= "0"b then do;	/* Must decrement usage counts of old rules */
+		segnum = binary (search_rules (i).base, 18);
+		call get_kstep (segnum, kstep, xcode);
+		if xcode = 0
+		     then if search_rules (i).uid = kste.uid
+		     then do;
+			call dc_find$obj_terminate_ptr (baseptr (segnum), old_ep, xcode); /* audit termination */
+			if xcode = 0 then  call lock$dir_unlock (ptr (old_ep, 0));
+			if xcode = error_table_$root then xcode = 0;
+			if xcode = 0 then call segno_usage$decrement (segnum, (0));
+		     end;
+	     end;
+	end;
+
+	search_rules = search_rule_temp;		/* Copy search rules into KST */
+
+fin:	call lock$unlock_fast (addr (ahd$search_rules_lock));
+	a_code = code;
+	return;
+
+too_many_err: code = error_table_$too_many_sr;
+	go to fin;
+%page;
+
+/* This entry is called from the initializer to set the system default search rules */
+
+set_system_rules: entry (sysptr, syscode);
+	xsp = sysptr;
+	syscode = 0;
+	i = dft_sr_arg.ntags;
+	if i > hbound (dft_sr_arg.tags, 1) then do;
+	     syscode = error_table_$bad_arg;
+	     return;
+	end;
+	count = dft_sr_arg.nrules;
+	if count > hbound (dft_sr_arg.rules, 1) then do;
+	     syscode = error_table_$bad_arg;
+	     return;
+	end;
+	call lock$lock_fast (addr (ahd$search_rules_lock)); /* Nobody use whilst i am changing */
+	ahd$n_sys_rules = count;
+	ahd$n_sr_tags = i;
+	ahd$n_sys_rules = dft_sr_arg.nrules;
+	do i = 1 to ahd$n_sr_tags;
+	     ahd$sr_tag (i).name = dft_sr_arg.tags (i).name;
+	     ahd$sr_tag (i).flag = dft_sr_arg.tags (i).flag;
+	end;
+	do i = 1 to ahd$n_sys_rules;
+	     ahd$search_rule (i).name = dft_sr_arg.rules (i).name;
+	     ahd$search_rule (i).flag = dft_sr_arg.rules (i).flag;
+	end;
+	call lock$unlock_fast (addr (ahd$search_rules_lock));
+	return;
+
+/* This entry returns them to the user */
+
+get_system_rules: entry (sysptr, syscode);
+
+	syscode = 0;
+	xsp = sysptr;
+	call lock$lock_fast (addr (ahd$search_rules_lock));
+	do i = 1 to ahd$n_sr_tags;
+	     dft_sr_arg.tags (i).name = ahd$sr_tag (i).name;
+	     dft_sr_arg.tags (i).flag = ahd$sr_tag (i).flag;
+	end;
+	do i = 1 to ahd$n_sys_rules;
+	     dft_sr_arg.rules (i).name = ahd$search_rule (i).name;
+	     dft_sr_arg.rules (i).flag = ahd$search_rule (i).flag;
+	end;
+	dft_sr_arg.ntags = ahd$n_sr_tags;
+	dft_sr_arg.nrules = ahd$n_sys_rules;
+	call lock$unlock_fast (addr (ahd$search_rules_lock));
+	return;
+%page;
+process_rule: proc (dn, depth, code);
+
+dcl  code				fixed bin (35) parameter;
+dcl  depth			fixed bin parameter;
+dcl  dn				char (168) parameter;
+
+dcl  j				fixed bin;
+dcl  jj				fixed bin;
+dcl  nfound			fixed bin;
+
+	code, nfound = 0;
+	search_rule_temp (count).base = "0"b;
+	search_rule_temp (count).offset = "0"b;
+	search_rule_temp (count).uid = "0"b;
+
+	if substr (dn, 1, 1) = ">" then do;
+	     call initiate_name;
+	end;
+
+	else if dn = search_rule_names (1) then do;	/* "initiated_segments" */
+	     search_rule_temp (count).offset = INITIATED_RULE; /* search KST code */
+	end;
+
+	else if dn = search_rule_names (2) then do;	/* "referencing_dir" */
+	     search_rule_temp (count).offset = REFERENCING_DIR_RULE; /* parent of referencing proceedure search */
+	end;
+
+	else if dn = search_rule_names (3) then do;	/* "working_dir" */
+	     search_rule_temp (count).offset = WDIR_RULE; /* search working directory code */
+	end;
+
+	else if dn = "process_dir" then do;		/* process directory */
+	     dn = pds$process_dir_name;
+	     call initiate_name;
+	end;
+
+	else if dn = "home_dir" then do;		/* home or login directory */
+	     dn = pds$home_dir;
+	     call initiate_name;
+	end;
+
+	else if dn = search_rule_names (4) then do;	/* End of rules */
+	     code = 1;				/* Force end of loop */
+	end;
+
+	else do;					/* Unrecognized. */
+	     if depth = 0 then do;			/* Keyword ok? */
+		do j = 1 to ahd$n_sr_tags while (dn ^= ahd$sr_tag (j).name); end;
+		if j <= ahd$n_sr_tags then do;
+		     do jj = 1 to ahd$n_sys_rules;
+			if (ahd$search_rule (jj).flag & ahd$sr_tag (j).flag) ^= "0"b then do;
+			     call process_rule (ahd$search_rule (jj).name, 1, code);
+			     if code ^= 0 then return;
+			     nfound = nfound + 1;
+			     count = count + 1;
+			end;
+		     end;
+		     if nfound = 0 then code = 2;
+		     else count = count - 1;		/* count incr by loop above once more than req'd */
+		     return;
+		end;
+	     end;
+	     code = error_table_$bad_string;
+	end;
+
+	return;
+
+initiate_name: proc;
+
+	     call dc_find$dir_initiate (dn, dp, code);
+	     if code = 0 then do;
+		segnum = segno (dp);
+		search_rule_temp (count).base = bit (binary (segnum, 18), 18); /* put away base of pointer */
+		search_rule_temp (count).uid = dp -> dir.uid; /* store uid */
+		call lock$dir_unlock (dp);		/* don't dereference dir */
+	     end;
+	     else if new_ring then do;		/* new ring so do best we can */
+		code = 0;
+		search_rule_temp (count).offset = BAD_RULE; /* special code for bad entry during proc init */
+	     end;
+	     return;
+	end initiate_name;
+
+     end process_rule;
+%page; %include dc_find_dcls;
+%page; %include dir_entry;
+%page; %include dir_header;
+%page; %include kst;
+%page; %include rnt;
+%page; %include search_rule_flags;
+%page; %include stack_header;
+%page; %include system_dft_sr;
+     end initiate_search_rules;

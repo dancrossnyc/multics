@@ -1,0 +1,773 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+recover_volume_log: proc;
+
+/* This utility command is used in the rare case when a volume log is not available, either because it
+   has been deleted, or  because we are reloading the RPV. It recovers the latest volume log
+   by name from the dump volume that the requestor provides. It is the requestor's responsibility to provide the
+   latest dump volume. */
+
+/* Modified 6/79 by D. Vinograd to correct check for beginning of logical record */
+/* Modified 11/79 by D. Vinograd to add -wd as control arg and add code to
+   delete volume log if recovered when there is one already there */
+/* Modified: 9/83 by GA Texada to allow multiple pvnames to be specified,
+	   and to reformat and move includes.
+	   */
+/* Modified: 3/14/84 by GA Texada to allow for 'stranger' volume logs.		*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-10-10,Farley), approve(88-10-10,MCR8005),
+     audit(88-10-15,Beattie), install(88-10-17,MR12.2-1173):
+     Added new read routine and associated surrounding code to support the
+     version 2 volume dump tapes.  These tapes have a pair of unique strings
+     that delimit the object data of vtoce_type records.
+  2) change(89-08-31,GWMay), approve(89-10-03,MCR8135),
+     audit(89-10-04,Beattie), install(89-10-10,MR12.3-1089):
+     Updated to process version 3 of backup_volume_log.incl.pl1 structures.
+                                                   END HISTORY COMMENTS */
+
+
+dcl (att_desc, input_volume_desc) char (256);
+dcl (ac, argl, enl, itype, nargs, words_skipped, i, pvindex) fixed bin;
+dcl (char_read, read_char) fixed bin (21);
+dcl recovery_dir	     char (168);
+dcl temp_dir	     char (168);			/* a place to put my pdir			*/
+dcl (argp, iocbp)	     ptr;
+dcl (debug, wd_specified, new_tape, first_input_volume, ok_to_abc, resynching) bit (1);
+dcl delimited	     bit (1) aligned;		/* ON = reading object data delimited by unique matching strings */
+dcl (irpvpvid, irpvlvid, time) bit (36);
+dcl input_buf	     (divide (char_read, CHARS_PER_WORD, 17, 0)) bit (36) based (recordp);
+dcl word		     (size (backup_volume_header)) bit (36) based (recordp);
+dcl string	     bit (BITS_PER_WORD * size (backup_volume_header)) based (recordp);
+dcl pattern_match_label  label;
+dcl (ilvname, volname)   char (32);
+dcl var_volname	     char (32) varying;
+dcl (code, ignore)	     fixed bin (35);
+dcl arg		     char (argl) based (argp);
+dcl objectp	     ptr;
+dcl input_buffer_ptr     ptr;
+dcl input_buffer_start   fixed bin;
+dcl input_buffer_len     fixed bin (21);
+dcl old_256K_switch	     bit (2) aligned;
+dcl tp		     (3) ptr;
+
+dcl 1 rvl		     aligned based (rvlp),		/* structure to control multiple pv's		*/
+    2 npvs	     fixed bin,			/* number of valid per_pv's			*/
+    2 per_pv	     (maxpvs),			/* max that can be done (same as nargs)		*/
+      3 pvname	     char (32),			/* pvname name to be recovered		*/
+      3 volname	     char (32),			/* tape volume the log found on		*/
+      3 ename	     char (32),			/* name to terminate			*/
+      3 temp_logp	     ptr,				/* for pdir recovery			*/
+      3 new_logp	     ptr,				/* ptr to recoverd log			*/
+      3 time	     bit (36),			/* fs time of recover log			*/
+      3 flags,
+        4 abandoned	     bit (1) unal,			/* if I had to abandon this one		*/
+        4 volog_found    bit (1) unal,			/* if I found his				*/
+        4 mbz	     bit (34) unal,			/* RFU					*/
+  rvlp		     ptr,
+  maxpvs		     fixed bin;			/* will be set to nargs for allocation of rvl	*/
+
+dcl (cleanup, linkage_error) condition;
+
+dcl error_table_$data_loss fixed bin (35) ext;
+dcl error_table_$noentry fixed bin (35) ext;
+dcl error_table_$entlong fixed bin (35) ext;
+dcl error_table_$segknown fixed bin (35) ext;
+dcl error_table_$namedup fixed bin (35) ext;
+dcl error_table_$device_end fixed bin (35) ext;
+dcl error_table_$end_of_info fixed bin (35) ext;
+dcl error_table_$badopt  ext fixed bin (35);
+dcl sys_info$seg_size_256K fixed bin (19) ext static;
+dcl sys_info$max_seg_size fixed bin (18) ext static;
+
+dcl DEFAULT_RECOVERY_DIR char (168) int static init (">daemon_dir_dir>volume_backup") options (constant);
+dcl myname	     char (32) static init ("recover_volume_log") options (constant);
+dcl DELIMITED	     bit (1) aligned internal static options (constant)
+		     init ("1"b);
+dcl FORWARD_CHAR_POSITIONING fixed bin int static init (3) options (constant);
+
+dcl hcs_$delentry_file   entry (char (*), char (*), fixed bin (35));
+dcl hcs_$delentry_seg    entry (ptr, fixed bin (35));
+dcl hphcs_$delentry_file entry (char (*), char (*), fixed bin (35));
+dcl get_group_id_	     entry returns (char (32));
+dcl get_pdir_	     entry () returns (char (168));
+dcl hcs_$level_get	     entry returns (fixed bin);
+dcl date_time_$fstime    entry (bit (36), char (*));
+dcl adjust_bit_count_    entry (char (*), char (*), bit (1), fixed bin, fixed bin (35));
+dcl cu_$arg_count	     entry (fixed bin, fixed bin (35));
+dcl hcs_$fs_search_get_wdir entry (ptr, fixed bin (35));
+dcl cu_$arg_ptr	     entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl com_err_	     entry options (variable);
+dcl get_temp_segments_   entry (char (*), (*) ptr, fixed bin (35));
+dcl ioa_$rsnnl	     entry options (variable);
+dcl ioa_		     entry options (variable);
+dcl hcs_$terminate_noname entry (ptr, fixed bin (35));
+dcl hcs_$make_seg	     entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl hcs_$fs_move_seg     entry (ptr, ptr, fixed bin, fixed bin (35));
+dcl hcs_$set_256K_switch entry (bit (2) aligned, bit (2) aligned, fixed bin (35));
+dcl hcs_$set_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl hcs_$truncate_seg    entry (ptr, fixed bin (19), fixed bin (35));
+dcl iox_$attach_ioname   entry (char (*), ptr, char (*), fixed bin (35));
+dcl command_query_	     entry () options (variable);
+dcl mdc_$pvname_info     entry (char (*), bit (36), char (*), bit (36), fixed bin, fixed bin (35));
+dcl release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+
+dcl (addcharno, addr, divide, index, length, min, null, ptr, size, substr) builtin;
+
+/* init local control variables */
+
+    temp_dir = get_pdir_ ();				/* all recovery is done here first, moved after validation*/
+    recovery_dir = DEFAULT_RECOVERY_DIR;
+    debug, resynching, time, ok_to_abc = "0"b;
+    first_input_volume = "1"b;
+    input_volume_desc = "";
+    old_256K_switch = ""b;
+    tp (*) = null;
+    bvlp, iocbp, rvlp = null ();
+    code, maxpvs = 0;
+    query_info.version = query_info_version_6;
+    on cleanup call finish_;				/* set up cleanup handler */
+    call cu_$arg_count (nargs, code);
+    if nargs <= 0 then do;
+argerr: call com_err_ (0, myname,
+	   " USAGE: ^a pvnames [-input_volume_desc ""alternate attach decscription""] [-working_dir | -wd]",
+	   myname);
+        return;
+      end;
+    do ac = 1 to nargs;
+      call cu_$arg_ptr (ac, argp, argl, code);
+      if code ^= 0 then do;
+	call com_err_ (code, myname);
+	goto finish;
+        end;
+
+      if arg = "-input_volume_desc" then do;
+	ac = ac + 1;
+	call cu_$arg_ptr (ac, argp, argl, code);
+	if code ^= 0 then do;
+	    call com_err_ (code, myname, "Unable to access input volume desc");
+	    goto finish;
+	  end;
+	input_volume_desc = arg;
+        end;
+      else if arg = "-working_dir" | arg = "-wd" then do;
+	wd_specified = "1"b;
+	recovery_dir = wdir_ ();
+        end;
+      else if substr (arg, 1, 1) = "-" then do;
+	call com_err_ (error_table_$badopt, myname, "^a", arg);
+	goto finish;
+        end;
+      else do;					/* should be a pvname, we will validate it later	*/
+	if rvlp = null () then do;
+	    maxpvs = (nargs - ac) + 1;		/* this is the max we could need		*/
+	    allocate rvl set (rvlp);			/* allocate the space			*/
+	    rvl.npvs = 0;				/* get ready				*/
+	  end;
+
+	rvl.npvs = rvl.npvs + 1;			/* bump to the next slot			*/
+	rvl.pvname (rvl.npvs) = arg;			/* and put in the unvalidated name		*/
+
+	rvl.volname (rvl.npvs), rvl.ename (rvl.npvs) = "";/* now, initialize the entry	*/
+	rvl.temp_logp (rvl.npvs), rvl.new_logp (rvl.npvs) = null (); /* so the cleanup handler works properly*/
+	rvl.time (rvl.npvs), rvl.flags (rvl.npvs) = "0"b;
+        end;
+    end;
+
+    if (rvlp = null ()) | (rvl.npvs = 0) then do;		/* hmmmm, no pvnames given, complain		*/
+        call com_err_ (0, myname, "No pvnames were specified.");
+        goto finish;
+      end;
+
+    call setup_data_segments;
+    if code ^= 0 then do;
+        call com_err_ (code, myname, "Unable to get temp segs");
+        goto finish;
+      end;
+    code = 0;
+
+    call attach;
+
+/* The search loop  reads successive records from the dump volume until it encounters a volume log with the name
+   that matches pvname.  It then creates a segment, if one does not already exist and copies the data into it. The
+   dump volume is read until the end of tape is reached. */
+
+search_loop:
+    pvindex = 0;					/* pvindex is set by read_volume_record		*/
+    do while (pvindex = 0 & code = 0 & not_all_abandoned ());
+						/* not_all_abandoned returns true if		*/
+      call read_volume_record;			/* there is at least one pvname that we are still looking for*/
+    end;
+    if code ^= 0 then do;
+        call com_err_ (code, myname, "Error while reading input volume");
+        goto finish;
+      end;
+						/* create entry name */
+    if pvindex ^= 0 then do;
+        call ioa_$rsnnl ("^a.^a", rvl.ename (pvindex), enl, rvl.pvname (pvindex), "volog");
+        if enl > length (rvl.ename (1)) then do;
+	  code = error_table_$entlong;
+	  call com_err_ (code, myname, "Error creating volog name for ^a. Recovery for it will be abandoned.",
+	       rvl.pvname (pvindex));
+	  rvl.abandoned (pvindex) = "1"b;		/* don't do this anymore!			*/
+	  goto search_loop;
+	end;
+
+        call delete_make_and_move (temp_dir, bvlp, rvl.temp_logp (pvindex)); /* create and get ptr to segment */
+        if rvl.abandoned (pvindex) then ;		/* sorry charlie...				*/
+        else rvl.volog_found (pvindex) = "1"b;		/* only mark it if all operations worked...	*/
+        goto search_loop;
+      end;
+finish_all_temp:
+
+    if validate_all_vologs () then do;			/* ok, we've got all vologs in the process dir	*/
+						/* they all must match as to who the RPV is	*/
+        if ^wd_specified then do;			/* but, if we are NOT wd mode, then they also 	*/
+						/* must belong to the mounted RPV		*/
+	  call mdc_$pvname_info ("rpv", irpvpvid, ilvname, irpvlvid, itype, (0));
+	  if irpvpvid ^= rvl.new_logp (1) -> backup_volume_log.info.root_pvid then do;
+	      call com_err_ (0, myname, "Invalid attempt to recover a 'stranger' volume log. Use ""-wd"".");
+	      goto finish;
+	    end;
+	end;
+        do pvindex = 1 to rvl.npvs;
+	if ((rvl.volog_found (pvindex)) & ^(rvl.abandoned (pvindex))) then
+	  call delete_make_and_move (recovery_dir, rvl.temp_logp (pvindex), rvl.new_logp (pvindex));
+        end;
+      end;
+    else call com_err_ (0, myname, "All volume logs must belong to the same RPV.");
+						/* cleanup attachments, temp segs, and address space */
+finish:
+    call finish_;
+
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+all_vologs_found:
+  proc () returns (bit (1));
+
+dcl i		     fixed bin;
+    do i = 1 to rvl.npvs;
+      if (^rvl.volog_found (i)) then return ("0"b);	/* if one hasn't been found, return...		*/
+    end;
+    return ("1"b);
+  end all_vologs_found;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+not_all_abandoned: proc () returns (bit (1));
+
+dcl i		     fixed bin;
+
+    do i = 1 to rvl.npvs;
+      if rvl.abandoned (i) then ;
+      else return ("1"b);				/* at least one is still ok			*/
+    end;
+    return ("0"b);					/* nope, all abandoned			*/
+  end not_all_abandoned;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+detach: proc;
+
+/* This proc closes and detaches the dump volume. */
+
+    call iox_$close (iocbp, ignore);
+    call iox_$detach_iocb (iocbp, ignore);
+    iocbp = null;					/* be sure */
+
+  end detach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+setup_data_segments: proc;
+
+/* This proc sets up the data segments used during the recovery. */
+
+    call get_temp_segments_ (myname, tp, code);
+    if code ^= 0 then return;
+
+    recordp = tp (1);
+    objectp = tp (2);
+    input_buffer_ptr = tp (3);
+    call hcs_$set_256K_switch ("11"b, (""b), code);
+    if code ^= 0 then return;
+    call hcs_$set_max_length_seg (objectp, sys_info$seg_size_256K, code);
+    if code ^= 0 then return;
+    call hcs_$set_max_length_seg (input_buffer_ptr, sys_info$seg_size_256K, code);
+    if code ^= 0 then return;
+    input_buffer_start = 1;
+    input_buffer_len = 0;
+    return;
+
+  end setup_data_segments;
+						/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+attach: proc;
+
+/* This proc queries the caller for the dump volume name, attaches to it and opens it. */
+
+
+reask: call command_query_ (addr (query_info), var_volname, myname,
+         "Type ^[next ^;^s^]most recent dump volume name (Type ""."" to quit): ", (^first_input_volume));
+    if var_volname = "" then goto reask;
+    if var_volname = "." then goto finish;
+    volname = var_volname;
+
+    first_input_volume = "0"b;
+
+    if input_volume_desc ^= "" then
+      call ioa_$rsnnl (input_volume_desc, att_desc, (0), volname);
+    else call ioa_$rsnnl ("tape_mult_ ^a ^[-system^]", att_desc, (0), volname, ^debug);
+
+    call iox_$attach_ioname ("input_volume", iocbp, att_desc, code);
+    if code ^= 0 then do;
+        call com_err_ (code, myname, "Unable to attach input volume with attach desc ^a", att_desc);
+        goto finish;
+      end;
+
+    call iox_$open (iocbp, Stream_input, "0"b, code);
+    if code ^= 0 then do;
+        call com_err_ (code, myname, "Error opening input volume");
+        goto finish;
+      end;
+
+  end attach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+delete_make_and_move:
+  proc (temp_dir_in, ptr_in1, ptr_in2);
+
+dcl temp_dir_in	     char (*),
+  (ptr_in1, ptr_in2)     ptr;
+
+    on linkage_error goto delerr;
+    call hcs_$delentry_file (temp_dir_in, (rvl.ename (pvindex)), code);
+    if code ^= 0 & code ^= error_table_$noentry then do;
+        call hphcs_$delentry_file (temp_dir_in, (rvl.ename (pvindex)), code);
+        if code ^= 0 then do;
+delerr:	  call com_err_ (code, myname, "Unable to delete  ^a>^a. Recovery for it will be abandoned.",
+	       temp_dir_in, rvl.ename (pvindex));
+	  rvl.abandoned (pvindex) = "1"b;		/* well, forget this one...			*/
+	  return;
+	end;
+      end;
+    call hcs_$make_seg (temp_dir_in, (rvl.ename (pvindex)), "", 01010b, ptr_in2, code);
+    if (code = 0
+         | code = error_table_$namedup
+         | code = error_table_$segknown) then ;
+    else do;
+        call com_err_ (code, myname, "Unable to create volog seg ^a>^a. Recovery for it will be abandoned.",
+	   temp_dir_in, rvl.ename (pvindex));
+        rvl.abandoned (pvindex) = "1"b;			/* forget this one 				*/
+        return;
+      end;
+						/* copy data */
+    call hcs_$fs_move_seg (ptr_in1, ptr_in2, 1, code);
+    if code ^= 0 then do;
+        call com_err_ (code, myname, "Unable to move volog from temp seg to target. Recovery for it will be abandoned.");
+        rvl.abandoned (pvindex) = "1"b;
+        return;
+      end;
+  end delete_make_and_move;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+validate_all_vologs:
+  proc () returns (bit (1));
+
+dcl i		     fixed bin,
+  mismatch	     bit (1) init ("0"b);
+
+    do i = 1 to rvl.npvs;
+      if rvl.temp_logp (i) -> backup_volume_log.info.root_pvid =
+	 rvl.temp_logp (1) -> backup_volume_log.info.root_pvid then ;
+      else mismatch = "1"b;
+    end;
+    return (^mismatch);
+  end validate_all_vologs;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+resynch_volume: proc;
+
+/* This proc is used for error recovery. It reads the dump volume word by word looking for a match on the
+   3 words which are part of the header of the logical dump record. When it gets a match it returns to specified label.
+   While resynchronization is in progress , io error handling is suppressed except if we reach the end of a dump
+   volume. This code is freely adapted from the volume reloader. */
+
+    resynching = "1"b;
+    input_buf (*) = "0"b;
+    new_tape = "0"b;
+    read_char = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, read_char, char_read, ^DELIMITED, code);
+    call check_input_error;
+
+    if new_tape then goto search_loop;
+    words_skipped = 0;
+test: if word (1) = pattern1 & word (4) = pattern2 & word (7) = pattern3 then do;
+        call com_err_ (0, myname, "Synchronization completed ^d words skipped",
+	   words_skipped);
+        resynching = "0"b;
+        delimited = "0"b;
+        code = 0;
+        goto pattern_match_label;
+      end;
+
+    string = substr (string, 37, (size (backup_volume_header) - 1) * BITS_PER_WORD);
+    new_tape = "0"b;
+    read_char = CHARS_PER_WORD;
+    call read (addr (word (size (backup_volume_header))),
+         read_char, char_read, ^DELIMITED, code);
+    call check_input_error;
+    if new_tape then goto search_loop;
+
+    words_skipped = words_skipped + 1;
+    if words_skipped > 1000000 then do;			/* put a limit on it */
+        call com_err_ (0, myname, "Resynchronization failed");
+        code = error_table_$end_of_info;
+        call check_input_error;
+        goto search_loop;
+      end;
+    goto test;
+
+  end resynch_volume;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+skip_chars: proc;
+
+/* This proc skips forward on a dump volume. */
+
+    call read (objectp, read_char, char_read, delimited, code);
+    call check_input_error;
+
+  end skip_chars;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+check_input_error: proc;
+
+/* This proc is used to check all io errors after a read request.  If no error we return.
+   If we are at the end of the dump volume, then it is detached. If a volume log has not been found, a new dump volume is
+   requested. Otherwise we are done. If the error is the result of a bad read we start resynchronization.
+   If it has already been started we just return. */
+
+    new_tape = "0"b;
+    if read_char ^= char_read | code ^= 0 then do;
+        if (code = error_table_$end_of_info) | (code = error_table_$device_end) then do;
+	  call detach;				/* if all have been found OR all 		*/
+	  if (all_vologs_found ()) | (^not_all_abandoned ()) then goto finish_all_temp;
+						/* have been abandoned, then forget it...	*/
+	  else do;
+	      call attach;				/* try the next tape			*/
+	      new_tape = "1"b;
+	    end;
+	  return;
+	end;
+        else if resynching then do;
+	  call com_err_ (code, myname, "I/O error reading input volume");
+	  call detach;
+	  goto finish;
+	end;
+        else if ^resynching then do;
+	  if read_char ^= char_read then do;
+	      if code = error_table_$data_loss then
+	        call com_err_ (code, myname, "Incomplete object detected");
+	      else do;
+		if code = 0 then call com_err_ (code, myname, "Read did not complete");
+		else call com_err_ (code, myname, "I/O error reading input volume");
+	        end;
+	    end;
+	  else do;
+	      if code = -1 then call com_err_ (0, myname, "Invalid dump record header");
+	      else call com_err_ (code, myname, "I/O error reading input volume");
+	    end;
+	  call ioa_ ("^a: Resynching started", myname);
+	  call resynch_volume;
+	end;
+      end;
+  end check_input_error;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+read_volume_record: proc;
+
+/* This proc reads a logical dump record, and checks to see it it is a volume log with the name pvname. If
+   so it returns with pvindex pointing to the correct rvl entry. If the logical dump record is not what we
+   are looking for, the next logical dump record is examined. */
+
+    pattern_match_label = pattern_match;
+    new_tape = "0"b;
+    delimited = "0"b;
+    read_char = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, read_char, char_read, delimited, code);
+    call check_input_error;
+    if new_tape then return;
+    if backup_volume_record.pattern1 ^= pattern1
+         | backup_volume_record.pattern2 ^= pattern2
+         | backup_volume_record.pattern3 ^= pattern3 then do;
+        code = -1;
+        call check_input_error;
+      end;
+pattern_match:
+    read_char = backup_volume_record.rec1_len - size (backup_volume_header) * CHARS_PER_WORD;
+    call read (ptr (recordp, size (backup_volume_header)),
+         read_char, char_read, delimited, code);
+    call check_input_error;
+    if new_tape then return;
+    if backup_volume_record.rec1_type ^= volume_log_type then do;
+        read_char = backup_volume_record.rec2_len;
+        if backup_volume_record.rec1_type = vtoce_type &
+	   backup_volume_record.version > backup_volume_record_version_1
+	   then delimited = "1"b;			/* object data is delimited */
+        call skip_chars;
+        return;
+      end;
+
+    bvlp = recordp;
+    if (backup_volume_log.version = backup_volume_log_version_1) |
+         (backup_volume_log.version = backup_volume_log_version_2) |
+         (backup_volume_log.version = backup_volume_log_version_3) then ;
+    else do;
+        call com_err_ (0, myname, "Invalid volume log version");
+        return;
+      end;
+    do pvindex = 1 to rvl.npvs;			/* include the check for previous abandonment here...*/
+      if (backup_volume_log.pvname = rvl.pvname (pvindex)) & ^(rvl.abandoned (pvindex)) then do;
+	if (rvl.volog_found (pvindex)) & (rvl.time (pvindex) > backup_volume_log.time_dumped) then do;
+	    pvindex = 0;				/* it is older than the one we already have	*/
+	    return;				/* we don't want this one			*/
+	  end;
+	rvl.time (pvindex) = backup_volume_log.time_dumped;
+	rvl.volname (pvindex) = volname;
+	return;					/* pvindex is set 				*/
+        end;
+    end;
+    pvindex = 0;					/* not found				*/
+  end read_volume_record;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+read: proc (return_buffer_ptr,
+       Nrequested_chars,
+       Nreturned_chars,
+       Sdelimited,
+       code);
+
+dcl return_buffer_ptr    ptr,
+  Nrequested_chars	     fixed bin (21),
+  Nreturned_chars	     fixed bin (21),
+  Sdelimited	     bit (1) aligned,
+  code		     fixed bin (35);
+
+dcl input_buffer	     char (256 * CHARS_PER_PAGE)
+		     based (input_buffer_ptr);
+
+dcl return_string	     char (Nrequested_chars)
+		     based (return_buffer_ptr);
+
+dcl Nassign_chars	     fixed bin (21),
+  Nread_chars	     fixed bin (21),
+  end_of_record	     fixed bin,
+  tape_check1 /* bit (72) */ char (8),
+  tape_check2 /* bit (72) */ char (8);
+
+    Nreturned_chars, Nread_chars, code = 0;
+
+    do while (Nreturned_chars < Nrequested_chars & code = 0);
+      if input_buffer_len = 0 then do;
+	input_buffer_start = 1;
+
+	if Sdelimited & Nreturned_chars = 0 then do;
+	    call iox_$get_chars (iocbp,
+	         addr (tape_check1), length (tape_check1), Nread_chars, code);
+	    if code ^= 0 then return;
+	  end;
+
+	if return_buffer_ptr = null then do;
+	    call iox_$position (iocbp, FORWARD_CHAR_POSITIONING,
+	         Nrequested_chars - Nreturned_chars, code);
+	    Nreturned_chars = Nreturned_chars + Nrequested_chars;
+	  end;
+	else do;
+	    call iox_$get_chars (iocbp,
+	         addcharno (return_buffer_ptr, Nreturned_chars),
+	         Nrequested_chars - Nreturned_chars, Nread_chars, code);
+	    Nreturned_chars = Nreturned_chars + Nread_chars;
+	  end;
+	if code ^= 0 then return;
+
+	if Sdelimited then do;
+	    call iox_$get_chars (iocbp,
+	         addr (tape_check2), length (tape_check2), Nread_chars, code);
+	    if code ^= 0 then
+	      return;
+
+	    if tape_check1 ^= tape_check2 then do;
+						/* found a short segment, move       */
+						/* return string into the temp input */
+						/* buffer and start parsing          */
+	        input_buffer_len = Nreturned_chars;
+	        substr (input_buffer, 1, input_buffer_len) =
+		   return_string;
+	      end;
+	  end;
+        end;
+
+      else
+	 if Sdelimited then do;
+	tape_check1 = substr (input_buffer,
+	     input_buffer_start, length (tape_check1));
+	tape_check2 = "";
+	input_buffer_start =
+	     input_buffer_start + length (tape_check1);
+	input_buffer_len =
+	     input_buffer_len - length (tape_check1);
+        end;
+
+      if input_buffer_len > 0 then do;
+	Nassign_chars =
+	     min (input_buffer_len, Nrequested_chars);
+
+	if Sdelimited then do;
+	    if tape_check1 ^= tape_check2 then do;
+	        end_of_record = index (substr (input_buffer, input_buffer_start,
+		   input_buffer_len), tape_check1);
+	        if end_of_record > 0 then do;
+		  Nassign_chars = end_of_record - 1;
+		  if Nrequested_chars ^= Nassign_chars then
+		    code = error_table_$data_loss;
+		end;
+	      end;
+	  end;
+
+	if return_buffer_ptr ^= null then
+	  return_string = substr (input_buffer,
+	       input_buffer_start, Nassign_chars);
+	Nreturned_chars = Nassign_chars;
+
+	input_buffer_start =
+	     input_buffer_start + Nassign_chars;
+	input_buffer_len =
+	     input_buffer_len - Nassign_chars;
+
+	if Sdelimited & input_buffer_len > 0 then do;
+	    input_buffer_start =
+	         input_buffer_start + length (tape_check2);
+	    substr (input_buffer, 1, input_buffer_len) =
+	         substr (input_buffer, input_buffer_start,
+	         input_buffer_len - length (tape_check2))
+	         || tape_check2;
+	    input_buffer_start = 1;
+	  end;
+        end;
+    end;
+
+    return;
+  end read;
+						/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+wdir_: proc returns (char (168) aligned);
+
+/* This proc returns the pathname of the working directory. */
+
+
+dcl wdir		     char (168) aligned;
+    call hcs_$fs_search_get_wdir (addr (wdir), ignore);
+    return (wdir);
+  end wdir_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+time_string: proc (i) returns (char (24));
+dcl string	     char (24),
+  i		     fixed bin;
+    call date_time_$fstime ((rvl.time (i)), string);
+    return (string);
+  end time_string;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+finish_: proc;
+    if iocbp ^= null then call detach;
+    if tp (1) ^= null then do;
+        call hcs_$truncate_seg (objectp, 0, ignore);	/* clean up our 256K segs */
+        call hcs_$truncate_seg (input_buffer_ptr, 0, ignore);
+        call hcs_$set_max_length_seg (objectp, (sys_info$max_seg_size), ignore);
+        call hcs_$set_max_length_seg (input_buffer_ptr, (sys_info$max_seg_size), ignore);
+        call release_temp_segments_ (myname, tp, ignore);
+        call hcs_$set_256K_switch (old_256K_switch, (""b), ignore);
+      end;
+    if get_group_id_ () ^= "Initializer.SysDaemon.z" & hcs_$level_get () ^= 1 then ok_to_abc = "1"b;
+    if rvlp ^= null () then do;
+        do i = 1 to rvl.npvs;
+	if rvl.temp_logp (i) ^= null () then call hcs_$delentry_seg (rvl.temp_logp (i), (0));
+	if rvl.new_logp (i) ^= null then do;
+	    if ok_to_abc then call adjust_bit_count_ (wdir_ (), (rvl.ename (i)), "0"b, (0), ignore);
+	    call hcs_$terminate_noname (rvl.new_logp (i), ignore);
+	  end;
+	call ioa_ ("Volume log ^a ^[recovered from tape volume ^a, dump time ^a^;not recovered^s^s ^]", rvl.pvname (i),
+	     (rvl.volog_found (i)), rvl.volname (i), time_string (i));
+        end;
+        free rvl;
+      end;
+  end finish_;
+%page; %include backup_volume_log;
+%include backup_pvol_info;
+%page; %include fs_vol_label;
+%page; %include backup_volume_record;
+%include backup_volume_header;
+%include backup_static_variables;
+%page; %include vtoce;
+%page; %include query_info;
+%page; %include iox_dcls;
+%page; %include iox_modes;
+%page; %include system_constants;
+  end recover_volume_log;

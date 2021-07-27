@@ -1,0 +1,1015 @@
+/* **************************************************************
+   *                                                            *
+   * Copyright, (C) Massachusetts Institute of Technology, 1973 *
+   *                                                            *
+   ************************************************************** */
+lisp_error_: proc;
+
+/*
+ * The new lisp error handler which supports user interrupts.
+ * and uses lisp argument passing conventions instead of pl1 arguments.
+ * Contains several associated lisp functions.
+ *
+ * arguments:
+ *   last two words on unmarked pdl are error code, code2 (file_system_error only)
+ *   If the error takes a lisp form to be printed out, it is on
+ *   the top of the marked pdl.
+ *
+ * lisp_error_ does all user interrupting and error recovery on
+ *  correctable errors.
+ *
+ * Written by David Moon, 3 July 1972
+ * reorganized 28 July 72 DAM
+ * pdl ptr format changed to -#, +#, or nil.  DAM 5-aug-72
+ * function names for bad_argument, bad_arg_correctable added 25 Aygust 1972 DAM
+ * err function moved here from lisp_prog_fns_, DAM 15 October 1972
+ * err_op entry added, DAM 21 Oct 72
+ * error tables moved into seperate module lisp_error_table_.alm, DAM, 7 Jan 73
+ * freturn added, 23 Jan 73 by DAM
+ * changed for new I/O system, 19 Mar 73 by DAM
+ * entry point for the lsubr 'error' added 11 May 1973 by DAM
+ * modified 73.10.25 by  DAM to make evalframe smarter
+ * modified 74.06.03 by DAM for new-arrays
+ * modified 74.09.12 by DAM for cleaning up and new frame formats
+ *
+ * The data kept around by an error consists of:
+ *
+ * bits	(some useful bits declared somewhere or other)
+ * stack ->
+ *  temp(1) the message
+ *  temp(2) the datum (NotThere if none)
+ *  temp(3) the interrupt channel (atom whose value is handler, NotThere if not to interrupt)
+ *
+ * unm -> fault_save:
+ *	stack_ptr = rel(stack)
+ *	code1	  a positive number
+ *	code2	  bits (unspecly)
+ */
+
+dcl lisp_error_table_$hbound fixed bin aligned external,	/* number of err codes */
+    lisp_error_table_$msgs aligned bit(36) external,
+    msgs (100:lisp_error_table_$hbound) char(40) aligned based(addr(lisp_error_table_$msgs)),  /* messages to be typed out */
+    msgbuf char(128) aligned automatic,			/* buffer for constructed messages */
+    lisp_error_table_$uintnum aligned bit(36) external,
+    uintnum (100:hbound(msgs,1)) fixed bin aligned based(addr(lisp_error_table_$uintnum)),	/* user intr channel */
+    lisp_error_table_$bit_tbl aligned bit(36) external,
+    bit_tbl(100:hbound(msgs,1)) bit(36) aligned based(addr(lisp_error_table_$bit_tbl)),	/* action control bits */
+    lisp_error_table_$fnames_hbound fixed bin aligned external,
+    lisp_error_table_$fnames aligned bit(36) external,
+    fnames(10:lisp_error_table_$fnames_hbound) char(16) aligned based(addr(lisp_error_table_$fnames));	/* names
+								of functions indi & ated by code2 */
+
+	/* table of bits to control action on interrupts */
+
+dcl (	datf	init("1"b),		/* data on stack from our caller */
+	printf	init("01"b),		/* s-expression is to be printed in err msg */
+	nilconsf	init("001"b),		/* listify before passing to intr service routine */
+	spbeg	init("0001"b),		/* special action to be taken first thing */
+	uintf	init("00001"b),		/* cause user interrupt on channel uintnum(code) */
+	evalf	init("000001"b),		/* evaluate value returned by intr service function */
+	spint	init("0000001"b),		/* special action to be taken before giving interrupt */
+	spfin	init("00000001"b),		/* special action to be taken after interrupt */
+	fserr	init("000000001"b),		/* message comes from file system rather than msgs(code) */
+
+	err_recf	init("0000000001"b),	/* fault_save frame is created _b_e_f_o_r_e calling lisp_error_ */
+	sptrapf	init("00000000001"b),	/* *rset-trap or errset trap */
+	fnamef	init("000000000001"b)	/* code2 designates function name to be given */
+    ) bit(36) aligned static,
+
+    bits bit(36) aligned automatic,		/* buffer in which the above bits are held */
+
+
+    err_fcn_f bit(1) aligned init("0"b),
+    errsw bit(1),				/* errprint / errframe entry switch */
+    bfb fixed bin (35) aligned based,
+    stack ptr,
+    error_data ptr,
+    argument_pointer pointer,
+    evals_stack ptr,
+    unm ptr,
+    code fixed bin,
+    code2 fixed bin,		/* 2nd code, at present used only by file_system_error */
+    myname fixed bin,		/* this is the other use for code2, fcn name codes. */
+    com_err_ ext entry options(variable),
+    ioa_ ext entry options(variable),
+    1 label_overlay aligned based,
+      2 label_ptr_1 aligned ptr,
+      2 label_ptr_2 aligned ptr,
+    dummy_aligned aligned fixed bin(35) based,
+    (null, addr, addrel, fixed, bit, ptr, rel, size, min, length,
+	divide, reverse, verify, lbound, hbound, unspec, substr) builtin,
+    lisp_fault_handler_$nointerrupt entry,
+    lisp_reader_$maknam entry,
+    lisp_prog_fns_$lisp_unwinder entry,
+    lisp_$freturn_real external,
+
+    1 label aligned automatic,
+      2 adr pointer,
+      2 sp pointer,
+    label0 label aligned based(addr(label)),
+
+    lisp_prog_fns_$lisp_err entry (bit(1) aligned),
+    unm2 ptr,
+    posf bit(1),	/* "1"b if a + pdl ptr was used, "0"b if - */
+    loc bit(18) aligned,
+    dbl_word fixed bin(71),		  
+    (i, nargs, uint_ch_num_spec) fixed bin;
+
+dcl 1 call1_cruft aligned based,		/* pushed on marked pdl by funcall and the call1 operator */
+    2 form fixed bin(71),
+    2 fcn fixed bin(71),
+    2 argl structure,
+      3 arg_rel_ptr bit(18) unaligned,
+      3 uncollectable_bits bit(18) unaligned,
+      3 number_of_args fixed bin(17) unaligned,
+      3 number_of_args_times_minus_two fixed bin(17) unaligned,
+    2 plist fixed bin(71);
+
+dcl uncollectable_tag bit(18) static init("000110000000000000"b),
+    apply_frame_bit bit(18) static init("000000000000000001"b),
+    marked_stack_frame pointer;		/* -> stuff pushed on as part of eval frame (see pdlframe:) */
+
+dcl 1 loc_ovly aligned based(addr(loc)),	/* so that we can add 1 to loc */
+      2 locfb fixed bin(17) unaligned,
+      2 extrabits bit(18) unal;
+
+dcl lisp_special_fns_$cons ext entry,
+    lisp_special_fns_$xcons entry,
+    lisp_special_fns_$ncons entry,
+    lisp_alloc_ ext entry (fixed bin, fixed bin(71) aligned),
+    lisp_static_vars_$readeof_atom fixed bin(71) external,
+    lisp_static_vars_$infile fixed bin(71) external,
+    infile fixed bin(71) def (lisp_static_vars_$infile),
+    lisp_static_vars_$outfiles fixed bin(71) external,
+    outfiles fixed bin(71) def (lisp_static_vars_$outfiles),
+    lisp_static_vars_$errlist external pointer,
+    lisp_get_atom_ ext entry(char(*) aligned, fixed bin(71) aligned),
+    lisp_$apply ext entry,
+    lisp_$eval ext entry;
+
+	dcl lisp_print_$type_nl entry,
+	    lisp_print_$type_string entry(char(*)),
+	    ioa_$rsnpnnl ext entry options(variable),
+	    retlen fixed bin,
+	    msgbufb char(retlen) aligned based(addr(msgbuf)),	/* get significant portion of msgbuf */
+	    convert_status_code_ ext entry(fixed bin, char(8) aligned) returns (char(100) aligned);
+
+dcl lisp_static_vars_$emptying_buffers fixed bin external,
+    lisp_io_control_$empty_all_buffers entry;
+
+dcl NotThere fixed bin(71) static init(0);
+
+dcl (lisp_static_vars_$err_atom,
+     lisp_static_vars_$eval_atom,
+     lisp_static_vars_$apply_atom,
+     lisp_static_vars_$princ_atom,
+     lisp_static_vars_$prin1_atom) fixed bin(71) external;
+
+	/* Error Codes */
+
+dcl (lisp_error_table_$not_pdl_ptr,
+     lisp_error_table_$stack_loss_error) fixed bin external,
+    not_pdl_ptr fixed bin defined lisp_error_table_$not_pdl_ptr,
+    stack_loss_error fixed bin defined lisp_error_table_$stack_loss_error;
+
+%include stack_frame;
+%include lisp_faults;
+%include lisp_string_fmt;
+%include lisp_unmkd_pdl;
+%include lisp_nums;
+%include lisp_atom_fmt;
+%include lisp_name_codes;
+%include lisp_stack_fmt;
+%include lisp_ptr_fmt;
+%include lisp_common_vars;
+%include lisp_io;		/* for ctrlW */
+%include lisp_cons_fmt;
+%include lisp_stack_seg;
+
+
+/*lisp_error_: entry; */
+
+	dcl (lisp_static_vars_$go_atom,
+	     lisp_static_vars_$return_atom,
+	     lisp_static_vars_$setq_atom) external fixed bin(71) aligned,
+	    setq_atom fixed bin(71) aligned defined(lisp_static_vars_$setq_atom),
+	    go_atom fixed bin(71) aligned defined (lisp_static_vars_$go_atom),
+	    return_atom fixed bin(71) aligned defined (lisp_static_vars_$return_atom);
+
+
+	/* set up pointers to stack */
+
+	stack = stack_ptr;
+	unm = addrel(unmkd_ptr, -2);		/* points to error code */
+	code = unm -> errcode(1);		/* pick up error code from unmarked pdl */
+	code2 = unm -> errcode(2);		/* get 2nd code in case file_system_error */
+	if code < lbound(msgs, 1) | code > hbound(msgs, 1) then do;
+		call ioa_("lisp_error_: undefined code ^d.", code);
+		go to unwind;
+		end;
+
+	bits = bit_tbl(code);		/* pick up controlling bits */
+	if ^ bits & datf then do;
+		stack_ptr = addr(stack -> temp(2));
+		stack -> temp(1) = NotThere;
+		end;
+	  else stack = addrel(stack, -2);	/* -> data on pdl */
+
+	stack_ptr = addr(stack -> temp(4));
+	stack -> temp(2) = stack -> temp(1);	/* get the data */
+
+	/* get the message into lispish form */
+
+	if bits & fserr then call ioa_$rsnpnnl("lisp: ^a   ",
+				msgbuf, retlen, convert_status_code_(code2,""));
+	  else if bits & fnamef then do;
+		code2 = - code2;
+		if code2 < lbound(fnames,1) then code2 = hbound(fnames,1);
+		else if code2 > hbound(fnames,1) then code2 = hbound(fnames,1);
+		call ioa_$rsnpnnl(substr(msgs(code), 1, index(msgs(code), "`")-1),	/* control string so fcn name can be inserted */
+			msgbuf, retlen, fnames(code2));
+		code2 = -code2;
+		end;
+	   else call ioa_$rsnpnnl("lisp: ^a   ", msgbuf, retlen, (msgs(code)) );
+	call lisp_alloc_(divide(retlen+7,4,18,0), stack -> temp(1));
+	stack -> temp_type(1) = String;
+	stack -> temp_ptr(1) -> lisp_string.string_length = retlen;
+	stack -> temp_ptr(1) -> lisp_string.string = msgbuf;
+
+	/* get the interrupt channel */
+
+	if ^bits & uintf then stack -> temp(3) = NotThere;	/* none such */
+	else do;
+	     addr(stack -> temp(3)) -> fixnum_fmt.type_info = fixnum_type;
+	     addr(stack -> temp(3)) -> fixedb = uintnum(code);
+	     end;
+
+	if bits & spbeg then go to spbegtv(code);	/* do special action */
+spbegxx:						/* ... and return here */
+
+	go to handle_error;
+
+	/* the LISP lsubr 'error', which makes the error system extensible. */
+
+error:	entry;
+
+	stack = addrel(stack_ptr, -2);
+	nargs = stack -> fixedb;		/* lsubr */
+	if nargs = 0 then do;		/* with no args, is like (err) */
+		stack -> temp(1) = nil;
+		err_fcn_f = "1"b;
+		go to unwind;		/* like err_aa */
+		end;
+	stack = addrel(stack, nargs);
+	stack_ptr = addr(stack -> temp(4));	/* change missing args to NotThere */
+	if nargs > -6 then stack -> temp(3) = NotThere;
+	if nargs > -4 then stack -> temp(2) = NotThere;
+	bits = ""b;
+	code = 1;
+	unm = unmkd_ptr;
+
+handle_error:	/* All types of errors join in here */
+
+		/* canonicalize the interrupt handler */
+
+	    if addr(stack -> temp(3)) -> fixnum_fmt.type_info = fixnum_type then do;
+		uint_ch_num_spec = addr(stack -> temp(3)) -> fixedb;
+		if uint_ch_num_spec >= 0 &
+		uint_ch_num_spec < hbound(user_intr_array, 1) + 1
+		then stack -> temp(3) = user_intr_array(uint_ch_num_spec);
+		else stack -> temp(3) = NotThere;
+		end;
+	    else if stack -> temp_type36(3) & Atsym36 	/* uint chn spec as atom */
+	      then do;
+		if stack -> temp(3) ^= nil then		/* unused channel marker */
+		  do uint_ch_num_spec = 0 to hbound(user_intr_array, 1);
+		     if user_intr_array(uint_ch_num_spec) = stack -> temp(3)
+			then go to exitloop;
+		     end;
+		stack -> temp(3) = NotThere;	/* bad uint chn */
+exitloop:		end;
+	    else stack -> temp(3) = NotThere;	/* bad uint chn */
+
+	/* do JONL's ncons hack on channels 5, 6, 7, and 8 */
+
+	do uint_ch_num_spec = 5 to 8;
+	   if stack -> temp(3) = user_intr_array(uint_ch_num_spec)
+	   then bits = bits | nilconsf;
+	   end;
+
+	/* flush all output buffers */
+
+	lisp_static_vars_$emptying_buffers = lisp_static_vars_$emptying_buffers + 1;
+	if lisp_static_vars_$emptying_buffers = 0 then call lisp_io_control_$empty_all_buffers;
+	lisp_static_vars_$emptying_buffers = lisp_static_vars_$emptying_buffers - 1;
+
+	/* Check for user interrupt action to be performed */
+
+	if stack -> temp(3) ^= NotThere then if rel(err_frame) then 
+		if addr(user_intr_array(4)) -> based_ptr -> atom.value ^= nil then go to user_interrupter; else;
+				else go to user_interrupter;
+
+
+uintdis:	/* come here when user interrupt is disabled */
+
+	if code = stack_loss_error then go to user_interrupter;	/* in this case, always interrupt */
+
+uintdis0:
+	/* check if errset (...) nil has suppressed error messages */
+
+	if rel(err_frame) then if err_frame -> frame.dat1 then go to unwind;	/* yes, skip msg */
+
+	/* no, print the error message */
+
+	call prmes_immediate;
+
+
+	/* non user interrupt or suppressed by errset, just unwind the pdl */
+
+unwind:	/* check for the need to do a *rset-trap */
+
+	if rel(err_frame) = ""b then	/* going to go all the way, take a *rset-trap first */
+	     if addr(user_intr_array(19)) -> based_ptr -> atom.value = nil then;	/* disabled */
+		else do;
+		     i = 19;
+uuint:		     stack_ptr = addr(stack -> temp(6));
+		     bits = bits | sptrapf;
+		     stack -> temp(4) = user_intr_array(i);
+		     stack -> temp(5) = nil;	/* call service fcn with no args */
+		     go to uint0;
+		     end;
+
+	else do;			/* caught be errset, take user intr 4 */
+	     if addr(user_intr_array(4)) -> based_ptr -> atom.value = nil then;	/* disabled */
+	     else do;
+		i = 4;
+		go to uuint;
+		end;
+	     end;
+
+unwind1:	stack_ptr = addr(stack -> temp(2));
+	call lisp_prog_fns_$lisp_err(err_fcn_f);		/* never returns */
+
+	/* Routine to do user interrupts */
+
+user_interrupter:
+
+	stack_ptr = addr(stack -> temp(6));
+	stack -> temp(5) = stack -> temp(2);	/* make copy of losing form */
+	if spint & bits then go to spinttv(code);	/* if special action needed */
+spintxx:
+	if bits & nilconsf then do;
+	     stack_ptr = addr(stack -> temp(7));
+	     stack -> temp(6) = nil;
+	     call lisp_special_fns_$cons;
+	     end;
+	stack -> temp(4) = stack -> temp(3);	/* pick up interrupt handler */
+	go to uint0;
+
+fs_err_com:
+	call lisp_special_fns_$cons;
+	go to spbegxx;
+
+
+
+	/* for nihil_ex_nihile fail-act, make the list (setq (nil))
+	   as arg to the interrupt service function */
+
+spinttv(128):
+	stack_ptr = addr(stack -> temp(8));
+	stack -> temp(6), stack -> temp(7) = nil;	/* make (nil) */
+	call lisp_special_fns_$cons;
+	stack_ptr = addr(stack -> temp(8));
+	stack -> temp(7) = nil;			/* and listify it with setq */
+	stack -> temp(5) = setq_atom;
+	call lisp_special_fns_$cons;
+	call lisp_special_fns_$cons;
+	go to spintxx;
+
+
+spinttv(121):	/* bad_prog_op, construct list (go return) */
+	stack_ptr = addr(stack -> temp(8));
+	stack -> temp(7) = nil;
+	stack -> temp(6) = lisp_static_vars_$return_atom;
+	stack -> temp(5) = lisp_static_vars_$go_atom;
+	call lisp_special_fns_$cons;
+	call lisp_special_fns_$cons;
+	go to spintxx;
+
+spinttv(124):	/* bad ibase, construct list (ibase) */
+	stack -> temp(5) = lisp_static_vars_$ibase;
+	go to spintxx;		/* let nilconsf listify it */
+
+spinttv(125):	/* bad base, construct list (base) */
+	stack -> temp(5) = lisp_static_vars_$base;
+	go to spintxx;	/* and let nilcons listify it */
+
+
+spinttv(145):		/* eof_in_object :  args -<- '(read-eof) */
+	stack -> temp(5) = lisp_static_vars_$readeof_atom;
+	go to spintxx;		/* and let nilconsf listify it */
+
+
+
+spbegtv(124):		/* bad ibase -- reset it to 8 */
+	addr(ibase)->based_ptr -> fixnum_fmt.type_info = fixnum_type;
+	addr(ibase)->based_ptr -> fixedb = 8;
+	go to spbegxx;
+
+spbegtv(125):		/* bad base -- reset it to 8 */
+	addr(base)->based_ptr -> fixnum_fmt.type_info = fixnum_type;
+	addr(base)->based_ptr -> fixedb = 8;
+	go to spbegxx;
+
+
+
+uint0:	unm = unmkd_ptr;
+
+	/* make a fault_save frame for this error, unless one is already there */
+
+	if ^ bits & err_recf then do;
+	     unmkd_ptr = addrel(unm, size(fault_save));
+	     fault_save.prev_frame = rel(err_recp);
+	     fault_save.stack_ptr = rel(stack);
+	     fault_save.sv_gc_inhibit = gc_inhibit;
+	     fault_save.sv_masked = masked;
+	     fault_save.code1 = code;
+	     unspec(fault_save.code2) = bits;
+	     unspec(fault_save.sv_array_info) = unspec(ptr(unm, ""b) -> stack_seg.array_info_for_store);
+	     fault_save.sv_array_offset = ptr(unm, ""b) -> stack_seg.array_offset_for_store;
+	     fault_save.sv_rdr_state = rdr_state;
+	     fault_save.sv_rdr_ptr = rdr_ptr;
+	     fault_save.sv_rdr_label = rdr_label;
+	     err_recp = unm;
+
+	     rdr_state = 0;			/* reset rdr to normal */
+		/* leave gc_inhibit the same */
+	     end;
+
+
+	/* now call the user interrupt service function */
+
+uint1:	stack_ptr = addr(stack -> temp(6));	/* shouldn't be needed, but... */
+	call lisp_special_fns_$ncons;	/* make arg list */
+	stack -> temp(4) = stack -> temp_ptr(4) -> atom.value;
+	if stack -> temp(4) = nil then go to uintdis0;	/* disabled...no intr */
+	call lisp_$apply;				/* apply fcn to args */
+
+	/* special kludge for pdl-overflow - ignore returned value and go on. */
+
+	if user_intr_array(12) = stack -> temp(3) then go to popoff;
+
+	/* error recovery code - if returned value is not a list, don't recover but error out */
+
+	if bits & sptrapf then go to unwind1;
+	if stack -> temp_type(4) then do;	/* if returned value is not a list. */
+						/* NB - nil is now an atomic symbol, not a list */
+		stack_ptr = addr(stack -> temp(2));
+		go to unwind;			/* don't print dumb err msg twice. */
+		end;
+
+	if bits & spfin then go to spfintv(code);
+	stack -> temp(1) = stack -> temp_ptr(4) -> cons.car;	/* service function returns list */
+	stack_ptr = addr(stack -> temp(2));
+	if bits & evalf then call lisp_$eval;		/* ... if returned result is to be evaluated */
+
+
+	/* Since we have recovered from the error and are not going to unwind ... */
+	/* Now pop the err_record off of the unmarked pdl... */
+
+	if ^ bits & err_recf then		/* ...but only if we made one */
+		do;
+		unspec(ptr(unm, ""b) -> stack_seg.array_info_for_store) = unspec(fault_save.sv_array_info);
+		ptr(unm, ""b) -> stack_seg.array_offset_for_store = fault_save.sv_array_offset;
+		rdr_state = fault_save.sv_rdr_state;
+		rdr_ptr = fault_save.sv_rdr_ptr;
+		rdr_label = fault_save.sv_rdr_label;
+		gc_inhibit = fault_save.sv_gc_inhibit;
+
+		/* restore masked state */
+
+		stack_ptr = addr(stack -> temp(3));
+		if fault_save.sv_masked.against.alarm then stack -> temp(2) = t_atom;
+		else if fault_save.sv_masked.against.tty then stack -> temp(2) = tty_atom;
+		else stack -> temp(2) = nil;
+		call lisp_fault_handler_$nointerrupt;
+
+		err_recp = ptr(err_recp, fault_save.prev_frame);
+		end;
+popoff:	unmkd_ptr = addrel(unm, -2);		/* popoff the frame and the error code */
+
+	stack_ptr = addr(stack -> temp(2));
+	return;			/* return a value to our caller, who will correct the error */
+
+
+
+
+	/* special recovery from correctable error routines */
+
+	/* interrupts which cannot be corrected */
+spfintv(121):		/* bad prog op */
+spfintv(122):		/* bad lexpr tv */
+spfintv(128):
+	call lisp_print_$type_string("lisp: this fail-act is uncorrectable
+");
+	go to uintdis;
+
+	/* interrupts which need to clear the stack before returning */
+spfintv(124):
+			/* bad ibase */
+spfintv(125):		/* bad base */
+spfinclrpdl:
+	if ^ bits & err_recf then err_recp = ptr(unm, unm -> frame.prev_frame);
+	unmkd_ptr = addrel(unm, -2);		/* pop code too */
+	stack_ptr = stack;
+	return;
+
+	/* err function, causes an error.  Takes errset traps and *rset-traps where appropriate */
+
+err:	entry;
+
+	stack = addrel(stack_ptr, -2);			/* fsubr */
+	if stack -> temp_type(1) then stack -> temp(1) = nil;	/* no args given, use nil */
+	  else do;
+		/* an arg was given, so eval it and return it to errset.
+		   but first check for a second arg, which if it is present
+		   and non-nil means don't eval the first arg until after
+		   unwinding back to the errset */
+
+	     if stack -> temp_ptr(1) -> cons_types.cdr then;
+	       else if stack -> temp_ptr(1) -> cons_ptrs.cdr -> cons.car = nil then;
+	         else do;		/* yes, 2nd arg is non - nil */
+		  if rel(err_frame) then err_frame -> frame.dat2 = "1"b;	/* flag indicates that first arg
+								   has not yet been evaled. */
+		  stack -> temp(1) = stack -> temp_ptr(1) -> cons.car;	/* get 1st arg */
+		  go to err_aa;
+		  end;
+	     stack -> temp(1) = stack -> temp_ptr(1) -> cons.car;		/* eval 1st arg */
+	     call lisp_$eval;
+	     end;
+
+	/* at this point, stack->temp(1) contains the value to be returned to errset */
+
+err_aa:	err_fcn_f = "1"b;
+	go to unwind;
+
+
+err_op:	entry;			/* from err operator in lisp_oprs_,
+				   for compiled version of err fcn */
+
+	stack = addrel(stack_ptr, -2);
+	go to err_aa;
+
+errprint: entry;		/* the lisp errprint function */
+
+	errsw = "0"b;
+	myname = fn_errprint;
+
+errprint_retry:
+	stack = addrel(stack_ptr, -2);	/* take one arg which is a pdl ptr */
+	posf = "0"b;			/* assume will not be a positive number */
+	if stack -> temp(1) = nil then do;			/* use most recent */
+				loc = rel(err_recp);
+				if loc then locfb = locfb+1;	/* if -> real frame, skip past it */
+				end;
+	  else if stack -> temp_type36(1) & Fixed36 then
+		if stack -> fixedb < 0 then
+
+			/* get negative pdl ptr & simulate downward search */
+
+			loc = substr(unspec(stack->fixedb), 19, 18);
+
+		else do;
+
+			/* get positive pdl ptr & simulate upward search */
+
+			i = - stack->fixedb;		/* mumble, mumble, can't take unspec of an expression any more */
+			loc = substr(unspec(i), 19, 18);	/* change sign of pdl ptr */
+			posf = "1"b;				/* but remember + */
+			end;
+	  else do;	/* not a fixed number, correctable error */
+errprint_bad_pdl_ptr:
+		call badpdlptr;
+		go to errprint_retry;
+		end;
+
+	/* check validity of pdl ptr - must lie in the stack */
+
+	if loc >= rel(unmkd_ptr) then go to errprint_bad_pdl_ptr;
+
+	if loc = ""b then if posf then go to errprint0;
+			      else go to errmes_not_there;
+	if loc < rel( ptr(unmkd_ptr, ""b) -> stack_seg.unmkd_stack_bottom )
+		then go to errprint_bad_pdl_ptr;
+
+	/* search for the err_record that we want */
+
+errprint0:
+	unm2 = null;
+	do unm = err_recp repeat (ptr(unm, unm -> fault_save.prev_frame)) while (rel(unm));
+					/* chase the threaded list of err_records */
+		if rel(unm) < loc then go to errprint1;
+		if posf then if rel(unm) = loc then go to errprint1;
+		unm2 = unm;
+		end;
+	if posf then go to errprint1a;	/* in case of starting from 0 */
+
+	/* No error message was there, just return nil */
+
+errmes_not_there:
+	stack -> temp(1) = nil;
+	return;
+
+errprint1:	/* found a stacked up error, print message and return t */
+
+	if posf then do;			/* special hac to make it look like an upward search */
+errprint1a:
+		if unm2 = null then go to errmes_not_there;
+		unm = unm2;
+		end;
+
+	code = fault_save.code1;
+	if code = 0 then			/* not an errprintable error, skip it */
+		if posf then do;
+		     if unm = err_recp then go to errmes_not_there;
+		     loc = rel(unm);
+		     do unm = err_recp repeat(ptr(unm, unm -> fault_save.prev_frame))
+					while (unm -> fault_save.prev_frame ^= loc);
+				/* find fault_save frame just above current one */
+				end;
+		     go to errprint1;
+		     end;
+		else do;
+		     unm = ptr(unm, unm -> fault_save.prev_frame);
+		     if rel(unm) = ""b then go to errmes_not_there;
+		     go to errprint1;
+		     end;
+	bits = unspec(fault_save.code2);
+
+	if errsw then go to errframe_fin;	/* if entered from errframe, don't prmes */
+	call prmes0;
+
+	stack_ptr = addr(stack -> temp(2));
+	stack -> temp(1) = t_atom;
+	return;
+
+prmes:	proc;				/* Does the actual printing of an error msg */
+
+	/* bind ^w so that the message will be sure to go to the terminal */
+	/* also bind ^r so that the message does n_o_t_ go to the output
+	    file, since the s ser might want to read it back in */
+
+	dcl (mkp, unmkp, spmsgp) ptr;
+	dcl esw fixed bin;
+
+	esw = 1;
+	go to bindings;
+
+prmes_immediate:  entry;		/* prmes with no err frame pushed */
+
+	esw = -1;
+
+bindings:	mkp = stack_ptr;
+	stack_ptr = addr(mkp -> temp(5));
+	unmkp = unmkd_ptr;
+	unmkd_ptr = addrel(unmkp, 2);
+	mkp -> temp(2) = ctrlW;
+	mkp -> temp(1) = addr(ctrlW) -> based_ptr -> atom.value;
+	mkp -> temp(4) = ctrlR;
+	mkp -> temp(3) = addr(ctrlR) -> based_ptr -> atom.value;
+	unmkp -> binding_block.bot_block = rel(mkp);
+	unmkp -> binding_block.top_block = rel(stack_ptr);
+	unmkp -> binding_block.back_ptr = rel(binding_top);
+	binding_top = unmkp;
+	addr(ctrlW)->based_ptr -> atom.value = nil;
+	addr(ctrlR) -> based_ptr -> atom.value = nil;
+	if esw < 0 then do;
+		error_data = stack;
+		go to JOIN2;
+		end;
+
+JOIN:	error_data = ptr(stack, unm -> fault_save.stack_ptr);
+
+JOIN2:	spmsgp = stack_ptr;
+	stack_ptr = addr(spmsgp -> temp(3));
+	spmsgp -> temp(2) = error_data -> temp(1);	/* pick up message */
+	spmsgp -> temp(1) = lisp_static_vars_$princ_atom;	/* and apply print to it */
+	call lisp_special_fns_$ncons;
+	call lisp_print_$type_nl;
+	call lisp_$apply;
+
+	/* If there is a losing form to be printed, do so. */
+
+	if error_data -> temp(2) ^= NotThere then do;
+	   stack_ptr = addr(spmsgp -> temp(3));
+	   spmsgp -> temp(2) = error_data -> temp(2);
+	   spmsgp -> temp(1) = lisp_static_vars_$prin1_atom;
+	   call lisp_special_fns_$ncons;
+	   call lisp_$apply;
+	   end;
+
+	/* put out a newline to end the message */
+
+	call lisp_print_$type_nl;
+	if esw = 0 then go to rtn_3;
+
+	/* unbind ^w and ^r */
+
+	addr(ctrlW)->based_ptr -> atom.value = mkp -> temp(1);
+	addr(ctrlR) -> based_ptr -> atom.value = mkp -> temp(3);
+	binding_top = ptr(unmkp, unmkp -> binding_block.back_ptr);
+	unmkd_ptr = unmkp;
+	stack_ptr = mkp;
+	return;
+
+	/* entry to print message without binding ^w or ^r */
+
+prmes0:	entry;
+
+	esw = 0;
+	go to JOIN;
+rtn_3:	return;
+end prmes;
+
+	/* the errframe function takes the same input argument as
+	   errprint, but it returns the list:
+		(pdlptr (message datum intr-chan) alist) */
+
+errframe: entry;
+
+	myname = fn_errframe;
+	errsw = "1"b;
+	go to errprint_retry;		/* join with errprint to analyze the input pdl ptr */
+
+	/* comes back here with code, code2, bits, stack->temp(1), and unm set up */
+
+errframe_fin:
+	error_data = ptr(stack, unm -> fault_save.stack_ptr);
+	stack_ptr = addr(stack -> temp(6));
+	stack -> temp(1) = lisp_static_vars_$err_atom;	/* type of frame */
+	stack -> temp(2) = error_data -> temp(1);
+	stack -> temp(3) = error_data -> temp(2);
+	if stack -> temp(3) = NotThere
+	   then stack_ptr = addr(stack -> temp(4));
+	else do;
+	     stack -> temp(4) = error_data -> temp(3);
+	     if stack -> temp(4) = NotThere
+	        then stack_ptr = addr(stack -> temp(5));
+	     end;
+	addrel(stack_ptr, -2) -> temp(1) = nil;
+	do while(stack_ptr ^= addr(stack -> temp(3)));
+	   call lisp_special_fns_$cons;
+	   end;
+
+	go to return_a_frame;			/* use pdlframe code to make the return list */
+
+	/* badpdlptr is an internal error recovery proc */
+
+badpdlptr: proc;
+
+	unm = unmkd_ptr;
+	unmkd_ptr = addrel(unm, 2);
+	unm -> errcode(1) = not_pdl_ptr;
+	unm -> errcode(2) = myname;
+	call lisp_error_;
+	return;
+	end;
+
+
+	/* the lisp pdlframe function */
+	/* (has been renamed evalframe) */
+
+pdlframe: entry;
+
+		/* declare the two names by which this function can be referenced */
+
+	dcl lisp_static_vars_$evalframe_atom fixed bin(71) aligned external,
+	    evalframe_atom fixed bin(71) aligned defined (lisp_static_vars_$evalframe_atom);
+	dcl lisp_static_vars_$pdlframe_atom fixed bin(71) aligned external,
+	    pdlframe_atom fixed bin(71) aligned defined (lisp_static_vars_$pdlframe_atom);
+
+	stack = addrel(stack_ptr, -2);	/* subr of one arg */
+	myname = fn_evalframe;
+pdl_frame_retry:
+	posf = "0"b;			/* assume will not be a positive number */
+	if stack -> temp(1) = nil then do;			/* most recent */
+				loc = rel(eval_frame);
+				if loc then locfb = locfb+1;		/* if frame real, skip past it */
+				end;				/* so that the code below will
+								   return it and not its sucessor */
+	  else if stack -> temp_type36(1) & Fixed36 then
+		if stack -> fixedb < 0 then do;
+
+			/* get negative pdl ptr & simulate downward search */
+
+			loc = substr(unspec(stack -> fixedb), 19, 18);
+			if myname = fn_freturn then locfb = locfb + 1;	/* want the frame itself ,
+								   not the next one down */
+			end;
+
+		else do;
+
+			/* get positive pdl ptr & simulate upward search */
+
+			i = - stack->fixedb;		/* mumble, mumble, can't take unspec of an expression any more */
+			loc = substr(unspec(i), 19, 18);
+			posf = "1"b;
+			end;
+
+	  else do;
+pdlframe_bad_pdl_ptr:
+		call badpdlptr;
+		go to pdl_frame_retry;
+		end;
+
+	/* check validity - pdl ptr must lie in the unmarked stack */
+
+	if loc >= rel(unmkd_ptr) then go to pdlframe_bad_pdl_ptr;
+	if loc = ""b then if posf then go to pdlframe0;
+			      else go to no_pdl_frame;
+	if loc < rel( ptr(unmkd_ptr,""b) -> stack_seg.unmkd_stack_bottom )
+			then go to pdlframe_bad_pdl_ptr;
+
+	/* search for the eval_frame that we want */
+
+pdlframe0:
+	unm2 = null;
+	do unm = eval_frame repeat (ptr(unm, unm -> frame.prev_frame)) while (rel(unm));
+	     if rel(unm) < loc then go to pdl_fr_0;
+	     if posf then if rel(unm) = loc then go to pdl_fr_0;	/* (pdlframe -n) should not return (-n () -n),
+							    but the next lower frame */
+	     unm2 = unm;
+	     end;
+	if posf then go to pdlframe1a;		/* in case searching from 0 */
+
+	/* no pdl frame found, return nil */
+
+no_pdl_frame:
+	if myname = fn_freturn then go to pdlframe_bad_pdl_ptr;	/* freturn barfs if no frame found */
+	stack_ptr = addr(stack -> temp(2));
+	stack -> temp(1) = nil;
+	return;
+
+
+pdl_fr_0:
+	if posf then do;			/* special hac to make +# simulate upward scan */
+pdlframe1a:
+	     if unm2 = null then go to no_pdl_frame;
+	     unm = unm2;
+	     end;
+
+pdl_fr_1:
+	if myname = fn_freturn then go to freturn0;		/* if freturn, unjoin back to it */
+	stack_ptr = addr(stack -> temp(5));
+	loc = unm -> frame.stack_ptr;
+	stack -> temp(2) = ptr(stack, loc) -> temp(1);	/* the form being evaled */
+	stack -> temp(1) = lisp_static_vars_$eval_atom;
+	if unm -> frame.dat1 & apply_frame_bit		/* special frame - do neat things */
+	then do;
+
+	     marked_stack_frame = ptr(stack, unm -> frame.stack_ptr);
+	     if marked_stack_frame -> call1_cruft.uncollectable_bits = uncollectable_tag
+	     then do;		/* if looks like a call1 type eval frame */
+
+		/* call1 or funcall frame - cons up arg list */
+
+		stack_ptr = addr(stack -> temp(3));
+		call lisp_special_fns_$ncons;		/* start list of pseudo-form being evaled */
+		stack -> temp(1) = stack -> temp(2);	/* save start of list */
+		stack_ptr = addr(stack -> temp(4));
+		argument_pointer = ptr(marked_stack_frame, marked_stack_frame -> call1_cruft.arg_rel_ptr);
+		do i = marked_stack_frame -> call1_cruft.number_of_args by -1 while(i > 0);
+		     stack -> temp(3) = argument_pointer -> temp(1);
+		     argument_pointer = addrel(argument_pointer, 2);
+		     call lisp_special_fns_$ncons;
+		     stack -> temp_ptr(2) -> cons.cdr = stack -> temp(3);
+		     stack -> temp(2) = stack -> temp(3);
+		     end;
+		stack_ptr = addr(stack -> temp(5));
+		stack -> temp(2) = stack -> temp(1);	/* recover start of list */
+		end;
+
+	     else do;
+
+		/* apply or map, cons up pseudo-form */
+
+		stack -> temp(3) = marked_stack_frame -> temp(3);			/* argl */
+		stack_ptr = addr(stack -> temp(4));
+		call lisp_special_fns_$cons;
+		stack_ptr = addr(stack -> temp(5));
+		end;
+	     stack -> temp(1) = lisp_static_vars_$apply_atom;
+	     end;
+
+	else if stack -> temp_ptr(2) -> cons.car = evalframe_atom then go to skip_this_pdlframe;
+	else if stack -> temp_ptr(2) -> cons.car = pdlframe_atom then do;
+
+		/* Woops, its ourself - skip it */
+
+skip_this_pdlframe:
+		if posf then do;			/* positive pdl ptr was given --
+						   have to get kludgy and up-scan */
+		     if unm = eval_frame then go to no_pdl_frame;		/* none above to get */
+		     loc = rel(unm);
+		     do unm = eval_frame repeat ( ptr(unm, unm -> frame.prev_frame))
+					while ( unm -> frame.prev_frame ^= loc);
+			/* this do-repeat scans down for the eval_frame just above
+			   the one we're currently at */
+			end;
+		     end;
+
+		else do;
+		     unm = ptr(unm, unm -> frame.prev_frame);
+		     if rel(unm) = ""b then go to no_pdl_frame;
+		     end;
+		go to pdl_fr_1;
+		end;
+
+	/* return a frame.  stack -> temp(1) = frame type,
+	   stack -> temp(2) = middle part of frame,
+	   unm -> the stack loc */
+
+return_a_frame:
+	stack_ptr = addr(stack -> temp(6));
+	stack -> temp(5) = nil;
+	stack -> temp(3) = stack -> temp(2);
+	addr(stack -> temp(4)) -> fixnum_fmt.type_info,
+	 addr(stack -> temp(2)) -> fixnum_fmt.type_info = fixnum_type;
+	unspec( addr(stack->temp(4)) -> fixedb) = (17)"1"b || "0"b || rel(unm);
+	unspec(addr(stack -> temp(2)) -> fixedb) = (18)"1"b || rel(unm);		/* pdl ptr -> unmarked pdl */
+	do while(stack_ptr ^= addr(stack -> temp(2)));
+	   call lisp_special_fns_$cons;
+	   end;
+	return;
+
+	/* The freturn subr, which allows returning from an arbitrary evaluation
+	   Subr of 2 args: 1) pdl ptr, 2) return value */
+
+freturn:	entry;
+
+	stack = addrel(stack_ptr, -4);		/* 2 args */
+	myname = fn_freturn;
+	dbl_word = stack -> temp(1);			/* interchange arguments to be like pdlframe, */
+	stack -> temp(1) = stack -> temp(2);		/*    having the pdl ptr arg at top of stack */
+	stack -> temp(2) = dbl_word;
+	stack = addr(stack -> temp(2));
+	go to pdl_frame_retry;			/* go find frame corresponding to first arg */
+
+freturn0:
+	/* unm -> the frame, stack -> temp(1) = the value we want to make that frame return with */
+
+	/* make sure that this frame lies within the Multics stack properly - could be problem
+	   if unseen-go-tag on very non local go happens after the stack is unwound, then user
+	   tries to freturn into stack between the prog and the non local go - can't be done
+	   because stack frames (sp stack) for functions in that part of lisp stack no longer
+	   exist - since freturn is usually done from command level we want to say bad_pdl_ptr
+	   rather than wait and get unwinder_error */
+
+	label0 = freturn0;				/* just a KLUDGE to do a sprisp instruction */
+	if rel(label.sp) <= eval_frame_part.dat1 then go to pdlframe_bad_pdl_ptr;
+
+	/* check for a frame with screwed up registers in it, which indicates an undf fcntn or something occurred */
+	/* such frames may not be returned to because they lose!! */
+
+	if substr(unspec(saved_index_registers), 31, 6) = "100011"b	/* its modifier, can never occur in
+								   a saved x2 from evaluator since
+								   would indicate applying a macro */
+		then go to pdlframe_bad_pdl_ptr;	/* Go barf at user */
+
+
+	stack = addrel(stack, -2);
+
+	/* declare the format of the evaluators unmarked pdl (lisp_.alm) */
+
+      dcl 1 the_eval_frame aligned based(unm),
+	 2 eval_frame_part ,
+	  3 prev_frame bit(18) unal,
+	  3 stack_ptr fixed bin (17) unal,
+	  3 dat1 bit(18) unal,
+	  3 dat2 bit(18) unal,
+	 2 saved_index_registers fixed bin(71),
+	 2 binding_frame_part fixed bin(71);
+
+	/* unwind down to but not including the evalframe - unwind its binding block */
+
+	unm2 = unmkd_ptr;
+	unmkd_ptr = addrel(unm2, 2);
+	unm2 -> based_ptr = addr(binding_frame_part);		/* unwinder takes arg on unmkd pdl */
+	evals_stack = ptr(stack, eval_frame_part.stack_ptr);	/* -> eval's garbage on the marked pdl */
+	evals_stack -> temp(4) = stack -> temp(1);		/* drop return value into ap|plist */
+	call lisp_prog_fns_$lisp_unwinder;			/* unwind back to the point of evaluation */
+
+	/* Now go call the evaluator, and let it clean things up, since it alone knows how */
+
+	unmkd_ptr = addrel(unm, size(the_eval_frame));		/* make unmkd_ptr where eval expects it */
+	stack_ptr = addr(evals_stack -> temp(5));		/* in case was cruft on marked pdl below b.b. */
+	label.adr = addr(lisp_$freturn_real);			/* make label variable to get to the evaluator */
+	label.sp = ptr(label.sp, eval_frame_part.dat1 & "111111111111111110"b);
+
+	/* save return ptr in stack frame going to go to since goddamn unwinder_ wrecks it. */
+
+	unspec(binding_frame_part)			/* use this double word since not in use right now */
+	  = unspec(label.sp -> stack_frame.return_ptr);
+
+	go to label0;
+end lisp_error_;

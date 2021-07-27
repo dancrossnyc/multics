@@ -1,0 +1,312 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(2016-01-15,Swenson), approve(2016-01-15,MCR10003):
+     Fix to support 4-character time zone abbreviations.
+                                                   END HISTORY COMMENTS */
+
+/* Interim mechanism for IMFT to send mail/messages: should be eliminated when mail_system_ allows setting message access
+   class and sending interactive messages */
+
+/* Created:  July 1982 by G. Palter as part of proper AIM support */
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+
+imft_mail_interface_:
+     procedure ();
+
+	return;					/* not an entrypoint */
+
+
+/* Parameters */
+
+dcl  P_sender_name character (*) parameter;		/* full name of sender (ie: foreign system) */
+dcl  P_destination character (*) parameter;		/* user to receive the message (Person.Project) */
+dcl  P_message_type fixed binary parameter;		/* type of message: ordinary or interactive */
+dcl  P_subject character (*) parameter;			/* subject of mesage */
+dcl  P_text character (*) parameter;			/* text of message */
+dcl  P_access_class bit (72) aligned parameter;		/* access class of message */
+dcl  P_code fixed binary (35) parameter;
+
+
+/* Remaining declarations */
+
+dcl  message_text_buffer character (4 * sys_info$max_seg_size) based (message_text_buffer_ptr);
+dcl  message_text character (message_text_lth) based (message_text_buffer_ptr);
+dcl  message_text_lth fixed binary (21);
+dcl  message_text_buffer_ptr pointer;
+
+dcl  (ipc_priv_code, ring1_priv_code) fixed binary (35);
+
+dcl  IMFT_MAIL_INTERFACE_ character (32) static options (constant) initial ("imft_mail_interface_");
+
+dcl  NOTIFY_MSG character (15) static options (constant) initial ("You have mail.
+");
+
+dcl  NL character (1) static options (constant) initial ("
+");
+
+/* format: off */
+dcl  DAY_NAMES (7) character (32) static options (constant) initial (
+	"Monday",		"Tuesday",	"Wednesday",	"Thursday",	"Friday",
+	"Saturday",	"Sunday");
+
+dcl  MONTH_NAMES (12) character (32) static options (constant) initial (
+	"January",	"February",	"March",		"April",		"May",		"June",
+	"July",		"August",		"September",	"October",	"November",	"December");
+
+dcl (error_table_$bad_subr_arg, error_table_$bigarg)
+	fixed binary (35) external;
+/* format: on */
+
+dcl  sys_info$max_seg_size fixed binary (19) external;
+
+dcl  decode_clock_value_$date_time
+	entry (fixed binary (71), fixed binary, fixed binary, fixed binary, fixed binary, fixed binary, fixed binary,
+	fixed binary (71), fixed binary, character (4), fixed binary (35));
+dcl  get_temp_segment_ entry (character (*), pointer, fixed binary (35));
+dcl  release_temp_segment_ entry (character (*), pointer, fixed binary (35));
+dcl  send_mail_$access_class entry (character (*), character (*), pointer, bit (72) aligned, fixed binary (35));
+dcl  system_privilege_$ipc_priv_off entry (fixed binary (35));
+dcl  system_privilege_$ipc_priv_on entry (fixed binary (35));
+dcl  system_privilege_$ring1_priv_off entry (fixed binary (35));
+dcl  system_privilege_$ring1_priv_on entry (fixed binary (35));
+dcl  user_info_ entry (character (*), character (*));
+
+dcl  (addr, after, before, clock, convert, index, length, ltrim, null, rtrim, substr, unspec) builtin;
+
+dcl  (cleanup, linkage_error) condition;
+%page;
+/* Deliver a messages to the specified user */
+
+deliver_message:
+     entry (P_sender_name, P_destination, P_message_type, P_subject, P_text, P_access_class, P_code);
+
+	if (P_message_type ^= ORDINARY_DELIVERY) & (P_message_type ^= INTERACTIVE_DELIVERY) then do;
+	     P_code = error_table_$bad_subr_arg;
+	     return;
+	end;
+
+	if index (P_destination, ".") = 0 then do;	/* only accepts Person.Project */
+INVALID_DESTINATION_SYNTAX:
+	     P_code = error_table_$bad_subr_arg;
+	     return;
+	end;
+	if index (after (P_destination, "."), ".") ^= 0 then go to INVALID_DESTINATION_SYNTAX;
+	if (before (P_destination, ".") = "") | (after (P_destination, ".") = "") then go to INVALID_DESTINATION_SYNTAX;
+
+
+/* Try to turn on ring-1 and IPC privileges: we might be sending down... */
+
+	ipc_priv_code, ring1_priv_code = -1;		/* non-zero => we didn't turn privilege on */
+
+	message_text_buffer_ptr = null ();		/* for cleanup handler */
+
+	on condition (cleanup)
+	     begin;
+		if message_text_buffer_ptr ^= null () then
+		     call release_temp_segment_ (IMFT_MAIL_INTERFACE_, message_text_buffer_ptr, (0));
+		if ipc_priv_code = 0 then call system_privilege_$ipc_priv_off ((0));
+		if ring1_priv_code = 0 then call system_privilege_$ring1_priv_off ((0));
+	     end;
+
+	on condition (linkage_error) go to CANT_SET_PRIVILEGE;
+
+	call system_privilege_$ring1_priv_on (ring1_priv_code);
+	call system_privilege_$ipc_priv_on (ipc_priv_code);
+
+
+CANT_SET_PRIVILEGE:
+	if P_message_type = ORDINARY_DELIVERY then do;
+
+/* Send a piece of mail: construct the header, send the mail, and send the notification */
+
+	     call get_temp_segment_ (IMFT_MAIL_INTERFACE_, message_text_buffer_ptr, P_code);
+	     if P_code ^= 0 then go to RETURN_FROM_DELIVER_MESSAGE;
+
+	     call format_message ();
+
+	     unspec (send_mail_info) = ""b;
+	     send_mail_info.version = send_mail_info_version_2;
+	     send_mail_info.always_add = "1"b;
+	     send_mail_info.sent_from = P_sender_name;
+
+	     call send_mail_$access_class (P_destination, message_text, addr (send_mail_info), P_access_class, P_code);
+
+	     if P_code = 0 then do;			/* got through OK */
+		send_mail_info.always_add = "0"b;	/* notification is an express message */
+		send_mail_info.wakeup, send_mail_info.notify = "1"b;
+		call send_mail_$access_class (P_destination, NOTIFY_MSG, addr (send_mail_info), P_access_class, (0));
+	     end;
+	end;
+
+
+	else do;
+
+/* Interactive message: send it without any fancy headers */
+
+	     unspec (send_mail_info) = ""b;
+	     send_mail_info.version = send_mail_info_version_2;
+	     send_mail_info.wakeup,			/* normal interactive message */
+		send_mail_info.always_add = "1"b;
+	     send_mail_info.sent_from = P_sender_name;
+
+	     call send_mail_$access_class (P_destination, P_text, addr (send_mail_info), P_access_class, P_code);
+	end;
+
+
+/* All done: cleanup; P_code is already set */
+
+RETURN_FROM_DELIVER_MESSAGE:
+	if message_text_buffer_ptr ^= null () then
+	     call release_temp_segment_ (IMFT_MAIL_INTERFACE_, message_text_buffer_ptr, (0));
+
+	if ipc_priv_code = 0 then call system_privilege_$ipc_priv_off ((0));
+	if ring1_priv_code = 0 then call system_privilege_$ring1_priv_off ((0));
+
+	return;
+%page;
+/* Formats a message by building the standard header */
+
+format_message:
+     procedure ();
+
+	message_text_lth = 0;
+
+	call add ("Date:  ");
+	call format_date ();
+	call add (NL);
+
+	call add ("From:  ");
+	call format_sender ();
+	call add (NL);
+
+	if P_subject ^= "" then do;
+	     call add ("Subject:  ");
+	     call add_trimmed (P_subject);
+	     call add (NL);
+	end;
+
+	call add ("To:  ");
+	call add_trimmed (P_destination);
+	call add (NL);
+
+	call add (NL);
+
+	call add_trimmed (P_text);
+
+	return;
+%page;
+/* Internal to format_message: add text to the message */
+
+add:
+	procedure (p_text);
+
+	     text_lth = length (p_text);
+	     go to ACTUALLY_ADD_THE_TEXT;
+
+
+/* Internal to format_message: add text to the message but first remove trailing blanks */
+
+add_trimmed:
+	entry (p_text);
+
+	     text_lth = length (rtrim (p_text));
+
+
+ACTUALLY_ADD_THE_TEXT:
+	     if message_text_lth + text_lth > length (message_text_buffer) then do;
+		P_code = error_table_$bigarg;
+		go to RETURN_FROM_DELIVER_MESSAGE;
+	     end;
+
+	     begin;
+dcl  new_piece_of_message character (text_lth) unaligned defined (message_text_buffer) position (message_text_lth + 1);
+		new_piece_of_message = substr (p_text, 1, text_lth);
+	     end;
+
+	     message_text_lth = message_text_lth + text_lth;
+
+	     return;
+
+
+dcl  p_text character (*) parameter;
+dcl  text_lth fixed binary (21);
+
+	end add;
+%page;
+/* Internal to format_message: formats the current date/time */
+
+format_date:
+	procedure ();
+
+dcl  four_digits picture "9999";
+dcl  two_digits picture "99";
+dcl  time_zone character (4);
+dcl  (month, day_of_month, year, hour, minute, day_of_week) fixed binary;
+dcl  code fixed binary (35);
+
+	     time_zone = "";			/* use default time zone */
+
+	     call decode_clock_value_$date_time (clock (), month, day_of_month, year, hour, minute, (0), (0),
+		day_of_week, time_zone, code);
+
+	     if code ^= 0 then			/* shouldn't happen, but... */
+		call add ("unknown");
+
+	     else do;
+		call add_trimmed (DAY_NAMES (day_of_week));
+		call add (", ");
+		call add (ltrim (convert (two_digits, day_of_month), "0"));
+		call add (" ");
+		call add_trimmed (MONTH_NAMES (month));
+		call add (" ");
+		call add (convert (four_digits, year));
+		call add (" ");
+		call add (convert (two_digits, hour));
+		call add (":");
+		call add (convert (two_digits, minute));
+		call add (" ");
+		call add (time_zone);
+	     end;
+
+	     return;
+
+	end format_date;
+%page;
+/* Internal to format_message: formats the sender */
+
+format_sender:
+	procedure ();
+
+dcl  (my_person_id, my_project_id) character (32);
+
+	     call user_info_ (my_person_id, my_project_id);
+
+	     if P_sender_name ^= "" then do;
+		call add_trimmed (P_sender_name);
+		call add (" <");
+	     end;
+
+	     call add_trimmed (my_person_id);
+	     call add (".");
+	     call add_trimmed (my_project_id);
+
+	     if P_sender_name ^= "" then call add (">");
+
+	     return;
+
+	end format_sender;
+
+     end format_message;
+%page;
+%include mlsys_deliver_info;
+
+%include send_mail_info;
+
+     end imft_mail_interface_;

@@ -1,0 +1,291 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-10-30,Swenson), approve(88-07-04,MCR7930),
+     audit(88-07-11,Parisek), install(88-07-15,MR12.2-1057):
+     Modified to really fix maxlength increases.
+                                                   END HISTORY COMMENTS */
+
+
+boundfault: proc (a_mcptr);
+
+/* Last modified BIM 84-02-06 to handle removal of setfaults for maxlength increases. */
+/* last modified by M. Grady on 08/17/79 to fix EIS decimal boundfault case  */
+/* last modified by R. Bratt on 09/17/76 for per-process boundfault metering */
+/* last modified by A. Bensoussan on 04/25/75 for the new storage system. */
+/* last modified by Greenberg on 10-14-74 for SST name table */
+/* last modified by Kobziar on 11-15-73 to respect only max_length */
+dcl  a_mcptr ptr;
+
+dcl (tsdwp, old_astep, new_astep, pastep, temptr, kstp, par_astep) ptr,
+    (pw1, pw2, pageno, segno, csl, pts, old_pts, ptsi) fixed bin,
+     offset fixed bin (18),
+     code fixed bin (35),
+    (time1, time2) fixed bin (71),
+    (last, relp) bit (18) aligned,
+    (lsw, par_ehs_status) bit (1) aligned,
+     tsdw fixed bin (71),
+     read_lock bit (36) aligned init ("0"b);
+
+dcl (error_table_$boundviol, error_table_$illegal_deactivation, error_table_$synch_seg_limit,
+     error_table_$mylock, error_table_$root) ext fixed bin (35),
+     kst_seg$ ext fixed bin,
+     pds$bounds_faults fixed bin (35) ext,
+     dseg$ (0 : 512) bit (72) aligned ext;
+
+dcl  page$enter_data ext entry (fixed bin, fixed bin),
+     pc$move_page_table ext entry (ptr, ptr),
+     syserr entry options (variable),
+     usage_values ext entry (fixed bin, fixed bin (71)),
+     sum$getbranch_root_my ext entry (ptr, bit (36) aligned, ptr, fixed bin (35)),
+     lock$dir_unlock ext entry (ptr),
+     lock$lock_ast entry,
+     lock$unlock_ast entry,
+     get_ptrs_$given_segno ext entry (fixed bin) returns (ptr),
+     get_aste ext entry (fixed bin) returns (ptr),
+     get_aste$synchronized entry (fixed bin) returns (ptr),
+     put_aste ext entry (ptr),
+     search_ast$hash_in ext entry (ptr),
+     search_ast$hash_out ext entry (ptr),
+     setfaults ext entry (ptr, bit (1) aligned);
+
+declare pmut$swap_sdw entry (pointer, pointer);
+declare sdw_util_$set_size entry (pointer, fixed binary (19));
+declare sdw_util_$get_address entry (pointer) returns (fixed bin (26));
+dcl  sst_seg$ external static;
+dcl  sst$pts (0 : 3) fixed bin external static;
+dcl  sst$cpu_bf_time fixed bin (71) external static;
+dcl  sst$total_bf_pf fixed bin (35) external static;
+dcl  sst$total_bf fixed bin (35) external static;
+dcl  sstp pointer;
+
+dcl (addr, baseptr, bin, divide, max, min, null, ptr, rel) builtin;
+
+
+% include mc;
+% include trace_types;
+% include dir_header;
+% include dir_entry;
+% include dir_name;
+% include aste;
+% include sstnt;
+
+
+	call usage_values (pw1, time1);		/* meter bound fault time */
+	code = 0;
+	sstp = addr (sst_seg$);			/* get pointers */
+	kstp = addr (kst_seg$);
+	tsdwp = addr (tsdw);
+
+	scup = addr (a_mcptr -> mc.scu (0));
+	offset = bin (scup -> scu.ca, 18);		/* get the word offset causing the OOB */
+	pageno = divide (offset, 1024, 17, 0);		/* get the page number in which the word is */
+	if scup -> scu.apu.ptw2 then pageno = pageno + 1;	/* if decimal unit prepage, up page number */
+	segno = bin (bin (scup -> scu.tsr, 15), 17);	/* get the segment number of the faulting segment */
+	call page$enter_data (segno, boundfault_start);	/* place entry in the trace list */
+
+	lsw = "1"b;				/* set lock switch on */
+						/* return with entry pointer and dir locked */
+	call sum$getbranch_root_my (baseptr (segno), read_lock, ep, code);
+	if code ^= 0
+	then if code = error_table_$mylock		/* dir already locked */
+	     then lsw = "0"b;			/* turn off lock switch */
+	     else if code = error_table_$root		/* this is the root */
+	     then call syserr (2, "boundfault: on the root");
+	     else go to update;			/* for any other error */
+
+	code = 0;					/* May have had a mylock */
+	dp = ptr (ep, 0);				/* pointer to directory */
+	if sdw_util_$get_address (addr (dseg$ (segno))) = 0 then go to un; /* if segment not connected, return */
+
+	temp_entry_name = (addr (ep -> entry.primary_name) -> names.name);
+						/* Copy name into stack, as we cannot
+						   touch branch with AST locked */
+	call lock$lock_ast;				/* lock the AST */
+
+	old_astep = get_ptrs_$given_segno (segno);	/* get a pointer to the AST entry */
+	if old_astep = null then goto unlock_set;	/* If deactivated since boundfault, return and retake */
+
+	if pageno >= bin (old_astep -> aste.msl, 9)	/* check max length of segment */
+	then do;
+	     code = error_table_$boundviol;		/* return OOB error code */
+	     go to unlock_set;			/* unlock ASTE and DIR and return code */
+	end;
+
+	if old_astep -> aste.ehs then do;		/* check for the entry hold switch being ON */
+	     code = error_table_$illegal_deactivation;	/* return illegal deactivation */
+	     goto unlock_set;
+	end;
+
+	ptsi = bin (old_astep -> aste.ptsi, 2);		/* get the page table index for the old aste */
+	old_pts = sst$pts (ptsi);		/* get the page table size of the old AST */
+     /**** Before we attempt to find a new, adequately sized page table, ensure
+           that the current page table size is not adequate.  If it is, then all
+           we need to do is update the SDW bounds field.  This discrepancy may
+           occur because, for efficiency reasons, we do not fault the SDW when
+           the maximum length of a segment is increased.  We just wait until
+           the next OOB occurs (this one).  Note that we've already ascertained
+           that the page being referenced is within the ASTE max length. */
+
+              if pageno < old_pts then                          /* fits within current page table */
+                    begin;
+     declare  temp_sdw bit (72) aligned;
+
+	     temp_sdw = dseg$ (segno);
+
+	     call sdw_util_$set_size ( addr (temp_sdw), min (old_pts, bin (old_astep -> aste.msl, 9)) * 1024); /* fix the sdw */
+	     call pmut$swap_sdw (baseptr (segno), addr (temp_sdw));
+
+	     call lock$unlock_ast;
+	     code = 0;				/* make fim restart */
+	     go to un;
+	end;
+
+	/* ? */ if ptsi >= 3 then do;			/* already at largest allowed page table size */
+	     code = error_table_$boundviol;		/* return illegal bounds violation code */
+
+unlock_set:    call lock$unlock_ast;			/* Unlock the AST */
+	     go to un;				/* unlock the directory and update meters */
+	end;
+
+	call setfaults (old_astep, "0"b);		/* set faults for old AST entry */
+
+	csl = bin (old_astep -> aste.csl, 9);		/* get the current length of the segment (in pages) */
+	pts = max (pageno+1, csl);			/* get new page table size */
+
+	if pts <= old_pts then do;			/* Used to happen for prepage decimal ops */
+	     call lock$unlock_ast;
+	     code = error_table_$boundviol;
+	     go to un;
+	end;
+
+/* Entry hold the father to avoid deactivating him during get_aste */
+
+	par_astep = ptr (sstp, old_astep -> aste.par_astep);
+	par_ehs_status = par_astep -> aste.ehs;
+	par_astep -> aste.ehs = "1"b;
+
+
+	if ^old_astep -> aste.synchronized
+	then new_astep = get_aste (pts);		/* get a new AST entry */
+	else do;
+	     new_astep = get_aste$synchronized (pts);
+	     if new_astep = null () then do;
+		call lock$unlock_ast;
+		code = error_table_$synch_seg_limit;
+		goto un;
+	     end;
+	end;
+	
+
+/* Copy the synchronized switch. This will ensure that page control does the
+   right thing during the page table move, preventing writes before they
+   should be done. */
+
+	new_astep -> aste.synchronized = old_astep -> aste.synchronized;
+
+/* Restore father's ehs status */
+
+	if new_astep = par_astep then call syserr (1, "boundfault: activating into father ^p", new_astep);
+	par_astep -> aste.ehs = par_ehs_status;
+
+/* Now copy the page table from the old entry into the new */
+
+	call pc$move_page_table (old_astep, new_astep);	/* clean up the page table move */
+	nm_astep = new_astep;
+
+
+/* Now replace the old aste by the new one in the inferior list */
+
+	pastep = ptr (sstp, old_astep -> aste.par_astep); /* get a pointer to the parent to update the inferior list */
+
+	last = "0"b;
+	relp = pastep -> aste.infp;			/* get a pointer to the inferiror list */
+	do while (relp ^= rel (old_astep));		/* loop searching for the current entry */
+	     last = relp;				/* chain to next, save old */
+	     relp = ptr (sstp, relp) -> aste.infl;	/* get next entry in list */
+	end;
+	if last = "0"b then pastep -> aste.infp = rel (new_astep);
+	else ptr (sstp, last) -> aste.infl = rel (new_astep);
+
+
+
+/* Now update the parent pointers of all inferior entries ( if it's a directory) */
+
+	relp = old_astep -> aste.infp;
+	do while (relp);				/* loop until the end of the list */
+	     temptr = ptr (sstp, relp);
+	     temptr -> aste.par_astep = rel (new_astep);	/* put in new parent pointer */
+	     relp = temptr -> aste.infl;		/* get the next entry */
+	end;
+
+
+
+	call search_ast$hash_out (old_astep);
+	call search_ast$hash_in (new_astep);
+
+	call put_aste (old_astep);			/* Return old ASTE in the free pool */
+
+%include make_sstnt_entry;
+
+	call lock$unlock_ast;
+un:	if lsw then call lock$dir_unlock (dp);		/* unlock the directory */
+
+update:
+	a_mcptr -> mc.errcode = code;
+	call usage_values (pw2, time2);		/* finish metering */
+	sst$cpu_bf_time = sst$cpu_bf_time + time2 - time1;
+	sst$total_bf_pf = sst$total_bf_pf + pw2 - pw1;
+	sst$total_bf = sst$total_bf + 1;
+	pds$bounds_faults = pds$bounds_faults + 1;
+	call page$enter_data (segno, boundfault_end);
+	return;
+
+ill_op_code: entry (a_mcptr);
+
+
+	a_mcptr -> mc.errcode = 1;
+	return;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   boundfault: on the root
+
+   S:	$term
+
+   T:	$run
+
+   M:	A boundfault on the root directory has been encountered.
+   $err
+
+   A:	$inform
+
+
+   Message:
+   boundfault: activating into father XXX|YYY
+
+   S:	$crash
+
+   T:	$run
+
+   M:	While activating a segment,
+   the parent directory for the segment became deactivated.
+   $err
+
+   A:	$recover
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end boundfault;

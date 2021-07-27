@@ -1,0 +1,684 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-03-05,Huen), approve(87-03-05,MCR7629), audit(87-04-15,RWaters),
+     install(87-05-14,MR12.1-1030):
+     Fix PL/1 error 2142 -
+     Signal the error condition when the string supplied has insufficient data
+     for the "get" statement.
+                                                   END HISTORY COMMENTS */
+
+plio2_gvl_:
+get_value_list_:
+     procedure (p_ps_ptr) options (support);
+
+/*        Modified: 9 January 1987 by S. Huen to signal the error condition when the string supplied has insufficient data for the "get" statement */
+/*	Modified:	18 July 1978 by R. A. Barnes to make gvl more quit-start proof if blocked */
+
+/*	Modified: 4 April 1978 by Peter C. Krupp to implement radix-n bit strings for get list	*/
+
+/*	Modified:	20 December 1977 by Richard A. Barnes to fix 1695 (get string)	*/
+
+/* Rewritten Spring 1977 by R.Schoeman as part of the quick stream_io package.
+   Recoded 770612 by PG to maintain fsb.kol accurately, and to use algorithms similar to EIS lex.
+   package.
+
+   This procedure is called once for each item in a data list
+   in a get list statement. It is called at runtime by pl1_operators_ through the entrypoint
+   get_value_list_.  Section 12.14 (GET statement) of AG94 describes in detail
+   the language-defined actions which are performed by this program.	*/
+
+/* parameters */
+
+declare	p_ps_ptr ptr parameter;			/* ptr to PS */
+
+/* automatic */
+
+declare	BIT_STRING bit (1) aligned,
+	bit256 bit (256) varying aligned,
+	break fixed bin (21),
+	code fixed bin (35),
+	convert_index fixed bin (15),
+	erno fixed bin (15),			/* oncode number */
+	error_string char (1000) varying,		/* used when raising conversion */
+	first_bit fixed bin (15),
+	first_char fixed bin (21),
+	in_ptr ptr,
+	iocbp ptr,
+	left fixed bin (21),
+	onchar_index fixed bin (15),
+	pic_buf char(64),
+	pic_ptr ptr,
+	psp ptr,
+	RADIX_FACTOR fixed bin(15),
+	rn_digit char(1) aligned,
+	rn_value fixed bin(15),
+	scan_index fixed bin (21),
+	scan_start fixed bin (21),
+	targ_ptr ptr,
+	token_length fixed bin (21),
+	token_start fixed bin (21),
+	token_string char (257) varying;
+
+/* based */
+
+declare	buffer_array (1044480) char (1) unaligned based (fsb.bptr);
+
+/* builtins */
+
+declare	(addr, addrel, binary, bit, divide, index, length, reverse, search, substr, verify, unspec) builtin;
+
+/* conditions */
+
+declare	conversion condition;
+
+/* entries */
+
+declare	iox_$get_chars entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35)),
+	iox_$get_line entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35)),
+	plio2_get_util_$get_prep_ entry (ptr),
+	plio2_signal_$conversion_error_ entry (ptr, char (*), fixed bin (15), ptr, fixed bin (15), fixed bin (15), fixed bin (15)),
+	plio2_signal_$s_ entry (ptr, char (*), char (*), fixed bin (15)),
+	plio2_signal_$s_r_ entry (ptr, char (*), char (*), fixed bin (15)),
+	plio2_resig_ entry (ptr),
+	put_copy_ entry (ptr, fixed bin (21));
+
+/* external static */
+
+dcl (error_table_$short_record,
+     error_table_$long_record,
+     error_table_$end_of_info) external static fixed bin (35);
+
+/* internal static */
+
+declare (	HT char (1) aligned initial ("	"),
+	NL char (1) aligned initial ("
+"),
+	QUOTE char (1) aligned initial (""""),
+	HT_NL_quote char (3) aligned initial ("	
+"""),
+	HT_NL_SP_comma char (4) aligned initial ("	
+ ,")
+	) internal static;
+
+declare	max_io_string_length internal static options(constant) initial(256);
+
+/* include files */
+
+%include plio2_ps;
+%include plio2_fsb;
+%include pl1_stack_frame;
+%include desc_dcls;
+%include desc_types;
+%include descriptor;
+%include picture_desc_;
+%include picture_image;
+%include picture_util;
+%include radix_factor_constants;
+
+/* program */
+
+	psp = p_ps_ptr;
+
+	if ps.prep ^= 0
+	then call plio2_get_util_$get_prep_ (psp);
+
+	iocbp = ps.fsbp -> fsb.iocb_p;
+	BIT_STRING = "0"b;
+	RADIX_FACTOR = 0;
+
+	on conversion call plio2_resig_ (psp);
+
+init_scan:
+	left = fsb.blc - fsb.bnc + 1;
+	first_char = verify (substr (xbuf, fsb.bnc, left), " ");
+
+	if first_char = 0
+	then do;					/* rest of string was blanks */
+		call refill_buffer_ldi;
+		if code ^= 0
+		then go to raise_eof;
+		go to init_scan;
+	     end;
+
+	fsb.kol = fsb.kol + first_char - 1;
+	fsb.bnc = fsb.bnc + first_char - 1;		/* step over blanks */
+
+	if substr (xbuf, fsb.bnc, 1) = NL
+	then do;
+		fsb.kol = 0;			/* reset current column */
+		fsb.bnc = fsb.bnc + 1;		/* step over newline */
+		go to init_scan;
+	     end;
+
+	if substr (xbuf, fsb.bnc, 1) = HT
+	then do;
+		fsb.kol = fsb.kol + 10 - divide (fsb.kol, 10, 21, 0);
+		fsb.bnc = fsb.bnc + 1;		/* step over HT */
+		go to init_scan;
+	     end;
+
+	if substr (xbuf, fsb.bnc, 1) = ","
+	then do;
+		fsb.kol = fsb.kol + 1;
+		fsb.bnc = fsb.bnc + 1;		/* step over comma */
+
+		if fsb.lsep = 2
+		then do;				/* last separator was not a comma... */
+			fsb.lsep = 1;		/* let this comma pass by */
+			goto init_scan;
+		     end;
+						/* last separator was a comma...this comma means */
+		return;				/* two commas in a row...input item is unchanged */
+	     end;
+	else if substr (xbuf, fsb.bnc, 1) = QUOTE	/* current char is a quote? */
+	     then do;				/* yes...scan a quoted string */
+		     scan_start = fsb.bnc + 1;	/* start copying after quote */
+		     token_start = scan_start;
+		     token_length = 0;
+
+rescan:
+		     scan_index = search (substr (xbuf, scan_start, fsb.blc - scan_start + 1), HT_NL_quote);
+
+		     if scan_index = 0
+		     then do;			/* eof while looking for closing quote */
+			     if token_start = 0	/* copy has begun */
+			     then token_string = token_string || substr (xbuf, scan_start, fsb.blc - scan_start + 1);
+			     else do;
+				     token_string = substr (xbuf, token_start, fsb.blc - token_start + 1);
+				     token_start = 0;
+				end;
+
+			     call refill_buffer_ldi;
+			     if code ^= 0
+			     then go to err163;	/* error -- end of file */
+
+			     scan_start = 1;
+			     go to rescan;
+			end;
+
+		     fsb.kol = fsb.kol + scan_index - 1;	/* update kol but not scan_start just yet */
+
+		     if substr (xbuf, scan_start + scan_index - 1, 1) = NL
+		     then do;
+			     /* AG94 says ignore newlines inside quoted strings when in
+			        list-directed input.  So we do. Ugh. */
+
+			     fsb.kol = 0;
+
+			     if token_start > 0	/* if not copied yet, copy now */
+			     then do;
+				     token_string = substr (xbuf, token_start, token_length);
+				     token_start = 0;
+				end;
+
+			     token_string = token_string || substr (xbuf, scan_start, scan_index - 1);
+			     scan_start = scan_start + scan_index;
+			     go to rescan;
+			end;
+		     else if substr (xbuf, scan_start + scan_index - 1, 1) = HT
+			then do;
+				fsb.kol = fsb.kol + 10 - divide (fsb.kol, 10, 21, 0);
+
+				if token_start = 0
+				then token_string = token_string || substr (xbuf, scan_start, scan_index);
+				else token_length = token_length + scan_index;
+
+				scan_start = scan_start + scan_index;
+				go to rescan;
+			     end;
+
+		     /* Found a matching quote. Ignore it. */
+
+		     if token_start = 0
+		     then token_string = token_string || substr (xbuf, scan_start, scan_index - 1);
+		     else token_length = token_length + scan_index - 1;
+
+		     scan_start = scan_start + scan_index;
+		     fsb.kol = fsb.kol + 1;		/* step over quote */
+
+		     /* Now look for a quote immediately following, which means we have two quotes in a row. */
+		     /* First make sure we are not at the end of the buffer */
+
+		     if scan_start > fsb.blc
+		     then do;
+			     if token_start > 0	/* if not copied yet, copy now */
+			     then do;
+				     token_string = substr (xbuf, token_start, token_length);
+				     token_start = 0;
+				end;
+
+			     call refill_buffer_ldi;
+			     if code ^= 0
+			     then goto finish;		/* eof encountered */
+			     scan_start = 1;
+			end;
+
+		     if substr (xbuf, scan_start, 1) = QUOTE
+		     then do;
+			     if token_start > 0	/* if not copied yet, copy now */
+			     then do;
+				     token_string = substr (xbuf, token_start, token_length);
+				     token_start = 0;
+				end;
+
+			     token_string = token_string || QUOTE;
+			     fsb.kol = fsb.kol + 1;
+			     scan_start = scan_start + 1;
+			     go to rescan;
+			end;
+
+		     /* We have now parsed the quoted section of the string...scan until the next
+		        space or comma and include those characters, too. */
+
+find_break:
+		     break = search (substr (xbuf, scan_start, fsb.blc - scan_start + 1), HT_NL_SP_comma);
+		     if break = 0
+		     then do;			/* eof while looking for delimiters */
+			     if token_start > 0	/* if not copied yet, do it now */
+			     then do;
+				     token_string = substr (xbuf, token_start, fsb.blc - token_start + 1);
+				     token_start = 0;
+				end;
+			     else token_string = token_string || substr (xbuf, scan_start, fsb.blc - scan_start + 1);
+
+			     call refill_buffer_ldi;
+			     if code ^= 0
+			     then goto finish;	/* AG94 says this is a legal termination, not an error */
+
+			     scan_start = 1;
+			     goto find_break;
+			end;
+
+		     fsb.kol = fsb.kol + break - 1;
+
+		     if substr (xbuf, scan_start + break - 1, 1) = HT
+		     then fsb.kol = fsb.kol + 10 - divide (fsb.kol, 10, 21, 0);
+		     else if substr (xbuf, scan_start + break - 1, 1) = NL
+			then fsb.kol = 0;
+
+						/* determine whether we have a bit string */
+		     if break = 2			/* exactly one char after trailing quote */
+		     then if substr (xbuf, scan_start, 1) = "b"	/* and that char is "b" */
+			then do;
+			     RADIX_FACTOR = 1;
+			     BIT_STRING = "1"b;
+			     end;
+
+						/* determine whether we have a radix-n (n=2,4,8,16) bit string */
+		     if break = 3			/* exactly two characters after the trailing quote */
+		     then do;
+			     RADIX_FACTOR = index ("1234", substr (xbuf, scan_start + 1, 1));
+
+			     if substr (xbuf, scan_start, 1) = "b" & RADIX_FACTOR ^= 0
+			     then BIT_STRING = "1"b;
+
+			end;
+
+		     fsb.bnc = scan_start + break;	/* step over scanned chars and over delim */
+
+		     if break > 1			/* if trailing stuff after closing quote... */
+		     then do;
+			     if token_start > 0	/* ...and not yet copied */
+			     then do;		/* ...copy it now. */
+				     token_string = substr (xbuf, token_start, token_length);
+				     token_start = 0;
+				end;
+
+			     /* At this point, token_string contains the (unquoted) portion of the
+			        input item that was originally quoted, and substr (xbuf, scan_start, break - 1)
+			        contains the portion of the input item that appeared after the quoted part
+			        and before the delimiter. */
+
+			     if ^BIT_STRING
+			     then do;			/* unknown text immediately follow closing quote of a character string */
+				     erno = 167;
+				     call conversion_error;
+				end;
+
+			end;
+		end;				/* end quoted string section */
+	     else do;				/* scan an unquoted input item */
+		     scan_start = fsb.bnc;
+		     token_start = scan_start;	/* token starts at first char */
+		     token_length = 0;
+
+find_break_nq:
+		     scan_index = search (substr (xbuf, scan_start, fsb.blc - scan_start + 1), HT_NL_SP_comma);
+		     if scan_index = 0                  /* token ends at the end of buffer */
+		     then do;
+			     if token_start > 0	/* if not copied, copy & concatenate */
+			     then do;
+				     token_string = substr (xbuf, token_start, fsb.blc - token_start + 1);
+				     token_start = 0;
+				end;
+			     else token_string = token_string || substr (xbuf, scan_start, fsb.blc - scan_start + 1);
+
+			     fsb.bnc = fsb.bnc + fsb.blc - scan_start + 1;   /* step over token */
+			     call refill_buffer_ldi;
+			     if code ^= 0
+			     then go to finish;	/* not an error -- normal termination */
+
+			     scan_start = 1;
+			     go to find_break_nq;
+			end;
+
+		     fsb.kol = fsb.kol + scan_index - 1;	/* update kol but not scan_start yet */
+
+		     if substr (xbuf, scan_start + scan_index - 1, 1) = HT
+		     then fsb.kol = fsb.kol + 10 - divide (fsb.kol, 10, 21, 0);
+		     else if substr (xbuf, scan_start + scan_index - 1, 1) = NL
+			then fsb.kol = 0;
+
+		     if token_start > 0
+		     then token_length = token_length + scan_index - 1;
+		     else token_string = token_string || substr (xbuf, scan_start, scan_index - 1);
+
+		     fsb.bnc = scan_start + scan_index;	/* step over scanned chars & delim */
+		end;
+
+	if substr (xbuf, fsb.bnc - 1, 1) = ","		/* item terminated by comma? */
+	then fsb.lsep = 1;				/* yes...next comma means null item */
+	else fsb.lsep = 2;				/* no....next comma is ignored */
+
+/* We have now parsed the input item....convert it to the type of the target */
+
+finish:
+	if token_start > 0				/* token has not been copied */
+	then do;
+		intype = char_desc * 2;
+		in_ptr = addr (buffer_array (token_start));	/* use substraddr when available! */
+		inscale_prec = token_length;
+
+		if token_length > max_io_string_length
+		then go to err172;
+
+	     end;
+	else if BIT_STRING
+	     then do;
+
+		     if length (token_string) > max_io_string_length
+		     then go to err172;
+
+		     if RADIX_FACTOR = 1		/* radix-2 bit string - no radix conversion necessary */
+		     then do;
+			     bit256 = bit (token_string);
+			     intype = v_bit_desc * 2;
+			     in_ptr = addr (bit256);
+			     inscale_prec = length (bit256);
+			end;
+		     else do;			/* radix-4, 8, or 16 bit string - radix conversion necessary */
+
+			     if length (token_string) * RADIX_FACTOR > max_io_string_length
+			     then go to err171;
+
+			     if RADIX_FACTOR = 4	/* radix-16 bit string - are hexadecimal digits upper or lower case */
+			     then if search (token_string, capital_hex) > 0
+				then substr (digits (4), 11, 6) = capital_hex;
+				else substr (digits (4), 11, 6) = lower_case_hex;
+
+			     bit256 = ""b;
+
+			     do convert_index=1 to length(token_string);	/* convert from radix-n to radix-2 */
+				rn_digit = substr (token_string, convert_index, 1);
+				rn_value = index (digits (RADIX_FACTOR), rn_digit);
+
+				if rn_value = 0
+				then do;
+					onchar_index = convert_index;
+					erno = 168;
+					error_string = token_string;
+					call conversion_error_for_RADIX_N;
+					go to finish;		/* retry conversion with value returned from on unit */
+				     end;
+
+				first_bit = RADIX_FACTOR * (rn_value - 1) + 1;
+				bit256 = bit256 || substr (expand_bits (RADIX_FACTOR), first_bit, RADIX_FACTOR);
+			     end;
+
+			     intype = v_bit_desc * 2;
+			     in_ptr = addr (bit256);
+			     inscale_prec = length (bit256);
+			end;
+		end;
+	     else do;
+		     intype = v_char_desc * 2;
+		     in_ptr = addr (token_string);
+		     inscale_prec = length (token_string);
+
+		     if length (token_string) > max_io_string_length
+		     then go to err172;
+
+		end;
+
+	ps.vp = ps.value_p;
+	ps.descr = ps.descriptor;
+
+	if ps.descr = "0"b
+	then do;
+	     pic_ptr = psp -> ps.stack_frame_p -> pl1_stack_frame.text_base_ptr;
+	     pic_ptr = addrel (pic_ptr, psp -> ps.top_half);
+
+/* The following block of code should be similiar to or
+   identical with the int. subroutine "set_pic_args" in plio2_qge.	*/
+
+	     outtype = type (pic_ptr -> picture_image.type);
+	     outfo.outscale = pic_ptr -> picture_image.scale - pic_ptr -> picture_image.scalefactor;
+	     if outtype = char_desc * 2
+	     then outfo.outprec = pic_ptr -> picture_image.varlength;
+	     else outfo.outprec = pic_ptr -> picture_image.prec;
+
+/* end of "set_pic_args"  	*/
+
+	     call assign_ (addr (pic_buf), outtype, outscale_prec, in_ptr, intype, inscale_prec);
+	     call pack_picture_ (ps.value_p -> char1, pic_ptr -> char1, addr (pic_buf) -> char1);
+	end;
+	else do;
+	     unspec (desc_) = unspec (ps.descr);
+	     outtype = desc_.type_ * 2 + binary (desc_.pack_, 1);
+
+	     if outtype = v_char_desc * 2 | outtype = v_bit_desc * 2
+	     then targ_ptr = addrel (ps.value_p, -1);
+	     else targ_ptr = ps.value_p;
+
+	     outfo.outscale = desc_.scale_;
+	     outfo.outprec = desc_.precision_;
+	     call assign_ (targ_ptr, outtype, outscale_prec, in_ptr, intype, inscale_prec);
+	     end;
+
+no_assign:				/* target of go to in conversion_error - transfer here when input item is to be left unchanged */
+	return;
+
+raise_eof:
+	if  ^ ps.string
+	then do;
+	     call plio2_signal_$s_r_ (psp, "endfile", "quick_get_list", 163);
+	     return;
+	     end;
+
+err163:
+	if ps.string
+	     then erno = 162;			/* the string supplied with string option	*/
+						/* has insufficient data for this get statement.	*/
+	     else erno = 163;			/* end_of_file encountered while executing get statement.	*/
+	go to any_err;
+
+
+err171:
+	erno=171;					/* radix-factor bit string has a expanded length that exceeds 256 bits */
+	go to any_err;
+
+err172:
+	erno=172;					/* string whose length exceeds 256 not handled by plio2_ */
+
+any_err:
+	call plio2_signal_$s_r_ (psp, "ERROR", "quick_get_list", erno);
+	return;
+
+/* The following procedure refills the buffer and returns with code = 0
+   if all went well, otherwise either raises an error itself or
+   returns with a non-zero value of code, depending on AG-94's defined action.	 */
+
+refill_buffer_ldi:
+	procedure;
+
+	     if ps.copy
+	     then do;
+		     call put_copy_ (psp, fsb.blc);
+		     ps.start_copy = 1;
+		end;
+
+	     if ps.string
+	     then do;
+		code = error_table_$end_of_info;
+		return;
+		end;
+
+	     fsb.blc = 0;	/* protects us somewhat from quit-start */
+	     fsb.bnc = 1;	/* .. */
+
+	     if fsb.console
+	     then call iox_$get_line (iocbp, fsb.bptr, fsb.bsize, fsb.blc, code);
+	     else call iox_$get_chars (iocbp, fsb.bptr, fsb.bsize, fsb.blc, code);
+
+	     fsb.bnc = 1;
+
+	     if code ^= 0
+	     then if (code = error_table_$short_record) | (code = error_table_$long_record)
+		then code = 0;
+		else if code ^= error_table_$end_of_info
+		     then do;
+			     call plio2_signal_$s_ (psp, "TRANSMIT", "quick_get_list", 153);
+			     return;
+			end;
+	     return;
+
+	end /* refill_buffer_ldi */;
+
+/* The following procedure processes conversion errors encountered during The execution
+   of get list statements.  It also validates the corrected onsource string and raises the conversion
+   condition again if necessary.	*/
+
+conversion_error:
+	procedure;
+
+	     /* AG94 (and ANSI) says raise conversion here. But since we have
+	        not been saving the original input string (in the interests
+	        of speed), we have to reconstruct it. Ugh. */
+
+	     error_string = QUOTE;
+	     do scan_index = 1 to length (token_string);
+		if substr (token_string, scan_index, 1) = QUOTE
+		then error_string = error_string || QUOTE;
+
+		error_string = error_string || substr (token_string, scan_index, 1);
+	     end;
+	     error_string = error_string || QUOTE;
+	     error_string = error_string || substr (xbuf, scan_start, break - 1);
+
+	     if substr (xbuf, scan_start, 1) = "b"	/* "..."b... ??? */
+	     then break = break - 1;	/* set onchar to char after b */
+
+	     onchar_index = length (error_string) - break + 2;
+
+conversion_error_for_RADIX_N:
+	entry;
+
+raise_conversion:
+	     call plio2_signal_$conversion_error_ (psp, "quick_get_list",
+		erno, addrel (addr (error_string), 1), 1, length (error_string),
+		onchar_index);
+
+	     if erno = 168
+	     then do;			/* radix conversion error occurred - go back */
+		     token_string = error_string;
+		     return;
+		end;
+
+	     /* Now check the returned onsource of validity. */
+
+	     if substr (error_string, 1, 1) = QUOTE
+	     then do;
+		     error_string = rtrim (error_string);	/* ignore white space to the right fo quoted string */
+		     if substr (error_string, length (error_string) - 1, 2) = """b"
+		     then do;
+		          BIT_STRING = "1"b;
+			RADIX_FACTOR = 1;
+		          token_string = substr (error_string, 2,
+		     	length (error_string) - 3);
+		     end;
+		     else if substr (error_string, length (error_string), 1) = QUOTE
+		     then do;
+		     	BIT_STRING = "0"b;
+		     	token_string = "";
+		     	do scan_index = 2 to length (error_string) - 1;
+		     	     if substr (error_string, scan_index, 1) = QUOTE
+		     	     then do;
+		     		     scan_index = scan_index + 1;
+		     		     if substr (error_string,
+		     			scan_index, 1) ^= QUOTE
+		     		     then do;
+		     			     onchar_index = scan_index;
+		     			     go to raise_conversion;
+		     			end;
+		     		end;
+
+		     	     token_string = token_string || substr (
+		     		error_string, scan_index, 1);
+		     	end;
+
+		     	if token_string = ""
+		     	then go to no_assign;	/* null item...no assign */
+
+		          end;
+		     else if substr (error_string, length (error_string) - 2, 2) = """b"
+		          then do;
+		     	     RADIX_FACTOR = index ("1234", substr (error_string, length (error_string), 1));
+		     	     if RADIX_FACTOR ^= 0
+		     	     then do;
+		     		     BIT_STRING = "1"b;
+		     		     token_string = substr (error_string, 2, length (error_string) - 4);
+		     		end;
+		     	     else do;
+		     		     onchar_index = length (error_string);
+		     		     go to raise_conversion;
+		     		end;
+		     	end;
+			else do;
+			     onchar_index = length (error_string) -
+				index (reverse (error_string), QUOTE) + 2;
+
+			     if onchar_index < length (error_string)
+			     then if substr (error_string, onchar_index, 1) = "b"
+				then do;
+					onchar_index = onchar_index + 1;
+					if onchar_index < length (error_string)
+					then if index ("1234", substr (error_string, onchar_index, 1)) ^= 0
+					     then onchar_index = onchar_index + 1;
+				     end;
+
+			    go to raise_conversion;
+			    end;
+		end;
+	     else if error_string = ""
+		then do;
+			onchar_index = 1;
+			go to raise_conversion; /* onsource cannot be blanks */
+		     end;
+		else do;				/* onsource OK */
+			BIT_STRING = "0"b;
+			token_string = error_string;
+		     end;
+
+	end /* conversion_error */;
+
+
+     end /* plio2_gvl_ */;

@@ -1,0 +1,297 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright (c) 1986 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+     audit(86-03-08,CLJones), install(86-07-18,MR12.0-1098):
+     Support IMU.
+  2) change(86-06-04,Hartogs), approve(86-06-04,MCR7383),
+     audit(86-06-05,Coppola), install(86-07-18,MR12.0-1098):
+     Changed to use version constant in rcp_printer_info.incl.pl1.
+                                                   END HISTORY COMMENTS */
+/* format: style4 */
+/* PRTDIM_ATTACH - Attach/Detach module for the printer DIM.
+   coded 10/30/74 by Noel I. Morris	*/
+/* Modified: 27 November 1981 by G. Palter to clear new reload_vfc_train_when_ready flag */
+/* Modified September 1983 by E. N. Kittlitz for multi-record IDCWs */
+/* Modified October 1983 by E. N. Kittlitz for eurc/urmpc partitioning */
+/* Modified January 1985 by Paul Farley for UR-DAI&UR-PDSI IPCs to look like eurc. */
+
+prtdim_attach:					/* attach a printer */
+     procedure (stream_name, prt, device, mode, iostatus, sdb_ptr);
+
+dcl  stream_name char (*);				/* name of IO stream */
+dcl  prt char (*);					/* name of DIM being attached */
+dcl  device char (*);				/* printer device name */
+dcl  mode char (*);					/* attachment mode */
+dcl  iostatus bit (72) aligned;			/* IOS status */
+dcl  i fixed bin;
+dcl  area_ptr ptr;					/* pointer to system free area */
+dcl  listen_based_area area ((16374)) based (area_ptr);	/* area in which to allocate sdb */
+dcl  wksp_max fixed bin (19);				/* max size of IOI workspace buffer */
+dcl  time_max fixed bin (52);				/* max time for IOI connect to complete */
+dcl  rcp_state fixed bin;				/* state variable from check_attach */
+dcl  rcode fixed bin (35);				/* error code */
+dcl  char_cnt fixed bin (18);
+
+dcl  1 ipc_message aligned like event_call_info;
+dcl  1 rcp_info like printer_info aligned auto;		/* automatic copy of RCP info structure */
+
+dcl  CR char (1) init ("") int static options (constant);
+
+dcl  get_system_free_area_ entry (ptr);
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  rcp_$attach entry (char (*), ptr, fixed bin (71), char (*), bit (36) aligned, fixed bin (35));
+dcl  rcp_$check_attach entry (bit (36) aligned, ptr, char (*), fixed bin, fixed bin (19), fixed bin (52),
+	fixed bin, fixed bin (35));
+dcl  init_printer_$reset entry (ptr);
+dcl  ioi_$set_status entry (fixed bin, fixed bin (18), fixed bin (8), fixed bin (35));
+dcl  ioi_$workspace entry (fixed bin, ptr, fixed bin (18), fixed bin (35));
+dcl  rcp_$detach entry (bit (36) aligned, bit (*), fixed bin, char (*), fixed bin (35));
+dcl  prt_conv_ entry (ptr, fixed bin (18), ptr, fixed bin (18), ptr);
+dcl  prtdim_util$init entry (ptr, fixed bin (35));
+dcl  prtdim_eurc_util$init entry (ptr, fixed bin (35));
+dcl  prtdim_eurc_util$initialize_workspace entry (ptr);
+dcl  prtdim_util$load_vfc entry (ptr, fixed bin (35));
+dcl  prtdim_eurc_util$load_vfc entry (ptr, fixed bin (35));
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+dcl  config_$find entry (char (4) aligned, ptr);
+dcl  config_$find_periph entry (char (4) aligned, ptr);
+
+dcl  error_table_$bigarg fixed bin (35) ext static;
+dcl  error_table_$ionmat fixed bin (35) ext;
+dcl  error_table_$no_room_for_dsb fixed bin (35) ext;
+dcl  error_table_$no_operation fixed bin (35) ext;
+dcl  config_deck$ ext;
+
+dcl  (addr, addrel, null, ptr, rel, substr, unspec) builtin;
+%page;
+
+	iostatus = "0"b;				/* Clear returned status. */
+	if sdb_ptr ^= null () then do;		/* Check for multiple attachments */
+	     substr (iostatus, 1, 36) = unspec (error_table_$ionmat); /* If multiple attachment return code */
+	     go to exit;
+	end;					/* End sdb_ptr not null do group */
+
+	call get_system_free_area_ (area_ptr);		/* Get ptr to area in listen_ before alloc */
+	allocate sdb in (listen_based_area) set (sdb_ptr);/* Create stream data block */
+	if sdb_ptr = null then do;			/* If this - then no room for sdb */
+	     substr (iostatus, 1, 36) = unspec (error_table_$no_room_for_dsb); /* Send message */
+	     go to exit;				/* Exit */
+	end;					/* End sdb_ptr null do group */
+
+	sdb.areap = area_ptr;			/* Save pointer to free area. */
+
+	outer_module_name = prt;			/* Put name this outer module in sdb */
+	device_name_list_ptr = addr (sdb.device_name);	/* Set pointer */
+	next_device_ptr = null;			/* Only one device allowed */
+	name_size = 32;				/* Set name size */
+	sdb.name = device;				/* Put attached device name in sdb */
+	sdb.stream_name = stream_name;		/* record the name of this attachment */
+
+	call ipc_$create_ev_chn (sdb.evchan, rcode);	/* Create event channel so that the supervisor
+						   knows who to wake when we are blocked */
+	if rcode ^= 0 then do;
+	     call convert_ipc_code_ (rcode);
+	     go to free1;
+	end;
+	ev_list.count = 1;				/* Set count in event list. */
+
+	pip = addr (sdb.info);			/* Get pointer to printer info. */
+	prt_info.devname = substr (sdb.name, 1, 4);	/* Set device name in structure. */
+
+	printer_info_ptr = addr (rcp_info);		/* Get pointer to RCP info for printer. */
+	rcp_info.version_num = PRINTER_INFO_VERSION_1;			/* Set up the RCP info structure. */
+	rcp_info.usage_time = 0;			/* Don't know how long we'll use printer. */
+	rcp_info.wait_time = 0;			/* We are not willing to wait. */
+	rcp_info.system_flag = "0"b;			/* Not system process. */
+	rcp_info.device_name = substr (sdb.name, 1, 8);	/* Set device name. */
+
+	call rcp_$attach ("printer", printer_info_ptr, sdb.evchan, "", rcp_id, rcode);
+	if rcode ^= 0 then go to free;		/* Attempt to attach the printer. */
+
+check:	call rcp_$check_attach (rcp_id, printer_info_ptr, "", prt_info.devx, wksp_max, time_max,
+	     rcp_state, rcode);			/* Check on progress of attachment. */
+	if rcode ^= 0 then go to free;
+
+	go to attach_state (rcp_state);		/* Dispatch on state variable. */
+
+attach_state (1):					/* Short wait needed */
+	call ipc_$block (addr (sdb.ev_list), addr (ipc_message), rcode);
+	if rcode ^= 0 then do;			/* Wait for attachment to complete. */
+	     call convert_ipc_code_ (rcode);
+	     go to free;
+	end;
+	go to check;				/* Perform check again. */
+
+attach_state (2):					/* long wait */
+attach_state (3):					/* error occurrence */
+	go to free;				/* This is an error condition. */
+
+attach_state (0):					/* Successful attachment */
+	prt_info.model = rcp_info.model;		/* Extract info from RCP info structure. */
+	prt_info.train = rcp_info.print_train;
+	prt_info.line_length = rcp_info.line_length;
+
+	call set_mpc_type;
+	if ^sdb.flags.eurc then wksp_max = 1024;	/* old URMPC dim */
+	else wksp_max = min (2048, wksp_max);		/* biggest we'll ever want */
+	sdb.data_end = wksp_max;			/* first approximation of circular dataspace end */
+	call ioi_$workspace (prt_info.devx, sdb.wsegp, (wksp_max), rcode); /* To wire down space for DCW list */
+	if rcode ^= 0 then go to free;		/* Check error code */
+
+	if sdb.flags.eurc then do;			/* fancy dim, more initializing */
+	     sdb.max_dcw_size = 65;			/* should calculate what prt_conv_ would do */
+	     if wksp_max < 2048 then sdb.max_dcws, sdb.n_dcws = 32; /* about 2 seconds/buffer at 1000LPM */
+	     else sdb.max_dcws, sdb.n_dcws = 62;	/* 1 less than idcw max */
+	     sdb.max_buffers, sdb.n_buffers = 3;
+	     prt_bufferp = addr (prt_buffers (0));
+	     sdb.data_end = sdb.data_end - size (null () -> istat);
+	     call ioi_$set_status (prt_info.devx, (sdb.data_end), 1, rcode);
+	     if rcode ^= 0 then go to free;
+	     sdb.status_ptr = ptr (wsegp, sdb.data_end);
+	     sdb.data_end = sdb.data_end - 1;		/* keep one word for prtdim_eurc_util$finish_abort */
+	     sdb.data_begin, sdb.bgin, sdb.stop = size (prt_buffers);
+	     sdb.b_begin, sdb.b_stop = 0;
+	     call prtdim_eurc_util$init (sdb_ptr, rcode); /* Initialize printer information. */
+	     if rcode ^= 0 then go to free;		/* If unable to initialize printer ... */
+	     pcip = addr (sdb.conv_info);
+	     call prt_conv_ (addr (CR), 1, wsegp, char_cnt, pcip); /* for prtdim_eurc_util$finish_abort */
+	     if char_cnt > 4 then do;			/* we only have 1 word to spare for this */
+		rcode = error_table_$bigarg;
+		go to free;
+	     end;
+	     sdb.null_line_data = wseg (0);		/* remember it, always */
+	     dcwp = addr (sdb.null_line_dcw);		/* make the 'null' dcw */
+	     string (dcw) = ""b;
+	     dcw.address = bit (sdb.data_end);		/* 1 word between end of data and ioi status area */
+	     dcw.tally = bit (bin (1, 12), 12);		/* 1 word, that is to say 1 */
+	     call init_printer_$reset (pcip);		/* clear any line/page count caused by above */
+	     if mode ^= "save_vfc" then do;
+		call prtdim_eurc_util$load_vfc (sdb_ptr, rcode);
+		if rcode = error_table_$no_operation then rcode = 0;
+		else if rcode ^= 0 then go to free;	/* load error */
+	     end;
+	end;					/* EURC */
+	else do;
+	     sdb.data_begin, sdb.bgin, sdb.stop = 0;
+	     call prtdim_util$init (sdb_ptr, rcode);	/* Initialize printer information. */
+	     if rcode ^= 0 then go to free;		/* If unable to initialize printer ... */
+	     if mode ^= "save_vfc" then do;		/* are we to load a vfc now? */
+		call prtdim_util$load_vfc (sdb_ptr, rcode); /* data is in  sdb.conv_info */
+		if rcode = error_table_$no_operation then rcode = 0;
+		else if rcode ^= 0 then go to free;	/* load error */
+	     end;
+	end;
+
+	idcwp = addr (prt_info.print_idcw);		/* Get pointer to IDCW for printing. */
+	if sdb.flags.eurc then idcw.control = "00"b;	/* no continue or marker in IDCW. */
+	else idcw.control = "10"b;			/* continue */
+
+	sdb.prev = 0;				/* Initialize DCW list pointers. */
+	sdb.wait_flag = "0"b;			/* Reset waiting for special flag. */
+	sdb.running = "0"b;				/* Indicate channel not running. */
+	sdb.marker_count = 0;			/* Clear the marker status counter. */
+	sdb.paper_low = "0"b;			/* Reset paper low flag. */
+	sdb.error_count = 0;			/* Clear the error counter. */
+	sdb.reload_vfc_train_after_special = "0"b;	/* Reset request to reload VFC/train after a special */
+	sdb.chars_printed = 0;
+	sdb.aborting = "0"b;
+	sdb.version = 1;
+
+	if sdb.flags.eurc then
+	     call prtdim_eurc_util$initialize_workspace (sdb_ptr); /* setup buffer headers, etc. */
+
+	return;					/* All finished. */
+
+%page;
+
+free:
+free1:	substr (iostatus, 1, 36) = unspec (rcode);	/* Return error code. */
+
+	go to detach;				/* try to clean up, but retain this error code */
+						/* Drop into normal detach code. */
+
+
+prtdim_detach: entry (sdb_ptr, device, mode, iostatus);	/* Detach entry point */
+
+	iostatus = "0"b;				/* clear the status code */
+
+detach:	call timer_manager_$reset_alarm_wakeup (sdb.evchan);
+	call ipc_$delete_ev_chn (sdb.evchan, rcode);	/* Delete event channel */
+	if rcode ^= 0 then if substr (iostatus, 1, 36) = "0"b then do;
+		call convert_ipc_code_ (rcode);
+		substr (iostatus, 1, 36) = unspec (rcode);
+	     end;
+
+	pip = addr (sdb.info);			/* Get pointer to info structure. */
+
+	call rcp_$detach (rcp_id, "0"b, error_count, "", rcode);
+	if rcode ^= 0 then				/* Attempt to detach the device. */
+	     if substr (iostatus, 1, 36) = "0"b then	/* report error if none exists */
+		substr (iostatus, 1, 36) = unspec (rcode); /* Put error code in return status */
+
+	area_ptr = sdb.areap;			/* Get pointer to area. */
+	free sdb in (listen_based_area);		/* Free-up allocated sdb */
+
+exit:	substr (iostatus, 52, 1) = "1"b;		/* Set ioname detached bit */
+	substr (iostatus, 41, 1) = "1"b;		/* Set transaction terminated bit */
+	return;
+
+%page;
+/* determine the type of MPC through which we are talking.  */
+
+set_mpc_type: proc;
+
+	call config_$find_periph (substr (sdb.name, 1, 4), prph_prt_cardp);
+	if prph_prt_cardp = null then return;		/* oh, well */
+	mpc_cardp = null;
+	do while ("1"b);
+	     call config_$find ("mpc", mpc_cardp);	/* next MPC card */
+	     if mpc_cardp = null then do;
+
+/* If no MPC card found for this device, assume that it is connected to
+   a IPC controller, that works like the EURC. */
+
+		sdb.flags.eurc = "1"b;
+		return;
+	     end;
+	     if mpc_card.port (1).iom = prph_prt_card.iom & /* an eurc only has one port... */
+		mpc_card.port (1).chan <= prph_prt_card.chan &
+		prph_prt_card.chan < mpc_card.port (1).chan + mpc_card.port (1).nchan then do;
+		do i = 1 to hbound (eurc_model_numbers, 1);
+		     if mpc_card.model = eurc_model_numbers (i) then do;
+			sdb.flags.eurc = "1"b;
+			return;
+		     end;				/* it's an eurc */
+		end;				/* checking model number */
+		return;
+	     end;					/* channel belongs to this MPC */
+	end;					/* while "1"b */
+
+     end set_mpc_type;
+
+/* format: off */
+%page; %include config_mpc_card;
+%page; %include config_prph_prt_card;
+%page; %include eurc_model_numbers;
+%page; %include event_call_info;
+%page; %include ioi_stat;
+%page; %include iom_dcw;
+%page; %include iom_pcw;
+%page; %include prt_sdb;
+%page; %include prt_info;
+%page; %include prt_conv_info;
+%page; %include rcp_printer_info;
+
+     end prtdim_attach;

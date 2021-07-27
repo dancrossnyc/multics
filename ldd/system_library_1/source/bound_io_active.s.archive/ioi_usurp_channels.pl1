@@ -1,0 +1,376 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+/*
+   Rewritten May 1983 by Chris Jones.
+   Modified January 1984 by Chris Jones for IOM reconfiguration.
+*/
+
+/* This procedure is responsible for managing the sharing of disk subsystem
+   channels between page control and the I/O Interfacer.  When channels are
+   needed for IOI operation, they are taken away from page control.  When
+   IOI no longer needs the channels, they are given back to page control. */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+ioi_usurp_channels:
+     proc;
+
+dcl	p_code		   fixed bin (35);		/* (O) error code */
+dcl	p_ctep		   ptr;			/* (I) pointer to channel table entry */
+dcl	p_dtep		   ptr;			/* (I) pointer to device table Entry */
+dcl	p_gtep		   ptr;			/* (I) group table entry pointer */
+
+dcl	ctep_to_retain	   ptr;			/* never cede this channel */
+dcl	max_chan_count	   fixed bin;		/* maximum number of channels to use */
+dcl	mcp		   ptr;			/* pointer to MPC config card */
+dcl	required		   bit (1) aligned;		/* "1"b if specific channel required */
+dcl	statusp		   ptr;			/* pointer to where io_manager stuffs status */
+dcl	used_chan_count	   fixed bin;		/* count of channels in use by IOI */
+dcl	usurped		   bit (1) aligned;		/* "1"b if channel successfully usurped */
+
+dcl	config$find_2	   entry (char (4) aligned, char (4) aligned, ptr);
+dcl	disk_control$usurp_channel
+			   entry (fixed bin (8), fixed bin (35), bit (1) aligned, fixed bin (35), ptr);
+dcl	disk_control$cede_channel
+			   entry (fixed bin (8), fixed bin (35), fixed bin (35), ptr);
+dcl	ioi_config$find_controller_card
+			   entry (char (8) aligned) returns (ptr);
+dcl	ioi_masked$getwork_channel
+			   entry (ptr);
+dcl	ioi_masked$quiesce_channel
+			   entry (ptr);
+dcl	error_table_$no_operation
+			   fixed bin (35) ext;
+
+dcl	(max, min, null, ptr, rel)
+			   builtin;
+
+assign:
+     entry (p_gtep, p_code);				/* entry to usurp enough channels */
+
+	p_code = 0;
+	gtep = p_gtep;
+	required = "0"b;				/* we'll take any channel */
+
+	used_chan_count = cur_chans ();		/* get count of channels currently usurped */
+	max_chan_count = max_chans ();		/* get maximum number to usurp */
+	do while (used_chan_count < max_chan_count);	/* try to usurp enough channels */
+	     usurped = "0"b;			/* no channel usurped as yet */
+	     call walk_channels (usurp_unused);		/* usurp an unused channel */
+	     if ^usurped then
+		max_chan_count = 0;			/* stop if no usurpable channel usurped */
+	end;
+
+	if (used_chan_count <= 0) & (gte.n_devices > 0) then
+						/* if no channel was found ... */
+	     p_code = error_table_$no_operation;
+	return;
+
+/* Routine to usurp exactly one channel.  It is called by walk_channels, and only usurps if no channel has been
+   usurped during this walk (i.e. if the variable "usurped" isn't set). */
+
+usurp_unused:
+     proc;
+
+	if ^usurped then				/* if no channel usurped as yet ... */
+	     if ^(cte.ioi_use | cte.deleted | cte.deleting) then
+						/* if channel not already in use ... */
+		call usurp_chan;			/* try to grab it */
+
+     end usurp_unused;
+
+
+/* Entry to cede channels back to disk control when a channel is unassigned. */
+
+unassign:
+     entry (p_gtep, p_code);
+
+	ctep_to_retain = null ();
+	p_code = 0;
+	gtep = p_gtep;
+	if gte.suspend_devices then
+	     return;				/* cannot cede channels if controller suspended */
+
+unassign_join:
+	used_chan_count = cur_chans ();		/* get count of channels currently usurped */
+	max_chan_count = max_chans ();		/* get maximum number to usurp */
+	do while (used_chan_count > max_chan_count);	/* give back excess channels */
+	     usurped = "1"b;			/* no cedable channel ceded as yet */
+	     call walk_channels (cede_used);		/* give back one used channel */
+	     if usurped then
+		return;				/* return if no candidate found */
+	end;
+
+	return;
+
+/* Routine to cede exactly one cedable channel.  It works like "usurped_unused", only backwards. */
+cede_used:
+     proc;
+
+	if (ctep ^= ctep_to_retain)			/* if not holding on to this channel */
+	     & usurped				/* if no channel ceded as yet ... */
+	     & cte.ioi_use				/* if this channel is in use ... */
+	     & ^(cte.deleted | cte.deleting)		/* ...for real */
+	     & (^test_chan_req ()) then do;		/* if no device requires this channel ... */
+	     call cede_chan;			/* give up the channel */
+	     usurped = "0"b;			/* found channel to cede */
+	end;
+
+test_chan_req:
+	proc returns (bit (1) aligned);		/* internal proc to see if channel required */
+
+dcl	chan_req		   bit (1) aligned;
+
+	     chan_req = "0"b;			/* set if some device requires this channel */
+	     call walk_devices (test_req);		/* test each device */
+	     return (chan_req);
+
+/* sets chan_req if the given channel is required by the given device (where the given entities are pointed to
+   by ctep and dtep respectively). */
+
+test_req:
+	     proc;
+
+		if dte.channel_required = cte.chanid then
+		     chan_req = "1"b;		/* set bit if channel is required */
+
+	     end test_req;
+
+	end test_chan_req;
+
+     end cede_used;
+
+/* Entry to usurp a given channel. */
+
+required:
+     entry (p_ctep, p_code);
+
+	p_code = 0;
+	ctep = p_ctep;
+
+	gtep = ptr (ctep, cte.gtep);			/* get pointer to group table entry */
+	if gte.suspend_devices then do;		/* cannot do this if controller suspended */
+	     p_code = error_table_$no_operation;
+	     return;
+	end;
+
+	required = "1"b;				/* we need this specific channel */
+	usurped = "0"b;
+	do while (^usurped);
+	     ctep = p_ctep;				/* grab desired channel, now */
+	     call usurp_chan;
+
+	     if ^usurped then do;			/* if we did not get desired channel ... */
+		if cte.deleting then do;		/* can't give any back since we're about to lose this one */
+		     p_code = error_table_$no_operation;
+		     return;
+		end;
+		usurped = "1"b;			/* no channel to cede found yet */
+		call walk_channels (cede_used);	/* cede one channel */
+		if usurped then do;			/* if no other candidate for ceding ... */
+		     p_code = error_table_$no_operation;
+		     return;
+		end;
+	     end;					/* now try again */
+	end;
+
+	ctep_to_retain = ctep;
+	goto unassign_join;				/* cede excess channels */
+/****	never returns	****/
+
+
+ioi_usurp_channels$suspend:
+     entry (p_dtep, p_gtep, p_code);
+
+	p_code = 0;
+	dtep = p_dtep;
+	gtep = p_gtep;
+	required = "1"b;				/* specific channels are required */
+
+	mcp = ioi_config$find_controller_card (dte.channel_required);
+						/* Get pointer to MPC card for this channel. */
+
+	if test_other_controller () then do;		/* No channels may be required for other controller. */
+	     p_code = error_table_$no_operation;
+	     return;
+	end;
+
+	call walk_channels (usurp_controller);		/* Grab all channels on this controller. */
+
+	return;
+
+
+
+test_other_controller:
+     proc returns (bit (1) aligned);
+
+dcl	other_controller	   bit (1) aligned init ("0"b);
+						/* set to "1"b if channel on other controller required */
+
+
+	call walk_devices (test_controller);		/* See if any device requires other controller. */
+
+	return (other_controller);			/* Return bit setting. */
+
+
+
+test_controller:
+	proc;
+
+	     if dte.channel_required ^= "" then		/* If this device requires a channel ... */
+		if mcp ^= ioi_config$find_controller_card (dte.channel_required) then
+		     other_controller = "1"b;		/* Channel should be on same controller. */
+
+	     return;
+
+
+	end test_controller;
+
+     end test_other_controller;
+
+
+usurp_controller:
+     proc;
+
+dcl	same_controller	   bit (1) aligned;		/* "1"b if two channels share same MPC */
+
+	same_controller = (mcp = ioi_config$find_controller_card (cte.chanid));
+
+	if cte.ioi_use then				/* If channel already in use ... */
+	     if ^same_controller then			/* If channel on another MPC ... */
+		call cede_chan;			/* Give it up. */
+	     else ;
+	else					/* If channel not in use ... */
+	     if same_controller & ^cte.deleted then do;	/* If channel on this MPC ... */
+	     call usurp_chan;			/* Usurp it now. */
+	     if ^usurped then
+		goto suspend_failure;		/* Abort everything if channel not available. */
+	end;
+
+	return;
+
+
+     end usurp_controller;
+
+
+
+suspend_failure:
+	call unassign (gtep, p_code);			/* Adjust usurped channels properly. */
+
+	p_code = error_table_$no_operation;		/* Couldn't get desired channel on controller. */
+
+	return;
+
+
+max_chans:
+     proc returns (fixed bin);
+
+	call config$find_2 ("udsk", gte.name, udsk_cardp);/* Search for UDSK card. */
+	if udsk_cardp ^= null () then			/* If card found ... */
+	     return (min (max (udsk_card.nchan, 1), gte.n_devices));
+						/* Allow at least one channel. */
+	else					/* Otherwise ... */
+	     return (min (gte.n_devices, 1));		/* Usurp only one channel. */
+
+
+     end max_chans;
+
+
+
+cur_chans:
+     proc returns (fixed bin);
+
+dcl	count		   fixed bin;		/* count of usurped channels */
+
+
+	count = 0;				/* Initialize count. */
+
+	call walk_channels (count_used);		/* Count all usurped channels. */
+
+	return (count);				/* And return the count. */
+
+
+
+count_used:
+	proc;
+
+	     if cte.ioi_use then			/* Count surped channels. */
+		count = count + 1;
+
+
+	end count_used;
+
+     end cur_chans;
+
+
+walk_channels:
+     proc (examine_channel);
+
+dcl	examine_channel	   entry;
+
+	do ctep = ptr (gtep, gte.ctep) repeat ptr (gtep, cte.next_ctep) while (rel (ctep) ^= ""b);
+	     call examine_channel;			/* check out channel. */
+	end;
+
+     end walk_channels;
+
+walk_devices:
+     proc (examine_device);
+
+dcl	examine_device	   entry;
+
+dcl	done		   bit (1) aligned;
+dcl	list_head		   bit (18);
+
+	done = "0"b;
+	list_head = gte.dtep;
+	do dtep = ptr (gtep, list_head) repeat ptr (gtep, dte.next_dtep) while (^done);
+	     call examine_device;			/* check out device. */
+	     done = (dte.next_dtep = list_head);
+	end;
+
+     end walk_devices;
+
+
+usurp_chan:
+     proc;
+
+	call disk_control$usurp_channel ((gte.disk_data_subsystem_idx), (cte.disktab_ctx), required, cte.chx, statusp);
+						/* Take channel from disk control. */
+	usurped = (cte.chx ^= 0);
+	if ^usurped then
+	     return;				/* Return now if channel not usurped. */
+
+	cte.statusp = statusp;
+	cte.ioi_use = "1"b;				/* Place channel in use for IOI. */
+	used_chan_count = used_chan_count + 1;		/* Keep track of count. */
+	call ioi_masked$getwork_channel (ctep);		/* use the channel if possible */
+
+     end usurp_chan;
+
+
+
+cede_chan:
+     proc;					/* internal procedure to return disk channel */
+
+
+	call ioi_masked$quiesce_channel (ctep);
+	do while (cte.connected | cte.quiescing);	/* Wait for channel to stop. */
+	end;
+	cte.ioi_use = "0"b;				/* Take channel away from IOI. */
+	used_chan_count = used_chan_count - 1;		/* Keep track of count. */
+
+	call disk_control$cede_channel ((gte.disk_data_subsystem_idx), (cte.disktab_ctx), cte.chx, (cte.statusp));
+						/* Give channel back to disk control. */
+
+     end cede_chan;
+
+%include ioi_data;
+%page;
+%include config_udsk_card;
+
+     end ioi_usurp_channels;

@@ -1,0 +1,433 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-22,Farley), approve(86-01-22,MCR6979),
+     audit(86-03-08,CLJones), install(86-03-21,MR12.0-1033):
+     Modified to extend the default IOI timeout during an unload of a FIPS tape
+     to include a possible full rewind time. Also changed to wait longer for
+     status return.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4 */
+rcp_unload_: proc (arg_volume_type, arg_volume_name, arg_ecode);
+
+
+/*
+
+   This program implements the ring 1 support for unloading volumes.
+   This includes the operator's unload command and internal interfaces
+   such as unloading at detach or device deletion time.
+
+
+   Created on 04/20/78 by Michael R. Jordan
+   Modified on 08/17/78 by Michael R. Jordan
+   Modified on 12/09/78 by Michael R. Jordan to provide new internal interface for unloading volumes.
+   Modified on 01/29/79 by Michael R. Jordan for MSS0500 subsystem support.
+   Modified 6/79 by Michael R. Jordan for MR7.0R.
+   Modified 1/85 by Chris Jones to stop using magic numbers.
+   Modified 3/85 by Chris Jones to not use device.volume_name after it's cleared.
+*/
+
+/*	ARGUMENT DATA		*/
+
+
+dcl  arg_clear_volume bit (1);			/* ON => clear volume info on unload */
+dcl  arg_device_ptr ptr;				/* ptr to RCPD device entry */
+dcl  arg_ecode fixed bin (35);			/* status code returned */
+dcl  arg_volume_name char (32);			/* name of the volume */
+dcl  arg_volume_type char (32);			/* type of volume */
+
+
+/*	CONSTANT DATA		*/
+
+
+dcl  UNLOAD_IDCW bit (36) static internal options (constant) init ("720000700201"b3);
+
+dcl  DEFAULT_UNLOAD_TIMEOUT fixed bin (71) static internal options (constant) init (30000000);
+
+dcl  FIPS_UNLOAD_TIMEOUT fixed bin (71) static internal options (constant) init (90000000);
+
+
+/*	AUTOMATIC DATA		*/
+
+
+dcl  alarm_channel fixed bin (71);			/* Saved alarm channel. */
+dcl  alarm_time fixed bin (71);			/* Saved alarm time. */
+dcl  bailout_time fixed bin (71);			/* Max wait time for status. */
+dcl  caller_level fixed bin;				/* callers validation level */
+dcl  device_off bit (18);				/* offset of rcpd.device entry */
+dcl  drive_num fixed bin;				/* The device number of the drive being unloaded. */
+dcl  ecode fixed bin (35);				/* local status code */
+dcl  event_id fixed bin (71);				/* event id for IOI */
+dcl  hit bit (1) aligned;
+dcl  i fixed bin;
+dcl  ioi_index fixed bin;				/* IOI identifier */
+dcl  manual_unload_required bit (1) aligned;		/* "1"b => an error has occured and operator intervention is required. */
+dcl  message (4) fixed bin (71);
+dcl  volume_name char (32);				/* local copy of volume name */
+dcl  volume_type char (32);				/* local copy of volume_type */
+dcl  vtypex fixed bin;				/* volume type index */
+dcl  wkspc_ptr ptr;					/* Pointer to the workspace for then unload command. */
+dcl  sleep_time fixed bin (71);			/* Time we will wait for I/O to complete. */
+
+dcl  1 wait_list aligned,
+       2 channel_count fixed bin init (1),		/* Number of channels. */
+       2 channel fixed bin (71);			/* Channel to wait on. */
+
+
+/*	BASED DATA		*/
+
+
+dcl  1 wkspc aligned based (wkspc_ptr),
+       2 idcw bit (36),				/* The rewind/unload idcw. */
+       2 status like istat;				/* The status of the operation. */
+
+
+/*	EXTERNAL DATA		*/
+
+
+dcl  admin_gate_$ioi_attach entry (fixed bin, char (*) aligned, fixed bin (71), bit (1) aligned, fixed bin (35));
+dcl  admin_gate_$ioi_detach entry (fixed bin, fixed bin (35));
+dcl  admin_gate_$ioi_set_to_max entry (fixed bin, fixed bin (71), fixed bin (35));
+dcl  admin_gate_$syserr entry options (variable);
+dcl  cu_$level_get entry (fixed bin);
+dcl  cu_$level_set entry (fixed bin);
+dcl  cv_dec_ entry (char (*)) returns (fixed bin (35));
+dcl  error_table_$media_not_removable fixed bin (35) ext;
+dcl  error_table_$volume_busy fixed bin (35) ext;
+dcl  error_table_$volume_not_loaded fixed bin (35) ext;
+dcl  get_ring_ entry () returns (fixed bin);
+dcl  hcs_$get_alarm_timer entry (fixed bin (71), fixed bin (71));
+dcl  hcs_$set_alarm_timer entry (fixed bin (71), fixed bin, fixed bin (71));
+dcl  ioi_$connect entry (fixed bin, fixed bin, fixed bin (35));
+dcl  ioi_$set_status entry (fixed bin, fixed bin (18), fixed bin, fixed bin (35));
+dcl  ioi_$timeout entry (fixed bin, fixed bin (71), fixed bin (35));
+dcl  ioi_$workspace entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  rcp_lock_$lock entry (ptr, fixed bin (35));
+dcl  rcp_lock_$unlock entry (ptr);
+dcl  rcp_pointers_$data entry () returns (ptr);
+dcl  resource_info_$get_vtypex entry (char (*), char (*), fixed bin, fixed bin (35));
+
+
+/*	BUILTINS AND CONDITIONS	*/
+
+
+dcl  addr builtin;
+dcl  bit builtin;
+dcl  cleanup condition;
+dcl  clock builtin;
+dcl  fixed builtin;
+dcl  ptr builtin;
+dcl  rel builtin;
+dcl  size builtin;
+dcl  substr builtin;
+
+/*
+
+   Get the callers validation level and get him set to go.
+
+*/
+
+
+	call cu_$level_get (caller_level);
+	on cleanup begin;
+	     call cu_$level_set (caller_level);
+	end;
+	call cu_$level_set (get_ring_ ());
+	ecode = 0;
+
+
+/*
+
+   Now copy all input arguments.
+
+*/
+
+
+	volume_type = arg_volume_type;
+	volume_name = arg_volume_name;
+
+
+/*
+
+   Find out what kind of device this volume might be on.
+
+*/
+
+
+	call resource_info_$get_vtypex (volume_type, volume_type, vtypex, ecode);
+	if ecode ^= 0 then goto RETURN;
+
+
+/*
+
+   Now make sure the device supports volumes and find one with this volume on it.
+
+*/
+
+
+	rcpd_ptr = rcp_pointers_$data ();		/* get ptr to rcp_data */
+	dtype_ptr = addr (rcpd.dtype (vtypex));		/* get device type ptr */
+	do device_off = dtype.first_off repeat device.next_off while (device_off ^= "0"b);
+	     device_ptr = ptr (rcpd_ptr, device_off);
+	     if volume_name = device.volume_name then goto GOT_DEVICE;
+	end;
+
+	ecode = error_table_$volume_not_loaded;
+	goto RETURN;
+
+
+/*
+
+   Now lock the data base and unload the volume.
+
+*/
+
+
+GOT_DEVICE:
+
+	call rcp_lock_$lock (addr (rcpd.lock_info), ecode);
+	if ecode ^= 0 then goto RETURN;
+
+	if device.flags.attached then do;		/* This volume is busy! */
+	     ecode = error_table_$volume_busy;
+	     goto UNLOCK_AND_RETURN;
+	end;
+	if volume_name ^= device.volume_name then goto UNLOCK_AND_RETURN;
+
+	if device.flags.not_removable_media then do;	/* ERROR */
+	     ecode = error_table_$media_not_removable;
+	     goto UNLOCK_AND_RETURN;
+	end;
+	else call UNLOAD_DEVICE ("1"b);
+
+
+/*
+
+   Now unlock the data base and ...
+
+*/
+
+
+UNLOCK_AND_RETURN:
+
+	call rcp_lock_$unlock (addr (rcpd.lock_info));
+
+
+/*
+
+   ... return to the caller.
+
+*/
+
+
+RETURN:
+
+	arg_ecode = ecode;
+	call cu_$level_set (caller_level);
+
+	return;
+
+unload_device: entry (arg_device_ptr, arg_clear_volume);
+
+
+	device_ptr = arg_device_ptr;			/* copy device ptr */
+	rcpd_ptr = rcp_pointers_$data ();		/* get ptr to RCP Data */
+
+	call UNLOAD_DEVICE (arg_clear_volume);		/* unload the device */
+
+	return;
+
+UNLOAD_DEVICE: proc (clear_volume);
+
+
+dcl  clear_volume bit (1);				/* ON => remove this volume from the device */
+
+
+	if device.flags.not_removable_media then return;	/* Don't fool with these */
+
+	volume_name = device.volume_name;		/* assure that this is true for later */
+	goto STATE (device.state);
+
+STATE (1):					/* ASSIGNED */
+	if device.flags.attached then return;
+
+
+STATE (0):					/* FREE */
+STATE (4):					/* RESERVED */
+	manual_unload_required = "0"b;		/* initialize */
+
+	call admin_gate_$syserr (0, "RCP: Unloading volume ^[scratch^s^;^a^] from device ^a", (device.volume_name = ""),
+	     device.volume_name, device.device_name);
+
+	if clear_volume then do;			/* this volume is being removed from this device */
+	     device.volume_name = "";			/* remove it from the device */
+	     hit = "0"b;
+	     do i = 1 to rcpd.last_volume while (^hit);	/* now find the volume entry */
+		volume_ptr = addr (rcpd.volume (i));
+		if (volume.volume_name = volume_name) & (volume.state = FREE) then do;
+						/* got it */
+		     volume.process_id = "0"b;
+		     volume.volume_name = "";
+		     volume.group_id = "";
+		     volume.reserved_by = "";
+		     volume.reservation_id = 0;
+		     volume.unassign_state = FREE;
+		     hit = "1"b;
+		end;
+	     end;
+	end;
+
+	call ipc_$create_ev_chn (event_id, ecode);
+	if ecode ^= 0 then goto MANUAL_UNLOAD;
+
+	call admin_gate_$ioi_attach (ioi_index, device.device_name, event_id, "0"b, ecode);
+	if ecode ^= 0 then do;			/* cannot do it right */
+	     call ipc_$delete_ev_chn (event_id, ecode);	/* delete the enent channel */
+	     goto MANUAL_UNLOAD;
+	end;
+
+	call ioi_$workspace (ioi_index, wkspc_ptr, size (wkspc), ecode);
+	if ecode ^= 0 then do;
+	     manual_unload_required = "1"b;
+	     goto DETACH;
+	end;
+
+/*
+   If we are unloading a FIPS tape drive, then we need to allow for the
+   case where a rewind is in progress and the FIPS adapter holds onto the
+   unload connect till the rewind completes. This is because the tape
+   subsystem does not allow the unload, because the rewind has it busy.
+*/
+	if device.flags.fips then do;
+	     call admin_gate_$ioi_set_to_max (ioi_index, FIPS_UNLOAD_TIMEOUT, ecode);
+	     if ecode ^= 0 then do;
+		manual_unload_required = "1"b;
+		goto DETACH;
+	     end;
+	     call ioi_$timeout (ioi_index, FIPS_UNLOAD_TIMEOUT, ecode);
+	     if ecode ^= 0 then do;
+		manual_unload_required = "1"b;
+		goto DETACH;
+	     end;
+	end;
+
+	wkspc.idcw = UNLOAD_IDCW;
+	drive_num = cv_dec_ (substr (device.device_name, 6, 2));
+	addr (wkspc.idcw) -> idcw.device = bit (fixed (drive_num, 6));
+
+	isp = addr (wkspc.status);
+	call ioi_$set_status (ioi_index, fixed (rel (isp), 18), 1, ecode);
+	if ecode ^= 0 then do;
+	     manual_unload_required = "1"b;
+	     goto DETACH;
+	end;
+	istat.completion.st = "0"b;
+
+	call ioi_$connect (ioi_index, 0, ecode);
+	if ecode ^= 0 then do;
+	     manual_unload_required = "1"b;
+	     goto DETACH;
+	end;
+
+
+	sleep_time = rcpd.unload_sleep_time;
+
+	call hcs_$get_alarm_timer (alarm_time, alarm_channel);
+						/* save old setting */
+
+	if device.flags.fips then bailout_time = clock () + FIPS_UNLOAD_TIMEOUT;
+	else bailout_time = clock () + DEFAULT_UNLOAD_TIMEOUT;
+
+	do while (clock () < bailout_time);
+	     call hcs_$set_alarm_timer (sleep_time, 1, event_id);
+	     wait_list.channel = event_id;
+	     call ipc_$block (addr (wait_list), addr (message), ecode);
+	     if istat.completion.st then do;
+		if istat.completion.time_out then manual_unload_required = "1"b;
+		goto REVERT_ALARM;
+	     end;
+	end;
+
+	manual_unload_required = "1"b;		/* timed out */
+REVERT_ALARM:
+	call hcs_$set_alarm_timer (alarm_time, 2, alarm_channel);
+						/* revert back to old setting */
+
+DETACH:
+	call admin_gate_$ioi_detach (ioi_index, ecode);
+
+	call ipc_$delete_ev_chn (event_id, ecode);	/* delete the event channel created earlier */
+
+	if ^manual_unload_required then return;
+
+
+MANUAL_UNLOAD:					/* Must tell the operator to do it manually. */
+	call admin_gate_$syserr (3, "RCP: Manually unload volume ^a from device ^a", volume_name, device.device_name);
+	ecode = 0;				/* show success */
+	return;
+
+
+STATE (2):					/* DELETED */
+STATE (3):					/* STORAGE SYSTEM */
+	return;
+
+
+     end UNLOAD_DEVICE;
+
+%include ioi_stat;
+%page;
+%include iom_pcw;
+%page;
+%include rcp_com_seg;
+%page;
+%include rcp_data;
+%page;
+%include rcp_resource_states;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   RCP: Unloading volume VOLUME from device DEVICE
+
+   S:	$info
+
+   T:	$run
+
+   M:	The specified VOLUME is being demounted by RCP.
+
+   A:	Return the specified VOLUME to the library.
+
+
+   Message:
+   RCP: Manually unload volume VOLUME from device DEVICE
+
+   S:	$beep
+
+   T:	$run
+
+   M:	RCP could not unload the specified volume from the device on which it was loaded.
+
+   A:	Manually unload the volume from the device and return the volume to the library for storage.
+
+
+   END MESSAGE DOCUMENTATION */
+
+
+     end rcp_unload_;

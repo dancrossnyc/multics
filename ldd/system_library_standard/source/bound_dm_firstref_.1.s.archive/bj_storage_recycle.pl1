@@ -1,0 +1,375 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+     This procedure is called when the end of the journal is reached.
+     The journal is circular; it has a head and a tail. The head moves
+     forward as the journal is written into; the tail stays where it is
+     and is located by bj_pste.cl.origin_ci. When the head tries to step over
+     the tail, it is time to recycle some of the control intervals starting
+     from the tail and going towards the head. The tail is moved forward 
+     towards the head, as far as possible, that is, up to the closest CI (to
+     the tail) which still has some useful information, i.e. some information
+     about a transaction still in progress.
+
+     If it can recycle at least 1 CI, it returns a zero code to the caller.
+     If it cannot recycle any CI at all, it returns a "bj_journal_full"
+     error code.
+
+     It does not attempt to rollback the "slow" transactions that may be
+     responsible for filling up the journal. One may try to do it in a
+     later version.
+
+     This procedure assumes that the bj_pste for this journal is already
+     locked by the caller. 
+*/
+
+/* HISTORY:
+Written by Andre Bensoussan,  08/06/82.
+Modified:
+11/18/82 by Andre Bensoussan:  to handle the special case where the caller
+	  is trying to write its first logical record in the journal and
+	  happens to be the only txn using the journal.
+12/15/82 by Andre Bensoussan:  to update the header of the journal each time
+	  the origin changes. This is necessary for finding the last CI
+	  after a crash.
+02/24/83 by Lee A. Newcomb:  to log error if n_txns found in pste does not
+	  agree with the total found b walking the txt for the BJ used.
+04/07/83 by A. Bensoussan:  to improve the message logged when number of txns 
+	  in txt and pste do not agree; and also to no longer adjust the
+	  number in the pste with the number found in the txt.
+05/04/83 by M. Pandolf:  to add meters.
+05/16/83 by A. Bensoussan:  to actually flush the new origin.
+01/30/84 by M. Pandolf:  to dump txt and pst at n_txn discrepancy.
+03/15/84 by M. Pandolf:  to perform more checking when determining whether
+	  or not a txte has a valid transaction when calculating n_txn.  A
+	  transaction is considered finished when its append state is
+	  "comm" or "abor" and the record has been written; this ought to
+	  close up the window where the n_txn discrepancy was.
+11/02/84 by Maggie Sharpe:  to correct format and dcls; to convert a begin
+            block to an internal procedure; to use "call ERROR_RETURN (code)"
+            method of error_handling; to set and reset validation level
+	  before calling file_manager_$? and after returning.
+11/22/84 by Lee A. Newcomb:  Changed to use dm_misc_util_$get_aim_dir.
+12/10/84 by R. Michael Tague:  Changed incl name to dm_daemon_sv_codes.
+01/15/85 by Lee A. Newcomb:  Fixed to use dm_log_sv_codes.incl.pl1 instead of
+            the obsolete dm_daemon_sv_codes.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+*/
+/* format: style4,indattr,^inddcls,ifthenstmt,ifthen,^indcomtxt,idind35 */
+%page;
+bj_storage_recycle: proc (p_bj_ppte_ptr, p_code);
+
+/* START OF DECLARATIONS */
+
+/* Parameters */
+dcl  (
+     p_bj_ppte_ptr			ptr,		/* Input */
+     p_code			fixed bin (35)	/* Output */
+     )				parameter;
+
+/* Automatic */
+dcl  (
+     n_ci_recycled			fixed bin (24) uns,
+     new_origin_ci			fixed bin (24) uns,
+     ci_no			fixed bin (24) uns,
+     distance			fixed bin (24) uns,
+     bj_txt_idx			fixed bin,
+     code				fixed bin (35),
+     n_txn			fixed bin,
+     bj_uid			bit (36) aligned,
+     pf_oid			bit (36) aligned,
+     txn_id			bit (36) aligned,
+     saved_level			fixed bin,
+     current_ring			fixed bin (3),
+     1 my_bj_pste			like bj_pste aligned
+     )				automatic;
+
+/* Based */
+
+dcl  1 rec_id_overlay		based aligned,
+       2 ci_no			fixed bin (24) uns unaligned,
+       2 slot			fixed bin (12) uns unaligned;
+
+/* Builtin */
+
+dcl  (addr, hbound, lbound, null,
+     size, unspec)			builtin;
+
+/* Condition */
+
+dcl  cleanup			condition;
+
+/* Entries */
+
+dcl  bj_storage_util$distance		entry (ptr, fixed bin (24) uns) returns (fixed bin (24) uns);
+dcl  bj_ci_zero$put_header		entry (bit (36) aligned, ptr, fixed bin);
+dcl  cu_$level_get			entry (fixed bin);
+dcl  cu_$level_set			entry (fixed bin);
+dcl  dm_misc_util_$log		entry options (variable);
+dcl  file_manager_$flush_consecutive_ci
+				entry (bit (36) aligned, fixed bin (24), fixed bin (24), fixed bin (35));
+dcl  get_ring_			entry () returns (fixed bin (3));
+
+
+/* External */
+dcl  (
+     dm_data_$bj_txt_ptr		ptr,
+     dm_error_$bj_journal_full	fixed bin (35)
+     )				external;
+%page;
+	call cu_$level_get (saved_level);
+	current_ring = get_ring_ ();
+
+	on cleanup begin;
+	     call cu_$level_set (saved_level);
+	end;
+
+	bj_ppte_ptr = p_bj_ppte_ptr;
+	bj_pste_ptr = bj_ppte.bj_pste_ptr;
+	bj_txt_ptr = dm_data_$bj_txt_ptr;
+	bj_uid = bj_pste.bj_uid;
+	pf_oid = bj_ppte.pf_oid;
+
+	code = 0;
+
+
+	new_origin_ci = bj_pste.cl.origin_ci;
+	n_ci_recycled = bj_pste.cl.number_ci;		/* Max number of ci's that can be recycled */
+						/* is also the max distance from origin to a ci */
+	n_txn = 0;
+
+/*
+   this next loop is to find the transaction that has the oldest record
+   in the before journal, so that we know how many ci's to recycle.  the
+   elaborate if-then statement contains all the logic necessary to see
+   if a transaction ought to be considered in our search
+*/
+
+	do bj_txt_idx = lbound (bj_txt.entry, 1) to hbound (bj_txt.entry, 1);
+
+	     bj_txte_ptr = addr (bj_txt.entry (bj_txt_idx));
+
+	     txn_id = bj_txte.tid;
+
+	     if bj_txte.bj_uid = bj_uid then		/* is this txn using our BJ? */
+		if txn_id ^= "0"b then		/* and is it active? */
+		     if bj_txte.first_bj_rec_id ^= "0"b then /* and has a record been written? */
+			if bj_txte.last_completed_operation ^= COMMITTED then
+						/* and has it not been committed */
+			     if bj_txte.last_completed_operation ^= ABORTED then
+						/* nor aborted? */
+				if (bj_txte.pending_bj_rec_id = "0"b) /* and if an operation is pending */
+				     | ((bj_txte.current_operation ^= COMMITTED) /* is neither for a commit */
+				     & (bj_txte.current_operation ^= ABORTED)) then /* nor for an abort? */
+				     if bj_txte.tid = txn_id then /* and hasn't changed from under us? */
+					do;	/* THEN THIS IS A LIVE ONE! */
+					n_txn = n_txn + 1;
+					ci_no = addr (bj_txte.first_bj_rec_id) -> rec_id_overlay.ci_no;
+					distance = bj_storage_util$distance (bj_pste_ptr, ci_no);
+
+					if distance < n_ci_recycled then
+					     do;
+					     new_origin_ci = ci_no;
+					     n_ci_recycled = distance;
+					end;
+				     end;
+	end;
+
+
+	if n_txn ^= bj_pste.n_txn then		/* bj_pste and bj_txte don't agree */
+	     call DUMP ();
+
+
+	if n_txn = 0 then				/* See NOTE 1 */
+	     do;
+	     new_origin_ci = bj_pste.last_ci_on_disk;
+	     n_ci_recycled = bj_storage_util$distance (bj_pste_ptr, new_origin_ci);
+	end;
+%page;
+	if n_ci_recycled <= 0 then do;
+	     bj_pste.meters.n_journal_full = bj_pste.meters.n_journal_full + 1; /* METER */
+	     call ERROR_RETURN (dm_error_$bj_journal_full);
+	end;
+
+	bj_pste.meters.n_successful_recycles = bj_pste.meters.n_successful_recycles + 1; /* METER */
+	bj_pste.meters.n_ci_recycled = bj_pste.meters.n_ci_recycled + n_ci_recycled;
+
+
+/* Journal should be flushed at least up to the ci which will become the new 
+   origin. This is to honor the convention that the origin should always be 
+   flushed. With this convention, the cursors last_ci_buffered, last_ci_put,
+   last_ci_flushed and last_ci_on_disk ALWAYS point to a CI in the circular 
+   list and NEVER have null values.
+   The bj_pste should not be unlocked during the I/O. 
+*/
+
+
+	if n_ci_recycled > bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_on_disk)
+	     then call FLUSH_NEW_ORIGIN ();
+
+
+
+/* The header of the journal must be updated each time the origin of the
+   circular list changes. This is to be able to find the end of the journal
+   after a system crash. If we change the origin in the pste and then update
+   the header, we have a window in between; if the process crashes in the
+   window, the next process will not know that the header has to be updated.
+   So, we take a copy of the pste, we change the origin in the copy, and we
+   use the copy to update the header; then we change the origin in the pste.
+   If the process crashes in the window, the header will be updated again
+   when recycle is done again. */
+
+
+	unspec (my_bj_pste) = unspec (bj_pste);
+
+	my_bj_pste.cl.origin_ci = new_origin_ci;
+
+	call bj_ci_zero$put_header (pf_oid, addr (my_bj_pste), size (bj_pste));
+
+	call cu_$level_set ((current_ring));
+	call file_manager_$flush_consecutive_ci (pf_oid, 0, 1, code);
+	call cu_$level_set (saved_level);
+
+	if code ^= 0 then call ERROR_RETURN (code);
+
+
+/* Now change the origin in the bj_pste */
+
+	bj_pste.cl.origin_ci = new_origin_ci;
+
+	p_code = 0;
+MAIN_RETURN:
+	return;
+
+ERROR_RETURN:
+     proc (error_code);
+
+dcl  error_code			fixed bin (35);
+
+	p_code = error_code;
+	goto MAIN_RETURN;
+
+     end ERROR_RETURN;
+%page;
+/* NOTE 1 - This means that no transaction using the journal was found by
+	inspecting the bj_txt table. However, bj_storage_recycle was called
+	on behalf of a txn trying to put its first logical record in the
+	journal. Since the logical record is not stored yet, or at least
+	not stored completely yet, in the journal, it does not appear yet
+	in the bj_txte as the first rec_id stored by this txn.
+
+	In the special situation, if no portion of the logical record was
+	stored yet, the entire journal is available; if one or several
+	portions of the logical record have already be written and more
+	space is needed for the rest, the entire journal is available except
+	for the CI's containing the portion(s) of the logical record already
+	stored. In both cases, it is safe to move the origin forward, up to
+	the last_ci_on_disk. This is what the program does.
+
+	Setting the origin to the last_ci_on_disk does, in general, make
+	space available except in the following case, which is a very special
+	case and very unlikely to happen: The logical record that this txn
+	is attempting to write is larger than the entire journal; in this
+	case the last_ci_on_disk is equal to the origin_ci. The program does
+	the right thing even in this strange case: When it calculates the 
+	number of recycled CI's, it does it by evaluating the distance
+	between the new origin and the old origin. In this special case, the
+	new origin and the old are the same and the distance is zero. The
+	program returns n_ci_recycled = 0, which indicates that the journal 
+	is full. */
+%page;
+FLUSH_NEW_ORIGIN: proc;
+
+
+	call cu_$level_set ((current_ring));
+	call file_manager_$flush_consecutive_ci (pf_oid, (new_origin_ci), 1, code);
+	call cu_$level_set (saved_level);
+
+	if code ^= 0 then call ERROR_RETURN (code);
+
+	if n_ci_recycled > bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_flushed) then
+	     bj_pste.last_ci_flushed = new_origin_ci;
+
+	bj_pste.last_ci_on_disk = new_origin_ci;
+
+
+
+/* Note - The stamp and various counters of before images held are 
+	not updated. In order to update them with the correct values, one 
+	would have to keep stamp and before image info about all ci's that
+	are not on disk yet; or one should read the CI before flushing it,
+	and get the necessary info from the ci itself, which would be too 
+	bad, considering that the ci is most likely already written out by
+	page control. The "error" introduced by not doing the proper updating
+	is always on the "safe" side; the flush mechanism is self adjusting,
+	and the stamp and counters will soon become correct again. */
+
+
+
+	return;
+     end FLUSH_NEW_ORIGIN;
+%page;
+DUMP: proc ();
+
+/*
+   this routine is not to see the light of day in production.  it is an
+   attempt to determine why the n_txn calculation has gone awry.
+*/
+
+dcl  dm_misc_util_$get_aim_dir	entry (char (*));
+dcl  unique_chars_			entry (bit (*)) returns (char (15));
+dcl  hcs_$make_seg			entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl  term_$seg_ptr			entry (ptr, fixed bin (35));
+dcl  aim_dir			char (168);
+dcl  ecode			fixed bin (35);
+dcl  entryname_prefix		char (15);
+dcl  txt_cptr			ptr;
+dcl  pste_cptr			ptr;
+dcl  tables_available		bit (1) aligned;
+dcl  RW				fixed bin (5) internal static options (constant) init (01010b);
+
+	call dm_misc_util_$get_aim_dir (aim_dir);
+
+	entryname_prefix = unique_chars_ (""b);
+
+	call hcs_$make_seg (aim_dir, entryname_prefix || ".bj_pste", "",
+	     RW, pste_cptr, ecode);
+	if pste_cptr ^= null () then
+	     do;
+	     call hcs_$make_seg (aim_dir, entryname_prefix || ".bj_txt", "",
+		RW, txt_cptr, ecode);
+	     if txt_cptr ^= null () then
+		do;
+		pste_cptr -> bj_pste = bj_pste_ptr -> bj_pste;
+		txt_cptr -> bj_txt = bj_txt_ptr -> bj_txt;
+		call term_$seg_ptr (pste_cptr, ecode);
+		call term_$seg_ptr (txt_cptr, ecode);
+		tables_available = "1"b;
+	     end;
+	     else do;
+		call term_$seg_ptr (txt_cptr, ecode);
+		tables_available = "0"b;
+	     end;
+	end;
+	else tables_available = "0"b;
+
+	call dm_misc_util_$log (INFORM_SV, 0, "bj_storage_recycle",
+	     "For bj_uid = ^o, n_txn in txt is ^d, but bj_pste.n_txn = ^d. Tables ^[copied into ^a.*^;not available^s^].",
+	     bj_uid, n_txn, bj_pste.n_txn, tables_available, entryname_prefix);
+
+
+     end DUMP;
+%page; %include dm_bj_static;
+%page; %include dm_bj_ppt;
+%page; %include dm_bj_pste;
+%page; %include dm_bj_txt;
+%page; %include dm_log_sv_codes;
+%page; %include dm_bj_records;
+
+
+     end bj_storage_recycle;

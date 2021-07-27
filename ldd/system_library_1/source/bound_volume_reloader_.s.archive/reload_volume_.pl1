@@ -1,0 +1,386 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Rewrote the paged read mechanism to read an entire object from a dump
+     tape, then write it a page at a time.  When a short segment is read from
+     tape, the routine will now deposit any unused pages.
+  2) change(90-10-04,WAAnderson), approve(90-10-04,MCR8207),
+     audit(90-10-10,Schroth), install(90-10-14,MR12.4-1042):
+     Fix duplicate record bug. The vtoce buffer was not being updated after the
+     local copy of the vtoce was modified.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+reload_volume_: proc (rldr_datap, code);
+
+/* This routine is the main driving program for the reload of a physical volume. We read a object from the dump
+   volume, check to see if it's already there, and if so we free the pages already allocated. We then withdraw the
+   necessary pages and write the new vtoce and the non-null pages of the object. If a page can not be written
+   we mark the page as unusable, allocate a new one and rewrite the page. If this operation bears
+   any resemlance to the way the hardcore behaves to a physical volume, the resemlance is intentional. */
+/* Modified 5/79 by D. Vinograd to correct calling sequence to rldr_input_$read_page
+   so that variable already_there is passed as arg and that a clumulative count
+   of elements read is maintained such that non-null pages of all zeros are
+   treated correctly. */
+/* Modified:     3/1/83 by GA Texada to allow multiple physical volume reloading.	         */
+
+dcl code		     fixed bin (35);
+dcl (csl, bad_pages, object_pgx, pgx, pvindex, vtocx) fixed bin;
+dcl (new_vtocep, old_vtocep) ptr;
+dcl (Swritten, already_there, new_volume, skip_next_header_check) bit (1);
+dcl pages_returned	     fixed bin;
+
+dcl 1 new_local_vtoce    like vtoce aligned;
+dcl 1 old_local_vtoce    like vtoce aligned;
+
+dcl myname	     char (32) int static init ("reload_volume_") options (constant);
+
+dcl error_table_$end_of_info ext fixed bin (35);
+
+dcl rldr_input_$collect_stats entry (ptr, fixed bin);
+dcl rldr_input_$get_object entry (ptr, bit (1), ptr, fixed bin, bit (1), fixed bin, fixed bin (35));
+dcl rldr_input_$read_object entry (ptr, fixed bin, bit (1), bit (1), fixed bin, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl rldr_vtoc_buffer_$get entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+dcl rldr_vtoc_buffer_$put entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+dcl rldr_output_$write_page entry (ptr, fixed bin, ptr, bit (18), fixed bin (35));
+dcl rldr_volume_map_$deposit entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+dcl rldr_volume_map_$withdraw entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+
+dcl (addr, bit, divide, fixed, pointer, substr, unspec) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+/* Initialize local variables and structures */
+    code = 0;
+    skip_next_header_check = "0"b;
+    new_vtocep = addr (new_local_vtoce);
+    old_vtocep = addr (old_local_vtoce);
+    unspec (new_local_vtoce) = "0"b;
+    unspec (old_local_vtoce) = "0"b;
+						/* Read through all the dump volumes on the list  */
+    do while ("1"b);				/* pvindex will be returned if code = 0, to show  */
+restart: call rldr_input_$get_object (rldr_datap, skip_next_header_check, new_vtocep, vtocx, already_there, pvindex, code);
+						/* which physical volume the object belongs to	*/
+      if code ^= 0 then do;
+	if code = error_table_$end_of_info then do;
+	    code = 0;
+	    return;
+	  end;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Error reading input");
+	return;
+        end;
+      vtoc_headerp = rldr_data_.vtoc_headerp (pvindex);
+						/* If already there free allocated pages */
+      if already_there then do;
+	call rldr_vtoc_buffer_$get (rldr_datap, pvindex, old_vtocep, vtocx, code);
+	if code ^= 0 then do;
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Error reading old vtoce ^o for pv ^a", vtocx,
+	         rldr_data_.pvname (pvindex));
+	    goto skip_this_pv;
+	  end;
+	if old_vtocep -> vtoce.uid ^= "0"b then do;
+	    call rldr_volume_map_$deposit (rldr_datap, pvindex, old_vtocep, -1, code);
+	    if code ^= 0 then do;
+	        call rldr_report_$error_output (rldr_datap, code, myname, "Error depositing old vtoce ^o for pv ^a", vtocx,
+		   rldr_data_.pvname (pvindex));
+	        goto skip_this_pv;
+	      end;
+	  end;
+        end;
+						/* Allocate new pages */
+      if new_vtocep -> vtoce.uid ^= "0"b then
+        call rldr_volume_map_$withdraw (rldr_datap, pvindex, new_vtocep, -1, code);
+      if code ^= 0 then do;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Unable to withdraw for new vtoce ^o for pv ^a", vtocx,
+	     rldr_data_.pvname (pvindex));
+	goto skip_this_pv;
+        end;
+						/* Write out vtoce  */
+      call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep, vtocx, code);
+      if code ^= 0 then do;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Error writing new vtoce ^o for pv ^a", vtocx,
+	     rldr_data_.pvname (pvindex));
+	goto skip_this_pv;
+        end;
+
+
+      if new_vtocep -> vtoce.uid ^= "0"b & ^rldr_data_.no_object then do;
+	csl = fixed (new_vtocep -> vtoce.csl);
+	call rldr_input_$read_object (rldr_datap, pvindex, new_volume,
+	     skip_next_header_check, pages_returned, code);
+	if new_volume then goto restart;
+	if code ^= 0 then
+	  new_vtocep -> vtoce.damaged = "1"b;
+
+/* Write out each non null page. If the write fails log the bad address, withdraw an other page and try again */
+
+
+	object_pgx = 0;
+	do pgx = 0 to csl - 1 while (divide (object_pgx, WORDS_PER_PAGE, 17) < pages_returned);
+	  if ^substr (new_vtocep -> vtoce.fm (pgx), 1, 1) then do;
+	      Swritten = "0"b;
+	      do while (^Swritten);
+	        call rldr_output_$write_page (rldr_datap, pvindex,
+		   pointer (rldr_data_.data_object_bp, object_pgx),
+		   new_vtocep -> vtoce.fm (pgx), code);
+	        if code ^= 0 then do;
+		  call log_bad_addr (new_vtocep -> vtoce.fm (pgx));
+		  call rldr_volume_map_$withdraw (rldr_datap,
+		       pvindex, new_vtocep, pgx, code);
+		  if code ^= 0 then do;
+		      call rldr_report_$error_output (rldr_datap, code, myname,
+			 "Unable to withdraw for bad page on pv ^a", rldr_data_.pvname (pvindex));
+		      goto skip_this_pv;
+		    end;
+                      call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep, vtocx, code);
+                      if code ^= 0 then do;
+                          call rldr_report_$error_output (rldr_datap, code, myname, "Error writing new vtoce ^o for pv ^a", vtocx,  rldr_data_.pvname (pvindex));
+        	                goto skip_this_pv;
+                        end;
+		end;
+	        else do;
+		  Swritten = "1"b;
+		  object_pgx = object_pgx + WORDS_PER_PAGE;
+		end;
+	      end;
+	    end;
+	end;
+
+	bad_pages = 0;
+	do pgx = pgx to csl - 1;			/* incomplete object */
+	  call rldr_volume_map_$deposit (rldr_datap, pvindex,
+	       new_vtocep, pgx, code);
+	  if code ^= 0 then
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Error depositing page ^d of vtoce ^o for pv ^a",
+	         pgx, vtocx, rldr_data_.pvname (pvindex));
+	  bad_pages = bad_pages + 1;
+	end;
+
+	if bad_pages > 0 then do;
+            call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep, vtocx, code);
+            if code ^= 0 then do;
+                call rldr_report_$error_output (rldr_datap, code, myname, "Error writing new vtoce ^o for pv ^a", vtocx,  rldr_data_.pvname (pvindex));
+	      goto skip_this_pv;
+	    end;
+            end;
+
+	if new_vtocep -> vtoce.damaged then do;
+	    new_vtocep -> vtoce.csl = bit (fixed (csl - bad_pages, 9), 9);
+	    new_vtocep -> vtoce.records = bit (fixed (fixed (new_vtocep -> vtoce.records) - bad_pages, 9), 9);
+	    call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep,
+	         vtocx, code);
+	    if code ^= 0 then
+	      call rldr_report_$error_output (rldr_datap, code, myname,
+		 "Unable to set damaged switch for vtoce ^o on pv ^a", vtocx, rldr_data_.pvname (pvindex));
+	  end;
+        end;
+
+
+      if ^already_there then call rldr_input_$collect_stats (rldr_datap, pvindex);
+    end;
+
+    return;
+skip_this_pv:
+    call rldr_report_$error_output (rldr_datap, 0, myname,	/* well, let the user know			*/
+         "Abandoning the reload of pv ^a", rldr_data_.pvname (pvindex));
+    rldr_data_.abandoned (pvindex) = "1"b;		/* mark as abandoned			*/
+    rldr_data_.num_abandoned = rldr_data_.num_abandoned + 1;
+    if rldr_data_.num_abandoned = rldr_data_.npvs then do;
+        call rldr_report_$error_output (rldr_datap, 0, myname,
+	   "All physical volumes to be reloaded have been abandoned.");
+        return;
+      end;
+
+    goto restart;					/* and press-on				*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+log_bad_addr: proc (add);
+
+/* This proc logs the bad address of a failed write request */
+
+
+dcl add		     bit (18);
+
+    call rldr_report_$error_output (rldr_datap, 0, myname, "Bad disk page ^o for pv ^a", add, rldr_data_.pvname (pvindex));
+    return;
+  end log_bad_addr;
+
+%include rldr_data_;
+
+%include vtoc_header;
+
+%include vtoce;
+
+%include system_constants;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   reload_volume_: Abandoning the reload of pv PVNAME
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Some fatal error has occurred during the reload of the specified
+   physical volume.
+
+   A:	Take the action required by the error just previous to this one and 
+   retry the reload of the physical volume.
+
+
+   Message:
+   reload_volume_: All physical volumes to be reloaded have been abandoned.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Some fatal error has occurred during the reload of ALL the
+   specified physical volumes.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Bad disk page PAGE_ADDRESS for pv PVNAME
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error occurred during a reload.
+   This message indicates the bad disk address on the volume being reloaded.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error reading input: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reading input.
+   The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error reading old vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error occurred during a reload. The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error depositing old vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The reloader was unable to release pages of an old object.
+   $err
+   The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error depositing page PAGENO of vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The reloader was unable to release page PAGENO (decimal) of the
+   new object. This is only done when an incomplete object is detected.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error writing new vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error occurred during a reload. The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Unable to set damaged switch for vtoce VTOCX on pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error has occured while attempting to write out the
+   new vtoce, which has the damaged switch turned on.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Unable to withdraw for bad page on pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	After an I/O error, the reloader attempted to allocate a new page,
+   and failed. The volume may be full.
+
+   A:	If the volume is full, it may be necessary to
+   clean it up with sweep_pv -gc before restarting the reload.
+
+
+   Message:
+   reload_volume_: Unable to withdraw for new vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The reloader is unable to allocate a new VTOCE.
+   The volume may be full. The input medium is abandoned.
+
+   A:	$ignore
+   If the volume is full, it may be necessary to clean it up with
+   sweep_pv with the -gc option and then to continue reloading.
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end reload_volume_;

@@ -1,0 +1,557 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/*  DESCRIPTION:
+    Per-Process Pre-Processor for Data Management Locking
+
+    Handles the (crude) locking hierarchy and does some optimizations.
+
+    This involves the following:
+
+    1. The locking hierarchy is two-level: Page File (parent) and Control
+       Interval (child). 
+
+    2. For each Control Interval lock, check whether a lock is required.
+       It is not required if a sufficiently strong lock is already held
+       on the parent Page File.
+
+    3. If a lock is required, obtain a lock on the parent of the appropriate
+       type. Do not do so if a sufficiently strong lock is already held.
+
+    4. Obtain a lock on the Control Interval (child).
+
+    Note the following:
+
+    1. File Locks are optimized in several senses. If a strong lock is held
+       on the File, it is not necessary to call per-system locking for
+       each Control Interval. If a lock is already held on the File, it is
+       not necessary to call per-system locking to determine this.
+*/
+/* HISTORY:
+
+Written by J. Bongiovanni, 11/01/82.
+Modified:
+03/11/83 by Benson I. Margulies:  To make unlock_all work in the daemon without
+            social services (Reagan cut them).
+04/26/83 by Benson I. Margulies:  To log, optionally.
+05/01/84 by R. Michael Tague:  Added %include dm_lm_meters.
+10/15/84 by Stanford S. Cox:  MAIN: Chg all int proc to have prefix var names
+	  and use ER, moved call to lm_log_ when tracing to LOCK_FILE.  ER:
+	  Added for common return.
+10/24/84 by Lindsey L. Spratt:  Added initialization of p_code to 0 for $lock
+            entrypoint.  Removed spurious check of p_code after call to
+            VALIDATE_MODE.  Added a check of p_code after call to 
+	  lm_per_system_$unlock.
+11/19/84 by Stanford S. Cox:  MAIN: Check for CHILD_LOCK = -1 (error).
+02/26/85 by Lindsey L. Spratt:  Changed SETUP$$LOCK to reset
+            lock_transaction_table.txn_id to the current_txn_id if it has
+            gotten set to "0"b (by an lm_per_system_$unlock_all call).
+*/
+
+/* format: style3,idind30 */
+lm_per_process_$lock:
+     proc (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_code);
+
+/*  Parameter  */
+
+declare	p_ci_number		fixed bin (27) parameter;
+						/* Control Interval Number */
+declare	p_checkpoint_id		bit (36) aligned parameter;
+						/* Checkpoint Unique ID */
+declare	p_code			fixed bin (35) parameter;
+						/* Standard Error p_code */
+declare	p_mode_obtained		fixed bin parameter;/* Lock Mode Obtained */
+declare	p_mode_req		fixed bin parameter;/* Lock Mode Requested */
+declare	p_f_uid			bit (36) aligned parameter;
+						/* Page File Unique ID */
+declare	p_timeout			fixed bin (71) parameter;
+						/* How long to wait */
+
+/*  Automatic  */
+
+declare	area_handler		entry variable;
+declare	ci_number			fixed bin (27);
+declare	hashx			fixed bin;
+declare	mode_obtained		fixed bin;
+declare	mode_req			fixed bin;
+declare	f_uid			bit (36) aligned;
+declare	set_code_parm_on_error_return bit (1);
+declare	timeout			fixed bin (71);
+
+/*  Static  */
+
+declare	CHILD_LOCK		(2:6, 2:6) fixed bin int static options (constant)
+				init (0, 0, 2, 2, 0, -1, 0, -1, 3, 3, 0, 0, 0, 0, 0, -1, 0, -1, 0, 0, -1, 0, -1,
+				6, 0);
+declare	COMMON_MODE		(2:6, 2:6) fixed bin int static options (constant)
+				init (2, 3, 2, 6, 6, 3, 3, 3, 3, 3, 2, 3, 4, 5, 6, 6, 3, 5, 5, 6, 6, 3, 6, 6, 6);
+declare	PARENT_MODE		(2:6) fixed bin int static options (constant) init (4, 5, 4, 5, 5);
+dcl	ME			char (15) int static options (constant) init ("lm_per_process_");
+
+
+/*  Based  */
+
+declare	dm_area			area based (dm_data_$inner_ring_areap);
+
+/*  External  */
+
+declare	dm_system_data_$max_n_transactions
+				fixed bin ext;
+declare	dm_data_$current_txn_id	bit (36) aligned external;
+
+declare	dm_data_$current_txn_index	fixed bin ext;
+declare	dm_data_$inner_ring_areap	ptr external;
+
+declare	dm_error_$lock_deadlock	fixed bin (35) external static;
+declare	dm_error_$no_current_transaction
+				fixed bin (35) external;
+declare	dm_error_$unimplemented_entry fixed bin (35) external;
+declare	dm_error_$lock_invalid_mode	fixed bin (35) external;
+declare	dm_error_$per_process_area_overflow
+				fixed bin (35) external;
+dcl	error_table_$unimplemented_version
+				fixed bin (35) ext static;
+declare	lm_data_$trace		bit (1) aligned external static;
+declare	lm_data_$lock_per_process_ptr pointer ext static;
+declare	lm_data_$current_txn_id	bit (36) aligned ext static;
+declare	lm_data_$lock_seg_ptr	pointer ext static;
+declare	lm_data_$txn_table_ptr	pointer external static;
+
+/*  Entry  */
+
+declare	sub_err_			entry options (variable);
+declare	lm_log_			entry options (variable);
+declare	lm_per_system_$checkpoint	entry (bit (36) aligned, fixed bin (35));
+declare	lm_per_system_$lock		entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+				fixed bin (35));
+declare	lm_per_system_$lock_resolve_deadlock
+				entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+				bit (36) aligned, fixed bin (35));
+declare	lm_per_system_$unlock	entry (bit (36) aligned, fixed bin (27), fixed bin (35));
+declare	lm_per_system_$unlock_all	entry;
+declare	lm_per_system_$unlock_to_checkpoint
+				entry (bit (36) aligned, fixed bin (35));
+declare	lm_signal_deadlock_		entry (bit (36) aligned, bit (36) aligned, fixed bin (27), fixed bin);
+declare	get_process_id_		entry returns (bit (36) aligned);
+
+/*  Condition  */
+
+declare	area			condition;
+
+/*  Builtin  */
+
+declare	addr			builtin;
+declare	bit			builtin;
+declare	fixed			builtin;
+declare	null			builtin;
+declare	unspec			builtin;
+%page;
+
+/* lm_per_process_$lock: entry (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_code); */
+
+	p_code = 0;
+	f_uid = p_f_uid;
+	ci_number = p_ci_number;
+	mode_req = p_mode_req;
+	timeout = p_timeout;
+	set_code_parm_on_error_return = "1"b;
+
+	area_handler = NOOP;			/* handler in outer block to avoid nonquick */
+	on area call area_handler;
+
+	call VALIDATE_MODE (mode_req);
+
+	call SETUP$$LOCK;
+
+	if ci_number = LOCK_ENTIRE_FILE
+	then call LOCK_FILE (f_uid, mode_req, timeout, p_mode_obtained, ci_number, ("lock(entire file)"), "0"b);
+	else do;
+		call LOCK_FILE (f_uid, PARENT_MODE (mode_req), timeout, mode_obtained, ci_number, ("lock(file)"),
+		     "1"b);
+
+		if CHILD_LOCK (mode_req, mode_obtained) > 0
+		then call lm_per_system_$lock (f_uid, ci_number, mode_req, timeout, p_mode_obtained, p_code);
+		else if CHILD_LOCK (mode_req, mode_obtained) = -1
+		then call ERROR_RETURN (dm_error_$lock_invalid_mode);
+		if lm_data_$trace
+		then call lm_log_ (INFORM_SV, p_code, "lock", "TXN ^w File ^w CI ^d ModeReq ^a ^[ModeGot ^a^].",
+			dm_data_$current_txn_id, f_uid, ci_number, LOCK_MODE_NAMES (mode_req), (p_code = 0),
+			LOCK_MODE_NAMES (p_mode_obtained));
+	     end;
+MAIN_RETURN:
+	return;
+%page;
+unlock:
+     entry (p_f_uid, p_ci_number, p_code);
+
+	f_uid = p_f_uid;
+	ci_number = p_ci_number;
+	p_code = 0;
+	set_code_parm_on_error_return = "1"b;
+
+	call SETUP;
+
+	if lm_data_$trace
+	then call lm_log_ (INFORM_SV, 0, "unlock", "TXN ^w File ^w ^[CI ^d^].", dm_data_$current_txn_id, f_uid,
+		(ci_number ^= LOCK_ENTIRE_FILE), ci_number);
+
+	if lock_transaction_table.txn_id = (36)"0"b	/* Never initialized */
+	then return;				/* so there can be no locks */
+
+/*****      NOTE -- this will make per_system unlock calls *****/
+/*****	  for control intervals that were never per_system locked. */
+
+	call lm_per_system_$unlock (f_uid, ci_number, p_code);
+	if p_code ^= 0
+	then call ERROR_RETURN (p_code);
+
+	if ci_number = LOCK_ENTIRE_FILE
+	then call HASH_OUT (f_uid);
+
+
+	return;
+
+
+
+unlock_all:
+     entry;
+
+	set_code_parm_on_error_return = "0"b;
+	call SETUP;
+
+	if lock_transaction_table.txn_id = (36)"0"b	/* Never initialized */
+	then return;				/* so there can be no locks */
+
+
+	call lm_per_system_$unlock_all;
+	call FLUSH_PER_PROCESS;
+	return;
+
+
+abandon:
+     entry (p_code);
+
+/**** Do not try to unlock locks, leave that for the daemon. However, */
+/**** remove per_process garbage */
+
+	p_code = 0;
+	set_code_parm_on_error_return = "0"b;
+	call FLUSH_PER_PROCESS;
+	return;
+
+
+lock_resolve_deadlock:
+     entry (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_checkpoint_id, p_code);
+
+	p_code = dm_error_$unimplemented_entry;
+	return;
+
+
+checkpoint:
+     entry (p_checkpoint_id, p_code);
+
+	p_code = dm_error_$unimplemented_entry;
+	return;
+
+
+unlock_to_checkpoint:
+     entry (p_checkpoint_id, p_code);
+
+	p_code = dm_error_$unimplemented_entry;
+	return;
+
+
+
+/*  Internal Procedure to establish global pointers  */
+
+SETUP:
+     procedure;
+
+declare	lock_entry		bit (1) aligned;
+
+	lock_entry = "0"b;
+	go to Common;
+
+SETUP$$LOCK:
+     entry;
+
+	lock_entry = "1"b;
+
+Common:
+	lock_per_process_ptr = lm_data_$lock_per_process_ptr;
+	lock_seg_ptr = lm_data_$lock_seg_ptr;
+	call CHECK_VERSION (LOCK_SEG_VERSION_1, lock_seg.version, "lock_seg");
+	if dm_data_$current_txn_id = ""b
+	then call sub_err_ (dm_error_$no_current_transaction, "lock_manager_", ACTION_CANT_RESTART, null (), (0),
+		"lock_manager_ requires a transaction.");
+	if lm_data_$current_txn_id ^= dm_data_$current_txn_id
+	then do;
+		lm_data_$txn_table_ptr = addr (lock_seg.transaction_table (dm_data_$current_txn_index));
+		lock_transaction_table_ptr = lm_data_$txn_table_ptr;
+		call FLUSH_PER_PROCESS;		/* no longer valid */
+
+		if lock_entry
+		then call CLAIM_TRANSACTION_TABLE;	/* fill it in to us */
+	     end;
+	else lock_transaction_table_ptr = lm_data_$txn_table_ptr;
+
+	if lock_entry
+	then if lock_transaction_table.txn_id = "0"b
+	     then lock_transaction_table.txn_id = dm_data_$current_txn_id;
+
+     end SETUP;
+
+CLAIM_TRANSACTION_TABLE:
+     procedure;
+
+	lock_transaction_table.process_id = get_process_id_ ();
+	lock_transaction_table.txn_id = dm_data_$current_txn_id;
+	lock_transaction_table.ev_channel = 0;
+	lock_transaction_table.own_ptr = NULL_VPTR;
+	lock_transaction_table.wait_ptr = NULL_VPTR;
+	lm_data_$current_txn_id = dm_data_$current_txn_id;
+	return;					/* Note that this is not done until all the proceeding has succeeded */
+     end CLAIM_TRANSACTION_TABLE;
+
+
+
+/*  Internal Procedure to validate a lock mode  */
+
+VALIDATE_MODE:
+     proc (vm_mode);
+
+declare	vm_mode			fixed bin;
+
+	if vm_mode < LOCK_MODE_S | vm_mode > LOCK_MODE_SIX
+	then call ERROR_RETURN (dm_error_$lock_invalid_mode);
+
+     end VALIDATE_MODE;
+
+/*  Internal Procedure to lock a file in the appropriate mode  */
+
+LOCK_FILE:
+     proc (lf_p_f_uid, lf_p_mode_req, lf_p_timeout, lf_p_mode_obtained, lf_p_ci_number, lf_p_caller, lf_p_log_errors_only)
+	;
+
+declare	lf_p_f_uid		bit (36) aligned parameter;
+declare	lf_p_mode_req		fixed bin parameter;
+declare	lf_p_timeout		fixed bin (71) parameter;
+declare	lf_p_mode_obtained		fixed bin parameter;
+declare	lf_p_ci_number		fixed bin (27) parameter;
+declare	lf_p_caller		char (17) parameter;
+declare	lf_p_log_errors_only	bit (1) parameter;
+
+declare	lf_code			fixed bin (35);
+declare	new_mode			fixed bin;
+
+	lf_code = 0;
+
+	per_process_file_lock_ptr = HASH_SEARCH (lf_p_f_uid);
+	if per_process_file_lock_ptr = null ()
+	then do;
+		per_process_file_lock_ptr = ALLOCATE_FILE ();
+		call lm_per_system_$lock (lf_p_f_uid, LOCK_ENTIRE_FILE, lf_p_mode_req, lf_p_timeout,
+		     lf_p_mode_obtained, lf_code);
+		if lf_code = 0
+		then do;
+			per_process_file_lock.f_uid = lf_p_f_uid;
+			per_process_file_lock.mode = lf_p_mode_obtained;
+			call HASH_IN (per_process_file_lock_ptr);
+		     end;
+	     end;
+	else do;
+		new_mode = COMMON_MODE (lf_p_mode_req, per_process_file_lock.mode);
+		if new_mode = per_process_file_lock.mode
+		then lf_p_mode_obtained = per_process_file_lock.mode;
+		else do;
+			call lm_per_system_$lock (lf_p_f_uid, LOCK_ENTIRE_FILE, new_mode, lf_p_timeout,
+			     lf_p_mode_obtained, lf_code);
+			if lf_code = 0
+			then per_process_file_lock.mode = lf_p_mode_obtained;
+		     end;
+	     end;
+
+	if lm_data_$trace & ((lf_code ^= 0 & lf_p_log_errors_only) | ^lf_p_log_errors_only)
+	then call lm_log_ (INFORM_SV, lf_code, lf_p_caller, "TXN ^w File ^w ModeReq ^a ^[CI ^d^;^s^[ModeGot ^a^]^]",
+		dm_data_$current_txn_id, lf_p_f_uid, LOCK_MODE_NAMES (lf_p_mode_req),
+		(lf_p_ci_number ^= LOCK_ENTIRE_FILE), lf_p_ci_number, (lf_code = 0),
+		LOCK_MODE_NAMES (lf_p_mode_obtained));
+
+	if lf_code ^= 0
+	then call ERROR_RETURN (lf_code);
+
+     end LOCK_FILE;
+
+
+
+/*  Internal Procedures for Hash Table Operations
+
+    HASH_IN -     Hashes a block into the per-process hash table
+
+    HASH_OUT -    Hashes out and frees a block
+
+    HASH_SEARCH - Searches for a block given the Page File UID
+
+*/
+
+HASH_IN:
+     proc (hi_p_file_ptr);
+
+declare	hi_p_file_ptr		ptr parameter;
+
+declare	hi_hashx			fixed bin;
+
+declare	1 hi_cur_file		aligned like per_process_file_lock based (hi_p_file_ptr);
+
+	hi_hashx = fixed (bit (hi_cur_file.f_uid & lock_per_process.ht_mask, 36), 36);
+	hi_cur_file.ht_fp = lock_per_process.hash_table (hi_hashx);
+	lock_per_process.hash_table (hi_hashx) = hi_p_file_ptr;
+
+     end HASH_IN;
+
+
+
+HASH_OUT:
+     proc (ho_p_f_uid);
+
+declare	ho_p_f_uid		bit (36) aligned parameter;
+
+declare	ho_hashx			fixed bin;
+declare	ho_file_ptr		ptr;
+declare	ho_prev_file_ptr		ptr;
+
+declare	1 ho_cur_file		aligned like per_process_file_lock based (ho_file_ptr);
+declare	1 ho_prev_file		aligned like per_process_file_lock based (ho_prev_file_ptr);
+
+	ho_hashx = fixed (bit (ho_p_f_uid & lock_per_process.ht_mask, 36), 36);
+	ho_prev_file_ptr = null ();
+	ho_file_ptr = lock_per_process.hash_table (ho_hashx);
+	do while (ho_file_ptr ^= null ());
+	     if ho_cur_file.f_uid = ho_p_f_uid
+	     then do;
+		     if ho_prev_file_ptr = null ()
+		     then lock_per_process.hash_table (ho_hashx) = ho_cur_file.ht_fp;
+		     else ho_prev_file.ht_fp = ho_cur_file.ht_fp;
+		     call FREE_FILE (ho_file_ptr);
+		     return;
+		end;
+	     else do;
+		     ho_prev_file_ptr = ho_file_ptr;
+		     ho_file_ptr = ho_cur_file.ht_fp;
+		end;
+	end;
+
+     end HASH_OUT;
+
+
+
+HASH_SEARCH:
+     proc (hs_p_f_uid) returns (ptr);
+
+declare	hs_p_f_uid		bit (36) aligned parameter;
+
+declare	hs_hashx			fixed bin;
+declare	hs_file_ptr		ptr;
+
+declare	1 hs_cur_file		aligned like per_process_file_lock based (hs_file_ptr);
+
+	hs_hashx = fixed (bit (hs_p_f_uid & lock_per_process.ht_mask, 36), 36);
+	hs_file_ptr = lock_per_process.hash_table (hs_hashx);
+	do while (hs_file_ptr ^= null ());
+	     if hs_cur_file.f_uid = hs_p_f_uid
+	     then return (hs_file_ptr);
+	     else hs_file_ptr = hs_cur_file.ht_fp;
+	end;
+
+	return (null ());
+
+
+     end HASH_SEARCH;
+
+
+
+ALLOCATE_FILE:
+     procedure () returns (pointer);
+
+declare	af_new_file_ptr		pointer;
+declare	1 af_new_file		aligned like per_process_file_lock based (af_new_file_ptr);
+
+	area_handler = AREA_TOO_SMALL;
+
+RETRY_ALLOC:
+	allocate af_new_file in (lm_per_process_area) set (af_new_file_ptr);
+
+	area_handler = NOOP;
+	return (af_new_file_ptr);
+
+AREA_TOO_SMALL:					/* Nonquick procedure to reallocate area */
+     procedure;
+
+declare	new_area_size		fixed bin (35);
+declare	new_area_ptr		pointer;
+declare	new_area			area (new_area_size) based (new_area_ptr);
+
+	on area call ERROR_RETURN (dm_error_$per_process_area_overflow);
+
+	new_area_size = lock_per_process.area_size * 2;
+	allocate new_area in (dm_area) set (new_area_ptr);
+	new_area = lm_per_process_area;
+	lock_per_process.area_ptr = new_area_ptr;
+	lock_per_process.area_size = new_area_size;
+	go to RETRY_ALLOC;
+     end AREA_TOO_SMALL;
+     end ALLOCATE_FILE;
+
+FREE_FILE:
+     procedure (ff_file_ptr);
+declare	ff_file_ptr		pointer;
+
+	free ff_file_ptr -> per_process_file_lock;
+	return;
+     end FREE_FILE;
+
+FLUSH_PER_PROCESS:
+     procedure;
+
+	lm_per_process_area = empty ();
+	lock_per_process.hash_table (*) = null ();	/* aggregate */
+	return;
+     end FLUSH_PER_PROCESS;
+
+NOOP:
+     entry;
+	return;					/* format: off */
+
+CHECK_VERSION:
+   proc (cv_p_expected_version, cv_p_received_version, cv_p_structure_name);
+
+dcl	cv_p_expected_version
+			char (8) aligned parameter;
+dcl	cv_p_received_version
+			char (8) aligned parameter;
+dcl	cv_p_structure_name char (32) aligned parameter;
+
+      if cv_p_expected_version ^= cv_p_received_version
+      then call sub_err_ (error_table_$unimplemented_version, ME, ACTION_CANT_RESTART, null (), 0,
+	      "^/Expected version ^a of the ^a structure." || "^/Received version ^a instead.", cv_p_expected_version,
+	      cv_p_structure_name, cv_p_received_version);
+   end CHECK_VERSION;
+
+ERROR_RETURN:
+	 proc (er_p_code);
+declare er_p_code fixed bin (35);
+
+	 if set_code_parm_on_error_return then p_code = er_p_code;
+	 goto MAIN_RETURN;
+end ERROR_RETURN;
+%page;  %include dm_lock_modes;
+%page;  %include sub_err_flags;
+%page;  %include dm_lm_per_process_data_;
+%page;  %include dm_lm_system_data;
+%page;  %include dm_lm_meters;
+%page;  %include dm_log_sv_codes;
+
+end lm_per_process_$lock;

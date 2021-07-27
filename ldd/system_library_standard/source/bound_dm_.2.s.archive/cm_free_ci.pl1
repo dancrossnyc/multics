@@ -1,0 +1,628 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+
+/* DESCRIPTION:
+
+   This  module  frees  a control interval.  If the collection uses the
+   Unblocked CISM, the specified control interval is  returned  directly  to
+   the  page  file free pool, i.e., the allocation map is updated to reflect
+   that control interval's availability.  If the collection uses the Blocked
+   CISM, the map for the block in which the control interval belongs is made
+   available.  If the whole block is available,  then  all  of  the  control
+   intervals of the block are freed.
+
+   There are three entries into this module, described as follows:
+
+   cm_free_ci$cm_free_ci
+   This entry is the entry used by callers through the
+   collection_manager_ transfer vector.  It frees the control interval,
+   updates threads for the previous and next control intervals, and,
+   if the control interval is the first or last of the collection,
+   updates the collection's storage record to show a new first or last
+   control interval.
+
+   cm_free_ci$info
+   This entry is used by collection_manager_ modules.  It behaves
+   exactly as cm_free_ci$cm_free_ci, execpt that a pointer to the
+   cm_info structure is passed in.  This is because the calling
+   collection_manager_ module has already gotten the structure.
+
+   cm_free_ci$raw_return_prev_next
+   This entry is used by cm_destroy_collection.  It does not bother to
+   maintain the control interval threads or the storage record
+   information.  Instead it just blows away the specified control
+   interval.  The fact that this leaves the collection in an
+   inconsistent state is all right, as cm_destroy_collection is going
+   to free everything anyway.  This entry also returns the values of
+   the previous and next control intervals, as stored in the specified
+   control interval's header, to assist cm_destroy_collection in
+   following the control interval thread.
+
+   cm_free_ci$trace_thread_modifications_(on off)
+   These entries set a static switch, static_trace_thread_switch, to
+   on and off, respectively.  When the switch is on, debugging
+   information is printed whenever the control interval thread may have
+   been modified by freeing a control interval.
+
+
+   The zero-on-free capability is not currently supported.
+
+*/
+
+/* HISTORY:
+
+Written by Matthew Pierret, 07/06/82.
+Modified:
+10/20/82 by Matthew Pierret:  Converted to use file_manager_.
+11/03/82 by Matthew Pierret:  Changed to use opening info for both the header
+            and specified collections; to use cm_file_header instead of
+            collmgr_header; to use BASIC_CI_LAYOUT_1 (datum header-less)
+12/10/82 by Lindsey Spratt:  Fixed to get the storage record from the header
+            collection.
+02/04/83 by Matthew Pierret: Upgraded to CM_INFO_VERSION_2. Changed to get
+            blocked storage record.
+02/09/83 by Lindsey Spratt:  Fixed to correctly re-thread the control
+            intervals.
+02/23/83 by Matthew Pierret: Changed to use file_reservation_map instead of
+            block_map_array.
+03/01/83 by Lindsey Spratt:  Fixed to use "next_control_interval" when
+            replacing the next_bci_header, rather than
+            "previous_control_interval".
+08/09/83 by Matthew Pierret: Removed the obsolete dm_data_$area_ptr.
+01/24/84 by Matthew Pierret: Added debugging entries for tracing
+            modifications to the control interval thread.
+05/21/84 by Matthew Pierret: Added RETURN and ERROR_RETURN procedures.
+            Renamed dm_cm_cism_info include file to dm_cism_info.  Changed to
+            use automatic code variable instead of p_code parameter.
+06/12/84 by Matthew Pierret: Re-named cm_put_element to cm_modify.
+07/24/84 by Matthew Pierret: Added raw_return_prev_next entry.  This entry
+            does a "raw" free, meaning that it does not update threads or
+            control information, just frees the ci. It also returns the values
+            of the prev and next ci from the ci's bci_header. This entry is
+            used by cm_destroy_collection.
+09/28/84 by Matthew Pierret: Removed initial attributes from flags. Changed
+            CHECK_VERSION_CHAR_4 to CHECK_CI_VERSION.  Added sub_err_ call for
+            case where an unsupported control interval storage method was
+            encountered.Added description of race entries.
+01/08/85 by Matthew Pierret: Corrected test of gsr_code in the subroutine
+            GET_STORAGE_RECORD_PTR to be for not-equal to 0 instead of equal.
+*/
+
+/* format: style2,ind3 */
+/* format: indcomtxt,^indblkcom */
+
+cm_free_ci:
+   proc (p_file_opening_id, p_collection_id, p_control_interval_number, p_zero_on_free, p_code);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+      dcl	    p_cm_info_ptr	       ptr parameter;
+      dcl	    p_file_opening_id      bit (36) aligned parameter;
+      dcl	    p_collection_id	       bit (36) aligned parameter;
+      dcl	    p_control_interval_number
+			       fixed bin (24) uns parameter;
+      dcl	    p_zero_on_free	       bit (1) aligned parameter;
+
+      dcl	    p_previous_control_interval_number
+			       fixed bin (24) uns parameter;
+      dcl	    p_next_control_interval_number
+			       fixed bin (24) uns parameter;
+      dcl	    p_code	       fixed bin (35) parameter;
+
+/* Automatic */
+
+      dcl	    code		       fixed bin (35);
+      dcl	    control_interval_number
+			       fixed bin (24) uns;
+      dcl	    hc_cm_info_ptr	       ptr init (null);
+      dcl	    1 previous_bci_header  aligned like bci_header;
+      dcl	    previous_control_interval
+			       fixed bin (24) unsigned;
+      dcl	    1 next_bci_header      aligned like bci_header;
+      dcl	    next_control_interval  fixed bin (24) unsigned;
+
+      dcl	    1 automatic_bci_header aligned like bci_header;
+      dcl	    1 automatic_cm_file_header
+			       aligned like cm_file_header;
+      dcl	    map_idx	       fixed bin (17);
+      dcl	    (collection_header_was_updated, return_prev_and_next_ci, this_is_raw_free)
+			       bit (1) aligned;
+
+/* Based */
+/* Builtin */
+
+      dcl	    (addr, divide, length, null, size, substr, unspec)
+			       builtin;
+
+/* Constant */
+
+      dcl	    myname	       init ("cm_free_ci") char (32) varying int static options (constant);
+      dcl	    BITS_PER_WORD	       init (36) fixed bin (17) int static options (constant);
+      dcl	    BYTES_PER_WORD	       init (4) fixed bin (17) int static options (constant);
+      dcl	    NO_CONTROL_INTERVAL    init (0) fixed bin (24) unsigned int static options (constant);
+      dcl	    OFFSET_OF_BCI_HEADER   init (0) fixed bin (21) internal static options (constant);
+
+/* Entry */
+
+      dcl	    file_manager_$free     entry (bit (36) aligned, uns fixed bin (24), uns fixed bin (24), fixed bin (35));
+      dcl	    file_manager_$simple_put
+			       entry (bit (36) aligned, fixed bin (27), fixed bin (21), ptr, fixed bin (21),
+			       fixed bin (35));
+      dcl	    ioa_		       entry () options (variable);
+      dcl	    sub_err_	       entry () options (variable);
+
+/* External */
+
+      dcl	    dm_error_$ci_0_invalid_free
+			       ext fixed bin (35);
+      dcl	    dm_error_$ci_not_in_collection
+			       ext fixed bin (35);
+      dcl	    dm_error_$unimplemented_ci_version
+			       ext fixed bin (35);
+      dcl	    dm_error_$unimplemented_cism
+			       ext fixed bin (35);
+      dcl	    error_table_$unimplemented_version
+			       ext fixed bin (35);
+
+/* Static */
+
+      dcl	    static_trace_thread_switch
+			       init ("0"b) bit (1) aligned internal static;
+
+/* END OF DECLARATIONS */
+%page;
+      this_is_raw_free, return_prev_and_next_ci = "0"b;
+      code = 0;
+
+      call cm_opening_info$get (p_file_opening_id, p_collection_id, cm_info_ptr, code);
+      if code ^= 0
+      then call ERROR_RETURN (code);
+
+
+      go to JOIN;
+
+
+
+info:
+   entry (p_cm_info_ptr, p_control_interval_number, p_zero_on_free, p_code);
+
+      this_is_raw_free, return_prev_and_next_ci = "0"b;
+      code = 0;
+      cm_info_ptr = p_cm_info_ptr;
+
+      go to JOIN;
+
+raw_return_prev_next:
+   entry (p_cm_info_ptr, p_control_interval_number, p_zero_on_free, p_previous_control_interval_number,
+        p_next_control_interval_number, p_code);
+
+      this_is_raw_free, return_prev_and_next_ci = "1"b;
+      code = 0;
+      cm_info_ptr = p_cm_info_ptr;
+
+      go to JOIN;
+%page;
+JOIN:
+      p_code = 0;
+      collection_header_was_updated = "0"b;
+
+      call CHECK_VERSION ("cm_info", cm_info.version, CM_INFO_VERSION_2);
+
+      collection_header_ptr = cm_info.header_ptr;
+
+      call CHECK_VERSION ("collection_header", collection_header.version, COLLECTION_HEADER_VERSION_2);
+
+      control_interval_number = p_control_interval_number;
+
+      if control_interval_number = 0
+      then call ERROR_RETURN (dm_error_$ci_0_invalid_free);
+
+   /*** The Header Collection will be accessed several times, so get
+        opening info for the Header Collection (pointed to by hc_cm_info_ptr) to
+        make these accesses more efficient. */
+
+      call cm_opening_info$get (cm_info.file_oid, HEADER_COLLECTION_ID, hc_cm_info_ptr, code);
+      if code ^= 0
+      then call ERROR_RETURN (code);
+
+   /*** Determine if this collection is in blocked or unblocked mode. */
+
+      if collection_header.control_interval_storage_method = UNBLOCKED_CONTROL_INTERVAL_STORAGE_METHOD
+      then
+UNBLOCKED:
+         do;
+
+         /*** This is an unblocked collection. */
+
+	  call cm_get_element (cm_info.file_oid, HEADER_COLLECTION_ID, CM_FILE_HEADER_ELEMENT_ID, (0),
+	       addr (automatic_cm_file_header), length (unspec (automatic_cm_file_header)), null, ("0"b),
+	       cm_file_header_ptr, (0), code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+	  call CHECK_VERSION ("cm_file_header", cm_file_header.version, CM_FILE_HEADER_VERSION_1);
+
+	  frmf_number_of_control_intervals = cm_file_header.number_of_control_intervals_per_block;
+	  frm_number_of_fragments = cm_file_header.number_of_blocks;
+
+UB_BEGIN_BLOCK:
+	  begin;
+	     dcl	   fragment_buffer	      (divide (frmf_number_of_control_intervals, BITS_PER_WORD * 2, 17, 0) + 1)
+				      fixed bin (71);
+	     dcl	   file_reservation_map_buffer
+				      (frm_number_of_fragments) fixed bin (71);
+
+	  /*** Get proper block of allocation map.  This requires getting the cm_file_header
+	       which contains a pointer to the array of allocation block maps, getting
+	       that array (file_reservation_map), searching that array until the proper block
+	       is found. */
+
+	     call cm_get_element (cm_info.file_oid, HEADER_COLLECTION_ID, cm_file_header.allocation_map_element_id, (0),
+		addr (file_reservation_map_buffer), length (unspec (file_reservation_map_buffer)), null, ("0"b),
+		file_reservation_map_ptr, (0), code);
+	     if code ^= 0
+	     then call ERROR_RETURN (code);
+
+FIND_APPROPRIATE_BLOCK_LOOP:
+	     do map_idx = 1 to frm_number_of_fragments
+		while (
+		^(file_reservation_map (map_idx).lowest_numbered_control_interval <= control_interval_number
+		& control_interval_number
+		< file_reservation_map (map_idx).lowest_numbered_control_interval + frmf_number_of_control_intervals))
+		;
+	     end FIND_APPROPRIATE_BLOCK_LOOP;
+
+	     if map_idx > frm_number_of_fragments
+	     then call ERROR_RETURN (dm_error_$ci_not_in_collection);
+
+	  /*** Get the file_reservation_map_fragment.  An exclusive get is used here to avoid being
+	       locked out later when trying to put back the updated file_reservation_map_fragment. */
+
+	     call cm_get_element$exclusive (cm_info.file_oid, HEADER_COLLECTION_ID,
+		file_reservation_map (map_idx).element_id, (0), addr (fragment_buffer),
+		length (unspec (fragment_buffer)), null, ("0"b), file_reservation_map_fragment_ptr, (0), code);
+	     if code ^= 0
+	     then call ERROR_RETURN (code);
+
+	     if substr (file_reservation_map_fragment,
+		control_interval_number - file_reservation_map (map_idx).lowest_numbered_control_interval + 1, 1)
+		= "0"b
+	     then call RETURN;			/* Already free */
+
+	     substr (file_reservation_map_fragment,
+		control_interval_number - file_reservation_map (map_idx).lowest_numbered_control_interval + 1, 1) =
+		"0"b;				/* Set to free */
+
+
+	     bci_header_ptr = addr (automatic_bci_header);
+
+	     call cm_get_bci_header$exclusive (cm_info.file_oid, control_interval_number, bci_header_ptr, code);
+	     if code ^= 0
+	     then call ERROR_RETURN (code);
+
+	     call CHECK_CI_VERSION (bci_header.layout_type);
+
+	     if bci_header.collection_id ^= cm_info.collection_id
+	     then call ERROR_RETURN (dm_error_$ci_not_in_collection);
+
+	     previous_control_interval = bci_header.previous_control_interval;
+	     next_control_interval = bci_header.next_control_interval;
+
+	     if ^this_is_raw_free
+	     then
+UPDATE_PREV_AND_NEXT_CI:
+	        do;
+
+	        /*** The first actual updating done in freeing a control interval is to update
+		   the threads of the previous and next control intervals. These control
+		   intervals are determined by looking in the bci_header of the control
+		   interval to be freed. In getting that control interval's bci_header, an
+		   exclusive lock is obtained since it will be needed when it is freed. */
+
+		 if previous_control_interval = NO_CONTROL_INTERVAL
+		 then
+		    do;
+		       unblocked_storage_record_ptr = GET_STORAGE_RECORD_PTR ();
+		       unblocked_storage_record.first_control_interval = next_control_interval;
+		       collection_header_was_updated = "1"b;
+		    end;
+		 else
+		    do;
+		       call cm_get_bci_header (cm_info.file_oid, previous_control_interval,
+			  addr (previous_bci_header), code);
+		       if code ^= 0
+		       then call ERROR_RETURN (code);
+
+		       call CHECK_CI_VERSION (bci_header.layout_type);
+
+		       previous_bci_header.next_control_interval = next_control_interval;
+		    end;
+
+		 if next_control_interval = NO_CONTROL_INTERVAL
+		 then
+		    do;
+		       unblocked_storage_record_ptr = GET_STORAGE_RECORD_PTR ();
+		       unblocked_storage_record.last_control_interval = previous_control_interval;
+		       collection_header_was_updated = "1"b;
+		    end;
+		 else
+		    do;
+		       call cm_get_bci_header (cm_info.file_oid, next_control_interval, addr (next_bci_header), code);
+		       if code ^= 0
+		       then call ERROR_RETURN (code);
+
+		       call CHECK_CI_VERSION (bci_header.layout_type);
+
+		       next_bci_header.previous_control_interval = previous_control_interval;
+		    end;
+
+	        /*** Dislay tracing information if desired. */
+
+		 if static_trace_thread_switch
+		 then call ioa_ ("Control interval ^d freed.", control_interval_number);
+
+	        /*** Modify previous and next control intervals' headers. */
+
+		 if previous_control_interval ^= 0
+		 then
+		    do;
+		       call file_manager_$simple_put (cm_info.file_oid, (previous_control_interval),
+			  OFFSET_OF_BCI_HEADER, addr (previous_bci_header),
+			  size (previous_bci_header) * BYTES_PER_WORD, code);
+		       if code ^= 0
+		       then call ERROR_RETURN (code);
+		       if static_trace_thread_switch
+		       then call ioa_ ("^8xControl interval ^d changed to have next of ^d.",
+			       previous_control_interval, previous_bci_header.next_control_interval);
+		    end;
+		 if next_control_interval ^= 0
+		 then
+		    do;
+		       call file_manager_$simple_put (cm_info.file_oid, (next_control_interval), OFFSET_OF_BCI_HEADER,
+			  addr (next_bci_header), size (next_bci_header) * BYTES_PER_WORD, code);
+		       if code ^= 0
+		       then call ERROR_RETURN (code);
+		       if static_trace_thread_switch
+		       then call ioa_ ("^8xControl interval ^d changed to have previous of ^d.",
+			       next_control_interval, next_bci_header.previous_control_interval);
+		    end;
+	        end UPDATE_PREV_AND_NEXT_CI;
+
+	  /*** Release disk address held by control interval. */
+
+	     call file_manager_$free (cm_info.file_oid, control_interval_number, 1, code);
+	     if code ^= 0
+	     then call ERROR_RETURN (code);
+
+	  /*** Write out the allocation map block. The window between releasing the disk
+	       address and writing back the updated map should be closed. */
+
+	     call cm_modify$info (hc_cm_info_ptr, file_reservation_map_fragment_ptr, -1,
+		file_reservation_map (map_idx).element_id, (0), code);
+	     if code ^= 0
+	     then call ERROR_RETURN (code);
+
+	     if file_reservation_map (map_idx).flags.no_control_intervals_are_available
+	     then
+	        do;
+		 file_reservation_map (map_idx).flags.no_control_intervals_are_available = "0"b;
+		 call cm_modify$info (hc_cm_info_ptr, file_reservation_map_ptr, -1,
+		      cm_file_header.allocation_map_element_id, (0), (0));
+	        end;
+
+	  /*** If the collection_header was updated, put it back. */
+
+	     if collection_header_was_updated
+	     then
+	        do;
+		 call cm_modify$info (hc_cm_info_ptr, unblocked_storage_record_ptr, -1,
+		      collection_header.storage_record_element_id, (0), code);
+		 if code ^= 0
+		 then call ERROR_RETURN (code);
+	        end;
+
+	  /*** Return the previous and next control interval numbers. */
+
+	     if return_prev_and_next_ci
+	     then
+	        do;
+		 p_previous_control_interval_number = previous_control_interval;
+		 p_next_control_interval_number = next_control_interval;
+	        end;
+	  end UB_BEGIN_BLOCK;
+         end UNBLOCKED;
+      else call sub_err_ (dm_error_$unimplemented_cism, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/This routine does not implement control interval storage method ^d.",
+	      collection_header.control_interval_storage_method);
+
+
+/**** ***************************************************************************
+
+      The following code is to support the blocked control interval storage method.
+      This method is not yet supported and will not be supported in MR11.
+
+      else
+      BLOCKED:
+      do;
+      blocked_storage_record_ptr = GET_STORAGE_RECORD_PTR ();
+
+      camb_number_of_control_intervals = blocked_storage_record.number_of_control_intervals_per_block;
+      cam_number_of_blocks = blocked_storage_record.number_of_blocks;
+
+      begin;
+      dcl	   block_buffer	      (divide (camb_number_of_control_intervals, BITS_PER_WORD * 2, 17, 0) + 1)
+      fixed bin (71);
+      dcl	   cam_buffer	      (cam_number_of_blocks) fixed bin (71);
+
+      call
+      cm_get_element (cm_info.file_oid, HEADER_COLLECTION_ID,
+      blocked_storage_record.block_map_array_element_id, (0), addr (cam_buffer), length (unspec (cam_buffer)),
+      null, ("0"b), collection_allocation_map_ptr, (0), code);
+      if code ^= 0
+      then call ERROR_RETURN (code);
+
+      do map_idx = 1 to cam_number_of_blocks
+      while (
+      ^(collection_allocation_map (map_idx).lowest_numbered_control_interval <= control_interval_number
+      & control_interval_number
+      < collection_allocation_map (map_idx).lowest_numbered_control_interval + camb_number_of_control_intervals));
+      end;
+
+      if map_idx > cam_number_of_blocks
+      then call ERROR_RETURN (dm_error_$ci_not_in_collection);
+
+      call
+      cm_get_element$exclusive (cm_info.file_oid, HEADER_COLLECTION_ID,
+      collection_allocation_map (map_idx).element_id, (0), addr (block_buffer), length (unspec (block_buffer)), null,
+      ("0"b), collection_allocation_map_block_ptr, (0), code);
+      if code ^= 0
+      then call ERROR_RETURN (code);
+
+      if substr (collection_allocation_map_block,
+      control_interval_number - collection_allocation_map (map_idx).lowest_numbered_control_interval + 1, 1)
+      = "0"b
+      then call RETURN;
+
+      substr (collection_allocation_map_block,
+      control_interval_number - collection_allocation_map (map_idx).lowest_numbered_control_interval + 1, 1) =
+      "0"b;
+
+      call
+      cm_modify$info (hc_cm_info_ptr, collection_allocation_map_block_ptr, -1,
+      collection_allocation_map (map_idx).element_id, (0), code);
+      if code ^= 0
+      then
+      call ERROR_RETURN (code);
+
+      if collection_allocation_map (map_idx).flags.no_control_intervals_are_available
+      then
+      do;
+      collection_allocation_map (map_idx).flags.no_control_intervals_are_available = "0"b;
+      call
+      cm_modify$info (hc_cm_info_ptr, collection_allocation_map_ptr, -1,
+      blocked_storage_record.block_map_array_element_id, (0), (0));
+      if code ^= 0
+      then
+      call ERROR_RETURN (code);
+      end;
+
+      end;
+      end BLOCKED;
+
+      ************************************************************************ ****/
+
+MAIN_RETURN:
+      return;
+
+
+trace_thread_modifications_on:
+   entry ();
+      static_trace_thread_switch = "1"b;
+      return;
+
+trace_thread_modifications_off:
+   entry ();
+      static_trace_thread_switch = "0"b;
+      return;
+%page;
+RETURN:
+   proc ();
+
+      go to MAIN_RETURN;
+
+   end RETURN;
+
+
+ERROR_RETURN:
+   proc (er_p_code);
+
+      dcl	    er_p_code	       fixed bin (35);
+
+      p_code = er_p_code;
+      call FINISH ();
+      go to MAIN_RETURN;
+
+   end ERROR_RETURN;
+
+
+FINISH:
+   proc ();
+
+   end FINISH;
+
+GET_STORAGE_RECORD_PTR:
+   proc () returns (ptr);
+
+      dcl	    gsr_p_storage_record_ptr
+			       ptr;
+      dcl	    gsr_code	       fixed bin (35) init (0);
+
+      if cm_info.storage_record_ptr = null
+      then call cm_opening_info$get_storage_record (cm_info_ptr, gsr_code);
+
+      if gsr_code ^= 0
+      then call ERROR_RETURN (gsr_code);
+
+      gsr_p_storage_record_ptr = cm_info.storage_record_ptr;
+
+      return (gsr_p_storage_record_ptr);
+
+   end GET_STORAGE_RECORD_PTR;
+%page;
+CHECK_VERSION:
+   proc (cv_p_structure_name, cv_p_given_version, cv_p_correct_version);
+
+      dcl	    cv_p_structure_name    char (*);
+      dcl	    cv_p_given_version     char (8) aligned;
+      dcl	    cv_p_correct_version   char (8) aligned;
+
+      if cv_p_given_version ^= cv_p_correct_version
+      then call sub_err_ (error_table_$unimplemented_version, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected version ""^8a"" of ^a structure; received ""^8a"".", cv_p_correct_version,
+	      cv_p_structure_name, cv_p_given_version);
+
+      return;
+
+   end CHECK_VERSION;
+
+
+CHECK_CI_VERSION:
+   proc (ccv_p_given_version);
+
+      dcl	    ccv_p_given_version    char (4) aligned;
+
+      if ccv_p_given_version ^= BASIC_CI_LAYOUT_1
+      then call sub_err_ (dm_error_$unimplemented_ci_version, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected version ^a control interval; received ^a.", BASIC_CI_LAYOUT_1, ccv_p_given_version);
+      else return;
+
+   end CHECK_CI_VERSION;
+%page;
+%include dm_hdr_collection_id;
+
+%include dm_cm_hdr_col_ids;
+%page;
+%include dm_cm_info;
+%page;
+%include dm_cm_collection_header;
+%page;
+%include dm_cm_file_header;
+%page;
+%include dm_cm_storage_record;
+%page;
+%include dm_cm_reservation_map;
+%page;
+%include dm_cism_info;
+%page;
+%include dm_cm_basic_ci;
+%page;
+%include dm_cm_entry_dcls;
+%page;
+%include sub_err_flags;
+
+   end cm_free_ci;

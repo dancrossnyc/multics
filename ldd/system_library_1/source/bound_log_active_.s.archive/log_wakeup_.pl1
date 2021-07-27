@@ -1,0 +1,392 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-12-20,EJSharpe), approve(86-02-20,MCR7334),
+     audit(86-02-26,Kissel), install(86-04-23,MR12.0-1044):
+     set bootload time, ignore duplicate entries
+                                                   END HISTORY COMMENTS */
+
+
+/* format: off */
+
+log_wakeup_:
+     procedure ();
+
+/* *	LOG_WAKEUP_
+   *
+   *	This procedure manages the sending of wakeups when messages are
+   *	placed in a log. There is a table of listening processes in the
+   *	header of each log segment, and these processes are all sent
+   *	wakeups when this procedure is called. The table of processes
+   *	is limited in size; there may only be 25 (or some such small
+   *	number (see log_segment_info.incl.pl1 for the exact count) processes
+   *	listening at a time, but this hardly seems like an unreasonable
+   *	limitation.
+   *
+   *	If a process is found to have expired when an attempt is made
+   *	to awaken it, it is automatically removed from the list.
+   *	Entries in the list are made by STACQ'ing process IDs into
+   *	apparently empty slots, making the mechanism lockless.
+   *
+   *	This program assumes that the segment it is adding entries to
+   *	is the one currently in use for writing.  It checks the in_service
+   *	flag explicitly when registering and de-registering listeners,
+   *	but NOT when sending wakeups, the assumption being that if a
+   *	message was added to the segment, the processes listed in that
+   *	segment should be the ones notified.
+   *
+   *	Written 84-05-04, W. Olin Sibert
+   */
+
+declare	P_log_segment_ptr pointer parameter;
+declare	P_log_message_ptr pointer parameter;
+declare	P_process_id bit (36) aligned parameter;
+declare	P_event_channel fixed bin (71) parameter;
+declare	P_code fixed bin (35) parameter;
+
+declare	code fixed bin (35);
+
+declare	error_table_$itt_overflow fixed bin (35) external static;
+declare	error_table_$log_out_of_service fixed bin (35) external static;
+declare	error_table_$log_segment_damaged fixed bin (35) external static;
+declare	error_table_$log_wakeup_table_full fixed bin (35) external static;
+declare	error_table_$wakeup_denied fixed bin (35) external static;
+
+declare	sys_info$time_of_bootload fixed bin (71) external static;
+
+declare	get_ring_ entry () returns (fixed bin (3));
+declare	hcs_$validate_processid entry (bit (36) aligned, fixed bin (35));
+declare	hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+declare	log_segment_$get_service_bit entry (pointer, bit (1) aligned, fixed bin (35));
+declare	pxss$ring_0_wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+declare	tc_util$validate_processid entry (bit (36) aligned, fixed bin (35));
+
+declare	PROCESS_ID_FLAG bit (36) aligned internal static options (constant) init ("400000000000"b3);
+declare	PROCESS_ID_MASK bit (36) aligned internal static options (constant) init ("377777777777"b3);
+
+declare  (binary, bit, hbound, rel, stacq, substr, unspec) builtin;
+
+/* */
+
+finished:						/* All-purpose exitl we always leave through here */
+     procedure (P_status_code);
+
+declare	P_status_code fixed bin (35) parameter;
+
+
+	P_code = P_status_code;
+	goto MAIN_RETURN;
+
+	end finished;
+
+
+
+MAIN_RETURN:					/* This is the only return statement in the main procedure */
+	return;
+
+
+
+log_wakeup_$send_wakeups:
+     entry (P_log_segment_ptr, P_log_message_ptr, P_code);
+
+	call copy_log_segment_ptr ();			/* DON'T call check_in_service for this; the caller has */
+	call send_wakeups ();			/* (presumably) already dealt with that possibility */
+	call finished (0);
+
+/* */
+
+log_wakeup_$register:
+     entry (P_log_segment_ptr, P_process_id, P_event_channel, P_code);
+
+	call copy_log_segment_ptr ();
+	call check_in_service ();
+	call register_listener ();
+	call check_in_service ();
+	call finished (0);
+
+
+
+log_wakeup_$deregister:
+     entry (P_log_segment_ptr, P_process_id, P_event_channel, P_code);
+
+	call copy_log_segment_ptr ();
+	call check_in_service ();
+	call deregister_listener ();
+	call check_in_service ();
+	call finished (0);
+
+
+
+log_wakeup_$discard_all:
+     entry (P_log_segment_ptr, P_code);
+
+	call copy_log_segment_ptr ();
+	call check_in_service ();
+	call clear_listener_info ();
+	call check_in_service ();
+	call finished (0);
+
+/* */
+send_wakeups:
+     procedure ();
+
+/* This procedure delivers the wakeups to every listening process. If a process
+   turns out to be defunct, it is removed from the list, but no error is indicated
+   to anyone. */
+
+declare	slot_idx fixed bin;
+declare	process_id bit (36) aligned;
+declare	event_channel fixed bin (71);
+declare	ring_zero bit (1) aligned;
+declare	event_message fixed bin (71);
+
+
+	if ^log_segment.listeners_registered then		/* A flag kept for efficiency reasons */
+	     return;
+
+	log_message_ptr = P_log_message_ptr;	/* Parameter imported from external procedure */
+	unspec (event_message) = bit (binary (log_message.sequence, 36)) || "000000"b3 || rel (log_message_ptr);
+						/* Message is sequence number and location */
+	ring_zero = (get_ring_ () = 0);		/* If we can, call pxss directly */
+
+	do slot_idx = 1 to hbound (log_segment.listener, 1);
+	     process_id = log_segment.listener.process_id (slot_idx);
+	     event_channel = log_segment.listener.event_channel (slot_idx);
+	     if (process_id = ""b) then		/* See that somebody's there, and that the slot is */
+		goto WAKEUP_NEXT_CUSTOMER;		/* properly filled in (filling flag is off) */
+	     if (substr (process_id, 1, 1)) then
+		goto WAKEUP_NEXT_CUSTOMER;
+
+	     if ring_zero then
+		call pxss$ring_0_wakeup (process_id, event_channel, event_message, code);
+	     else call hcs_$wakeup (process_id, event_channel, event_message, code);
+
+	     if (code = 0) then ;			/* Success, or some error codes, leave the target there */
+	     else if (code = error_table_$itt_overflow) then ; /* for others to try awakening. */
+	     else if (code = error_table_$wakeup_denied) then ; /* Remaining codes (indicating failure) are: */
+	     else call clear_slot (slot_idx);		/* process_stopped, process_unknown, bad_arg */
+
+WAKEUP_NEXT_CUSTOMER:
+	     end;
+
+	return;
+	end send_wakeups;
+
+/* */
+
+register_listener:
+     procedure ();
+
+
+	if (try_to_register ()) then			/* Try it outright the first time. */
+	     return;				/* Just return if it works */
+
+	call reclaim_dead_listeners ();		/* If that fails, pick out any losers and try again */
+
+	if (try_to_register ()) then			/* If it works a second time, we must have picked */
+	     return;				/* up after some deaders */
+
+	call finished (error_table_$log_wakeup_table_full);    /* Otherwise, give up (do a goto out of here) */
+
+	end register_listener;
+
+/* */
+
+try_to_register:
+     procedure () returns (bit (1) aligned);
+
+declare	event_channel fixed bin (71);
+declare	process_id bit (36) aligned;
+declare	flagged_process_id bit (36) aligned;
+declare	slot_idx fixed bin;
+declare	ignore_bit bit (1) aligned;
+
+
+/* This procedure returns "1"b if it successfully registered a process, and
+   "0"b if it finds the table is full.	The algorithm works as follows:
+
+   The process table is searched for a presently empty slot (process_id is
+   zero when empty). Once one is found, the target process_id is installed,
+   but with the upper bit set to tell the wakeup procedure, ignore this
+   entry until it's properly filled in. Once it's properly filled in, that
+   upper bit is turned off.
+   */
+
+	process_id = P_process_id;			/* P_process_id and P_event_channel parameters are */
+	event_channel = P_event_channel;		/* imported from the external procedure */
+	flagged_process_id = process_id | PROCESS_ID_FLAG;
+
+	log_segment.listeners_registered = "1"b;		/* Flag it as having listeners (flag is for efficiency) */
+
+RETRY_REGISTER:
+	do slot_idx = 1 to hbound (log_segment.listener, 1);
+	     if (log_segment.listener.process_id (slot_idx) = process_id) then
+		if (log_segment.listener.event_channel (slot_idx) = event_channel) then
+		     return ("1"b);			/* procID/ev_chn should only appear once */
+
+	     if (log_segment.listener.process_id (slot_idx) = ""b) then do; /* A candidate */
+		if ^stacq (log_segment.listener.process_id (slot_idx), flagged_process_id, ""b) then
+		     goto RETRY_REGISTER;		/* But someone else got him first */
+
+		log_segment.listener.event_channel (slot_idx) = event_channel;
+
+		ignore_bit = stacq (log_segment.listener.process_id (slot_idx), process_id, flagged_process_id);
+		return ("1"b);			/* Flag it as valid, and return, successful */
+		end;
+	     end;
+
+	return ("0"b);
+
+	end try_to_register;
+
+/* */
+
+reclaim_dead_listeners:
+     procedure ();
+
+declare	slot_idx fixed bin;
+declare	process_id bit (36) aligned;
+declare	ring_zero bit (1) aligned;
+
+/* This procedure attempts to reclaim slots in use by expired processes.
+   It just goes through and checks all the process-ids in the slots, reclaiming
+   dead ones. It is only used when a new listener is being added and there are
+   no slots already available; normally, dead processes will be detected in the
+   course of sending wakeups, and their slots reclaimed automatically. */
+
+/* Note that listeners from the previous bootload (by definition dead) have
+   already been "reclaimed" by the check in copy_log_segment_ptr, which cleans
+   them all out the first time it runs in a different bootload. */
+
+
+	ring_zero = (get_ring_ () = 0);
+
+	do slot_idx = 1 to hbound (log_segment.listener, 1);
+	     process_id = log_segment.listener.process_id (slot_idx) & PROCESS_ID_MASK;
+	     if (process_id ^= ""b) then do;		/* A possibly valid process-id is here */
+		if ring_zero then
+		     call tc_util$validate_processid (process_id, code);
+		else call hcs_$validate_processid (process_id, code);
+
+		if (code ^= 0) then			/* Not one of ours, Jack */
+		     call clear_slot (slot_idx);
+		end;
+	     end;
+
+	return;
+	end reclaim_dead_listeners;
+
+/* */
+
+deregister_listener:
+     procedure ();
+
+declare	slot_idx fixed bin;
+declare	process_id bit (36) aligned;
+declare	test_process_id bit (36) aligned;
+declare	event_channel fixed bin (71);
+
+
+	process_id = P_process_id;			/* P_process_id and P_event_channel parameters are */
+	event_channel = P_event_channel;		/* imported from the external procedure */
+
+	do slot_idx = 1 to hbound (log_segment.listener, 1);
+	     test_process_id = log_segment.listener.process_id (slot_idx) & PROCESS_ID_MASK;
+	     if (process_id = test_process_id) then
+		if (log_segment.listener.event_channel (slot_idx) = event_channel) then
+		     call clear_slot (slot_idx);
+	     end;
+
+	return;
+	end deregister_listener;
+
+/* */
+
+clear_slot:
+     procedure (P_slot_idx);
+
+declare	P_slot_idx fixed bin parameter;
+
+declare	process_id bit (36) aligned;
+
+
+/* Shouldn't need this silly loop, but may as well have it anyway */
+
+	process_id = log_segment.listener.process_id (P_slot_idx);
+	do while (^stacq (log_segment.listener.process_id (P_slot_idx), ""b, process_id));
+	     process_id = log_segment.listener.process_id (P_slot_idx);
+	     end;
+
+	return;
+	end clear_slot;
+
+
+
+clear_listener_info:
+     procedure ();
+
+/* This procedure clears out all the wakeup info in the log, wholesale */
+
+	log_segment.listeners_registered = "0"b;		/* Turn off wakeups first */
+
+	unspec (log_segment.listener) = ""b;		/* Then just clear them all out */
+
+	log_segment.listener_bootload_time = sys_info$time_of_bootload;
+						/* and set the bootload time */
+
+	return;
+	end clear_listener_info;
+
+/* */
+
+copy_log_segment_ptr:
+     procedure ();
+
+	log_segment_ptr = P_log_segment_ptr;
+
+	if (log_segment.version ^= LOG_SEGMENT_VERSION_1) then
+	     call finished (error_table_$log_segment_damaged);
+
+/* NOTE: This check for listeners belonging to the current bootload imposes the
+   requirement that a process calling ANY log_wakeup_ entrypoint must have write
+   access to the log segment, because it might make this check and want to clear
+   out the old listener info.	 This is not an onerous requirement, because only
+   the wakeup entrypoint could conceivably work without write access, but it
+   is only called if the process has already just written a message (for which,
+   of course, write access was already required). */
+
+	if (log_segment.listener_bootload_time ^= sys_info$time_of_bootload) then /* bootload; if not, they're all */
+	     call clear_listener_info ();		/* dead, and we should dispose of them before doing anything */
+						/* else with the listener info. */
+	return;
+	end copy_log_segment_ptr;
+
+
+
+check_in_service:
+     procedure ();
+
+declare	service_bit bit (1) aligned;
+
+
+	call log_segment_$get_service_bit (log_segment_ptr, service_bit, code);
+	if (code ^= 0) then
+	     call finished (code);
+	if ^service_bit then
+	     call finished (error_table_$log_out_of_service);
+
+	return;
+	end check_in_service;
+
+%page; %include log_segment;
+%page; %include log_message;
+
+	end log_wakeup_;

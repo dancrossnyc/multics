@@ -1,0 +1,804 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-12-05,GWMay), approve(), audit(), install():
+     history comments before the hcom program:
+        Created on 10/24/74 by Bill Silver.
+        Modified 3/80 by R.J.C. Kissel to fix a bug in label writing.
+        Modified 1/2/81 by J. A. Bush for bootable tape labels.
+        Modified 8/12/81 by J. A. Bush for pre-MR9.0 label compatibility
+        Modified 8/82 by S. Krupp to change from tdcm_ to tape_ioi_ interface.
+        Modified 4/83 by Chris Jones to fix critical bug when writing suspended
+        buffers
+        Modified 12/84 by Chris Jones to improve writing strategy as subsets
+        fill
+        Modified 1985-03-14, BIM: fix dropped records end of tapes.
+        Modified 1985-03-25, BIM: fixed off-by-one in padding changes above.
+        Modified 1985-03-28, BIM: call PAD before instead of after
+        SETUP_RECORD.
+        Modified 1985-05-13, BIM: correctly set .admin and .set every time.
+  2) change(86-02-13,GWMay), approve(86-02-13,MCR7337), audit(86-03-11,Farley),
+     install(86-03-17,MR12.0-1030):
+     moved the call to tape_io_$write before the check for eot so that when the
+     last write is performed which causes the eot to be signalled, the program
+     will handle the cleanup before returning. Before this change the program
+     was not flushing its internal work buffers before exiting causing the tape
+     to be out of format.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+tape_mult_write_:
+     procedure;
+
+/*	This program is part of the Multics standard tape I/O module, tape_mult_.
+   *	All of the functions that involve writing on a tape have been combined in this program.
+   *	It contains the following entry points.
+   *
+   *	put_chars: Writes data onto the tape.  The character stream is broken up into Multics
+   *		 standard records.  This implements the iox_$put_chars entry point.
+   *	record:	 Writes one Multics standard record.  The data that is to be written must
+   *		 fit into one Multics standard record.  Currently, this entry may be
+   *		 called only from within tape_mult_.
+   *	eof:	 Writes one End of File record.  May be called only from within tape_mult_.
+   *	flush:	 Writes all the data we have currently buffered.  This entry
+   *		 may be called only from within tape_mult_.
+   *	label:	 sets up a buffer with the data for a standard tape label,
+   *		 defined by the structure mst_label (for a bootable tape)
+   *		 within the include file  mstr.incl.pl1. The label record
+   *		 is actually written by a succeeding call to the eof entry,
+   *		 which will write the label record followed by an EOF mark.
+   *		 This entry is called only from within
+   *		 tape_mult_ (currently from tape_mult_labeler_).
+*/
+
+
+/*		ARGUMENTS			*/
+
+dcl	arg_char_count	   fixed bin (21),		/* (I) Number of characters to write. */
+	arg_error_code	   fixed bin (35),		/* (O) Standard system error code. */
+	arg_iocb_ptr	   ptr,			/* (I) Pointer to I/O control block. */
+	arg_tmdbp		   ptr,			/* (I) Pointer to tape_mult_ data . */
+	arg_work_buf_ptr	   ptr;			/* (I) Pointer to beginning of caller's buffer. */
+
+
+/*		AUTOMATIC  DATA		*/
+
+dcl	buf_space		   fixed bin,		/* Num of unused characters in record buffer. */
+	char_count	   fixed bin (21),		/* Current num of characters to be written. */
+	error_code	   fixed bin (35),		/* Standard system error code. */
+	boot_label	   bit (1),		/* ON => a bootable (version >= 3) label is being generated */
+	i		   fixed bin,		/* iteration counter */
+	iocb_ptr		   ptr,			/* Pointer to I/O control block. */
+	move_len		   fixed bin,		/* Num of chars to move. */
+	n_ready_bufs	   fixed bin,
+	n_susp_bufs	   fixed bin,
+	num_data_bits	   fixed bin,		/* Bit count of actual data in a record. */
+	rb_plen		   fixed bin,		/* Num of chars already in record buffer. */
+	rb_ptr		   ptr,			/* Pointer to record buffer. */
+	rx		   fixed bin,		/* result index */
+	vidp		   ptr,			/* Pointer to version 2 label volume info */
+	ip		   ptr,			/* pointer to installation_parms segment */
+	bpp		   ptr,			/* temp pointer */
+	bpo		   fixed bin,		/* length of external boot program  */
+	segfaultsw	   bit (1) init ("0"b),	/* Set if segfault occurs moving data to buffer */
+	wb_plen		   fixed bin (21),		/* Num of chars moved from work buffer. */
+	tn1		   fixed bin,		/* temp number storage */
+	tb1		   bit (18),		/* temp bit offset storage */
+	wb_ptr		   ptr;			/* Pointer to caller's work buffer. */
+
+
+/*   CONSTANTS */
+/* program offset if booted (octal 30) */
+dcl	boot_offset	   fixed bin internal static options (constant) init (24);
+
+/*  change v3_label to "1"b to enable generation of version 3 bootable default labels */
+
+dcl	v3_label		   bit (1) aligned int static options (constant) init ("0"b);
+
+dcl	READY_BUFFERS	   fixed bin init (1) int static options (constant);
+dcl	SUSPENDED_BUFFERS	   fixed bin init (3) int static options (constant);
+
+/*		 BASED  DATA		*/
+
+dcl	1 work_buf	   based unaligned,		/* Caller's buffer. */
+	  2 processed	   char (wb_plen),		/* Data already written. */
+	  2 move		   char (move_len);		/* Data being moved to record buffer. */
+
+dcl	1 record_buf	   based aligned,		/* Physical record buffer. */
+	  2 head		   (size (mstr_header)) bit (36),
+						/* Multics standard tape record header. */
+	  (
+	  2 processed	   char (rb_plen),		/* Data already moved into record buffer. */
+	  2 move		   char (move_len)
+	  )		   unal;			/* Data being moved into record buffer. */
+
+dcl	1 based_record	   based aligned,		/* Physical record buffer. */
+	  2 head		   (size (mstr_header)) bit (36),
+						/* Multics standard tape record header. */
+	  2 array		   (1:4096) bit (9) unaligned;/* Record data as an array. */
+
+/*		EXTERNAL  DATA		*/
+
+dcl	(
+	error_table_$bad_arg,
+	error_table_$device_end,
+	error_table_$device_not_active,
+	error_table_$device_parity,
+	error_table_$segfault,
+	error_table_$invalid_write
+	)		   fixed bin external;
+
+
+dcl	get_group_id_	   entry returns (char (32)),
+	hcs_$initiate	   entry (char (*), char (*), char (*), fixed bin (5), fixed bin (2), ptr, fixed bin (35)),
+	release_temp_segment_  entry (char (*), ptr, fixed bin (35)),
+	tape_checksum_	   entry (ptr, ptr),
+	tape_mult_util_$wait_for_write
+			   entry (bit (36) aligned, fixed bin, fixed bin (35)),
+	unique_bits_	   entry returns (bit (70));
+
+dcl	seg_fault_error	   condition;
+
+dcl	(addr, addcharno, bin, bit, divide, hbound, high9, min, null, ptr, rel, size, substr, unspec)
+			   builtin;
+
+put_chars:
+     entry (arg_iocb_ptr, arg_work_buf_ptr, arg_char_count, arg_error_code);
+
+/*	This entry is called to write stream data onto a tape.  The element size of the
+   *	stream must be 9 bits.  The stream will be broken up into units that can be written
+   *	as one Multics standard tape record.
+*/
+	iocb_ptr = arg_iocb_ptr;			/* Copy arguments. */
+	wb_ptr = arg_work_buf_ptr;
+	char_count = arg_char_count;
+
+	iocb_ptr = iocb_ptr -> iocb.actual_iocb_ptr;	/* Initialize pointers. */
+	tmdb_ptr = iocb_ptr -> iocb.attach_data_ptr;
+
+	tioi_id = tmdb.work.tioi_id;			/* Initialize variables. */
+	wb_plen = 0;
+	error_code = 0;
+
+	if ^tmdb.opt.write_sw			/* May we write on this tape? */
+	then do;					/* NO. */
+	     error_code = error_table_$invalid_write;
+	     goto PUT_CHARS_ERROR;
+	end;
+
+	if tmdb.head.flags.eot			/* Have we past the End of Tape reflector? */
+	then do;					/* YES, can't write anymore. */
+	     error_code = error_table_$device_end;
+	     goto PUT_CHARS_ERROR;
+	end;
+
+/*	We will now move the caller's data into the record buffers.  This loop breaks the
+   *	data up into Multics standard tape records.  Each iteration implies that one
+   *	tape record has been filled  or  contains all the data we have to write.
+*/
+	do while (char_count > 0);			/* Keep looping until all data moved. */
+	     call FILL_BUFFER (error_code);		/* Fill buffer - up to 1 Mult. stand. tape record. */
+	     if error_code ^= 0 then
+		go to PUT_CHARS_ERROR;
+	end;
+
+	if ^tmdb.async_sw then do;
+	     call tape_mult_util_$wait_for_write (tioi_id, rx, error_code);
+	     call CHECK_RX (rx, error_code);
+	     if error_code ^= 0 then
+		go to PUT_CHARS_ERROR;
+	end;
+
+	if segfaultsw then do;			/* error copying data */
+	     error_code = error_table_$segfault;
+	     go to PUT_CHARS_ERROR;
+	end;
+
+	arg_error_code = 0;				/* put_chars operation was successful. */
+	return;
+
+PUT_CHARS_ERROR:
+	arg_error_code = error_code;
+	return;
+
+record:
+     entry (arg_tmdbp, arg_work_buf_ptr, arg_char_count, arg_error_code);
+
+/*	This entry is called to write ONE Multics standard tape record.  The data
+   *	that the user wants to write MUST fit into one Multics standard tape record.
+   *	No record is written unless the caller supplies at least one character.
+   *	If there is space in the record which is not used it will be padded with
+   *	characters of "111111111"b.  If there is unwritten data in the current
+   *	record buffer then that record will also be padded.  We will always begin
+   *	writing our data at the beginning of the data portion of the Multics standard record.
+*/
+	tmdb_ptr = arg_tmdbp;			/* Initialize pointers, etc. */
+	wb_ptr = arg_work_buf_ptr;
+	char_count = arg_char_count;
+
+	tioi_id = tmdb.work.tioi_id;			/* Initialize variables. */
+	error_code = 0;
+	char_count = min (char_count, tmdb.work.rec_length);
+	wb_plen = 0;
+
+	if char_count = 0				/* No data => no write. */
+	     then
+	     goto RECORD_RETURN;
+
+	call PAD ();				/* Pad current record. */
+	call SETUP_RECORD ();			/* Set record header and trailer. */
+	if SUBSET_IS_FULL () then do;
+	     call WRITE_SUBSET (error_code);
+	     if ^(error_code = 0 | error_code = error_table_$device_end) then
+		go to RECORD_RETURN;
+	end;
+
+	call FILL_BUFFER (error_code);		/* Move data into record buffer. */
+	call PAD ();				/* Pad the rest of this record */
+	call SETUP_RECORD ();			/* Set the header and trailer. */
+	call WRITE_SUBSET (error_code);
+
+RECORD_RETURN:					/* Common way out of this entry. */
+	arg_error_code = error_code;			/* Return code. */
+	return;
+
+label:
+     entry (arg_tmdbp, arg_error_code);
+
+/*	This entry is called to set up a buffer with the information
+   *	required for a Multics standard tape label.  If the "boot_program"
+   *	control order has been executed, then a "bootable" tape label is set
+   *	up which is defined by the mst_label structure within the include
+   *	file mstr.incl.pl1.  If the "boot_program" control order has not been
+   *	executed, then the label record takes on the personality of an
+   *	"ordinary" tape_mult standard record, the volume information being
+   *	defined by the volume_identifier structure within the mstr include
+   *	file.
+*/
+
+	tmdb_ptr = arg_tmdbp;			/* Initialize pointers, etc. */
+	tioi_id = tmdb.work.tioi_id;
+	wb_plen = 0;				/* set processed char count to 0 */
+	error_code = 0;				/* Return good code. */
+	mstrp, rb_ptr = tmdb.work.curr_buf;		/* Set ptr to label buffer */
+	bpp = ptr (mstrp, 0);			/* mstrp with zero offset */
+	tb1 = bit (bin (bin (rel (addr (bpp -> mst_label.boot_pgm)), 18) + boot_offset, 18), 18);
+	call hcs_$initiate (">system_control_1", "installation_parms", "", 0b, 0, ip, (0));
+
+	if tmdb.opt.tbpp ^= null then do;		/* if external boot program */
+	     mst_label = tmdb.opt.tbpp -> mst_label;	/* copy it */
+	     bpo = mst_label.boot_pgm_len;		/* set text length */
+	     mst_label.copyright = protection_notice;	/* set protection notice on bootable tapes */
+	     call release_temp_segment_ ("tape_mult_", tmdb.opt.tbpp, (0));
+						/* release our temp boot pgm buffer */
+	     tmdb.opt.tbpp = null;			/* null out ptr, so if called again, will work */
+	     boot_label = "1"b;			/* indicate this is a bootable label */
+	     tmdb.work.buf_pos = bpo * 4;
+	end;
+	else if v3_label then do;			/* default boot label */
+	     bpo = 2;				/* set boot program length, (pad the rest) */
+	     mst_label.boot_pgm (1) = tb1 || "616200"b3;	/* set up DIS to stop if this tape is booted */
+	     mst_label.boot_pgm (2) = "777777710204"b3;	/* and a tra to *-1,ic to make sure he stops */
+	     mst_label.boot_pgm_path = "";		/* pad with blanks */
+	     mst_label.copyright = "";		/* protection notice only goes on bootable tapes */
+	     boot_label = "1"b;			/* indicate this is a bootable label */
+	     tmdb.work.buf_pos = bpo * 4;
+	end;
+	else do;					/* pre-MR9.0 label compatibility hack */
+	     vidp = addr (mstr.data);			/* set volume info ptr */
+	     boot_label = "0"b;			/* indicate this is not a bootable label */
+	     if ip = null then			/* Is there an installation_parms segment? */
+		vidp -> volume_identifier.installation_id = " ";
+						/* NO, use blanks. */
+	     else vidp -> volume_identifier.installation_id = installation_parms.installation_id;
+	     vidp -> volume_identifier.tape_reel_id = tmdb.opt.reel_name;
+						/* Caller knows reel ID. */
+	     vidp -> volume_identifier.volume_set_id = tmdb.opt.volume_set_id;
+						/* copy directly, could be blanks */
+	     tmdb.work.buf_pos = size (volume_identifier) * 4;
+						/* set char size of label */
+	     tmdb.work.rec_length = 1024 * 4;		/* reset  record length */
+	     tmdb.head.data_bit_len = 1024 * 36;	/* and max bit count */
+	     call PAD ();				/* Pad the rest of this record */
+	     call SETUP_RECORD ();
+	     call WRITE_SUBSET (error_code);		/* and write it. */
+	     go to LABEL_RETURN;
+	end;
+
+
+/* set up the rest of the bootable tape label record */
+
+	if ip = null then				/* Is there an installation_parms segment? */
+	     mst_label.installation_id = " ";		/* NO, use blanks. */
+	else mst_label.installation_id = installation_parms.installation_id;
+	mst_label.tape_reel_id = tmdb.opt.reel_name;	/* Caller knows reel ID. */
+	mst_label.volume_set_id = tmdb.opt.volume_set_id; /* copy directly, could be blanks */
+	mst_label.label_version = LABEL_VERSION;	/* set the label version number */
+	do i = 1 to hbound (iox_modes, 1) while (iox_modes (i) ^= substr (tmdb.open.description, 1, tmdb.open.length));
+	end;
+	mst_label.output_mode = i;			/* set output mode */
+	do i = 1 to hbound (mst_label.xfer_vector, 1);	/* initialize transfer vector */
+	     mst_label.xfer_vector (i).lda_instr = label_c1;
+						/* set a "LDA 4" instruction */
+	     mst_label.xfer_vector (i).tra_instr = tb1 || "710000"b3;
+						/* and "TRA" instruction */
+
+	end;
+	tb1 = bit (bin (bin (rel (addr (bpp -> mst_label.fault_data)), 18) + boot_offset, 18), 18);
+	tn1 = bin (rel (addr (bpp -> mst_label.fv_overlay)), 18) + boot_offset;
+	do i = 0 to hbound (mst_label.fv_overlay, 1);	/* initialize fault vector overlay */
+	     mst_label.fv_overlay (i).scu_instr = tb1 || "657200"b3;
+	     mst_label.fv_overlay (i).dis_instr = bit (bin (tn1 + (i * 2), 18), 18) || "616200"b3;
+	end;
+
+	mst_label.boot_pgm_len =
+	     (divide (tmdb.work.rec_length, 4, 17, 0)
+	     - (bin (rel (addr (mst_label.boot_pgm))) - bin (rel (addr (mst_label.installation_id)))));
+						/* set  max boot pgm length */
+	mst_label.userid = get_group_id_ ();		/* put userid of tape creator in label */
+	if bpo > mst_label.boot_pgm_len then		/* if user boot pgm  too long... */
+	     bpo = mst_label.boot_pgm_len;		/* truncate it. This condition should */
+						/*  have been detected by tape_mult_util_$control */
+
+	if bpo < mst_label.boot_pgm_len then do;	/* is padding needed? */
+	     do i = bpo + 1 to mst_label.boot_pgm_len;	/* yes, pad it out to end of data area */
+		mst_label.boot_pgm (i) = "777777777777"b3;
+	     end;
+	     tmdb.head.flags.set, tmdb.head.flags.padded = "1"b;
+						/* turn on padding flag */
+	end;
+	else tmdb.head.flags.padded = "0"b;		/* turn it off if it was on */
+	num_data_bits =
+	     (bpo + (bin (rel (addr (mst_label.boot_pgm))) - bin (rel (addr (mst_label.installation_id))))) * 36;
+	call SETUP_RECORD ();
+	call WRITE_SUBSET (error_code);		/* Write the buffer. */
+
+LABEL_RETURN:
+	arg_error_code = error_code;
+	return;
+
+eof:
+     entry (arg_tmdbp, arg_error_code);
+
+/*	This entry is called to write one End of File record.  If there is any
+   *	unwritten data in the current buffer it will be padded and written
+   *	before the EOF record is written.
+*/
+	tmdb_ptr = arg_tmdbp;			/* Initialize pointers, etc. */
+	tioi_id = tmdb.work.tioi_id;
+	error_code = 0;
+
+	call PAD ();				/* Pad any data in current record buffer */
+	call SETUP_RECORD ();
+	call WRITE_SUBSET (error_code);		/* and write it. */
+	if ^(error_code = 0 | error_code = error_table_$device_end) then
+	     goto EOF_RETURN;
+
+	call tape_mult_util_$wait_for_write (tioi_id, rx, error_code);
+	call CHECK_RX (rx, error_code);
+	if error_code ^= 0 then
+	     go to EOF_RETURN;
+
+	call WRITE_EOF (error_code);			/* Write the EOF record. */
+
+EOF_RETURN:					/* Common way out of this entry. */
+	arg_error_code = error_code;
+	return;
+
+flush:
+     entry (arg_tmdbp, arg_error_code);
+
+/*	This entry is called to flush out all the data we currently have
+   *	buffered.  If the current buffer is only partially full it will be
+   *	padded.
+   *	Calling this entry guarantees that the next data given to tape_write_
+   *	will be placed at the beginning of the data portion of the next
+   *	physical Multics standard record.
+*/
+
+	tmdb_ptr = arg_tmdbp;			/* Initialize. */
+	tioi_id = tmdb.work.tioi_id;
+	error_code = 0;
+
+	call PAD ();				/* Take care of any data in the current buffer */
+	call SETUP_RECORD ();
+	call WRITE_SUBSET (error_code);		/* (pad and write it). */
+
+FLUSH_RETURN:
+	arg_error_code = error_code;
+	return;
+
+FILL_BUFFER:
+     procedure (error_code);
+
+dcl	error_code	   fixed bin (35) parameter;
+
+/*	This procedure is called to move data into the current record buffer.
+   *	It will only move the number of characters needed to fill up one buffer.
+   *	If there is more data to write, this procedure must be called again.
+   *	This procedure calls SETUP_RECORD to fill in the record header and
+   *	the record trailer.  Then, WRITE_BUFFER is called to perform
+   *      the write.
+*/
+	rb_ptr = tmdb.work.curr_buf;
+	rb_plen = tmdb.work.buf_pos;			/* Get current position in record buffer. */
+	buf_space = tmdb.work.rec_length - tmdb.work.buf_pos;
+
+	move_len = min (char_count, buf_space);
+
+	tmdb.work.buf_pos = tmdb.work.buf_pos + move_len;
+	num_data_bits = tmdb.work.buf_pos * 9;
+	error_code = 0;
+
+/*	Now move the data from the input work buffer to the record buffer.
+   *	We must then update our current work buffer counters.
+*/
+
+	on seg_fault_error
+	     begin;				/* if segment goes away during copy */
+	     if segfaultsw then
+		go to FILL_BUFFER_RETURN;		/* only allow this once */
+	     segfaultsw = "1"b;
+	     go to move_to_buffer;
+	end;
+
+move_to_buffer:
+	if ^segfaultsw then
+	     rb_ptr -> record_buf.move = wb_ptr -> work_buf.move;
+	else unspec (rb_ptr -> record_buf.move) = ""b;	/* use zeroes if segfault or page fault happened */
+	wb_plen = wb_plen + move_len;
+	char_count = char_count - move_len;
+	if tmdb.work.buf_pos >= tmdb.work.rec_length | ^tmdb.async_sw then do;
+	     call PAD ();				/* PAD turns off the padded bit if no padding is needed, so we call it always. */
+	     call SETUP_RECORD ();
+
+	     if tmdb.work.n_full >= tmdb.work.bufs_per_subset | ^tmdb.async_sw then
+		call WRITE_SUBSET (error_code);
+	end;
+
+FILL_BUFFER_RETURN:
+	return;
+
+     end FILL_BUFFER;
+
+PAD:
+     procedure;
+
+/*	This procedure is called to pad out the current record with characters of
+   *	(-1) and write it out to tape.  We will not pad if there is no data
+   *      in the current buffer.  Padded records will have the "set" and
+   *      "Padded" flags ON.
+*/
+
+declare	pad_string_ptr	   pointer;
+declare	pad_string_length	   fixed bin;
+declare	pad_string	   char (pad_string_length) based (pad_string_ptr);
+
+	if tmdb.work.buf_pos = 0 | tmdb.work.buf_pos >= tmdb.work.rec_length then do;
+						/* Need to pad? */
+	     tmdb.head.flags.padded = "0"b;		/* NO, no padding needed. */
+	     return;
+	end;
+
+	rb_ptr = tmdb.work.curr_buf;
+	num_data_bits = tmdb.work.buf_pos * 9;		/* Get number of actual bits of data. */
+
+	pad_string_ptr = addcharno (addr (rb_ptr -> based_record.array), tmdb.work.buf_pos);
+						/* addcharno is like a 0:N array */
+	pad_string_length = tmdb.work.rec_length - tmdb.work.buf_pos;
+
+	pad_string = high9 (pad_string_length);
+
+	tmdb.head.flags.set,			/* Turn ON padding flags. */
+	     tmdb.head.flags.padded = "1"b;
+
+     end PAD;
+
+SETUP_RECORD:
+     procedure;
+
+/*	This procedure is called to set up the header and trailer of the current
+   *	record and then write the record to tape.  First it will update the information
+   *      that must go into the header and trailer.  Then it will move the work header
+   *      and trailer into the actual write buffer for this record.
+*/
+
+	mstrp = tmdb.work.curr_buf;			/* Get pointer to actual record buffer. */
+
+	if tmdb.work.buf_pos = 0			/* Data in buffer? */
+	     then
+	     return;				/* No. */
+
+	tmdb.head.uid,				/* Same UID in header & trailer. */
+	     tmdb.trail.uid = unique_bits_ ();
+
+	tmdb.head.rec_within_file = tmdb.head.rec_within_file + 1;
+	tmdb.head.data_bits_used = num_data_bits;
+	tmdb.head.repeat_count = 0;
+
+	tmdb.trail.tot_data_bits = tmdb.trail.tot_data_bits + num_data_bits;
+	tmdb.trail.tot_rec = tmdb.trail.tot_rec + 1;
+
+	tmdb.flags.admin = tmdb.flags.label | tmdb.flags.eor;
+						/* Recalculate these, avoid all problems of un-reset bits */
+	tmdb.flags.set =
+	     tmdb.flags.repeat | tmdb.flags.padded | tmdb.flags.eot | tmdb.flags.drain | tmdb.flags.continue;
+
+	if tmdb.head.label & boot_label then do;	/* is this a bootable label record? */
+	     mst_label.head = tmdb.head;		/* yes, copy header and trailer  to label structure */
+	     mst_label.trail = tmdb.trail;
+	     call tape_checksum_ (addr (mst_label.head), addr (mst_label.head.checksum));
+	end;
+	else do;					/* no, must be standard record */
+	     mstr.head = tmdb.head;			/* Copy work header and trailer. */
+	     mstr.trail = tmdb.trail;
+	     call tape_checksum_ (mstrp, addr (mstr.head.checksum));
+	end;
+
+	tmdb.work.n_full = tmdb.work.n_full + 1;	/* We have filled another buffer. */
+	tmdb.work.curr_buf = NEXT_BUF ();		/* Get ptr to next empty buffer. */
+	tmdb.work.buf_pos = 0;			/* This record full - reset character offset. */
+
+	if tmdb.head.rec_within_file = 127 then do;
+	     tmdb.work.flags.eof = "1"b;
+	     tmdb.work.n_recs_to_eof = tmdb.work.n_full;
+	     tmdb.head.rec_within_file = -1;		/* EOF OK, update header & trailer. */
+	     tmdb.head.phy_file = tmdb.head.phy_file + 1;
+	     tmdb.trail.tot_file = tmdb.trail.tot_file + 1;
+	end;
+
+     end SETUP_RECORD;
+
+WRITE_EOF:
+     procedure (code);
+
+/*	This procedure is called to write one End of File record.
+   *      We must update the record header and trailer data to reflect
+   *      the beginning of a new file.
+*/
+
+dcl	code		   fixed bin (35);
+
+	code = 0;
+
+	if (tmdb.head.rec_within_file = -1 & ^tmdb.head.flags.eor) then
+	     return;				/* EOF already there */
+
+	call tape_ioi_$order (tioi_id, "eof", 1, (null), (0), (0), code);
+	if code ^= 0 then
+	     return;
+
+	tmdb.head.rec_within_file = -1;		/* EOF OK, update header & trailer. */
+	tmdb.head.phy_file = tmdb.head.phy_file + 1;
+	tmdb.trail.tot_file = tmdb.trail.tot_file + 1;
+
+     end WRITE_EOF;
+
+
+WRITE_SUBSET:
+     proc (code);
+
+/*        This procedure queues a set of buffers to be written to tape.
+   *      The number of buffers depends on how many have been filled
+   *      at the time this procedure is called.  It then gets
+   *      that number of free buffers so that we can start filling them
+   *      with data while the other buffers are being written.
+*/
+
+dcl	buf_num		   fixed bin;
+dcl	buf_pos		   fixed bin;
+dcl	code		   fixed bin (35);
+dcl	n_bufs		   fixed bin;
+dcl	n_bufs_written	   fixed bin;
+dcl	n_write_buffers	   fixed bin;
+dcl	write_buffers	   (n_write_buffers) ptr based (write_buffers_ptr);
+dcl	write_buffers_ptr	   ptr;
+
+	code = 0;
+	n_bufs = tmdb.work.n_full;
+	buf_pos = tmdb.work.buf_pos;
+
+	if n_bufs = 0 then
+	     return;
+
+	tmdb.work.n_full = 0;
+	tmdb.work.buf_pos = 0;			/* Reset this only if we write successfully. */
+
+	n_bufs_written = 0;
+
+	do while (n_bufs > 0);
+
+	     write_buffers_ptr = addr (tmdb.work.buffer (n_bufs_written + 1));
+
+	     if tmdb.work.flags.eof then do;
+		n_write_buffers = tmdb.work.n_recs_to_eof;
+		n_bufs = n_bufs - n_write_buffers;
+	     end;
+	     else do;
+		n_write_buffers = n_bufs;
+		n_bufs = 0;
+	     end;
+
+	     n_bufs_written = n_bufs_written + n_write_buffers;
+
+	     if ^tmdb.head.flags.eot then do;
+		call tape_ioi_$write (tioi_id, write_buffers, tmdb.work.buf_len, (null), rx, code);
+		call CHECK_RX (rx, code);
+		if code ^= 0 then
+		     go to WRITE_RETURN;
+	     end;
+
+	     if tmdb.head.flags.eot then do;
+		do i = 1 to n_write_buffers;
+		     mstrp = write_buffers (i);
+		     if ^mstr.head.eot then do;
+			mstr.head.eot, mstr.head.set = "1"b;
+			call tape_checksum_ (mstrp, addr (mstr.head.checksum));
+		     end;
+		     call tape_ioi_$queue_write (tioi_id, mstrp, tmdb.work.buf_len, code);
+		     if code ^= 0 then
+			go to WRITE_RETURN;
+		     call tape_ioi_$check_write (tioi_id, mstrp, rx, code);
+		     call CHECK_RX (rx, code);
+		     if code ^= 0 then
+			go to WRITE_RETURN;
+		end;
+	     end;
+
+	     if tmdb.work.flags.eof then do;
+		tmdb.work.flags.eof = "0"b;
+		tmdb.work.n_recs_to_eof = 0;
+		call tape_mult_util_$wait_for_write (tioi_id, rx, code);
+		call CHECK_RX (rx, code);
+		if code ^= 0 then
+		     go to WRITE_RETURN;
+		call tape_ioi_$order (tioi_id, "eof", 1, (null), (0), (0), code);
+		if code ^= 0 then
+		     go to WRITE_RETURN;
+	     end;
+
+	end;
+
+	call tape_ioi_$list_buffers (tioi_id, READY_BUFFERS, tmdb.work.buffer, n_ready_bufs, code);
+	do buf_num = n_ready_bufs + 1 to tmdb.work.bufs_per_subset;
+	     call tape_ioi_$check_write (tioi_id, tmdb.work.buffer (buf_num), rx, code);
+	     call CHECK_RX (rx, code);
+	     if code ^= 0 then do;
+		if code = error_table_$device_not_active then do;
+		     call tape_ioi_$list_buffers (tioi_id, READY_BUFFERS, tmdb.work.buffer, n_ready_bufs, code);
+		     if code ^= 0 then
+			go to WRITE_RETURN;
+		     if n_ready_bufs < tmdb.work.bufs_per_subset then do;
+/**** ******* Put a real code here ****** ****/
+			code = error_table_$bad_arg;
+			go to WRITE_RETURN;
+		     end;
+		     buf_num = tmdb.work.bufs_per_subset;
+		end;
+		else go to WRITE_RETURN;
+	     end;
+	end;
+
+	tmdb.work.buf_pos = buf_pos;			/* Successful write, we want to write the rest. */
+
+	if tmdb.head.flags.eot then
+	     code = error_table_$device_end;
+
+WRITE_RETURN:
+	tmdb.work.curr_buf = tmdb.work.buffer (1);	/* Always restart from this buffer. */
+
+
+     end WRITE_SUBSET;
+
+SUBSET_IS_FULL:
+     proc () returns (bit (1));
+
+/*        This procedure tells us whether or not a subset of buffers is full.
+   *      If a subset is full, we want to queue the buffers to be written. */
+
+	if tmdb.work.n_full >= tmdb.work.bufs_per_subset then
+	     return ("1"b);
+	else return ("0"b);
+
+     end SUBSET_IS_FULL;
+
+
+NEXT_BUF:
+     proc () returns (ptr);
+
+/*        This procedure returns a pointer to the next buffer in the subset. */
+
+	if tmdb.work.n_full >= tmdb.work.bufs_per_subset then
+	     return (tmdb.work.buffer (1));
+	else return (tmdb.work.buffer (tmdb.work.n_full + 1));
+
+     end NEXT_BUF;
+
+CHECK_RX:
+     proc (rx, code);
+
+dcl	rx		   fixed bin;
+dcl	code		   fixed bin (35);
+
+	if rx = 0 then
+	     return;
+
+	if rx = TAPE_IO_EOT then do;
+	     if ^tmdb.head.flags.eot			/* First time. */
+	     then do;
+		tmdb.head.flags.eot = "1"b;		/* Set these first! */
+		tmdb.head.flags.set = "1"b;
+		call REQUEUE_SUSP_BUFS (code);
+		if code ^= 0 then
+		     return;
+	     end;
+	     else code = 0;				/* get rid of error_table_$device_end */
+	end;
+	else do;
+	     if code = 0 then
+		code = error_table_$device_parity;
+	end;
+
+     end CHECK_RX;
+
+
+REQUEUE_SUSP_BUFS:
+     proc (code);
+
+dcl	code		   fixed bin (35);
+dcl	i		   fixed bin;
+dcl	susp_bufs		   (16) ptr;
+
+	call tape_ioi_$list_buffers (tioi_id, SUSPENDED_BUFFERS, susp_bufs, n_susp_bufs, code);
+	if code ^= 0 then
+	     return;
+
+	do i = 1 to n_susp_bufs;
+	     mstrp = susp_bufs (i);
+	     if ^mstr.head.flags.eot & tmdb.head.flags.eot then do;
+		mstr.head.flags.set, mstr.head.flags.eot = "1"b;
+		call tape_checksum_ (mstrp, addr (mstr.head.checksum));
+	     end;
+	     call tape_ioi_$queue_write (tioi_id, susp_bufs (i), tmdb.work.buf_len, code);
+	     if code ^= 0 then
+		return;
+
+	     call tape_ioi_$check_write (tioi_id, susp_bufs (i), rx, code);
+	     if (rx = TAPE_IO_SUCCESS) | (rx = TAPE_IO_EOT) then
+		code = 0;				/* continue writing suspended buffers */
+	     if code ^= 0 then
+		return;
+	end;
+
+     end REQUEUE_SUSP_BUFS;
+
+%include iox_modes;
+%page;
+%include tmdb;
+%page;
+%include mstr;
+%page;
+%include protection_notice;
+%page;
+%include installation_parms;
+%page;
+%include tape_ioi_dcls;
+%page;
+%include tape_ioi_result_indexes;
+%page;
+%include iocb;
+
+     end tape_mult_write_;

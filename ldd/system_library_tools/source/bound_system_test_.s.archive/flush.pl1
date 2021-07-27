@@ -1,0 +1,236 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+flush:	proc;
+	
+/* Program to flush the contents of main memory by touching a
+   sufficient number of pages in temporary segments created for
+   this purpose.  The number of pages to flush is determined
+   from sst$nused (it defaults to 1024 is the user does not
+   have sufficient access to examine sst$nused).  The temporary
+   segments are named flush.<sequential number>, and they are
+   created either in thr process directory (the default) or in
+   a directory supplied by the user via the -temp_dir control
+   argument.  In order for all pages of main memory to be flushed,
+   the directory used must have sufficient quota (the aggregate
+   quota used by the temporary segments is the value of sst$nused).
+   There is a mildly interesting hack to prevent a fatal process
+   error if the temporary directory is the process directory and
+   there is not enough quota to flush all of main memory.  
+   Prior to the flush, the next page of the stack is written to,
+   ensuring that there's enough stack to do the minimal condition
+   handling if a reqord quota overflow occurs.
+
+   Completely rewritten by J. Bongiovanni in June 1981						*/
+	
+
+/* Automatic */
+
+	dcl arg_no fixed bin;			/* current argument number			*/
+	dcl argl fixed bin (21);			/* length of current argument			*/
+	dcl argp ptr;				/* pointer to current argument		*/
+	dcl code fixed bin (35);			/* standard error code			*/
+	dcl dir_name char (168);			/* name of directory for temp segments		*/
+	dcl flush_seg_no pic "zzzz9";			/* for constructing temp segment names		*/
+	dcl garbage fixed bin (35);			/* just what it says			*/
+	dcl n_args fixed bin;			/* number of arguments			*/
+	dcl n_flush_segs fixed bin;			/* number of temporary segs			*/
+	dcl n_pages fixed bin;			/* number of pages in memory to flush		*/
+	dcl n_pages_flushed fixed bin;		/* count of pages flushed			*/
+	dcl n_pages_left fixed bin;			/* used in creating temp segs			*/
+	dcl other_error bit (1);			/* ON => seg_fault_error occurred during flush	*/
+	dcl pages_per_seg fixed bin;			/* number of pages per segment		*/
+	dcl pagex fixed bin;			/* index to array of pages			*/
+	dcl quota_overflow bit (1);			/* ON => RQO occurred during flush		*/
+	dcl segx fixed bin;				/* index into control structure		*/
+	dcl tempp ptr;				/* pointer to temp seg			*/
+	
+/* Static */
+
+	dcl DEFAULT_PAGES_TO_FLUSH fixed bin int static options (constant) init (1024);
+	dcl MYNAME char (5) int static options (constant) init ("flush");
+	dcl TEMP_SEG_PREFIX char (6) int static options (constant) init ("flush.");
+	
+/* Based */
+
+	dcl arg char (argl) based (argp);		/* current argument				*/
+	dcl 1 flush_segs aligned based (tempp),		/* control structure			*/
+	2 n_segs fixed bin,				/* number of temp segs 			*/
+	2 segs (0 refer (n_segs)),
+	3 segp ptr,				/* pointer to segment			*/
+	3 seg_pages fixed bin;			/* number of pages to touch in this seg		*/
+	dcl 1 segment aligned based,			/* used for touching pages during flush		*/
+	2 page (256),
+	3 word (1024) fixed bin (35);
+	
+/* Entry */
+
+	dcl absolute_pathname_ entry (char(*), char(*), fixed bin(35));
+	dcl com_err_ entry options (variable);
+	dcl cu_$arg_count entry (fixed bin, fixed bin(35));
+	dcl cu_$arg_ptr entry (fixed bin, ptr, fixed bin(21), fixed bin(35));
+	dcl get_pdir_ entry() returns(char(168));
+	dcl get_temp_segment_ entry (char(*), ptr, fixed bin(35));
+	dcl hcs_$delentry_seg entry (ptr, fixed bin(35));
+	dcl hcs_$make_seg entry (char(*), char(*), char(*), fixed bin(5), ptr, fixed bin(35));
+	dcl ioa_$ioa_switch entry options (variable);
+	dcl release_temp_segment_ entry (char(*), ptr, fixed bin(35));
+	dcl ring_zero_peek_$by_definition entry (char(*), char(*), fixed bin(18), ptr, fixed bin(19), fixed bin(35));
+	
+/* External */
+
+	dcl error_table_$badopt fixed bin (35) external;
+	dcl iox_$error_output ptr external;
+	dcl sys_info$max_seg_size fixed bin (19) external;
+	dcl sys_info$page_size fixed bin external;
+
+/* Condition */
+
+	dcl cleanup condition;
+	dcl record_quota_overflow condition;
+	dcl seg_fault_error condition;
+
+/* Builtin */
+
+	dcl addr builtin;
+	dcl ltrim builtin;
+	dcl null builtin;
+	dcl stackframeptr builtin;
+	%page;
+	
+/* Pick up arguments and validate								*/
+	
+	dir_name = get_pdir_ ();			/* default temp dir = [pd]			*/
+
+	call cu_$arg_count (n_args, code);
+	if code ^= 0 then do;			/* active function not allowed		*/
+	     call com_err_ (code, MYNAME);
+	     return;
+	end;
+	
+	do arg_no = 1 to n_args;
+	     call cu_$arg_ptr (arg_no, argp, argl, code);
+	     if arg = "-temp_dir" | arg = "-td" then do;
+		arg_no = arg_no + 1;
+		call cu_$arg_ptr (arg_no, argp, argl, code);
+		if code^= 0 then do;
+		     call com_err_ (code, MYNAME, "Temp directory name");
+		     return;
+		end;
+		call absolute_pathname_ (arg, dir_name, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, MYNAME, arg);
+		     return;
+		end;
+	     end;
+	     else do;
+		call com_err_ (error_table_$badopt, MYNAME, arg);
+		return;
+	     end;
+	end;
+	%page;
+	
+/* Get a temp segment for the control structure.  Find out how many pages
+   we should flush, and create the temporary segments needed in the
+   appropriate directory									*/
+	
+	tempp = null ();
+	on cleanup call clean_out;
+	
+	call get_temp_segment_ (MYNAME, tempp, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, MYNAME, "Getting temp segment");
+	     call clean_out;
+	     return;
+	end;
+	
+	call ring_zero_peek_$by_definition ("sst", "nused", 0, addr (n_pages), 1, code);
+	if code ^= 0 then
+	     n_pages = DEFAULT_PAGES_TO_FLUSH;
+	
+	pages_per_seg = divide (sys_info$max_seg_size, sys_info$page_size, 17);
+	n_flush_segs = divide (n_pages, pages_per_seg, 17);
+	n_pages_left = n_pages;
+	do segx = 1 to n_flush_segs;
+	     flush_seg_no = segx;
+	     call hcs_$make_seg (dir_name, TEMP_SEG_PREFIX || ltrim (flush_seg_no), "",
+		01010b, flush_segs.segs (segx).segp, code);
+	     if flush_segs.segs (segx).segp = null () then do;
+		call com_err_ (code, MYNAME, "Creating ^[>^1s^;^a>^]^a",
+		     (dir_name = ">"), dir_name, TEMP_SEG_PREFIX || ltrim (flush_seg_no));
+		call clean_out;
+		return;
+	     end;
+	     flush_segs.segs (segx).seg_pages = min (pages_per_seg, n_pages_left);
+	     flush_segs.n_segs = segx;
+	     n_pages_left = n_pages_left - flush_segs.segs (segx).seg_pages;
+	end;
+	%page;
+	
+/* Do the flush, after making sure there's enough stack to handle a
+   record_quota_overflow condition								*/
+	
+	stackframeptr () -> segment.page (2).word (1) = 1;
+	quota_overflow = "0"b;
+	other_error = "0"b;
+
+	on record_quota_overflow begin;
+	     quota_overflow = "1"b;
+	     goto END_FLUSH;
+	end;
+	
+	on seg_fault_error begin;			/* most likely out of room on LV */
+	     other_error = "1"b;
+	     goto END_FLUSH;
+	end;
+
+	n_pages_flushed = 0;
+	
+	do segx = 1 to n_flush_segs;
+	     do pagex = 1 to flush_segs.segs (segx).seg_pages;
+		garbage = flush_segs.segs (segx).segp -> segment.page (pagex).word (1);
+		n_pages_flushed = n_pages_flushed + 1;
+	     end;
+	end;
+	
+END_FLUSH:
+	revert record_quota_overflow;
+	call clean_out;
+
+	if quota_overflow then 
+	     call ioa_$ioa_switch (iox_$error_output, 
+	     "Insufficient quota for full flush - flushed ^d out of ^d pages",
+	     n_pages_flushed, n_pages);
+
+	if other_error then
+	     call ioa_$ioa_switch (iox_$error_output,
+	     "Error during flush - flushed ^d out of ^d pages",
+	     n_pages_flushed, n_pages);
+
+	return;
+	%page;
+	
+/* Internal procedure to clean up after ourselves							*/
+	
+clean_out:
+	proc;
+	
+	if tempp ^= null () then do;
+	     do segx = 1 to flush_segs.n_segs;
+		call hcs_$delentry_seg (flush_segs.segs (segx).segp, code);
+	     end;
+	     call release_temp_segment_ (MYNAME, tempp, code);
+	     tempp = null ();
+	end;
+	
+end clean_out;
+
+
+end flush;

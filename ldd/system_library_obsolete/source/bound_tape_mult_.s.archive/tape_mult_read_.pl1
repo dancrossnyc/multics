@@ -1,0 +1,694 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(74-10-06,Silver), approve(), audit(), install():
+     Written by Bill Silver.
+  2) change(77-09-01,Morris), approve(), audit(), install():
+     Reading algorithm completely reworked.
+  3) change(81-01-02,Bush), approve(), audit(), install():
+     for bootable tape labels.
+  4) change(81-08-12,Bush), approve(), audit(), install():
+     Pre-Mr9.0 label compatibility.
+  5) change(81-12-15,Bush), approve(), audit(), install():
+     Rewrote read error recovery.
+  6) change(82-08-01,SKrupp), approve(), audit(), install():
+     changed from tdcm_ interface to tape_ioi_.
+  7) change(83-03-01,Kittlitz), approve(), audit(), install():
+     added 256K segment processing ability.
+  8) change(83-09-01,SKrupp), approve(), audit(), install():
+     to abort read retries on unrecoverable errors that return certain
+     major statuses (such as POWER_OFF or DEVICE_ATTENTION etc.).
+  9) change(84-09-01,CJones), approve(), audit(), install():
+     to ignore consecutive EOFs and to recognize a record with a UID less
+     than the label UID as EOI.
+ 10) change(85-03-11,Margulies), approve(), audit(), install():
+     Get rid of useless "clean the tape" repositioning. Return
+     error_table_$data_loss if we lose stream.
+ 11) change(85-05-17,Margulies), approve(), audit(), install():
+     Remove misleading dead code on data_loss.
+ 12) change(86-02-13,GWMay), approve(86-02-13,MCR7337), audit(86-03-11,Farley),
+     install(86-03-17,MR12.0-1030):
+     Changed to allow no further reading after the eor mark is found.
+     Restructured the routine VALIDATE_CHARS so that the end-of-reel (eor) mark
+     is always diagnosed. The code is set up to diagnose other errors
+     encountered in the read first and then return the
+     error_table_$end_of_information code on the next read. If there are no
+     other errors, the code is returned on the first pass.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+tape_mult_read_:
+     procedure;
+
+/*	This program is part of the Multics standard tape I/O module, tape_mult_.
+   *	This program contains all of the read logic needed by tape_mult_.
+   *	It implements the iox_$get_chars entry point.  It also
+   *	contains an entry point for reading the label record.
+*/
+
+dcl	arg_tmdbp		   ptr,
+	arg_iocb_ptr	   ptr,
+	arg_work_buf_ptr	   ptr,
+	arg_char_count	   fixed bin (21),
+	arg_chars_read	   fixed bin (21),
+	arg_error_code	   fixed bin (35);
+
+dcl	iocb_ptr		   ptr;
+
+dcl	char_count	   fixed bin (21);
+dcl	error_code	   fixed bin (35);
+dcl	boot_label	   bit (1);
+dcl	test_checksum	   bit (36) aligned;
+dcl	get_chars_call	   bit (1);
+dcl	rem		   fixed bin;		/* remainder of buffer */
+dcl	wb_plen		   fixed bin (21);		/* Num chars moved into work buffer. */
+dcl	cb_plen		   fixed bin;		/* Num chars moved from current rec buffer. */
+dcl	move_len		   fixed bin;		/* Num chars to move. */
+dcl	wb_ptr		   ptr;			/* Pointer to caller's work buffer. */
+dcl	tioi_id		   bit (36) aligned;	/* id for tape_ioi_ activation */
+dcl	data_len		   fixed bin (21);		/* # of chars returned by read */
+dcl	rx		   fixed bin;		/* result index of tape_ioi_operation */
+dcl	rdy_status	   bit (36) aligned;	/* Status returned from "ready" order. */
+
+dcl	LABEL_LEN		   init (48) fixed bin static options (constant);
+dcl	MAX_BK_RETRYS	   init (2) fixed bin static options (constant);
+dcl	MAX_FWD_READS	   init (64) fixed bin static options (constant);
+dcl	MAX_LABEL_READS	   init (8) fixed bin static options (constant);
+dcl	MAX_READS_PAST_ERROR   init (10) fixed bin static options (constant);
+
+dcl	READ		   init (1) fixed bin int static options (constant);
+
+dcl	(addr, currentsize, divide, hbound, min, null, size, string, substr, unspec)
+			   builtin;
+dcl	sys_info$seg_size_256K fixed bin (19) external static;
+dcl	error_table_$bad_density
+			   fixed bin (35) ext static;
+dcl	error_table_$bad_label fixed bin (35) external static;
+dcl	error_table_$data_loss fixed bin (35) ext static;
+dcl	error_table_$invalid_read
+			   fixed bin (35) external static;
+dcl	error_table_$no_operation
+			   fixed bin (35) external static;
+dcl	error_table_$end_of_info
+			   fixed bin (35) external static;
+dcl	error_table_$improper_data_format
+			   fixed bin (35) external static;
+dcl	error_table_$device_parity
+			   fixed bin (35) external static;
+dcl	error_table_$data_improperly_terminated
+			   fixed bin (35) external static;
+dcl	error_table_$device_attention
+			   fixed bin (35) external static;
+dcl	error_table_$tape_error
+			   fixed bin (35) ext static;
+dcl	tape_checksum_	   ext entry (ptr, ptr);
+
+dcl	based_string	   char (move_len) based aligned;
+
+dcl	1 wb		   based (wb_ptr) unaligned,	/* Overlay of caller's work buffer. */
+	  2 processed	   char (wb_plen),		/* Num chars already returned. */
+	  2 move		   char (move_len);		/* Num chars to be moved. */
+
+dcl	1 cb		   based (mstrp) aligned,	/* Overlay of physical record buffer. */
+	  2 head		   (size (mstr_header)) bit (36),
+						/* Record header. */
+	  2 processed	   char (cb_plen) unaligned,	/* Num chars already moved. */
+	  2 move		   char (move_len) unaligned; /* Num chars to be moved. */
+
+declare  sub_err_		  entry () options (variable);
+
+label:
+     entry (arg_tmdbp, arg_work_buf_ptr, arg_chars_read, arg_error_code);
+
+/*	This entry is called to read the label record.
+   *	Currently this entry is called only by tape_mult_labeler_.
+*/
+	tmdb_ptr = arg_tmdbp;			/* Initialize pointers and work variables. */
+	tioi_id = tmdb.work.tioi_id;
+	wb_ptr = arg_work_buf_ptr;
+	wb_plen = 0;
+	string (tmdb.work.flags), boot_label = "0"b;	/* Reset these values on each call. */
+	char_count, error_code = 0;
+
+/*	Now, read the label record.
+*/
+
+	call READ_LABEL (error_code);
+	if error_code ^= 0 then
+	     go to RECORD_RETURN;
+
+/*	We got a good and valid record.  If this is an EOF record we will have already returned.
+   *	We will move the data from the record into the work buffer specified by
+   *      the caller.  We will tell him the number of WORDS of data that we are giving him.
+   *      We will move the record header and trailer into the MSTD.
+*/
+	if boot_label				/* if a bootable tape label record... */
+	then do;
+	     char_count, move_len = currentsize (mst_label) * 4;
+						/* get char len of entire boot label */
+	     wb_ptr -> based_string = mstrp -> based_string;
+						/* move label to work buffer */
+	     tmdb.head = mst_label.head;		/* Return header & trailer data. */
+	     tmdb.trail = mst_label.trail;
+	     tmdb.head.data_bit_len = tmdb.head.data_bit_len + ((hbound (mst_label.xfer_vector, 1) * 2) * 36);
+	     tmdb.work.label_version = mst_label.label_version;
+						/* copy version number of label */
+	     tmdb.work.output_mode = mst_label.output_mode;
+						/* set output mode tape was written with */
+	end;
+	else do;					/* not a bootable label record */
+	     char_count = divide (mstr.head.data_bits_used, 9, 17, 0);
+	     if char_count = 0 then do;		/* Kludge to get past bug in old tape_xtach_$attach. */
+		if mstr.head.flags.label		/* It didn't set data_bits_used in label. */
+		     then
+		     char_count = LABEL_LEN;		/* Trust that this is the length of the label. */
+		else do;				/* Not a label record. */
+		     error_code = error_table_$improper_data_format;
+		     goto RECORD_RETURN;
+		end;
+	     end;
+	     move_len = char_count;			/* Get number of chars to copy. */
+	     wb_ptr -> based_string = addr (mstr.data) -> based_string;
+
+	     tmdb.head = mstr.head;			/* Return header & trailer data. */
+	     tmdb.trail = mstr.trail;
+	     if tmdb.head.label			/* if this is a label record */
+	     then do;
+		if unspec (substr (wb_ptr -> volume_identifier.volume_set_id, 1, 1)) ^= "777"b3 then
+		     tmdb.work.label_version = 2;	/* if volume set id exists, must be version 2 */
+	     end;
+	end;
+
+RECORD_RETURN:					/* Common way out of this entry. */
+	arg_chars_read = char_count;			/* Set return arguments. */
+	arg_error_code = error_code;
+	return;
+%page;
+get_chars:
+     entry (arg_iocb_ptr, arg_work_buf_ptr, arg_char_count, arg_chars_read, arg_error_code);
+
+	iocb_ptr = arg_iocb_ptr;			/* Copy arguments. */
+	wb_ptr = arg_work_buf_ptr;
+	char_count = arg_char_count;
+	if char_count < 0 | char_count > sys_info$seg_size_256K * 4 then do;
+	     arg_chars_read = 0;
+	     arg_error_code = error_table_$no_operation;
+	     return;
+	end;
+	get_chars_call = "1"b;			/* called thru get_chars entry */
+
+get_chars_start:
+	wb_plen = 0;				/* No characters returned yet. */
+	iocb_ptr = iocb_ptr -> iocb.actual_iocb_ptr;	/* Initialize pointers. */
+	tmdb_ptr = iocb_ptr -> iocb.attach_data_ptr;
+	tioi_id = tmdb.work.tioi_id;			/* if last time we read        */
+						/* we hit the end of the tape  */
+						/* then return		 */
+	if tmdb.work.flags.eod then do;
+	     error_code = error_table_$end_of_info;
+	     go to GET_CHARS_RETURN;
+	end;
+
+	error_code = 0;				/* Initialize work variables. */
+	string (tmdb.work.flags) = "0"b;
+
+	if tmdb.opt.write_sw			/* Are we writing on tape? */
+	then do;
+	     error_code = error_table_$invalid_read;	/* Yes, error. */
+	     goto GET_CHARS_RETURN;
+	end;
+
+/* On first call, initialize things. */
+
+	if tmdb.opt.flags.begin			/* Do this only once. */
+	then do;
+	     tmdb.opt.flags.begin = "0"b;
+	     tmdb.work.rec_length = 0;
+	     tmdb.work.buf_pos = 0;
+	     tmdb.trail.tot_rec = 0;
+	     tmdb.work.curr_buf = null;
+	     tmdb.work.next_buf = null;
+	     tmdb.meters = 0;
+	     tmdb.opt.blp = null;			/* if control has'nt picked up label, too late now */
+	end;
+%page;
+/* Return characters from records. */
+
+
+	mstrp = tmdb.work.curr_buf;			/* Return chars from this buffer. */
+
+	do while (char_count > 0);			/* do until all requested data processed */
+	     cb_plen = tmdb.work.buf_pos;		/* Num chars processed in current record buf. */
+	     rem = tmdb.work.rec_length - cb_plen;	/* Num remaining chars to proccess in current buf. */
+	     if rem <= 0 then do;			/* Any unprocessed characters in this record? */
+		cb_plen, tmdb.work.buf_pos = 0;	/* Start at beginning of new record. */
+		tmdb.trail.tot_rec = tmdb.trail.tot_rec + 1;
+						/* Step expected record number. */
+		call READ_CHARS (error_code);		/* Try to get a valid record */
+		if error_code ^= 0			/* Unable to get a valid record */
+		     then				/* on data loss, there is valid data that we can return next time ... */
+		     go to GET_CHARS_RETURN;
+		tmdb.work.rec_length = divide (mstr.head.data_bits_used, 9, 17);
+						/* set record length */
+		rem = tmdb.work.rec_length;
+	     end;
+	     move_len = min (rem, char_count);		/* Amt of data we can move . */
+	     if get_chars_call then
+		wb.move = cb.move;			/* Move the data into work buffer. */
+	     wb_plen = wb_plen + move_len;		/* Update total num chars moved. */
+	     char_count = char_count - move_len;	/* Update num chars left to move. */
+	     tmdb.work.buf_pos = cb_plen + move_len;
+	end;
+
+GET_CHARS_RETURN:
+	if get_chars_call then
+	     arg_chars_read = wb_plen;		/* Return total num chars actually returned. */
+	arg_error_code = error_code;
+
+	if error_code ^= 0				/* Force new record after error. */
+	     & error_code ^= error_table_$data_loss	/* Buffer is returnable in this case */
+	     then
+	     tmdb.work.rec_length = 0;
+
+	return;
+
+%page;
+/* position entry. The position operation is implemented crudely as a get_chars call
+   with no data tranfer. */
+
+position:
+     entry (arg_iocb_ptr, arg_pos_type, arg_pos_value, arg_error_code);
+
+dcl	arg_pos_type	   fixed bin;
+dcl	arg_pos_value	   fixed bin (21);
+
+	iocb_ptr = arg_iocb_ptr;
+	if arg_pos_type ^= 3 then do;			/* Only type 3 supported */
+	     arg_error_code = error_table_$no_operation;
+	     return;
+	end;
+
+	char_count = arg_pos_value;
+
+	if char_count < 0 then do;
+	     arg_error_code = error_table_$no_operation;
+	     return;
+	end;
+	if char_count = 0 then do;
+	     arg_error_code = 0;
+	     return;
+	end;
+
+	get_chars_call = "0"b;			/* not called thru get_chars */
+	wb_ptr = null;
+	go to get_chars_start;
+
+%page;
+READ_LABEL:
+     proc (code);
+
+/*        This procedure is called to read the label record.  It performs
+   *       the read and then checks the status of the read operation.
+   *       If the read operation is successful, then consistency checks
+   *       are made on the label.  If the read is unsucessful, it may be
+   *       retried depending on the type of error that occured.  The maximum
+   *       number of rereads is 10.
+*/
+
+dcl	code		   fixed bin (35);
+dcl	fwd_reads		   fixed bin;
+dcl	rewinds		   fixed bin;
+dcl	local_code	   fixed bin (35);
+dcl	density_problem	   bit (1) aligned;
+dcl	give_up		   bit (1) aligned;
+
+	fwd_reads, rewinds = 0;
+	density_problem = "0"b;
+	give_up = "0"b;
+
+	code = 0;
+	call REWIND;				/* always start here */
+	if local_code ^= 0 then
+	     goto READ_LABEL_RETURN;
+	do while (^give_up);
+
+	     string (tmdb.work.flags) = ""b;
+
+	     call tape_ioi_$read (tioi_id, mstrp, data_len, rx, local_code);
+
+	     if local_code = error_table_$bad_density then do;
+		density_problem = "1"b;
+		tmdb.flags.fatal_read_error = "1"b;
+	     end;
+	     else if rx = TAPE_IO_SUCCESS then
+		call VALIDATE_LABEL (addr (tmdb.work.flags), local_code);
+						/* Yes, check for record consistency. */
+	     else call CHECK_RX (addr (tmdb.work.flags), READ, local_code);
+
+
+	     if string (tmdb.work.flags) = "0"b then do;	/* Good read or bad error. */
+		local_code = 0;
+		give_up = "1"b;
+	     end;
+	     if tmdb.work.flags.read_fwd | tmdb.flags.fatal_read_error | tmdb.flags.retry_read | tmdb.flags.eof then do;
+		fwd_reads = fwd_reads + 1;
+		if fwd_reads > MAX_LABEL_READS | tmdb.flags.eof then do;
+		     fwd_reads = 0;
+		     rewinds = rewinds + 1;
+		     if rewinds > MAX_BK_RETRYS then do;
+			code = error_table_$bad_label;
+			give_up = "1"b;
+		     end;
+		     call REWIND;
+		     if local_code ^= 0 then
+			give_up = "1"b;
+		end;
+	     end;
+	end;
+
+READ_LABEL_RETURN:
+	if (local_code ^= 0) | (code ^= 0) then		/* translate errors */
+	     local_code = error_table_$bad_label;
+	if density_problem & local_code ^= 0 then
+	     local_code = error_table_$bad_density;	/* believe that */
+	code = local_code;
+	return;
+
+REWIND:
+	procedure;
+
+
+	     call tape_ioi_$order (tioi_id, "rdy", 1, addr (rdy_status), (0), (0), local_code);
+						/* Wait for device to be ready. */
+	     if local_code ^= 0 then
+		return;
+	     call tape_ioi_$order (tioi_id, "rew", 1, (null), (0), (0), local_code);
+						/* Rewind the tape */
+	     if local_code ^= 0 then
+		return;
+	     call tape_ioi_$order (tioi_id, "rdy", 1, addr (rdy_status), (0), (0), local_code);
+						/* Wait for rewind to complete. */
+	     return;
+	end REWIND;
+
+     end READ_LABEL;
+
+%page;
+READ_CHARS:
+     proc (code);
+
+/*        This procedure reads a physical record from tape.  It then checks the status of the read
+   *      and takes action according to the values set in tmdb.work.flags.  Generally,
+   *      there can be a successful read, a bad error (we can't handle so no recovery is tried on
+   *      our part), or a "recoverable" error.  Specifically, recoverable errors are as follows (see tmdb.incl.pl1):
+   *
+   *      eof        - Skip it (read and return the next record).
+   *      retry_read - Error has occured, try recovery by reading the next record.
+   *                   This is for compatibility with the earlier version of tape_mult_
+   *		   where write error recovery was done by rewriting the record
+   *		   in error (up to 64 times) until a write was done without error.
+   *      read_fwd   - Error has not necessarily occured, need to keep reading forward for various reasons.
+   *      fatal_read - try to read further along, if you succeed return error_table_$data_loss.
+   *
+   *      If none of these flags are set, either we cannot continue processing (bad error),
+   *      or we do not want to continue processing (successful read).  In that case we just return.
+*/
+
+dcl	code		   fixed bin (35);
+dcl	rereads		   fixed bin;
+dcl	reads_past_error	   fixed bin;
+dcl	give_up		   bit (1) aligned;
+
+	give_up = "0"b;
+	rereads = 0;
+	reads_past_error = 0;
+	code = 0;
+
+	do while (^give_up);
+
+/**** In the following sequence, we expect code to be non-zero
+      only if none of the flags has been set. This means that
+      we have an error that must stop reading absolutely right here.
+*/
+
+	     string (tmdb.work.flags) = "0"b;
+	     call tape_ioi_$read (tioi_id, mstrp, data_len, rx, code);
+	     if rx = TAPE_IO_SUCCESS then do;		/* okay, we got one */
+		tmdb.work.curr_buf = mstrp;
+		call VALIDATE_CHARS ((rereads > 0), addr (tmdb.work.flags), code);
+	     end;					/* nonzero code can only mean missing EOT (valid record for another tape image) */
+	     else call CHECK_RX (addr (tmdb.work.flags), READ, code);
+						/* nonzero code means that we got an RX that is incomprehensible */
+
+/**** NOTE
+      The next stretch need not check the eof or read_fwd flags explicitly.
+      the fact that they were on stop the string () from being ""b,
+      and we just fall through and go around. */
+
+	     if string (tmdb.work.flags) = ""b then
+		give_up = "1"b;			/* and return whatever we have in code */
+
+	     if tmdb.work.flags.retry_read then do;
+		rereads = rereads + 1;
+		if rereads > MAX_FWD_READS then do;
+		     give_up = "1"b;
+		     code = error_table_$tape_error;
+		end;
+	     end;
+
+	     if tmdb.flags.eod then do;
+		give_up = "1"b;
+		if code = 0 then
+		     code = error_table_$end_of_info;
+	     end;
+	     if tmdb.work.flags.fatal_read_error then do;
+		reads_past_error = reads_past_error + 1;
+		if reads_past_error > MAX_READS_PAST_ERROR then do;
+		     code = error_table_$device_attention;
+		     give_up = "1"b;
+		end;
+	     end;
+
+	end;
+
+	return;
+
+     end READ_CHARS;
+%page;
+VALIDATE_CHARS:
+     procedure (want_repeat, flagsp, code);
+
+/*        This routine is called to validate the current (non-label) record.
+   *      The usual record checks (VALIDATE_RECORD) plus a few miscellaneous
+   *      consistency checks are made.
+*/
+
+dcl	want_repeat	   bit (1);
+dcl	flagsp		   ptr;
+dcl	1 flags		   aligned like tmdb.work.flags based (flagsp);
+dcl	code		   fixed bin (35);
+
+	string (flags) = "0"b;
+	code = 0;
+
+	if ^VALID_RECORD ()				/* Is current record valid?          */
+	     then					/* No, look for a repeat of  record. */
+	     flags.retry_read = "1"b;
+
+	else do;					/* Check for end of logical tape.    */
+	     if mstr.head.admin & mstr.head.eor then
+		flags.eod = "1"b;			/* Is record part of logical tape?   */
+	     if mstr.head.uid < tmdb.work.label_uid then
+		code = error_table_$data_improperly_terminated;
+
+	     else					/* Looking for a repeated record     */
+		if want_repeat & ^mstr.head.repeat then
+		code = error_table_$data_loss;
+
+/* Looking for a new record          */
+	     else					/* But have a repeat, skip it.       */
+		if ^want_repeat & mstr.head.repeat then
+		flags.read_fwd = "1"b;
+
+	     else					/* Before desired record?            */
+		if mstr.trail.tot_rec < tmdb.trail.tot_rec then
+		flags.read_fwd = "1"b;
+
+/* Past desired record?              */
+/* This is the record that we are    */
+	     else					/* returning so indicate a skip.     */
+		if mstr.trail.tot_rec > tmdb.trail.tot_rec then do;
+		tmdb.trail.tot_rec = mstr.trail.tot_rec;
+		code = error_table_$data_loss;
+	     end;
+	end;
+
+	return;
+
+     end VALIDATE_CHARS;
+
+%page;
+VALIDATE_LABEL:
+     procedure (flagsp, code);
+
+/*        This routine is called to make some consistency checks on the label
+   *      record.
+*/
+
+dcl	flagsp		   ptr;
+dcl	1 flags		   aligned like tmdb.work.flags based (flagsp);
+dcl	code		   fixed bin (35);
+
+	string (flags) = "0"b;
+	code = 0;
+
+	if ^VALID_RECORD () then
+	     flags.retry_read = "1"b;
+
+/**** ****/
+/* +
+   /*	if boot_label				/* boot_label is set in VALIDATE_RECORD */
+/*	then do;
+   /*	     if mst_label.trail.tot_rec > 0 then
+   /*		flags.reposition = "1"b;		/* Good read but not label. */
+/*	end;
+   /*	else do;
+   /*	     if mstr.trail.tot_rec > 0 then
+   /*		flags.reposition = "1"b;
+   /*	end; */
+
+     end VALIDATE_LABEL;
+%page;
+VALID_RECORD:
+     proc () returns (bit (1));
+
+dcl	code		   fixed bin (35);
+
+	call VALIDATE_RECORD (code);
+	if code = 0 then
+	     return ("1"b);
+	else return ("0"b);
+
+     end VALID_RECORD;
+
+%page;
+VALIDATE_RECORD:
+     procedure (code);
+
+/*	This internal procedure is called to validate a record.  The record has been read
+   *	successfully. We want to be sure that the header and trailer data is valid.
+*/
+
+dcl	code		   fixed bin (35);
+
+	code = 0;
+
+	if (mstr.head.c1 ^= tmdb.head.c1) | (mstr.head.c2 ^= tmdb.head.c2) then do;
+						/* Invalid header or bootable tape label. */
+	     if mstr.head.c1 = label_c1		/* is this a bootable label record? */
+	     then do;
+		if (mst_label.head.c1 = tmdb.head.c1) & (mst_label.head.c2 = tmdb.head.c2)
+		     & (mst_label.trail.c1 = tmdb.trail.c1) & (mst_label.trail.c2 = tmdb.trail.c2)
+		     & mst_label.head.label		/* it is a label, record */
+		then do;
+		     boot_label = "1"b;		/* set bootable label flag */
+		     call tape_checksum_ (addr (mst_label.head), addr (test_checksum));
+						/* compute checksum */
+		     if mst_label.head.checksum ^= test_checksum
+						/* are the checksums = */
+			then
+			code = error_table_$device_parity;
+						/* no */
+		     return;
+		end;
+	     end;
+	     code = error_table_$device_parity;		/* bad header or trailer */
+	     return;
+	end;
+	if (mstr.trail.c1 ^= tmdb.trail.c1) | (mstr.trail.c2 ^= tmdb.trail.c2)
+						/* Invalid trailer */
+	then do;
+	     code = error_table_$device_parity;
+	     return;
+	end;
+	call tape_checksum_ (mstrp, addr (test_checksum));
+	if mstr.head.checksum ^= test_checksum		/* Checksum error. */
+	     then
+	     code = error_table_$device_parity;
+
+	return;
+
+     end VALIDATE_RECORD;
+
+%page;
+CHECK_RX:
+     procedure (flagsp, rx_type, code);
+
+/*        This routine decides what action to take by evaluating the result
+   *      index (rx) returned by tape_ioi_.  It sets flags in
+   *      tmdb.work.flags to direct the action of the calling routine.
+   *      rx_type signifies the type of tape_ioi_ operation that returned
+   *      the rx.
+*/
+
+dcl	code		   fixed bin (35);
+dcl	flagsp		   ptr;
+dcl	1 flags		   aligned like tmdb.work.flags based (flagsp);
+dcl	rx_type		   fixed bin;
+
+	string (flags) = "0"b;
+	code = 0;
+
+	if rx = 0 then
+	     return;
+
+	go to RX (rx_type);
+
+RX (1):
+	if rx = TAPE_IO_EOF then
+	     flags.eof = "1"b;
+	else if rx = TAPE_IO_UNRECOVERABLE_IO_ERROR then
+	     flags.fatal_read_error = "1"b;
+	else if rx = TAPE_IO_EOT then
+	     flags.eod = "1"b;
+	else
+UNEXPECTED_RX:
+	     do;
+	     call sub_err_ (0, "tape_mult_read_", ACTION_DEFAULT_RESTART, null (), (0),
+		"Unexpected tape_ioi_ result ^d on read.", rx);
+	     code = error_table_$device_parity;
+	end;
+	return;
+
+RX (2):						/* Backspace file. */
+	if rx = TAPE_IO_BOT then
+	     tmdb.work.flags.bot = "1"b;
+	else go to UNEXPECTED_RX;
+
+	return;
+
+     end CHECK_RX;
+
+%page;
+%include tmdb;
+%page;
+%include mstr;
+%page;
+%include tape_ioi_result_indexes;
+%page;
+%include tape_ioi_dcls;
+%page;
+%include iocb;
+%page;
+%include sub_err_flags;
+     end tape_mult_read_;

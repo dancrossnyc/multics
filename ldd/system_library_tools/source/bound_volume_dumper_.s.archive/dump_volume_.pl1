@@ -1,0 +1,438 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+dump_volume_: proc (code);
+
+/* This routine dumps a single physical volume in the dump mode specified.  It also updates the appropriate
+   volume log, a per physical volume log of all the output volumes that contain relevent information about that
+   physical volume.In addition it maintains statistics about what is dumped from each physical volume. The incremental
+   and consolidated volume dumping is driven by a ring 0 bit map of which vtoces to dump. The complete volume
+   dump is driven by either a constructed bit map or a vtoce by vtoce scan, depending on which will use less resources.
+   The volume log is written out befor and after the physical volume is dumped, so that the most recent copy
+   is on an output volume should the online copy be lost. */
+
+/* Modified: 10/22/81 by GA Texada to change page_read_error to page_fault_error.     
+   Modified: 11/16/81 by GAT to close and write the current volume log if aborting a dump.
+   Modified: 12/17/81 by GAT to recognize when an attachment of a volume fails and abort the dump.
+   Modified: 11/10/82 by GAT (PBF for MR10.1) to actually indicate that the dump 
+		  should be aborted ny Operator request.
+   Modified: 11/17/82 by GAT to query when a pv is found locked under 'special' circumstances.
+   Modified: August 1983 by GA Texada to call dmpr_output_$new_pass_attach if necessary.
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(86-03-04,Fawcett), approve(86-04-10,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-18,MR12.0-1098):
+     Support for subvolume devices real 512_word_io.
+  2) change(88-04-13,GWMay), approve(88-04-13,MCR7855), audit(88-04-14,Farley),
+     install(88-04-19,MR12.2-1039):
+     Changed to diagnose vtoce connection failures and continue dumping.
+  3) change(88-05-27,GWMay), approve(88-05-27,MCR7883),
+     audit(88-06-14,Beattie), install(88-07-19,MR12.2-1061):
+     Added init for first pass flag in  dmpr_data.
+                                                   END HISTORY COMMENTS */
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+    code = 0;					/* set return values */
+    loop_cnt = 0;					/* init */
+
+/* First we will set the number of vtoce in a page dependent on device_type */
+
+    if dmpr_data_.version <= dmpr_data_version_2 then n_vtoce_per_page = 5; /* old style can not be for a sub volume device */
+    else n_vtoce_per_page = vtoc_per_rec (dmpr_data_.disk_type);
+
+    recordp = dmpr_data_.recordp;
+    dmpr_data_.num_null_vtoce,
+         dmpr_data_.num_vtoce_only,
+         dmpr_data_.physical_volume_dir_num,
+         dmpr_data_.physical_volume_dir_rec,
+         dmpr_data_.physical_volume_seg_num,
+         dmpr_data_.physical_volume_seg_rec = 0;		/* reset counters */
+						/* get ptr to volume log */
+    call dmpr_log_$init_volume_log (code);
+    if code ^= 0 then do;
+        call dmpr_report_$error_output (code, myname, "Volume log init failure of ^a.volog ", dmpr_data_.pvname);
+        return;
+      end;
+    bvlp = dmpr_data_.bvlp;
+
+/* Interlock physical volume against dumper operating in same mode, ie: two incremental dumpers.  Setup cleanup
+   handler in case we abort. Also pickup newest copy of label record of physical volume and some other descriptive
+   info about the state of the pack. The label record will be use by the volume reloader to check if the
+   initialized pack it is given can handle the information to be reloaded. */
+
+    on cleanup call unlock_pv;
+try_again:
+    call hc_backup_$dmpr_lock_pv (dmpr_data_.pvid, dmpr_data_.dump_type, addr (backup_volume_log.info), code);
+    if code ^= 0 then do;
+        if dmpr_data_.restart_pvname = dmpr_data_.pvname then do;
+						/* only do this IF we are restarting		*/
+	  call command_query_$yes_no (ansb, 0, myname,
+	       "The physical volume ^a was found locked. This could have been caused by a previous system interruption.
+A ""yes"" answer will attempt to forcibly unlock it. A ""no"" answer will not.",
+	       "Volume ^a is locked, do you wish to unlock it?", dmpr_data_.pvname);
+	  if ansb then do;
+	      call unlock_pv ();
+	      if ec = 0 then goto try_again;
+	    end;
+	end;
+bust_anyway:
+        call dmpr_report_$error_output (code, myname,
+	   "Unable to lock  disk volume ^a",
+	   dmpr_data_.pvname);
+        return;
+      end;
+						/* pickup local copies */
+    n_vtoce = backup_volume_log.n_vtoce;
+    n_free_vtoce = backup_volume_log.n_free_vtoce;
+
+/* For each dump volume we maintain a log of which physical volume are on it. This allows us  to control
+   the use of volumes and to not overwrite a volume which has useful infomation on it.
+   This call updates that log. */
+
+/* If we need to, get an output volume. */
+    if dmpr_data_.detach & dmpr_data_.outputvol_iocbp = null () then do;
+        call dmpr_output_$new_pass_attach (code);
+        if code ^= 0 then do;
+	  call unlock_pv;
+	  return;
+	end;
+      end;
+						/* write physical volume log to dump volume */
+    call dmpr_output_$write_volume_log (code);
+    if code ^= 0 then do;
+        call dmpr_report_$error_output (code, myname, "Unable to write ^a.volog", dmpr_data_.pvname);
+        call unlock_pv;
+        return;
+      end;
+						/*  Add dump volume to physical volume log */
+    call dmpr_log_$open_volume_log (code);
+    if code ^= 0 then do;
+        call dmpr_report_$error_output (code, myname, "Unable to open ^a.volog", dmpr_data_.pvname);
+        call unlock_pv;
+        return;
+      end;
+
+    call dmpr_log_$update_pvolog (code);
+    if code ^= 0 then do;
+        call dmpr_report_$error_output (code, myname, "Unable to update ^a.pvolog", dmpr_data_.volname);
+        call unlock_pv;
+        return;
+
+      end;
+
+
+/* If this is a complete dump, then there are two ways to do it, either by reading each vtoce or by building
+   a bit map of all in-use vtoces. The difference comes because to build the map we can read 5 vtoce in each page
+   at one time by suitable use of an abs seg. Thus we compute which is the better method(uses the least resources)
+   and  do the right thing. If we build the bit map, in our ring, we operate in "request" mode. */
+
+    request = "0"b;
+    if (dmpr_data_.dump_type = comp) &
+         (n_free_vtoce * vtoce_read_time > n_vtoce * divide (page_read_time, n_vtoce_per_page, 17, 0)) then do;
+        request = "1"b;
+        vbmp = addr (vtoc_bit_map);
+        unspec (vtoc_bit_map) = "0"b;
+
+        n_windows = divide (n_vtoce, max_pages_per_segment * n_vtoce_per_page, 17, 0) + 1;
+        on page_fault_error begin;
+	  code = error_table_$device_parity;
+	  call dmpr_report_$error_output (0, myname, "Page read error building volume bit map for disk ^a",
+	       dmpr_data_.pvname);
+	  goto map_err;
+	end;
+        do i = 0 to n_windows - 1;
+	call hc_backup_$dmpr_build_vtoc_map (vbmp, i, code);
+	if code ^= 0 then do;
+map_err:	    call dmpr_report_$error_output (code, myname,
+	         "Unable to construct bit map for disk ^a", dmpr_data_.pvname);
+	    call unlock_pv;
+	    return;
+	  end;
+        end;
+        revert page_fault_error;
+      end;
+
+/* Initialize the input structure to the ring 0 volume dumper */
+
+    inputp = dmpr_data_.inputp;
+    dmpr_input.request_vtocx = -1;
+    dmpr_input.request = request;
+    dmpr_input.pvid = dmpr_data_.pvid;			/* changes each invocation */
+    dmpr_input.start_time = clock ();
+
+/* This is the main dump loop. We repeatedly call the ring 0 dumper to provide us with a pointer to the next
+   object to be dumped until there are no more. Segments and directories are handled differently in that a directory
+   must be consistent when dumped and thus are copied, while locked, into a temporyary segment. Segments, on the other
+   hand are accessed through a ring 0 abs seg, we thus must be able to handle a seg fault error. Should one
+   occur we call the ring 0 dumper and ask for a pointer to the segment again. We will repeat this up to 10 times
+   and then give up. The final case is that of a vtoce which does not have an associated object. We dump this "null"
+   vtoce as a place holder so that the volume reloader will not recover an earlier object with the same vtocx  index. */
+
+    backup_volume_record.vtocx = -1;			/* set to beginning */
+    dmpr_input.Sfirst_pass_for_pv = "1"b;
+    do while (loop_cnt <= n_vtoce);			/* put a limit on it */
+      seg_fault_retry_cnt = 0;
+      in_use_retry_cnt = 0;
+      vtocx_retry_cnt = 0;
+      dmpr_input.retry = "0"b;
+      if request then dmpr_input.request_vtocx = get_next_vtocx_ ();
+      dmpr_input.prev_vtocx = backup_volume_record.vtocx;
+      dmpr_input.volid = dmpr_data_.volid;
+      on page_fault_error begin;
+	call dmpr_report_$error_output (error_table_$device_parity, myname, "Skipping vtoce ^o on disk ^a",
+	     backup_volume_record.vtocx, dmpr_data_.pvname);
+	goto end_loop;
+        end;
+						/* get pointer to object */
+retry: call hc_backup_$get_dmpr_data_object (dmpr_data_.inputp, recordp, code);
+      if code ^= 0 then do;
+	if code = error_table_$dmpr_in_use then do;
+						/* object in use by other dumper so sleep */
+	    in_use_retry_cnt = in_use_retry_cnt + 1;
+	    if in_use_retry_cnt > 10 then do;
+	        call dmpr_report_$error_output (0, myname,
+		   "Skipping vtoce ^o on disk ^a because in-use too long",
+		   backup_volume_record.vtocx, dmpr_data_.pvname);
+	        goto end_loop;
+	      end;
+	    call timer_manager_$sleep (5, "11"b);
+	    goto retry;
+	  end;
+						/*  if request could not be done */
+	else if (request & code = error_table_$action_not_performed) then do;
+	    code = 0;
+	    goto end_loop;
+	  end;
+	else if code = error_table_$end_of_info then do;
+	    code = 0;				/* completed sucessfully */
+	    goto exit;
+	  end;
+	else if code = error_table_$invalid_vtoce then do;
+	    backup_volume_record.uid = "0"b;
+	  end;
+	else if code = error_table_$vtoce_connection_fail then do;
+						/* Directory damage is reported and this vtoce is not dumped until a system
+   maintainer repairs the damage. */
+	    call dmpr_report_$error_output (0, myname,
+	         "Skipping vtoce ^o on disk volume ^a because it has the
+same UID as another vtoce.  See the syserr log for more detailed information.",
+	         backup_volume_record.vtocx, dmpr_data_.pvname);
+	    go to end_loop;
+	  end;
+
+	else do;					/* error condition */
+	    if vtocx_retry_cnt < 10 then do;
+	        call dmpr_report_$error_output (code, myname, " vtoce after ^o on disk ^a, retrying dump.",
+		   dmpr_input.prev_vtocx, dmpr_data_.pvname);
+	        vtocx_retry_cnt = vtocx_retry_cnt + 1;
+	        goto retry;
+	      end;
+	    else do;
+	        call dmpr_report_$error_output (code, myname, "Volume dump of ^a aborted.", dmpr_data_.pvname);
+	        goto exit;				/* got to clean up what I have already dumped.	*/
+	      end;
+	  end;
+        end;
+						/* type of object determines pointer	*/
+      if (backup_volume_record.uid = "0"b | dmpr_input.no_object) then datap = null ();
+      else if backup_volume_record.dirsw then datap = dmpr_data_.dirp;
+      else datap = dmpr_data_.segp;
+						/* write out vtoce and possibly object */
+      call dmpr_output_$output_object (datap, code);
+      if code ^= 0 then do;				/* if -1, the attach/open failed, so abort	*/
+	if code = -1 then do;			/* which actually says that the operatore requested abort*/
+	    call dmpr_report_$error_output (0, myname, "Dump aborted by operator request.");
+	    call unlock_pv;
+	    return;
+	  end;
+						/* retry dump up to 10 times */
+	if code = error_table_$segfault then do;
+	    dmpr_input.retry = "1"b;
+	    seg_fault_retry_cnt = seg_fault_retry_cnt + 1;
+	    if seg_fault_retry_cnt > 10 then do;
+	        call dmpr_report_$error_output (code, myname, "Retry of vtocx ^o on disk ^a failed",
+		   backup_volume_record.vtocx, dmpr_data_.pvname);
+	        dmpr_input.retry = "0"b;
+	        seg_fault_retry_cnt = 0;
+	        goto end_loop;
+	      end;
+	    dmpr_data_.retrys = dmpr_data_.retrys + 1;
+	    goto retry;
+	  end;
+	call dmpr_report_$error_output (code, myname, "Unable to write object");
+        end;
+						/* Update counters */
+      if backup_volume_record.uid = "0"b | dmpr_input.no_object then do;
+	if backup_volume_record.uid = "0"b then dmpr_data_.num_null_vtoce = dmpr_data_.num_null_vtoce + 1;
+	else dmpr_data_.num_vtoce_only = dmpr_data_.num_vtoce_only + 1;
+        end;
+
+/* Record the uid of the object dumped in the contents seg. This will save the retriever having to
+   mount and serach an output volume, rather it can search the online contents segment. In addition record
+   in the accounting data base the uid pathname of the object dumped. Dumping uses system resources and
+   users should be billed for this service. Finally update some counters about what is being dumped. */
+
+      else do;
+	call dmpr_log_$log_object (code);
+	if code ^= 0 then
+	  call dmpr_report_$error_output (code, myname, "Error logging object");
+	if backup_volume_record.dirsw then do;
+	    dmpr_data_.physical_volume_dir_num = dmpr_data_.physical_volume_dir_num + 1;
+	    dmpr_data_.physical_volume_dir_rec = dmpr_data_.physical_volume_dir_rec +
+	         fixed (backup_volume_record.records, 9);
+	    dmpr_data_.vol_log_dir_num = dmpr_data_.vol_log_dir_num + 1;
+	    dmpr_data_.vol_log_dir_rec = dmpr_data_.vol_log_dir_rec +
+	         fixed (backup_volume_record.records, 9);
+	    dmpr_data_.dump_volume_dir_num = dmpr_data_.dump_volume_dir_num + 1;
+	    dmpr_data_.dump_volume_dir_rec = dmpr_data_.dump_volume_dir_rec +
+	         fixed (backup_volume_record.records, 9);
+	  end;
+	else do;
+	    dmpr_data_.physical_volume_seg_num = dmpr_data_.physical_volume_seg_num + 1;
+	    dmpr_data_.physical_volume_seg_rec = dmpr_data_.physical_volume_seg_rec +
+	         fixed (backup_volume_record.records, 9);
+	    dmpr_data_.vol_log_seg_num = dmpr_data_.vol_log_seg_num + 1;
+	    dmpr_data_.vol_log_seg_rec = dmpr_data_.vol_log_seg_rec +
+	         fixed (backup_volume_record.records, 9);
+	    dmpr_data_.dump_volume_seg_num = dmpr_data_.dump_volume_seg_num + 1;
+	    dmpr_data_.dump_volume_seg_rec = dmpr_data_.dump_volume_seg_rec +
+	         fixed (backup_volume_record.records, 9);
+	  end;
+        end;
+end_loop:
+						/* keep track of how many times in loop */
+      loop_cnt = loop_cnt + 1;
+    end;
+exit:
+    revert page_fault_error;
+
+/* error exit - can't dump more then the number of vtoce on the physical volume */
+    if loop_cnt > n_vtoce then
+      call dmpr_report_$error_output (0, myname, "Bit map error - please salvage disk ^a",
+	 dmpr_data_.pvname);
+
+/* Unlock physical volume, close volume log and write updated copy to dump volume */
+
+    call unlock_pv;
+    call dmpr_log_$close_volume_log (code);
+    if code ^= 0 then
+      call dmpr_report_$error_output (code, myname,
+	 "Unable to close ^a.volog", dmpr_data_.pvname);
+    call dmpr_output_$write_volume_log (code);
+    if code ^= 0 then
+      call dmpr_report_$error_output (code, myname, "Unable to write ^a.volog", dmpr_data_.pvname);
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+get_next_vtocx_: proc returns (fixed bin);
+
+/* This proc finds the next vtoce to dump from the complete volume dump bit map, described above, and
+   retruns the vtocx index of it. */
+
+    do idx = dmpr_input.request_vtocx + 1 to n_vtoce - 1 while (vtoc_bit_map (idx) = "0"b);
+    end;
+    vtoc_bit_map (idx) = "0"b;
+    return (idx);
+
+  end get_next_vtocx_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+unlock_pv: proc;
+    if dmprp = null then return;
+    call hc_backup_$dmpr_unlock_pv (dmpr_data_.pvid, dmpr_data_.dump_type, ec);
+    if ec ^= 0 then
+      call dmpr_report_$error_output (ec, myname, "Unable to unlock disk ^a", dmpr_data_.pvname);
+  end unlock_pv;
+%page;
+
+dcl ansb		     bit (1);
+dcl loop_cnt	     fixed bin;
+dcl seg_fault_retry_cnt  fixed bin;
+dcl vtocx_retry_cnt	     fixed bin;
+dcl in_use_retry_cnt     fixed bin;
+dcl code		     fixed bin (35);
+dcl ec		     fixed bin (35);
+dcl idx		     fixed bin;
+dcl n_vtoce	     fixed bin;
+dcl n_free_vtoce	     fixed bin;
+dcl datap		     ptr;
+dcl i		     fixed bin;
+dcl vbmp		     ptr;
+dcl request	     bit (1);
+dcl vtoc_bit_map	     (0:36720 - 1) bit (1) unaligned;
+dcl n_windows	     fixed bin;
+dcl n_vtoce_per_page     fixed bin;
+dcl myname	     char (32) int static init ("dump_volume_") options (constant);
+dcl vtoce_read_time	     fixed bin int static init (25) options (constant);
+dcl page_read_time	     fixed bin int static init (40) options (constant);
+dcl max_pages_per_segment fixed bin int static init (255) options (constant);
+
+dcl error_table_$invalid_vtoce ext fixed bin (35);
+dcl error_table_$dmpr_in_use ext fixed bin (35);
+dcl error_table_$device_parity ext fixed bin (35);
+dcl error_table_$action_not_performed ext fixed bin (35);
+dcl error_table_$segfault ext fixed bin (35);
+dcl error_table_$end_of_info ext fixed bin (35);
+dcl error_table_$vtoce_connection_fail fixed bin (35) ext static;
+
+dcl command_query_$yes_no entry () options (variable);
+dcl timer_manager_$sleep entry (fixed bin (71), bit (2));
+dcl dmpr_report_$error_output entry options (variable);
+dcl dmpr_output_$new_pass_attach entry (fixed bin (35));
+dcl dmpr_output_$write_volume_log entry (fixed bin (35));
+dcl dmpr_output_$output_object entry (ptr, fixed bin (35));
+dcl dmpr_log_$update_pvolog entry (fixed bin (35));
+dcl dmpr_log_$log_object entry (fixed bin (35));
+dcl dmpr_log_$init_volume_log entry (fixed bin (35));
+dcl dmpr_log_$open_volume_log entry (fixed bin (35));
+dcl dmpr_log_$close_volume_log entry (fixed bin (35));
+
+dcl hc_backup_$dmpr_lock_pv entry (bit (36) aligned, fixed bin, ptr, fixed bin (35));
+dcl hc_backup_$dmpr_unlock_pv entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl hc_backup_$dmpr_build_vtoc_map entry (ptr, fixed bin, fixed bin (35));
+dcl hc_backup_$get_dmpr_data_object entry (ptr, ptr, fixed bin (35));
+
+dcl cleanup	     condition;
+dcl page_fault_error     condition;
+dcl addr		     builtin;
+dcl clock		     builtin;
+dcl divide	     builtin;
+dcl fixed		     builtin;
+dcl null		     builtin;
+dcl unspec	     builtin;
+%page;
+%include dmpr_data_;
+%page;
+%include backup_volume_header;
+%include dmpr_input;
+%page;
+%include backup_volume_record;
+%include backup_static_variables;
+%page;
+%include vtoce;
+%page;
+%include backup_volume_log;
+%include backup_pvol_info;
+%page;
+%include fs_vol_label;
+%page;
+%include fs_dev_types;
+
+  end dump_volume_;

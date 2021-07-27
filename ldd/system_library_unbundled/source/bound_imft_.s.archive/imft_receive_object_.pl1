@@ -1,0 +1,1805 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* Receive storage system objects from a remote Multics */
+
+/* Created:  October 1980 by G. Palter */
+/* Modified: 28 February 1981 by G. Palter to validate user's access to parent directory and improve messages used to
+   report incorrect access on the parent */
+/* Modified: April 1982 by G. Palter to finish initial implementation */
+/* Modified: July 1982 by G. Palter for true AIM support and to properly process I/O error abort control records */
+/* Modified: March 1983 by Robert Coren to recognize local I/O errors and to not hide imft_et_$unknown_status_code */
+/* Modified: March 1983 by Robert Coren to process requests for remote transfer */
+/* Modified: July 1983 by Robert Coren to fix bug in call to ioa_$rsnnl */
+/* Modified: August 1983 by Robert Coren for version 5 backup_control structure */
+/* Modified: November 1983 by Robert Coren to turn on ring-1 privilege for pull requests in order to call
+   queue_admin_$add_index with impunity */
+/* Modified: 1984-10-11 BIM for mseg_message_info */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-06-30,Beattie), approve(88-08-01,MCR7948),
+     audit(88-10-11,Farley), install(88-10-14,MR12.2-1165):
+     a) Add support for extend and update operations.
+     b) Add access check to support delete option in remote pulls.
+     c) Change all access checks to look for explicit ACLs at all times.
+  2) change(88-11-10,Beattie), approve(88-08-01,PBF7948),
+     audit(88-11-14,Farley), install(88-11-14,MR12.2-1214):
+     Change declaration of local_request_number to match up with what is
+     coming from request_descriptor structure to prevent size condtions.
+  3) change(88-11-16,Beattie), approve(88-08-01,PBF7948),
+     audit(88-11-16,Farley), install(88-11-16,MR12.2-1217):
+     Allow driver to access *.imft.acs through links in home directories
+     without having status access by first calling hcs_$get_link_target
+     to get actual pathname before checking access.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+imft_receive_object_:
+     procedure (P_imft_driver_info_ptr, P_fis_info_ptr, P_code);
+
+	imft_driver_info_ptr = P_imft_driver_info_ptr;
+	fis_info_ptr = P_fis_info_ptr;
+	P_code = 0;				/* no errors yet */
+
+	foreign_system_name = rtrim (imft_driver_info.foreign_system.name);
+
+	if fis_info.version ^= FIS_INFO_VERSION_1 then do;
+	     P_code = error_table_$unimplemented_version;
+	     return;
+	end;
+
+	if (fis_info.n_iocbs < 2) | (fis_info.n_iocbs > hbound (fis_info.iocbs, 1)) then do;
+	     P_code = error_table_$bad_arg;
+	     return;
+	end;
+
+	master_iocb_ptr = fis_info.iocbs (1);		/* first switch is master terminal ... */
+	data_iocb_ptr = fis_info.iocbs (2);		/* ... and second is where objects arrives */
+
+	if (master_iocb_ptr = null ()) | (data_iocb_ptr = null ()) then do;
+	     P_code = error_table_$bad_arg;
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+						/** for determining access */
+	my_group_id = get_group_id_ ();		/* Person.Project.Tag */
+						/* strip tag */
+	my_user_id = substr (my_group_id, 1, length (rtrim (my_group_id)) - 2);
+	current_ring = get_ring_ ();
+
+/* One time initialization */
+
+	if first_call then do;
+
+	     errfile_dname = get_pdir_ ();		/* place for reload's error files */
+	     errfile_ename = "IMFT." || unique_chars_ (""b);
+	     errfile_pathname = pathname_ (errfile_dname, errfile_ename);
+	     call hcs_$make_seg (errfile_dname, errfile_ename, "", RW_ACCESS_BIN, errfile_ptr, code);
+	     if errfile_ptr = null () then do;		/* shouldn't happen, but... */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_RECEIVE_OBJECT_,
+		     "Creating ^a as error file for notifications.", errfile_pathname);
+		P_code = code;
+		return;
+	     end;
+	     call hcs_$terminate_noname (errfile_ptr, ignore_code);
+
+	     branch_info.version = create_branch_version_2;
+						/* initialize branch info structure */
+	     branch_info.dir_sw = "1"b;
+	     branch_info.copy_sw = "0"b;
+	     branch_info.chase_sw = "0"b;
+	     branch_info.priv_upgrade_sw = "0"b;
+	     branch_info.parent_ac_sw = "1"b;
+	     branch_info.mbz1 = ""b;
+	     branch_info.mode = SMA_ACCESS;
+	     branch_info.mbz2 = ""b;
+	     branch_info.rings (1), branch_info.rings (2), branch_info.rings (3) = 7;
+	     branch_info.userid = my_group_id;
+	     branch_info.bitcnt = 0;
+	     branch_info.quota = 0;
+	     branch_info.access_class = get_authorization_ ();
+	     branch_info.dir_quota = 0;
+	     temp_ename = "IMFT_dir." || unique_chars_ (""b);
+	     temp_dname = pathname_ (errfile_dname, temp_ename);
+
+	     call hcs_$create_branch_ (errfile_dname, temp_ename, addr (branch_info), code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_RECEIVE_OBJECT_,
+		     "Creating holding directory for extend and update file operations.");
+		P_code = code;
+		return;
+	     end;
+
+	     first_call = "0"b;			/* all set */
+	end;
+
+/* Setup for operation */
+
+	acl_ptr, errfile_ptr = null ();		/* keep cleanup handler happy */
+
+	errfile_attached, object_in_progress = "0"b;
+
+	on condition (cleanup) call cleanup_handler ();
+
+/*
+   Main processing loop: Accept objects from the remote system indefintely or until input is available on the master
+   console.  When input is available from the master, control returns to the caller when between objects to permit driver
+   command processing
+*/
+
+	do while ("1"b);
+
+	     call imft_find_input_switch_ (fis_info_ptr, "1"b, source, code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_RECEIVE_OBJECT_, "Waiting for input from master or remote.")
+		     ;
+		P_code = code;
+		go to RETURN_FROM_RECEIVE_OBJECT;
+	     end;
+
+	     if (source = 1) then			/* input from master console */
+		go to RETURN_FROM_RECEIVE_OBJECT;
+
+/* Input is available from remote Multics: check for a BOF command */
+
+	     object_in_progress = "0"b;		/* haven't started yet */
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = 5 * ONE_MINUTE;	/* give it a chance to be read */
+	     local_icri.record_ptr = addr (input_buffer);
+	     local_icri.record_max_lth = length (input_buffer);
+
+	     call iox_$control (data_iocb_ptr, "read_command_record", addr (local_icri), code);
+	     if code ^= 0 then call io_error (code, "Attempting to read from " || foreign_system_name || ".");
+
+	     if (local_icri.record_type = IMFT_SYNC1) | (local_icri.record_type = IMFT_SYNC2) then
+		signal condition (imft_resynchronize_driver_);
+
+	     else if local_icri.record_type = IMFT_LOGOUT then signal condition (imft_remote_logout_);
+
+	     else if local_icri.record_type ^= IMFT_BOF & local_icri.record_type ^= IMFT_REMOTE_REQUEST then do;
+		call iodd_msg_ (NORMAL, MASTER, NO_ERROR, IMFT_RECEIVE_OBJECT_, "Unexpected command code ^d from ^a.",
+		     local_icri.record_type, foreign_system_name);
+		P_code = error_table_$fatal_error;	/* make driver reinitialize */
+		go to RETURN_FROM_RECEIVE_OBJECT;
+	     end;
+	     local_bof_reply.abort_request = "0"b;	/* assume everything is OK */
+	     local_bof_reply.abort_message = "";
+
+	     acl_count = 2;				/* one entry each for driver and user */
+	     allocate general_acl in (system_area) set (acl_ptr);
+	     general_acl.version = GENERAL_ACL_VERSION_1;
+	     general_acl.count = acl_count;
+	     general_acl (DRIVER_ACL_IDX).access_name = rtrim (my_user_id) || ".*";
+	     imft_chk_acl.version = IMFT_CHECK_ACL_VERSION_1;
+	     imft_chk_acl.foreign_sys_name = foreign_system_name;
+	     imft_chk_acl.gen_acl_ptr = acl_ptr;
+	     imft_chk_acl.sys_auth_ceiling = imft_driver_info.local_system.access_ceiling;
+	     imft_chk_acl.sys_auth_floor = imft_driver_info.local_system.access_floor;
+
+	     object_in_progress = "1"b;		/* in case of QUITs or other failures */
+%page;
+	     if local_icri.record_type = IMFT_BOF then do;
+
+/**** Object to be sent from other system. */
+
+		local_bof_command = addr (input_buffer) -> bof_command;
+
+		local_request_number, local_bof_reply.request_number = local_bof_command.request_number;
+
+/*
+   Determine resting place of the object, the user to notify, log the BOF command, inform the user that something is
+   coming, and validate that the driver and user have proper access
+*/
+
+		if local_bof_command.foreign_path_given then do;
+		     local_dirname = local_bof_command.foreign_dirname;
+		     local_entname = local_bof_command.foreign_ename;
+		     local_full_pathname = pathname_ (local_dirname, local_entname);
+		     foreign_full_pathname =
+			pathname_ (local_bof_command.local_dirname, local_bof_command.local_ename);
+		end;
+		else do;
+		     local_dirname = local_bof_command.local_dirname;
+		     local_entname = local_bof_command.local_ename;
+		     local_full_pathname, foreign_full_pathname = pathname_ (local_dirname, local_entname);
+		end;
+
+		if local_bof_command.foreign_user_given then
+		     mail_destination = local_bof_command.foreign_user;
+		else mail_destination = local_bof_command.local_user;
+
+		foreign_user_id = rtrim (local_bof_command.local_user);
+		local_user_id = rtrim (mail_destination);
+
+		imft_chk_acl.user_auth = local_bof_command.local_user_authorization;
+
+		call translate_aim_attributes_ (imft_driver_info.foreign_system.aim_attributes_ptr,
+		     local_bof_command.local_user_authorization, imft_driver_info.local_system.aim_attributes_ptr,
+		     mail_access_class, code);
+		if code ^= 0 then			/* submitter authorization is too high ... */
+		     mail_access_class = imft_driver_info.local_system.access_ceiling;
+
+		call iodd_msg_ (LOG, MASTER, NO_ERROR, "",
+		     "Request ^d ^a input q^d: receive^[ extension to^]^[ update to^] ^a ^a^/^2xfor ^a^[ from ^a^;^s^]^[^/^2xoriginally ^a^]",
+		     local_bof_command.request_number, foreign_system_name, local_bof_command.queue,
+		     local_bof_command.extend, local_bof_command.update, OBJECT_TYPES (local_bof_command.object_type),
+		     local_full_pathname, mail_destination, local_bof_command.foreign_user_given,
+		     local_bof_command.local_user, local_bof_command.foreign_path_given, foreign_full_pathname);
+
+		local_personid = before (mail_destination, ".");
+		call imft_pnt_interface_$validate_personid (local_personid, code);
+		if code ^= 0 then
+		     call reject_request (code, "Validating user name """ || rtrim (local_personid) || """.");
+
+		call translate_aim_attributes_ (imft_driver_info.foreign_system.aim_attributes_ptr,
+		     local_bof_command.object_access_class, imft_driver_info.local_system.aim_attributes_ptr,
+		     local_bof_command.object_access_class, code);
+		if code ^= 0 then do;
+		     call convert_aim_attributes_ (local_bof_command.object_access_class, octal_string);
+		     call reject_request (code,
+			"Attempting to translate access class (" || rtrim (octal_string) || ") from "
+			|| foreign_system_name || ".");
+		end;
+
+		call validate_access ();		/* will abort if not OK */
+
+		if local_bof_command.notify then
+		     call notify_user (
+			"Beginning reception of^[ extension to^]^[ update to^] ^a ^a from ^a (queue ^d).",
+			local_bof_command.extend, local_bof_command.update,
+			OBJECT_TYPES (local_bof_command.object_type), local_full_pathname, foreign_system_name,
+			local_bof_command.queue);
+
+/*
+   If control reaches here, as much validation of the request has been performed as possible without actually invoking
+   backup_load_:  Inform the other system that it may send the object
+*/
+
+		local_icri.version = ICRI_VERSION_1;
+		local_icri.timeout = 5 * ONE_MINUTE;	/* give the other system a decent chance */
+		local_icri.record_type = IMFT_BOF;	/* this is a reply to their BOF command */
+		local_icri.record_ptr = addr (local_bof_reply);
+		local_icri.record_lth = 4 * currentsize (local_bof_reply);
+
+		call iox_$control (data_iocb_ptr, "write_reply_record", addr (local_icri), code);
+		if code ^= 0 then call io_error (code, "Attempting to reply to " || foreign_system_name || ".");
+
+
+/*
+   Prepare to invoke backup_load_: construct description of reload and terminate the backup system to cleanup from last
+   use in this process (if any)
+*/
+
+		static_backup_control.version = BACKUP_CONTROL_VERSION_5;
+		static_backup_control.tape_entry = nulle;
+
+		string (static_backup_control.options) = ""b;
+		static_backup_control.debug_sw = "1"b;
+		static_backup_control.error_file = "1"b;
+		static_backup_control.first = "1"b;
+		static_backup_control.allow_dir_overwrite = "1"b;
+
+		static_backup_control.preattached = "1"b;
+						/* we supply the I/O switch */
+		static_backup_control.data_iocb = data_iocb_ptr;
+
+		static_backup_control.restore_access_class = "1"b;
+						/* restore the AIM access class even though not privileged */
+
+		static_backup_control.enforce_minimum_ring = "1"b;
+		static_backup_control.minimum_ring = acs_write_bracket;
+						/* don't create anything lower than the ACS segment's write
+						   bracket which should reflect local user's normal ring of
+						   execution */
+
+		static_backup_control.translate_access_class = "1"b;
+		static_backup_control.source_attributes_ptr = imft_driver_info.foreign_system.aim_attributes_ptr;
+		static_backup_control.target_attributes_ptr = imft_driver_info.local_system.aim_attributes_ptr;
+						/* translate foreign system's AIM attributes to our own */
+
+		static_backup_control.request_count = 1;/* one and only one object to load */
+
+		static_backup_control.object.path = foreign_full_pathname;
+
+		if local_bof_command.extend | local_bof_command.update then
+		     static_backup_control.object.new_path = pathname_ (temp_dname, local_entname);
+
+		else if local_bof_command.foreign_path_given then
+						/* user requested it be put somewhere else */
+		     static_backup_control.object.new_path = local_full_pathname;
+		else static_backup_control.object.new_path = "";
+
+		string (static_backup_control.object.switches) = ""b;
+		static_backup_control.object.no_primary_sw = "1"b;
+		if local_bof_command.object_type = MSF then
+						/* always flush old subtree if present */
+		     static_backup_control.object.trim_sw = "1"b;
+		else static_backup_control.object.trim_sw =
+			(local_bof_command.directory_creation_mode = REPLACE_DIRECTORIES);
+
+		call term_$refname ("backup_load_", ignore_code);
+		call term_$refname ("backup_map_", ignore_code);
+		call term_$refname ("bk_ss_", ignore_code);
+
+		call ios_$attach ("err_file", "file", errfile_pathname, "w", ios_status);
+		if ios_status.code ^= 0 then call abort_reception (ios_status.code, "Setting up backup error file.");
+		errfile_attached = "1"b;		/* go it */
+
+/* Perform the reload: establish a handler in case anything went wrong during transmission and invoke backup_load_ */
+
+		on condition (imft_read_abort_) call analyze_read_abort;
+
+		call backup_load_ (addr (static_backup_control), code);
+
+RETURN_FROM_BACKUP_LOAD:				/* backup_load_ will read the EOF record */
+		call analyze_backup_results (code);
+
+		if ^backup_errors_detected then	/* reload occurred without any troubles ... */
+		     if local_bof_command.extend | local_bof_command.update then do;
+
+			string (cpo.copy_items) = ""b;
+			cpo.version = COPY_OPTIONS_VERSION_1;
+			cpo.caller_name = IMFT_RECEIVE_OBJECT_;
+			cpo.copy_items.entry_bound = "1"b;
+			string (cpo.flags) = ""b;
+			cpo.flags.delete = "1"b;
+			cpo.copy_items.extend = local_bof_command.extend;
+			cpo.copy_items.update = local_bof_command.update;
+			cpo.flags.raw = "1"b;
+			cpo.source_dir = temp_dname;
+			cpo.source_name = local_entname;
+			cpo.target_dir = local_dirname;
+			cpo.target_name = local_entname;
+
+			on sub_error_ call copy_sub_err_handler ();
+
+			call copy_ (addr (cpo));
+			revert sub_error_;
+		     end;
+
+COPY_OPERATION_FINISHED:
+		if ^backup_errors_detected then	/* reload occurred without any troubles ... */
+		     if local_bof_command.notify then
+			call notify_user (
+			     "Received^[ extension to^]^[ update to^] ^a ^a without^[ further^] errors from ^a (queue ^d).",
+			     local_bof_command.extend, local_bof_command.update,
+			     OBJECT_TYPES (local_bof_command.object_type), local_full_pathname,
+			     foreign_backup_errors, foreign_system_name, local_bof_command.queue);
+
+		if ^imft_driver_info.old_version then do;
+						/* other end is expecting eof_reply to confirm */
+						/* successful reception */
+		     local_eof_reply.request_number = local_request_number;
+		     local_eof_reply.error = backup_errors_detected;
+
+		     local_icri.version = ICRI_VERSION_1;
+		     local_icri.timeout = 5 * ONE_MINUTE;
+		     local_icri.record_type = IMFT_EOF;
+		     local_icri.record_ptr = addr (local_eof_reply);
+		     local_icri.record_lth = 4 * currentsize (local_eof_reply);
+
+		     call iox_$control (data_iocb_ptr, "write_reply_record", addr (local_icri), code);
+		     if code ^= 0 then call io_error (code, "Attempting to reply to " || foreign_system_name || ".");
+		end;
+
+		if backup_errors_detected | foreign_backup_errors then
+		     call iodd_msg_ (LOG, MASTER, NO_ERROR, "",
+			"^2xNon-fatal errors in transfer detected by ^[^a^;^s^]^[ and ^]^[^a^]",
+			foreign_backup_errors, foreign_system_name, foreign_backup_errors & backup_errors_detected,
+			backup_errors_detected, imft_driver_info.local_system.name);
+
+		call iodd_msg_ (LOG, MASTER, NO_ERROR, "", "^2xReceived request ^d.",
+		     local_bof_command.request_number);
+
+	     end;					/* if sending to other system */
+%page;
+/**** Request to queue transfers from here to the other system. */
+
+	     else do;
+		local_rr = addr (input_buffer) -> remote_request;
+		local_request_number, local_bof_reply.request_number = local_rr.request_number;
+		local_dirname = local_rr.dirname;
+		local_starname = local_rr.ename;
+		local_full_pathname = pathname_ (local_dirname, local_starname);
+
+		if local_rr.foreign_path_given then
+		     foreign_equalname = pathname_ (local_rr.foreign_dirname, local_rr.foreign_ename);
+		else foreign_equalname = local_full_pathname;
+
+		if local_rr.foreign_user_given then
+		     mail_destination = local_rr.foreign_user;
+		else mail_destination = local_rr.local_user;
+
+		foreign_user_id = rtrim (local_rr.local_user);
+		local_user_id = rtrim (mail_destination);
+		general_acl (USER_ACL_IDX).access_name = local_user_id || ".*";
+
+		call translate_aim_attributes_ (imft_driver_info.foreign_system.aim_attributes_ptr,
+		     local_rr.local_user_authorization, imft_driver_info.local_system.aim_attributes_ptr,
+		     mail_access_class, code);
+		if code ^= 0 then			/* submitter authorization is too high ... */
+		     mail_access_class = imft_driver_info.local_system.access_ceiling;
+
+		if ^imft_driver_info.remote_request_allowed
+						/* this site doesn't permit it */
+		     then
+		     call reject_request (NO_ERROR,
+			foreign_system_name || " does not have permission to request transfers.");
+
+		local_personid = before (mail_destination, ".");
+		call imft_pnt_interface_$validate_personid (local_personid, code);
+		if code ^= 0 then
+		     call reject_request (code, "Validating user name """ || rtrim (local_personid) || """.");
+
+		call iodd_msg_ (LOG, MASTER, NO_ERROR, "",
+		     "Request ^d ^a input q^d: transmit^[ extension^]^[ update^] ^a^/^2xfrom ^a^[ for ^a^;^s^]^[^/^2xas ^a^]",
+		     local_request_number, foreign_system_name, local_rr.queue, local_rr.extend, local_rr.update,
+		     local_full_pathname, mail_destination, local_rr.foreign_user_given, local_rr.local_user,
+		     local_rr.foreign_path_given, foreign_equalname);
+
+		call validate_acs (R_ACCESS);
+		user_ring = max (local_rr.local_user_ring, acs_write_bracket);
+
+		call submit_request;
+
+/*
+   if we return to here, we submitted the request, or part of it, anyway, so tell
+   the other system
+*/
+
+		local_icri.version = ICRI_VERSION_1;
+		local_icri.timeout = 5 * ONE_MINUTE;	/* give the other system a decent chance */
+		local_icri.record_type = IMFT_BOF;	/* this is a reply to their BOF command */
+		local_icri.record_ptr = addr (local_bof_reply);
+		local_icri.record_lth = 4 * currentsize (local_bof_reply);
+
+		call ioa_$rsnnl ("Queued ^d request^[^;s^] on ^a for request ^d^[ with ^d error^[^;s^]^].",
+		     local_bof_reply.abort_message, ignore_fb21, n_submitted, (n_submitted = 1),
+		     imft_driver_info.local_system.name, local_request_number, (n_not_submitted > 0), n_not_submitted,
+		     (n_not_submitted = 1));
+
+		call iox_$control (data_iocb_ptr, "write_reply_record", addr (local_icri), code);
+		if code ^= 0 then call io_error (code, "Attempting to reply to " || foreign_system_name || ".");
+
+		call iodd_msg_ (LOG, MASTER, NO_ERROR, "",
+		     "^2xQueued ^d request^[^;s^] for request ^d^[ with ^d error^[^;s^]^].", n_submitted,
+		     (n_submitted = 1), local_request_number, (n_not_submitted > 0), n_not_submitted,
+		     (n_not_submitted = 1));
+
+	     end;					/* if queueing transfers from here to other system */
+
+	     object_in_progress = "0"b;		/* all done with this one */
+
+WAIT_FOR_NEXT_OBJECT:
+	end;					/* do while ("1"b) */
+
+RETURN_FROM_RECEIVE_OBJECT:
+	call cleanup_handler ();
+
+	return;
+%page;
+/*
+   Handler for imft_read_abort_:  This condition is raised during reading of backup records if transmission was
+   prematurely terminated at the remote system
+*/
+
+analyze_read_abort:
+     procedure ();
+
+	local_icri.version = ICRI_VERSION_1;
+	local_icri.timeout = 5 * ONE_MINUTE;		/* give the remote system sometime */
+	local_icri.record_ptr = addr (input_buffer);
+	local_icri.record_max_lth = length (input_buffer);
+
+	call iox_$control (data_iocb_ptr, "get_abort_info", addr (local_icri), code);
+	if code ^= 0 then call io_error (code, "Attempting to read from " || foreign_system_name || ".");
+
+	if (local_icri.record_type = IMFT_SYNC1) | (local_icri.record_type = IMFT_SYNC2) then do;
+	     call notify_user ("Request for ^a deferred: ^a requested driver to reinitialize.", local_full_pathname,
+		foreign_system_name);
+	     signal condition (imft_resynchronize_driver_);
+	end;
+
+	else if local_icri.record_type = IMFT_LOGOUT then do;
+	     call notify_user ("Request for ^a deferred: ^a's output driver disconnected.", local_full_pathname,
+		foreign_system_name);
+	     signal condition (imft_remote_logout_);
+	end;
+
+	else if local_icri.record_type = IMFT_EOF then do;/* backup_load_ will keep reading after object is loaded: */
+						/* the EOF record after the object is trapped here */
+	     eof_command_ptr = local_icri.record_ptr;
+	     go to RETURN_FROM_BACKUP_LOAD;
+	end;
+
+
+	else if local_icri.record_type = IMFT_ABORT then do;
+	     abort_command_ptr = local_icri.record_ptr;
+	     if abort_command.reason = IMFT_ABORT_IO_ERROR | abort_command.reason = IMFT_ABORT_LOCAL_IO_ERROR then do;
+		if abort_command.reason = IMFT_ABORT_IO_ERROR
+						/* came from foreign system */
+		     then
+		     abort_command.code = imft_convert_status_code_$decode (abort_command.code);
+		call io_error (abort_command.code, "Attempting to read from " || foreign_system_name || ".");
+	     end;
+	     else if abort_command.reason = IMFT_ABORT_ABORTED then
+		call abort_reception (NO_ERROR, foreign_system_name || " terminated transmission prematurely.");
+	     else if abort_command.reason = IMFT_ABORT_RESTARTED then
+		call abort_reception (NO_ERROR, "Operator at " || foreign_system_name || " restarted the request.");
+	     else if (abort_command.reason = IMFT_ABORT_DEFERRED) | (abort_command.reason = IMFT_ABORT_SAVED) then
+		call abort_reception (NO_ERROR,
+		     "Operator at " || foreign_system_name || " deferred transmission until a later time.");
+	     else if abort_command.reason = IMFT_ABORT_CANCELLED then
+		call abort_reception (NO_ERROR, "Operator at " || foreign_system_name || " cancelled transmission.");
+	     else call abort_reception (NO_ERROR,
+		     foreign_system_name || " terminated transmission for an unknown reason.");
+	end;
+
+	else do;
+	     call iodd_msg_ (NORMAL, MASTER, NO_ERROR, IMFT_RECEIVE_OBJECT_, "Unexpected command code ^d from ^a.",
+		local_icri.record_type, foreign_system_name);
+	     P_code = error_table_$fatal_error;		/* make driver reinitialize */
+	     go to RETURN_FROM_RECEIVE_OBJECT;
+	end;
+     end analyze_read_abort;
+%page;
+/* Cleanup before returning to caller */
+
+cleanup_handler:
+     procedure ();
+
+	if acl_ptr ^= null () then do;
+	     free general_acl in (system_area);
+	     acl_ptr = null ();
+	end;
+
+	if errfile_ptr ^= null () then do;
+	     call hcs_$terminate_noname (errfile_ptr, ignore_code);
+	     errfile_ptr = null ();
+	end;
+
+	if errfile_attached then do;
+	     call ios_$detach ("err_file", "", "", ios_status);
+	     call hcs_$truncate_file (errfile_dname, errfile_ename, 0, ignore_code);
+	     call hcs_$set_bc (errfile_dname, errfile_ename, 0, ignore_code);
+	     errfile_attached = "0"b;
+	end;
+
+	if object_in_progress then do;
+	     call iodd_msg_ (NORMAL, MASTER, NO_ERROR, IMFT_RECEIVE_OBJECT_, "Processing of request ^d terminated.",
+		local_request_number);
+	     object_in_progress = "0"b;
+	end;
+
+	return;
+
+     end cleanup_handler;
+%page;
+copy_sub_err_handler:
+     procedure;
+
+dcl  1 ci aligned like condition_info;
+dcl  local_error_message character (1024);
+
+	call find_condition_info_ (null (), addr (ci), ignore_code);
+	sub_error_info_ptr = ci.info_ptr;
+
+	if sub_error_info.name ^= "copy_" then do;
+CONTINUE_TO_SIGNAL:
+	     call continue_to_signal_ (ignore_code);
+	     goto END_COPY_HANDLER;
+	end;
+	else if sub_error_info.info_ptr = null then goto CONTINUE_TO_SIGNAL;
+	else if copy_error_info.copy_options_ptr ^= addr (cpo) then goto CONTINUE_TO_SIGNAL;
+
+	code = sub_error_info.status_code;
+	if code ^= 0 then do;
+	     if code = error_table_$unsupported_operation & copy_error_info.operation = "entry bound" then
+		go to COPY_OPERATION_FINISHED;
+
+	     backup_errors_detected = "1"b;
+	     call convert_status_code_ (code, shortinfo, code_message);
+	     call ioa_$rsnnl ("Error occured in extend/update operation:^[^s^; ^a^]^/(^a)", local_error_message,
+		ignore_fb21, (sub_error_info.info_string = ""), sub_error_info.info_string, code_message);
+	     call notify_user (local_error_message);
+	end;
+	go to COPY_OPERATION_FINISHED;
+
+END_COPY_HANDLER:
+     end copy_sub_err_handler;
+%page;
+/****^
+   Validates access to receive a transfer request:  Let TPerson.TProj be the user who is to receive the file/subtree,
+   SPerson.SProj be the user (on the other system) who is sending the file/subtree, MPerson.MProj be the user who is
+   running the daemon, and let TDir be the directory into which the file/subtree will be placed.  Then:
+
+      (1) SPerson.SProj must have explicit write access to the segment:
+	   >udd>TProj>TPerson>SSite.imft.acs
+	where SSite is the name of the foreign system (the foreign_system keyword in the I/O daemon tables),
+
+      (2) TPerson.TProj and MPerson.MProj must have explicit "sma" access to TDir, and
+
+      (3) the access class of DIR must be equal to the access class of the file/subtree from the other system.
+
+   To perform these checks, MPerson.MProj requires "s" access to the parent of TDir and to >udd>TProj>TPerson.
+
+   The user's access to the directory is checked using the highest value of the following 3 items;
+      (1) write bracket of the user's ACS segment on local system as the user's ring of execution.
+      (2) the foreign user ring of execution.
+      (3) driver ring of execution.
+*/
+
+validate_access:
+     procedure () options (non_quick);			/* because it has lots of automatic storage */
+
+dcl  dir_access_class bit (72) aligned;
+dcl  dir_access_class_text character (256);
+dcl  local_error_message character (1024);
+dcl  local_pathname character (168);
+dcl  object_access_class_text character (256);
+dcl  parent_dirname character (168);
+dcl  parent_ename character (32);
+dcl  transfer_ring fixed binary (3);
+
+	call validate_acs (W_ACCESS);			/* check access on ACS */
+	transfer_ring = max (local_bof_command.local_user_ring, acs_write_bracket);
+
+	if local_dirname = ">" then			/* can't transfer to the root */
+	     call reject_request (NO_ERROR, "IMFT can not create branches under the root.");
+%page;
+/**** Both driver and user must have explicit SMA access to parent directory */
+
+	call expand_pathname_ (local_dirname, parent_dirname, parent_ename, ignore_code);
+	imft_chk_acl.dirname = parent_dirname;
+	imft_chk_acl.ename = parent_ename;
+	imft_chk_acl.dir_access = SMA_ACCESS;
+	imft_chk_acl.seg_access = RW_ACCESS;
+	imft_chk_acl.check_aim = "0"b;		/* check_object_acl AIM check is not right for parent dir */
+	imft_chk_acl.effective_ring = transfer_ring;
+	imft_chk_acl.bad_acl_idx = DRIVER_ACL_IDX;	/* by default, error is driver's */
+	general_acl (USER_ACL_IDX).access_name = local_user_id || ".*";
+
+	call imft_util_$check_object_acl (addr (imft_chk_acl), code);
+	if code = 0 then code = imft_chk_acl.error_code;
+	if code ^= 0 then do;
+	     if code = error_table_$unimplemented_version then call fatal_ica_error ();
+	     call set_va_dir_sma_error_message (imft_chk_acl.bad_acl_idx);
+	     call reject_request (code, local_error_message);
+	end;					/* if code ^= 0 */
+
+	code = 0;
+	do idx = 1 to hbound (general_acl.entries, 1);
+	     if general_acl (idx).status_code ^= 0 then do;
+		code = general_acl (idx).status_code;
+		call convert_status_code_ (code, shortinfo, code_message);
+		call set_va_dir_sma_error_message (idx);
+		call notify_user (REQ_TERMED_STR, code ^= 0, code_message, local_error_message, local_dirname);
+	     end;
+	end;
+
+	if code ^= 0 then
+	     call reject_request_no_notify (NO_ERROR,
+		"Insufficient driver/user access to parent directory to receive object.");
+
+/**** Check AIM of parent directory. */
+
+	call hcs_$get_access_class ((parent_dirname), (parent_ename), dir_access_class, code);
+	if code ^= 0 then
+	     call reject_request (code, "Attempting to determine access class of parent directory to object.");
+
+	if ^aim_check_$equal (dir_access_class, local_bof_command.object_access_class) then do;
+	     dir_access_class_text, object_access_class_text = "";
+	     call convert_authorization_$to_string_short (dir_access_class, dir_access_class_text, ignore_code);
+	     call convert_authorization_$to_string_short (local_bof_command.object_access_class,
+		object_access_class_text, ignore_code);
+	     call ioa_$rsnnl (
+		"Access class of ^a (^[^a^;^ssystem_low^]) must be equal to access class of object on ^a (^[^a^;^ssystem_low^]).",
+		local_error_message, ignore_fb21, local_dirname, (dir_access_class_text ^= ""), dir_access_class_text,
+		foreign_system_name, (object_access_class_text ^= ""), object_access_class_text);
+	     call reject_request (error_table_$ai_restricted, local_error_message);
+	end;
+%page;
+	if local_bof_command.extend | local_bof_command.update then do;
+
+/**** Object must already exist and have explicit ACL entries of RW for both driver and user. */
+
+	     local_pathname = pathname_ (local_dirname, local_entname);
+	     imft_chk_acl.dirname = local_dirname;
+	     imft_chk_acl.ename = local_entname;
+	     imft_chk_acl.dir_access = SMA_ACCESS;
+	     imft_chk_acl.seg_access = RW_ACCESS;
+	     imft_chk_acl.check_aim = "1"b;
+	     imft_chk_acl.bad_acl_idx = DRIVER_ACL_IDX;	/* by default, error is driver's */
+	     general_acl (USER_ACL_IDX).access_name = local_user_id || ".*";
+
+	     call imft_util_$check_object_acl (addr (imft_chk_acl), code);
+	     if code = 0 then code = imft_chk_acl.error_code;
+	     if code ^= 0 then do;
+		if code = error_table_$unimplemented_version then call fatal_ica_error ();
+		call reject_request (NO_ERROR, (imft_chk_acl (imft_chk_acl.bad_acl_idx).error_message));
+	     end;
+
+	     code = 0;
+	     do idx = 1 to hbound (general_acl.entries, 1);
+		if general_acl (idx).status_code ^= 0 then do;
+		     code = general_acl (idx).status_code;
+		     call notify_user (REQ_TERMED_STR, "0"b, code_message, imft_chk_acl (idx).error_message,
+			local_pathname);		/* code_message is already in .error_message */
+		end;
+	     end;
+
+	     if code ^= 0 then
+		call reject_request_no_notify (NO_ERROR,
+		     "Insufficient driver/user access to extend or update object.");
+
+	     if ^(imft_chk_acl.type = ENTRY_TYPE_SEGMENT | imft_chk_acl.type = ENTRY_TYPE_MSF) then do;
+
+		if index (imft_chk_acl.type, "-") = 1 then
+		     local_type = substr (imft_chk_acl.type, 2);
+		else local_type = imft_chk_acl.type;
+
+		call ioa_$rsnnl ("Can only ^[extend^]^[update^] with segments or MSFs, not with ^a type object.",
+		     local_error_message, ignore_fb21, local_bof_command.extend, local_bof_command.update, local_type)
+		     ;
+		call reject_request (NO_ERROR, local_error_message);
+	     end;
+
+	end;					/* if extend or update */
+
+	return;					/* passes */
+%page;
+set_va_dir_sma_error_message:
+	proc (p_idx);
+
+dcl  p_idx fixed binary parameter;
+
+	     if code = error_table_$moderr | code = error_table_$user_not_found then
+		call ioa_$rsnnl (
+		     "^[Driver^;User^] (^a) must have an explicit ACL entry of SMA to parent directory of object to be received.",
+		     local_error_message, ignore_fb21, (p_idx = DRIVER_ACL_IDX), general_acl (p_idx).access_name,
+		     local_pathname);
+	     else call ioa_$rsnnl (
+		     "Unable to determine ^a's and ^a's access to parent directory of object to be received.",
+		     local_error_message, ignore_fb21, local_user_id, my_user_id);
+
+	end set_va_dir_sma_error_message;
+
+     end validate_access;
+%page;
+/*
+   Check for the existence of the ACS described in introductory comment to validate_access,
+   and ensure that the foreign user has the appropriate access (W for transferring
+   objects to this system, or R for requesting that they be transferred to SSite).
+*/
+
+validate_acs:
+     procedure (access_required);
+
+dcl  access_required bit (3) parameter;
+
+dcl  link_dirname character (168);
+dcl  link_ename character (32);
+dcl  local_dirname character (168);
+dcl  local_ename character (32);
+dcl  local_error_message character (1024);
+dcl  local_pathname character (168);
+
+	local_dirname, imft_chk_acl.dirname =
+	     ">udd>" || after (local_user_id, ".") || ">" || before (local_user_id, ".");
+	local_ename, imft_chk_acl.ename = foreign_system_name || ".imft.acs";
+	local_pathname = pathname_ (local_dirname, local_ename);
+						/* ACS path could be a link in "home" directory to which */
+						/* daemon doesn't even have status access, */
+						/* find actual path */
+	call hcs_$get_link_target (local_dirname, local_ename, link_dirname, link_ename, code);
+
+	if code = 0 | code = error_table_$noentry then do;
+
+						/** previous call could have changed pathname */
+	     imft_chk_acl.dirname = link_dirname;
+	     imft_chk_acl.ename = link_ename;
+	     local_pathname = pathname_ (link_dirname, link_ename);
+	end;
+
+	if code ^= 0 then go to VALIDATE_ACS_ERROR;
+
+	imft_chk_acl.dir_access = S_ACCESS;
+	imft_chk_acl.seg_access = access_required;
+	imft_chk_acl.check_aim = "0"b;
+	imft_chk_acl.effective_ring = 0;		/* we want to know what it is without getting an error */
+	imft_chk_acl.bad_acl_idx = DRIVER_ACL_IDX;	/* by default, error is driver's */
+	general_acl (USER_ACL_IDX).access_name = foreign_user_id || ".*";
+
+	call imft_util_$check_object_acl (addr (imft_chk_acl), code);
+	if code = 0 then code = imft_chk_acl.error_code;
+	if code ^= 0 then do;
+
+	     if code = error_table_$unimplemented_version then call fatal_ica_error ();
+
+VALIDATE_ACS_ERROR:
+	     call set_acs_error_message ();
+	     call reject_request (code, local_error_message);
+	end;
+
+	if general_acl (USER_ACL_IDX).status_code ^= 0 then do;
+	     code = general_acl (USER_ACL_IDX).status_code;
+	     call set_acs_error_message ();		/* code can be set to 0 in this call */
+	     call reject_request (code, local_error_message);
+	end;
+
+	acs_write_bracket = max (imft_chk_acl.object_ring, current_ring);
+						/* restrict transfers to user's probable ring of */
+						/* execution unless we operate in a higher ring */
+
+	return;
+%page;
+/**** Support routine for validate_acs to generate an applicable error message. */
+
+set_acs_error_message:
+	proc;
+
+	     if code = error_table_$noentry then do;
+		call ioa_$rsnnl ("^a has not established an ACS segment in ^a to control transfers ^[from^;to^] ^a.",
+		     local_error_message, ignore_fb21, local_user_id, imft_chk_acl.dirname,
+		     (access_required = W_ACCESS), foreign_system_name);
+		code = 0;				/* no need to include the error_table_ message */
+	     end;
+	     else if code = error_table_$moderr | code = error_table_$user_not_found then
+		call ioa_$rsnnl ("^a has not given ^a permission to transfer files ^[from^;to^] ^a ^[to^;from^] ^a.",
+		     local_error_message, ignore_fb21, local_user_id, foreign_user_id, (access_required = W_ACCESS),
+		     foreign_system_name, (access_required = W_ACCESS), imft_driver_info.local_system.name);
+	     else call ioa_$rsnnl ("Attempting to determine ^a's access to ^a.", local_error_message, ignore_fb21,
+		     foreign_user_id, local_pathname);
+
+	end set_acs_error_message;
+
+     end validate_acs;
+%page;
+/*
+   Submit one or more requests for transfer to the foreign system as specified by
+   the starname given in a request for remote transfer. This code is essentially lifted
+   from enter_imft_request
+*/
+
+submit_request:
+     procedure;
+
+dcl  queue_index fixed bin;
+dcl  request_type character (24);
+dcl  transmit_driver_id character (32);
+dcl  queue_ename character (32);
+dcl  local_error_message character (1024);
+dcl  queue_picture picture "9";
+dcl  access_mode bit (36) aligned;
+dcl  queue_mode bit (36) aligned;
+dcl  chase_control bit (2);
+dcl  have_starname bit (1);
+dcl  submitted_a_request bit (1);
+dcl  reported_error bit (1);
+dcl  reported_dir_sma_warning bit (1);
+dcl  entry_idx fixed bin;
+dcl  priv_code fixed bin (35);
+
+dcl  1 local_ft_request aligned like ft_request;
+
+	queue_index = 0;				/* for cleanup handler */
+	priv_code = -1;				/* so it won't look like we turned it on */
+	star_entry_ptr, star_names_ptr = null ();
+
+	on cleanup
+	     begin;
+	     if star_names_ptr ^= null () then do;
+		free star_names in (system_area);
+		star_names_ptr = null ();
+	     end;
+
+	     if star_entry_ptr ^= null () then do;
+		free star_entries in (system_area);
+		star_entry_ptr = null ();
+	     end;
+
+	     if queue_index ^= 0 then do;
+		call message_segment_$close (queue_index, ignore_code);
+		queue_index = 0;
+	     end;
+
+	     if priv_code = 0			/* we turned ring 1 privilege on */
+		then
+		call system_privilege_$ring1_priv_off (ignore_code);
+
+	end;
+
+	local_user_access_id = local_user_id || ".*";
+	request_type = "To_" || foreign_system_name;
+	queue_ename = rtrim (request_type) || "_" || convert (queue_picture, local_rr.queue) || ".ms";
+
+/* turn on ring 1 privilege in preparation for call to queue_admin_$add_index */
+
+	on linkage_error ;				/* if we don't have access to the gate, we'll risk it */
+	call system_privilege_$ring1_priv_on (priv_code); /* sets code to 0 iff privilege was off before and */
+	revert linkage_error;			/* we turned it on */
+
+	call message_segment_$open (imft_data_$queue_dirname, queue_ename, queue_index, code);
+	if code ^= 0 then call reject_request (code, "Opening " || pathname_ (imft_data_$queue_dirname, queue_ename));
+
+	call hcs_$get_user_access_modes (imft_data_$queue_dirname, queue_ename, local_user_access_id, (user_ring),
+	     access_mode, queue_mode, code);
+	if code ^= 0 then
+	     call reject_request (code,
+		"Could not determine access to " || pathname_ (imft_data_$queue_dirname, queue_ename));
+
+	if (queue_mode & A_EXTENDED_ACCESS) ^= A_EXTENDED_ACCESS
+						/* not enough access at all */
+	     then
+	     call reject_request (NO_ERROR,
+		"User has insufficient access to " || rtrim (request_type) || " queue "
+		|| convert (queue_picture, local_rr.queue));
+
+	call iod_info_$driver_access_name (request_type, transmit_driver_id, code);
+	if code ^= 0 then do;
+	     call ioa_$rsnnl ("Receiving driver attempting to determine transmiting driver ident on ^a system.",
+		local_error_message, ignore_fb21, imft_driver_info.local_system.name);
+	     call reject_request (code, local_error_message);
+	end;
+	general_acl (DRIVER_ACL_IDX).access_name = transmit_driver_id;
+
+/* Fill in constant portion of the ft_request */
+
+	unspec (local_ft_request) = ""b;
+
+	local_ft_request.header.hdr_version = queue_msg_hdr_version_1;
+	local_ft_request.header.message_type = FT_MESSAGE_TYPE;
+	local_ft_request.header.notify = local_rr.notify;
+	local_ft_request.header.orig_queue = local_rr.queue;
+	local_ft_request.header.std_length = currentsize (local_ft_request);
+	local_ft_request.delete = local_rr.delete;
+	local_ft_request.extend = local_rr.extend;
+	local_ft_request.update = local_rr.update;
+
+	local_ft_request.version = FT_REQUEST_VERSION_1;
+	if foreign_user_id ^= local_user_id then do;	/* foreign user is different from local user */
+	     local_ft_request.foreign_user = foreign_user_id;
+	     local_ft_request.foreign_user_given = "1"b;
+	end;
+
+	local_ft_request.foreign_path_given = local_rr.foreign_path_given;
+	chase_control = local_rr.chase_control;
+
+	n_submitted = 0;
+	n_not_submitted = 0;
+
+	call check_star_name_$entry (local_starname, code);
+	have_starname = (code ^= 0);
+	reported_dir_sma_warning = "0"b;		/* SMA access warning is to be reported once per request */
+
+	if have_starname then do;			/* more than one object */
+	     star_entry_ptr, star_names_ptr = null ();
+	     submitted_a_request, reported_error = "0"b;
+	     if chase_control = ALWAYS_CHASE then
+		call hcs_$star_ (local_dirname, local_starname, star_ALL_ENTRIES, system_area_ptr, star_entry_count,
+		     star_entry_ptr, star_names_ptr, code);
+	     else call hcs_$star_ (local_dirname, local_starname, star_BRANCHES_ONLY, system_area_ptr, star_entry_count,
+		     star_entry_ptr, star_names_ptr, code);
+	     if code ^= 0 then call reject_request (code, "Attempting to process star names.");
+
+	     do entry_idx = 1 to star_entry_count;
+		call process_single_request (local_dirname, star_names (star_entries (entry_idx).nindex));
+
+PROCESS_NEXT_STAR_ENTRY:
+	     end;
+	     free star_names in (system_area);
+	     free star_entries in (system_area);
+	     star_entry_ptr, star_names_ptr = null ();
+	     if ^submitted_a_request then
+		if reported_error then
+		     call reject_request_no_notify (NO_ERROR, NO_OBJ_FND_SATISFY_REQ_STR);
+		else call reject_request (NO_ERROR, NO_OBJ_FND_SATISFY_REQ_STR);
+	end;
+
+	else call process_single_request (local_dirname, local_starname);
+
+	call message_segment_$close (queue_index, ignore_code);
+
+	if priv_code = 0				/* if we turned ring-1 privilege on */
+	     then
+	     call system_privilege_$ring1_priv_off (ignore_code);
+
+	return;
+%page;
+/* Internal to submit_request: Performs all necessary processing to submit a single request */
+
+process_single_request:
+	procedure (p_dirname, p_ename);
+
+dcl  (p_dirname, p_ename) character (*) parameter;
+
+dcl  (local_dirname, local_pathname, parent_dirname, real_dirname) character (168);
+dcl  (local_ename, parent_ename, real_ename, foreign_ename) character (32);
+
+dcl  entry_bit_count fixed binary (24);
+dcl  entry_type fixed binary (2);
+
+dcl  local_error_message character (1024);
+dcl  request_id character (19);
+dcl  the_message_id bit (72) aligned;
+
+dcl  1 auto_mseg_message_info aligned like mseg_message_info;
+
+	     local_dirname = p_dirname;
+	     local_ename = p_ename;
+	     local_pathname = pathname_ (local_dirname, local_ename);
+
+/* Determine the type of entry and, if requested and the entry is a link, determine its actual target */
+
+	     call hcs_$status_minf (local_dirname, local_ename, HCS_DONT_CHASE, entry_type, entry_bit_count, code);
+	     if code ^= 0 then
+COULD_NOT_STATUS_BRANCH:
+		call abort_single_request (code, local_pathname, "Determining type of object.");
+
+	     if (entry_type = star_LINK) then
+		if (^have_starname & (chase_control = DEFAULT_CHASE)) | (chase_control = ALWAYS_CHASE) then do;
+		     call hcs_$get_link_target (local_dirname, local_ename, real_dirname, real_ename, code);
+		     if code ^= 0 then
+			call abort_single_request (code, local_pathname, "Determining link target of object.");
+
+		     local_dirname = real_dirname;
+		     local_ename = real_ename;
+		     call hcs_$status_minf (local_dirname, local_ename, HCS_DONT_CHASE, entry_type, entry_bit_count,
+			code);
+		     if code ^= 0 then go to COULD_NOT_STATUS_BRANCH;
+		end;
+		else call abort_single_request (error_table_$link, local_pathname,
+			"Object to be transmitted can not be a link.");
+%page;
+/****
+      Check the user's and the daemon's access to object.  Both must have
+      explicit non-null access to the branch.
+*/
+
+	     imft_chk_acl.dirname = local_dirname;
+	     imft_chk_acl.ename = local_ename;
+	     imft_chk_acl.dir_access = S_ACCESS;
+	     imft_chk_acl.seg_access = R_ACCESS;
+	     imft_chk_acl.check_aim = "0"b;		/* output daemon will check AIM */
+	     imft_chk_acl.effective_ring = user_ring;
+	     imft_chk_acl.bad_acl_idx = DRIVER_ACL_IDX;	/* by default, error is driver's */
+	     general_acl (USER_ACL_IDX).access_name = local_user_id || ".*";
+
+	     call imft_util_$check_object_acl (addr (imft_chk_acl), code);
+	     if code = 0 then code = imft_chk_acl.error_code;
+	     if code ^= 0 then
+		if code = error_table_$unimplemented_version then
+		     call fatal_ica_error ();
+		else call abort_single_request (NO_ERROR, local_pathname,
+			(imft_chk_acl (imft_chk_acl.bad_acl_idx).error_message));
+
+	     code = 0;
+	     do idx = 1 to hbound (general_acl.entries, 1);
+		if general_acl (idx).status_code ^= 0 then do;
+		     code = general_acl (idx).status_code;
+		     call notify_user (REQ_TERMED_STR, "0"b, code_message, imft_chk_acl (idx).error_message,
+			local_pathname);		/* code_message is already in .error_message */
+		end;
+	     end;
+
+	     if code ^= 0 then
+		call abort_single_request_no_notify (NO_ERROR, local_pathname,
+		     "Insufficient driver/user access to object.");
+
+/* If -file or -subtree was specified, verify that the branch is of the appropriate type */
+
+	     if ^(imft_chk_acl.type = ENTRY_TYPE_DIRECTORY) & ^local_rr.include_files then
+		if ^have_starname then
+		     call reject_request (NO_ERROR, "Files may not be specified when ""-subtree"" is used.");
+
+	     if (imft_chk_acl.type = ENTRY_TYPE_DIRECTORY) & ^local_rr.include_subtrees then
+		if ^have_starname then do;
+		     call ioa_$rsnnl ("Subtrees may not be specified when ""-^[file^]^[extend^]^[update^]"" is used.",
+			local_error_message, ignore_fb21, ^(local_rr.extend | local_rr.update), local_rr.extend,
+			local_rr.update);
+		     call reject_request (NO_ERROR, local_error_message);
+		end;
+
+	     if (local_rr.extend | local_rr.update)
+		& ^((imft_chk_acl.type = ENTRY_TYPE_SEGMENT) | (imft_chk_acl.type = ENTRY_TYPE_MSF)) then do;
+
+		if index (imft_chk_acl.type, "-") = 1 then
+		     local_type = substr (imft_chk_acl.type, 2);
+		else local_type = imft_chk_acl.type;
+
+		call ioa_$rsnnl ("Can only ^[extend^]^[update^] with segments or MSFs, not with ^a type objects.",
+		     local_error_message, ignore_fb21, local_rr.extend, local_rr.update, local_type);
+		call abort_single_request (NO_ERROR, local_pathname, local_error_message);
+	     end;
+
+/* Construct the foreign pathname if -target_pathname was specified */
+
+	     if local_ft_request.foreign_path_given then do;
+		call get_equal_name_ (local_ename, local_rr.foreign_ename, foreign_ename, code);
+		if code ^= 0 then
+		     call abort_single_request (code, local_pathname,
+			"Applying " || rtrim (local_rr.foreign_ename) || " to " || rtrim (local_ename));
+	     end;
+%page;
+/****
+      Must always have S access to containing or parent directory for both
+      driver and user.
+
+      If the -delete option was used or local object is being extended or
+      updated, both driver and user must have explicit SMA.
+*/
+
+	     call expand_pathname_ (local_dirname, parent_dirname, parent_ename, ignore_code);
+	     imft_chk_acl.dirname = parent_dirname;
+	     imft_chk_acl.ename = parent_ename;
+	     imft_chk_acl.dir_access = S_ACCESS;
+	     imft_chk_acl.seg_access = R_ACCESS;
+	     imft_chk_acl.check_aim = "0"b;		/* AIM checking done by output daemon */
+	     imft_chk_acl.effective_ring = user_ring;
+	     imft_chk_acl.bad_acl_idx = DRIVER_ACL_IDX;	/* by default, error is driver's */
+	     general_acl (USER_ACL_IDX).access_name = local_user_id || ".*";
+
+	     call imft_util_$check_object_acl (addr (imft_chk_acl), code);
+	     if code = 0 then code = imft_chk_acl.error_code;
+	     if code ^= 0 then do;
+		if code = error_table_$unimplemented_version then call fatal_ica_error ();
+		call set_dir_s_error_message (imft_chk_acl.bad_acl_idx);
+		call reject_request (code, local_error_message);
+	     end;					/* if code ^= 0 */
+
+	     code = 0;
+	     do idx = 1 to hbound (general_acl.entries, 1);
+		if general_acl (idx).status_code ^= 0 then do;
+		     code = general_acl (idx).status_code;
+		     call set_dir_s_error_message (idx);
+		     call convert_status_code_ (code, shortinfo, code_message);
+		     call notify_user (REQ_TERMED_STR, code ^= 0, code_message, local_error_message, local_pathname);
+		end;
+	     end;
+
+	     if code ^= 0 then
+		call reject_request_no_notify (NO_ERROR, "Insufficient driver/user access to parent directory.");
+%page;
+/****
+      SMA access is not critical here.  S access for both driver and user has
+      already been checked above and was all right.  The transmitting daemon may
+      be able to do the proper checking.  In case it does fail, the transfer
+      will still occur; only the delete operation will not be done.  Since this
+      access check is done on the parent directory, there is no need to go
+      through this check for each match on a star name once it has been
+      reported.
+*/
+
+	     if local_rr.delete & ^reported_dir_sma_warning then do;
+						/* need SMA to parent directory for this case */
+
+		imft_chk_acl.dir_access = SMA_ACCESS;
+		imft_chk_acl.seg_access = RW_ACCESS;
+		imft_chk_acl.bad_acl_idx = DRIVER_ACL_IDX;
+						/* by default, error is driver's */
+		general_acl (USER_ACL_IDX).access_name = local_user_id || ".*";
+
+		call imft_util_$check_object_acl (addr (imft_chk_acl), code);
+		if code = 0 then code = imft_chk_acl.error_code;
+		if code ^= 0 then do;
+		     if code = error_table_$unimplemented_version then call fatal_ica_error ();
+		     call set_dir_sma_error_message (imft_chk_acl.bad_acl_idx);
+		     call notify_user (local_error_message);
+		end;				/* if code ^= 0 */
+
+		do idx = 1 to hbound (general_acl.entries, 1);
+		     if general_acl (idx).status_code ^= 0 then do;
+			code = general_acl (idx).status_code;
+			call set_dir_sma_error_message (idx);
+			call notify_user (local_error_message);
+		     end;
+		end;
+
+	     end;					/* if local_rr.delete */
+%page;
+/* Submit the request */
+
+	     local_ft_request.header.msg_time = clock ();
+
+	     local_ft_request.header.dirname = local_dirname;
+	     local_ft_request.header.ename = local_ename;
+
+	     if local_ft_request.foreign_path_given then do;
+		local_ft_request.foreign_dirname = local_rr.foreign_dirname;
+		local_ft_request.foreign_ename = foreign_ename;
+	     end;
+
+	     if entry_type = star_DIRECTORY then
+		local_ft_request.directory_creation_mode = local_rr.directory_creation_mode;
+	     else local_ft_request.directory_creation_mode = "00"b;
+
+	     mseg_message_info_ptr = addr (auto_mseg_message_info);
+	     unspec (mseg_message_info) = ""b;
+	     mseg_message_info.version = MSEG_MESSAGE_INFO_V1;
+	     mseg_message_info.ms_ptr = addr (local_ft_request);
+	     mseg_message_info.ms_len = 36 * currentsize (local_ft_request);
+	     mseg_message_info.sender_id = rtrim (mail_destination) || ".*";
+	     mseg_message_info.sender_level = current_ring;
+	     mseg_message_info.sender_authorization, mseg_message_info.ms_access_class = mail_access_class;
+	     mseg_message_info.sender_max_authorization = mail_access_class;
+	     mseg_message_info.sender_process_id = ""b;
+	     mseg_message_info.ms_id = ""b;
+
+	     call queue_admin_$add_index (queue_index, mseg_message_info_ptr, the_message_id, code);
+	     if code ^= 0 then call abort_single_request (code, local_pathname, "Attempting to add request.");
+
+	     if local_rr.notify then do;		/* let the user know it worked */
+		request_id = request_id_ (local_ft_request.header.msg_time);
+		call notify_user ("Submitted request ^a to transfer ^a to ^a (queue ^d)", (substr (request_id, 7, 8)),
+		     local_pathname, foreign_system_name, local_rr.queue);
+	     end;
+
+	     n_submitted = n_submitted + 1;		/* keep count */
+	     submitted_a_request = "1"b;		/* needed by starname processor */
+
+	     return;
+%page;
+/* This particular request cannot be processed, others may be OK. */
+
+abort_single_request:
+	     procedure (p_code, p_pathname, p_message);
+
+dcl  p_code fixed binary (35) parameter;
+dcl  p_pathname character (*) parameter;
+dcl  p_message character (*) parameter;
+
+dcl  code_message character (100) aligned;
+dcl  notify bit (1);
+
+		notify = "1"b;
+		go to ABORT_SINGLE_JOIN;
+
+abort_single_request_no_notify:
+	     entry (p_code, p_pathname, p_message);
+
+		notify = "0"b;
+
+ABORT_SINGLE_JOIN:
+		if have_starname			/* there might be others that we can do */
+		then do;
+		     if p_code ^= NO_ERROR then
+			call convert_status_code_ (p_code, shortinfo, code_message);
+		     else code_message = "";
+
+		     if notify then
+			call notify_user ("Request not submitted: ^[^a^/^2x^;^s^]^a^/^2x(^a)", (p_code ^= NO_ERROR),
+			     code_message, p_message, p_pathname);
+
+		     n_not_submitted = n_not_submitted + 1;
+						/* count unsuccessful tries */
+		     reported_error = "1"b;		/* so we'll know not to do it later */
+		     go to PROCESS_NEXT_STAR_ENTRY;	/* non-local goto into submit_request */
+		end;
+
+		else if notify then call reject_request (p_code, p_message);
+		else call reject_request_no_notify (p_code, p_message);
+
+	     end abort_single_request;
+%page;
+set_dir_s_error_message:
+	     proc (p_idx);
+
+dcl  p_idx fixed binary parameter;
+
+		if code = error_table_$moderr | code = error_table_$user_not_found then
+		     call ioa_$rsnnl (
+			"^[Driver^;User^] (^a) must have an explicit ACL entry of S to parent directory of object.",
+			local_error_message, ignore_fb21, (p_idx = DRIVER_ACL_IDX), general_acl (p_idx).access_name)
+			;
+		else call ioa_$rsnnl (
+			"Unable to determine access of ^[driver^;user^] (^a) to the parent directory of object.",
+			local_error_message, ignore_fb21, (p_idx = DRIVER_ACL_IDX), general_acl (p_idx).access_name)
+			;
+
+	     end set_dir_s_error_message;
+%skip (4);
+set_dir_sma_error_message:
+	     proc (p_idx);
+
+dcl  p_idx fixed binary parameter;
+
+		reported_dir_sma_warning = "1"b;	/* don't want to come through here again */
+						/* for current star name */
+		if code = error_table_$moderr | code = error_table_$user_not_found then
+		     call ioa_$rsnnl (
+			"Warning: ^[Driver^;User^] (^a) must have an explicit ACL entry of SMA to parent directory of object to be deleted.^/^2xRequest will still be submitted.^/^2x(^a)",
+			local_error_message, ignore_fb21, (p_idx = DRIVER_ACL_IDX), general_acl (p_idx).access_name,
+			local_pathname);
+		else do;
+		     call convert_status_code_ (code, shortinfo, code_message);
+		     call ioa_$rsnnl (
+			"Warning: ^a^/^2xUnable to determine access of ^[driver^;user^] (^a) to the parent directory of object to be deleted.^/^2xRequest will still be submitted.^/^2x(^a)",
+			local_error_message, ignore_fb21, code_message, (p_idx = DRIVER_ACL_IDX),
+			general_acl (p_idx).access_name, local_pathname);
+		end;
+
+	     end set_dir_sma_error_message;
+
+	end process_single_request;
+
+     end submit_request;
+%page;
+/* Reject the transfer request: send a reply to the remote system indicating the reason for the failure */
+
+reject_request:
+     procedure (p_code, p_message);
+
+dcl  p_code fixed binary (35) parameter;
+dcl  p_message character (*) parameter;
+
+dcl  code_message character (100) aligned;
+dcl  send_to_user bit (1);
+
+	send_to_user = "1"b;
+	go to REJECT_JOIN;
+
+reject_request_no_notify:
+     entry (p_code, p_message);
+
+	send_to_user = "0"b;
+
+REJECT_JOIN:
+	if p_code ^= NO_ERROR then
+	     call convert_status_code_ (p_code, shortinfo, code_message);
+	else code_message = "";
+
+	local_bof_reply.abort_request = "1"b;		/* tell remote system to not send it */
+	local_bof_reply.abort_message = rtrim (code_message) || " " || p_message;
+
+	if send_to_user then
+	     call notify_user (REQ_TERMED_STR, p_code ^= 0, code_message, p_message, local_full_pathname);
+
+	call iodd_msg_ (LOG, MASTER, NO_ERROR, "", "**Request ^d: ^a ^a", local_request_number, code_message, p_message)
+	     ;
+
+	local_icri.version = ICRI_VERSION_1;
+	local_icri.timeout = 5 * ONE_MINUTE;
+	local_icri.record_type = IMFT_BOF;		/* this is a reply to their BOF command */
+	local_icri.record_ptr = addr (local_bof_reply);
+	local_icri.record_lth = 4 * currentsize (local_bof_reply);
+
+	call iox_$control (data_iocb_ptr, "write_reply_record", addr (local_icri), code);
+	if code ^= 0 then call io_error (code, "Attempting to reply to " || foreign_system_name || ".");
+
+	call cleanup_handler ();			/* cleanup after this one */
+
+	go to WAIT_FOR_NEXT_OBJECT;
+
+     end reject_request;
+%page;
+/* Abort receiving an object */
+
+abort_reception:
+     procedure (p_code, p_message);
+
+dcl  p_code fixed binary (35) parameter;
+dcl  p_message character (*) parameter;
+
+dcl  code_message character (100) aligned;
+
+	if p_code ^= 0 then
+	     call convert_status_code_ (p_code, shortinfo, code_message);
+	else code_message = "";
+
+	call notify_user ("Request for ^a terminated: ^a ^a", local_full_pathname, code_message, p_message);
+
+	call iodd_msg_ (LOG, MASTER, NO_ERROR, "", "**Request ^d: ^a ^a", local_bof_command.request_number,
+	     code_message, p_message);
+
+	call cleanup_handler ();			/* cleanup after it */
+
+	go to WAIT_FOR_NEXT_OBJECT;
+
+     end abort_reception;
+%skip (4);
+/**** Unable to communicate with imft_util_$check_object_acl with current version of imft_check_acl structure. */
+
+fatal_ica_error:
+     procedure ();
+
+	P_code = code;
+	call iodd_msg_ (NORMAL, MASTER, NO_ERROR, IMFT_RECEIVE_OBJECT_,
+	     "Invalid imft_check_acl version error from call to imft_util_$check_object_acl.");
+	go to RETURN_FROM_RECEIVE_OBJECT;
+
+     end fatal_ica_error;
+%page;
+/* Respond to an I/O error on the line: return to command level */
+
+io_error:
+     procedure (p_io_code, p_message);
+
+dcl  p_io_code fixed binary (35) parameter;
+dcl  p_message character (*) parameter;
+
+dcl  code_message character (100) aligned;
+
+	if object_in_progress & local_bof_command.notify then do;
+	     if p_io_code ^= 0 then			/* let the user know */
+		call convert_status_code_ (p_io_code, shortinfo, code_message);
+	     else code_message = "";
+	     call notify_user ("Request for ^a terminated: ^a ^a", local_full_pathname, code_message, p_message);
+	end;
+
+	call iodd_msg_ (ERROR, MASTER, p_io_code, IMFT_RECEIVE_OBJECT_, "^a", p_message);
+
+	P_code = p_io_code;				/* reflect to the driver which will reinitialize */
+
+	if imft_driver_info.debug_mode & (p_io_code ^= imft_et_$timeout) then signal condition (imft_debug_);
+						/* give programmer a look: timeouts are handled by imft_io_ */
+
+	go to RETURN_FROM_RECEIVE_OBJECT;
+
+     end io_error;
+%skip (4);
+/* Send a notification to the user */
+
+notify_user:
+     procedure () options (variable);
+
+dcl  notify_msg character (notify_msg_buffer_used) based (addr (notify_msg_buffer));
+dcl  notify_msg_buffer_used fixed binary (21);
+
+	call ioa_$general_rs (cu_$arg_list_ptr (), 1, 2, notify_msg_buffer, notify_msg_buffer_used, "0"b, "1"b);
+
+	call imft_mail_interface_$deliver_message ((foreign_system_name), mail_destination, INTERACTIVE_DELIVERY, "",
+	     notify_msg, mail_access_class, ignore_code);
+
+	return;
+
+     end notify_user;
+%page;
+/*
+   Analyze results of using backup_load_: assumes any possible errors will be reflected both in the error file and return
+   code from the backup_load_ call
+*/
+
+analyze_backup_results:
+     procedure (P_code);
+
+dcl  P_code fixed binary (35) parameter;		/* return from backup_load_ */
+
+dcl  errfile_bc fixed binary (24);
+dcl  backup_code fixed binary (35);
+dcl  backup_message character (20) varying;
+
+	backup_errors_detected = "0"b;		/* until proven otherwise */
+
+	if ^imft_driver_info.old_version then
+	     foreign_backup_errors = eof_command.backup_errors;
+	else foreign_backup_errors = "0"b;
+
+	call ios_$detach ("err_file", "", "", ios_status);
+
+	call hcs_$initiate_count (errfile_dname, errfile_ename, "", errfile_bc, 00b, errfile_ptr, ignore_code);
+
+	if errfile_ptr ^= null () then		/* there is an error file there */
+	     if errfile_bc ^= 0 then			/* it's not empty: something went wrong */
+		call report_backup_errors ();
+
+	     else do;				/* no error file, but make sure reload really worked */
+		if ^static_backup_control.object.found	/* didn't find anything with the right name */
+		then do;
+		     backup_code = error_table_$noentry;
+		     backup_message = "not received from";
+		     call notify_backup_failure ();
+		end;
+
+		else if ^static_backup_control.object.loaded
+						/* found it, but couldn't load it */
+		then do;
+		     backup_code = static_backup_control.object.status_code;
+						/* hopefully this will be something informative */
+		     backup_message = "not loaded from";
+		     call notify_backup_failure ();
+		end;
+
+		else if foreign_backup_errors then
+		     call notify_user ("Errors in transmission of ^a; see your mail at ^a.", local_full_pathname,
+			foreign_system_name);
+	     end;
+
+	call hcs_$truncate_file (errfile_dname, errfile_ename, 0, ignore_code);
+	call hcs_$set_bc (errfile_dname, errfile_ename, 0, ignore_code);
+
+	errfile_attached = "0"b;
+
+	return;
+%page;
+/* Internal to analyze_backup_results: reports errors detected by backup_load_ and recorded in the error file */
+
+report_backup_errors:
+	procedure ();
+
+dcl  error_file character (errfile_lth) based (errfile_ptr);
+dcl  errfile_lth fixed binary (21);
+dcl  mail_subject character (1024) varying;
+
+	     backup_errors_detected = "1"b;		/* let top-level know not to notify */
+
+	     errfile_lth = divide ((errfile_bc + 8), 9, 21, 0);
+
+	     call ioa_$rsnnl ("Received^[ extension to^]^[ update to^] ^a ^a with errors from ^a (queue ^d)",
+		mail_subject, ignore_fb21, local_bof_command.extend, local_bof_command.update,
+		OBJECT_TYPES (local_bof_command.object_type), local_full_pathname, foreign_system_name,
+		local_bof_command.queue);
+
+	     call imft_mail_interface_$deliver_message ((foreign_system_name), mail_destination, ORDINARY_DELIVERY,
+		(mail_subject), error_file, mail_access_class, ignore_code);
+
+	     return;
+
+	end report_backup_errors;
+
+
+/* Internal to analyze_backup_results: reports failure of backup when no error file present */
+
+notify_backup_failure:
+	procedure ();
+
+dcl  code_message character (100) aligned;
+dcl  (mail_subject, mail_message) character (1024) varying;
+
+	     call convert_status_code_ (backup_code, shortinfo, code_message);
+	     call ioa_$rsnnl ("^a^/^a ^a ^a (queue ^d).^/^a", mail_message, ignore_fb21, code_message,
+		local_full_pathname, backup_message, foreign_system_name, local_bof_command.queue,
+		static_backup_control.object.error_name);
+
+	     call ioa_$rsnnl ("Received^[ extension to^]^[ update to^] ^a ^a with errors from ^a (queue ^d)",
+		mail_subject, ignore_fb21, local_bof_command.extend, local_bof_command.update,
+		OBJECT_TYPES (local_bof_command.object_type), local_full_pathname, foreign_system_name,
+		local_bof_command.queue);
+
+	     call imft_mail_interface_$deliver_message ((foreign_system_name), mail_destination, ORDINARY_DELIVERY,
+		(mail_subject), (mail_message), mail_access_class, ignore_code);
+
+	     backup_errors_detected = "1"b;
+	     return;
+
+	end notify_backup_failure;
+
+     end analyze_backup_results;
+%page;
+/* Represents the null entry value: if called, the current object is aborted */
+
+nulle:
+     procedure () options (variable);
+
+	call abort_reception (NO_ERROR, "Backup system requested tape label.");
+
+	return;
+
+     end nulle;
+%page;
+/* Parameters */
+
+dcl  P_imft_driver_info_ptr pointer parameter;		/* -> description of the IMFT driver */
+dcl  P_fis_info_ptr pointer parameter;			/* -> list of I/O switches: 1st is master terminal; 2nd is the
+						   connection to the remote system */
+dcl  P_code fixed binary (35) parameter;
+
+/* Remaining declarations */
+
+dcl  data_iocb_ptr pointer;				/* -> I/O switch for file transmission */
+dcl  master_iocb_ptr pointer;				/* -> I/O switch for master console */
+
+dcl  code fixed binary (35);
+dcl  idx fixed binary;
+dcl  ignore_code fixed binary (35);
+dcl  ignore_fb21 fixed binary (21);
+
+dcl  1 local_icri aligned like icri automatic;
+dcl  1 local_bof_command aligned like bof_command;
+dcl  1 local_bof_reply aligned like bof_reply;
+dcl  1 local_eof_reply aligned like eof_reply;
+dcl  1 local_rr aligned like remote_request;
+
+dcl  1 imft_chk_acl aligned like imft_check_acl;
+
+dcl  1 ios_status aligned,				/* for calling ios_$* */
+       2 code fixed binary (35),			/* actual error code */
+       2 io_status bit (36);				/* status bits from last I/O operation */
+
+dcl  system_area area based (system_area_ptr);
+dcl  system_area_ptr pointer;
+
+dcl  code_message char (100) aligned;
+dcl  input_buffer character (2048);			/* for reading commands */
+dcl  notify_msg_buffer character (2048);		/* for construction of user notifications */
+
+dcl  source fixed binary;				/* which I/O switch has input */
+
+dcl  errfile_ptr pointer;				/* -> error file generated by backup */
+dcl  errfile_attached bit (1) aligned;			/* ON => error file is setup */
+
+dcl  object_in_progress bit (1) aligned;		/* ON => something is being received: inform user on abort */
+dcl  backup_errors_detected bit (1) aligned;		/* ON => some errors occured in backup_load_ */
+dcl  foreign_backup_errors bit (1) aligned;		/* ON => error reported in backup_dump_ by foreign system */
+
+dcl  (mail_destination, local_personid) character (32);
+dcl  mail_access_class bit (72) aligned;
+
+dcl  (local_full_pathname, local_dirname, foreign_full_pathname) character (168);
+dcl  foreign_system_name character (32) varying;
+dcl  local_entname character (32);
+dcl  local_request_number fixed binary (35);
+dcl  local_starname character (32);
+dcl  local_type character (32);
+dcl  foreign_equalname character (168);
+dcl  octal_string character (32) aligned;
+
+dcl  my_group_id character (32);
+dcl  my_user_id character (30);
+dcl  (foreign_user_id, local_user_id) character (32) varying;
+dcl  shortinfo character (8) aligned;
+dcl  user_ring fixed binary (3);
+dcl  local_user_access_id character (32);
+dcl  (acs_write_bracket, current_ring) fixed binary (3);
+
+dcl  n_submitted fixed binary;
+dcl  n_not_submitted fixed binary;
+
+dcl  IMFT_RECEIVE_OBJECT_ character (32) static options (constant) initial ("imft_receive_object_");
+dcl  ONE_MINUTE fixed binary static options (constant) initial (60);
+dcl  NO_ERROR fixed binary (35) initial (0) static options (constant);
+dcl  NO_OBJ_FND_SATISFY_REQ_STR character (42) initial ("No objects were found to satisfy request.") internal
+	static options (constant);
+dcl  REQ_TERMED_STR character (54) initial ("Request terminated: ^[^a^/^2x^;^s^]^a^/^2x(^a)") internal static
+	options (constant);
+dcl  first_call bit (1) aligned static initial ("1"b);
+
+dcl  1 static_backup_control aligned static,		/* control structure for backup_load_ */
+       2 header like backup_control.header,		/* ... global data */
+       2 object like backup_control.requests;		/* ... the actual object to be reloaded */
+
+dcl  1 branch_info aligned int static like create_branch_info;
+dcl  1 cpo aligned like copy_options;
+
+dcl  errfile_dname character (168) static;		/* name of scratch file used as error file */
+dcl  errfile_ename character (32) static;
+dcl  errfile_pathname character (168) static;
+dcl  temp_ename character (32) static;
+dcl  temp_dname character (168) static;
+
+dcl  error_table_$ai_restricted fixed bin (35) ext static;
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  error_table_$fatal_error fixed bin (35) ext static;
+dcl  error_table_$link fixed bin (35) ext static;
+dcl  error_table_$moderr fixed bin (35) ext static;
+dcl  error_table_$noentry fixed bin (35) ext static;
+dcl  error_table_$unimplemented_version fixed binary (35) external;
+dcl  error_table_$unsupported_operation fixed bin (35) ext static;
+dcl  error_table_$user_not_found fixed bin (35) ext static;
+
+dcl  imft_et_$timeout fixed binary (35) external;
+
+dcl  imft_data_$queue_dirname character (168) external static;
+
+dcl  HCS_DONT_CHASE fixed binary (1) static options (constant) initial (0);
+
+dcl  A_EXTENDED_ACCESS bit (36) aligned internal static options (constant) init ("400000000000"b3);
+
+dcl  aim_check_$equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  backup_load_ entry (pointer, fixed binary (35));
+dcl  check_star_name_$entry entry (char (*), fixed bin (35));
+dcl  continue_to_signal_ entry (fixed bin (35));
+dcl  convert_aim_attributes_ entry (bit (72) aligned, character (32) aligned);
+dcl  convert_authorization_$to_string_short entry (bit (72) aligned, char (*), fixed bin (35));
+dcl  convert_status_code_ entry (fixed binary (35), character (8) aligned, character (100) aligned);
+dcl  copy_ entry (ptr);
+dcl  cu_$arg_list_ptr entry () returns (pointer);
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  find_condition_info_ entry (ptr, ptr, fixed bin (35));
+dcl  get_authorization_ entry () returns (bit (72) aligned);
+dcl  get_equal_name_ entry (char (*), char (*), char (32), fixed bin (35));
+dcl  get_group_id_ entry () returns (character (32));
+dcl  get_pdir_ entry () returns (character (168));
+dcl  get_ring_ entry () returns (fixed binary (3));
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  hcs_$create_branch_ entry (char (*), char (*), ptr, fixed bin (35));
+dcl  hcs_$get_access_class entry (char (*), char (*), bit (72) aligned, fixed bin (35));
+dcl  hcs_$get_link_target entry (char (*), char (*), char (*), char (*), fixed bin (35));
+dcl  hcs_$get_user_access_modes
+	entry (char (*), char (*), char (*), fixed bin, bit (36) aligned, bit (36) aligned, fixed bin (35));
+dcl  hcs_$initiate_count
+	entry (character (*), character (*), character (*), fixed binary (24), fixed binary (2), pointer,
+	fixed binary (35));
+dcl  hcs_$make_seg entry (character (*), character (*), character (*), fixed binary (5), pointer, fixed binary (35));
+dcl  hcs_$set_bc entry (character (*), character (*), fixed binary (24), fixed binary (35));
+dcl  hcs_$star_ entry (char (*), char (*), fixed bin (2), ptr, fixed bin, ptr, ptr, fixed bin (35));
+dcl  hcs_$status_minf entry (char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24), fixed bin (35));
+dcl  hcs_$terminate_noname entry (pointer, fixed binary (35));
+dcl  hcs_$truncate_file entry (character (*), character (*), fixed binary (19), fixed binary (35));
+dcl  iod_info_$driver_access_name entry (char (*), char (32), fixed bin (35));
+dcl  imft_convert_status_code_$decode entry (fixed binary (35)) returns (fixed binary (35));
+dcl  imft_find_input_switch_ entry (pointer, bit (1) aligned, fixed binary, fixed binary (35));
+dcl  imft_mail_interface_$deliver_message
+	entry (character (*), character (*), fixed binary, character (*), character (*), bit (72) aligned,
+	fixed binary (35));
+dcl  imft_pnt_interface_$validate_personid entry (character (*), fixed binary (35));
+dcl  imft_util_$check_object_acl entry (ptr, fixed bin (35));
+dcl  ioa_$general_rs entry (pointer, fixed binary, fixed binary, character (*), fixed binary (21), bit (1), bit (1));
+dcl  ioa_$rsnnl entry () options (variable);
+dcl  iodd_msg_ entry () options (variable);
+dcl  ios_$attach entry (character (*), character (*), character (*), character (*), 1 aligned like ios_status);
+dcl  ios_$detach entry (character (*), character (*), character (*), 1 aligned like ios_status);
+dcl  iox_$control entry (pointer, character (*), pointer, fixed binary (35));
+dcl  message_segment_$open entry (char (*), char (*), fixed bin, fixed bin (35));
+dcl  message_segment_$close entry (fixed bin, fixed bin (35));
+dcl  pathname_ entry (character (*), character (*)) returns (character (168));
+dcl  request_id_ entry (fixed bin (71)) returns (char (19));
+dcl  queue_admin_$add_index entry (fixed bin, pointer, bit (72) aligned, fixed bin (35));
+dcl  system_privilege_$ring1_priv_on entry (fixed binary (35));
+dcl  system_privilege_$ring1_priv_off entry (fixed binary (35));
+dcl  term_$refname entry (character (*), fixed binary (35));
+dcl  translate_aim_attributes_ entry (pointer, bit (72) aligned, pointer, bit (72) aligned, fixed binary (35));
+dcl  unique_chars_ entry (bit (*)) returns (character (15));
+
+dcl  (cleanup, imft_debug_, imft_read_abort_, imft_remote_logout_, imft_resynchronize_driver_, linkage_error, sub_error_)
+	condition;
+
+dcl  (addr, after, before, clock, convert, currentsize, divide, hbound, index, length, max, null, rtrim, string, substr,
+     sum, unspec) builtin;
+%page;
+%include access_mode_values;
+%page;
+%include acl_structures;
+%page;
+%include backup_control;
+%page;
+%include condition_info;
+%page;
+%include condition_info_header;
+%page;
+%include copy_error_info;
+%page;
+%include copy_flags;
+%page;
+%include copy_options;
+%page;
+%include create_branch_info;
+%page;
+%include fs_star_;
+%page;
+%include "_imft_check_acl";
+%page;
+%include "_imft_cri";
+%page;
+%include "_imft_driver_info";
+%page;
+%include "_imft_fis_info";
+%page;
+%include "_imft_ft_commands";
+%page;
+%include "_imft_ft_request";
+%page;
+%include "_imft_std_commands";
+%page;
+%include iodd_msg_constants;
+%page;
+%include mlsys_deliver_info;
+%page;
+%include mseg_message_info;
+%page;
+%include queue_msg_hdr;
+%page;
+%include star_structures;
+%page;
+%include sub_error_info;
+     end imft_receive_object_;

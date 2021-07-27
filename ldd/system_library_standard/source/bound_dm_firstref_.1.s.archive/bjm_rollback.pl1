@@ -1,0 +1,541 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/*  DESCRIPTION:
+
+	This program rolls back the before images created by any process
+     during the current transaction.
+
+	The transaction ID, transaction index, and checkpoint number are
+     input parameters.  p_code is an output parameter.  Rollback should
+     only be called by transacton_manager_, and it is assumed the
+     transaction being rolled back was started in this process.  An added
+     check is made if the process does not own the transaction to try to
+     adopt the transaction to roll it back.
+
+	NOTE: checkpoints are not currently supported.
+*/
+
+/*  HISTORY:
+Written by M. Pandolf, 07/23/82.
+Modified:
+08/23/83 by M. Pandolf: to become bjm_rollback for operation in any proces.
+08/15/82 by M. Pandolf: to use file_manager_ to manipulate data
+	  management files.
+11/11/82 by M. Pandolf: to not die when a before image cannot be rolled back.
+12/15/82 by M. Pandolf: to not change txte.n_rec_written.
+01/04/83 by M. Pandolf:  to check TID from image, verify number of records
+	  read, and keep track of instances of rollback failures.
+01/24/83 by M. Pandolf:  to log errors and to not use "addr (substr)".
+02/14/83 by M. Pandolf:  to get bj_txt_ptr before getting bj_txte_ptr.
+03/02/83 by M. Pandolf:  to use new txte protocol and new bj marks.
+03/16/83 by M. Pandolf:  to get report errors more intellegently.
+04/29/83 by M. Pandolf:  to add meters and report n_recs_rolledback.
+05/12/83 by L. A. Newcomb:  made TEMP MOD to special handle deleted protected
+            files until file_manager_ does so.
+05/13/83 by L. A. Newcomb:  Modified Rollback summary to be more accurate in
+            wording and easier to read.
+12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+06/07/84 by Lee Baldwin:  Fixed to call dm_error_$no_current_transaction
+            instead of $bj_no_txn, renamed dm_error_$bj_txt_version_bad
+            to $bj_bad_txt_version.
+10/23/84 by M. Sharpe:  to use addcharno; to check for et_$noinfo in the
+	  "TEMP MOD" section of the code; cleanup dcls and format; to
+	  use "call ERROR_RETURN (code)" technique; to set level to   
+	  current (lower) ring before calling file_manager and reset
+	  it after returning;
+10/29/84 by Matthew Pierret:  Changed handling of FM_ROLLBACK_HANDLER record
+            to call file_manager_$undo instead of $rollback_handler and to
+            not attempt to open the file if no opening id is supplied in
+            in the bj_fm_handler_rec.
+11/29/84 by M.  Sharpe:  to correct call to cu_$level_get.
+12/10/84 by R. Michael Tague:  Changed incl name to dm_daemon_sv_codes.
+12/14/84 by Matthew C. Pierret:  Removed FM_ROLLBACK_HANDLER code which
+            special cased bj_handler_rec.oid equal to ZERO and attempted to
+            get an oid if a non-null oid was supplied, but the process is
+            different from the owner process.  We only want opening
+            information if this is the owner process.
+01/07/84 by R. Michael Tague:  changed error_table_$noinfo to $no_info.
+01/14/85 by Lee A. Newcomb:  Corrected my_ci_parts declaration in
+            RESTORE_BEFORE_IMAGE to have the must_be_zero component; removed
+            the unused before_image_array; declared builtin's used; fixed to
+            use dm_log_sv_codes.incl.pl1; corrected internal procs' variables
+            to use project naming standard; removed temporary modification
+            added before deletes of DM files were protected; changed to only
+            report rollback errors instead of a complete summary of the
+            rollback (to make it easier to read the log); changed to use init
+            clauses to initialize most automatic storage; fixed to have one
+            format comment instead of two conflicting ones.
+01/16/85 by Lee A. Newcomb:  Fixed to not set bjm_data_$bj_exit_err or the
+            cleanup handler until it is known =$bj_operation may be set.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+03/19/85 by Steve Herbst: Fixed to initialize bjm_data_$bj_code to zero.
+04/26/85 by Lee A. Newcomb:  Fixed to always reset validation level after
+            setting it and to understand some errors are benign, such as when
+            a file was created, deleted in a rollback, but the rollback was
+            re-run due to an error in the first run.
+05/02/85 by Lee A. Newcomb:  Fixed to open DM files when a FM_ROLLBACK_HANDLER
+            record is found; this is required so recovery can find the file in
+            the UID-pathname table.
+*/
+/* format:  style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,comcol80,linecom */
+%page;
+bjm_rollback:
+   proc (p_tid, p_tix, p_checkpoint_no, p_code);
+
+
+/* DECLARATIONS */
+
+/* Parameter */
+dcl  (
+     p_tid			bit (36) aligned,		         /* transaction id */
+     p_tix			fixed bin,		         /* transaction index */
+     p_checkpoint_no		fixed bin (35),		         /* checkpoint to rollback to */
+     p_code			fixed bin (35)		         /* standard system status code */
+     )				parameter;
+
+/* Automatic */
+dcl  (
+     before_image_length		fixed bin (24),		         /* bit length of before image */
+     code				fixed bin (35) init (0),	         /* local error code */
+     current_ring			fixed bin (3),
+     fm_oid			bit (36) aligned init (NULL_ID),       /* local copy of file manager OID */
+     n_bi_unput			fixed bin (35) init (0),
+     n_bytes_unput			fixed bin (71) init (0),
+     n_get_oid_errors		fixed bin (35) init (0),
+     n_handler_errors		fixed bin (35) init (0),
+     n_rec_bytes			fixed bin,		         /* size of current before image */
+     n_rec_read			fixed bin (35) init (0),	         /* # of records in BJ for this TID */
+     n_unput_errors			fixed bin (35) init (0),
+     number_of_ci_parts		fixed bin (17) init (0),	         /* # of ci parts in before image record */
+     prev_get_oid_code		fixed bin (35) init (0),
+     prev_handler_code		fixed bin (35) init (0),
+     prev_unput_code		fixed bin (35) init (0),
+     records_used_mismatch		bit (1) aligned init ("0"b),	         /* # records read ^= txte.n_rec_written */
+     saved_level			fixed bin,
+     this_rec_id			bit (36) aligned,		         /* record currently rolling back */
+     tid				bit (36) aligned,		         /* copy of transaction id */
+     tix				fixed bin,		         /* copy of the transaction index */
+     uns_ci_no			fixed bin (24) unsigned	         /* for file_manager_ calling seq */
+     )				automatic;
+
+/* Builtin */
+dcl  (addcharno, addr, fixed, null)	builtin;
+
+/* Condition */
+dcl  cleanup			condition;
+
+/* Constant */
+dcl  (
+     ME				char (32) init ("bjm_rollback"),
+     NULL_ID			bit (36) aligned init ((36)"0"b)
+     )				internal static options (constant);
+
+/* Entry */
+dcl  (
+     bj_adopt_txn$get_pf_oid		entry (bit (36) aligned,
+				bit (36) aligned),
+     bj_cleanup_tables$handler	entry (fixed bin (35)),
+     bj_storage_get			entry (bit (36) aligned,
+				bit (36) aligned, ptr, fixed bin),
+     bj_txte_util$synchronize_txte_pste entry (ptr),
+     cu_$level_get			entry (fixed bin),
+     cu_$level_set			entry (fixed bin),
+     dm_misc_util_$log		entry () options (variable),
+     file_manager_$undo		entry (bit (36) aligned,
+				bit (36) aligned, ptr, fixed bin,
+				fixed bin (35)),
+     file_manager_$unput		entry (bit (36) aligned,
+				uns fixed bin (24), ptr,
+				fixed bin (35)),
+     get_ring_			entry returns (fixed bin (3))
+     )				external;
+
+/* External */
+dcl  (
+     bjm_data_$bj_ppt_ptr		pointer,
+     bjm_data_$bj_pst_ptr		pointer,
+     bjm_data_$bj_rollback_buffer_ptr	pointer,
+     dm_data_$bj_txt_ptr		pointer,
+     (
+     dm_error_$bj_bad_rec_count,
+     dm_error_$bj_bad_tid,
+     dm_error_$bj_bad_txt_version,
+     dm_error_$bj_incomplete_rollback,
+     dm_error_$bj_not_my_txn,
+     dm_error_$bj_recursive_invoc,
+     dm_error_$bj_rollback_bad_cp_no,
+     dm_error_$bj_txn_aborted,
+     dm_error_$bj_txn_committed,
+     dm_error_$bj_unexpected_aborted_mark,
+     dm_error_$bj_unexpected_committed_mark,
+     dm_error_$bj_unknown_record_type,
+     dm_error_$file_doesnt_exist,
+     dm_error_$file_was_deleted,
+     dm_error_$no_current_transaction,
+     error_table_$noentry
+     )				fixed bin (35)
+     )				external static;
+
+/* Static */
+
+/* END OF DECLARATIONS */
+%page;
+COPY_AND_INIT_PARAMETERS:
+   do;
+      tid = p_tid;
+      tix = p_tix;
+      p_code = 0;
+   end COPY_AND_INIT_PARAMETERS;
+
+SETUP_ERROR_HANDLING:
+   do;
+      if bjm_data_$bj_operation ^= "" then do;
+         p_code = dm_error_$bj_recursive_invoc;			         /* do not use ERROR_RETURN so */
+         goto MAIN_RETURN;					         /* CLEAN_UP will not be called */
+      end;
+
+      call cu_$level_get (saved_level);
+      on cleanup call CLEAN_UP ();
+
+      bjm_data_$bj_operation = ME;
+      bjm_data_$bj_exit_err = NONLOCAL_ERROR_EXIT;
+      bjm_data_$bj_code = 0;
+
+   end SETUP_ERROR_HANDLING;
+
+
+UPDATE_METERS:
+   bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_rollback =
+        bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_rollback + 1;
+
+
+VALIDATE_PARAMETERS_AND_SYSTEM_TABLES:
+   do;
+
+      if tix < 1 | tix > dm_system_data_$max_n_transactions | tid = NULL_ID
+	 then
+         call ERROR_RETURN (dm_error_$no_current_transaction);
+
+      bj_txt_ptr = dm_data_$bj_txt_ptr;
+      bj_txte_ptr = addr (bj_txt.entry (tix));
+
+      if bj_txt.version ^= BJ_TXT_VERSION_1 then
+         call ERROR_RETURN (dm_error_$bj_bad_txt_version);
+
+      if bj_txte.tid ^= tid then
+         if bj_txte.tid = NULL_ID then
+	  call ERROR_RETURN (dm_error_$no_current_transaction);
+         else call ERROR_RETURN (dm_error_$bj_bad_tid);
+
+/* checkpoint numbers for version 1 will be 0 and -1 only */
+
+      if p_checkpoint_no ^= 0 & p_checkpoint_no ^= -1 then
+         call ERROR_RETURN (dm_error_$bj_rollback_bad_cp_no);
+
+   end VALIDATE_PARAMETERS_AND_SYSTEM_TABLES;
+%page;
+SYNC_TXTE_WITH_PSTE:
+   do;
+
+/* This might complete a pending operation. */
+
+      call bj_txte_util$synchronize_txte_pste (bj_txte_ptr);
+
+      if bj_txte.tid = NULL_ID then
+         call ERROR_RETURN (dm_error_$no_current_transaction);
+
+   end SYNC_TXTE_WITH_PSTE;
+
+
+IS_BJ_OPEN_IN_THIS_PROCESS:
+   if bj_txte.operator_info.process_id
+        ^= bjm_data_$bj_ppt_ptr -> bj_ppt.process_id then
+      call ERROR_RETURN (dm_error_$bj_not_my_txn);
+
+
+/* set up bj_rec_hdr_ptr so we can get before images, and	*/
+/* current_ring so we do not have to keep calling get_ring_.*/
+
+   bj_rec_hdr_ptr = bjm_data_$bj_rollback_buffer_ptr;
+   current_ring = get_ring_ ();
+%page;
+/* walk the transaction records backward, restoring before images */
+/* This loop assumes no checkpoint facility exists.	      */
+
+ROLLBACK_LOOP:
+   do this_rec_id = bj_txte.last_bj_rec_id
+        repeat (bj_rec_hdr.prev_rec_id) while (this_rec_id ^= NULL_ID);
+
+      call bj_storage_get (bj_txte.bj_oid, this_rec_id, bj_rec_hdr_ptr,
+	 n_rec_bytes);					         /* get before image record */
+
+      if bj_rec_hdr.tid ^= bj_txte.tid then			         /* validate TID threading in the */
+         call ERROR_RETURN (dm_error_$bj_bad_tid);		         /* before images */
+
+      n_rec_read = n_rec_read + 1;
+
+
+CHECK_IMAGE_TYPE_AND_ROLLBACK:
+      do;
+
+         if bj_rec_hdr.type = COMMITTED | bj_rec_hdr.type = BEGIN_COMMIT then
+	  if this_rec_id ^= bj_txte.last_bj_rec_id then
+	     call ERROR_RETURN (dm_error_$bj_unexpected_committed_mark);
+	  else call ERROR_RETURN (dm_error_$bj_txn_committed);
+
+         if bj_rec_hdr.type = ABORTED then
+	  if this_rec_id ^= bj_txte.last_bj_rec_id then
+	     call ERROR_RETURN (dm_error_$bj_unexpected_aborted_mark);
+	  else call ERROR_RETURN (dm_error_$bj_txn_aborted);
+%page;
+         if bj_rec_hdr.type = BEFORE_IMAGE then
+DATA_TO_ROLLBACK:
+	  do;
+
+	  number_of_ci_parts = bj_before_image.n_parts;
+	  before_image_length = bj_before_image.image_len;
+
+RESTORE_BEFORE_IMAGE:
+	  begin;
+
+/* This begin block automatically allocates the correct amount of	*/
+/* storage for the ci_parts structure; the number of elements in the	*/
+/* parts array is determined by number_of_ci_parts, set in the main	*/
+/* procedure block.						*/
+
+dcl  1 my_ci_parts			aligned,
+       2 number_of_parts		fixed bin,
+       2 must_be_zero		fixed bin init (0),
+       2 part			dim (number_of_ci_parts)
+				like ci_parts.part;
+dcl  curr_image_pos			fixed bin (24) init (0);
+dcl  this_part			fixed bin;
+
+	     my_ci_parts.number_of_parts = number_of_ci_parts;
+
+	     do this_part = 1 to number_of_ci_parts;
+
+	        my_ci_parts.part (this_part).offset_in_bytes =
+		   bj_before_image.part (this_part).byte_offset;
+	        my_ci_parts.part (this_part).length_in_bytes =
+		   bj_before_image.part (this_part).byte_length;
+
+	        my_ci_parts.part (this_part).local_ptr =
+		   addcharno (addr (bj_before_image.image), curr_image_pos)
+		   ;
+
+	        curr_image_pos =
+		   curr_image_pos
+		   + bj_before_image.part (this_part).byte_length;
+	     end;
+
+	     if bj_txte.owner_info.process_id
+		^= bjm_data_$bj_ppt_ptr -> bj_ppt.process_id then
+	        call bj_adopt_txn$get_pf_oid (bj_before_image.fm_uid, fm_oid)
+		   ;
+	     else fm_oid = bj_before_image.fm_oid;
+
+	     if fm_oid ^= NULL_ID then			         /* have file to work with */
+UNPUT_IMAGE:
+	        do uns_ci_no = bj_before_image.ci_no;
+		 call cu_$level_set ((current_ring));
+		 call file_manager_$unput (fm_oid, uns_ci_no,
+		      addr (my_ci_parts), code);
+		 call cu_$level_set (saved_level);
+		 if code ^= 0 & code ^= dm_error_$file_doesnt_exist
+		      & code ^= dm_error_$file_was_deleted then do;
+		    n_unput_errors = n_unput_errors + 1;
+		    if prev_unput_code ^= code then do;
+		       call dm_misc_util_$log (ERROR_SV, code, ME,
+			  "Error occurred ^i times consecutively calling unput",
+			  n_unput_errors);
+		       n_unput_errors = 0;
+		       prev_unput_code = code;
+		    end;
+		 end;
+		 else do;
+		    n_bi_unput = n_bi_unput + 1;
+		    n_bytes_unput = n_bytes_unput + before_image_length;
+		 end;
+	        end UNPUT_IMAGE;
+	     else if bjm_data_$bj_code ^= error_table_$noentry then do;
+	        n_get_oid_errors = n_get_oid_errors + 1;
+	        if prev_get_oid_code ^= bjm_data_$bj_code then do;
+		 call dm_misc_util_$log (ERROR_SV, bjm_data_$bj_code, ME,
+		      "Error occurred ^i consecutive times while getting OID, file UID ^w",
+		      n_get_oid_errors, bj_before_image.fm_uid);
+		 n_get_oid_errors = 0;
+		 prev_get_oid_code = bjm_data_$bj_code;
+	        end;
+	     end;
+	     else ;					         /* OK, image of a now deleted file */
+
+	     bjm_data_$bj_code = 0;				         /* reset for the next round */
+	  end RESTORE_BEFORE_IMAGE;
+
+         end DATA_TO_ROLLBACK;
+%page;
+         else if bj_rec_hdr.type = ROLLED_BACK then
+	  ;
+
+         else if bj_rec_hdr.type = FM_POSTCOMMIT_HANDLER then
+	  ;
+
+         else if bj_rec_hdr.type = FM_ROLLBACK_HANDLER then
+ACTION_TO_ROLLBACK:
+	  do;
+
+	  if bj_txte.owner_info.process_id
+	       ^= bjm_data_$bj_ppt_ptr -> bj_ppt.process_id then
+	     call bj_adopt_txn$get_pf_oid (bj_fm_handler_rec.fm_uid, fm_oid);
+	  else fm_oid = bj_fm_handler_rec.fm_oid;
+
+	  if fm_oid ^= NULL_ID then				         /* have file to work with */
+RUN_FM_ROLLBACK_HANDLER:
+	     do;
+	     call cu_$level_set ((current_ring));
+	     call file_manager_$undo (bj_fm_handler_rec.fm_uid, fm_oid,
+		addr (bj_fm_handler_rec.info_bytes),
+		bj_fm_handler_rec.info_len, code);
+	     call cu_$level_set (saved_level);
+	     if code ^= 0 then do;
+	        n_handler_errors = n_handler_errors + 1;
+	        if prev_handler_code ^= code then do;
+		 call dm_misc_util_$log (ERROR_SV, code, ME,
+		      "Error occurred ^i consecutive times while calling rollback handler.",
+		      n_handler_errors);
+		 n_handler_errors = 0;
+		 prev_handler_code = code;
+	        end;
+	     end;
+	  end RUN_FM_ROLLBACK_HANDLER;
+	  else if bjm_data_$bj_code ^= error_table_$noentry then do;
+	     n_get_oid_errors = n_get_oid_errors + 1;
+	     if prev_get_oid_code ^= bjm_data_$bj_code then do;
+	        call dm_misc_util_$log (ERROR_SV, bjm_data_$bj_code, ME,
+		   "Error occurred ^i consecutive times while getting OID, file UID ^w",
+		   n_get_oid_errors, bj_before_image.fm_uid);
+	        n_get_oid_errors = 0;
+	        prev_get_oid_code = bjm_data_$bj_code;
+	     end;
+	  end;
+	  else ;						         /* OK, handler for a now deleted file */
+
+	  bjm_data_$bj_code = 0;				         /* reset for the next round */
+
+         end ACTION_TO_ROLLBACK;
+
+
+         else call ERROR_RETURN (dm_error_$bj_unknown_record_type);	         /* unknown or unsupported BJ rec type */
+
+      end CHECK_IMAGE_TYPE_AND_ROLLBACK;
+
+   end ROLLBACK_LOOP;
+
+   bj_txte.curr_checkpoint_rec_id = this_rec_id;			         /* change when checkpoints implemented */
+%page;
+CHECK_FOR_ERRORS:
+   do;
+      records_used_mismatch = (n_rec_read ^= bj_txte.n_rec_written);
+
+      if records_used_mismatch then
+         bjm_data_$bj_code = dm_error_$bj_bad_rec_count;
+      else if n_get_oid_errors + n_unput_errors + n_handler_errors > 0 then
+         bjm_data_$bj_code = dm_error_$bj_incomplete_rollback;
+
+      if bjm_data_$bj_code ^= 0 then
+LOG_ERROR_SUMMARY:
+         do;
+         call dm_misc_util_$log (LOG_SV, bjm_data_$bj_code, ME,
+	    "TID ^d^[;^2x^d images read vs. ^d written^;^2s^]^[;^2x^d unput errors^;^s^]^[;^2x^d OID errors^;^s^]^[;^2x^d handler errors.^]",
+	    fixed (tid), records_used_mismatch, n_rec_read,
+	    bj_txte.n_rec_written, (n_unput_errors > 0), n_unput_errors,
+	    (n_get_oid_errors > 0), n_get_oid_errors, (n_handler_errors > 0),
+	    n_handler_errors);
+         call ERROR_RETURN (bjm_data_$bj_code);
+
+      end LOG_ERROR_SUMMARY;
+
+   end CHECK_FOR_ERRORS;
+
+   call FINISH ();
+
+MAIN_RETURN:
+   return;
+
+
+/* end bjm_rollback; */
+%page;
+NONLOCAL_ERROR_EXIT:
+   call ERROR_RETURN (bjm_data_$bj_code);
+
+
+
+
+ERROR_RETURN:
+   proc (er_p_code);
+
+dcl  er_p_code			fixed bin (35) parameter;
+
+   call CLEAN_UP ();
+   p_code = er_p_code;
+   goto MAIN_RETURN;
+
+   end ERROR_RETURN;
+
+
+
+CLEAN_UP:
+   procedure ();
+
+dcl  cu_code			fixed bin (35) automatic;
+
+   call bj_cleanup_tables$handler (cu_code);
+
+   call FINISH ();
+
+   return;
+
+   end CLEAN_UP;
+
+
+
+
+FINISH:
+   proc ();
+
+/* operations we must do no matter how we exit bjm_rollback */
+
+   bjm_data_$bj_operation = "";
+   bjm_data_$bj_exit_err = bjm_data_$bj_default_error_label;
+   call cu_$level_set (saved_level);
+
+   return;
+
+   end FINISH;
+%page;
+%include dm_bj_global_error_info;
+%page;
+%include dm_bj_ppt;
+%page;
+%include dm_bj_pst;
+%page;
+%include dm_bj_pste;
+%page;
+%include dm_bj_records;
+%page;
+%include dm_bj_static;
+%page;
+%include dm_bj_txt;
+%page;
+%include dm_ci_parts;
+%page;
+%include dm_log_sv_codes;
+
+
+   end bjm_rollback;

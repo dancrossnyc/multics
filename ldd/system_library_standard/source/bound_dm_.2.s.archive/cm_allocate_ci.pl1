@@ -1,0 +1,808 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* DESCRIPTION:
+
+         This module implements collection_manager_$allocate_control_interval.
+
+         This  routine  allocates  a  control  interval  in a page file using
+     either the Unblocked or Blocked Control Interval Storage Method.
+
+          Currently only the Unblocked CISM is supported. Allocating a control
+     interval requires finding a free control interval in the allocation map,
+     assigning a disk address to a new control interval, initializing that
+     control interval, updating the map, updating the collection_header to show
+     that the new control interval is the last control interval of the
+     collection, and updating the former last control interval's header to
+     thread it with the new one. Non-harmful inconsistencies can develop if a
+     failure occurs in the middle of this routine, but they are not rolled back
+     because future allocations will fix the inconsistency. 
+          One non-pasive inconsistency can arise if every step is completed
+     except for threading the previous control interval.
+
+     **** This module should be changed to not abort if a deadlock ****
+     occurs while attempting to access a file_reservation_map fragment.
+     It was set up to skip a fragment if a deadlock or timeout occured,
+     but assumed that dm_error_$lock_deadlock and dm_error_$lock_timeout
+     would be returned.  Actually, deadlocks are signalled, and file_manager_
+    wwaits for a very long time.  This module really needs an interface to
+     file_manager_ which does not wait at all.  That is the only way in which 
+     it would be practical to implement the skipping of fragments which are
+     already locked.
+*/
+
+/* HISTORY:
+
+Written by Matthew Pierret, 07/21/82.
+Modified:
+09/27/82 by Matthew Pierret:  Fixed bug that accidentally set first_control_interval
+            equal to last_control_interval.
+10/20/82 by Matthew Pierret:  Converted to use file_manager_.  Removed attempts
+            to explicitly assign disk addresses to control intervals - this is
+            done automatically by fm_$put.
+11/23/82 by Lindsey Spratt:  Fixed to set the storage_record_ptr to null in
+	  the finish procedure if the storage_record is freed.  Added
+	  putting of the storage_record back into the header collection when
+	  modified.  Also, added setting of the first_control_interval.
+01/03/83 by Lindsey Spratt:  Fixed to call cm_get_info$full_get using
+	  cm_info.file_oid and cm_info.collection_id instead of
+	  p_file_opening_id and p_collection_id.  Added the info_header
+	  entry point.  This entry takes a pointer to an (empty) bci_header
+	  and fills in the bci_header for its caller.
+	  cm_allocate_overlength_tail needs this.
+02/01/83 by Matthew Pierret: Upgraded to support CM_INFO_VERSION_2.
+            Changed to report internal inconsistencies via sub_err_.
+            Changed to use cm_get_bci_header. Removed allocate_control_interval
+            label.
+02/23/83 by Matthew Pierret: Changed to use file_reservation_map instead of
+            block_map_array.
+03/31/83 by Lindsey L. Spratt:  Fixed to initialize the new
+            file_reservation_map.element_id to "0"b.
+03/31/83 by Lindsey L.  Spratt:  Added distinct setup of the CI which holds
+            the new allocation map fragment.  This CI is in the header
+            collection, but is not threaded into any list of CI's (e.g., those
+            in the header collection).
+04/01/83 by Lindsey L. Spratt:  Fixed to set the lowest_ci_number of the new
+            map fragment to 1 greater than the ci number of the ci which
+	  contains the new map fragment.  The new map fragment CI being the
+	  CI which immediately follows the last CI of the previous map
+	  fragment.
+	  Fixed to fully initialize the fragment_bci_header.  Fixed to set
+	  the cm_file_header.number_of_blocks when extending the
+            file_reservation_map.  Fixed to leave space in the map_buffer for
+            the extension (by 1).  Changed to use the ERROR_RETURN procedure.
+04/03/83 by Lindsey L. Spratt:  Fixed to replace the file_reservation_map in
+            the file after extending it.
+04/29/83 by Matthew Pierret:  Changed to check for
+            dm_error_$long_return_element in addition to $long_element, as the
+            "get" modules now return the former and the "put" modules return
+            the latter.
+            Changed to check to see if this is the first control interval of a
+            collection (storage_record.first_control_interval is 0), and to not
+            attempt to thread the non-existent previous ci in this case.
+08/09/83 by Matthew Pierret:  Removed uses of the obsolete dm_data_$area_ptr.
+01/24/84 by Matthew Pierret:  Added debugging entriesto trace control interval
+            thread modificaitons.
+05/21/84 by Matthew Pierret:  Renamed include file dm_cm_cism_info to 
+            dm_cism_info.
+06/12/84 by Matthew Pierret:  Renamed cm_allocate_element to cm_put,
+            cm_put_element to cm_modify.
+10/09/84 by Matthew Pierret:  Changed file_manager_$get declaration to take
+            a fixed bin (27) control interval number.  Changed ERROR_RETURN
+            to accept as input an error code, and changed the module to use
+            a local code variable instead of the p_code parameter.
+            Changed value of myname to from "cm_allocate_control_interval".
+            Added a call to sub_err_ if the CISM is not supported.
+            Removed the FINISH procedure - the work it did was unnecessary
+            and wrong. Re-hashed the technology for determining
+            inconsistencies.
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+     audit(87-02-02,Dupuis), install(87-04-02,MR12.1-1020):
+     For TR phx20754, changed initialization of bci_header.start_of_used_space
+     to be just CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES. It was CIALIB -1
+     which caused assumptions of the free space available being on a word
+     boundary to be wrong. This caused alignment problems with internal data
+     structures depending on this word alignment.
+                                                   END HISTORY COMMENTS */
+
+
+
+/* format: style2,^indnoniterdo,^indprocbody,ind3,ll79 */
+cm_allocate_ci:
+   proc (p_file_opening_id, p_collection_id, p_control_interval_number, p_code)
+        ;
+
+/* START OF DECLARATIONS */
+
+/* Parameter */
+
+   dcl	 p_file_opening_id	    bit (36) aligned parameter;
+   dcl	 p_collection_id	    bit (36) aligned parameter;
+   dcl	 p_control_interval_number
+			    fixed bin (24) unsigned parameter;
+   dcl	 p_bci_header_ptr	    ptr parameter;
+   dcl	 p_cm_info_ptr	    ptr parameter;
+   dcl	 p_code		    fixed bin (35) parameter;
+
+/* Automatic */
+
+   dcl	 1 automatic_bci_header aligned like bci_header;
+   dcl	 1 fragment_bci_header  aligned like bci_header;
+   dcl	 automatic_ci_parts_buffer
+			    (6) fixed bin (71);	/* Max of 1 part */
+   dcl	 1 automatic_cm_file_header
+			    aligned like cm_file_header;
+   dcl	 map_idx		    fixed bin (17);
+   dcl	 code		    fixed bin (35);
+   dcl	 control_interval_number
+			    fixed bin (27);
+   dcl	 free_control_interval_idx
+			    fixed bin (17);
+   dcl	 number_of_fragments_with_vacancies
+			    fixed bin (17);
+   dcl	 1 previous_bci_header  aligned like bci_header;
+   dcl	 previous_control_interval_number
+			    fixed bin (27);
+
+   dcl	 allocated	    bit (1) aligned;
+   dcl	 replace_map	    bit (1) aligned;
+
+/* Based */
+/* Builtin */
+
+   dcl	 (addr, divide, string, index, length, null, size, substr, unspec)
+			    builtin;
+
+/* Constant */
+
+   dcl	 myname		    init ("cm_allocate_ci") char (32) varying
+			    int static options (constant);
+   dcl	 BYTES_PER_WORD	    init (4) fixed bin (17) int static
+			    options (constant);
+   dcl	 BITS_PER_WORD	    init (36) fixed bin (17) int static
+			    options (constant);
+   dcl	 (
+	 ATTEMPTING_TO_GET	    init ("1"b),
+	 ATTEMPTING_TO_PUT	    init ("0"b)
+	 )		    bit (1) aligned int static
+			    options (constant);
+
+/* Entry */
+
+   dcl	 sub_err_		    entry () options (variable);
+   dcl	 file_manager_$put	    entry (bit (36) aligned, fixed bin (27), ptr,
+			    fixed bin (35));
+   dcl	 ioa_		    entry () options (variable);
+
+/* Static */
+
+   dcl	 static_trace_thread_switch
+			    init ("0"b) bit (1) aligned internal static;
+
+/* External */
+
+   dcl	 (
+	 dm_error_$long_element,
+	 dm_error_$long_return_element,
+	 dm_error_$ci_not_allocated,
+	 dm_error_$no_element,
+	 dm_error_$misformatted_ci,
+	 dm_error_$ci_not_in_collection,
+	 dm_error_$unimplemented_cism,
+	 error_table_$unimplemented_version
+	 )		    ext fixed bin (35);
+
+/* END OF DECLARATIONS */
+
+/* format: ^indblkcom,indcomtxt */
+
+   p_code, code = 0;
+   call cm_opening_info$full_get (p_file_opening_id, p_collection_id,
+        cm_info_ptr, code);
+   if code ^= 0
+   then call ERROR_RETURN (code);
+   bci_header_ptr = addr (automatic_bci_header);
+
+   go to JOIN;
+
+
+info:
+   entry (p_cm_info_ptr, p_control_interval_number, p_code);
+
+   p_code, code = 0;
+   cm_info_ptr = p_cm_info_ptr;
+   bci_header_ptr = addr (automatic_bci_header);
+
+   go to JOIN;
+
+info_header:
+   entry (p_cm_info_ptr, p_control_interval_number, p_bci_header_ptr, p_code);
+
+   p_code, code = 0;
+   cm_info_ptr = p_cm_info_ptr;
+   bci_header_ptr = p_bci_header_ptr;
+
+   go to JOIN;
+
+%page;
+JOIN:
+   call CHECK_VERSION ("cm_info", cm_info.version, CM_INFO_VERSION_2);
+   collection_header_ptr = cm_info.header_ptr;
+   call CHECK_VERSION ("collection_header", collection_header.version,
+        COLLECTION_HEADER_VERSION_2);
+
+   p_control_interval_number = 0;
+
+   blocked_storage_record_ptr, unblocked_storage_record_ptr = null;
+   if cm_info.storage_record_ptr = null
+   then
+      do;
+      call cm_opening_info$get_storage_record (cm_info_ptr, code);
+      if code ^= 0
+      then call ERROR_RETURN (code);
+   end;
+
+/**** Setup the ci_parts structure for later use in writing bci_header */
+
+   automatic_ci_parts_buffer = 0;
+   ci_parts_ptr = addr (automatic_ci_parts_buffer);
+   ci_parts.number_of_parts = 1;
+   ci_parts.part (1).offset_in_bytes = 0;
+   ci_parts.part (1).length_in_bytes = size (bci_header) * BYTES_PER_WORD;
+
+
+   if collection_header.control_interval_storage_method
+        ^= UNBLOCKED_CONTROL_INTERVAL_STORAGE_METHOD
+   then call sub_err_ (dm_error_$unimplemented_cism, myname,
+	   ACTION_CANT_RESTART, null, 0,
+	   "^/This operation only supports control interval storage method ^d;^/received method ^d."
+	   , UNBLOCKED_CONTROL_INTERVAL_STORAGE_METHOD,
+	   collection_header.control_interval_storage_method);
+   else
+UNBLOCKED:
+      do;
+      unblocked_storage_record_ptr = cm_info.storage_record_ptr;
+
+   /*** Get the header of the last control interval of the collection exclusively.
+        If an exclusive lock cannot be obtained on this control interval, the
+        allocation cannot take place, as it must be threaded to the new control
+        interval. */
+
+      previous_control_interval_number =
+	 unblocked_storage_record.last_control_interval;
+
+      if previous_control_interval_number ^= 0
+	 | cm_info.collection_id = HEADER_COLLECTION_ID
+      then
+         do;
+         call cm_get_bci_header (cm_info.file_oid,
+	    (previous_control_interval_number), addr (previous_bci_header),
+	    code);
+         if code ^= 0
+         then call ERROR_RETURN (code);
+      end;
+
+   /*** Get the allocation map by getting cm_file_header, file_reservation_map and
+        then a suitable fragment of the reservation map. */
+
+      call cm_get_element (cm_info.file_oid, HEADER_COLLECTION_ID,
+	 CM_FILE_HEADER_ELEMENT_ID, 0, addr (automatic_cm_file_header),
+	 length (unspec (automatic_cm_file_header)), null, ("0"b),
+	 cm_file_header_ptr, (0), code);
+      if code ^= 0
+      then call GET_ERROR_RETURN (code, "cm_file_header",
+	      CM_FILE_HEADER_ELEMENT_ID,
+	      length (unspec (automatic_cm_file_header)));
+
+      call CHECK_VERSION ("cm_file_header", cm_file_header.version,
+	 CM_FILE_HEADER_VERSION_1);
+
+   /*** Before proceeding, initialize the header of the new control interval
+        (bci_header), and set up buffers for the file_reservation_map and for one
+        fragment. Note that the buffer for file_reservation_map is slightly
+        larger than is needed; this is in case the array needs to be extended
+        (i.e., there are no available control intervals).
+   */
+
+      unspec (bci_header) = "0"b;
+      bci_header.layout_type = BASIC_CI_LAYOUT_1;
+      bci_header.collection_id = cm_info.collection_id;
+      bci_header.start_of_used_space =
+	 CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES;
+      bci_header.previous_control_interval =
+	 unblocked_storage_record.last_control_interval;
+
+
+      frmf_number_of_control_intervals =
+	 cm_file_header.number_of_control_intervals_per_block;
+      frm_number_of_fragments = cm_file_header.number_of_blocks;
+
+BEGIN_BLOCK:
+      begin;
+         dcl     fragment_buffer	(
+				divide (
+				frmf_number_of_control_intervals,
+				BITS_PER_WORD * 2, 17, 0) + 1)
+				fixed bin (71);
+         dcl     map_buffer		(frm_number_of_fragments + 1) fixed
+				bin (71);
+
+      /*** Get file_reservation_map, which contains the element ids of the fragments of
+	 the reservation map. The array also contains a flag associated with each
+	 entry (no_control_intervals_are_available) which tells if the fragment is
+	 full. If the file_reservation_map cannot be gotten, the allocation cannot continue
+      */
+
+         call cm_get_element (cm_info.file_oid, HEADER_COLLECTION_ID,
+	    cm_file_header.allocation_map_element_id, 0, addr (map_buffer),
+	    length (unspec (map_buffer)), null, ("0"b),
+	    file_reservation_map_ptr, (0), code);
+         if code ^= 0
+         then call GET_ERROR_RETURN (code, "file reservation map",
+	         cm_file_header.allocation_map_element_id,
+	         length (unspec (map_buffer)));
+
+         allocated, replace_map = "0"b;
+         number_of_fragments_with_vacancies = 0;
+
+TRY_EACH_ALLOCATION_FRAGMENT_LOOP:
+         do map_idx = 1 to frm_number_of_fragments while (^allocated);
+
+	  if ^file_reservation_map (map_idx).flags
+	       .no_control_intervals_are_available
+	  then
+TRY_THIS_ALLOCATION_FRAGMENT:
+	     do;
+	     number_of_fragments_with_vacancies =
+		number_of_fragments_with_vacancies + 1;
+
+	  /*** Get this fragment. If unavailable because of locking conflict,
+	       try the next fragment. If unavailable for any other reason, it can be assumed
+	       the problem is not local to the fragment, so give up the allocation.
+	  */
+
+	     call cm_get_element (cm_info.file_oid, HEADER_COLLECTION_ID,
+		file_reservation_map (map_idx).element_id, 0,
+		addr (fragment_buffer), length (unspec (fragment_buffer)),
+		null, "0"b, file_reservation_map_fragment_ptr, (0), code);
+	     if code ^= 0
+	     then call FILE_MAP_ERROR_RETURN (code, map_idx,
+		     file_reservation_map (map_idx).element_id,
+		     length (unspec (fragment_buffer)));
+	     else
+	        do;
+
+	        free_control_interval_idx =
+		   index (file_reservation_map_fragment, "0"b);
+
+	        if free_control_interval_idx = 0
+	        then
+		 do;
+		 number_of_fragments_with_vacancies =
+		      number_of_fragments_with_vacancies - 1;
+		 file_reservation_map (map_idx).flags
+		      .no_control_intervals_are_available = "1"b;
+		 replace_map = "1"b;
+	        end;
+	        else
+TRY_THIS_CI:
+		 do;
+
+		 control_interval_number =
+		      file_reservation_map (map_idx)
+		      .lowest_numbered_control_interval
+		      + free_control_interval_idx - 1;
+		 substr (file_reservation_map_fragment,
+		      free_control_interval_idx, 1) = "1"b;
+
+	        /*** Try to assign a disk address to the new control interval by writing into
+		   it.  If a locking conflict exists, someone else is trying to allocate
+		   into this fragment, so give up on the entire fragment. */
+
+		 ci_parts.part (1).local_ptr = bci_header_ptr;
+
+		 call file_manager_$put (cm_info.file_oid,
+		      control_interval_number, ci_parts_ptr, code);
+		 if code ^= 0
+		 then call ERROR_RETURN (code);
+
+	        /*** Put the updated file_reservation_map_fragment. If unsuccessful due to locking conflict,
+		   try another fragment. Otherwise it is assumed that the same error will occur
+		   no matter what fragment is tried.  */
+
+		 call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+		      file_reservation_map_fragment_ptr, -1,
+		      file_reservation_map (map_idx).element_id, (0), code)
+		      ;
+		 if code ^= 0
+		 then call MODIFY_ERROR_RETURN (code,
+			 "file reservation map fragment",
+			 file_reservation_map (map_idx).element_id);
+		 else
+		    do;
+
+		 /*** Put the updated collection_header. If unsuccessful, return. The collection
+		      will be inconsistent in a non-harmful way, only causing the loss of a
+		      control interval, but no data. */
+
+		    if unblocked_storage_record.first_control_interval = 0
+		         & cm_info.collection_id ^= HEADER_COLLECTION_ID
+		    then unblocked_storage_record.first_control_interval =
+			    control_interval_number;
+
+		    unblocked_storage_record.last_control_interval =
+		         control_interval_number;
+
+		    call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+		         cm_info.storage_record_ptr, -1,
+		         collection_header.storage_record_element_id, (0),
+		         code);
+		    if code ^= 0
+		    then call MODIFY_ERROR_RETURN (code, "storage record",
+			    collection_header.storage_record_element_id);
+
+		    call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+		         collection_header_ptr, -1, cm_info.collection_id,
+		         (0), code);
+		    if code ^= 0
+		    then call MODIFY_ERROR_RETURN (code,
+			    "collection header", cm_info.collection_id);
+
+
+		    if previous_control_interval_number ^= 0
+		         | cm_info.collection_id = HEADER_COLLECTION_ID
+		    then
+		       do;
+
+		    /*** Thread in the previous control interval.  This control interval has already
+		         been locked exclusively, so a non-zero error code indicates a fatal problem.
+		         If such is the case, the colleciton is left inconsistent, since the
+		         collection_header thinks that the last control interval is one that is not
+		         addressable. */
+
+		       previous_bci_header.next_control_interval =
+			  control_interval_number;
+		       ci_parts.part (1).local_ptr =
+			  addr (previous_bci_header);
+
+		       call file_manager_$put (cm_info.file_oid,
+			  previous_control_interval_number, ci_parts_ptr,
+			  code);
+		       if code ^= 0
+		       then call ERROR_RETURN (code);
+		    end;
+
+		    allocated = "1"b;
+
+		 end;
+
+	        end TRY_THIS_CI;
+	     end;
+	  end TRY_THIS_ALLOCATION_FRAGMENT;
+         end TRY_EACH_ALLOCATION_FRAGMENT_LOOP;
+
+         if number_of_fragments_with_vacancies > 0
+         then
+	  do;
+
+	  if replace_map
+	  then call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+		  file_reservation_map_ptr, -1,
+		  cm_file_header.allocation_map_element_id, (0), (0));
+         end;
+         else
+EXTEND_MAP_AND_ALLOCATE_IN_NEW_FRAGMENT:
+	  do;
+
+         /*** This do-group does almost the identical thing as TRY_THIS_ALLOCATION_FRAGMENT,
+	    with a few exceptions: Since this is the last attempt, an error at any point
+	    aborts the allocation; the file_reservation_map is extended one entry and
+	    put back; the control_interval_number is determined by figuring out
+	    the highest possible control interval number + 1; and the file_reservation_map_fragment
+	    is allocated instead of put because it does not exist yet. */
+
+	  frm_number_of_fragments = frm_number_of_fragments + 1;
+	  cm_file_header.number_of_blocks = frm_number_of_fragments;
+	  map_idx = frm_number_of_fragments;
+	  control_interval_number =
+	       file_reservation_map (map_idx - 1)
+	       .lowest_numbered_control_interval
+	       + frmf_number_of_control_intervals;
+	  file_reservation_map (map_idx).lowest_numbered_control_interval =
+	       control_interval_number + 1;
+	  string (file_reservation_map (map_idx).flags) = "0"b;
+	  addr (file_reservation_map (map_idx).element_id)
+	       -> element_id.control_interval_id = control_interval_number;
+	  addr (file_reservation_map (map_idx).element_id)
+	       -> element_id.index = 0;
+	  file_reservation_map_fragment = "0"b;
+	  substr (file_reservation_map_fragment, 1, 1) = "1"b;
+	  control_interval_number = control_interval_number + 1;
+
+         /*** Assign a disk address for the new control interval by writing into the new
+	    control interval.  Put the bci_header initialized earlier. */
+
+	  ci_parts.part (1).local_ptr = bci_header_ptr;
+
+	  call file_manager_$put (cm_info.file_oid, control_interval_number,
+	       ci_parts_ptr, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Set up the CI for the new fragment. */
+
+	  unspec (fragment_bci_header) = "0"b;
+	  fragment_bci_header.layout_type = BASIC_CI_LAYOUT_1;
+	  fragment_bci_header.collection_id = HEADER_COLLECTION_ID;
+	  fragment_bci_header.start_of_used_space =
+	       CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES;
+
+	  ci_parts.part (1).local_ptr = addr (fragment_bci_header);
+	  call file_manager_$put (cm_info.file_oid,
+	       (addr (file_reservation_map (map_idx).element_id)
+	       -> element_id.control_interval_id), ci_parts_ptr, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Allocate a new file_reservation_map_fragment. */
+
+	  call cm_put (cm_info.file_oid, HEADER_COLLECTION_ID,
+	       file_reservation_map_fragment_ptr,
+	       (frmf_number_of_control_intervals),
+	       file_reservation_map (map_idx).element_id, (0), code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Put the updated cm_file_header. */
+
+	  call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+	       cm_file_header_ptr, -1, CM_FILE_HEADER_ELEMENT_ID, (0), code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Put the revised file_reservation_map. */
+
+	  call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+	       file_reservation_map_ptr,
+	       length (unspec (file_reservation_map)),
+	       cm_file_header.allocation_map_element_id, (0), code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Put updated collection_header. */
+
+	  unblocked_storage_record.last_control_interval =
+	       control_interval_number;
+
+	  if unblocked_storage_record.first_control_interval = 0
+	       & cm_info.collection_id ^= HEADER_COLLECTION_ID
+	  then unblocked_storage_record.first_control_interval =
+		  control_interval_number;
+
+	  call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+	       cm_info.storage_record_ptr, -1,
+	       collection_header.storage_record_element_id, (0), code);
+	  if code ^= 0
+	  then call MODIFY_ERROR_RETURN (code, "storage record",
+		  collection_header.storage_record_element_id);
+
+	  call cm_modify (cm_info.file_oid, HEADER_COLLECTION_ID,
+	       cm_info.header_ptr, -1, cm_info.collection_id, (0), code);
+	  if code ^= 0
+	  then call MODIFY_ERROR_RETURN (code, "collection header",
+		  cm_info.collection_id);
+
+	  if previous_control_interval_number ^= 0
+	       | cm_info.collection_id = HEADER_COLLECTION_ID
+	  then
+	     do;
+
+	  /*** Thread in the previous control interval.  This control interval has
+	       already been locked exclusively, so a non-zero error code indicates a
+	       fatal problem. */
+
+	     previous_bci_header.next_control_interval =
+		control_interval_number;
+	     ci_parts.part (1).local_ptr = addr (previous_bci_header);
+
+	     call file_manager_$put (cm_info.file_oid,
+		previous_control_interval_number, ci_parts_ptr, code);
+	     if code ^= 0
+	     then call ERROR_RETURN (code);
+	  end;
+
+         end EXTEND_MAP_AND_ALLOCATE_IN_NEW_FRAGMENT;
+      end BEGIN_BLOCK;
+   end UNBLOCKED;
+
+   if static_trace_thread_switch
+   then call ioa_ (
+	   "Control interval ^d allocated with previous of ^d.^/^8xControl interval ^d changed to have next of ^d."
+	   , control_interval_number, bci_header.previous_control_interval,
+	   previous_bci_header.next_control_interval);
+
+   p_control_interval_number = control_interval_number;
+
+MAIN_RETURN:
+   return;
+
+
+trace_thread_modifications_on:
+   entry ();
+
+   static_trace_thread_switch = "1"b;
+   call cm_free_ci$trace_thread_modifications_on ();
+   call cm_replace_buffered_ci$trace_thread_modifications_on ();
+   return;
+
+trace_thread_modifications_off:
+   entry ();
+
+   static_trace_thread_switch = "0"b;
+   call cm_free_ci$trace_thread_modifications_off ();
+   call cm_replace_buffered_ci$trace_thread_modifications_off ();
+   return;
+
+%page;
+ERROR_RETURN:
+   proc (er_p_code);
+
+   dcl	 er_p_code	    fixed bin (35);
+
+   p_code = er_p_code;
+   go to MAIN_RETURN;
+
+   end ERROR_RETURN;
+
+
+CHECK_VERSION:
+   proc (cv_p_structure_name, cv_p_given_version, cv_p_correct_version);
+
+   dcl	 cv_p_structure_name    char (*);
+   dcl	 cv_p_given_version	    char (8) aligned;
+   dcl	 cv_p_correct_version   char (8) aligned;
+
+   if cv_p_given_version ^= cv_p_correct_version
+   then call sub_err_ (error_table_$unimplemented_version, myname,
+	   ACTION_CANT_RESTART, null, 0,
+	   "^/Expected version ^8a of ^a structure; received ^8a.",
+	   cv_p_correct_version, cv_p_structure_name, cv_p_given_version);
+   else return;
+
+   end CHECK_VERSION;
+%page;
+GET_ERROR_RETURN:
+   proc (ger_p_code, ger_p_element_name, ger_p_element_id,
+        ger_p_expected_length);
+
+   dcl	 ger_p_code	    fixed bin (35);
+   dcl	 ger_p_element_name	    char (*);
+   dcl	 ger_p_element_id	    bit (36) aligned;
+   dcl	 ger_p_expected_length  fixed bin (35);
+
+   if ger_p_code = dm_error_$long_return_element
+   then call sub_err_ (ger_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "The ^a at CI ^d, slot ^d, is longer than the ^d bits expected.",
+	   ger_p_element_name,
+	   addr (ger_p_element_id) -> element_id.control_interval_id,
+	   addr (ger_p_element_id) -> element_id.index,
+	   ger_p_expected_length);
+   else if ger_p_code = dm_error_$no_element
+   then call sub_err_ (ger_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "^/The ^a expected at CI ^d, slot ^d, is not there.",
+	   ger_p_element_name,
+	   addr (ger_p_element_id) -> element_id.control_interval_id,
+	   addr (ger_p_element_id) -> element_id.index);
+   else if ger_p_code = dm_error_$ci_not_allocated
+	   | ger_p_code = dm_error_$ci_not_in_collection
+	   | ger_p_code = dm_error_$misformatted_ci
+   then call sub_err_ (ger_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "^/CI ^d is expected to have the ^a at slot ^d.",
+	   addr (ger_p_element_id) -> element_id.control_interval_id,
+	   ger_p_element_name, addr (ger_p_element_id) -> element_id.index);
+   else call ERROR_RETURN (ger_p_code);
+
+   end GET_ERROR_RETURN;
+%page;
+MODIFY_ERROR_RETURN:
+   proc (mer_p_code, mer_p_element_name, mer_p_element_id);
+
+   dcl	 mer_p_code	    fixed bin (35);
+   dcl	 mer_p_element_name	    char (*);
+   dcl	 mer_p_element_id	    bit (36) aligned;
+
+   if mer_p_code = dm_error_$long_element
+   then call sub_err_ (mer_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "The ^a at CI ^d, slot ^d, did not fit, even though it did not change in size."
+	   , mer_p_element_name,
+	   addr (mer_p_element_id) -> element_id.control_interval_id,
+	   addr (mer_p_element_id) -> element_id.index);
+   else if mer_p_code = dm_error_$no_element
+   then call sub_err_ (mer_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "^/The ^a expected at CI ^d, slot ^d, is not there.",
+	   mer_p_element_name,
+	   addr (mer_p_element_id) -> element_id.control_interval_id,
+	   addr (mer_p_element_id) -> element_id.index);
+   else if mer_p_code = dm_error_$ci_not_allocated
+	   | mer_p_code = dm_error_$ci_not_in_collection
+	   | mer_p_code = dm_error_$misformatted_ci
+   then call sub_err_ (mer_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "^/CI ^d is expected to have the ^a at slot ^d.",
+	   addr (mer_p_element_id) -> element_id.control_interval_id,
+	   mer_p_element_name, addr (mer_p_element_id) -> element_id.index);
+   else call ERROR_RETURN (mer_p_code);
+
+   end MODIFY_ERROR_RETURN;
+
+%page;
+FILE_MAP_ERROR_RETURN:
+   proc (fmer_p_code, fmer_p_fragment_number, fmer_p_element_id,
+        fmer_p_expected_length);
+
+   dcl	 fmer_p_code	    fixed bin (35);
+   dcl	 fmer_p_fragment_number fixed bin (17);
+   dcl	 fmer_p_element_id	    bit (36) aligned;
+   dcl	 fmer_p_expected_length fixed bin (35);
+
+   if fmer_p_code = dm_error_$long_return_element
+   then call sub_err_ (fmer_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "File reservation map fragment ^d at CI ^d, slot ^d, is longer than^/the ^d bits expected."
+	   , fmer_p_fragment_number,
+	   addr (fmer_p_element_id) -> element_id.control_interval_id,
+	   addr (fmer_p_element_id) -> element_id.index,
+	   fmer_p_expected_length);
+   else if fmer_p_code = dm_error_$no_element
+   then call sub_err_ (fmer_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "^/File reservation map fragment ^d is not at the expected location, CI ^d, slot ^d."
+	   , fmer_p_fragment_number,
+	   addr (fmer_p_element_id) -> element_id.control_interval_id,
+	   addr (fmer_p_element_id) -> element_id.index);
+   else if fmer_p_code = dm_error_$ci_not_allocated
+	   | fmer_p_code = dm_error_$ci_not_in_collection
+	   | fmer_p_code = dm_error_$misformatted_ci
+   then call sub_err_ (fmer_p_code, myname, ACTION_CANT_RESTART, null, 0,
+	   "^/CI ^d is expected to have file reservation map fragment ^d at slot ^d."
+	   , addr (fmer_p_element_id) -> element_id.control_interval_id,
+	   fmer_p_fragment_number,
+	   addr (fmer_p_element_id) -> element_id.index);
+   else call ERROR_RETURN (fmer_p_code);
+
+   end FILE_MAP_ERROR_RETURN;
+%page;
+%include dm_hdr_collection_id;
+%page;
+%include dm_cm_hdr_col_ids;
+%page;
+%include dm_cm_info;
+%page;
+%include dm_cm_file_header;
+%page;
+%include dm_cm_collection_header;
+%page;
+%include dm_cm_storage_record;
+%page;
+%include dm_cm_reservation_map;
+%page;
+%include dm_cm_basic_ci;
+%page;
+%include dm_cism_info;
+%page;
+%include dm_ci_header;
+%page;
+%include dm_ci_parts;
+%page;
+%include dm_ci_lengths;
+%page;
+%include dm_element_id;
+%page;
+%include dm_cm_entry_dcls;
+%page;
+%include sub_err_flags;
+   end cm_allocate_ci;

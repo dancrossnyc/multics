@@ -1,0 +1,549 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+rmdb_create_and_pop_rel: proc (I_rmdb_ctl_ptr, I_db_path, I_temp_dir_path, I_sel_exp,
+	I_rmdb_sel_val_info_ptr, I_index_attrs_ptr, O_err_msg, O_err_code);
+
+/* 		    BEGIN_DESCRIPTION
+
+   The purpose of this procedure is to  create  and populate a relation
+   given a selection expression like that provided for define_temp_rel.
+   The relation name is contained in the  I_index_attrs  structure. The
+   attributes for the relation are defined by the  selected  attributes
+   specified in the  selection expression.  Indexed  attributes  are in
+   the index_attr_structure, and  were defined  outside this procedure.
+
+   This procedure opens  the database twice: to translate the selection
+   expression  to get the relation  attributes, and after the  relation
+   has been created and is needed to store the selected tuples.
+
+   .                     END_DESCRIPTION
+*/
+
+/* HISTORY
+   82-04-23 Written by Roger Lackey
+
+   82-06-15 Roger Lackey : added the init of db_model_ptr to
+	                 rmdb_delete_rel_info in tidy_up procedure.
+
+   82-06-25 Roger Lackey : changed to use divide builtin and undo request 
+	                 to use -brief instead of -force
+
+   82-07-01  Roger Lackey : Modified the calls to mu_db_inconsistent to use
+	                  mdbm_util_$inconsistent_* for binding.
+
+   82-07-02 R. Harvey : Modified calls to mrds_dsl_translate, mu_define_area,
+	              and mu_get_tuple for binding.
+
+  82-07-01 Roger Lackey : changed mu_database_index$get_resultant_model_pointer
+	                to mdbm_util_$get_resultant_model_pointer and
+	                mu_store$store_direct to mdbm_util_$store_direct
+	                for binding
+
+  82-08-20 D. Woodka : deleted reference to rm_rel_info.max_data_len for
+	             DMS conversion.
+
+  82-09-15 Mike Kubicar : converted to use vectors.
+
+  82-11-18 D. Woodka : changed calling sequence to include rmdb_ctl_ptr. 
+
+  83-02-07 Mike Kubicar : Added transaction processing include files.
+
+  83-02-15 Davids: modified to use the new db_type_flags in the db_model
+  structure instead of the old numeric db_type.
+
+  83-04-08 Mike Kubicar : Changed calling sequence of mdbm_util_$direct.
+
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-01-22,Hergert), approve(88-07-11,MCR7903),
+     audit(88-07-26,Dupuis), install(88-08-01,MR12.2-1073):
+     For new parser, changed referneces of sel_ptr to select_list_ptr.
+                                                   END HISTORY COMMENTS */
+
+
+/*        PARAMETERS       */
+	dcl     I_rmdb_ctl_ptr	 ptr;		/* ptr to rmdb_ctl used to access relation_manager entries */
+	dcl     I_db_path		 char (*) parameter;/* Database path were are working with */
+	dcl     I_temp_dir_path	 char (*) parameter;/* Temporary diretory pathname */
+	dcl     I_sel_exp		 char (*) parameter;/* Selection expresion like that of define_temp_rel */
+	dcl     I_rmdb_sel_val_info_ptr ptr parameter;	/* Pointer rmdb_sel_val_info structure */
+	dcl     I_index_attrs_ptr	 pointer parameter; /* Pointer to the rmdb_index_attrs structure */
+	dcl     O_err_msg		 char (*) parameter;/* Error message text */
+	dcl     O_err_code		 fixed bin (35) parameter; /* Error code */
+
+%page;
+/* rmdb_create_and_pop_rel: proc (I_rmdb_ctl_ptr, I_db_path, I_temp_dir_path, I_sel_exp,
+   I_rmdb_sel_val_info_ptr, I_index_attrs_ptr, O_err_msg, O_err_code); */
+
+
+	must_delete_relation = "0"b;
+	sel_exp_ptr = addr (I_sel_exp);
+	sel_exp_len = length (I_sel_exp);
+	rmdb_sel_val_info_ptr = I_rmdb_sel_val_info_ptr;
+	rmdb_ix_attrs_ptr = I_index_attrs_ptr;
+	rmdb_ctl_ptr = I_rmdb_ctl_ptr;
+	O_err_msg = "";
+	O_err_code = 0;
+	rel_name = rtrim (rmdb_ix_attrs.relation_name);
+	dbi = 0;
+	ftf = "1"b;				/* first time flag */
+
+	on cleanup call tidy_up;
+
+	if I_db_path = " " then
+	     call error (mrds_error_$no_db_path, "");
+	else db_path = I_db_path;
+
+	call hcs_$initiate (db_path, "db_model", "", 0, 0, dbm_ptr, code); /* Get pointer to db_model */
+	if dbm_ptr = null then call error (mrds_error_$no_database, "^/" || db_path);
+
+	if db_model.db_type_flags.transactions_needed
+	then do;
+		mstxn_transactions_needed = "1"b;
+		call transaction_manager_$get_current_txn_id (mstxn_txn_id, mstxn_code);
+		if mstxn_code = 0 then do;
+			mstxn_txn_id = "0"b;
+			call error (error_table_$action_not_performed,
+			     "Relations may not be created while a transaction " ||
+			     "is in progress.  Commit or abort the transaction " ||
+			     "and try again.");
+		     end;
+	     end;
+	else mstxn_transactions_needed = "0"b;
+	mstxn_txn_id = "0"b;
+
+/* See if a relation by this name already exists in db */
+
+	call hcs_$initiate (db_path, rel_name || ".m", "", 0, 0, fm_ptr, code);
+
+	if fm_ptr ^= null then call error (mrds_error_$dup_rel, "^/" || rel_name);
+
+	on cleanup
+	     begin;
+		call tidy_up;
+		call mstxn_cleanup;
+	     end;
+	on any_other call mstxn_any_other;
+%include mrds_start_transaction;
+	if mstxn_code ^= 0
+	then call error (mstxn_code, "Could not start a transaction while creating relation " || rtrim (rel_name) || ".");
+	call dsl_$open (db_path, dbi, EXCLUSIVE_UPDATE, code);
+	if code ^= 0 then call error (code, "^/" || db_path);
+
+	call mdbm_util_$get_resultant_model_pointer (dbi, dbcb_ptr); /* Get the dbcb pointer */
+	if dbcb_ptr = null then
+	     call error (mrds_error_$invalid_db_index, "Getting dbcb_ptr");
+
+	call mdbm_util_$define_temp_dir_area (dbcb.def_temp_rel_area_ptr, dbi, (sys_info$max_seg_size),
+	     "MRDS.def_tr", "0"b /* not extensible */, "1"b /* no freeing */, "0"b,
+	     "0"b /* no zeroing */, code);
+	work_area_ptr = dbcb.def_temp_rel_area_ptr;
+	if code ^= 0 then call error (code, "");
+
+	num_sel_vals = rmdb_sel_val_info.sv_num;	/* Cause translate changes them */
+	sel_val_arg_list_ptr = rmdb_sel_val_info.data_list_ptr;
+	sel_val_desc_list_ptr = rmdb_sel_val_info.desc_list_ptr;
+
+	call mdbm_util_$mrds_dsl_translate (dbcb_ptr, work_area_ptr, 4, sel_exp_ptr, sel_exp_len,
+	     sel_val_arg_list_ptr, sel_val_desc_list_ptr,
+	     num_sel_vals, code);
+	if code ^= 0 then call error (code, "^/""" || I_sel_exp || """");
+
+	if ^dbcb.val_dtr then call error (mrds_error_$inval_dtr_expr,
+		"^/""" || I_sel_exp || """");
+%page;
+	if dbcb.ss_ptr ^= null then do;		/* set ptrs needed later */
+		ss_ptr = dbcb.ss_ptr;
+		select_list_ptr = select_sets.items.select_ptr (1);
+		range_ptr = select_sets.items.range_ptr (1);
+	     end;
+	else do;
+		range_ptr = dbcb.range_ptr;		/* initialize */
+		select_list_ptr = dbcb.select_ptr;
+	     end;
+
+	rmdb_create_rel_info_alloc = select_list.num_items;
+	allocate rmdb_create_rel_info in (work_area) set (rmdb_create_rel_info_ptr);
+	rmdb_create_rel_info.version = RMDB_CREATE_REL_INFO_VERSION_1;
+	rmdb_create_rel_info.db_path = I_db_path;
+	rmdb_create_rel_info.temp_directory_path = I_temp_dir_path;
+	rmdb_create_rel_info.db_model_ptr = dbm_ptr;
+	rmdb_create_rel_info.relation_name = rmdb_ix_attrs.relation_name;
+	rmdb_create_rel_info.num_attrs = select_list.num_items;
+
+	do i = 1 to select_list.num_items;
+	     rai_ptr = select_list.item.ai_ptr (i);	/* Get rm_attr_info_ptr */
+	     rmdb_create_rel_info.attrs (i).name = rm_attr_info.model_name;
+	     rmdb_create_rel_info.attrs (i).primary_key = select_list.item (i).key;
+	     rmdb_create_rel_info.attrs (i).indexed = "0"b; /* Will mark those index  in index_attr_mark proc */
+	     rmdb_create_rel_info.attrs (i).mbz = "0"b;
+	end;
+
+	call index_attr_mark;			/* Internal proc */
+
+	must_delete_relation = "1"b;			/* In case an error occurs during creating */
+
+/* The call to rmdb_create_relation will set the db inconsistent during the
+   creation period but will then return the db to a consistent state prior to
+   returning  */
+
+	call rmdb_create_relation (rmdb_ctl_ptr, rmdb_create_rel_info_ptr, "0"b /* Not called from request level */, err_msg, code);
+	if code ^= 0 then call error (code, err_msg);
+
+	call dsl_$close (dbi, code);
+	if code ^= 0 then call error (code, "First close of db");
+
+	dbi = 0;
+
+	call store;				/* Internal procedure */
+
+	must_delete_relation = "0"b;
+
+	if ftf then /* The relation was created
+						   but no tuples stored because nothing was found that
+						   matched the selection_exp */
+	     call error (mrds_error_$no_tuple,
+		"^/The relation was created but was not populated because" ||
+		"^/there were no tuples that satisfied the selection expression.");
+	call tidy_up;
+
+exit:
+	mftxn_code = O_err_code;
+%include mrds_finish_transaction;
+	if mftxn_code ^= 0 then do;
+		O_err_code = mftxn_code;
+		O_err_msg = "Could not finish a transaction while creating relation " || rtrim (rel_name) || ".";
+	     end;
+	return;
+
+%page;
+/*  * * * * * * * * * * * *   index_attr_mark   * * * * * * * * * * * * * * */
+
+
+index_attr_mark: proc;
+
+	do k = 1 to rmdb_ix_attrs.num_used;		/* All indexed attrs */
+
+	     attr_name = rmdb_ix_attrs.an (k);
+
+	     found = "0"b;
+
+	     do j = 1 to rmdb_create_rel_info.num_attrs while (^found); /* Search for name in list */
+
+		if attr_name = rmdb_create_rel_info.attrs (j).name then do;
+
+			if rmdb_create_rel_info.attrs (j).indexed = "1"b then
+			     call error (mrds_error_$previously_defined_index, "^/" || attr_name);
+
+			rmdb_create_rel_info.attrs (j).indexed = "1"b; /* Mark as indexed */
+			found = "1"b;
+		     end;
+
+	     end;
+
+	     if ^found then call error (mrds_error_$undef_attr,
+		     "^/" || attr_name);
+
+	end;					/* END All indexed attrs */
+
+     end index_attr_mark;
+%page;
+/*   * * * * * * * * * * * * * *   store     * * * * * * * * * * * * * * *   */
+
+store: proc;
+
+/* This internal procedure opens the db for the second time so the opening
+   includes the newly created relation and stores each tuple selected.
+
+   If a tuple's primary key is found to duplicate that of a previously stored
+   tuple the second tuple is NOT stored and no error reported.
+
+   The database is set inconsistent just prior to beginning the stores */
+
+
+
+/* Open db again this time with new relation in it */
+
+	call dsl_$open (db_path, dbi, EXCLUSIVE_UPDATE, code);
+	if code ^= 0 then call error (code, "^/" || db_path);
+
+	call mdbm_util_$get_resultant_model_pointer (dbi, dbcb_ptr); /* Get the dbcb pointer */
+	if dbcb_ptr = null then
+	     call error (mrds_error_$invalid_db_index, "Getting dbcb_ptr");
+
+	call mdbm_util_$define_temp_dir_area (dbcb.def_temp_rel_area_ptr, dbi, (sys_info$max_seg_size),
+	     "MRDS.def_tr", "0"b /* not extensible */, "1"b /* no freeing */, "0"b,
+	     "0"b /* no zeroing */, code);
+	work_area_ptr = dbcb.def_temp_rel_area_ptr;
+
+	if code ^= 0 then call error (code, "");
+
+	num_sel_vals = rmdb_sel_val_info.sv_num;	/* Cause translate changes them */
+	sel_val_arg_list_ptr = rmdb_sel_val_info.data_list_ptr;
+	sel_val_desc_list_ptr = rmdb_sel_val_info.desc_list_ptr;
+
+	call mdbm_util_$mrds_dsl_translate (dbcb_ptr, work_area_ptr, 4, sel_exp_ptr, sel_exp_len,
+	     sel_val_arg_list_ptr, sel_val_desc_list_ptr,
+	     num_sel_vals, code);
+	if code ^= 0 then call error (code, "^/""" || I_sel_exp || """");
+%page;
+	if dbcb.ss_ptr ^= null then do;		/* set ptrs needed later */
+		ss_ptr = dbcb.ss_ptr;
+		select_list_ptr = select_sets.items (1).select_ptr;
+		range_ptr = select_sets.items (1).range_ptr;
+		ti_ptr = select_sets.items (1).ti_ptr;
+	     end;
+	else do;
+		range_ptr = dbcb.range_ptr;		/* initialize */
+		select_list_ptr = dbcb.select_ptr;
+		ti_ptr = dbcb.ti_ptr;
+	     end;
+
+	rdbi_ptr = dbcb.rdbi_ptr;			/*  Pointer to rm_db_info */
+	rmra_ptr = rm_db_info.ra_ptr;			/* find rel info */
+
+/* search for rel_name in rm_rel_array  so we can get the rmri_ptr */
+
+	i = index (string (rm_rel_array.name), "!" ||
+	     rmdb_ix_attrs.relation_name);
+	i = (divide ((i - 1), 33, 17)) + 1;		/* convert from char to array index */
+	rmri_ptr = rm_rel_array.rel_data.ri_ptr (i);
+	dbcb.last_store_rel_name = "!!!!!!!... ...!!!!!"; /*  Temparory store bad rel name incase this store fails */
+%page;
+	call mdbm_util_$inconsistent_set (dbm_ptr, "create_relation", /* Cause rmdb_create_relation reset it */
+	     "Creating relation " || rel_name, "delete_relation " || rel_name || " -brief");
+
+	quit_received = "0"b;			/* Not yet */
+
+	stv_number_of_dimensions = mrds_data_$max_attributes;
+	allocate simple_typed_vector;
+
+	simple_typed_vector.type = SIMPLE_TYPED_VECTOR_TYPE;
+
+
+	call mdbm_util_$mu_get_tuple (dbcb_ptr, work_area_ptr, rmri_ptr, simple_typed_vector_ptr, code); /* get a tuple */
+
+RESTART:	on quit quit_received = "1"b;			/* Hold off quits til end of loop */
+
+	do while (code = 0);			/* As long as there are tuples to be retrieved */
+
+	     call mdbm_util_$store_direct (dbcb_ptr,
+		rmri_ptr, simple_typed_vector_ptr, code); /* add tuple */
+	     if code = 0 | code = dm_error_$key_duplication then do;
+						/* ignore duplicates */
+		     ftf = "0"b;
+		     dbcb.another_flag = "1"b;
+		     call mdbm_util_$mu_get_tuple (dbcb_ptr, work_area_ptr, rmri_ptr, simple_typed_vector_ptr, code);
+		end;
+
+	     if quit_received then do;		/* If user quit during the loop so we will NOW let it go thru */
+		     quit_received = "0"b;
+		     revert quit;
+		     signal quit;
+		     on quit quit_received = "1"b;
+		end;
+
+	end;
+
+	revert quit;
+
+	if quit_received then do;			/* If user quit during the loop so we will NOW let it go thru */
+		quit_received = "0"b;
+		signal quit;
+	     end;
+
+	on cleanup call tidy_up;
+
+	if code = mrds_error_$tuple_not_found then code = 0;
+	else call error (code, "");
+
+%page;
+
+     end store;
+%page;
+
+/*  * * * * * * * * * * * * * *      error     * * * * * * * * * * * * * *   */
+
+
+
+error: proc (err_code, err_message);
+
+	dcl     err_code		 fixed bin (35);
+	dcl     err_message		 char (*);
+
+
+	O_err_code = err_code;
+	O_err_msg = err_message;
+	call tidy_up;
+	goto exit;
+
+     end error;
+
+
+
+
+
+
+
+
+/* * * * * * * * * * * * * * * *   tidy_up  * * * * * * * * * * * * * * *  */
+
+tidy_up: proc;
+
+	code = 0;
+
+	if dbi ^= 0 then call dsl_$close (dbi, code);
+	if code = 0 then dbi = 0;
+
+	if must_delete_relation then do;
+		delete_rel_info.version = RMDB_DELETE_REL_INFO_VERSION_1;
+		delete_rel_info.absolute_db_path = db_path;
+		delete_rel_info.db_model_ptr = dbm_ptr;
+		delete_rel_info.relation_name = rel_name;
+		delete_rel_info.brief = "1"b;
+		delete_rel_info.mbz = "0"b;
+
+		call rmdb_delete_relation$cleanup (rmdb_ctl_ptr, addr (delete_rel_info), err_msg, code);
+	     end;
+
+	if code = 0 then call mdbm_util_$inconsistent_reset (dbm_ptr); /* Make db consistnert */
+
+
+     end tidy_up;
+%page;
+/***********
+*
+*   These routines are used by the transaction processing include files.
+*   Restore_significant_data is called to reinitialize variables in case
+*   of a rollback.  Should_rollback determines whether a transaction should
+*   be rolled back or aborted on error.  Currently, it is always aborted.
+*
+**********/
+
+
+restore_significant_data:
+     proc;
+	delete_rel_info.version = RMDB_DELETE_REL_INFO_VERSION_1;
+	delete_rel_info.absolute_db_path = db_path;
+	delete_rel_info.db_model_ptr = dbm_ptr;
+	delete_rel_info.relation_name = rel_name;
+	delete_rel_info.brief = "1"b;
+	delete_rel_info.mbz = "0"b;
+	call rmdb_delete_relation$cleanup (rmdb_ctl_ptr,
+	     addr (delete_rel_info), err_msg, code);
+	must_delete_relation = "0"b;
+	ftf = "1"b;
+     end restore_significant_data;
+
+
+
+should_rollback:
+     proc returns (bit (1));
+	return ("0"b);
+     end should_rollback;
+
+%page;
+	dcl     addr		 builtin;
+	dcl     any_other		 condition;
+	dcl     attr_name		 char (32);
+	dcl     cleanup		 condition;
+	dcl     code		 fixed bin (35);
+	dcl     dbi		 fixed bin (35);
+	dcl     db_path		 char (168);
+	dcl     divide		 builtin;
+	dcl     dsl_$close		 entry () options (variable);
+	dcl     dsl_$open		 entry () options (variable);
+	dcl     err_msg		 char (256);
+	dcl     error_table_$action_not_performed fixed bin (35) ext static;
+	dcl     EXCLUSIVE_UPDATE	 int static options (constant) init (4);
+	dcl     fixed		 builtin;
+	dcl     fm_ptr		 ptr;
+	dcl     found		 bit (1);
+	dcl     ftf		 bit (1) aligned;
+	dcl     hcs_$initiate	 entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+	dcl     i			 fixed bin;
+	dcl     index		 builtin;
+	dcl     j			 fixed bin;
+	dcl     k			 fixed bin;
+	dcl     length		 builtin;
+	dcl     dm_error_$key_duplication fixed bin (35) ext static;
+	dcl     mrds_data_$max_select_items ext fixed bin (35);
+	dcl     mdbm_util_$mrds_dsl_translate entry (ptr, ptr, fixed bin, ptr, fixed bin, ptr, ptr, fixed bin, fixed bin (35));
+	dcl     mrds_error_$dup_rel	 fixed bin (35) ext static;
+	dcl     mrds_error_$invalid_db_index fixed bin (35) ext static;
+	dcl     mrds_error_$inval_dtr_expr fixed bin (35) ext static;
+	dcl     mrds_error_$no_database fixed bin (35) ext static;
+	dcl     mrds_error_$no_db_path fixed bin (35) ext static;
+	dcl     mrds_error_$no_tuple	 fixed bin (35) ext static;
+	dcl     mrds_error_$previously_defined_index fixed bin (35) ext static;
+	dcl     mrds_error_$tuple_not_found fixed bin (35) ext static;
+	dcl     mrds_error_$undef_attr fixed bin (35) ext static;
+	dcl     must_delete_relation	 bit (1);
+	dcl     mdbm_util_$get_resultant_model_pointer entry (fixed bin (35), ptr);
+	dcl     mdbm_util_$inconsistent_reset entry (ptr);
+	dcl     mdbm_util_$inconsistent_set entry (ptr, char (*), char (*), char (*));
+	dcl     mdbm_util_$define_temp_dir_area entry (ptr, fixed bin (35), fixed bin (18), char (11), bit (1) aligned, bit (1) aligned, bit (1) aligned, bit (1) aligned, fixed bin (35));
+	dcl     mdbm_util_$mu_get_tuple entry (ptr, ptr, ptr, ptr, fixed bin (35));
+	dcl     mdbm_util_$store_direct entry (ptr, ptr, ptr, fixed bin (35));
+	dcl     mrds_data_$max_attributes ext fixed bin (35);
+	dcl     null		 builtin;
+	dcl     num_sel_vals	 fixed bin;
+	dcl     quit		 condition;
+	dcl     quit_received	 bit (1);
+	dcl     range_ptr		 ptr;
+	dcl     rel		 builtin;
+	dcl     rel_name		 char (32) varying;
+	dcl     rmdb_create_relation	 entry (ptr, ptr, bit (1), char (*), fixed bin (35));
+	dcl     rmdb_ctl_ptr	 ptr;
+	dcl     rmdb_delete_relation$cleanup entry (ptr, ptr, char (*), fixed bin (35));
+	dcl     rtrim		 builtin;
+	dcl     sel_exp_len		 fixed bin;
+	dcl     sel_exp_ptr		 ptr;
+	dcl     sel_val_arg_list_ptr	 ptr;
+	dcl     sel_val_desc_list_ptr	 ptr;
+	dcl     string		 builtin;
+	dcl     sys_info$max_seg_size	 fixed bin (35) ext static;
+	dcl     work_area		 area based (work_area_ptr);
+	dcl     work_area_ptr	 ptr;
+
+
+
+
+	dcl     1 delete_rel_info	 aligned
+				 like rmdb_delete_rel_info;
+
+%page;
+%include mrds_dbcb;
+%page;
+%include mdbm_rm_rel_array;
+%page;
+%include mdbm_db_model;
+%page;
+%include mrds_select_list;
+%page;
+%include mrds_select_sets;
+%page;
+%include rmdb_create_rel_info;
+%page;
+%include mdbm_rm_rel_info;
+%page;
+%include mdbm_rm_db_info;
+%page;
+%include mdbm_rm_attr_info;
+%page;
+%include mrds_tuple_info;
+%page;
+%include rmdb_delete_rel_info;
+%page;
+%include vu_typed_vector;
+
+
+     end rmdb_create_and_pop_rel;

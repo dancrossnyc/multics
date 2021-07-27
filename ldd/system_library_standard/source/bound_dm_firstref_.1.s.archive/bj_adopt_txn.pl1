@@ -1,0 +1,390 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+     bj_adopt_txn - procedure to change before journal transaction specific
+   table entry which will allow a process other than the one that initiated
+   a transaction to complete it.  It is assumed that this other process
+   will be the data management daemon.
+
+   This procedure has four entrypoints:
+
+   adopt,      to adopt the transaction information for use by another project;
+   abandon,    to restore the transaction information to the way it was 
+               before the adoption (except for transaction ID after ABORT);
+   force_abandon,
+               to ignore all adoption errors and close adoption, this may
+               leave the adoption state inconsistent, so should be used
+               if all else fails;
+   get_pf_oid, to generate a page file opening ID specific to this process
+               and to save the OID for a close operation during the 
+               abandon process.
+*/
+
+/*  HISTORY
+Written by M. Pandolf, 08/30/82.
+Modified:
+08/15/82 by M. Pandolf: to use file_manager_ for manipulation of data
+	  management system files.
+12/21/82 by M. Pandolf:  to call bj_close_oid as part of abandoning.
+01/13/83 by L. A. Newcomb:  to call file_manager_$open_by_uid_after_crash
+	  if recovery is in progress.
+01/18/83 by L. A. Newcomb:  to fix subscriptrange problem in abandon
+	  in close_page_files loop and the adoption info structure.
+01/27/83 by M. Pandolf:  to eliminate clearing of pf_uid_list, which caused
+	  stringsize condition, and was not necessary anyway.
+02/04/83 by M. Pandolf:  to save error codes from file_manager_ in
+	  bjm_data_$bj_code.
+03/04/83 by M. Pandolf:  to make adopt call abandon if an adoption
+	  is still active and fix code to open_by_uid.
+03/14/83 by M. Pandolf:  to not look at (zeroed) p_tid as an indication
+	  of proper adoption during abandon.
+03/16/83 by L. A. Newcomb:  to use dm_error_$not_daemon for privilege check.
+05/13/83 by L. A. Newcomb:  Added pf_opening_error_code to internal hash table
+            so we can return it if we match in the hash search.
+12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+03/05/84 by L. A. Newcomb:  changed to use the include file dm_system_states
+            (renamed from dm_statuses), and to use the new names therein.
+04/06/84 by Lindsey L. Spratt:  Added shutdown_warning, user_shutdown, and
+            system_shutdown to running as valid states to do fm_$open_by_uid.
+09/10/84 by Lee A. Newcomb:  Changed to use the new system state constants and
+            fixed to not have variables declared by context or implication.
+11/30/84 by Maggie Sharpe:  to set/rest validation level around the calls to
+	  file_manager_.
+*/
+
+/* format:  style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+
+bj_adopt_txn$adopt:
+     proc (p_tix);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+dcl  (
+     p_tix		        fixed bin,		/* index of transaction to be adopted */
+     p_tid		        bit (36) aligned,	/* UID of transaction to be adopted */
+     p_pf_uid		        bit (36) aligned,	/* UID of page file to be opened for rollback */
+     p_pf_oid		        bit (36) aligned	/* OID of page file just opened */
+     )			        parameter;
+
+/* Automatic */
+dcl  (
+     tix			        fixed bin,		/* local copy of parameter */
+     tid			        bit (36) aligned,	/* local copy of parameter */
+     pf_uid		        bit (36) aligned,	/* local copy of parameter */
+     saved_level		        fixed bin,		/* caller's validation level */
+     code			        fixed bin (35),	/* standard system status code */
+     uid_ht_index		        fixed bin,		/* index into UID hash table */
+     curr_uid_list_index	        fixed bin,		/* index into UID list */
+     prev_uid_list_index	        fixed bin		/* to hold onto value of curr_uid_list_index */
+     )			        automatic;
+
+/* Based */
+dcl
+     1 adoption_info	        aligned based (adoption_info_ptr),
+       2 target_txn		        aligned,
+         3 tix		        fixed bin,
+         3 tid		        bit (36),
+         3 process_id	        bit (36),
+         3 bj_oid		        bit (36),
+         3 ppte_ptr		        pointer,
+       2 last_used_uid_list_entry     fixed bin,
+       2 pf_uid_ht		        dimension (0:511) fixed bin,
+       2 pf_uid_list	        dimension (0 refer (adoption_info.last_used_uid_list_entry)) aligned,
+         3 next		        fixed bin,		/* next entry in this uid list */
+         3 pf_uid		        bit (36),
+         3 pf_oid		        bit (36),
+         3 pf_opening_error_code      fixed bin (35);
+
+/* Builtin */
+dcl  (
+     addr, binary, null, substr,
+     unspec
+     )			        builtin;
+
+/* Condition */
+
+dcl  cleanup		        condition;
+
+/* Constant */
+dcl  (
+     myname		        char (32) init ("bj_adopt_txn")
+     )			        int static options (constant);
+
+/* Entry */
+dcl
+     get_process_id_	        entry () returns (bit (36)),
+     bj_report_err		        entry (fixed bin (35), char (*)),
+     get_temp_segment_	        entry (char (*), ptr, fixed bin (35)),
+     bj_oid_util$get_ptr	        entry (bit (36) aligned) returns (ptr),
+     bj_open_by_uid		        entry (bit (36) aligned, bit (36) aligned),
+     bj_close_oid		        entry (bit (36) aligned),
+     bj_pst_lock		        entry (),
+     get_ring_		        entry () returns (fixed bin (3)),
+     cu_$level_set		        entry (fixed bin),
+     cu_$level_get		        entry (fixed bin),
+     bj_pst_lock$unlock	        entry (),
+     file_manager_$close	        entry (bit (36) aligned, fixed bin (35)),
+     file_manager_$open_by_uid        entry (bit (36) aligned, bit (36) aligned, fixed bin (35)),
+     file_manager_$open_by_uid_after_crash
+			        entry (bit (36) aligned, bit (36) aligned, fixed bin (35));
+
+/* External */
+dcl  (
+     dm_data_$bj_txt_ptr	        ptr,
+     (dm_error_$not_daemon,				/* DM error codes */
+     dm_error_$bj_not_adopting,
+     dm_error_$bj_this_not_adopted
+     )			        fixed bin (35),
+     dm_system_data_$initializer_processid bit (36),
+     dm_system_data_$current_dm_state char (4) aligned
+     )			        external static;
+
+/* Static */
+dcl  (
+     adoption_info_ptr	        ptr init (null ())
+     )			        internal static;
+%page;
+/* bj_adopt_txn$adopt:		*/
+/*     proc (p_tix);		*/
+
+	tix = p_tix;
+
+/* only the data management daemon should get past this next check */
+
+	if dm_system_data_$initializer_processid ^= get_process_id_ ()
+	then do;
+	     call bj_report_err (dm_error_$not_daemon, myname);
+	     return;
+	end;
+
+/* see if we have to get space for the adoption information */
+
+	if adoption_info_ptr = null ()
+	then do;
+	     call get_temp_segment_ (myname, adoption_info_ptr, code);
+	     if adoption_info_ptr = null ()
+	     then do;
+		call bj_report_err (code, myname);
+		return;
+	     end;
+	     unspec (adoption_info) = "0"b;
+	end;
+
+/* see if an adoption is currently in progress */
+
+	if adoption_info.tix ^= 0
+	     then call abandon (adoption_info.tix, adoption_info.tid);
+
+/* TXTE assumed verified by bjm primitive, so copy pertinent data */
+
+	bj_txte_ptr = addr (dm_data_$bj_txt_ptr -> bj_txt.entry (tix));
+
+	adoption_info.target_txn.tid = bj_txte.tid;
+	adoption_info.target_txn.process_id = bj_txte.operator_info.process_id;
+	adoption_info.target_txn.bj_oid = bj_txte.operator_info.bj_oid;
+	adoption_info.target_txn.ppte_ptr = bj_txte.operator_info.ppte_ptr;
+	unspec (adoption_info.pf_uid_ht) = "0"b;
+	adoption_info.last_used_uid_list_entry = 0;
+
+/* set operator_info in TXTE to values for this process */
+
+	call bj_open_by_uid (bj_txte.bj_uid, bj_txte.operator_info.bj_oid);
+	bj_txte.operator_info.ppte_ptr = bj_oid_util$get_ptr (bj_txte.operator_info.bj_oid);
+	bj_txte.operator_info.process_id = dm_system_data_$initializer_processid;
+
+/* setting the TIX validates the adoption information */
+
+	adoption_info.target_txn.tix = tix;
+
+/* transaction is adopted from the point of view of before journal manager */
+
+	return;
+
+/*   end adopt; */
+%page;
+abandon:
+     entry (p_tix, p_tid);
+
+	tix = p_tix;
+	tid = p_tid;
+	call cu_$level_get (saved_level);
+
+	on cleanup begin;
+	     call cu_$level_set (saved_level);
+	end;
+
+/* have we adopted a transaction? */
+
+	if adoption_info_ptr = null ()		/* surely not! */
+	then do;
+	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+	     return;
+	end;
+
+	if adoption_info.target_txn.tix = 0
+	then do;
+	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+	     return;
+	end;
+
+	bj_txte_ptr = addr (dm_data_$bj_txt_ptr -> bj_txt.entry (adoption_info.target_txn.tix));
+
+	if adoption_info.target_txn.tix ^= tix | bj_txte.tid ^= tid
+	then do;
+	     call bj_report_err (dm_error_$bj_this_not_adopted, myname);
+	     return;
+	end;
+
+/* close all page files that were opened during the adoption */
+
+	call cu_$level_set (get_ring_ ());
+
+CLOSE_PAGE_FILES:
+	do curr_uid_list_index = 1 to adoption_info.last_used_uid_list_entry;
+
+	     if adoption_info.pf_uid_list (curr_uid_list_index).pf_oid ^= (36)"0"b
+		then call file_manager_$close (adoption_info.pf_uid_list (curr_uid_list_index).pf_oid, code);
+
+	end CLOSE_PAGE_FILES;
+
+	call cu_$level_set (saved_level);
+
+	unspec (adoption_info.pf_uid_ht) = "0"b;
+
+/* close the before journal */
+
+	call bj_pst_lock ();
+
+	call bj_close_oid (bj_txte.operator_info.bj_oid);
+
+	call bj_pst_lock$unlock ();
+
+/* set the ppte in the txte to null:  better to hit a brick wall than to fall into a wormhole... */
+
+	bj_txte.operator_info.ppte_ptr = null ();
+
+/* setting the TIX completes the abandoning.  note that this is also a back door */
+
+force_abandon:
+     entry ();
+	if adoption_info_ptr ^= null ()
+	     then adoption_info.tix = 0;
+
+/* finished */
+
+	return;
+%page;
+get_pf_oid:
+     entry (p_pf_uid, p_pf_oid);
+
+	pf_uid = p_pf_uid;
+	p_pf_oid = (36)"0"b;
+	call cu_$level_get (saved_level);
+
+	on cleanup begin;
+	     call cu_$level_set (saved_level);
+	end;
+
+/* have we adopted a transaction? */
+
+	if adoption_info_ptr = null ()		/* nope! */
+	then do;
+	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+	     return;
+	end;
+
+	if adoption_info.target_txn.tix = 0
+	then do;
+	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+	     return;
+	end;
+
+/* find beginning of list that includes the desired UID */
+
+	uid_ht_index = binary (substr (pf_uid, 28, 9));
+
+/* we walk the pf_uid_list looking for pf_uid */
+
+	prev_uid_list_index = 0;
+
+SEARCH_FOR_UID:
+	do curr_uid_list_index = adoption_info.pf_uid_ht (uid_ht_index)
+	     repeat (adoption_info.pf_uid_list (curr_uid_list_index).next)
+	     while (curr_uid_list_index ^= 0);
+
+	     if adoption_info.pf_uid_list (curr_uid_list_index).pf_uid = pf_uid
+	     then do;
+		p_pf_oid = adoption_info.pf_uid_list (curr_uid_list_index).pf_oid;
+		bjm_data_$bj_code =
+		     adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code;
+		return;			/* short cut */
+	     end;
+
+	     prev_uid_list_index = curr_uid_list_index;
+
+	end SEARCH_FOR_UID;
+
+/* if we made it here, then UID was not in the list */
+
+	call ALLOC_UID (pf_uid, curr_uid_list_index);
+
+	if prev_uid_list_index = 0			/* pf_uid_ht for this uid was empty */
+	     then adoption_info.pf_uid_ht (uid_ht_index) = curr_uid_list_index;
+	else adoption_info.pf_uid_list (prev_uid_list_index).next = curr_uid_list_index;
+
+	call cu_$level_set (get_ring_ ());
+	if dm_system_data_$current_dm_state = DM_SYSTEM_STATE_RUNNING
+	     | dm_system_data_$current_dm_state = DM_SYSTEM_STATE_SHUTDOWN_BEGUN
+	     | dm_system_data_$current_dm_state = DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS
+	     then
+	     call file_manager_$open_by_uid (pf_uid, adoption_info.pf_uid_list (curr_uid_list_index).pf_oid,
+		adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code);
+	else call file_manager_$open_by_uid_after_crash (pf_uid, adoption_info.pf_uid_list (curr_uid_list_index).pf_oid,
+		adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code);
+						/* don't check the code, because reporting */
+						/* an error would cause the whole rollback to */
+						/* be aborted.  if the code is not 0, then */
+						/* p_pf_oid will remain zero for the return */
+						/* and the non-zero code will be in static storage */
+
+	call cu_$level_set (saved_level);
+
+	p_pf_oid = adoption_info.pf_uid_list (curr_uid_list_index).pf_oid;
+	bjm_data_$bj_code = adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code;
+	call cu_$level_set (saved_level);
+
+	return;
+%page;
+ALLOC_UID:
+     proc (p_uid, p_index);
+
+/* Internal Declarations */
+
+dcl  p_uid		        bit (36) aligned parameter; /* UID which needs a slot in table */
+dcl  p_index		        fixed bin (17) aligned parameter; /* slot number into which we put UID */
+
+	p_index,
+	     adoption_info.last_used_uid_list_entry =
+	     adoption_info.last_used_uid_list_entry + 1;
+
+	adoption_info.pf_uid_list (adoption_info.last_used_uid_list_entry).pf_uid = p_uid;
+	adoption_info.pf_uid_list (adoption_info.last_used_uid_list_entry).next = 0;
+
+	return;
+
+     end ALLOC_UID;
+
+
+%page; %include dm_bj_static;
+%page; %include dm_bj_txt;
+%page; %include dm_system_states;
+%page; %include dm_bj_global_error_info;
+
+
+     end bj_adopt_txn$adopt;

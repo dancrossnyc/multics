@@ -1,0 +1,341 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-17,Fawcett), approve(86-01-17,MCR7220),
+     audit(86-05-14,Farley), install(86-07-17,MR12.0-1097):
+     Keith Loepere to extract disk spec parsing code and
+     call bce_parse_disk_spec (created for bce_copy_disk).
+  2) change(86-01-17,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-05-14,Farley), install(86-07-17,MR12.0-1097):
+     Changed to support subvolumes by adding call to disk_name_pvtx.
+                                                   END HISTORY COMMENTS */
+
+
+bce_test_disk: proc (p_ss_info_ptr);
+
+/* Written by Allen Ball June of 1984 to replace BOS command TEST. */
+/* Modified 85-01-09 ADB to fix d451. 'last' still refers to last record number
+                         before alt partition but user can still refer to
+                         records past the beginning of the alt partition. */
+/* Modified 85-02-09 Keith Loepere, to use bootload disk i/o for performance. */
+/* Modified 85-03-10 Keith Loepere to extract disk spec parsing code. */
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind35,^indcomtxt */
+
+/* Constants */
+
+dcl  Me				char (32) static options (constant) init ("test_disk");
+
+/* Parameters */
+
+dcl  p_ss_info_ptr			ptr parameter;
+
+/* Variables */
+
+dcl  arg_count			fixed bin;
+dcl  arg_len			fixed bin (21);
+dcl  arg_num			fixed bin;
+dcl  arg_ptr			ptr;
+dcl  code				fixed bin (35);
+dcl  device_type			fixed bin;	/* as in fs_dev_types */
+dcl  drive			char (8);		/* device name */
+dcl  error_on_write			bit (1);		/* report error for write op, not read */
+dcl  f_record			fixed bin (18);	/* first record to be read or written */
+dcl  force			bit (1) aligned;	/* don't ask questions */
+dcl  key				char (2);
+dcl  l_record			fixed bin (18);	/* last record to be read or written */
+dcl  1 my_label			aligned like label;
+dcl  new_record			fixed bin (18);	/* first record of new set to read/write */
+dcl  page_num			fixed bin;
+dcl  1 pattern			aligned,
+       2 word_pattern_len		fixed bin,
+       2 pattern_buffer		bit (1024 * 36) aligned; /* build area for pattern to write to disk */
+dcl  pattern_buffer_ptr		ptr;
+dcl  prev_record			fixed bin (18);	/* last record read/written */
+dcl  prev_record_in_cylinder		fixed bin;	/* (0 origin) record number within cylinder (used for detecting cylinder crossing) */
+dcl  pvtx				fixed bin;
+dcl  read_sw			bit (1);
+dcl  read_then_write		bit (1);
+dcl  records_this_cylinder		fixed bin;
+dcl  temp_astep			ptr;		/* to temp_seg in use */
+dcl  temp_seg_ptr			ptr;		/* to temp_seg (which we wire) */
+dcl  write_then_read		bit (1);
+dcl  write_sw			bit (1);
+dcl  yes_no			bit (1);
+
+/* External */
+
+dcl  error_table_$bad_arg		fixed bin (35) ext static;
+dcl  error_table_$noarg		fixed bin (35) ext static;
+
+/* Entries */
+
+dcl  bce_check_abort		entry;
+dcl  disk_name_pvtx			entry (char (8), fixed bin (17), fixed bin (35));
+dcl  bce_parse_disk_spec		entry (char (32), ptr, fixed bin, fixed bin, ptr, fixed bin (18), fixed bin (18), entry (ptr, fixed bin, ptr, fixed bin (35)), ptr, fixed bin (35));
+dcl  bce_query$yes_no		entry options (variable);
+dcl  bootload_disk_io$read		entry (fixed bin, fixed bin (18), fixed bin, ptr, fixed bin (35));
+dcl  bootload_disk_io$write		entry (fixed bin, fixed bin (18), fixed bin, ptr, fixed bin (35));
+dcl  com_err_			entry () options (variable);
+dcl  cu_$arg_count_rel		entry (fixed bin, ptr, fixed bin (35));
+dcl  cu_$arg_ptr_rel		entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr);
+dcl  cv_oct_check_			entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  get_ptrs_$given_segno		entry (fixed bin (15)) returns (ptr);
+dcl  get_temp_segment_		entry (char (*), ptr, fixed bin (35));
+dcl  ioa_				entry () options (variable);
+dcl  pc_abs$unwire_abs		entry (ptr, fixed bin, fixed bin);
+dcl  pc_abs$wire_abs_contig		entry (ptr, fixed bin, fixed bin, fixed bin (35));
+dcl  read_disk			entry (fixed bin, fixed bin (18), ptr, fixed bin (35));
+dcl  release_temp_segment_		entry (char (*), ptr, fixed bin (35));
+
+/* Based */
+
+dcl  arg				char (arg_len) based (arg_ptr);
+dcl  bootload_disk_buffer		(0:2) bit (1024 * 36) aligned based (temp_seg_ptr);
+dcl  word				bit (36) aligned based;
+dcl  word_pattern			bit (word_pattern_len * 36) based (pattern_buffer_ptr) aligned;
+
+/* Misc */
+
+dcl  cleanup			condition;
+
+dcl  (addr, addrel, copy, divide, max, min, mod, null, segno, unspec) builtin;
+%page;
+	ss_info_ptr = p_ss_info_ptr;
+	pattern_buffer_ptr = addr (pattern.pattern_buffer);
+	pvtp = addr (pvt$);
+	pvt_arrayp = addr (pvt.array);
+	call cu_$arg_count_rel (arg_count, ss_info.arg_list_ptr, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, Me);
+	     return;
+	end;
+	if arg_count < 2 then do;
+	     call ioa_ ("Usage:^/  ^a <key> <device> (<arg1> <arg2> ...)", Me);
+	     return;
+	end;
+	arg_num = 1;
+	call cu_$arg_ptr_rel (arg_num, arg_ptr, arg_len, code, ss_info.arg_list_ptr);
+	if code ^= 0 then do;
+	     call com_err_ (code, Me, "Can't get arg");
+	     return;
+	end;
+	if arg_len < 1 | arg_len > 2 then goto bad_key;
+	key = arg;
+	if ^(key = "r" | key = "w" | key = "rw" | key = "wr") then do;
+bad_key:	     call ioa_ ("^a: Unrecognized key - ^a", Me, arg);
+	     return;
+	end;
+	read_sw = (key = "r");
+	write_sw = (key = "w");
+	read_then_write = (key = "rw");
+	write_then_read = (key = "wr");
+
+	arg_num = 2;
+	call cu_$arg_ptr_rel (arg_num, arg_ptr, arg_len, code, ss_info.arg_list_ptr);
+
+	drive = arg;
+	call disk_name_pvtx (drive, pvtx, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, Me, "^a", arg);
+	     return;
+	end;
+
+	pattern.word_pattern_len = 0;
+	force = "0"b;
+
+	labelp = addr (my_label);
+	call read_disk (pvtx, (LABEL_ADDR), labelp, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, Me, "Could not read label of ^a.", drive);
+	     return;
+	end;
+
+	device_type = pvt_array (pvtx).device_type;
+
+	arg_num = 3;
+	call bce_parse_disk_spec (Me, ss_info.arg_list_ptr, arg_num, device_type, labelp, f_record, l_record, pattern_parse, addr (pattern), code);
+	if code ^= 0 then return;
+
+/* Now that f_record and l_record are assigned we will give them their chance to turn back. */
+
+	if write_sw | write_then_read then do;
+	     if f_record = l_record then call ioa_ ("Writing to record number ^oo on ^a.", f_record, drive);
+	     else call ioa_ ("Writing to records ^oo through ^oo (inclusive) on ^a.", f_record, l_record, drive);
+	     if ^force then do;
+		call bce_query$yes_no (yes_no, "Do you wish to write to the ^[non ^;^]^a - ^a? ",
+		     (label.Multics ^= Multics_ID_String), Multics_ID_String, drive);
+		if ^yes_no then return;
+	     end;
+	end;
+
+	if pattern.word_pattern_len = 0 then unspec (pattern.pattern_buffer) = "0"b;
+	else pattern.pattern_buffer = copy (word_pattern, divide (1024, pattern.word_pattern_len, 17) + 1);
+%page;
+
+/* Now for the real work.  The basic loop structure below implements the 4
+keys as follows.  For "r", we simply keep reading into our wired buffer.
+For "w", we copy our pattern into the wired buffer once, and then keep
+writing from it.  For "rw", we read into and write back from the wired buffer.
+For "wr", though, we must copy the pattern into the wired buffer each time
+through.
+
+The i/o is done backwards, and (normally) three pages at a time.  This is
+to minimize latency between i/o's, to maximize the time we have between i/o's
+to get our next request in, within the constraints that bootload_disk_io
+can handle a maximum of 4 pages at a time.  Three pages is optimal both for
+451 and 501 style drives.
+
+However, we don't want to read/write a set of pages that cross a cylinder
+boundary, so we check for this.  Also, if an i/o error occurs, we go back
+to reading/writing a single page, so that we can eventually track down which
+page(s) really can't be read/written. */
+
+/* try to find wired work area */
+
+	temp_seg_ptr = null;
+	call get_temp_segment_ (Me, temp_seg_ptr, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, Me, "Unable to get temp disk buffer.");
+	     return;
+	end;
+
+	temp_astep = get_ptrs_$given_segno (segno (temp_seg_ptr));
+	call pc_abs$wire_abs_contig (temp_astep, 0, 3, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, Me, "Unable to wire temp disk buffer.");
+	     call release_temp_segment_ (Me, temp_seg_ptr, code);
+	     return;
+	end;
+
+	on cleanup call clean_up;			/* remember, this is only called during bce_check_abort */
+
+	if write_sw then do page_num = 0 to 2;
+	     bootload_disk_buffer (page_num) = pattern.pattern_buffer;
+	end;
+
+	prev_record = l_record + 1;
+	prev_record_in_cylinder = mod (prev_record, rec_per_cyl (device_type));
+	do while (prev_record > f_record);		/* stop when processed lowest record */
+	     if prev_record_in_cylinder = 0 then prev_record_in_cylinder = rec_per_cyl (device_type); /* next cylinder */
+	     records_this_cylinder = min (prev_record_in_cylinder, 3); /* num pages to do this time around */
+	     new_record = max (prev_record - records_this_cylinder, f_record); /* don't go over requested area */
+	     records_this_cylinder = prev_record - new_record; /* real amt to do */
+
+retry:	     call bce_check_abort;
+	     if write_then_read then do;
+		do page_num = 0 to records_this_cylinder - 1;
+		     bootload_disk_buffer (page_num) = pattern.pattern_buffer;
+		end;
+		call bootload_disk_io$write (pvtx, new_record, records_this_cylinder, temp_seg_ptr, code);
+		if code ^= 0 then do;
+		     error_on_write = "1"b;
+		     go to io_error;
+		end;
+	     end;
+	     if ^write_sw then do;
+		call bootload_disk_io$read (pvtx, new_record, records_this_cylinder, temp_seg_ptr, code);
+		if code ^= 0 then do;
+		     error_on_write = "0"b;
+		     go to io_error;
+		end;
+	     end;
+	     if read_then_write | write_sw then do;
+		call bootload_disk_io$write (pvtx, new_record, records_this_cylinder, temp_seg_ptr, code);
+		if code ^= 0 then do;
+		     error_on_write = "1"b;
+io_error:		     if records_this_cylinder > 1 then do; /* try i/o on just 1 record to find fault one */
+			new_record = prev_record - 1;
+			records_this_cylinder = 1;
+			go to retry;
+		     end;
+		     else do;
+			call com_err_ (0, Me, "Could not ^[write^;read^] record ^oo on ^a.", error_on_write, new_record, drive);
+			go to next_record;
+		     end;
+		end;
+	     end;
+	     if write_then_read then
+		do page_num = 0 to records_this_cylinder - 1;
+		if bootload_disk_buffer (page_num) ^= pattern.pattern_buffer then
+		     call ioa_ ("^a: What was read did not match what was written at record ^oo of ^a.", Me, new_record + page_num, drive);
+	     end;
+
+next_record:   prev_record = new_record;
+	     prev_record_in_cylinder = prev_record_in_cylinder - records_this_cylinder;
+	end;
+
+	call clean_up;
+	return;
+
+clean_up: proc;
+
+	call pc_abs$unwire_abs (temp_astep, 0, 3);
+	call release_temp_segment_ (Me, temp_seg_ptr, code);
+	return;
+     end;
+%page;
+pattern_parse: proc (arg_list_ptr, arg_num, info_ptr, code);
+
+/* called by bce_parse_disk_spec when it doesn't like something,
+most likely a pattern spec */
+
+dcl  arg_list_ptr			ptr parameter;
+dcl  arg_num			fixed bin parameter;
+dcl  code				fixed bin (35) parameter;
+dcl  info_ptr			ptr parameter;
+
+dcl  number			fixed bin (35);
+
+	call cu_$arg_count_rel (arg_count, arg_list_ptr, code);
+	call cu_$arg_ptr_rel (arg_num, arg_ptr, arg_len, code, arg_list_ptr);
+	if arg = "-force" | arg = "-fc" then force = "1"b;
+	else if arg = "-pattern" | arg = "-pat" then do;
+	     pattern.word_pattern_len = 0;
+	     if key = "rw" | key = "r" then do;
+		code = error_table_$bad_arg;
+		call com_err_ (code, Me, "-pattern is incompatible with the ^a key.", key);
+		return;
+	     end;
+next_word:     arg_num = arg_num + 1;
+	     if arg_num > arg_count then go to end_pattern;
+	     call cu_$arg_ptr_rel (arg_num, arg_ptr, arg_len, code, arg_list_ptr);
+	     number = cv_oct_check_ (arg, code);
+	     if code ^= 0 then do;			/* not a number */
+		arg_num = arg_num - 1;		/* most likely a new control arg */
+
+end_pattern:	if pattern.word_pattern_len ^= 0 then code = 0;
+		else do;				/* pattern spec missing */
+		     code = error_table_$noarg;
+		     call com_err_ (code, Me, "pattern");
+		end;
+		return;
+	     end;
+	     else do;
+		addrel (pattern_buffer_ptr, pattern.word_pattern_len) -> word = unspec (number);
+		pattern.word_pattern_len = pattern.word_pattern_len + 1;
+		goto next_word;
+	     end;
+	end;
+	else do;
+	     code = error_table_$bad_arg;
+	     call com_err_ (code, Me, "^a", arg);
+	     return;
+	end;
+	code = 0;
+	return;
+     end pattern_parse;
+%page; %include bce_subsystem_info_;
+%page; %include disk_pack;
+%page; %include fs_dev_types;
+%page; %include fs_vol_label;
+%page; %include pvt;
+%page; %include pvte;
+     end bce_test_disk;

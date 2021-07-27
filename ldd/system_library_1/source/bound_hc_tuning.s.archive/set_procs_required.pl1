@@ -1,0 +1,480 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1986 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(81-09-01,Bongiovanni), approve(), audit(), install():
+      Written by J. Bongiovanni.
+  2) change(83-08-01,Bongiovanni), approve(), audit(), install():
+      Modified to initialize variables in given_processid.
+  3) change(86-06-02,Lippard), approve(87-02-09,MCR7616),
+     audit(87-06-03,Farley), install(87-08-06,MR12.1-1063):
+      Modified to fix coding error which sometimes allowed sprq'ing an
+      offline cpu.
+  4) change(87-01-12,Lippard), approve(87-02-09,MCR7616),
+     audit(87-06-03,Farley), install(87-08-06,MR12.1-1063):
+      Modified to check ACS before allowing sprq. Removed the obsolete
+      single_cpu entry point and associated code.
+  5) change(87-08-07,Lippard), approve(87-02-09,PBF7616),
+     audit(87-08-11,Farley), install(87-08-18,MR12.1-1090):
+      Added entry points get_procs_required and get_system_procs_required.
+  6) change(87-08-27,Lippard), approve(87-02-09,PBF7616),
+     audit(87-08-28,Farley), install(87-09-01,MR12.1-1095):
+      Always allow Initializer access.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style3 */
+set_procs_required:
+     proc (a_procs_required, a_code);
+
+/*  Ring-0 routine to allow suitably a privileged process to
+    set per-process or system default CPUs required.  Access
+    is controlled by gates to this procedure.  Although this
+    routine locks the Global APT Lock, it is normally unwired,
+    as it is called infrequently.
+
+    Entries:
+
+    set_procs_required - sets per-process CPUs required
+
+    given_processid    - sets per-process CPUs required for
+		     another process
+
+    system_default     - sets the system default group of CPUs
+		     required (this default applies to processes
+		     which have not requested specific CPUs)
+
+    get_procs_required - gets per-process CPUs required
+
+    get_system_procs_required - gets system default group of CPUs
+                         required */
+
+/*  Parameter */
+
+dcl	a_code		fixed bin (35) parameter;	/* standard error code */
+dcl	a_default_flag	bit (1) aligned parameter;	/* on if set of CPUs is default */
+dcl	a_processid	bit (36) aligned parameter;	/* target processid */
+dcl	a_procs_required	bit (8) aligned parameter;	/* mask of CPUs required */
+
+/*  Automatic */
+
+dcl	apteap		ptr;			/* pointer to APTE array */
+dcl	aptex		fixed bin;		/* index into APTE array */
+dcl	bad_processid	bit (1);			/* ON => invalid target processid */
+dcl	code		fixed bin (35);		/* error code (standard or otherwise) */
+dcl	cpu_num		fixed bin;		/* CPU number (0-7) */
+dcl	1 event_flags	like audit_event_flags;	/* audit flags for access_audit_ */
+dcl	is_default	bit (1);			/* ON => setting to system default */
+dcl	local_apte_ptr	ptr;			/* pointer to user's APT entry */
+dcl	mode		bit (36) aligned;		/* ACS access mode */
+dcl	n_aptes		fixed bin;		/* number of APTEs */
+dcl	no_cpus_online	bit (1);			/* ON => requested set of CPUs had none online */
+dcl	old_procs_required	bit (8) aligned;		/* previous value of system default */
+dcl	old_procs_required_tags
+			char (8);			/* CPU tags of previous system default */
+dcl	processid		bit (36) aligned;		/* target processid */
+dcl	procs_required	bit (8) aligned;		/* mask of CPUs required */
+dcl	procs_required_tags char (8);			/* CPU tags of new system default */
+dcl	ptwp		ptr;			/* saved pointer to stack page table for pmut */
+dcl	saved_mask	fixed bin (71);		/* saved interrupt mask for pmut */
+
+/*  Static */
+
+dcl	CPUS		char (8) init ("ABCDEFGH") int static options (constant);
+dcl	INITIALIZER	char (23) init ("Initializer.SysDaemon.z") int static options (constant);
+dcl	MAX_CPU_TAG	fixed bin init (7) int static options (constant);
+dcl	SPRQ_ACS_DIR	char (14) init (">sc1>admin_acs") int static options (constant);
+dcl	SPRQ_ACS_SEG	char (21) init ("set_proc_required.acs") int static options (constant);
+
+/*  Based */
+
+dcl	1 aptea		(n_aptes) aligned based (apteap) like apte;
+dcl	1 local_apte	aligned based (local_apte_ptr) like apte;
+
+/* Entry */
+
+dcl	access_audit_$log_general
+			entry options (variable);
+dcl	level$get		entry returns (fixed bin);
+dcl	pmut$wire_and_mask	entry (fixed bin (71), ptr);
+dcl	pmut$unwire_unmask	entry (fixed bin (71), ptr);
+dcl	pxss$lock_apt	entry;
+dcl	pxss$lock_apte	entry (bit (36) aligned, ptr, fixed bin (35));
+dcl	pxss$set_procs_required
+			entry (bit (8) aligned, fixed bin (35));
+dcl	pxss$unlock_apt	entry;
+dcl	pxss$unlock_apte	entry (ptr);
+dcl	status_$get_user_raw_mode
+			entry (char (*), char (*), char (*), bit (36) aligned, fixed bin (35));
+dcl	syserr		entry options (variable);
+dcl	syserr$error_code	entry options (variable);
+dcl	wire_proc$wire_me	entry;
+dcl	wire_proc$unwire_me entry;
+
+/* External */
+
+dcl	access_operations_$get_procs_required
+			bit (36) aligned external;
+dcl	access_operations_$set_procs_required
+			bit (36) aligned external;
+dcl	error_table_$bad_arg
+			fixed bin (35) external;
+dcl	error_table_$insufficient_access
+			fixed bin (35) ext static;
+dcl	error_table_$no_cpus_online
+			fixed bin (35) external;
+dcl	error_table_$process_unknown
+			fixed bin (35) external;
+dcl	pds$apt_ptr	ptr external;
+dcl	pds$process_group_id
+			char (32) aligned external;
+dcl	scs$processor	bit (8) aligned external;
+dcl	tc_data$apt	bit (36) aligned external;
+dcl	tc_data$apt_size	fixed bin external;
+dcl	tc_data$default_procs_required
+			bit (8) aligned external;
+
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	null		builtin;
+dcl	rtrim		builtin;
+dcl	string		builtin;
+dcl	substr		builtin;
+
+%page;
+/* SET_PROCS_REQUIRED - set CPUs required for this process
+
+   takes a bit mask specifying CPUs required ("0"b means current
+                        system default)
+
+   return code = 0    - this process running on some CPU in the group
+
+	       error_table_$no_cpus_online - the set requested had
+	              no CPUs online
+*/
+
+	procs_required = a_procs_required;		/* copy to stack which will be wired */
+	if ^CHECK_ACCESS (access_operations_$set_procs_required)
+	then do;
+		a_code = error_table_$insufficient_access;
+		return;
+	     end;
+
+	call SET_MY_PROCS_REQUIRED (procs_required, code);
+
+	a_code = code;
+	return;
+
+%page;
+/* GIVEN_PROCESSID     - sets per-process CPUs required for another
+                         process
+
+   takes a bit mask specifying CPUs required ("0"b means current
+   system default) and a processid.
+
+   return code = 0    - proc_required mask set for target process
+                        (will take effect on next trip thru getwork)
+
+                 error_table_$no_cpus_online - the set requested had
+                        no CPUs online
+
+                 error_table_$process_unknown - the target processid
+                        is invalid
+*/
+
+given_processid:
+     entry (a_procs_required, a_processid, a_code);
+
+	procs_required = a_procs_required;		/* copy arguments to stack to be wired */
+	processid = a_processid;
+
+	call WIRE_LOCK_APT;
+
+/* ---------- WIRED, MASKED, GLOBAL APT LOCK HELD ---------- */
+
+	if procs_required = "0"b
+	then do;					/* system default */
+		is_default = "1"b;
+		procs_required = tc_data$default_procs_required;
+	     end;
+	else is_default = "0"b;
+
+
+	bad_processid = "0"b;			/* Steve Harris says this is useful */
+	if (scs$processor & procs_required) = "0"b
+	then no_cpus_online = "1"b;			/* No online CPUs in requested set */
+	else do;
+		no_cpus_online = "0"b;		/* Steve was correct */
+		call pxss$lock_apte (processid, aptep, code);
+						/* Check processid, lock APTE, set aptep */
+		if code ^= 0
+		then bad_processid = "1"b;		/* Could not lock - processid not found */
+		else if apte.flags.idle		/* Don't allow idle process to change */
+		then do;
+			bad_processid = "1"b;
+			call pxss$unlock_apte (aptep);
+		     end;
+		else do;
+			apte.procs_required = procs_required;
+			apte.flags.default_procs_required = is_default;
+			call pxss$unlock_apte (aptep);/* Unlock APTE */
+		     end;
+	     end;
+
+	call UNLOCK_APT_UNWIRE;
+
+/* ---------- UNMASKED, UNWIRED, NO LOCKS HELD ---------- */
+
+	if no_cpus_online
+	then a_code = error_table_$no_cpus_online;
+	else if bad_processid
+	then a_code = error_table_$process_unknown;
+	else a_code = 0;
+
+	return;
+%page;
+/* SYSTEM_DEFAULT     - sets the system default group of CPUs required
+
+   takes a bit mask specifying the CPUs required
+
+   walks the APTE array and changes procs_required for all processes
+   with current default to new default
+
+   return code = 0    - default set as requested
+
+	       error_table_$no_cpus_online - the set requested had
+                        no CPUs online
+
+                 error_table_$bad_arg - a mask of "0"b was specified
+                        (no CPUs)
+*/
+
+system_default:
+     entry (a_procs_required, a_code);
+
+	procs_required = a_procs_required;		/* copy to stack to be wired */
+
+	if procs_required = "0"b
+	then do;					/* no CPUs in set */
+		a_code = error_table_$bad_arg;
+		return;
+	     end;
+
+	no_cpus_online = "0"b;
+
+	call WIRE_LOCK_APT;
+
+/* ---------- WIRED, MASKED, GLOBAL APT LOCK HELD ---------- */
+
+	if (scs$processor & procs_required) = "0"b
+	then no_cpus_online = "1"b;			/* No online CPUs in set requested */
+	else do;
+		old_procs_required = tc_data$default_procs_required;
+		tc_data$default_procs_required = procs_required;
+		apteap = addr (tc_data$apt);
+		n_aptes = tc_data$apt_size;
+		do aptex = 1 to n_aptes;
+		     if aptea (aptex).flags.default_procs_required
+						/* This process has system default */
+		     then aptea (aptex).procs_required = procs_required;
+		end;
+	     end;
+
+	call UNLOCK_APT_UNWIRE;
+
+
+/* ---------- UNMASKED, UNWIRED, NO LOCKS HELD ---------- */
+
+	if no_cpus_online
+	then a_code = error_table_$no_cpus_online;
+	else do;
+		a_code = 0;
+		procs_required_tags, old_procs_required_tags = "";
+						/* Build syserr message */
+		do cpu_num = 0 to MAX_CPU_TAG;
+		     if substr (procs_required, cpu_num + 1, 1) = "1"b
+		     then procs_required_tags = rtrim (procs_required_tags) || substr (CPUS, cpu_num + 1, 1);
+		     if substr (old_procs_required, cpu_num + 1, 1) = "1"b
+		     then old_procs_required_tags = rtrim (old_procs_required_tags) || substr (CPUS, cpu_num + 1, 1);
+		end;
+		call syserr (SYSERR_PRINT_ON_CONSOLE,
+		     "set_procs_required: Changing system default CPUs required from ^a to ^a for ^a",
+		     old_procs_required_tags, procs_required_tags, pds$process_group_id);
+	     end;
+
+	return;
+%page;
+/* GET_PROCS_REQUIRED - gets the per-process CPUs required
+
+   returns a bit mask specifying CPUs required, a bit indicating
+   whether the CPUs required is the default, and an error code. */
+
+get_procs_required:
+     entry (a_procs_required, a_default_flag, a_code);
+
+	if ^CHECK_ACCESS (access_operations_$get_procs_required)
+	then do;
+		a_code = error_table_$insufficient_access;
+		return;
+	     end;
+
+	local_apte_ptr = pds$apt_ptr;
+	a_procs_required = local_apte.procs_required;
+	a_default_flag = local_apte.flags.default_procs_required;
+	a_code = 0;
+	return;
+%page;
+/* GET_SYSTEM_PROCS_REQUIRED - gets system default group of CPUs required
+   returns a bit mask specifying CPUs required by the system */
+
+get_system_procs_required:
+     entry (a_procs_required);
+
+	a_procs_required = tc_data$default_procs_required;
+	return;
+
+%page;
+/* Internal Procedure to check ACS segment for access */
+CHECK_ACCESS:
+     proc (a_access_op) returns (bit (1) aligned);
+
+dcl	a_access_op	bit (36) aligned parm;
+dcl	access_op		bit (36) aligned;
+dcl	have_access	bit (1) aligned;
+dcl	return_code	fixed bin (35);
+
+	access_op = a_access_op;
+	have_access = "0"b;
+	return_code = 0;
+
+	if pds$process_group_id = INITIALIZER then return ("1"b);
+
+	call status_$get_user_raw_mode (SPRQ_ACS_DIR, SPRQ_ACS_SEG, "", mode, code);
+	if code ^= 0
+	then do;
+		call syserr$error_code (SYSERR_LOG_OR_PRINT, code,
+		     "set_procs_required: Failed to check access for ^a.", pds$process_group_id);
+		return ("0"b);
+	     end;
+
+	if (mode & RW_ACCESS) = RW_ACCESS
+	then have_access = "1"b;
+	else return_code = error_table_$insufficient_access;
+
+	string (event_flags) = ""b;
+	event_flags.priv_op = "1"b;
+	event_flags.grant = have_access;
+
+	call access_audit_$log_general ("set_procs_required", level$get (), string (event_flags), access_op, "",
+	     return_code, null (), 0);
+	return (have_access);
+
+     end CHECK_ACCESS;
+
+%page;
+/* Internal Procedure to set the CPUs required for this process */
+
+SET_MY_PROCS_REQUIRED:
+     proc (procs, code);
+
+dcl	procs		bit (8) aligned;		/* Mask for CPUs required */
+dcl	code		fixed bin (35);		/* Standard error code */
+
+dcl	pxss_code		fixed bin (35);		/* Non-standard error code from pxss */
+
+
+	call pxss$set_procs_required (procs, pxss_code);
+	if pxss_code = 0
+	then code = 0;
+	else code = error_table_$no_cpus_online;
+	return;
+
+
+     end SET_MY_PROCS_REQUIRED;
+
+%page;
+/* Internal Procedure to wire this procedure (text and linkage), wire
+   stack, mask to system level, and lock the Global APT Lock */
+
+WIRE_LOCK_APT:
+     proc;
+
+	call wire_proc$wire_me;
+	call pmut$wire_and_mask (saved_mask, ptwp);
+	call pxss$lock_apt;
+
+
+     end WIRE_LOCK_APT;
+
+
+
+
+
+
+
+
+/* Internal Procedure to Unlock Global APT Lock, Reset mask to previous,
+   Unwire Stack, Unwire text and linkage */
+
+UNLOCK_APT_UNWIRE:
+     proc;
+
+
+	call pxss$unlock_apt;
+	call pmut$unwire_unmask (saved_mask, ptwp);
+	call wire_proc$unwire_me;
+
+
+     end UNLOCK_APT_UNWIRE;
+
+
+%page;
+%include access_audit_eventflags;
+%include access_mode_values;
+%include apte;
+%include syserr_constants;
+
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   set_procs_required: Changing system default CPUs required from XXXX to YYYY for PERSON.PROJECT.TAG
+
+   S: $info
+
+   T: $run
+
+   M: The default set of CPUs has been changed from XXXX (CPU tags) to YYYY
+   (CPU tags) by PERSON.PROJECT.TAG.  These are the only CPUs on which
+   processes will run which have not requested to be run on specific CPUs.
+
+   A: $ignore
+
+
+   Message:
+   set_procs_required: Failed to check access for USER.
+
+   S: $log
+
+   T: $run
+
+   M: Access on >sc1>admin_acs>set_proc_required.acs could not be checked.
+
+   A: Verify that the ACS seg exists.
+
+   END MESSAGE DOCUMENTATION */
+
+     end set_procs_required;
+

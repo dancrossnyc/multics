@@ -1,0 +1,788 @@
+/****^  ***********************************************************
+        *                                                         *
+        * copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(74-10-06,Silver), approve(), audit(), install():
+     Written by Bill Silver.
+  2) change(77-09-01,Morris), approve(), audit(), install():
+     Reading algorithm completely reworked.
+  3) change(81-01-02,Bush), approve(), audit(), install():
+     for bootable tape labels.
+  4) change(81-08-12,Bush), approve(), audit(), install():
+     Pre-Mr9.0 label compatibility.
+  5) change(81-12-15,Bush), approve(), audit(), install():
+     Rewrote read error recovery.
+  6) change(82-08-01,SKrupp), approve(), audit(), install():
+     changed from tdcm_ interface to tape_ioi_.
+  7) change(83-03-01,Kittlitz), approve(), audit(), install():
+     added 256K segment processing ability.
+  8) change(83-09-01,SKrupp), approve(), audit(), install():
+     to abort read retries on unrecoverable errors that return certain
+     major statuses (such as POWER_OFF or DEVICE_ATTENTION etc.).
+  9) change(84-09-01,CJones), approve(), audit(), install():
+     to ignore consecutive EOFs and to recognize a record with a UID less
+     than the label UID as EOI.
+ 10) change(85-03-11,Margulies), approve(), audit(), install():
+     Get rid of useless "clean the tape" repositioning. Return
+     error_table_$data_loss if we lose stream.
+ 11) change(85-05-17,Margulies), approve(), audit(), install():
+     Remove misleading dead code on data_loss.
+ 12) change(86-02-13,GWMay), approve(86-02-13,MCR7337), audit(86-03-11,Farley),
+     install(86-03-17,MR12.0-1030):
+     Changed to allow no further reading after the eor mark is found.
+     Restructured the routine VALIDATE_CHARS so that the end-of-reel (eor)
+     mark is always diagnosed. The code is set up to diagnose other errors
+     encountered in the read first and then return the
+     error_table_$end_of_information code on the next read. If there are no
+     other errors, the code is returned on the first pass.
+ 13) change(86-09-30,GWMay), approve(86-09-30,MCR7552),
+     audit(86-10-13,Martinson), install(86-10-20,MR12.0-1189):
+     rewritten to eliminate useless intermediate subroutines which have lost
+     their functionality over the years. Modified the record evaluation
+     conditions to match on the record number of the tape record only when
+     determining data loss. Moved density determination process from
+     tape_mult_labeler_ to this module.  Added back the repositioning code
+     with some additional retry processes that will reduce data loss errors
+     considerably and give tape_mult_ much better tape reading powers.
+ 14) change(86-10-22,GWMay), approve(86-10-22,PBF7552),
+     audit(86-11-19,Martinson), install(86-11-21,MR12.0-1223):
+     added to sets of tmdb.opt.flags.begin to set allow operations to know when
+     we are at the beginnning of the tape and when we are into it. changed
+     things around just a little bit to make the tape complete rewinds before
+     setting the next density.  Also, removed the return on bad code from below
+     the call to tape_ioi to set density because, if the tape drive does not
+     support the particular density we are trying to set, then it will return
+     when in fact there is special handling for bad density.  the problem which
+     results is that we return and incorrect error message sometimes.
+ 15) change(87-03-30,GWMay), approve(87-03-30,MCR7643), audit(87-03-31,Farley),
+     install(87-04-28,MR12.1-1028):
+     changed to not reset the valid information flag when the retry loop is
+     exhausted.
+ 16) change(87-07-07,GWMay), approve(87-07-17,MCR7747),
+     audit(87-07-07,Beattie), install(87-07-17,MR12.1-1043):
+     Changed to return immediately when records are out of sequence.
+                                                   END HISTORY COMMENTS */
+
+/* format: off */
+%page;
+tape_mult_read_: proc;
+
+/* This program is part of the Multics standard tape I/O module, tape_mult_.*/
+/* This program contains all of the read logic needed by tape_mult_.	      */
+/* It implements the iox_$get_chars entry point.  It also contains an entry */
+/* point for reading the label record.				      */
+
+       dcl Piocb			ptr,
+	 Ptmdb			ptr,
+	 number_of_chars_requested	fixed bin (21),
+	 code			fixed bin (35);
+
+       dcl Lcallers_buffer		fixed bin (21),
+	 Pcallers_buffer		ptr,
+				/* never ever assign a value to     */
+				/* this pointer.		      */
+	 callers_buffer		char  (Lcallers_buffer)
+				based (Pcallers_buffer);
+
+       dcl Lcallers_buffer_insert	fixed bin (21),
+	 Pcallers_buffer_insert	ptr,
+	 callers_buffer_insert	char  (Lcallers_buffer_insert)
+				based (Pcallers_buffer_insert);
+
+       dcl Ldata_to_return		fixed bin,
+	 Pdata_to_return		ptr,
+	 data_to_return		char  (Ldata_to_return)
+				based (Pdata_to_return);
+
+       dcl Sentry_was_at_get_chars	bit (1) aligned,
+	 Shave_a_label		bit (1) aligned,
+	 Shave_next_record		bit (1) aligned,
+	 Smissing_eor		bit (1) aligned,
+	 Srecovery		bit (1) aligned,
+	 Suser_defined_bootlabel	bit (1) aligned,
+	 auto_retry_cnt		fixed bin,
+	 channel_command		bit (6) aligned,
+	 density_counter		fixed bin,
+	 density_index		fixed bin,
+	 density_index_adder	fixed bin,
+	 number_of_chars_left_to_return
+				fixed bin (21),
+           read_cnt			fixed bin,
+	 reads_past_error		fixed bin,
+	 rewind_cnt		fixed bin,
+	 test_checksum		bit (36) aligned;
+
+/* constants */
+
+       dcl DENSITY (0:2)		fixed bin 
+				internal static options (constant)
+				init (800, 1600, 6250),
+           LABEL_LEN		fixed bin internal static
+				options (constant) init (48),
+           MAX_AUTO_RETRYS		fixed bin internal static
+				options (constant) init (8),
+           MAX_BK_RETRYS		fixed bin internal static
+				options (constant) init (2),
+           MAX_FWD_READS		fixed bin internal static
+				options (constant) init (64),
+           MAX_LABEL_READS		fixed bin internal static
+				options (constant) init (8),
+           MAX_READS_PAST_ERROR	fixed bin internal static
+				options (constant) init (32),
+           FIVE_FILES		fixed bin internal static
+				options (constant) init (5),
+           ONE_FILE			fixed bin internal static
+				options (constant) init (1),
+           TWO_FILES		fixed bin internal static
+				options (constant) init (2);
+
+/* builtins */
+
+       dcl (addcharno, addr, bin, bit, currentsize, divide, hbound,
+	  lbound, min, mod, null, string, substr, unspec)
+				builtin;
+	       
+/* external static */
+
+       dcl error_table_$bad_density	fixed bin (35) external static,
+	 error_table_$bad_label	fixed bin (35) external static,
+	 error_table_$data_improperly_terminated
+				fixed bin (35) external static,
+           error_table_$data_loss	fixed bin (35) external static,
+	 error_table_$device_attention
+				fixed bin (35) external static,
+           error_table_$device_parity	fixed bin (35) external static,
+	 error_table_$end_of_info	fixed bin (35) external static,
+	 error_table_$improper_data_format
+				fixed bin (35) external static,
+           error_table_$invalid_read	fixed bin (35) external static,
+	 error_table_$no_operation	fixed bin (35) external static,
+	 error_table_$null_info_ptr	fixed bin (35) external static,
+	 error_table_$tape_error	fixed bin (35) external static,
+	 sys_info$seg_size_256K	fixed bin (19) external static;
+
+/* external entries */
+
+       dcl sub_err_			entry () options (variable),
+	 tape_checksum_		ext entry (ptr, ptr);
+
+%page;
+/* ************************************************************************ */
+
+get_chars: entry (Piocb,
+	        Pcallers_buffer,
+	        number_of_chars_requested,
+	        Lcallers_buffer,
+	        code);
+
+/* ************************************************************************ */
+
+       code = 0;
+       Sentry_was_at_get_chars = "1"b;
+       call get_number_of_chars_requested (Sentry_was_at_get_chars, code);
+       return;
+%page;
+/* ************************************************************************ */
+
+position: entry (Piocb,
+	       arg_pos_type,
+	       number_of_chars_requested,
+	       code);
+
+/* ************************************************************************ */
+/*							      */
+/* Although the position i/o operation is not supported externally, this    */
+/* entry allows forward positioning.				      */
+/*							      */
+/* Usage: io switch_name position 3 {number of chars to position forward}   */
+/*							      */
+/* ************************************************************************ */
+
+       dcl arg_pos_type		fixed bin;
+
+       code = 0;
+
+       if arg_pos_type ^= 3 then do;	/* Only type 3 supported */
+	code = error_table_$no_operation;
+	return;
+	end;
+
+       if number_of_chars_requested = 0 then
+	return;
+
+       Sentry_was_at_get_chars = "0"b;
+       call get_number_of_chars_requested (Sentry_was_at_get_chars, code);
+       return;
+%page;
+get_number_of_chars_requested: proc (Sentry_was_at_get_chars,
+			       code);
+
+       dcl Sentry_was_at_get_chars	bit(1) aligned,
+	 code			fixed bin (35);	 
+
+       if number_of_chars_requested < 0
+	| number_of_chars_requested > sys_info$seg_size_256K * 4 then do;
+	if Sentry_was_at_get_chars then
+	   Lcallers_buffer = 0;
+	code = error_table_$no_operation;
+	return;
+	end;
+
+       tmdb_ptr = Piocb -> iocb.actual_iocb_ptr -> iocb.attach_data_ptr;
+
+       if tmdb_ptr = null then do;
+	code = error_table_$null_info_ptr;
+	return;
+	end;
+
+       if tmdb.opt.write_sw then do;    /* can't write & read together     */
+	code = error_table_$invalid_read;
+	return;
+	end;
+
+       if tmdb.work.flags.eod then do;  /* at the logical end of the tape  */
+	code = error_table_$end_of_info;
+	return;
+	end;
+
+       tmdb.opt.flags.begin = "0"b;	/* no longer at beginning of tape  */
+       channel_command = "30"b3;
+       if Sentry_was_at_get_chars then
+	Lcallers_buffer = 0;
+
+       number_of_chars_left_to_return = number_of_chars_requested;
+       mstrp = tmdb.work.curr_buf;
+
+       /* The object of the following is to read the number of characters   */
+       /* requested by the caller from the mounted tape volume.             */
+       /* When the get_chars entrypoint is used the data is returned in work*/
+       /* space supplied by the caller.  If the position entrypoint is used */
+       /* the data is read from the tape, but not returned.		      */
+       /* Note that the tape record may not be the same size as the number  */
+       /* of characters the caller requests.  To handle this, the code reads*/
+       /* tape records into and internal buffer, then moves the data as     */
+       /* needed to the callers buffer.				      */
+
+       do while (number_of_chars_left_to_return > 0);
+
+	if tmdb.work.buf_pos >= tmdb.work.rec_length  then do;
+	   string (tmdb.work.flags) = "0"b;
+	   read_cnt = 0;
+	   reads_past_error = 0;
+	   tmdb.work.buf_pos = 0;
+	   tmdb.trail.tot_rec = tmdb.trail.tot_rec + 1;
+	   Shave_next_record = "0"b;
+				/* have tape_ioi_ do error recovery */
+	   Srecovery = "1"b;
+	   auto_retry_cnt = 0;
+
+	   call tape_ioi_$set_mode (tmdb.work.tioi_id, "recovery", 
+	      addr(Srecovery), code);
+	   if code ^= 0 then
+	      return;
+
+	   do while (^Shave_next_record
+		   & read_cnt < MAX_FWD_READS
+		   & auto_retry_cnt < MAX_AUTO_RETRYS
+		   & reads_past_error < MAX_READS_PAST_ERROR
+		   & ^tmdb.work.flags.eod);
+
+	      Smissing_eor = "1"b;
+	      tmdb.work.flags.data_loss = "0"b;
+	      tmdb.work.flags.eod = "0"b;
+				/* read a new mstr and set mstrp    */
+	      call READ_TAPE (code);
+
+	      read_cnt = read_cnt + 1;
+	      if tmdb.work.flags.fatal_read_error then
+	         reads_past_error = reads_past_error + 1;
+
+	      if code = 0 then do;
+	         tmdb.work.curr_buf = mstrp;
+
+	         call VALIDATE_RECORD (code);
+	         if code = 0 then do;
+
+		  Smissing_eor = "0"b;
+
+		  /* although the record is good, it may be out of order*/
+		  /* this is a data loss condition if the record number */
+		  /* is greater than the number we are attempting to    */
+		  /* read. For this we will back the tape up and try a  */
+		  /* new set of tape hardware settings and try to read  */
+		  /* the missing record.			      */
+                      /* This section will allow any end-of-reel record     */
+		  /* to be recognized.  It does not matter if it is from*/
+		  /* a previous write, we will still use it to set eot  */
+                      /* then report the bad uid.			      */
+
+		  if mstr.trail.tot_rec < tmdb.trail.tot_rec then
+		     read_cnt = 0;
+
+		  else do;
+
+		     if mstr.trail.tot_rec > tmdb.trail.tot_rec then
+		        tmdb.work.flags.data_loss = "1"b;
+		     else		/* otherwise it is equal & is the 1 */
+				/* we want.		      */
+		        Shave_next_record = "1"b;
+		     end;
+
+		  if mstr.head.admin & mstr.head.eor then
+		     tmdb.work.flags.eod = "1"b;
+
+		  if mstr.head.uid < tmdb.work.label_uid then do;
+		     tmdb.work.flags.eod = "1"b;
+		     Smissing_eor = "1"b;
+		     tmdb.work.flags.data_loss = "1"b;
+		     end;
+		  else
+		     if tmdb.work.flags.data_loss then do;
+		        call set_next_auto_retry_possibility (auto_retry_cnt,
+			 code);
+		        if code ^= 0 then
+			 return;
+		        if auto_retry_cnt < MAX_AUTO_RETRYS then do;
+			 read_cnt = 0;
+			 reads_past_error = 0;
+			 tmdb.work.flags.eod = "0"b;
+			 end;
+		        end;
+		  end;
+	         end;
+	      else
+	         if tmdb.work.flags.fatal_read_error then		
+	            reads_past_error = reads_past_error + 1;
+	      end;
+	   
+	   if reads_past_error >= MAX_READS_PAST_ERROR then
+	      code = error_table_$device_attention;
+
+	   if ^tmdb.work.flags.data_loss then do;
+	      if read_cnt < MAX_FWD_READS then;
+	      else
+	         
+	         code = error_table_$tape_error;
+
+	      if code ^= 0 then
+	         return;
+	      end;
+
+	   if tmdb.work.flags.eod then do;
+	      if Smissing_eor then
+	         code = error_table_$data_improperly_terminated;
+	      else
+	         code = error_table_$end_of_info;
+	      return;
+	      end;
+
+	   tmdb.work.rec_length = divide(mstr.head.data_bits_used, 9, 17);
+
+	   /* if data loss, return what we have in the buffer and then    */
+	   /* start on the tape record next time through.		      */
+
+	   if tmdb.work.flags.data_loss then do;
+	      code = error_table_$data_loss;
+	      tmdb.trail.tot_rec = mstr.trail.tot_rec;
+	      if Sentry_was_at_get_chars then
+	         if Lcallers_buffer > 0 then
+	            return;
+	      end;
+	   end;
+
+	Pdata_to_return = addcharno (addr(mstr.data), tmdb.work.buf_pos);
+         	Ldata_to_return = min ((tmdb.work.rec_length - tmdb.work.buf_pos), number_of_chars_left_to_return);
+
+	if Sentry_was_at_get_chars then do;
+	   Pcallers_buffer_insert =
+	      addcharno (Pcallers_buffer, Lcallers_buffer);
+	   Lcallers_buffer_insert = Ldata_to_return;
+             callers_buffer_insert = data_to_return;
+	   Lcallers_buffer = Lcallers_buffer + Ldata_to_return;
+	   end;
+
+	number_of_chars_left_to_return =
+	   number_of_chars_left_to_return - Ldata_to_return;
+
+	tmdb.work.buf_pos = tmdb.work.buf_pos + Ldata_to_return;
+          end;
+       return;
+%page;
+set_next_auto_retry_possibility: proc (auto_retry_cnt, code);
+
+       dcl auto_retry_cnt		fixed bin,
+	 code			fixed bin (35);
+
+       dcl completed_bsfs		fixed bin,
+	 completed_fsfs		fixed bin,
+	 requested_bsfs		fixed bin,
+	 rx			fixed bin;
+
+/* This routine supplies special code that will tell the tape hardware to   */
+/* use a new set of settings when reading the tape.  This way if a record   */
+/* was lost in a previous read attempt, it may be readable after setting    */
+/* the tape device to new tolerances.				      */
+/* The tape drives currently allow seven various settings.		      */
+
+       if channel_command = "37"b3 then do;
+	auto_retry_cnt = MAX_AUTO_RETRYS;
+	return;
+	end;
+       else do;
+	auto_retry_cnt = auto_retry_cnt + 1;
+	channel_command = bit( bin( bin (channel_command) + 1, 6), 6);
+	end;
+
+       call tape_ioi_$stop_tape (tmdb.work.tioi_id, (0), rx, code);
+       if rx ^= 0 then do;
+	if code = 0 then
+	   code = error_table_$device_parity;
+	return;
+	end;
+
+       completed_bsfs = 0;
+       if tmdb.work.flags.eod then
+	requested_bsfs = FIVE_FILES;
+       else
+	requested_bsfs = TWO_FILES;
+
+       do while (requested_bsfs > 0);
+	call tape_ioi_$order (tmdb.work.tioi_id, "bsf", requested_bsfs,
+	   null, completed_bsfs, rx, code);
+	if rx = 0 then do;
+	   requested_bsfs = requested_bsfs - completed_bsfs;
+	   code = 0;
+	   end;
+	else
+	   if rx = TAPE_IO_BOT then do;
+	      rx = 0;
+	      requested_bsfs = 0;
+	      code = 0;
+	      end;
+
+	if code ^= 0 then
+	   return;
+	end;
+
+       completed_fsfs = 0;
+       do while (completed_fsfs < 1);
+	call tape_ioi_$order (tmdb.work.tioi_id, "fsf", ONE_FILE, null,
+	   completed_fsfs, rx, code);
+	if code ^= 0 then
+	   return;
+	end;
+
+				/* turn off tape_ioi_ error retry   */
+       if auto_retry_cnt = 1 then do;
+	Srecovery = "0"b;
+	call tape_ioi_$set_mode (tmdb.work.tioi_id, "recovery", 
+	   addr(Srecovery), code);
+	if code ^= 0 then
+	   return;
+	end;
+				/* and control it from here	      */
+       call tape_ioi_$set_mode (tmdb.work.tioi_id, "cif",
+	addr (channel_command), code);
+       return;
+       end set_next_auto_retry_possibility;
+       end get_number_of_chars_requested;
+%page;
+/* ************************************************************************ */
+
+label: entry (Ptmdb,
+	    Pcallers_buffer,
+	    Lcallers_buffer,
+	    code);
+
+/* ************************************************************************ */
+/* caller: tape_mult_labeler_.		                          */
+/*							      */
+/* This routine will attempt to read and interpret a standard Multics	tape  */
+/* label.							      */
+/*							      */
+/* 1) The first action is an attempt to read the tape at either the density */
+/* determined when the tape was mounted by rcp_, or  if the installation    */
+/* parameter that controls tape authentication is turned off, the density   */
+/* supplied by the -density control argument is used.  There is a default   */
+/* density of 1600 that will be used if either of the first two are not     */
+/* available for use.					      */
+/*							      */
+/* 2) The density value "loop" is used to facilitate the following sequences*/
+/* of density read trys.  The starting density (see 1) is looked up in the  */
+/* DENSITY array.  Once done, a counter is established so that the densities*/
+/* will be tried in the order:				      */
+/*         starting density   next   next			      */
+/*               800          1600   6250			      */
+/*	       1600	6250    800			      */
+/*	       6250	1600    800			      */
+/*							      */
+/* 3) After setting the density, a read is attempted.		      */
+/*    If the read is successful and the record is good,		      */
+/*       then we read again looking for an EOF			      */
+/*       If the next read is another good label,			      */
+/*          we will accept it as the label.			      */
+/*							      */
+/* 4) Any other conditions will cause a rewind and reread.		      */
+/*							      */
+/* Note:	The code will read forward 8 times looking for a label when the   */
+/*        correct density is established.  It will attempt to do this 2     */
+/*	times before returning an error.  When the density fails on the   */
+/*	read, we will set to the next density without retrying the read.  */
+/*							      */
+/* ************************************************************************ */
+%page;
+
+       code = 0;
+
+       if Ptmdb = null then do;
+	code = error_table_$null_info_ptr;
+	return;
+	end;
+
+       tmdb_ptr = Ptmdb;
+       Lcallers_buffer = 0;
+       Ldata_to_return = 0;
+       Pdata_to_return = null;
+       Shave_a_label = "0"b;
+       string (tmdb.work.flags) = "0"b;
+
+       do density_index = lbound (DENSITY, 1) to hbound (DENSITY, 1)
+	while (tmdb.volume_density ^= DENSITY (density_index));
+	end;
+			
+       if density_index = hbound(DENSITY, 1) then
+	density_index_adder = -1;	/* process densities in descending order */
+       else
+	density_index_adder = 1;	/* process densities in ascending order */
+
+       do density_counter = lbound (DENSITY, 1) to hbound (DENSITY, 1)
+	while ((code = 0 | code = error_table_$bad_density)
+	      & ^Shave_a_label
+	      & ^tmdb.work.flags.eof);
+
+	call REWIND ((0), (0), code);
+	if code ^= 0 then
+	   return;
+
+	call tape_ioi_$order (tmdb.work.tioi_id, "den", 1, 
+	   addr (DENSITY(density_index)), (0), (0), code);
+
+	read_cnt = MAX_LABEL_READS;
+	rewind_cnt = -1;
+
+	do while (^tmdb.work.flags.eof & code = 0);
+	   Suser_defined_bootlabel = "0"b;
+	   Shave_next_record = "0"b;
+
+	   do while (^Shave_next_record
+		  & ^tmdb.work.flags.eof
+		  & read_cnt <= MAX_LABEL_READS
+		  & rewind_cnt <= MAX_BK_RETRYS
+		  & code ^= error_table_$bad_density);
+
+	      read_cnt = read_cnt + 1;
+	      if read_cnt > MAX_LABEL_READS then
+	         call REWIND (read_cnt, rewind_cnt, code);
+	      if code ^= 0 then
+	         return;
+
+	      call READ_TAPE (code);
+	      if code = 0 then do;
+	         call VALIDATE_RECORD (code);
+	         if code = 0 then
+		  Shave_next_record = "1"b;
+	         end;
+	      end;
+
+	   if code = 0 & ^tmdb.work.flags.eof then do;
+	      Shave_a_label = "1"b;
+
+	      if Suser_defined_bootlabel then do;
+	         Pdata_to_return = mstrp;
+	         Ldata_to_return = currentsize (mst_label) * 4;
+	         tmdb.head = mst_label.head;
+	         tmdb.trail = mst_label.trail;
+	         tmdb.head.data_bit_len = tmdb.head.data_bit_len + ((hbound (mst_label.xfer_vector, 1) * 2) * 36);
+	         tmdb.work.label_version = mst_label.label_version;
+	         tmdb.work.output_mode = mst_label.output_mode;
+	         end;
+
+	      else do;
+	         Pdata_to_return = addr (mstr.data);
+	         Ldata_to_return = divide (mstr.head.data_bits_used, 9, 17, 0);
+	         if Ldata_to_return = 0 then do;
+		  if mstr.head.flags.label then
+		     Ldata_to_return = LABEL_LEN;
+		  else do;
+		     code = error_table_$improper_data_format;
+		     return;
+		     end;
+		  end;
+
+	         tmdb.head = mstr.head;
+	         tmdb.trail = mstr.trail;
+	         if unspec(substr(Pdata_to_return -> volume_identifier.volume_set_id, 1, 1)) ^= "777"b3 then
+		  tmdb.work.label_version = 2;
+	         end;
+	      end;
+	   end;
+				/* get the next density to try      */
+	density_index = mod (density_index + density_index_adder,
+	   hbound(DENSITY,1) + 1);
+	end;
+
+       if rewind_cnt > MAX_BK_RETRYS | (code ^= 0) then do;
+	code = error_table_$bad_label;
+	return;
+	end;
+
+       Lcallers_buffer = Ldata_to_return;
+       callers_buffer = data_to_return;
+       tmdb.opt.flags.begin = "1"b;	/* set beginning og tape switch     */
+       return;
+%page;
+READ_TAPE: proc (code);
+
+
+       dcl code			fixed bin (35);
+
+       dcl data_len			fixed bin (21),
+	 rx			fixed bin;
+
+       code = 0;
+       call tape_ioi_$read (tmdb.work.tioi_id, mstrp, data_len, rx, code);   
+
+       if rx = 0 then
+	code = 0;
+       else
+	if rx = TAPE_IO_EOF then do;
+	   tmdb.work.flags.eof = "1"b;
+	   code = 0;
+	   end;
+       else
+	if rx = TAPE_IO_UNRECOVERABLE_IO_ERROR then
+	   tmdb.work.flags.fatal_read_error = "1"b;
+       else
+	if rx = TAPE_IO_EOT then do;
+	   tmdb.work.flags.eod = "1"b;
+	   if code = 0 then
+	      code = error_table_$end_of_info;
+	   end;
+       else
+	if rx = TAPE_IO_BOT then
+	   tmdb.work.flags.bot = "1"b;
+       else do;
+	call sub_err_ (0, "tape_mult_read_", ACTION_DEFAULT_RESTART,
+	   null (), (0), "Unexpected tape_ioi_ result ^d on read.", rx);
+	code = error_table_$device_parity;
+	end;
+
+       return;
+
+     end READ_TAPE;
+%page;
+REWIND: proc (read_cnt,
+	    rewind_cnt,
+	    code);
+
+       dcl read_cnt			fixed bin,
+	 rewind_cnt		fixed bin,
+	 code			fixed bin (35);
+
+       dcl rdy_status		bit (36) aligned;
+
+       code = 0;
+
+       call tape_ioi_$order (tioi_id, "rdy", 1, addr (rdy_status), (0), (0),
+	code);
+				/* Wait for device to be ready. */
+       if code = 0 then do;		/* Rewind the tape */
+	call tape_ioi_$order (tioi_id, "rew", 1, (null), (0), (0), 
+	   code);
+
+	if code = 0 then do;
+	   call tape_ioi_$order (tioi_id, "rdy", 1, addr (rdy_status), (0),
+	      (0), code);
+	   rewind_cnt = rewind_cnt + 1;
+	   read_cnt = 0;
+	   end;
+	end;
+
+       return;
+       end REWIND;
+%page;
+VALIDATE_RECORD: proc (code);
+
+/* This internal procedure is called to validate a record.  The record has  */
+/* been read successfully. We want to be sure that the header and trailer   */
+/* data is valid.						      */
+
+dcl	code		   fixed bin (35);
+
+       code = 0;
+
+       /* Invalid header or bootable tape label. */
+
+       if (mstr.head.c1 ^= tmdb.head.c1)
+	| (mstr.head.c2 ^= tmdb.head.c2) then do;
+
+	if mstr.head.c1 = label_c1 then do;
+
+				/* is this a bootable label record? */
+	   if (mst_label.head.c1 = tmdb.head.c1)
+	      & (mst_label.head.c2 = tmdb.head.c2)
+	      & (mst_label.trail.c1 = tmdb.trail.c1)
+	      & (mst_label.trail.c2 = tmdb.trail.c2)
+	      & mst_label.head.label then do;
+
+	      
+	      Suser_defined_bootlabel = "1"b;
+	      call tape_checksum_ (addr (mst_label.head), addr (test_checksum));
+
+	      if mst_label.head.checksum ^= test_checksum then
+	         code = error_table_$device_parity;
+
+	      return;
+	      end;
+	   end;
+
+	code = error_table_$device_parity;
+	return;
+	end;
+
+				/* Invalid trailer */
+       if (mstr.trail.c1 ^= tmdb.trail.c1)
+	| (mstr.trail.c2 ^= tmdb.trail.c2) then do;
+	code = error_table_$device_parity;
+	return;
+	end;
+
+       call tape_checksum_ (mstrp, addr (test_checksum));
+
+       if mstr.head.checksum ^= test_checksum then
+	code = error_table_$device_parity;
+
+       return;
+
+     end VALIDATE_RECORD;
+%page;
+%include tmdb;
+%page;
+%include mstr;
+%page;
+%include tape_ioi_result_indexes;
+%page;
+%include tape_ioi_dcls;
+%page;
+%include iocb;
+%page;
+%include sub_err_flags;
+     end tape_mult_read_;

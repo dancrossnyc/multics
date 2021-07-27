@@ -1,0 +1,342 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* program to compile a block
+
+   Initial Version: 16 April 1971 by BLW for Version II
+	Modified: 15 December 1972 by BLW
+	Modified:	5 October 1975 by RAB to fix 1427
+	Modified:	27 September 1976 by RAB to fix 1523
+	Modified:	15 August 1977 by RAB to fix 1654
+	Modified:	30 November 1978 by RAB to fix 1789
+		(bad storage allocation in quick begin blocks
+		 contained within quick procedures)	*/
+
+compile_block: proc(pt);
+
+dcl	pt ptr;		/* points at a block node */
+
+dcl	(cg_stat$cur_block,cg_stat$text_base,cg_stat$sym_base,
+	 cg_stat$prol_ent,cg_stat$root,cg_stat$cur_entry,
+	 cg_stat$sym_reloc_base,cg_stat$m_s_p,cg_stat$cur_statement,
+	 cg_stat$link_base,cg_stat$link_reloc_base,cg_stat$agg_temps,
+	 cg_stat$profile_base) ptr ext static,
+	(cg_stat$text_pos,cg_stat$sym_pos,cg_stat$cur_level,cg_stat$profile_pos,cg_stat$map_start) fixed bin(18) ext,
+	(cg_stat$table_option,cg_stat$in_prologue,cg_stat$skip_to_label,
+	 cg_stat$generate_map,cg_stat$old_id,cg_stat$profile_option,cg_stat$extended_stack) bit(1) ext;
+
+dcl	1 cg_stat$statement_map	unaligned ext,
+	2 first		bit(18),
+	2 last		bit(18);
+
+dcl	(bp,fp,sp,p,q,prol_save,entry_save,pl) ptr,
+	n fixed bin,
+	sym_pos fixed bin(18),
+	bt bit(9),
+	unused bit(1) aligned;
+
+dcl	(addrel,fixed,max,null,size,string) builtin;
+
+dcl	create_list entry(fixed bin) returns(ptr),
+	create_label entry(ptr,ptr,bit(3) aligned) returns(ptr),
+	(compile_block,compile_statement) entry(ptr),
+	c_a entry(fixed bin,fixed bin) returns(ptr),
+	(state_man$flush,io_op$init_ps) entry,
+	state_man$create_ms entry returns(ptr),
+	make_mod entry(fixed bin(17),fixed bin) returns(fixed bin(18)),
+	prepare_operand entry(ptr,fixed bin,bit(1) aligned) returns(ptr),
+	expmac$fill_usage entry(fixed bin(18),fixed bin(17)),
+	expmac$zero entry(fixed bin(15)),
+	expmac entry(fixed bin(15),ptr),
+	stack_temp$free_aggregates entry;
+
+dcl (	enter_prologue	init(202),
+	leave_prologue	init(203),
+	tra		init(169)) fixed bin(15) int static;
+
+dcl	1 eax_ins		aligned based,
+	2 offset		unal bit(18);
+
+dcl	relocation bit(36) aligned based;
+
+%include block;
+%include reference;
+%include statement;
+%include list;
+%include label;
+%include runtime_symbol;
+%include statement_map;
+%include profile_entry;
+%include declare_type;
+%include block_types;
+%include relbts;
+
+	bp = pt;
+	if bp = null then return;
+
+	bt = bp -> block.block_type;
+	if bt = begin_block
+	then do;
+db:	     call compile_block((bp -> block.brother));
+	     return;
+	     end;
+
+	if bt = on_unit then goto db;
+
+	goto l1;
+
+compile_block$begin_block: entry(pt);
+
+	bp = pt;
+	bt = bp -> block.block_type;
+
+	/* since we are doing a transition from one block to another,
+	   block.last_auto_loc must be up to date (fixes 1789)	*/
+
+	if bp -> block.no_stack & cg_stat$cur_block -> block.no_stack
+	then do;
+	     fp = cg_stat$cur_block;
+
+	     do while(fp -> block.no_stack);
+		if fp -> block.owner = null
+		     then fp = fp -> block.father;
+		     else fp = fp -> block.owner;
+		end;
+
+	     fp -> block.last_auto_loc = max(fp -> block.last_auto_loc, cg_stat$cur_block -> block.last_auto_loc);
+	     end;
+
+l1:	cg_stat$cur_block, fp = bp;
+
+	if bp -> block.no_stack
+	then do;
+
+	     /* get ptr to block in which storage should be allocated */
+
+	     do while(fp -> block.no_stack);
+		if fp -> block.owner = null then fp = fp -> block.father;
+		else fp = fp -> block.owner;
+		end;
+
+	     bp -> block.last_auto_loc = fp -> block.last_auto_loc;
+	     end;
+
+	cg_stat$cur_level = bp -> block.level;
+
+	if cg_stat$m_s_p = null then cg_stat$m_s_p = state_man$create_ms(); else call state_man$flush;
+
+	bp -> block.free_temps(1),
+	bp -> block.free_temps(2),
+	bp -> block.free_temps(3) = null;
+
+	entry_save = cg_stat$cur_entry;
+	cg_stat$cur_entry = null;
+
+	prol_save = cg_stat$prol_ent;
+
+	/* if there is only one entry to this block, we don't compile the prologue
+	   sequence;  the entire prologue sequence will be inserted into the
+	   main sequence by compile_tree when it sees the ex_prologue operator.
+	   if there is more than one entry, we must compile prologue as a closed
+	   subroutine, in this case cg_stat$prol_ent will point to a dummy
+	   label used to identify start of prologue.  There is a different
+	   label for each procedure | begin block */
+
+	cg_stat$prol_ent = null;
+
+	p = bp -> block.prologue;
+	if p = null
+	then if bp -> block.plio_ps = null
+	     then goto do_main;
+
+	if bp -> block.number_of_entries = 1 then goto do_main;
+
+	cg_stat$in_prologue = "1"b;
+	cg_stat$skip_to_label = "0"b;
+
+	if bt ^= begin_block
+	then do;
+	     cg_stat$prol_ent = create_label((bp),null,by_compiler);
+	     cg_stat$prol_ent -> label.location = cg_stat$text_pos;
+	     cg_stat$prol_ent -> label.allocated = "1"b;
+
+	     bp -> block.enter.start = cg_stat$text_pos;
+
+	     n = bp -> block.last_auto_loc;
+	     bp -> block.last_auto_loc = n + 1;
+
+	     call expmac((enter_prologue),c_a(n,4));
+	     bp -> block.enter.end = cg_stat$text_pos;
+	     end;
+
+	if bp -> block.plio_ps ^= null
+	then do;
+	     if bt = begin_block then bp -> block.enter.start = cg_stat$text_pos;
+	     call io_op$init_ps;
+	     bp -> block.enter.end = cg_stat$text_pos;
+	     end;
+
+	do while(p ^= null);
+	     call compile_statement(p);
+	     p = p -> statement.next;
+	     end;
+
+	if bt ^= begin_block
+	then do;
+	     bp -> block.leave.start = cg_stat$text_pos;
+	     call expmac((leave_prologue),c_a(n,4));
+	     bp -> block.leave.end = cg_stat$text_pos;
+	     call state_man$flush;
+	     end;
+
+	/* initialize object map if we're generating a symbol table */
+
+do_main:	if cg_stat$generate_map
+	then do;
+	     sp = addrel(cg_stat$sym_base,bp -> block.symbol_block);
+	     sp -> runtime_block.map.first = bit(fixed(cg_stat$sym_pos -
+	      bp -> block.symbol_block,18),18);
+	     cg_stat$old_id = "0"b;
+	     end;
+
+	cg_stat$in_prologue = "0"b;
+
+	/* compile main sequence */
+
+	p = bp -> block.main;
+	do while(p ^= null);
+	     call compile_statement(p);
+	     p = p -> statement.next;
+	     end;
+
+	cg_stat$extended_stack = "0"b;	/* fixes 1654 */
+
+	if bp -> block.no_stack then fp -> block.last_auto_loc =
+	 max(fp -> block.last_auto_loc,bp -> block.last_auto_loc);
+
+	/* free any aggregate temps that have not already been freed */
+
+	if cg_stat$agg_temps ^= null
+	     then call stack_temp$free_aggregates;
+
+	/* do son block */
+
+	p = bp -> block.son;
+	if p ^= null
+	then do;
+
+	     /* if this is a begin block, we must generate a transfer around
+	        the code for internal procedures */
+
+	     if bt = begin_block
+	     then do;
+
+		q = p;
+		do while(q ^= null);
+
+		     if q -> block.block_type = internal_procedure
+		     then do;
+
+			q = create_label((bp),null,by_compiler);
+			call expmac((tra),prepare_operand(q,1,unused));
+			cg_stat$cur_statement -> statement.object.finish =
+			 cg_stat$cur_statement -> statement.object.finish + 1;
+			goto l2;
+			end;
+
+		     q = q -> block.brother;
+		     end;
+		end;
+
+l2:	     call compile_block(p);
+
+	     if bt = begin_block
+	     then if q ^= null
+		then call expmac$fill_usage(cg_stat$text_pos,(q -> label.location));
+
+	     end;
+
+	if bp -> block.no_stack
+	then do;
+
+	     /* update total automatic storage used in block holding allocations
+	        for this quick block.  if that block is a brother, it may have
+	        already been completely compiled, so we may have to fill in the
+	        stack size again */
+
+	     fp -> block.last_auto_loc = max(fp -> block.last_auto_loc,bp -> block.last_auto_loc);
+	     if fp -> block.processed then call fill_stack(fp);
+	     end;
+	else call fill_stack(bp);
+
+	bp -> block.processed = "1"b;
+
+chk_st:	if ^ cg_stat$generate_map then goto chk_pf;
+
+	if bp = cg_stat$root
+	then do;
+
+	     /* just finished root block, put dummy at end of map */
+
+	     sym_pos = cg_stat$sym_pos;
+	     q = addrel(cg_stat$sym_base,sym_pos);
+	     q -> statement_map.location = bit(cg_stat$text_pos,18);
+	     string(q -> statement_map.source_id) = (27)"1"b;
+	     addrel(cg_stat$sym_reloc_base,sym_pos) -> relocation = rc_t;
+	     cg_stat$sym_pos = cg_stat$sym_pos + size(q -> statement_map);
+	     cg_stat$statement_map.last = bit(cg_stat$sym_pos,18);
+	     end;
+
+	sp -> runtime_block.map.last = bit(fixed(cg_stat$sym_pos - bp -> block.symbol_block,18),18);
+
+chk_pf:	if ^ cg_stat$profile_option then goto do_bro;
+
+	if bp ^= cg_stat$root then goto do_bro;
+
+	/* put dummy entry at end of profile */
+
+	addrel(cg_stat$profile_base,cg_stat$profile_pos) -> profile_entry.map = bit(fixed(sym_pos - cg_stat$map_start,18),18);
+
+do_bro:	if bt ^= begin_block
+	then if bt ^= on_unit
+	     then if bp -> block.brother ^= null
+		then call compile_block((bp -> block.brother));
+
+	cg_stat$prol_ent = prol_save;
+	cg_stat$cur_entry = entry_save;
+
+fill_stack:    proc(blk);
+
+dcl	     blk ptr;
+
+dcl	     stack_size bit(18),
+	     (p,q) ptr;
+
+	     /* fill stack size into first instruction (eaxy) of each entry
+	        in this block */
+     
+	     stack_size = bit(make_mod(blk -> block.last_auto_loc,16),18);
+	     p = blk -> block.entry_list;
+
+	     if blk -> block_type = begin_block
+	     then do;
+		p -> eax_ins.offset = stack_size;
+		return;
+		end;
+     
+	     do while(p ^= null);
+		q = p -> element(2) -> statement.labels -> element(2) -> reference.symbol;
+		addrel(cg_stat$text_base,q -> label.location) -> eax_ins.offset = stack_size;
+		p = p -> element(1);
+		end;
+     
+	     end;
+
+	end;

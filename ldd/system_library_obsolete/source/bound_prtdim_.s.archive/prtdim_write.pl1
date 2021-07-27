@@ -1,0 +1,430 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+
+/* Printer DIM write module: responsible for actually sending print lines to the line printer and handling statuses
+   returned from the printer by IOI */
+
+/* Created:  31 October 1974 by Noel I. Morris */
+/* Modified: 16 March 1977 by Noel I. Morris */
+/* Modified: June 1978 by J. C. Whitmore to suppress multiple error messages */
+/* Modified: 7 August 1980 by Art Beattie to send error messages every N times and wait */
+/* Modified: 27 November 1981 by G. Palter to fix entry number 0028 (phx04610) on the io_daemon error list:
+      A power fault on a local printer will reset the VFC to the default state (6 lines/inch).  The entry in
+      prt_status_table_ for "power fault" does not indicate that the VFC and train image are lost -- the fix for this bug
+      is to add a new flag which is used by the printer DIM to indicate a VFC and image reload should be done after the
+      operator readies the printer (the next special interrupt) */
+
+
+prtdim_write:
+     procedure (arg_sdb_ptr, wkspptr, offset, nelem, nelemt, iostatus);
+
+dcl  arg_sdb_ptr ptr,				/* pointer to stream data block */
+     wkspptr ptr,					/* pointer to caller's data */
+     offset fixed bin (24),				/* offset into caller data */
+     nelem fixed bin (24),				/* number of elements to transmit */
+     nelemt fixed bin (24),				/* number of elements actually transmitted */
+     iostatus bit (72) aligned;			/* IOS status */
+
+dcl  rcode fixed bin (35),				/* error code */
+     cur_page fixed bin,				/* current page number */
+     lp ptr,					/* pointer to next DCW block */
+     prev_lp ptr,					/* pointer to last DCW block */
+     dp ptr,					/* pointer to place for data */
+     lth fixed bin (18),				/* remaining length of input */
+     inptr ptr,					/* pointer to rest of input */
+     char_cnt fixed bin (18),				/* count of characters in output */
+     word_cnt fixed bin (18),				/* count of words in output */
+     temp_iom_stat bit (72) aligned,			/* temp area for iom status */
+     errmess char (256) var,				/* error message on bad status */
+     tra bit (36) aligned;				/* prototype TDCW */
+
+dcl  last_iom_stat bit (72) aligned;			/* last status an error msg was printed for */
+dcl  max_err_stat_count fixed bin init (10) int static options (constant); /* max no. of errors between reporting */
+dcl  same_err_stat_count fixed bin;			/* counter for the same error status from printer */
+
+dcl (paper_low_flag init ("000000000000000001"b),		/* status flag for paper low */
+     image_flag init ("000000000000000010"b),		/* status flag for destroyed train image */
+     vfc_flag init ("000000000000000100"b),		/* status flag for destroyed VFC image */
+     slew_error init ("000000000000001000"b),		/* status flag for slew error on prev slew */
+     power_fault_flag init ("000000000000010000"b))	/* status flag for power fault */
+     bit (18) aligned static options (constant);
+
+dcl  dev_stat_bits bit (72) aligned int static options (constant) /* bits used by analyze_device_stat_ */
+     init ("377700770000"b3 || (12) "0"b3);		/* bit string in octal to mask all but */
+						/* power, maj, sub, channel and central status bits */
+%page;
+dcl  prt_conv_ entry (ptr, fixed bin (18), ptr, fixed bin (18), ptr),
+     ioi_$connect entry (fixed bin, fixed bin (18), fixed bin (35)),
+     ipc_$block entry (ptr, ptr, fixed bin (35)),
+     convert_ipc_code_ entry (fixed bin (35)),
+     analyze_device_stat_$rs entry (char (*) var, ptr, bit (72) aligned, bit (18) aligned),
+     analyze_system_fault_ entry (char (*) aligned, bit (72) aligned),
+     prtdim_util$load_image entry (ptr, fixed bin (35)),
+     prtdim_util$load_vfc entry (ptr, fixed bin (35)),
+     com_err_ entry options (variable);
+
+dcl  prt_status_table_$prt_status_table_ ext;
+
+dcl  wseg (0:1023) bit (36) aligned based (wsegp);	/* the IOI buffer segment */
+
+dcl  wksp char (1) based unal;			/* used for getting pointer to input string */
+
+dcl  error_table_$net_timeout ext fixed bin (35);
+dcl  error_table_$request_pending fixed bin (35) ext static;
+
+dcl 1 dcws aligned based (lp),			/* DCW/data block */
+    2 idcw bit (36),				/* instruction DCW */
+    2 ddcw bit (36),				/* data xfer DCW */
+    2 tdcw bit (36),				/* Transfer DCW or terminate DCW */
+    2 data;					/* data follows the DCW's */
+
+dcl 1 ipc_message aligned,
+    2 chname fixed bin (71),				/* Chan over which message arrived */
+    2 message fixed bin (71),				/* 2-word event message */
+    2 sender bit (36),				/* Sending process */
+    2 origin,					/* Origin of event message */
+      3 devsignal bit (18),				/* 1 = device signal */
+      3 ring bit (18),				/* Senders ring number */
+    2 channel_index fixed bin;
+
+dcl (addr, addrel, bin, bit, divide, rel, string, substr, unspec) builtin;
+%page;
+% include prt_sdb;
+%page;
+% include prt_info;
+%page;
+% include prt_conv_info;
+
+
+% include ioi_stat;
+% include status_flags;
+
+% include iom_pcw;
+% include iom_dcw;
+%page;
+	iostatus = "0"b;				/* Clear IOS status. */
+
+	sdb_ptr = arg_sdb_ptr;			/* Copy pointer to stream data block. */
+	pip = addr (sdb.info);			/* Get pointer to printer info structure. */
+	pcip = addr (sdb.conv_info);			/* Get pointer to conversion info structure. */
+	last_iom_stat = ""b;			/* start clean on each write */
+	same_err_stat_count = 0;
+
+	rcode = 0;				/* Clear the error code. */
+	nelemt = 0;				/* Zero elements transmitted. */
+	lth = nelem;				/* Get initial length of input string. */
+	inptr = addr (substr (wkspptr -> wksp, offset+1, 1)); /* Get pointer to input string. */
+
+	do while (lth > 0);				/* Loop until all elements transmitted. */
+	     cur_page = pci.page_count;		/* Remember current page count. */
+
+	     if sdb.stop > sdb.bgin then		/* If adding to end of workspace segment ... */
+		call set_io;			/* Add some more. */
+	     else if sdb.stop + 68 < sdb.bgin then	/* If adding to beginning of workspace segment ... */
+		call set_io;
+	     else if sdb.prev = sdb.bgin then		/* If cold starting ... */
+		call set_io;
+
+	     else					/* Cannot add more lines.  Wait for I/O completion. */
+	     call wait_io;
+
+	     if rcode ^= 0 then do;
+		substr (iostatus, 1, 36) = unspec (rcode);
+		substr (iostatus, 41, 1) = "1"b;
+		sdb.chars_printed = sdb.chars_printed + nelem - lth; /* boost the number done */
+		return;
+	     end;
+
+	     if cur_page ^= pci.page_count then do;	/* If going to a new page ... */
+		sdb.stop_counter = sdb.stop_counter + 1; /* Bump the page stop counter. */
+
+		if sdb.single_page | (sdb.stop_every ^= 0 & sdb.stop_counter >= sdb.stop_every) then do;
+		     sdb.stop_counter = 0;		/* If time to stop ... */
+		     sdb.chars_printed = sdb.chars_printed + nelem - lth; /* boost the number done */
+		     substr (iostatus, 1, 36) = unspec (error_table_$request_pending);
+		     return;
+		end;
+	     end;
+	end;
+
+	sdb.chars_printed = sdb.chars_printed + nelem - lth; /* boost the number done */
+	return;
+%page;
+set_io:	proc;					/* procedure to set new DCW and data block */
+
+
+	     lp = addr (wseg (sdb.stop));		/* Get ptr to place for next DCW block. */
+	     dp = addr (lp -> dcws.data);		/* Get pointer to place for data. */
+
+	     call prt_conv_ (inptr, lth, dp, char_cnt, pcip); /* Perform code conversion. */
+	     word_cnt = divide (char_cnt + 3, 4, 18, 0);	/* Compute number of words to write. */
+	     nelemt = nelem - lth;			/* Update the number of elements xmitted. */
+
+	     if sdb.noprint then return;		/* Just return if print suppressed. */
+
+	     dcws.tdcw = prt_info.term_idcw;		/* Set terminator at end of block. */
+
+	     dcwp = addr (dcws.ddcw);			/* Get pointer to data transfer DCW. */
+	     string (dcw) = "0"b;			/* Clear the DCW. */
+	     dcw.address = rel (dp);			/* Set address to point to data. */
+	     dcw.tally = bit (bin (word_cnt, 12));	/* Set tally of DCW. */
+
+	     dcws.idcw = prt_info.print_idcw;		/* Set the IDCW to print line. */
+
+	     if sdb.running then do;			/* If channel is running ... */
+		sdb.marker_count = sdb.marker_count + word_cnt; /* Bump the marker count. */
+		if sdb.marker_count > 512 then do;	/* If workspace segment more than half filled ... */
+		     idcwp = addr (dcws.idcw);	/* Get pointer to IDCW for printing line. */
+		     idcw.control = "11"b;		/* Set marker bits in IDCW. */
+		     sdb.marker_count = 0;		/* Reset the count. */
+		end;
+	     end;
+
+	     if sdb.prev ^= sdb.stop then do;		/* If previous line queued ... */
+		tdcwp = addr (tra);			/* Get pointer to prototype TDCW. */
+		tra = "0"b;			/* Clear it. */
+		tdcw.address = bit (bin (sdb.stop, 18)); /* Set target of transfer. */
+		tdcw.type = "10"b;			/* Identify as TDCW. */
+
+		prev_lp = addr (wseg (sdb.prev));	/* Get pointer to previous line. */
+		prev_lp -> dcws.tdcw = tra;		/* Copy into list. */
+	     end;
+
+	     sdb.prev = sdb.stop;			/* Save index to this line. */
+	     sdb.stop = sdb.stop + word_cnt + 3;	/* Get offset of first word past current block. */
+	     if sdb.stop + 68 >= 1024 then sdb.stop = 0;	/* Lap if buffer size exceeded. */
+
+	     if ^sdb.running then call start_io;	/* If channel stopped, start it up again. */
+
+	     return;
+
+
+	end set_io;
+%page;
+start_io:	proc;					/* procedure to start up printer */
+
+	     if ^sdb.wait_flag then if sdb.prev ^= sdb.stop then do; /* If not waiting for special and something to do ... */
+		     sdb.marker_count = 0;		/*  Reset marker count. */
+		     sdb.running = "1"b;		/* Indicate device now running. */
+
+		     call ioi_$connect (prt_info.devx, sdb.bgin, rcode); /* Fire up the device. */
+
+		end;
+
+	     return;
+
+
+	end start_io;
+
+
+
+wait_io:	proc;					/* procedure to wait for I/O completion */
+
+
+	     if ^sdb.running then			/* If printer not running ... */
+		call start_io;			/* Get it in motion. */
+
+	     call ipc_$block (addr (sdb.ev_list), addr (ipc_message), rcode);
+	     if rcode ^= 0 then do;			/* Wait for I/O completion. */
+		call convert_ipc_code_ (rcode);
+		return;
+	     end;
+
+	     call stat_check;			/* Examine status and set flags. */
+
+	     return;
+
+
+	end wait_io;
+%page;
+stat_check: proc;					/* Printer status check entry  -  a la Dijkstra */
+
+dcl  flags bit (18) aligned,
+     found_dcw bit (1) aligned,
+     lx fixed bin (18);
+
+	     flags = "0"b;				/* Clear flags. */
+
+	     imp = addr (ipc_message.message);		/* get pointer to ioi message */
+	     if imess.level = "111"b then do;		/* if a special interupt... */
+		sdb.wait_flag = "0"b;		/* not waiting any more */
+		if sdb.reload_vfc_train_after_special then do;	/* whatever required operator intervention ... */
+		     call prtdim_util$load_image (sdb_ptr, (0));	/* ... also destroyed the train and VFC images */
+		     call prtdim_util$load_vfc (sdb_ptr, (0));
+		     sdb.reload_vfc_train_after_special = "0"b;
+		end;
+		return;
+	     end;
+
+	     if imess.st then do;			/* if status present */
+		if imess.time_out then do;		/* if caused by time out */
+		     rcode = error_table_$net_timeout;	/* indicate error */
+		     sdb.running = "0"b;		/* not running any more */
+		     return;
+		end;
+
+		if bin (imess.level) <= 5 then do;	/* If terminate, marker, or system fault ... */
+		     temp_iom_stat = imess.status;	/* copy status to double word */
+		     lx = bin (imess.offset);		/* Copy list index for this status */
+
+		     if imess.er then do;		/* If error occurred ... */
+			if imess.level = "001"b then do; /* If system fault ... */
+			     call analyze_system_fault_ (prt_info.devname, temp_iom_stat);
+			     sdb.wait_flag = "1"b;	/* Wait for operator intervention. */
+			     sdb.error_count = sdb.error_count + 1;
+			end;
+			else do;			/* If terminate ... */
+			     call analyze_device_stat_$rs (errmess, addr (prt_status_table_$prt_status_table_),
+				temp_iom_stat, flags);
+
+			     if flags & paper_low_flag then
+				if pci.overflow_off then /* If in overflow_off mode ... */
+				     flags = flags | report_flag | halt_flag;
+						/* Stop now to avoid printing on perf. */
+				else if ^sdb.paper_low then do; /* Report paper low only once. */
+				     sdb.paper_low = "1"b;
+				     flags = flags | report_flag;
+				end;
+
+			     if flags & power_fault_flag then	/* power fault: VFC/train images no longer valid */
+				sdb.reload_vfc_train_after_special = "1"b;
+
+			     if flags & report_flag then do; /* If error should be reported ... */
+				sdb.error_count = sdb.error_count + 1;
+
+				if (temp_iom_stat & dev_stat_bits) ^= last_iom_stat then do; /* if not reported */
+				     last_iom_stat = (temp_iom_stat & dev_stat_bits); /* save for next error */
+				     same_err_stat_count = 1;
+				     call com_err_ (0, prt_info.devname, errmess);
+				end;
+				else do;
+				     same_err_stat_count = same_err_stat_count + 1;
+						/* Allow only a resonable amount of unreported */
+						/* errors to occur.  Then report again. */
+						/* Also want to report again if need to wait. */
+				     if same_err_stat_count >= max_err_stat_count | (flags&halt_flag) ^= "0"b
+				     then do;
+					sdb.wait_flag = "1"b;
+					call com_err_ (0, prt_info.devname, errmess);
+				     end;
+				end;
+			     end;
+			     sdb.wait_flag = ((flags & halt_flag) ^= "0"b) | sdb.wait_flag;
+						/* Decide if operator intervention required. */
+
+			     if flags & image_flag then do; /* If train image destroyed ... */
+				call prtdim_util$load_image (sdb_ptr, rcode);
+				if rcode ^= 0 then return;
+			     end;
+
+			     if flags & vfc_flag then do; /* If VFC image destroyed ... */
+				call prtdim_util$load_vfc (sdb_ptr, rcode);
+				if rcode ^= 0 then return;
+			     end;
+			end;
+
+			if sdb.wait_flag then do;
+			     same_err_stat_count = 0;
+			     call com_err_ (0, prt_info.devname, "***** OPERATOR INTERVENTION REQUIRED^/");
+			end;
+
+		     end;
+
+		     else				/* If no error ... */
+		     sdb.paper_low = "0"b;		/* Reset paper low flag. */
+
+		     idcwp = addr (wseg (lx));	/* Get pointer to last DCW processed. */
+		     found_dcw = "0"b;		/* Clear flag. */
+
+		     if flags & backup_flag then do while (idcw.code ^= "111"b);
+			lx = lx - 1;		/* Back up to last print IDCW. */
+			idcwp = addrel (idcwp, -1);
+		     end;
+
+		     else if bin (imess.level) <= 3 then /* If termination status ... */
+			do while (^found_dcw);	/* Search for terminate IDCW or TDCW. */
+			if string (idcw) = prt_info.term_idcw then do;
+			     lx, sdb.prev = sdb.stop; /* If end of list, reset. */
+			     found_dcw = "1"b;
+			end;
+			else if idcw.code = "111"b then do; /* If at print IDCW ... */
+			     found_dcw = "1"b;	/* Stay at this point. */
+			end;
+			else if idcwp -> tdcw.type = "10"b then do;
+			     lx = bin (idcwp -> tdcw.address, 18);
+			     found_dcw = "1"b;	/* If TDCW, follow the thread. */
+			end;
+			else do;			/* Must be IOTD DCW. */
+			     lx = lx + 1;		/* Step to third DCW slot. */
+			     idcwp = addrel (idcwp, 1);
+			end;
+		     end;
+		     else;			/* Don't do anything for marker status. */
+
+		     sdb.bgin = lx;			/* Set new starting point. */
+		     sdb.running = imess.run;		/* Set running flag. */
+		end;
+
+	     end;
+
+	     return;
+
+	end stat_check;
+%page;
+prtdim_resetwrite: entry (arg_sdb_ptr, iostatus);		/* entry to scrap unprinted information */
+
+
+	iostatus = "0"b;
+
+	sdb_ptr = arg_sdb_ptr;
+	pip = addr (sdb.info);
+	pcip = addr (sdb.conv_info);
+
+	rcode = 0;
+
+	do while (sdb.running);			/* Wait for printer to stop. */
+	     call wait_io;
+	     if rcode ^= 0 then do;
+		substr (iostatus, 1, 36) = unspec (rcode);
+		return;
+	     end;
+	end;
+
+	sdb.prev,
+	     sdb.bgin,
+	     sdb.stop = 0;				/* Reset all indices. */
+
+	return;					/* Output all scrapped. */
+%page;
+runout:	entry (arg_sdb_ptr, iostatus);		/* entry to disgorge unprinted information */
+
+
+	iostatus = "0"b;
+
+	sdb_ptr = arg_sdb_ptr;
+	pip = addr (sdb.info);
+	pcip = addr (sdb.conv_info);
+
+	rcode = 0;
+
+	do while (sdb.prev ^= sdb.stop);		/* Force connects until all caught up. */
+	     call wait_io;				/* Start printer and wait for completion. */
+	     if rcode ^= 0 then do;
+		substr (iostatus, 1, 36) = unspec (rcode);
+		return;
+	     end;
+	end;
+
+	return;					/* Output all flushed. */
+
+
+
+     end prtdim_write;

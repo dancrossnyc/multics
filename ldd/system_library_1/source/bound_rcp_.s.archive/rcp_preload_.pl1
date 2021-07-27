@@ -1,0 +1,388 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+rcp_preload_:
+     proc (arg_device_name, arg_volume_name, arg_group_id, arg_ecode);
+
+
+/*
+
+   This program implements the preload operator command support
+   in ring one.
+
+
+   Created on 04/20/78 by Michael R. Jordan
+   Modified on 08/17/78 by Michael R. Jordan
+   Modified 6/79 by Michael R. Jordan to fix misc bugs.
+   Modified 021585 by M. M. Pozzo to interface with rcp_access_kernel_ and
+   general cleanup for B2 effort.
+
+*/
+
+dcl	addr		   builtin;
+dcl	admin_gate_$syserr	   options (variable);
+dcl	arg_device_name	   char (32);		/* name of the device */
+dcl	arg_ecode		   fixed bin (35);		/* status code returned */
+dcl	arg_group_id	   char (32);		/* name of the user */
+dcl	arg_volume_name	   char (32);		/* name of the volume */
+dcl	caller_level	   fixed bin;		/* callers validation level */
+dcl	cleanup		   condition;
+dcl	clock		   builtin;
+dcl	cu_$level_get	   entry (fixed bin);
+dcl	cu_$level_set	   entry (fixed bin);
+dcl	device_name	   char (8);		/* local copy of device name */
+dcl	device_off	   bit (18);		/* offset of rcpd.device entry */
+dcl	dtypex		   fixed bin;		/* device type table index */
+dcl	ecode		   fixed bin (35);		/* local status code */
+dcl	effmode		   bit (3);
+dcl	error_table_$device_busy
+			   fixed bin (35) ext;
+dcl	error_table_$incorrect_device_type
+			   fixed bin (35) ext;
+dcl	error_table_$incomplete_access_name
+			   fixed bin (35) ext;
+dcl	error_table_$noarg	   fixed bin (35) ext;
+dcl	error_table_$resource_unknown
+			   fixed bin (35) ext;
+dcl	error_table_$volume_busy
+			   fixed bin (35) ext;
+
+dcl	access_operations_$rcp_preload
+			   bit (36) aligned ext static;
+
+dcl	get_authorization_	   entry () returns (bit (72) aligned);
+dcl	get_ring_		   entry () returns (fixed bin);
+dcl	group_id		   char (32);		/* local copy of user name */
+dcl	i		   fixed bin;
+dcl	null		   builtin;
+dcl	operation		   bit (36) aligned;
+dcl	ptr		   builtin;
+dcl	rel		   builtin;
+dcl	reg_iocb_ptr	   ptr;
+dcl	1 res_info	   aligned automatic like resource_info;
+dcl	1 req_info	   aligned automatic like requestor_info;
+dcl	rcp_access_kernel_	   entry (bit (36) aligned, ptr, ptr, bit (3), fixed bin (35));
+dcl	rcp_lock_$lock	   entry (ptr, fixed bin (35));
+dcl	rcp_lock_$unlock	   entry (ptr);
+dcl	rcp_match_user_name_   entry (char (32), char (32)) returns (bit (1));
+dcl	rcp_pointers_$data	   entry () returns (ptr);
+dcl	rcp_unload_$unload_device
+			   entry (ptr, bit (1));
+dcl	record_ptr	   ptr;
+dcl	this_device_off	   bit (18);		/* device_off for the device being preloaded */
+dcl	trans_iocb_ptr	   ptr;
+dcl	volume_off	   bit (18);
+dcl	volume_name	   char (32);		/* local copy of volume name */
+
+/*                   CONSTANTS                          */
+
+dcl	DEFAULT_REGISTRY_DIR   char (64) internal static options (constant) init (">sc1>rcp");
+						/*
+
+						   Get the callers validation level and get him set to go.
+
+						*/
+
+
+	call cu_$level_get (caller_level);
+	on cleanup
+	     begin;
+	     call cu_$level_set (caller_level);
+	end;
+	call cu_$level_set (get_ring_ ());
+	reg_iocb_ptr, trans_iocb_ptr = null ();
+	ecode = 0;
+
+
+/*
+
+   Now copy all input arguments.
+
+*/
+
+
+	device_name = arg_device_name;
+	volume_name = arg_volume_name;
+	group_id = arg_group_id;
+
+	rcpd_ptr = rcp_pointers_$data ();
+	if ^rcpd.modes.resource_mgmt_enabled then
+	     if group_id = "" then do;
+		arg_ecode = error_table_$noarg;
+		return;
+	     end;
+	if group_id ^= "" then
+	     if incomplete_name (group_id) then do;
+		arg_ecode = error_table_$incomplete_access_name;
+		return;
+	     end;
+
+/* See if the volume is available */
+
+	volume_off = "0"b;
+	do i = 1 to rcpd.last_volume while (volume_off = "0"b);
+	     volume_ptr = addr (rcpd.volume (i));
+	     if volume.volume_name = volume_name then
+		volume_off = rel (volume_ptr);
+	end;
+	if volume_off ^= "0"b then do;
+	     if volume.state = 2 | volume.state = 3 then do;
+		ecode = error_table_$volume_busy;
+		goto UNLOCK_AND_RETURN;
+	     end;
+	     if volume.state = 1 | volume.state = 4 then do;
+		if ((group_id ^= "") & (^rcp_match_user_name_ ((volume.group_id), group_id))) | (group_id = "")
+		then do;
+		     ecode = error_table_$volume_busy;
+		     goto UNLOCK_AND_RETURN;
+		end;
+	     end;
+	end;					/*
+
+						   Make sure this device type is known before we go any farther.
+
+						*/
+
+
+	do dtypex = 1 to rcpd.tot_dtypes;
+
+	     do device_off = rcpd.dtype (dtypex).first_off repeat device.next_off while (device_off ^= "0"b);
+		device_ptr = ptr (rcpd_ptr, device_off);
+		if device_name = device.device_name then
+		     goto FOUND_DEVICE;
+	     end;
+
+	end;
+
+	ecode = error_table_$resource_unknown;
+	goto RETURN;
+
+
+/*
+
+   Got the device, now is the volume in use?
+
+*/
+
+
+FOUND_DEVICE:
+	if dtypex ^= TAPE_DRIVE_DTYPEX & dtypex ^= DISK_DRIVE_DTYPEX then do;
+						/* Not tape or disk. */
+	     ecode = error_table_$incorrect_device_type;
+	     goto RETURN;
+	end;
+
+	call rcp_lock_$lock (addr (rcpd.lock_info), ecode);
+	if ecode ^= 0 then
+	     goto RETURN;
+
+	if device.flags.attached then do;		/* Someone has this one attached! */
+	     ecode = error_table_$device_busy;
+	     goto UNLOCK_AND_RETURN;
+	end;
+
+	goto STATE (device.state);			/* Cross-check the device state */
+
+
+STATE (2):					/* DELETED - cannot allow this */
+STATE (3):					/* STORAGE SYSTEM - this should never happen */
+	ecode = error_table_$device_busy;
+	goto UNLOCK_AND_RETURN;
+
+
+STATE (1):					/* ASSIGNED - make sure this is the right user */
+STATE (4):					/* RESERVED - ditto */
+						/* If its not assigned or reserved to this user then it can't
+						   be preloaded and if the group_id is "" then we can't tell
+						   so deny preload */
+	if ((group_id ^= "") & (^rcp_match_user_name_ ((device.group_id), group_id))) | (group_id = "") then do;
+	     ecode = error_table_$device_busy;
+	     goto UNLOCK_AND_RETURN;
+	end;
+
+
+STATE (0):					/* FREE - no sweat */
+	this_device_off = device_off;
+
+/*           If the volume is free or not in rcp_data yet, see if we
+   have access to it - if we don't, then don't preload it
+   since we can't get it.  If the device is free, check it's
+   access as well for the same reason.   */
+
+	if volume_off = "0"b | volume.state = 0 then do;
+	     call setup_kernel_call ((VOLUME_TYPE (device.dtypex)), (volume_name), ecode);
+	     if ecode ^= 0 then
+		goto UNLOCK_AND_RETURN;
+	     call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), effmode, ecode);
+	     if ecode ^= 0 then do;
+		ecode = error_table_$volume_busy;
+		goto UNLOCK_AND_RETURN;
+	     end;
+	     call cleanup_kernel_call (ecode);
+	end;
+	if device.state = 0 then do;
+	     call setup_kernel_call ((DEVICE_TYPE (device.dtypex)), (device_name), ecode);
+	     if ecode ^= 0 then
+		goto UNLOCK_AND_RETURN;
+	     call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), effmode, ecode);
+	     if ecode ^= 0 then do;
+		ecode = error_table_$device_busy;
+		goto UNLOCK_AND_RETURN;
+	     end;
+	     call cleanup_kernel_call (ecode);
+	end;
+
+/*
+
+   We have all we need.  Make the note of this volume on this device.
+
+*/
+
+
+	device_ptr = ptr (rcpd_ptr, this_device_off);
+	if device.volume_name ^= "" then
+	     if device.volume_name ^= volume_name then
+		call rcp_unload_$unload_device (device_ptr, "1"b);
+	device.volume_name = volume_name;
+	if device.state = 0 then do;			/* only set if device is free */
+	     device.group_id = group_id;
+	     device.state_time = clock ();
+	end;
+
+	call admin_gate_$syserr (0, "RCP: Preload volume ^a on device ^a^[ for ^a^;^s^].", volume_name, device_name,
+	     (group_id ^= ""), group_id);
+
+
+/*
+
+   Now return to the caller in a proper manner.
+
+*/
+
+
+UNLOCK_AND_RETURN:
+	call cleanup_kernel_call (ecode);
+	call rcp_lock_$unlock (addr (rcpd.lock_info));
+
+
+RETURN:
+	arg_ecode = ecode;
+	call cu_$level_set (caller_level);
+	return;
+%page;
+setup_kernel_call:
+     proc (a_resource_type, a_resource_name, a_code);
+
+dcl	(a_resource_type, a_resource_name)
+			   char (*) aligned;
+dcl	a_code		   fixed bin (35);
+dcl	local_code	   fixed bin (35);
+
+dcl	rcprm_registry_util_$grab_transaction_control_file
+			   entry (ptr, char (*) aligned, fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry
+			   entry (ptr, char (*) aligned, char (*) aligned, fixed bin (35));
+dcl	rcprm_registry_util_$find_resource_record
+			   entry (ptr, char (*) aligned, ptr, fixed bin (35));
+
+	local_code = 0;
+	req_info.user_id = group_id;
+	req_info.current_authorization = get_authorization_ ();
+	req_info.validation_level = caller_level;
+	operation = access_operations_$rcp_preload;
+	if rcpd.modes.resource_mgmt_enabled then do;
+	     res_info.registry_dir = DEFAULT_REGISTRY_DIR;
+	     call rcprm_registry_util_$grab_transaction_control_file (trans_iocb_ptr, res_info.registry_dir, local_code)
+		;
+	     if local_code ^= 0 then
+		goto SETUP_RETURN;
+	     call rcprm_registry_util_$grab_registry (reg_iocb_ptr, res_info.registry_dir, a_resource_type, local_code);
+	     if local_code ^= 0 then
+		goto SETUP_RETURN;
+	     call rcprm_registry_util_$find_resource_record (reg_iocb_ptr, a_resource_name, record_ptr, local_code);
+	     if local_code ^= 0 then
+		goto SETUP_RETURN;
+	     res_info.registry_switch_ptr = reg_iocb_ptr;
+	     res_info.registry_record_ptr = record_ptr;
+	end;
+	else do;
+	     res_info.registry_dir = "";
+	     res_info.registry_switch_ptr, res_info.registry_record_ptr = null ();
+	end;
+	res_info.resource_type = a_resource_type;
+	res_info.resource_name = a_resource_name;
+
+SETUP_RETURN:
+	a_code = local_code;
+     end setup_kernel_call;
+%page;
+cleanup_kernel_call:
+     proc (a_code);
+
+dcl	a_code		   fixed bin (35);
+dcl	local_code	   fixed bin (35);
+dcl	rcprm_registry_util_$release_transaction_control_file
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$release_registry
+			   entry (ptr, fixed bin (35));
+
+	local_code = 0;
+	if reg_iocb_ptr ^= null () then
+	     call rcprm_registry_util_$release_registry (reg_iocb_ptr, local_code);
+	if trans_iocb_ptr ^= null () then
+	     call rcprm_registry_util_$release_transaction_control_file (trans_iocb_ptr, local_code);
+	if local_code ^= 0 then
+	     a_code = local_code;
+
+     end cleanup_kernel_call;
+%page;
+incomplete_name:
+     proc (a_group_id) returns (bit (1));
+
+dcl	a_group_id	   char (*);
+dcl	after		   builtin;
+
+	if after ((after (a_group_id, ".")), ".") = "" then
+	     return ("1"b);
+	else return ("0"b);
+     end incomplete_name;
+%page;
+%include rcp_resource_info;
+%page;
+%include rcp_requestor_info;
+%page;
+%include rcp_com_seg;
+%page;
+%include rcp_data;
+%page;
+%include rcp_resource_types;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   RCP: Preload volume VOLUME on device DEVICE
+
+   S:	$info
+
+   T:	$run
+
+   M:	The operator request to preload has been accepted by RCP.
+
+   A:	Preload the volume in question on the specified device.
+
+
+   END MESSAGE DOCUMENTATION */
+
+
+     end rcp_preload_;

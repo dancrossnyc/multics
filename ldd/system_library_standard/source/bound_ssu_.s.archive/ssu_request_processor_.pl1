@@ -1,0 +1,554 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: off */
+
+/* Default subsystem request line processor and active string evaluator */
+
+/* Created:  3 May 1980 by W. Olin Sibert */
+/* Modified: 15 February 1982 by G. Palter to support standalone invocations, rename eval_string to evaluate_active_string
+      and correct its calling sequence, return ssu_et_$null_request_line rather than 100, and reflect the reorganization
+      of the sci structure */
+/* Modified: 26 February 1982 by G. Palter to make execute_line handle program_interrupt when there is no active listener
+      in this subsystem invocation */
+/* Modified: June 1982 by G. Palter to split execute_line and evaluate_active_string into part which is always executed
+      and part which is replaceable (ssu 14), to always trapping calls to ssu_$abort_line (ssu 12), to pass along request
+      processor options to the Multics command processor (which does most of the work for subsystems), and to add
+      (set get)_abbrev_info and (get free set reset)_request_processor_options and get_default_rp_options entries (ssu 6)
+      */
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+ssu_request_processor_:
+     procedure ();
+
+	return;					/* not an entrypoint */
+
+
+/* Parameters */
+
+dcl  P_sci_ptr pointer parameter;
+dcl  P_code fixed binary (35) parameter;
+
+dcl  P_rp_options_ptr pointer parameter;		/* evaluate_active_string, (get get_default set)_rp_options */
+
+dcl  P_request_line_ptr pointer parameter;		/* execute_line: -> the request line */
+dcl  P_request_line_lth fixed binary (21) parameter;	/* execute_line: length of said string */
+
+dcl  P_request_string character (*) parameter;		/* execute_string: the request line to execute */
+
+dcl  P_active_string character (*) parameter;		/* evaluate_active_string: the active string (no []'s) */
+dcl  P_active_string_type fixed binary parameter;		/* evaluate_active_string: type of string supplied */
+dcl  P_return_value character (*) varying parameter;	/* evaluate_active_string: results of evaluation */
+
+dcl  P_rp_options_version character (8) parameter;	/* (get get_default)_rp_options: which version to return */
+
+dcl  P_default_profile_ptr pointer parameter;		/* get_abbrev_info, set_abbrev_info: -> default profile */
+dcl  P_profile_ptr pointer parameter;			/* get_abbrev_info, set_abbrev_info: -> current profile */
+dcl  P_abbrev_mode bit (1) aligned parameter;		/* get_abbrev_info, set_abbrev_info: ON => enable abbrevs */
+
+
+/* Local copies of parameters */
+
+dcl  request_line character (request_line_lth) based (request_line_ptr);
+dcl  request_line_lth fixed binary (21);
+dcl  request_line_ptr pointer;
+
+dcl  code fixed binary (35);
+
+
+/* Internal representation of the subsystem's current request processor options */
+
+dcl  1 irpo aligned based (sci.rp_options_ptr),
+       2 cp_subsys_info like cp_subsys_info,		/* command language definition */
+       2 abbrev_info,
+         3 abbrev_enabled bit (1),			/* ON => expand request lines before execution */
+         3 default_profile_ptr pointer,			/* -> default profile (used if profile_ptr is null) */
+         3 profile_ptr pointer;			/* -> current profile */
+
+
+/* Remaining declarations */
+
+dcl  1 lcsi aligned like cp_subsys_info;
+
+dcl  (saved_abort_subsystem_label, saved_abort_line_label) label variable;
+dcl  (saved_in_listener, saved_executing_request) bit (1) aligned;
+
+dcl  (idx, jdx) fixed binary (21);
+
+dcl  WHITESPACE character (5) static options (constant) initial ("
+	 ");						/* NL, HT, SP, VT, FF */
+
+dcl  1 cp_data_$standard_language aligned external,	/* standard Multics command language definition */
+       2 character_types (0:511) fixed binary (9) unaligned unsigned;
+
+dcl  error_table_$unimplemented_version fixed binary (35) external;
+
+/* format: off */
+dcl (ssu_et_$null_request_line, ssu_et_$program_interrupt, ssu_et_$request_line_aborted, ssu_et_$subsystem_aborted)
+	fixed binary (35) external;
+/* format: on */
+
+dcl  abbrev_$subsys_process_line
+	entry (character (*), pointer, entry, pointer, entry, pointer, pointer, character (*), fixed binary (35));
+dcl  command_processor_$subsys_execute_line
+	entry (character (*), pointer, entry, pointer, character (*), fixed binary (35));
+dcl  command_processor_$subsys_eval_string
+	entry (character (*), pointer, entry, pointer, character (*), fixed binary, character (*) varying,
+	fixed binary (35));
+dcl  command_processor_$validate_cp_subsys_info entry (pointer, fixed binary (35));
+dcl  cu_$cp entry (pointer, fixed binary (21), fixed binary (35));
+dcl  cu_$evaluate_active_string entry (pointer, character (*), fixed binary, character (*) varying, fixed binary (35));
+dcl  hcs_$terminate_noname entry (pointer, fixed binary (35));
+dcl  ssu_$execute_line entry (pointer, pointer, fixed binary (21), fixed binary (35));
+dcl  ssu_$get_subsystem_and_request_name entry (pointer) returns (character (72) varying);
+dcl  ssu_$invoke_request entry () options (variable);
+
+dcl  (cleanup, program_interrupt) condition;
+
+dcl  (addr, index, length, null, substr, unspec, verify) builtin;
+
+/**/
+
+/* Initialize the subsystem's request processor options */
+
+init_rp_options:
+     entry (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+
+	allocate irpo in (sci_parent_area) set (sci.rp_options_ptr);
+
+	irpo.cp_subsys_info.version = CP_SUBSYS_INFO_VERSION_1;
+	irpo.cp_subsys_info.non_standard_language = "0"b;
+
+	irpo.abbrev_info.abbrev_enabled = "0"b;
+	irpo.abbrev_info.default_profile_ptr, irpo.abbrev_info.profile_ptr = null ();
+
+	return;
+
+
+
+/* Release the subsystem's request processor options (called by ssu_$destroy_invocation) */
+
+term_rp_options:
+     entry (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+
+	if sci.rp_options_ptr = null () then return;	/* nothing there anyway */
+
+	call maybe_terminate_profiles (null (), null ()); /* terminate the profiles */
+
+	free irpo in (sci_parent_area);
+	sci.rp_options_ptr = null ();			/* all gone */
+
+	return;
+
+/**/
+
+/* Prepares to call the execute_line procedure: if in a standalone invocation, transfers directly to cu_$cp; otherwise,
+   sets up the label used by ssu_$abort_line and then invokes the actual replaceable execute_line procedure.  This entry
+   is called by the ssu_$execute_line transfer vector */
+
+prepare_to_execute_line:
+     entry (P_sci_ptr, P_request_line_ptr, P_request_line_lth, P_code);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+
+	if sci.standalone_invocation then do;		/* a Multics command/AF simulating a subsystem ... */
+	     call cu_$cp (P_request_line_ptr, P_request_line_lth, P_code);
+	     if P_code = 100 then P_code = ssu_et_$null_request_line;
+	     return;
+	end;
+
+	saved_in_listener = sci.in_listener;
+	saved_executing_request = sci.executing_request;	/* in case this is called by a request */
+	saved_abort_line_label = sci.request_processor_info.abort_line_label;
+
+	sci.request_processor_info.abort_line_label = LINE_ABORT_RETURN;
+
+	if ^sci.in_listener then do;			/* no listener: trap subsystem abort and program interrupt */
+	     saved_abort_subsystem_label = sci.listener_info.abort_subsystem_label;
+	     sci.listener_info.abort_subsystem_label = SUBSYSTEM_ABORT_RETURN;
+	     on condition (program_interrupt)
+		begin;
+		     call sci.entries.program_interrupt (sci_ptr);
+		     P_code = ssu_et_$program_interrupt;/* let caller know it wasn't a clean execution */
+		     go to RETURN_FROM_EXECUTE_LINE;
+		end;
+	end;
+
+	on condition (cleanup)
+	     begin;
+		sci.in_listener = saved_in_listener;
+		sci.executing_request = saved_executing_request;
+		if ^sci.in_listener then sci.listener_info.abort_subsystem_label = saved_abort_subsystem_label;
+		sci.request_processor_info.abort_line_label = saved_abort_line_label;
+	     end;
+
+	call sci.entries.execute_line (sci_ptr, P_request_line_ptr, P_request_line_lth, code);
+
+	if code = 100 then				/* translate null line code to appropriate value */
+	     P_code = ssu_et_$null_request_line;
+	else P_code = 0;				/* error messages have already been printed */
+
+RETURN_FROM_EXECUTE_LINE:
+	sci.in_listener = saved_in_listener;		/* restore state */
+	sci.executing_request = saved_executing_request;
+	if ^sci.in_listener then sci.listener_info.abort_subsystem_label = saved_abort_subsystem_label;
+	sci.request_processor_info.abort_line_label = saved_abort_line_label;
+
+	return;
+
+
+SUBSYSTEM_ABORT_RETURN:				/* user/program asked to abort the subsystem */
+	P_code = ssu_et_$subsystem_aborted;
+	go to RETURN_FROM_EXECUTE_LINE;
+
+LINE_ABORT_RETURN:					/* user/program asked to abort the request line */
+	P_code = ssu_et_$request_line_aborted;
+	go to RETURN_FROM_EXECUTE_LINE;
+
+/**/
+
+/* Execute a subsystem request line: this is the default procedure invoked by prepare_to_execute_line which is called
+   externally as ssu_$execute_line */
+
+execute_line:
+     entry (P_sci_ptr, P_request_line_ptr, P_request_line_lth, P_code);
+
+	sci_ptr = P_sci_ptr;
+
+	request_line_ptr = P_request_line_ptr;
+	request_line_lth = P_request_line_lth;
+
+	if request_line_lth > 2 then do;		/* implement ".." escape here */
+	     idx = index (request_line, "..");
+	     if idx ^= 0 then do;			/* ... seems to be one */
+		if idx > 1 then			/* ... insure only white space preceeds it */
+		     jdx = verify (substr (request_line, 1, idx - 1), WHITESPACE);
+		else jdx = 0;			/* ... just a ".." somewhere in the middle of the line */
+		if jdx = 0 then do;			/* ... a true escape: do it */
+						/* format: off */
+		     call sci.entries.cpescape
+			     (sci_ptr, addr (substr (request_line, idx + 2, 1)), request_line_lth - (idx + 1),
+			      P_code);		/* format: on */
+		     if P_code = 100 then P_code = 0;	/* ... censor null lines as the line isn't really blank */
+		     return;
+		end;
+	     end;
+	end;
+
+	if irpo.abbrev_info.abbrev_enabled then		/* user wants abbreviations expanded */
+	     call abbrev_$subsys_process_line (ssu_$get_subsystem_and_request_name (sci_ptr), sci_ptr,
+		ssu_$invoke_request, addr (irpo.cp_subsys_info), command_processor_$subsys_execute_line,
+		irpo.abbrev_info.default_profile_ptr, irpo.abbrev_info.profile_ptr, request_line, P_code);
+
+	else call command_processor_$subsys_execute_line (ssu_$get_subsystem_and_request_name (sci_ptr), sci_ptr,
+		ssu_$invoke_request, addr (irpo.cp_subsys_info), request_line, P_code);
+
+	return;
+
+
+
+/* Allows for execution of constant request strings: simply calls ssu_$execute_line so that replacement of that procedure
+   will properly affect this one */
+
+execute_string:
+     entry (P_sci_ptr, P_request_string, P_code);
+
+	call ssu_$execute_line (P_sci_ptr, addr (substr (P_request_string, 1, 1)), length (P_request_string), P_code);
+
+	return;
+
+/**/
+
+/* Prepares to invoke the evaluate_active_string procedure: if in a standalone invocation, transfers directly to
+   cu_$evaluate_active_string; otherwise, sets up the labels used by ssu_$abort_line and then invokes the actual
+   replaceable evaluate_active_string procedure.  This entry is called by the ssu_$evaluate_active_string transfer
+   vector */
+
+prepare_to_evaluate_string:
+     entry (P_sci_ptr, P_rp_options_ptr, P_active_string, P_active_string_type, P_return_value, P_code);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+
+	if sci.standalone_invocation then do;		/* a Multics command/AF simulating a subsystem ... */
+	     call cu_$evaluate_active_string (null (), P_active_string, P_active_string_type, P_return_value, P_code);
+	     return;
+	end;
+
+	saved_in_listener = sci.in_listener;
+	saved_executing_request = sci.executing_request;	/* in case this is called by a request */
+	saved_abort_line_label = sci.request_processor_info.abort_line_label;
+
+	sci.request_processor_info.abort_line_label = LINE_ABORT_RETURN;
+
+	if ^sci.in_listener then do;			/* no listener: trap subsystem aborts */
+	     saved_abort_subsystem_label = sci.listener_info.abort_subsystem_label;
+	     sci.listener_info.abort_subsystem_label = SUBSYSTEM_ABORT_RETURN;
+	end;
+
+	on condition (cleanup)
+	     begin;
+		sci.in_listener = saved_in_listener;
+		sci.executing_request = saved_executing_request;
+		if ^sci.in_listener then sci.listener_info.abort_subsystem_label = saved_abort_subsystem_label;
+		sci.request_processor_info.abort_line_label = saved_abort_line_label;
+	     end;
+
+/* format: off */
+	call sci.entries.evaluate_active_string
+		(P_sci_ptr, P_rp_options_ptr, P_active_string, P_active_string_type, P_return_value, P_code);
+						/* format: on */
+
+	sci.in_listener = saved_in_listener;
+	sci.executing_request = saved_executing_request;
+	if ^sci.in_listener then sci.listener_info.abort_subsystem_label = saved_abort_subsystem_label;
+	sci.request_processor_info.abort_line_label = saved_abort_line_label;
+
+	return;
+
+/**/
+
+/* Evaluate a subsystem active string: this is the default procedure invoked by prepare_to_evaluate_string which is called
+   externally as ssu_$evaluate_active_string */
+
+evaluate_active_string:
+     entry (P_sci_ptr, P_rp_options_ptr, P_active_string, P_active_string_type, P_return_value, P_code);
+
+	sci_ptr = P_sci_ptr;
+
+	if P_rp_options_ptr ^= null () then do;		/* caller wishes to override subsystem's default options */
+	     rp_options_ptr = P_rp_options_ptr;
+	     if rp_options.version ^= RP_OPTIONS_VERSION_1 then do;
+		P_code = error_table_$unimplemented_version;
+		return;				/* ... but we don't understand it */
+	     end;
+	     cp_subsys_info_ptr = addr (lcsi);		/* ... validate that these options are OK */
+	     lcsi.version = CP_SUBSYS_INFO_VERSION_1;
+	     lcsi.non_standard_language = rp_options.non_standard_language;
+	     unspec (lcsi.full_tct_table) = unspec (rp_options.character_types);
+	     call command_processor_$validate_cp_subsys_info (cp_subsys_info_ptr, P_code);
+	     if P_code ^= 0 then return;		/* ... there's something wrong with them */
+	end;
+	else cp_subsys_info_ptr = sci.rp_options_ptr;	/* use the subsystem's current options */
+
+	call command_processor_$subsys_eval_string (ssu_$get_subsystem_and_request_name (sci_ptr), sci_ptr,
+	     ssu_$invoke_request, cp_subsys_info_ptr, P_active_string, P_active_string_type, P_return_value, P_code);
+
+	return;
+
+/**/
+
+/* Returns the request processor options presently in effect in this subsystem */
+
+get_rp_options:
+     entry (P_sci_ptr, P_rp_options_version, P_rp_options_ptr, P_code);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+	rp_options_ptr = P_rp_options_ptr;
+
+	if P_rp_options_version ^= RP_OPTIONS_VERSION_1 then do;
+	     P_code = error_table_$unimplemented_version;
+	     return;				/* we only support this version at present */
+	end;
+
+	if sci.rp_options_ptr = null () then call init_rp_options (sci_ptr);
+						/* be sure there's something to look at */
+
+	rp_options.version = RP_OPTIONS_VERSION_1;	/* it's the only version we have */
+
+	rp_options.non_standard_language = irpo.cp_subsys_info.non_standard_language;
+	if irpo.cp_subsys_info.non_standard_language then /* be sure caller sees proper language definition */
+	     unspec (rp_options.character_types) = unspec (irpo.cp_subsys_info.full_tct_table);
+	else unspec (rp_options.character_types) = unspec (cp_data_$standard_language);
+
+	rp_options.expand_request_lines = irpo.abbrev_info.abbrev_enabled;
+	rp_options.default_profile_ptr = irpo.abbrev_info.default_profile_ptr;
+	rp_options.profile_ptr = irpo.abbrev_info.profile_ptr;
+
+	P_code = 0;				/* success */
+
+	return;
+
+/**/
+
+/* Returns the default request processor options for a subsystem */
+
+get_default_rp_options:
+     entry (P_sci_ptr, P_rp_options_version, P_rp_options_ptr, P_code);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+	rp_options_ptr = P_rp_options_ptr;
+
+	if P_rp_options_version ^= RP_OPTIONS_VERSION_1 then do;
+	     P_code = error_table_$unimplemented_version;
+	     return;				/* we only support this version at present */
+	end;
+
+	rp_options.version = RP_OPTIONS_VERSION_1;	/* it's the only version we have */
+
+	rp_options.non_standard_language = "0"b;	/* default is the standard language */
+	unspec (rp_options.character_types) = unspec (cp_data_$standard_language);
+
+	rp_options.expand_request_lines = "0"b;		/* abbrev is off by default */
+	rp_options.default_profile_ptr, rp_options.profile_ptr = null ();
+
+	P_code = 0;				/* success */
+
+	return;
+
+/**/
+
+/* Sets the request processor options to be used in this subsystem */
+
+set_rp_options:
+     entry (P_sci_ptr, P_rp_options_ptr, P_code);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+	rp_options_ptr = P_rp_options_ptr;
+
+	if rp_options.version ^= RP_OPTIONS_VERSION_1 then do;
+	     P_code = error_table_$unimplemented_version;
+	     return;				/* we only support this version at present */
+	end;
+
+	if sci.rp_options_ptr = null () then call init_rp_options (sci_ptr);
+						/* be sure there's something to look at */
+
+	lcsi.version = CP_SUBSYS_INFO_VERSION_1;	/* validate the caller's request language definition */
+	lcsi.non_standard_language = rp_options.non_standard_language;
+	unspec (lcsi.full_tct_table) = unspec (rp_options.character_types);
+	call command_processor_$validate_cp_subsys_info (addr (lcsi), P_code);
+	if P_code ^= 0 then return;			/* ... it's illegal */
+
+	irpo.cp_subsys_info = lcsi;			/* OK: set the options */
+
+	call maybe_terminate_profiles (rp_options.default_profile_ptr, rp_options.profile_ptr);
+
+	irpo.abbrev_info.abbrev_enabled = rp_options.expand_request_lines;
+	irpo.abbrev_info.default_profile_ptr = rp_options.default_profile_ptr;
+	irpo.abbrev_info.profile_ptr = rp_options.profile_ptr;
+
+	P_code = 0;				/* success */
+
+	return;
+
+/**/
+
+/* Resets the request processor options in use by this subsystem to their default state */
+
+reset_rp_options:
+     entry (P_sci_ptr);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;
+	if sci.rp_options_ptr = null () then call init_rp_options (sci_ptr);
+						/* be sure there's something to look at */
+
+	irpo.cp_subsys_info.version = CP_SUBSYS_INFO_VERSION_1;
+	irpo.cp_subsys_info.non_standard_language = "0"b; /* but you already knew that */
+
+	call maybe_terminate_profiles (null (), null ()); /* terminate the profile segments if needed */
+	irpo.abbrev_info.abbrev_enabled = "0"b;		/* no abbrev expansion */
+	irpo.abbrev_info.default_profile_ptr, irpo.abbrev_info.profile_ptr = null ();
+
+	return;
+
+/**/
+
+/* Returns all data related to abbreviation processing of request lines in this subsystem */
+
+get_abbrev_info:
+     entry (P_sci_ptr, P_default_profile_ptr, P_profile_ptr, P_abbrev_mode);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;			/* need to check that options were setup */
+	if sci.rp_options_ptr = null () then call init_rp_options (sci_ptr);
+
+	P_default_profile_ptr = irpo.abbrev_info.default_profile_ptr;
+	P_profile_ptr = irpo.abbrev_info.profile_ptr;
+	P_abbrev_mode = irpo.abbrev_info.abbrev_enabled;
+
+	return;
+
+
+
+/* Sets all data related to abbreviation processing */
+
+set_abbrev_info:
+     entry (P_sci_ptr, P_default_profile_ptr, P_profile_ptr, P_abbrev_mode);
+
+	call ssu_check_sci (P_sci_ptr);
+
+	sci_ptr = P_sci_ptr;			/* need to check that options were setup */
+	if sci.rp_options_ptr = null () then call init_rp_options (sci_ptr);
+
+	call maybe_terminate_profiles (P_default_profile_ptr, P_profile_ptr);
+
+	irpo.abbrev_info.default_profile_ptr = P_default_profile_ptr;
+	irpo.abbrev_info.profile_ptr = P_profile_ptr;
+	irpo.abbrev_info.abbrev_enabled = P_abbrev_mode;
+
+	return;
+
+/**/
+
+/* Conditionally terminate the current subsystem profile segments: never terminates a segment if one of the other
+   pointers (old or new) references it and never terminates a segment more than once.  Some subsystems only initiate their
+   profile segment once even though they set it as the default and current profiles; therefore, it isn't safe to just
+   terminate the old profile segments */
+
+maybe_terminate_profiles:
+     procedure (p_new_default_profile_ptr, p_new_profile_ptr);
+
+dcl  (p_new_default_profile_ptr, p_new_profile_ptr) pointer parameter;
+dcl  (old_default_profile_ptr, old_profile_ptr) pointer;
+
+	old_default_profile_ptr = irpo.abbrev_info.default_profile_ptr;
+	old_profile_ptr = irpo.abbrev_info.profile_ptr;
+
+	if old_default_profile_ptr ^= null () then	/* may not be using the default profile any longer */
+	     if ((old_default_profile_ptr ^= p_new_default_profile_ptr)
+		& (old_default_profile_ptr ^= p_new_profile_ptr)) then
+		call hcs_$terminate_noname (old_default_profile_ptr, (0));
+
+	if old_profile_ptr ^= null () then		/* may not be using the current profile any longer */
+	     if old_profile_ptr ^= old_default_profile_ptr then
+		if ((old_profile_ptr ^= p_new_default_profile_ptr) & (old_profile_ptr ^= p_new_profile_ptr)) then
+		     call hcs_$terminate_noname (old_profile_ptr, (0));
+
+	return;
+
+     end maybe_terminate_profiles;
+
+/**/
+
+%include "_ssu_check_sci";
+%page;
+%include "_ssu_sci";
+%page;
+%include ssu_rp_options;
+%page;
+%include "_cp_subsys_info";
+
+
+     end ssu_request_processor_;

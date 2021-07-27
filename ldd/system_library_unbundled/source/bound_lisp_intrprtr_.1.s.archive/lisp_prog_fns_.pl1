@@ -1,0 +1,1129 @@
+/* **************************************************************
+   *                                                            *
+   * Copyright, (C) Massachusetts Institute of Technology, 1973 *
+   *                                                            *
+   ************************************************************** */
+prog:	proc;
+
+	/* lisp functions that use hairy control structures - prog, errset, catch/throw, & c.  */
+
+	/*
+	 * Gathered from other modules and recoded by D. Moon 8-JUN-72
+	 * break added, 12-July-72 DAM
+	 * go changed to search for label instead of making
+	 *  label-table array, DAM 5 Aug 72
+	 * go, return, and xec_body moved into hand code in lisp_.alm, 19 AUG 72 DAM
+	 * err function moved to lisp_error_.pl1, DAM 15 OCT 1972
+	 * Moby unwind_protect feature, after HIC dared me, BSG 09/09/78
+	 */
+
+/* INCLUDE FILES */
+
+%include lisp_control_chars;
+%include lisp_stack_seg;
+%include lisp_nums;
+%include lisp_stack_fmt;
+%include lisp_faults;
+%include lisp_unmkd_pdl;
+%include lisp_ptr_fmt;
+%include lisp_initial_atoms;
+%include lisp_common_vars;
+%include lisp_cons_fmt;
+%include lisp_atom_fmt;
+%include lisp_error_codes;
+%include lisp_name_codes;
+
+
+/* declarations for lisp_unwinder */
+
+dcl unwind_to bit(18),				/* rel ptr to unmarked pdl, which tells lisp_unwinder
+						   how far to unwind the unmarked stack. */
+    where_to bit(18) aligned,
+    frame_rels(0:6  /* nframeptrs - PL1 compiler bug */ ) bit(18) aligned;	/* rel's of the frame_ptrs */
+	dcl (qt, qb) pointer;
+
+	/* ENTRY POINTS CALLED */
+
+dcl lisp_special_fns_$cons ext entry;
+dcl lisp_fault_handler_$interrupt_poll entry ();
+dcl lisp_oprs_$xec_unwprot_compiled_handler ext entry;
+dcl lisp_$eval entry;
+dcl lisp_$eval_list entry;
+dcl lisp_$unwind_reversal entry;
+dcl lisp_error_ entry, unmp ptr;
+dcl (addr, addrel, null, bit, fixed, ptr, rel) builtin;
+
+dcl  lisp_static_vars_$eval_atom fixed bin (71) external;
+
+/* general variables */
+
+dcl progsw bit(1);	/* "1"b = prog, "0"b = do */
+			/* equivalent to: binding_block.top_block = prog_frame.dat1 + 6, approximately */
+dcl p ptr;
+
+dcl 1 save_masked automatic like masked;
+
+dcl myname fixed bin;		/* name code for too_few_args error signalled by need_arg */
+
+dcl stack ptr;
+dcl top_of_stack ptr;
+dcl unm ptr;
+
+dcl (i, n) fixed bin;
+
+/* 
+/*  prog function for lisp */
+
+/* prog:	entry;	*/
+
+	myname = fn_prog;
+	progsw = "1"b;
+	stack = addrel(stack_ptr, -2);
+	stack_ptr = addr(stack -> temp(4));		/* 3 temp cells */
+
+	/* make sure we have at least one arg - the local variable list */
+
+	call need_arg;
+
+	/* save old bindings of the local variables */
+
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* the local - variable list */
+local_variables_loop:
+	if stack -> temp(2) = nil then go to rebind;
+	if stack -> temp_ptr(2) -> cons_types.car & Atsym then;	/* OK to rebind */
+	     else do;		/* unrecoverable error */
+		stack -> temp(3) = stack -> temp_ptr(2) -> cons.car;
+		unmp = unmkd_ptr;
+		unmkd_ptr = addrel(unmp, 2);
+		unmp -> errcode(1) = bad_bv;
+		call lisp_error_;
+		end;
+
+	p = stack_ptr;
+	stack_ptr = addrel(stack_ptr, 4);		/* defend binding block against the vicious
+						   onslaught of the garbage collector */
+	p -> bindings(1).atom = stack -> temp_ptr(2) -> cons.car;
+	p -> bindings(1).old_val = stack -> temp_ptr(2) -> cons_ptrs.car -> atom.value;
+
+	stack -> temp(2) = stack -> temp_ptr(2) -> cons.cdr;
+	go to local_variables_loop;
+
+		/* now set up a binding_block  on the unmarked pdl */
+
+rebind:
+	p = unmkd_ptr;
+	unmkd_ptr = addrel(unmkd_ptr, 2);
+	p -> binding_block.bot_block = rel(addr(stack -> temp(4)));	/* first binding */
+	p -> binding_block.top_block = rel(stack_ptr);		/* just above last binding */
+	p -> binding_block.back_ptr = rel(binding_top);
+	p -> binding_block.rev_ptr = ""b;
+	binding_top = p;				/* push onto the binding pseudo-pdl */
+
+/******** It is now safe to rebind the local variables to nil ********/
+
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* get local vars list again */
+bind_local_vars_to_nil:
+	if stack -> temp(2) = nil then go to mk_frame;
+	stack -> temp_ptr(2) -> cons_ptrs.car -> atom.value = nil;
+	stack -> temp(2) = stack -> temp_ptr(2) -> cons.cdr;
+	go to bind_local_vars_to_nil;
+
+mk_frame:
+	call make_prog_frame;
+/* 
+/* At long last, we are ready to execute the body of the prog */
+
+	stack -> temp(2),
+	stack -> temp(3) = stack -> temp_ptr(1) -> cons.cdr;	/* the body */
+
+prog_ex:	call xec_body;				/* run the body of the prog */
+
+prog_end:	/* End of the prog reached uneventfully, return nil (unwinding the saved bindings) */
+
+	stack -> temp(1) = nil;
+	go to prog_ret;
+
+
+/* go or return comes here with label name or return value and a go/return switch on the stack */
+
+go_or_return:
+
+	p = addrel(stack_ptr, -4);			/* pick up stuff from stack frame of go or return */
+	stack = ptr(p, prog_frame -> frame.dat1);
+	stack -> temp(1) = p -> temp(1);		/* and copy it down so it won't go away */
+
+	if p -> temp(2) = nil then do;
+
+		/* GO */
+
+		stack5 = ptr(stack_ptr, prog_frame -> frame.dat2);
+
+		/* search prog body for label to go to */
+
+go_once_more:
+		do stack -> temp(2) = stack -> temp(3)		/* scan whole prog body */
+			repeat(stack -> temp_ptr(2) -> cons.cdr)
+			while (stack -> temp_type(2) = Cons);
+		     if stack -> temp_ptr(2) -> cons_types.car then
+
+			/* found a label - see if it's the one we want */
+
+		     if stack -> temp_ptr(2) -> cons.car = stack -> temp(1) then do;
+			unwind_to = rel(addrel(prog_frame, 6));	/* unwind any nested stuff */
+			call lisp_unwinder;
+			stack_ptr = addr(stack5 -> temp(2));
+			if progsw then go to prog_ex;		/* YES - begin executing at label */
+			  else go to do_ex;
+			end;
+		     end;
+
+		/* search failed - barf */
+		/*** NOTE that at this point the LISP evalframes are still
+		   there, for the benefit of clever unseen-go-tag handlers,
+		   but the associated Multics stack frames, if any, are not
+		   there.  So beware  -  mostly of using freturn or throw. ***/
+
+		unmp = unmkd_ptr;
+		unmkd_ptr = addrel(unmp, 2);
+		unmp -> errcode(1) = unseen_go_tag;
+		top_of_stack = stack_ptr;
+		stack_ptr = addrel(top_of_stack, 2);
+		top_of_stack -> temp(1) = stack -> temp(1);
+		call lisp_error_;
+		stack -> temp(1) = top_of_stack -> temp(1);		/* recovery */
+		stack_ptr = top_of_stack;
+		go to go_once_more;
+		end;
+
+	/*  RETURN  */
+
+prog_ret:
+	unwind_to = rel(addrel(prog_frame, -2));			/* unwind it all */
+	call lisp_unwinder;
+	stack_ptr = addr(stack -> temp(2));
+xretn:	return;
+
+
+	/* common code for do and prog */
+
+
+	/* create prog frame on the unmarked pdl */
+
+make_prog_frame:  proc;
+
+	stack4, stack5 = stack_ptr;
+	p = unmkd_ptr;
+	unmkd_ptr = addrel(unmkd_ptr, 6);		/***** size of a frame */
+	p -> frame.ret = go_or_return;
+	p -> frame.prev_frame = rel(prog_frame);
+	p -> frame.stack_ptr = rel(stack4);		/* clear the stack if we get unwound */
+						/* also base of label table */
+	p -> frame.dat1 = rel(stack);
+	p -> frame.dat2 = rel(stack5);
+	prog_frame = p;				/* push onto the stack */
+	stack_ptr = addr(stack5 -> temp(2));		/* make some room to call eval */
+	return;
+	end;
+
+	/* routine to execute the body of a prog or do*/
+
+xec_body:	proc;
+
+	dcl unm ptr;
+
+	unm = unmkd_ptr;
+	unmkd_ptr = addrel(unm, 2);
+	unm -> based_ptr = addr(stack -> temp(2));	/* -> body */
+	call lisp_$eval_list;			/* fast body evaluator */
+	return;
+	end;
+/* 
+/* entry point to allow outsiders to call lisp_unwinder.
+   Called with top of unmarked pdl containing ptr to where to unwind to */
+
+lisp_unwinder: entry;
+
+	unwind_to = rel( addrel(unmkd_ptr,-2)->based_ptr );
+	call lisp_unwinder;
+	return;
+
+
+/* Internal procedure to unwind the unmarked stack down to a specified point (specified by unwind_to) */
+
+lisp_unwinder:	proc;
+
+	dcl st bit(18);		/* rel of stack_ptr, for efficiency */
+	dcl relp bit(18) aligned;
+	dcl temp_framep ptr;
+	/* convert pointers to rel pointers for easy comparison */
+
+set_rel:	do i = 0 to nframeptrs;
+	     frame_rels(i) = rel(frame_ptrs(i));
+	     end;
+	unm = unmkd_ptr;				/* copy this ext static variable */
+	st = rel(stack_ptr);		/* set this in case we unwind nothing */
+
+choose:	/* find something to unwind */
+
+
+	where_to = ""b;		/* the minimum number */
+	do i = 0 to nframeptrs;		/* find max of the frame_rels */
+	     if frame_rels(i) >= where_to then do;	/* can't be = but generates better code than > */
+		where_to = frame_rels(i);
+		n = i;
+		end;
+	     end;
+
+	if where_to = ""b then go to done_unw;	/* no more to be unwound */
+	if where_to < unwind_to
+	then
+done_unw:	     do;
+
+		if unwind_to = ""b
+		then do;
+		     unm = ptr(unm,""b);
+		     unwind_to = rel(unm->stack_seg.unmkd_stack_bottom);	/* to bottom of unmkd_stack */
+		     st = rel(unm->stack_seg.marked_stack_bottom);	/* to bottom of marked_stack */
+		     end;
+		unmkd_ptr = ptr(unm, unwind_to);		/* move unmkd_ptr down */
+		stack_ptr = ptr(stack_ptr, st);		/* move stack_ptr down */
+		return;
+	     end;
+
+	if n = 0 then go to unwind_bindings;		/* this is harder to unwind than the others */
+	  else if n = 1 then go to unwind_fault_save;	/* .. */
+	  else do;
+	      st = frame_ptrs(n) -> frame.stack_ptr;
+	      relp = frame_ptrs(n) -> frame.prev_frame;
+	      if n = 6 then do;			/* Unwind protect */
+		 stack_ptr = ptr (stack_ptr, st);	/* Normalize pdls */
+		 temp_framep = unwp_frame;		/* Save pointer */
+		 unmkd_ptr = addrel (frame_ptrs (6), size (frame));
+		 if temp_framep -> frame.dat1 = "000000"b3	/* Interpreted unw_prot */
+		 then do;
+		      save_masked = masked;
+		      string (masked.against) = copy ("1"b, length (string (masked.against)));
+		      unwp_frame = ptr (unm, relp);
+		      unmkd_ptr = addrel (temp_framep, size (based_ptr));
+		      temp_framep -> based_ptr = addrel (stack_ptr, -2);
+		      call lisp_$eval_list;		/* Do the exit forms */
+		      masked = save_masked;
+		      if lisp_static_vars_$deferred_interrupt
+		      then call lisp_fault_handler_$interrupt_poll;
+		 end;
+		 else call lisp_oprs_$xec_unwprot_compiled_handler;
+		 frame_rels (6) = relp;
+		 go to choose;
+	      end;
+	      frame_ptrs(n) = ptr(unm, relp);
+	      frame_rels(n) = relp;
+	      go to choose;
+	      end;
+
+
+
+unwind_bindings:
+	qt = ptr(stack_ptr, binding_top -> binding_block.top_block);
+	st = binding_top -> binding_block.bot_block;		/* put stack_ptr below the bindings */
+	if st then do;		/* normal bb */
+	     qb = ptr(qt, st);
+	     do while (qb ^= qt);		/* restore bindings to their atoms */
+		qt = addrel(qt, -4);
+		addr(qt -> bindings(1).atom) -> based_ptr -> atom.value = qt -> bindings(1).old_val;
+		end;
+	     binding_top = ptr(binding_top, binding_top -> binding_block.back_ptr);
+	     end;
+	else do;		/* reversal bb */
+	     call lisp_$unwind_reversal;
+	     end;
+	frame_rels(0) = (rel(binding_top));
+	go to choose;
+
+
+	/* routine to unwind through a user interrupt */
+
+unwind_fault_save:
+	st = err_recp -> fault_save.stack_ptr;
+	gc_inhibit = err_recp -> fault_save.sv_gc_inhibit;
+	call lisp_fault_handler_$set_mask((err_recp -> fault_save.sv_masked));
+	unspec(ptr(unmkd_ptr, ""b) -> stack_seg.array_info_for_store) = unspec(err_recp -> fault_save.sv_array_info);
+	ptr(unmkd_ptr, ""b) -> stack_seg.array_offset_for_store = err_recp -> fault_save.sv_array_offset;
+	rdr_label = err_recp -> fault_save.sv_rdr_label;
+	rdr_state = err_recp -> fault_save.sv_rdr_state;
+	rdr_ptr = err_recp -> fault_save.sv_rdr_ptr;
+	err_recp = ptr(err_recp, err_recp -> fault_save.prev_frame);
+	frame_rels(1) = rel(err_recp);
+	go to choose;
+
+	end lisp_unwinder;
+/*  
+/* this is the lisp errset funtion, which traps errors */
+
+errset:	entry;
+
+	stack = addrel(stack_ptr, -2);
+
+	/* get our argument, which we will eval after setting up an err_frame */
+
+	myname = fn_errset;
+	call need_arg;
+
+	/* set up an err_frame in the unmarked pdl */
+
+	p = unmkd_ptr;
+	unmkd_ptr = addrel(unmkd_ptr, 6);		/***** size of a frame */
+	p -> frame.ret = error_return;		/* where to come back to if error */
+	p -> frame.stack_ptr = rel(stack_ptr);
+	p -> frame.prev_frame = rel(err_frame);
+	p -> frame.dat2 = "0"b;			/* "1"b means err with non-nil 2nd arg */
+
+	/* set frame.dat1 to reflect whether caller wants error messages suppressed */
+
+	p -> frame.dat1 = "0"b;			/* assume he wants err msgs */
+	if stack -> temp_ptr(1) -> cons.cdr = nil | stack -> temp_ptr(1) -> cons_types.cdr then;
+	   else if stack -> temp_ptr(1) -> cons_ptrs.cdr -> cons.car = nil
+		then p -> frame.dat1 = "1"b;		/* 2nd arg nil ---> suppress err msgs */
+	err_frame = p;				/* NOW push frame onto pdl */
+
+	stack -> temp(1) = stack -> temp_ptr(1) -> cons.car;	/* arg is ready to give to eval */
+	call lisp_$eval;				/* evaluate the arg */
+
+	/* if we get this far, there was no error */
+
+	err_frame = ptr(err_frame, p -> frame.prev_frame);	/* particularly easy to unwind */
+	unmkd_ptr = p;
+	stack_ptr = addrel(stack_ptr, 2);		/* set up to call to cons */
+	addrel(stack_ptr, -2) -> temp(1) = nil;		/* return list of result of our arg */
+	call lisp_special_fns_$cons;
+	return;
+
+
+	/* come here if an error occurs */
+
+error_return:
+
+	stack = addrel(ptr(stack_ptr, err_frame -> frame.stack_ptr),   -2);
+	stack -> temp(1) = addrel(stack_ptr, -2) -> temp(1);	/* pick up value to return */
+	unwind_to = rel(err_frame);			/* unwind back to & including our errset frame */
+	if err_frame -> frame.dat2 then do;		/* unwind before eval -- err with non-nil 2nd arg */
+	     call lisp_unwinder;
+	     call lisp_$eval;
+	     end;
+	else call lisp_unwinder;			/* already been evaled */
+	return;
+
+
+/* 
+
+/*	Catch and Throw   */
+
+/* Catch and throw have been extended to include "catch labels."
+ * If they are called with a second argument, then the unevaluated
+ * second argument, which is usually an atom, "labels" the catch
+ * so that a throw with a second argument _e_q to the second argument
+ * to that catch will throw back to that catch in spite of any
+ * intervening catches.  If the second argument is omitted, catch
+ * catches any throw and throw throws to the most recent
+ * catch.  Catch evaluates its first argument, and if a throw
+ * occurs, the evaluated first argument to throw is returned
+ * as the result of the catch, otherwise the evaluated first
+ * argument to catch is returned.  Example of catch labels.:
+ * (catch (progn (catch (throw 't foo) bar) (print 'foobar))  foo)
+ * would not print foobar since the throw throws back through
+ * the progn all the way out to the outer catch.  The value
+ * of the expression would be t.
+ */
+
+
+catch:	entry;
+
+	/* first find out how many args we have and make sure it is 1 or 2 */
+
+	stack = addrel(stack_ptr, -2);		/* Is an fsubr */
+	myname = fn_catch;
+	call need_arg;
+	stack_ptr = addr(stack -> temp(3));		/* get 2 cells instead of one */
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* save first arg */
+
+	/* check for a second arg */
+
+	if stack -> temp_ptr(1) -> cons.cdr = nil | stack -> temp_ptr(1) -> cons_types.cdr
+		then stack -> temp_type36(1) = Numeric36;		/* no second arg -- use this cruft */
+								/* which can "never" appear in a list
+								   but won't screw up the g.c. */
+	  else stack -> temp(1) = stack -> temp_ptr(1) -> cons_ptrs.cdr -> cons.car;	/* use given 2nd arg */
+
+	/* set up a catch frame */
+
+	p = unmkd_ptr;
+	unmkd_ptr = addrel(unmkd_ptr, 6);			/***** size of a frame */
+	p -> frame.ret = catch_return;		/* if we get thrown to */
+	p -> frame.prev_frame = rel(catch_frame);
+	p -> frame.stack_ptr = rel(addr(stack -> temp(2)));		/* leaving catch-label and junk on stack */
+	catch_frame = p;				/* push onto pdl */
+
+	/* eval the first arg */
+
+	call lisp_$eval;
+
+	/* normal return -- return (eval 1st_arg) */
+
+	stack -> temp(1) = stack -> temp(2);		/* move down the value to be returned */
+
+uncatch:	unwind_to = rel(catch_frame);			/* unwind back through our catch frame */
+	call lisp_unwinder;
+	return;
+
+
+catch_return:
+
+	/* unwind and return the evaluated first arg of throw */
+
+	addrel(ptr(stack_ptr, catch_frame -> frame.stack_ptr), -2) -> temp(1) =
+		addrel(stack_ptr, -4) -> temp(2);	/* move result down so we can return it */
+	go to uncatch;				/* unwind & return */
+
+/* 
+/* the throw function throws its evaluated first arg back to the most recent catch whose
+   second arg was _e_q to the second arg of throw */
+
+throw:	entry;
+
+	stack = addrel(stack_ptr, -2);
+	stack_ptr = addr(stack -> temp(3));
+
+	/* eval our first arg */
+
+	myname = fn_throw;
+	call need_arg;
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* get first arg */
+	stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;	/* save rest of arg-list */
+	call lisp_$eval;					/* eval our first arg and leave it on
+							   the stack where catch_return can find it */
+
+
+	/* see if we have a second arg */
+
+	if stack -> temp(1) = nil | stack -> temp_type(1) then do;
+					/* no, find most recent catch */
+		p = catch_frame;
+		if rel(p) then go to throw1;
+		  else go to bad_throw_uu;		/* error - no catch_frame */
+		end;
+	  else stack -> temp(1) = stack -> temp_ptr(1) -> cons.car;		/* yes -- use it as catch label */
+
+	/* search for a catch frame for this label */
+
+throw_retry:
+	p = catch_frame;
+catch_search:
+	if rel(p) = "0"b then go to bad_throw;		/* exhausted stack without finding place to throw to */
+
+	qb = addrel(ptr(stack_ptr, p -> frame.stack_ptr), -2);
+	if qb -> temp(1) = stack -> temp(1) then go to throw1;
+	if qb -> temp_type36(1) = Numeric36 then do;	/* an unlabeled catch */
+throw1:		/* found the catch to throw back to */
+
+		catch_frame = p;			/* discard any intervening catches */
+		go to p -> frame.ret;		/* unwind pl1 stack back to catch_return,
+						   which will do the rest */
+		end;
+	p = ptr(p, p -> frame.prev_frame);		/* keep searching back */
+	go to catch_search;
+
+
+bad_throw_uu:
+	unspec(stack -> temp(1)) = Undefined;
+					/* inform lisp_error_ that there was no throw-label given */
+
+bad_throw:	/* tried to throw but there was no corresponding catch */
+
+	unmp = unmkd_ptr;
+	unmkd_ptr = addrel(unmp, 2);
+	unmp -> errcode(1) = throw_to_no_catch;
+	stack_ptr = addr(stack -> temp(4));
+	stack -> temp(3) = stack -> temp(1);	/* throw tag */
+	call lisp_error_;
+	stack -> temp(1) = stack -> temp(3);	/* replacement value */
+	go to throw_retry;
+
+/* 
+*/
+
+/* Lisp unwind-protect:  borrowed from Lisp Machine, BSG 09/09/78 */
+
+unwind_protect:
+	 entry;
+
+
+	 myname = fn_unwind_protect;
+	 stack = addrel (stack_ptr, -2);
+	 call need_arg;
+	 stack_ptr = addr (stack -> temp (4));
+	 stack -> temp (3) = stack -> temp_ptr (1) -> cons.car;	/* thing to eval */
+	 stack -> temp (2) = stack -> temp_ptr (1) -> cons.cdr;	/* exit list */
+
+	 /* stack (1) is for return result */
+	 /* Set up a unwp frame */
+
+	 p = unmkd_ptr;
+	 unmkd_ptr = addrel (unmkd_ptr, 6);
+	 p -> frame.prev_frame = rel (unwp_frame);
+	 p -> frame.stack_ptr = rel (addr (stack -> temp (3)));
+	 p -> frame.dat1 = "000000"b3;		/* No compiled exit. */
+	 unwp_frame = p;
+
+	 /* Eval the first arg. */
+
+	 call lisp_$eval;
+
+	 stack -> temp (1) = stack -> temp (3);		/* Save the result */
+	 unwind_to = rel (unwp_frame);		/* Set unwind point */
+	 call lisp_unwinder;			/* Will eval the exit forms, pop the pdls */
+	 stack_ptr = addr (stack -> temp (2));		/* Set to return result */
+	 return;
+/**/
+/* entry to unwind the stack following a call to lisp_err_ */
+
+	/* the stack is unwound until an errset is found.  If there is none, return to top level */
+
+lisp_err:	entry(err_fcn_f);
+
+	dcl err_fcn_f bit(1) aligned parameter;	/* "1"b means errset value on stack */
+
+	if ^err_fcn_f then do;
+		stack_ptr = addrel(stack_ptr, 2);		/* force errset to return nil */
+		addrel(stack_ptr, -2) -> temp(1) = nil;
+		end;
+
+process_error:
+
+	if rel(err_frame) then 
+				/* there is an err_frame to return to */
+	go to err_frame -> frame.ret;			/* the errset routine will do the rest */
+	   else;	/* no errset - unwind all the way and return to top level */
+
+		/* copy value of errlist before unbinding */
+	addr(lisp_static_vars_$SLASH) -> based_ptr -> atom.value = addr(lisp_static_vars_$errlist) -> based_ptr -> atom.value;
+	unwind_to = ""b;
+	call lisp_unwinder;
+	go to lisp_static_vars_$top_level;	/* return to the top-level read-eval-print loop */
+
+/* 
+/* lisp do function */
+
+do:	entry;
+
+	progsw = "0"b;
+dcl (stack2, stack3, stack4, stack5) ptr,	/* -> various places in marked stack */
+    prog_with_initial_values bit(1);	/* flag for (do (...) nil ...) */
+
+/*
+	written by Alex Sunguroff 6/72
+	rewritten by David Moon 9-JUN-72 for new stack discipline, new pointer format, and v2pl1 compiler
+	quick fix of bug introduced 9-JUN-72, made 17-MAY-73 by DAM.
+	prog-with-initial-values feature put in 16 Oct 1973 by DAM
+*/
+/* a pictorial exposition of the data stored on the stacks by do */
+/*
+		MARKED PDL 				UNMARKED PDL
+
+	______________________________		______________________________
+	|			|		|			|
+stack ->  |       argument list	|		|			|
+	|			|		|			|
+	|	scanning pointer	|		|			|
+	|			|     binding_top ->|-----------------------------|
+	|      body of the do	|		| rel(stack4) |  rel(stack3)  | - boundaries of saved bindings
+	|			|		|-------------|---------------|
+	|      endtest        	|		|  thread	    |      0   	|
+	|			|		|-------------|---------------|
+	|     return value list	|		|			|
+	|-----------------------------|		|			|
+stack2 ->	|      (indices information)  |      prog_frame ->|-----------------------------|
+	|			|		|			|
+	|- - - - - - - - - - - - - - -|		|  ret = do_control_return	|       
+	|      index atom             |		|                             |
+	|     initial value           |		|                             |
+	|      stepper		|		|-----------------------------|   
+	|- - - - - - - - - - - - - - -|		|  thread     | rel(stack4)   | - to wipe out the stack
+	|             .     	|		|-----------------------------|
+	|	    .		|		| rel(stack)  | rel(stack5)   | - boundary of label table
+	|	    .		|		|-----------------------------|
+	|			|		|			|
+	|-----------------------------|		|			|
+stack3 ->	|  (saved bindings of indices)|
+	|			|
+	|- - - - - - - - - - - - - - -|
+	|	atom		|
+	|	value		|
+	|- - - - - - - - - - - - - - -|
+	|	   .		|
+	|	   .		|
+	|	   .		|
+stack4 -> |-----------------------------|
+stack5 ->	| -> thing being evaled	|
+	|-----------------------------|
+stack_ptr->			|
+	|			|
+	|			|
+*/
+
+
+
+
+
+
+	myname = fn_do;
+	stack = addrel(stack_ptr, -2);		/* fsubr */
+	call need_arg;
+	stack_ptr = addr(stack -> temp(6));		/* protect temp(1:5) */
+
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* get the first element of the arg list */
+	stack2, stack3 = addr(stack -> temp(6));	/* initialize these pointers*/
+
+
+	if stack -> temp_type36(2) & Atsym36 then do;	/* if the first element of the argument list is
+							atomic, then this is an old style do group */
+	     prog_with_initial_values = "0"b;			/* clear flag for funny do */
+	     if stack -> temp(2) = nil then go to new_type_do_join;	/* nil is a list in this context */
+	     stack_ptr,stack3 = addr(stack2 -> temp(4));
+	     stack2 -> temp(1) = stack -> temp(2);     	/* remember the index atom */
+
+	     stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;	/* shorten the arg list */
+	call need_arg;
+
+	     stack2 -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* place the initial value here */
+
+	     stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;	/* shorten the arg list */
+	call need_arg;
+
+	     stack2 -> temp(3) = stack -> temp_ptr(1) -> cons.car;	/*place the stepper function here */
+
+	     stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;	/*shorten the arg list */
+	call need_arg;
+
+	     stack -> temp(4) = stack -> temp_ptr(1) -> cons.car;	/*place the endtest here */
+	     stack4, stack_ptr = addr(stack3 -> temp(3));
+	     stack3 -> bindings(1).atom = stack2 -> temp(1);
+	     stack3 -> bindings(1).old_val = stack2 -> temp_ptr(1) -> atom.value;
+	     stack -> temp(5) = nil;			/* return value is nil */
+	     go to common_do_code;			/*proceed to where both forms are handled similarly */
+	end;
+
+
+	do while(stack -> temp(2) ^= nil);		/* this do group takes the list of indeces
+					where each element of the list has the form:  (x xinit xstepper)
+					and where xinit and xstepper may be ommitted and places those
+					three elements on the stack and binds the oldvalue of x */
+	     if stack -> temp_type(2) then go to bad_form_do;	/*error if not a list */
+	     stack_ptr = addr(stack3 -> temp(4));	/* get room for another index table entry */
+
+	     stack3 -> temp(3) = stack -> temp_ptr(2) ->cons.car;	/*place the list containing the information
+							about the next index here */
+	     if stack3 -> temp(3) = nil then go to bad_form_do;	/* this requires that there be at least a list of x*/
+	     if stack3 -> temp_type(3) then go to bad_form_do;
+
+	     stack3 -> temp(1) = stack3 -> temp_ptr(3) -> cons.car;	/*place the index here*/
+
+	     stack3 -> temp(3) = stack3 -> temp_ptr(3) -> cons.cdr;		/*shorten the list */
+	     if stack3 -> temp(3) = nil then do;	/*if the xinit and xstepper have been ommited then initialze
+						to nil and don't step it*/
+		stack3 -> temp(2) = nil;		/*set to nil */
+		stack3 -> temp(3) = stack3 -> temp(1);		/* make stepping be a no-op */
+	     end;
+	     else do;				/*if there is an xinit */
+		if stack3 -> temp_type(3) then go to bad_form_do;
+		stack3 -> temp(2) = stack3 -> temp_ptr(3) -> cons.car;	/*place the xinit here */
+		stack3 -> temp(3) = stack3 -> temp_ptr(3) -> cons.cdr;	/*shorten the list*/
+		if stack3 -> temp(3) = nil then
+			stack3 -> temp(3) = stack3 -> temp(1);	/* keep it from stepping */
+		else do;
+		     if stack3 -> temp_type(3) then go to bad_form_do;
+		     stack3 -> temp(3) = stack3 -> temp_ptr(3) -> cons.car;	/*place xstepper here */
+		end;
+	     end;
+	     stack3 = addr(stack3 -> temp(4));		/*move up 3 locations and look for another index*/
+	     stack -> temp(2) = stack -> temp_ptr(2) -> cons.cdr;	/*shorten the index list*/
+	end;
+
+new_type_do_join:
+	/* now save the bindings of the indices */
+
+	stack4 = stack3;
+	stack5 = stack2;
+	do while (stack5 ^= stack3);
+						/* scan through the index table */
+		stack_ptr = addr(stack4 -> temp(3));	/* make room */
+		stack4 -> bindings(1).atom = stack5 -> temp(1);
+		stack4 -> bindings(1).old_val = stack5 -> temp_ptr(1) -> atom.value;
+		stack4 = stack_ptr;
+		stack5 = addr(stack5 -> temp(4));
+		end;
+
+
+					/* the following routine takes the endtest and the return
+					value and puts them on the stack for later use */
+	stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;	/* shorten the arg list */
+	call need_arg;
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/*place the list of endtest and return-value here */
+	if stack -> temp(2) = nil then 		/* we allow endtest,retval to be omitted */
+	     prog_with_initial_values = "1"b;		/* set flag to remember no endtest, do once only */
+	else if stack -> temp_type(2) then go to bad_form_do;
+	else do;
+	     prog_with_initial_values = "0"b;				/* not special funny do */
+	     stack -> temp(4) = stack -> temp_ptr(2) -> cons.car;		/*put the endtest here*/
+	     stack -> temp(5) = stack -> temp_ptr(2) -> cons.cdr;	/* save the list of retval forms */
+	     end;
+
+common_do_code:			/*from here both styles of do share the code*/
+	stack -> temp(1), stack -> temp(2), stack-> temp(3) = stack -> temp_ptr(1) -> cons.cdr;	/*dobody*/
+
+	/* construct binding block */
+
+	p = unmkd_ptr;
+	unmkd_ptr = addrel(unmkd_ptr, 2);
+	p -> binding_block.bot_block = rel(stack3);
+	p -> binding_block.top_block = rel(stack4);
+	p -> binding_block.back_ptr = rel(binding_top);
+	p -> binding_block.rev_ptr = ""b;
+	binding_top = p;
+	stack_ptr = addr(stack4 -> temp(2));		/* room to call eval */
+	stack5 = stack2;
+	do while(stack5 ^= stack3);
+				/*scan up the stack evaling the initial values*/
+	     stack4 -> temp(1) = stack5 -> temp(2);	/*put the initial value at top of stack*/
+	     call lisp_$eval;			/*and eval it*/
+	     stack5 -> temp(2) = stack4 -> temp(1);	/* save value of initial value */
+	stack5 = addr(stack5 -> temp(4));
+	end;
+
+	stack_ptr = stack4;			/* give back the one cell we took */
+	stack5 = stack2;
+	do while(stack5 ^= stack3);	/* rescan, set indices */
+	     stack5 -> temp_ptr(1) -> atom.value = stack5 -> temp(2);
+	stack5 = addr(stack5 -> temp(4));
+	end;
+
+	call make_prog_frame;
+
+do_loop:					/*this is the iteration of the execution of the do*/
+	if prog_with_initial_values then go to do_ex_0;	/* if funny do, skip end test */
+	stack5 -> temp(1) = stack -> temp(4);		/*pull in the endtest function*/
+	call lisp_$eval;				/*and eval it*/
+	if stack5 -> temp(1) ^= nil then do;		/*this detects if the predicate is true  and terminates the
+						the do.  Note that an endtest function of nil won't stop*/
+	     stack5 -> temp(1) = nil;			/* in case this do-while gets done 0 times */
+	     do while (stack -> temp_type(5) = Cons);	/* evaluate the forms in the retval list */
+		stack5 -> temp(1) = stack -> temp_ptr(5) -> cons.car;
+		call lisp_$eval;
+		stack -> temp(5) = stack -> temp_ptr(5) -> cons.cdr;
+		end;
+	     stack -> temp(1) = stack5 -> temp(1);	/*put value of last one where it can be returned*/
+	     go to prog_ret;			/* unwind it all... */
+	end;
+
+do_ex_0:	stack -> temp(2) = stack -> temp(3);		/*get the complete do-body again*/
+
+do_ex:	call xec_body;			/* execute the body of the do */
+	if prog_with_initial_values		/* if no repeating, then we are done */
+	then go to prog_end;
+
+	stack4 = stack2;
+	do while(stack4 ^= stack3);
+							/* eval the stepping functions */
+	     stack5 -> temp(1) = stack4 -> temp(3);		/*get the stepping function*/
+	     call lisp_$eval;				/*and eval it*/
+	     stack4 -> temp(2) = stack5 -> temp(1);		/* and save it */
+	stack4 = addr(stack4 -> temp(4));
+	end;
+
+	/* scan through again giving the indices their new values */
+
+	stack4 = stack2;
+	do while (stack4 ^= stack3);
+	     stack4 -> temp_ptr(1) -> atom.value = stack4 -> temp(2);	/*give the new value*/
+	stack4 = addr(stack4 -> temp(4));
+	end;
+
+	go to do_loop;
+
+bad_form_do:	/* gi1e a wrong-type-arg uncorrectable error */
+	unmp = unmkd_ptr;
+	unmkd_ptr = addrel(unmp, 2);
+	unmp -> errcode(1) = bad_do_format;
+	stack_ptr = addr(stack -> temp(2));	/* barf at original form */
+	call lisp_error_;		/* never returns */
+
+need_arg:	proc;					/* proc to make sure we have an arg */
+
+	if stack -> temp(1) = nil then go to no_arg;
+	if stack -> temp_type(1) then go to no_arg;
+	return;		/* ...if no problems */
+
+no_arg:	unmp = unmkd_ptr;
+	unmkd_ptr = addrel(unmp, 2);
+	unmp -> errcode(1) = too_few_args;
+	unmp -> errcode(2) = myname;
+	stack_ptr = addr(stack -> temp(2));		/* unrecoverable */
+	call lisp_error_;				/* requires replacement form to eval */
+	go to xretn;
+	end;
+
+
+
+	/* the lisp break function */
+
+break:	entry;
+
+	dcl lisp_print_$type_string entry(char(*)aligned),
+	    lisp_print_$type_nl entry,
+	    iox_$user_output external ptr,
+	    iox_$put_chars entry(ptr, ptr, fixed bin(21), fixed bin(35)),
+	    iox_status fixed bin(35),
+	    lisp_static_vars_$dollar_p_atom fixed bin(71) aligned external,
+	    dollar_p_atom fixed bin(71) aligned def (lisp_static_vars_$dollar_p_atom),
+	    1 unmask aligned like masked,
+	    lisp_static_vars_$return_atom external fixed binary (71) aligned,
+	    return_atom fixed bin(71) aligned def (lisp_static_vars_$return_atom),
+	    lisp_static_vars_$print_atom fixed bin(71) external,
+	    lisp_static_vars_$prin1_atom fixed bin(71) external,
+	    lisp_special_fns_$ncons entry,
+	    lisp_$apply entry,
+	    lisp_reader_$read entry;
+
+	stack = addrel(stack_ptr, -2);			/* fsubr */
+	stack_ptr = addr(stack -> temp(4));
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;	/* bkpt identifier */
+	stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;
+	if stack->temp(1) = nil then go to break_for_sure;
+	stack -> temp(3) = stack -> temp_ptr(1) -> cons.car;	/* predicate */
+	stack -> temp(1) = stack -> temp_ptr(1) -> cons.cdr;
+	if stack -> temp(1) ^= nil then
+	     stack -> temp(1) = stack -> temp_ptr(1) -> cons.car;	/* return value */
+	call lisp_$eval;
+	if stack -> temp(3) = nil then go to breakxe;	/* don't break if predicate evals to nil */
+break_for_sure:
+	unm = unmkd_ptr;		/* going to put a binding block and */
+	unmkd_ptr = addrel(unm, 8+size(fault_save));	/* an errset frame on the unmarked pdl */
+						/* and a fault_save to save rdr_state */
+	stack_ptr = addr(stack -> temp(11));
+
+	/* save ^q, ^r, and ^w and reset them to nil */
+
+	stack -> temp(4) = ctrlQ;
+	stack -> temp(3) = stack -> temp_ptr(4) -> atom.value;
+	stack -> temp(6) = ctrlW;
+	stack -> temp(5) = stack -> temp_ptr(6) -> atom.value;
+	stack -> temp(8) = ctrlR;
+	stack -> temp(7) = stack -> temp_ptr(8) -> atom.value;
+	unm -> binding_block.top_block = rel(addr(stack -> temp(9)));
+	unm -> binding_block.bot_block = rel(addr(stack -> temp(3)));
+	unm -> binding_block.rev_ptr = ""b;
+	unm -> binding_block.back_ptr = rel(binding_top);
+	binding_top = unm;
+	unm = addrel(unm, 2);
+	stack -> temp_ptr(4) -> atom.value ,
+	stack -> temp_ptr(6) -> atom.value ,
+	stack -> temp_ptr(8) -> atom.value = nil;
+
+	/* construct an errset frame so errors won't leave our read-eval-print loop */
+
+	unm -> frame.ret = break_err;
+	unm -> frame.stack_ptr = rel(addr(stack -> temp(9)));
+	unm -> frame.prev_frame = rel(err_frame);
+	unm -> frame.dat1, unm -> frame.dat2 = ""b;
+	err_frame = unm;
+	unm = addrel(unm, 6);
+
+	/* save rdr_state */
+
+	unm -> fault_save.prev_frame = rel(err_recp);
+	unm -> fault_save.stack_ptr = rel(stack_ptr);
+	unm -> fault_save.sv_gc_inhibit = lisp_static_vars_$garbage_collect_inhibit;
+	unm -> fault_save.sv_masked = lisp_static_vars_$masked;
+	unm -> fault_save.code1 = 0;			/* not due to an error */
+	unm -> fault_save.sv_array_info = null;
+	unm -> fault_save.sv_array_offset = 0;
+	unm -> fault_save.sv_rdr_label = rdr_label;
+	unm -> fault_save.sv_rdr_ptr = rdr_ptr;
+	unm -> fault_save.sv_rdr_state = rdr_state;
+	err_recp = unm;
+	rdr_state = 0;				/* get to tty */
+
+	/* now identify the break */
+
+	call lisp_print_$type_string("
+;bkpt ");
+	stack -> temp(10) = stack -> temp(2);		/* our first arg */
+	if addr(lisp_static_vars_$prin1_atom) -> based_ptr->atom.value = 0 | addr(lisp_static_vars_$prin1_atom) -> based_ptr->atom.value = nil
+	then stack -> temp(9) = lisp_static_vars_$prin1_atom;
+	else stack -> temp(9) = addr(lisp_static_vars_$prin1_atom)->based_ptr->atom.value;
+	call lisp_special_fns_$ncons;
+	call lisp_$apply;
+	call lisp_print_$type_nl;
+	go to reset_read;
+
+	/* read-eval-print loop */
+
+break_rdnext:
+	if pending_ctrl then do;
+		string(unmask.against) = ""b;
+		call lisp_fault_handler_$set_mask(unmask);	/* if more ctrl chars stacked up, do them */
+		end;
+	go to tty_join_in;
+
+r_e_p_loop:	/* here is where the read-eval-print loop repeats */
+
+	addr(PLUS)->based_ptr -> atom.value = addr(MINUS)->based_ptr -> atom.value;
+	if addr(ctrlQ)->based_ptr -> atom.value = nil
+	then do;							/* comments are in lisp.pl1 */
+
+tty_loop:		call lisp_print_$type_nl;
+tty_join_in:	stack_ptr = addr(stack -> temp(10));
+		addr(stack -> temp(9)) -> fixnum_fmt.type_info = fixnum_type;
+		addr(stack -> temp(9)) -> fixedb = 0;
+		call lisp_reader_$read;
+		end;
+	else do;
+
+uread_loop:	stack_ptr = addr(stack -> temp(11));
+		addr(stack -> temp(10)) -> fixnum_fmt.type_info = fixnum_type;
+		addr(stack -> temp(10)) -> fixedb = -2;
+		addr(stack -> temp(9)) -> flonum_fmt.type_info = flonum_type;
+		addr(stack -> temp(9)) -> fixedb = 0;
+		call lisp_reader_$read;
+		if addr(stack->temp(9)) -> flonum_fmt.type_info = flonum_type
+		 then if addr(stack->temp(9)) -> fixedb = 0
+		  then go to tty_loop;
+		end;
+	addr(MINUS)->based_ptr -> atom.value = stack -> temp(9);
+	if stack -> temp(9) = dollar_p_atom then go to breakwxe;	/* $p exits the break */
+	if stack -> temp_type(9) then;
+	  else if stack -> temp_ptr(9) -> cons.car = return_atom then do;	/* (return val) exits
+								   the break with a value */
+		stack -> temp(1) = stack -> temp_ptr(9) -> cons_ptrs.cdr -> cons.car;   /* get val */
+		go to breakwxe;
+		end;
+	call lisp_$eval;
+	addr(STAR)->based_ptr -> atom.value = stack -> temp(9);
+	stack_ptr = addr(stack -> temp(11));
+	stack -> temp(10) = stack -> temp(9);
+	stack -> temp(9) = lisp_static_vars_$print_atom;
+	call lisp_special_fns_$ncons;
+	call lisp_$apply;
+	go to r_e_p_loop;
+
+	/* error caught by an errset - return to read-eval-print loop */
+
+break_err:
+	unwind_to = rel(addrel(err_frame, 6+size(fault_save)));
+	call lisp_unwinder;
+	stack_ptr = addr(stack -> temp(10));
+	call iox_$put_chars(iox_$user_output, addr(bell), 1, iox_status);
+	  dcl bell char(1) static options(constant) init("");
+	addr(ctrlQ) -> based_ptr -> atom.value = nil;		/* get back to console input */
+
+	   /* reset the reader's tty buffer */
+	dcl lisp_io_control_$clear_input entry,
+	   1 iochan based aligned,
+	    2 ioindex fixed bin(35),
+	    2 iolength fixed bin (35);		/* rest of structure not declared here since not needed */
+
+reset_read:
+	stack -> temp(9) = nil;			/* flush buffered input from tty */
+	call lisp_io_control_$clear_input;		/* = lisp  (clear-input nil) */
+	rdr_state = 0;
+	go to break_rdnext;
+
+
+breakwxe:	unwind_to = rel(binding_top);			/* unwind it all */
+	call lisp_unwinder;
+breakxe:	stack_ptr = addr(stack -> temp(2));
+	call lisp_$eval;				/* eval return value */
+	return;
+
+
+
+progv:	entry;
+
+	myname = fn_progv;
+	stack = addrel(stack_ptr,-2);
+	stack_ptr = addr(stack->temp(3));
+	stack->temp(2) = stack->temp_ptr(1)->cons.car;
+	stack->temp(1) = stack->temp_ptr(1)->cons.cdr;
+	call lisp_$eval;
+	stack_ptr = addr(stack->temp(4));
+	stack->temp(3) = stack->temp_ptr(1)->cons.car;
+	stack->temp(1) = stack->temp_ptr(1)->cons.cdr;
+	call lisp_$eval;
+
+	/* now build a binding block, saving all old values */
+
+	do while(stack->temp(2)^=nil);
+
+	     p = stack_ptr;
+	     stack_ptr = addrel(p,4);
+	     p->bindings(1).atom = stack->temp_ptr(2)->cons.car;
+	     p->bindings(1).old_val = stack->temp_ptr(2)->cons_ptrs.car->atom.value;
+	     stack->temp(2) = stack->temp_ptr(2)->cons.cdr;
+	end;
+
+	p = unmkd_ptr;
+	unmkd_ptr = addrel(p,2);
+	p->binding_block.bot_block = rel(addr(stack->temp(4)));
+	p->binding_block.top_block = rel(stack_ptr);
+	p->binding_block.back_ptr = rel(binding_top);
+	p->binding_block.rev_ptr = ""b;
+	binding_top = p;
+
+	/* now binding block has been made, set atoms to new values */
+
+	p = addr(stack->temp(4));
+	do while(p^=stack_ptr & stack->temp(3)^=nil); /* scan supplied values */
+	     addr(p->bindings(1).atom)->based_ptr->atom.value = stack->temp_ptr(3)->cons.car;
+	     stack->temp(3) = stack->temp_ptr(3)->cons.cdr;
+	     p = addrel(p,4);
+	end;
+	do while(p^=stack_ptr);	/* fill in rest with nil */
+	    addr(p->bindings(1).atom)->based_ptr->atom.value = nil;
+	     p = addrel(p,4);
+	end;
+
+	p = stack_ptr;
+	stack_ptr = addr(p->temp(2));
+	do while(stack->temp(1)^=nil);	/* evaluate body */
+	     p->temp(1) = stack->temp_ptr(1)->cons.car;
+	     stack->temp(1) = stack->temp_ptr(1)->cons.cdr;
+	     call lisp_$eval;
+	end;
+	stack->temp(1) = p->temp(1);
+	unwind_to = rel(binding_top);
+	call lisp_unwinder;
+	stack_ptr = addr(stack->temp(2));
+	return;
+
+/* eval-when   -- BSG 4/26/80 */
+
+eval_when:
+	entry;
+
+	myname = fn_eval_when;
+	stack = addrel (stack_ptr, -2);		/* fsubr, gets 1 arg */
+	call need_arg;
+	stack_ptr = addrel (stack, 4);		/* need a temp */
+	stack -> temp(2) = stack -> temp_ptr(1) -> cons.cdr;  /* save forms */
+	do stack -> temp(1) = stack -> temp_ptr(1) -> cons.car  /* get test list */
+	     repeat (stack -> temp_ptr(1) -> cons.cdr)
+	     while (stack -> temp_type(1) = Cons);
+	     if stack -> temp_ptr(1) -> cons.car = lisp_static_vars_$eval_atom then do;
+		call xec_body;
+		stack -> temp(1) = lisp_static_vars_$t_atom;
+		stack_ptr = addr (stack -> temp(2));
+		return;
+	     end;
+	end;
+	stack -> temp(1) = lisp_static_vars_$nil;
+	stack_ptr = addr (stack -> temp(2));
+	return;
+end;

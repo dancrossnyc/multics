@@ -1,0 +1,349 @@
+/****^  ********************************************
+        *                                          *
+        * Copyright, (C) Honeywell Bull Inc., 1987 *
+        *                                          *
+        ******************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-03-31,Blair), approve(87-03-31,MCR7666),
+     audit(87-06-25,Fawcett), install(87-07-15,MR12.1-1040):
+     Install as part of bound_copy_disk_.  Error processing rewritten to
+     do retries a page at a time and exit on write errors.  Changed P_io_error
+     to be a flag to indicate whether or not we're supposed to retry failed
+     reads.  We won't when we're trying to read the label or vol_map or if the
+     user specifies error_threshold of 0.
+     
+     Basically, the way this works is as follows:
+               If something goes wrong while we're processing a block, we'll get a
+     sub-err condition from rdisk_.  If we're writing, or retries are not
+     allowed, we call condition_info_ to get the error and report it before
+     returning.  Otherwise, we start processing the block, reading and writing
+     one record at a time.  If the error persists, we'll reach the condition
+     where first_record and last_record are the same and we call io_error to
+     report the bad record, returning to the loop where we're going through the
+     block one record at a time.  After all the records have been processed, we
+     set the block size to zero, so that when we return to our caller, we will
+     have nothing to write and we can resynchronize our double buffering.  If
+     we reach the error_threshold and the user wants to abort, we'll return a
+     non-zero error_code to our caller, forcing a return, but normally, after
+     a bad read, we zero the error code after reporting the error, allowing us
+     to continue.
+                                                   END HISTORY COMMENTS */
+copy_disk_io_:
+     procedure ();
+
+/* This is the procedure which actually does I/O for the disks. It is
+   responsible for error handling and doing retries. When a disk error 
+   occurs on an I/O, it splits the I/O in two pieces (making the break
+   at a record boundary) and calls itself to retry the I/O recursively.
+   If an error occurs on an I/O that is entirely within the bounds of 
+   a single record, it gives up, damages the record, and returns. An
+   I/O error is indicated by the P_io_error bit being set, rather than
+   by the value of P_code.  Any non-zero error code means a fatal error
+   which should abort the copy; if a non-zero code is returned, a message
+   has already been printed.
+   */
+
+dcl  P_info_ptr pointer parameter;
+dcl  P_buffer_ptr pointer parameter;
+dcl  P_sector fixed bin (35) parameter;
+dcl  P_n_sectors fixed bin parameter;
+dcl  P_record fixed bin (18) parameter;
+dcl  P_brief_sw bit (1) aligned parameter;
+dcl  P_query_sw bit (1) aligned parameter;
+dcl  P_cv_record fixed bin (18);
+dcl  P_cv_sector fixed bin (35);
+dcl  P_retry_sw bit (1) aligned;
+dcl  P_code fixed bin (35) parameter;
+
+dcl 1 P_info aligned like copy_disk_info based (P_info_ptr);
+
+dcl  answer char (32) varying;
+dcl  operation fixed bin;
+dcl  source_info_ptr ptr;
+dcl  target_info_ptr ptr;
+dcl  error_table_$device_parity fixed bin (35) external static;
+dcl  error_table_$item_too_big fixed bin(35) ext static;
+
+dcl  command_query_ entry() options(variable);
+dcl  com_err_ entry options (variable);
+
+dcl  (cleanup, sub_error_) condition;
+
+dcl (addr, divide, mod, null, substr, unspec) builtin;
+
+/*  */
+
+copy_disk_io_$read:
+     entry (P_info_ptr, P_brief_sw, P_query_sw,
+            P_buffer_ptr, P_sector, P_n_sectors, P_retry_sw, P_code);
+
+	source_info_ptr = P_info_ptr;
+	operation = READ;
+	call sector_io (operation, (P_sector), (P_n_sectors));
+	return;
+
+
+
+copy_disk_io_$write:
+     entry (P_info_ptr, P_brief_sw, P_query_sw,
+            P_buffer_ptr, P_sector, P_n_sectors, P_retry_sw, P_code);
+
+	target_info_ptr = P_info_ptr;
+	operation = WRITE;
+	call sector_io (operation, (P_sector), (P_n_sectors));
+	return;
+
+
+
+copy_disk_io_$read_record:
+     entry (P_info_ptr, P_brief_sw, P_query_sw,
+            P_buffer_ptr, P_record, P_retry_sw, P_code);
+
+	call sector_io (READ, r_to_s (P_record), P_info.sectors_per_record);
+	return;
+
+
+
+copy_disk_io_$write_record:
+     entry (P_info_ptr, P_brief_sw, P_query_sw,
+            P_buffer_ptr, P_record, P_retry_sw, P_code);
+
+	call sector_io (WRITE, r_to_s (P_record), P_info.sectors_per_record);
+	return;
+
+
+
+copy_disk_io_$sector_to_record:
+     entry (P_info_ptr, P_cv_sector) returns (fixed bin (18));
+
+	return (s_to_r (P_cv_sector));
+
+
+
+copy_disk_io_$record_to_sector:
+     entry (P_info_ptr, P_cv_record) returns (fixed bin (35));
+
+	return (r_to_s (P_cv_record));
+
+/*  */
+
+sector_io:
+     procedure (P_operation, P_first_sector, P_n_sectors);
+
+dcl  P_operation fixed bin;
+dcl  P_first_sector fixed bin (35);
+dcl  P_n_sectors fixed bin;
+
+dcl  buffer_ptr pointer;
+dcl  buffer (buffer_size) bit (36) aligned based (buffer_ptr);
+dcl  buffer_size fixed bin (18);
+dcl  io_length fixed bin (21);
+
+
+	buffer_ptr = P_buffer_ptr;
+	buffer_size = P_n_sectors * P_info.words_per_sector;
+	io_length = P_n_sectors * P_info.chars_per_sector;
+	P_code = 0;				/* assume success */
+
+	call iox_$position (P_info.iocb, POSITION_ABSOLUTE, (P_sector), P_code);
+	if (P_code ^= 0) then do;
+	     call com_err_ (P_code, WHOAMI, 
+		"Cannot position to sector ^d. on ^a",
+		P_sector, P_info.device);
+	     return;
+	     end;
+
+/* Establish handlers so we can get control when rdisk_ reports an error. */
+	on condition (cleanup) call cleanup_stack;  /* this will get rid of unwanted stack frames */
+
+	on condition (sub_error_) begin;
+	     call suberr_handler;
+	     goto HANDLE_IO_ERROR;  /* the non_local goto allows us to cleanup the stack */
+	     end;
+
+	if (P_operation = READ) then
+	     call iox_$read_record (P_info.iocb, buffer_ptr, io_length, (0), P_code);
+	else call iox_$rewrite_record (P_info.iocb, buffer_ptr, io_length, P_code);
+
+	revert condition (sub_error_);
+
+	if (P_code = error_table_$item_too_big) then return;
+	
+	if (P_code ^= 0) then do;			/* not an I/O error, probably a program bug */
+	     call com_err_ (P_code, WHOAMI, 
+		"Unrecoverable error ^[reading^;writing^] disk ^a.",
+		(P_operation = READ), P_info.device);
+	     return;
+	     end;
+
+	P_code = 0;				/* all went well */
+	return;
+
+
+
+HANDLE_IO_ERROR:
+	if (P_operation = READ & P_retry_sw) then call retry_io ();
+	return;
+
+/*  */
+
+retry_io:						/* internal to sector_io */
+     procedure ();
+
+dcl  first_record fixed bin (18);
+dcl  last_record fixed bin (18);
+dcl  record_idx fixed bin (18);
+     
+/* We'll only ever get here on a READ since we just return for a bad WRITE */
+	first_record = s_to_r (P_sector);
+	last_record = s_to_r (P_sector + P_n_sectors - 1);
+
+	if first_record = last_record then do; /* this is the case during single record I/O */
+	     call report_io_error;
+	     if (P_code ^= 0) then return; /* Error threshold reached and no continue */
+	     return;
+	     end;
+	else do record_idx = first_record to last_record by 1;
+	     unspec (buffer) = ""b;
+
+	     call copy_disk_io_$read (source_info_ptr, P_brief_sw, P_query_sw,
+	          P_buffer_ptr,  r_to_s (record_idx), sect_per_rec (P_info.device_type), P_retry_sw, P_code);
+/* switch info_ptr to the target disk */
+
+	     call copy_disk_io_$write (source_info_ptr -> P_info.target_info_ptr, P_brief_sw, P_query_sw,
+		P_buffer_ptr, r_to_s (record_idx), sect_per_rec (P_info.device_type), P_retry_sw, P_code);
+
+	     if (P_code ^= 0) then return; 
+	     end;			/*  no more records this I/O block */
+/* Here we've finished with a whole buffer, and we need to do another synchronous I/O
+   to get back on track.  The way to cause this is to force the write buffer to zero. */
+	P_n_sectors = 0;
+
+	return;
+	end retry_io;
+
+	end sector_io;
+
+/*  */
+
+report_io_error:
+     procedure ();
+
+/* Report the bad sector and then check to see if we've reached the error_threshold. */
+
+          call com_err_ (error_table_$device_parity, WHOAMI, 
+	     "Unrecoverable error reading ^a at sector ^d.", P_info.device, P_sector);
+	P_code = 0;      /* Once we report it, we'll set ourselves up to continue. */
+	P_info.errors = P_info.errors + 1;
+	if (P_info.errors = P_info.threshold) then
+	     if ^P_query_sw then do;
+		call com_err_ (0, WHOAMI,
+		     "More than ^d I/O errors on ^a. Copying aborted.",
+		     P_info.threshold, P_info.device);
+
+		P_code = error_table_$item_too_big;
+		return;
+		end;
+	     else do;
+		call command_query_ (addr(query_info), answer, WHOAMI, "Error_threshold of ^d errors reached. ^/Do you wish to continue?", P_info.threshold);
+		if (answer = "yes" |  answer = "y" | answer = "Y" | answer = "YES") then do;
+		     P_info.errors = 0;
+		     return;
+		     end;
+		else do;
+		     call com_err_  (0, WHOAMI,
+			"More than ^d I/O errors on ^a. Copying aborted.",
+			P_info.threshold, P_info.device);
+
+		     P_code = error_table_$item_too_big;
+		     return;
+		     end;
+		end;
+	else return;
+	end report_io_error;
+
+
+cleanup_stack:
+     proc ();
+     return;
+     end cleanup_stack;
+
+suberr_handler:
+     proc();
+     
+dcl  1 local_condition_info like condition_info;
+dcl  continue_to_signal_ entry (fixed bin(35));
+dcl  find_condition_info_ entry (ptr, ptr, fixed bin(35));
+dcl  ioa_ entry() options(variable);
+
+
+	condition_info_ptr = addr (local_condition_info);
+	condition_info.version = condition_info_version_1;
+	call find_condition_info_ (null (), condition_info_ptr, P_code);
+	if P_code ^= 0
+	     then do;
+	     call com_err_ (P_code, WHOAMI, "Unrecoverable error writing disk ^a.", P_info.device);
+	     return;
+	     end;
+
+	sub_error_info_ptr = condition_info.info_ptr;
+	if substr (sub_error_info.name, 1, 5) ^= "rdisk_"
+	     then do;
+	     call continue_to_signal_ (P_code);
+	     return;
+	     end;
+	
+	if operation = WRITE
+	     then call ioa_ ("^a", sub_error_info.header.info_string);
+	P_code = sub_error_info.retval;
+	return;
+	end suberr_handler;
+
+r_to_s:
+     procedure (P_rec) returns (fixed bin (35));
+
+dcl  P_rec fixed bin (18) parameter;
+dcl  P_sec fixed bin (35) parameter;
+
+dcl  cylinder fixed bin;
+dcl  record_in_cylinder fixed bin;
+dcl  record fixed bin (18);
+dcl  sector fixed bin (35);
+dcl  sector_in_cylinder fixed bin;
+
+
+	cylinder = divide (P_rec, P_info.records_per_cylinder, 17, 0);
+	record_in_cylinder = mod (P_rec, P_info.records_per_cylinder);
+	sector = cylinder * P_info.sectors_per_cylinder;
+	sector = sector + record_in_cylinder * P_info.sectors_per_record;
+
+	return (sector);
+
+
+s_to_r:
+     entry (P_sec) returns (fixed bin (18));
+
+	cylinder = divide (P_sec, P_info.sectors_per_cylinder, 17, 0);
+	sector_in_cylinder = mod (P_sec, P_info.sectors_per_cylinder);
+	record_in_cylinder = divide (sector_in_cylinder, P_info.sectors_per_record, 17, 0);
+	if (record_in_cylinder >= P_info.records_per_cylinder) then
+	     record_in_cylinder = P_info.records_per_cylinder - 1;
+	record = cylinder * P_info.records_per_cylinder;
+	record = record + record_in_cylinder;
+
+	return (record);
+	end r_to_s;
+
+%page; %include copy_disk_info;
+%page; %include fs_dev_types_sector;
+%page; %include iox_dcls;
+%page; %include disk_pack;
+%page; %include query_info;
+%page; %include sub_error_info;
+%page; %include condition_info;
+%page; %include condition_info_header;
+       
+
+	end copy_disk_io_;

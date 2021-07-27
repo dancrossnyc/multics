@@ -1,0 +1,552 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style2,idind30,indcomtxt */
+
+/**** sc_process_command_line_.pl1
+
+      THIS
+      program is the common interface for all parts of the Initializer
+      that read command lines from operators. It is responsible for
+      creating an environment that mimics a normal user process
+      and then executing the command line in that environment.
+
+      FIRST
+      it sets up the I/O switches, saves the old value of
+      sc_stat_$admin_sci_ptr, and sets sc_stat_$admin_sci_ptr
+      to the given sci_ptr. It sets user_i/o to signal_io_.
+      The sc_signal_io_handler_ established in system_control_
+      is depended on to handle I/O signals. sc_subsystem_info.real_iocb
+      is assumed to be correct.
+
+      SEND_ADMIN_COMMAND
+      calls the special multics_command entrypoint which calls
+      cu_$cp instead of ssu_$execute_line.
+
+      SC_COMMAND
+      does not call this. It assumes that it is called either in
+      admin mode, which is entered through this program, or in
+      the admin exec com, which is also entered via this program.
+      sc_command call ssu_ directly.
+
+
+      MASKING
+      This program does not mask event calls. The rule for masking event
+      calls is that the Initializer may never run an event_call handler
+      while in one of its subsystems, for fear of recursion. initializer
+      commands are presumed to enter the environment that requires this
+      protection. Multics commands are not. Thus, masking takes place
+      in sc_execute_command_line_ before entering the command, rather
+      then in here.
+
+      MEMOS
+      and the like may NEVER be used in the Initializer process.
+      when the alarm call handler goes off there is no code that will
+      establish the correct environment.
+
+      PROBE and DEBUG
+      establish similiar limitations. Since there is a user_i/o
+      (the system console) outside of this environment, careful use can
+      be made to work.
+
+      HISTORICAL NOTE
+      This procedure includes the previous contents of admin_mode_,
+      borrow_tty_from_mc_, and return_tty_to_mc_.
+*/
+
+sc_process_command_line_:
+     procedure (SCI_ptr, Line_ptr, Line_lth);
+
+/* Written 1984-10-26 BIM */
+/* Modified 1985-01-07, BIM: MC access control, access name in sc_subsystem_info_ */
+/* Modified 1985-01-30, E. Swenson: Fixed operator login. */
+/* Modified 1985-04-01, E. Swenson: to do sign_out on hangup in mc_tty_. */
+/* Modified 1985-04-05, E. Swenson: to handle abort_lines correctly and to
+   not log extra NL in admin_log. */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-01,Cox), approve(87-05-25,MCR7690), audit(87-03-13,GDixon),
+     install(87-08-04,MR12.1-1055):
+     Modified for change to mc_anstbl.incl.pl1.
+  2) change(86-08-03,Swenson), approve(87-05-25,MCR7680),
+     audit(87-03-13,GDixon), install(87-08-04,MR12.1-1055):
+     Also changed to support system_control_ test mode.
+  3) change(87-02-05,GDixon), approve(87-05-25,MCR7680),
+     audit(87-05-06,Parisek), install(87-08-04,MR12.1-1055):
+     Also added System Message Documentation for calls to syserr and sys_log_.
+     Made minor changes to improve code efficiency.
+                                                   END HISTORY COMMENTS */
+
+
+	declare SCI_ptr		        pointer;
+	declare Line_ptr		        pointer;
+	declare Line_lth		        fixed bin (21);
+
+	declare code		        fixed bin (35);
+	declare (ev_calls_masked_code, ev_calls_unmasked_code)
+				        fixed bin (35);
+	declare hungup		        bit (1) aligned;
+	declare line_ptr		        pointer;
+	declare line_lth		        fixed bin (21);
+	declare multics_switch	        bit (1) aligned;
+	declare old_mask		        bit (36) aligned;
+	declare old_operator_name	        char (32);
+	declare request_line	        char (line_lth) based (line_ptr);
+	declare saved_user_io	        pointer;
+	declare saved_user_input	        pointer;
+	declare saved_error_output	        pointer;
+	declare saved_user_output	        pointer;
+	declare saved_admin_sci_ptr	        pointer;
+	declare sci_ptr		        pointer;
+	declare switch_unique	        char (30);
+	declare test_switch		        bit (1) aligned;
+
+/* Entries */
+
+	dcl     com_err_		        entry () options (variable);
+	declare continue_to_signal_	        entry (fixed binary (35));
+	declare cu_$cp		        entry (ptr, fixed bin (21), fixed bin (35));
+	declare hcs_$wakeup		        entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+	declare hcs_$set_ips_mask	        entry (bit (36) aligned, bit (36) aligned);
+	declare hcs_$reset_ips_mask	        entry (bit (36) aligned, bit (36) aligned);
+	declare hphcs_$syserr_error_code      entry options (variable);
+	declare hphcs_$syserr	        entry options (variable);
+	declare ioa_$ioa_switch	        entry () options (variable);
+	declare iox_$init_standard_iocbs      entry;
+	declare ipc_$decl_ev_wait_chn	        entry (fixed bin (71), fixed bin (35));
+	declare ipc_$decl_event_call_chn      entry (fixed bin (71), entry, pointer, fixed bin, fixed bin (35));
+	declare lg_ctl_$logout_operator       entry (ptr, char (*), char (*));
+	declare mc_commands_$note_input       entry (char (*), pointer, fixed binary (35));
+
+	declare mc_commands_$sign_out	        entry (pointer, character (*), fixed binary (35));
+	declare ssu_$get_info_ptr	        entry (ptr) returns (ptr);
+	declare ssu_$execute_line	        entry (ptr, ptr, fixed bin (21), fixed bin (35));
+	declare sys_log_		        entry options (variable);
+	declare unique_chars_	        entry (bit (*)) returns (char (15));
+
+	dcl     ME		        char (32) initial ("sc_process_command_line_") internal static
+				        options (constant);
+	dcl     NL		        char (1) int static options (constant) init ("
+");
+	declare cleanup		        condition;
+	declare any_other		        condition;
+
+	dcl     addr		        builtin;
+	dcl     clock		        builtin;
+	dcl     codeptr		        builtin;
+	dcl     null		        builtin;
+	dcl     rtrim		        builtin;
+	dcl     substr		        builtin;
+%page;
+
+	test_switch = "0"b;
+	multics_switch = "0"b;
+	go to COMMON;
+
+/**** The test entrypoint does switches for a normal user process. */
+
+test:
+     entry (SCI_ptr, Line_ptr, Line_lth);
+
+	multics_switch = "0"b;
+	test_switch = "1"b;
+	go to COMMON;
+
+test_multics:
+     entry (SCI_ptr, Line_ptr, Line_lth);
+
+	multics_switch = "1"b;
+	test_switch = "1"b;
+	go to COMMON;
+
+multics_command:
+     entry (SCI_ptr, Line_ptr, Line_lth);
+
+/**** SCI is required for Multics to find the real IOCB pointer. */
+
+	multics_switch = "1"b;
+	test_switch = "0"b;
+COMMON:
+	sci_ptr = SCI_ptr;
+	line_ptr = Line_ptr;
+	line_lth = Line_lth;
+	code = 0;
+
+	sc_subsystem_info_ptr = ssu_$get_info_ptr (sci_ptr);
+	saved_admin_sci_ptr = sc_stat_$admin_sci_ptr;
+	switch_unique = "sc" || unique_chars_ (""b);
+	saved_user_io, saved_user_input, saved_user_output, saved_error_output = null ();
+	ev_calls_masked_code = -1;
+	ev_calls_unmasked_code = -1;
+	on cleanup
+	     begin;
+		call RESTORE_ATTACHMENTS;
+		sc_stat_$admin_sci_ptr = saved_admin_sci_ptr;
+	     end;
+
+	mc_atep = sc_subsystem_info.mc_atep;		/* this may be null */
+	sc_subsystem_info.printer_offed = "0"b;		/* log suppression is only permitted within a command line */
+
+/**** Depend on the system_control_ handler for signal_io_, which uses
+      sc_stat_$admin_sci_ptr to find the right real_iocb. */
+
+	call SAVE_ATTACHMENTS;			/* we could assume correct switches and */
+						/* just depend on having the top signal handler. */
+						/* this, however, saves us from file_output */
+
+	sc_stat_$admin_sci_ptr = sci_ptr;
+
+	if sc_stat_$mc_is_on & mc_atep ^= null ()
+	then do;
+		call mc_commands_$note_input (request_line, mc_atep, (0));
+						/* broadcast input around */
+		if mc_ate.signed_on & sc_stat_$Multics
+		then do;
+			if clock ()
+			     > mc_ate.last_input_time
+			     + (as_data_$rs_ptrs (0) -> installation_parms.operator_inactive_time * 1000 * 1000)
+			then do;			/* passed the deadline, tough bananas */
+				call mc_commands_$sign_out (mc_atep, old_operator_name, (0));
+				sc_subsystem_info.access_control_name = sc_stat_$unidentified_access_name;
+				call lg_ctl_$logout_operator (sc_subsystem_info_ptr, old_operator_name,
+				     "autologout");
+
+				call ioa_$ioa_switch (sc_subsystem_info.real_iocb,
+				     "**********^2/     Operator ^a signed off due to inactivity.^2/**********^/",
+				     old_operator_name);
+			     end;
+		     end;
+		mc_ate.last_input_time = clock ();
+	     end;
+
+	if ^sc_subsystem_info.no_real_tty & mc_atep ^= null ()
+						/* don't bother if sci has no associated terminal, assume caller logs */
+	then do;					/* log in both logs for easy reading */
+		call sys_log_ (SL_LOG_SILENT, " (input on ^a) ^a", mc_ate.real_tty_name, request_line);
+		call ioa_$ioa_switch (sc_stat_$admin_log_iocb, " (input on ^a) ^a", mc_ate.real_tty_name,
+		     rtrim (request_line, NL));
+	     end;					/* and log it */
+
+	sc_subsystem_info.hangup_entry = HANGUP;
+	sc_subsystem_info.abort_request_label = ABORT_LABEL;
+	hungup = "0"b;
+	if multics_switch
+	then call cu_$cp (line_ptr, line_lth, code);
+	else do;
+		call ssu_$execute_line (sci_ptr, line_ptr, line_lth, code);
+		if sc_subsystem_info.real_iocb ^= null () & sc_subsystem_info.print_ready
+		then do;
+			if ^sc_stat_$Multics
+			then call ioa_$ioa_switch (sc_subsystem_info.real_iocb, "Ready");
+			else call ioa_$ioa_switch (sc_subsystem_info.real_iocb,
+				"Ready^[ (^a)^;^s^]^[ (Not signed on.)^]", mc_ate.signed_on, mc_ate.personid,
+				as_data_$rs_ptrs (0) -> installation_parms.require_operator_login
+				& ^mc_ate.signed_on);
+		     end;
+	     end;
+
+ABORT_LABEL:
+	sc_stat_$admin_sci_ptr = saved_admin_sci_ptr;
+	call RESTORE_ATTACHMENTS;
+	if hungup
+	then call sys_log_ (SL_LOG_BEEP, "sc_process_command_line_: Terminal ^a hung up during execution of command.",
+		sc_subsystem_info.source_name);
+	return;
+
+HANGUP:
+     procedure;
+
+/**** unwind the entire command execution and return to the frame that
+      started this command. */
+
+	go to HANGUP_UNWIND;
+     end HANGUP;
+
+HANGUP_UNWIND:
+	hungup = "1"b;
+	go to ABORT_LABEL;
+%page;
+SAVE_ATTACHMENTS:
+     procedure;
+
+	old_mask = ""b;
+	on any_other call ERROR_MASKED;
+
+	call hcs_$set_ips_mask (""b, old_mask);
+
+	if test_switch
+	then do;					/* our caller is expected to have a signal_io_handler_ active */
+		call iox_$find_iocb ("real_i/o", real_iocb, (0));
+		call iox_$move_attach (iox_$user_io, real_iocb, (0));
+		call iox_$attach_ptr (iox_$user_io, "syn_ real_iocb", codeptr (sc_process_command_line_), (0));
+		sc_subsystem_info.real_iocb = real_iocb;
+	     end;
+
+	call save_switch (iox_$user_io, saved_user_io, "user_i/o");
+	call save_switch (iox_$user_input, saved_user_input, "user_input");
+	call save_switch (iox_$user_output, saved_user_output, "user_output");
+	call save_switch (iox_$error_output, saved_error_output, "error_output");
+
+	call attach_switch (iox_$user_io, "signal_io_");
+	call iox_$init_standard_iocbs;		/* attaches syn_'s */
+
+	if mc_atep ^= null ()
+	then if ^mc_ate.the_system_console
+	     then call ipc_$decl_ev_wait_chn (mc_ate.event, (0));
+
+	call hcs_$reset_ips_mask (old_mask, old_mask);
+     end SAVE_ATTACHMENTS;
+
+RESTORE_ATTACHMENTS:
+     procedure;
+
+	on any_other call ERROR_MASKED;
+	call hcs_$set_ips_mask (""b, old_mask);
+
+	call restore_switch (saved_user_io, iox_$user_io);
+	call restore_switch (saved_user_input, iox_$user_input);
+	call restore_switch (saved_user_output, iox_$user_output);
+	call restore_switch (saved_error_output, iox_$error_output);
+
+	if test_switch
+	then do;
+		call iox_$detach_iocb (iox_$user_io, (0));
+		call iox_$move_attach (real_iocb, iox_$user_io, (0));
+		call iox_$destroy_iocb (real_iocb, (0));
+	     end;
+	else do;
+		if mc_atep ^= null ()
+		then if ^mc_ate.the_system_console
+		     then do;
+			     mc_ansp = sc_stat_$mc_ansp;
+			     call ipc_$decl_event_call_chn (mc_ate.event, mc_anstbl.cons_cont_proc, addr (mc_ate),
+				MC_PRIO, (0));
+			     call hcs_$wakeup (mc_anstbl.mc_procid, mc_ate.queue_event, 0, code);
+			end;
+	     end;
+	call hcs_$reset_ips_mask (old_mask, old_mask);
+	return;
+     end RESTORE_ATTACHMENTS;
+
+save_switch:
+     procedure (live_iocb, save_iocb, iocb_name);
+
+	declare (live_iocb, save_iocb)        pointer;
+	declare iocb_name		        char (32) varying;
+	declare save_name		        char (32);
+
+	save_name = rtrim (switch_unique) || iocb_name;
+	call iox_$find_iocb (save_name, save_iocb, code);
+	if code ^= 0
+	then do;
+		if ^sc_stat_$test_mode
+		then call hphcs_$syserr_error_code (CRASH, code, "^a: Failed to find save iocb ^a.", ME, save_name);
+		else call com_err_ (code, ME, "Failed to find save iocb ^a.", save_name);
+	     end;
+	call iox_$close (save_iocb, (0));
+	call iox_$detach_iocb (save_iocb, (0));
+	call iox_$move_attach (live_iocb, save_iocb, code);
+	if code ^= 0
+	then do;
+		if ^sc_stat_$test_mode
+		then call hphcs_$syserr_error_code (CRASH, code, "^a: Failed to move_attach iocb ^a.", ME, save_name);
+		else call com_err_ (code, ME, "Failed to move_attach iocb ^a.", save_name);
+	     end;
+	return;
+     end save_switch;
+
+attach_switch:
+     procedure (iocbp, atd);
+
+	declare iocbp		        pointer;
+	declare atd		        char (*);
+
+	call iox_$attach_ptr (iocbp, atd, codeptr (sc_process_command_line_), code);
+	if code ^= 0
+	then do;
+		if ^sc_stat_$test_mode
+		then call hphcs_$syserr_error_code (CRASH, code,
+			"^a: Could not attach switch ^a (@ ^p)^/using attach description: ^a.", ME,
+			iocbp -> iocb.name, iocbp, atd);
+		else call com_err_ (code, ME, "Could not attach switch ^a (@ ^p)^/using attach description: ^a.",
+			iocbp -> iocb.name, iocbp, atd);
+	     end;
+	call iox_$open (iocbp, Stream_input_output, "0"b, code);
+	if code ^= 0
+	then do;
+		if ^sc_stat_$test_mode
+		then call hphcs_$syserr_error_code (CRASH, code,
+			"^a: Could not open switch ^a for stream_input_output.", ME, iocbp -> iocb.name);
+		else call com_err_ (code, ME, "Could not open switch ^a for stream_input_output.", iocbp -> iocb.name)
+			;
+	     end;
+	return;
+     end attach_switch;
+
+restore_switch:
+     procedure (saved_iocb, live_iocb);
+
+	declare (saved_iocb, live_iocb)       pointer;
+
+	call iox_$close (live_iocb, (0));
+	call iox_$detach_iocb (live_iocb, (0));
+	call iox_$move_attach (saved_iocb, live_iocb, code);
+	if code ^= 0
+	then do;
+		if ^sc_stat_$test_mode
+		then call hphcs_$syserr_error_code (CRASH, code, "^a: Could not restore attachment to switch ^a.", ME,
+			live_iocb -> iocb.name);
+		else call com_err_ (code, ME, "Could not restore attachment to switch ^a.", live_iocb -> iocb.name);
+	     end;
+	call iox_$destroy_iocb (saved_iocb, (0));
+	return;
+     end restore_switch;
+
+
+ERROR_MASKED:
+     procedure;
+
+	if substr (old_mask, 36, 1) = "0"b
+	then call continue_to_signal_ ((0));
+	else do;
+		if ^sc_stat_$test_mode
+		then call hphcs_$syserr (CRASH, "^a: Error while reattaching critical I/O switches.", ME);
+		else call com_err_ (0, ME, "Error while reattaching critical I/O switches.");
+	     end;
+	return;
+     end ERROR_MASKED;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   (input on SWITCH_NAME) REQUEST_LINE
+
+   S:	as (severity 0)
+
+   T:	$response
+
+   M:	Logs a REQUEST_LINE typed by the operator, or by another user via
+   the send_admin_command or send_initializer_command commands.
+
+   A:	$ignore
+
+   Message:
+   sc_process_command_line_: Terminal SOURCE_NAME hung up during execution of
+   command.
+
+   S:	as (severity 2)
+
+   T:	$response
+
+   M:	Reports that execution of an Initializer command was interrupted when
+   the message coordinator terminal identified by SOURCE_NAME hung.
+
+   A:	$ignore
+
+   Message:
+   sc_process_command_line_: ERROR_MESSAGE.  Failed to find save iocb NAME.
+
+   S:	$sc
+
+   T:	$response
+
+   M:	$crashes  $err  ERROR_MESSAGE is the expansion of the system status
+   code describing the actual error.
+
+   A:	$contact
+
+   Message:
+   sc_process_command_line_: ERROR_MESSAGE.  Failed to move_attach iocb NAME.
+
+   S:	$sc
+
+   T:	$response
+
+   M:	$crashes  $err  ERROR_MESSAGE is the expansion of the system status
+   code describing the actual error.
+
+   A:	$contact
+
+   Message:
+   sc_process_command_line_: ERROR_MESSAGE.  Could not attach switch NAME
+   (@ LOC) using attach description DESCRIP.
+
+   S:	$sc
+
+   T:	$response
+
+   M:	$crashes  $err  ERROR_MESSAGE is the expansion of the system status
+   code describing the attach error.  LOC gives the location of the
+   I/O Control Block (IOCB).
+
+   A:	$contact
+
+   Message:
+   sc_process_command_line_: ERROR_MESSAGE.  Could not open switch NAME for
+   stream_input_output.
+
+   S:	$sc
+
+   T:	$response
+
+   M:	$crashes  $err  ERROR_MESSAGE is the expansion of the system status
+   code describing the open error.
+
+   A:	$contact
+
+   Message:
+   sc_process_command_line_: ERROR_MESSAGE.  Could not restore attachment to
+   switch NAME.
+
+   S:	$sc
+
+   T:	$response
+
+   M:	$crashes  $err  ERROR_MESSAGE is the expansion of the system status
+   code describing the move_attach error.
+
+   A:	$contact
+
+   Message:
+   sc_process_command_line_: Error while reattaching critical I/O switches.
+
+   S:	$sc
+
+   T:	$response
+
+   M:	$crashes  $err
+
+   A:	$contact
+
+   END MESSAGE DOCUMENTATION */
+
+%include as_data_;
+
+%include as_wakeup_priorities;
+
+%include installation_parms;
+	declare ip		        pointer;
+
+%include iocb;
+
+%include iox_entries;
+
+%include iox_modes;
+
+%include mc_anstbl;
+
+%include sc_stat_;
+
+%include sc_subsystem_info_;
+
+%include sys_log_constants;
+
+%include syserr_constants;
+
+     end sc_process_command_line_;

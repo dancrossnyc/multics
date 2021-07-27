@@ -1,0 +1,355 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+bce_exec_com_:     procedure (ss_info_ptr);
+
+/* Modified from absentee_listen_ to become bootload Multics exec_com by 
+Keith Loepere, April 1983 */
+/* Modified August 1983 by Keith Loepere for new bce switches. */
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+
+declare  (addr, addrel, empty, index, length, ltrim, min, null, reverse, rtrim, search, substr, unspec, verify)
+				  builtin;
+
+declare  (cleanup, request_abort_, sub_request_abort_)
+				  condition;
+
+declare  arg_count			  fixed bin,
+         arg_len			  fixed bin (21),
+         arg_ptr			  ptr,
+         arg			  char (arg_len) based (arg_ptr),
+         arg_list_ptr		  ptr,
+         actual_len			  fixed bin (21),
+         bce_data$get_line		  entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35)) variable external,
+         1 bce_get_line_entry		  aligned based (addr (bce_data$get_line)), /* template for an entry variable */
+	 2 proc			  ptr,
+	 2 env			  ptr,
+         bce_data$get_line_data_ptr	  ptr external,
+         bce_data$subsys_info_ptr	  ptr external,
+         bce_data$command_abs_data_ptr	  ptr external,
+         bce_ready			  entry (char (*)),
+         ec_file_name		  char (32),
+         1 my_abs_data		  aligned like abs_data,
+         old_abs_data_ptr		  ptr,
+         read_chars			  char (read_len) based (read_ptr),
+         read_len			  fixed bin (21),
+         read_ptr			  ptr,
+         seg_ptr			  ptr,
+         status			  fixed bin (35),
+         temp_seg_ptr		  ptr,
+         whoami			  char (32),
+         work_len			  fixed bin (21),
+         work_ptr			  ptr,
+         work_string		  char (work_len) based (work_ptr);
+
+declare  1 ec_info			  aligned like ec_data;
+
+declare  CP_null_line		  fixed bin init (100) static options (constant);  /* cp_ returns this for null line */
+
+declare  (
+         error_table_$badopt,
+         error_table_$badpath,
+         error_table_$end_of_info,
+         error_table_$not_act_fnc,
+         error_table_$unimplemented_version
+         )			  fixed bin (35) external,
+         sys_info$max_seg_size	  fixed bin (18) external;
+
+declare  active_fnc_err_		  entry options (variable),
+         bce_check_abort		  entry,
+         bce_data$exec_com_get_line	  entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35)) variable ext,
+         bce_execute_command_		  entry (ptr, char (*), ptr, fixed bin (35)),
+         bootload_fs_$get_ptr		  entry (char (*), ptr, fixed bin (21), fixed bin (35)),
+         command_processor_$subsys_execute_line entry (char (*), ptr, entry, ptr, char (*), fixed bin (35)),
+         com_err_			  entry options (variable),
+         cu_$af_return_arg_rel	  entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr),
+         cu_$arg_ptr_rel		  entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr),
+         cu_$arg_list_ptr		  entry () returns (ptr),
+         cu_$generate_call		  entry (entry, ptr),
+         cv_dec_check_		  entry (char (*), fixed bin (35)) returns (fixed bin (35)),
+         get_temp_segment_		  entry (char (*), ptr, fixed bin (35)),
+         release_temp_segment_	  entry (char (*), ptr, fixed bin (35));
+%page;
+%include bce_abs_io_data;
+%page;
+%include bce_subsystem_info_;
+%page;
+%include ec_data;
+%page;
+	old_abs_data_ptr = bce_data$command_abs_data_ptr;
+
+	call initialize_ec_info ();
+
+	ec_info.who_am_i, whoami = "exec_com";
+
+	call check_arg_list (ss_info.arg_list_ptr);
+
+	if arg_count < 1 then do;
+	     if ec_info.active_function
+	     then call active_fnc_err_ (0, whoami, "Usage:  [ec path {args}]");
+	     else do;
+		call com_err_ (0, whoami, "Usage:  ec path {args}");
+		signal request_abort_;
+	     end;
+	     go to EGRESS;
+	end;
+
+	on cleanup call clean_up ();
+
+	call get_temp_segment_ ((ec_info.who_am_i), temp_seg_ptr, status);
+	if status ^= 0 then call complain (status, ec_info.who_am_i, "Getting temp segment.");
+	     
+	call cu_$arg_ptr_rel (1, arg_ptr, arg_len, status, ss_info.arg_list_ptr);
+	if status ^= 0 then call complain (status, ec_info.who_am_i, "Getting first argument.");
+
+	if substr (arg, 1, min (arg_len, 1)) = "-"
+	then call complain (error_table_$badopt, ec_info.who_am_i, "^a", arg);
+	begin;
+declare  1 args			  (arg_count - 1) aligned,
+	 2 ptr			  ptr,
+	 2 len			  fixed bin (21),
+	 2 quotes			  fixed bin (21);
+
+	     call attach_ec (find_ec ());
+
+	     if ec_info.active_function then ec_info.call_ready_proc = "0"b;
+	     status = CP_null_line;			/* Suppress initial call to ready proc			*/
+%page;
+/* The following routine reads lines from the input file and passes them on to the command processor. It communicates
+   with bce_exec_com_input through the attach_data block (found by bce_data$command_abs_data_ptr) in order to determine
+   when command vs. input lines are being read and what the ready mode is.					*/
+
+	     do while ("1"b);
+		if ec_info.call_ready_proc & status ^= CP_null_line then call invoke_ready_procedure ();
+
+		ec_info.input_line = "0"b;
+
+		read_ptr, work_ptr = temp_seg_ptr;
+		read_len = 4096;		/* 1st page */
+		work_len = 0;
+		do while (status ^= 0 | work_len = 0);
+		     on sub_request_abort_ go to EGRESS;
+		     call bce_check_abort;
+		     call bce_data$exec_com_get_line (addr (bce_data$exec_com_get_line), addr (read_chars), length (read_chars), actual_len, status);
+		     revert sub_request_abort_;
+		     work_len = work_len + actual_len;
+		     if status ^= 0 then
+			if status = error_table_$end_of_info then
+			     if work_len = 0 then go to EGRESS; /* I don't know if this is exactly legal, and I know that	*/
+			     else status = 0;	/* bce_exec_com_input wont do this, but if there is a partial line...	*/
+			else do;
+			     call com_err_ (status, ec_info.who_am_i, "Error while reading command line.");
+			     signal request_abort_;
+			end;
+		end;
+
+		ec_info.input_line = "1"b;		/* anything read after this point is an input line	*/
+
+		on request_abort_ go to EGRESS;
+		on sub_request_abort_ go to EGRESS;
+		call command_processor_$subsys_execute_line ("bce", bce_data$subsys_info_ptr, bce_execute_command_, null (), work_string, status);
+		if status ^= 0 then
+		     if status ^= CP_null_line then call com_err_ (status, whoami);
+		revert request_abort_;
+		revert sub_request_abort_;
+	     end;
+	     go to EGRESS;
+%page;
+invoke_ready_procedure:
+     procedure ();
+
+	call bce_ready ("bce (ec)");
+	return;
+
+     end invoke_ready_procedure;
+%page;
+attach_ec:
+     procedure (pathname);
+
+declare  NL			  char (1) static options (constant) init ("
+");
+declare  WHITE			  char (5) static options (constant) initial ("
+	 ");					/* FF VT NL TAB SPACE				*/
+declare  arg_num			  fixed bin;
+declare  idx			  fixed bin (21);
+declare  input_file			  char (abs_data.input_string.len) based (abs_data.input_string.ptr);
+declare  pathname			  char (*);
+
+	whoami = "exec_com";
+
+	abs_data_ptr = addr (my_abs_data);
+
+	unspec (abs_data) = "0"b;
+
+	abs_data.allocated_chars_ptr = addrel (temp_seg_ptr, 1024);
+	abs_data.allocated_chars_len = 4096;		/* 2nd page */
+	abs_data.work_area_ptr = addrel (temp_seg_ptr, 2048);  /* rest */
+	abs_data.work_area_len = sys_info$max_seg_size - 2048;
+	abs_data_work_area = empty ();
+%page;
+	abs_data.arg_info.arg_ptr, abs_data.input_string.ptr, abs_data.ec_data_ptr = null ();
+	abs_data.else_clause_ptr, abs_data.chars_ptr = null ();
+	abs_data.attach.save_ptr, abs_data.attach.victim_ptr = null ();
+	abs_data.labels_ptr = null ();
+	abs_data.arg_info.ec_name_ptr = null ();
+%page;
+	call initiate_input_path (pathname);
+
+/* Determine version of input file									*/
+
+	if substr (input_file, 1, min (8, abs_data.input_string.len)) ^= "&version" | search (input_file, WHITE) ^= 9
+	then do;
+	     abs_data.input_string.start, abs_data.input_string.limit = 0;
+	end;
+	else do;
+	     idx = index (substr (input_file, 9), NL);
+	     if idx = 0
+	     then call complain (error_table_$unimplemented_version, whoami, "Newline must end &version statement.");
+	     if verify (substr (input_file, 9, idx - 1), WHITE) = 0
+	     then call complain (error_table_$unimplemented_version, whoami,
+		     "No version given in &version statement.");
+	     if status ^= 0 | cv_dec_check_ (ltrim (rtrim (substr (input_file, 10, idx - 2), WHITE), WHITE), status) ^= 1 /* only version */
+	     then call complain (error_table_$unimplemented_version, whoami, "&version ""^a""",
+		     substr (input_file, 10, idx - 2));
+	     abs_data.input_string.start, abs_data.input_string.limit = idx + 8;
+	end;
+%page;
+
+
+
+/* ATTACH HERE */
+
+
+	abs_data.comment_line.on, abs_data.control_line.on = "0"b; /* implement tracing defaults				*/
+	if ec_info.active_function then abs_data.command_line.on, abs_data.input_line.on = "0"b;
+	else abs_data.command_line.on, abs_data.input_line.on = "1"b;
+
+	abs_data.active, abs_data.eof = "0"b;
+	unspec (abs_data.if_info) = "0"b;
+	abs_data.chars_ptr, abs_data.else_clause_ptr = null ();
+	abs_data.nest_level, abs_data.expected_nest_level = 0;
+	abs_data.chars_len, abs_data.else_clause_len = 0;
+	abs_data.input_string.position = abs_data.input_string.start;
+
+	abs_data.ec_data_ptr = addr (ec_info);
+
+	abs_data.arg_ptr = addr (args);
+	abs_data.arg_count = arg_count - 1;
+	do arg_num = 2 to arg_count;
+	     call cu_$arg_ptr_rel (arg_num, args (arg_num - 1).ptr, args (arg_num - 1).len, status, arg_list_ptr);
+	     args (arg_num - 1).quotes = -1;
+	end;
+	bce_data$command_abs_data_ptr = abs_data_ptr;
+	return;
+
+     end attach_ec;
+%page;
+find_ec:
+     procedure () returns (char (*));
+
+declare  (index, reverse, rtrim)	  builtin;
+
+declare  pathname			  char (32) varying;
+
+	pathname = arg;
+
+	if index (reverse (rtrim (pathname)), "ce.") ^= 1 then pathname = rtrim (pathname) || ".ec";
+
+	return (pathname);
+
+     end find_ec;
+%page;
+initiate_input_path:
+     procedure (file_name);
+
+declare  file_name			  char (*) parameter,
+         input_entry_len		  fixed bin (21);
+
+	call bootload_fs_$get_ptr (file_name, abs_data.input_string.ptr, abs_data.input_string.len, status);
+	if abs_data.input_string.ptr = null ()
+	then call complain (status, whoami, "Input file: ^a", file_name);
+
+/* Fill in &ec_name (&0) */
+
+	input_entry_len = length (rtrim (file_name));
+
+	abs_data.ec_name_ptr = addr (ec_file_name);
+	substr (ec_file_name, 1, input_entry_len) = substr (file_name, 1, input_entry_len);
+
+	abs_data.ec_name_len = input_entry_len - index (reverse (substr (file_name, 1, input_entry_len)), ".");
+	if abs_data.ec_name_len = 0 then call complain (error_table_$badpath, whoami);
+	return;
+
+     end initiate_input_path;
+     end; /* begin block */
+
+EGRESS:
+	call clean_up ();
+	return;
+%page;
+initialize_ec_info:
+     procedure ();
+
+	seg_ptr = null ();
+
+	ec_info.active_function = "0"b;
+	ec_info.return_len = 0;
+	ec_info.return_ptr = null ();
+	ec_info.input_line = "1"b;
+	ec_info.call_ready_proc = "0"b;
+	return;
+
+     end initialize_ec_info;
+%page;
+check_arg_list:
+     procedure (P_arg_list_ptr);
+
+declare  P_arg_list_ptr		  ptr;
+
+	arg_list_ptr = P_arg_list_ptr;
+
+	call cu_$af_return_arg_rel (arg_count, ec_info.return_ptr, ec_info.return_len, status, arg_list_ptr);
+	if status = 0 then ec_info.active_function = "1"b;
+	else if status ^= error_table_$not_act_fnc
+	then call complain (status, ec_info.who_am_i, "Getting argument list.");
+
+	return;
+
+     end check_arg_list;
+%page;
+clean_up:
+     procedure ();
+
+	if bce_data$command_abs_data_ptr ^= old_abs_data_ptr then do;
+	     if bce_data$command_abs_data_ptr = bce_data$get_line_data_ptr then do; /* &attach in effect */
+		bce_get_line_entry.env = null ();
+		bce_get_line_entry.proc = bce_data$command_abs_data_ptr -> abs_data.victim_ptr;
+		bce_data$get_line_data_ptr = bce_data$command_abs_data_ptr -> abs_data.save_ptr;
+	     end;		/* now &detach'ed */
+
+	     bce_data$command_abs_data_ptr = old_abs_data_ptr;
+	end;
+	if temp_seg_ptr ^= null then call release_temp_segment_ ((ec_info.who_am_i), temp_seg_ptr, status);
+	return;
+
+     end clean_up;
+%page;
+complain:
+     procedure () options (variable);
+
+declare  arg_list_ptr		  ptr;
+
+	arg_list_ptr = cu_$arg_list_ptr ();
+
+	if ec_info.active_function then call cu_$generate_call (active_fnc_err_, arg_list_ptr);
+	else call cu_$generate_call (com_err_, arg_list_ptr);
+
+	go to EGRESS;
+
+     end complain;
+     end bce_exec_com_;

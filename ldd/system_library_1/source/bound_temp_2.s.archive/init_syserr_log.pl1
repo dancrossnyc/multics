@@ -1,0 +1,689 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+init_syserr_log:
+     procedure ();
+
+/* *	INIT_SYSERR_LOG
+   *
+   *	This procedure is called early in collection II initialization.
+   *	It performs the following major initialization tasks:
+   *	1.  Sets up the log partition so it can be referenced as paged segments.
+   *	2.  If the version in the paged syserr_log_data segment is not
+   *	    correct, then we initialize the paged syserr_log_data segment.
+   *	3.  Initializes the wired log buffer in syserr_data$syserr_area
+   *	4.  Creates the syserr HPROC.
+   *
+   *	Modification history:
+   *	73-08-11, Bill Silver: Initial coding
+   *	75-11-02, Larry Johnson: Modified for new log and message format
+   *	76-03-23, Steve Webber: Modified to create HPROC for logging
+   *	77-04-11, Bernard Greenberg: Modified for syserr_daemon segments
+   *	79-05-26, Mike Grady: Modified for ring zero stack sharing
+   *	81-07-09, Ellie Donner: Modified for new format of event channel names
+   *	82-03-20, John Bongiovanni: Eliminated use of FSDCT
+   *	84-08-24, W. Olin Sibert: Modifications (part 1) for new syserr log format:
+   *	   Three segments in the partition, new log format, name changed from
+   *	   syserr_log_init to init_syserr_log, diagnose no PART LOG card.
+   *      84-11-16 by E. Swenson: Changed for new IPC validation.
+   *      1984-12-03, BIM: change to a fast lock.
+   *      1984-12-05 by E. Swenson:  Fixed to not use regular event channel.
+   *	1984-12-10 by Keith Loepere: To force LOG part onto RPV until
+   *	   init_branches becomes smarter.
+   *	1985-03-03, EJ Sharpe: added check for service bit, format,
+   *	   and set history_dir in log header at partition initialization
+   *	1985-03-25, EJ Sharpe: fixed subscript error, cleanup syserr messages
+*/
+
+declare  code fixed bin (35);
+declare  log_part_pvtx fixed bin;
+declare  log_part_start fixed bin (18);
+declare  log_part_size fixed bin (18);
+declare  part_idx fixed bin;
+declare  r_offset fixed bin (18);			/* used in IPC event channel creation and validation */
+declare  r_factor fixed bin (35);			/* ditto */
+declare  rpv_label bit (36 * 1024) aligned;
+declare  special_channel fixed bin (71);		/* event channel for syserr copy wakeups */
+
+declare  initializing bit (1) aligned;			/* Set if we are reinitializing partition */
+declare  test_mode bit (1) aligned;			/* Sets up a ring four test environment */
+
+declare  log_data_$syserr_log_dir char (32) external static;
+declare  log_data_$syserr_log_history_dir char (168) external static;
+declare  log_data_$syserr_log_partition char (4) external static;
+declare  log_data_$syserr_log_daemon char (32) external static;
+declare  pds$process_id bit (36) aligned external static;
+declare  pds$process_group_id char (32) external static;
+declare  pvt$root_pvtx fixed bin external static;
+declare  sys_info$page_size fixed bin external static;
+declare  syserr_data$log_meters fixed bin external static;
+declare  syserr_data$wired_log_size fixed bin external static;
+declare  syserr_data$logger_proc_id bit (36) aligned external static;
+declare  syserr_data$logger_ec fixed bin (71) external static;
+
+declare  syserr_log_laurel$ fixed bin external static;
+declare  syserr_log_hardy$ fixed bin external static;
+
+declare  create_hproc$early_hproc entry (char (*),
+	    bit (1) aligned, pointer, pointer, pointer, pointer, pointer, fixed bin (35));
+declare  ipc_validate_$encode_event_channel_name entry (fixed bin (18), fixed bin (35), bit (3) aligned, fixed bin (15), fixed bin (3), bit (1) aligned, fixed bin (18), fixed bin (71));
+declare  log_initialize_ entry (pointer, pointer, fixed bin (18), char (*), fixed bin (35));
+declare  log_segment_$create_message entry (pointer, fixed bin, fixed bin, char (10) varying, pointer, fixed bin (35));
+declare  log_segment_$finish_message entry (pointer, pointer, fixed bin (35));
+declare  log_segment_$get_service_bit entry (ptr, bit (1) aligned, fixed bin (35));
+declare  log_segment_$last_message_info entry (pointer, fixed bin (35), fixed bin (18), fixed bin (35));
+declare  log_segment_$place_in_service entry (pointer, fixed bin (35));
+declare  log_segment_$remove_from_service entry (pointer, fixed bin (35));
+declare  map_onto_disk entry (fixed bin, fixed bin (20), fixed bin, pointer, bit (1) aligned);
+declare  read_disk entry (fixed bin, fixed bin (18), ptr, fixed bin (35));
+declare  syserr entry options (variable);
+declare  syserr$error_code entry options (variable);
+declare  syserr_log_daemon entry ();
+declare  tc_util$get_ipc_operands_priv entry (bit (36) aligned, fixed bin (18), fixed bin (35), fixed bin (35));
+
+declare  FAST_CHANNEL_TYPE bit (1) aligned internal static options (constant) initial ("0"b);
+declare  WHOAMI char (32) internal static options (constant) init ("init_syserr_log");
+
+declare  (abs, addr, baseno, binary, clock, codeptr, copy, dimension, divide, length, null, rel, sign, size, sum, unspec) builtin;
+%page;
+
+	test_mode = "0"b;
+	goto BEGIN_INITIALIZATION;
+
+
+
+init_syserr_log$test:
+     entry ();
+
+	test_mode = "1"b;				/* This entrypoint sets up a ring four test environment */
+
+/* First, locate and check out the wired data area. */
+/* NOTE: THIS CHANGES WHEN THE WIRED AREA IS CONVERTED TO LOG SEGMENTS */
+
+BEGIN_INITIALIZATION:
+	wlog_ptr = addr (syserr_data$wired_log_area);
+	sd_ptr = addr (syserr_data$syserr_area);
+	if (size (wlog) > syserr_data$wired_log_size) then
+	     call syserr (SYSERR_CRASH_SYSTEM, "^a: Size of wired log is inconsistent.", WHOAMI);
+
+/* Next, locate the LOG partition. If none, we do no logging, but we
+   say so (a new message) because it's almost sure to be a mistake. */
+
+	if ^test_mode then do;			/* Don't play with the partition in test mode */
+
+/*	     call partition_io$find_partition (log_data_$syserr_log_partition,
+   log_part_pvtx, (""b), log_part_start, log_part_size, code); */
+	     labelp = addr (rpv_label);
+	     log_part_pvtx = pvt$root_pvtx;
+	     call read_disk (log_part_pvtx, 0, labelp, code);
+	     if code ^= 0 then go to log_part_error;
+	     do part_idx = 1 to label.nparts while (label.parts (part_idx).part ^= log_data_$syserr_log_partition);
+	     end;
+	     if part_idx > dimension (label.parts, 1) then do;
+log_part_error:	call syserr (SYSERR_CRASH_SYSTEM, "^a: No LOG partition found, syserr logging disabled.", WHOAMI);
+		return;
+	     end;
+	     log_part_start = label.parts (part_idx).frec;
+	     log_part_size = label.parts (part_idx).nrec;
+	end;
+
+	else log_part_size = 3;			/* Give each segment 1 record */
+
+/* Next, setup the syserr_log_data segment. It is always one page long,
+   and located in the first record of the partition. */
+
+	syserr_log_data_ptr = addr (syserr_log_data$);
+	call setup_segment (syserr_log_data_ptr, 0, 1);
+
+/* See if it has valid contents. If not, reinitialize it; if so, re-use it */
+
+	initializing = ^syserr_data_valid ();		/* See if there's anything useful there now */
+	if initializing then			/* If not, rebuild syserr_dta first */
+	     call initialize_syserr_data ();
+
+/* Set up the two alternating buffer segments; their locations may have been
+   remembered, or set up by initialize_syserr_data if we reinitialize */
+
+	syserr_log_data.log_ptr (1) = addr (syserr_log_laurel$);
+	syserr_log_data.log_ptr (2) = addr (syserr_log_hardy$);
+
+	syserr_log_data.log_name (1) = "syserr_log_laurel";
+	syserr_log_data.log_name (2) = "syserr_log_hardy";
+	syserr_log_data.log_dir = log_data_$syserr_log_dir;
+	call setup_segment (syserr_log_data.log_ptr (1), syserr_log_data.log_start (1), syserr_log_data.log_size (1));
+	call setup_segment (syserr_log_data.log_ptr (2), syserr_log_data.log_start (2), syserr_log_data.log_size (2));
+
+	unspec (syserr_log_data.lock) = ""b;
+	syserr_log_data.lock.event_id = binary ("105"b3); /* Initialize per-bootload items */
+
+	if initializing then			/* If we are rebuilding, re-set the log segments */
+	     call initialize_log_segments ();		/* In both cases, these set wlog.seq_num appropriately */
+	else call check_log_segments ();		/* Otherwise, just check the contents */
+
+	wlog.next = rel (addr (wlog.buffer));		/* Also set some other variables in the wired buffer */
+	wlog.count = 0;
+	addr (syserr_data$log_meters) -> olm.last_time = clock ();
+
+	if test_mode then				/* Set up IPC event-call kludge */
+	     call create_ring_four_test_logger ();
+	else call create_syserr_daemon ();		/* Create the daemon, and, if we make it this far, */
+	syserr_log_data.test_mode = test_mode;		/* Keep track of test mode operation */
+
+	if initializing then			/* If we are rebuilding, make it be finally valid */
+	     syserr_log_data.version = SYSERR_LOG_DATA_V1;
+
+	sd.log_flag = "1"b;				/* tell the daemon to start logging messages. */
+
+MAIN_RETURN:
+	return;
+%page;
+
+setup_segment:
+     procedure (P_seg_ptr, P_first_rec, P_seg_lth);
+
+declare  P_seg_ptr pointer parameter;
+declare  P_first_rec fixed bin parameter;
+declare  P_seg_lth fixed bin parameter;
+
+declare  segno fixed bin;
+
+declare  slt$ fixed bin external static;
+
+/* This procedure is used to set up an ASTE for the specified hardcore
+   segment (P_seg_ptr), the pages of which map onto a particular portion
+   of the LOG partition. */
+
+
+	if test_mode then				/* This has no meaning in test mode */
+	     return;
+
+	segno = binary (baseno (P_seg_ptr));
+
+	sltp = addr (slt$);				/* Check to see that the resulting page table will */
+	sltep = addr (slt.seg (segno));		/* be large enough; that is, was declared large */
+	if (P_seg_lth > binary (slte.max_length)) then	/* enough in the header. */
+	     call syserr (SYSERR_CRASH_SYSTEM, "^a: Size of ^p larger on disk than in header.", WHOAMI, P_seg_ptr);
+
+	call map_onto_disk				/* Pop the abs-seg onto the right place in the partition */
+	     (log_part_pvtx, (log_part_start + P_first_rec), P_seg_lth, P_seg_ptr, "1"b);
+
+	return;
+     end setup_segment;
+%page;
+
+syserr_data_valid:
+     procedure () returns (bit (1) aligned);
+
+declare  allocation_error bit (1) aligned;
+
+
+	if (syserr_log_data.version ^= SYSERR_LOG_DATA_V1) then
+	     return ("0"b);
+
+/* These tests verify that the first log segment thinks it starts immediately
+   after the one-page header, that the second starts immediately after that,
+   that no values are negative, that they don't overflow the partition, and
+   that they are evenly balanced */
+
+	if (syserr_log_data.log_start (1) ^= 1) then
+	     allocation_error = "1"b;
+	else if (syserr_log_data.log_start (2) ^= (1 + syserr_log_data.log_size (1))) then
+	     allocation_error = "1"b;
+	else if (sum (sign (syserr_log_data.log_start)) ^= 2) then
+	     allocation_error = "1"b;
+	else if (sum (sign (syserr_log_data.log_size)) ^= 2) then
+	     allocation_error = "1"b;
+	else if ((sum (syserr_log_data.log_size) + 1) > log_part_size) then
+	     allocation_error = "1"b;
+	else if (abs (syserr_log_data.log_size (1) - syserr_log_data.log_size (2)) > 2) then
+	     allocation_error = "1"b;
+	else if (syserr_log_data.live_log ^= 1) & (syserr_log_data.live_log ^= 2) then
+	     allocation_error = "1"b;
+	else allocation_error = "0"b;
+
+	if allocation_error then do;
+	     call syserr (SYSERR_PRINT_WITH_ALARM, "^a: LOG partition damaged. Reinitializing.", WHOAMI);
+	     return ("0"b);
+	end;
+
+/* If the syserr_log_data appears to be valid, then we reinitialize the
+   per-bootload values before returning; if not, this job will be taken
+   care of by initialize_syserr_data. */
+
+	unspec (syserr_log_data.per_bootload) = ""b;
+	syserr_log_data.log_ptr (*) = null ();
+
+	return ("1"b);
+     end syserr_data_valid;
+%page;
+
+initialize_syserr_data:
+     procedure ();
+
+declare  segment_size fixed bin;
+
+/* This procedure reinitializes the contents of the partition, splitting it
+   as evenly as possible between the two segments. It initializes all the
+   permanent information in syserr_log_data EXCEPT the version number,
+   which gets set after everything else is correct. */
+
+
+	if (syserr_log_data.old_init_word = "INIT") then
+	     call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Converting MR10.2 syserr partition", WHOAMI);
+
+	unspec (syserr_log_data) = ""b;		/* Clean it out */
+
+	segment_size = divide ((log_part_size - 1), 2, 17, 0); /* Remember a page for the header */
+
+	syserr_log_data.log_start (1) = 1;
+	syserr_log_data.log_start (2) = 1 + segment_size;
+	syserr_log_data.log_size (*) = segment_size;
+
+	syserr_log_data.old_init_word = "*NEW";
+
+	syserr_log_data.live_log = 1;
+	syserr_log_data.swap_time = 0;		/* This marks the other log as empty */
+
+	syserr_log_data.log_ptr (*) = null ();		/* Just to catch errors */
+
+	return;
+     end initialize_syserr_data;
+%page;
+
+initialize_log_segments:
+     procedure ();
+
+declare  log_idx fixed bin;
+declare  sys_log_ptr pointer;
+declare  log_size fixed bin (18);
+declare  INITIAL_MESSAGE char (100) varying internal static options (constant) init
+	    ("init_syserr_log: Syserr LOG partition reinitialized.");
+
+
+	do log_idx = 1, 2;				/* Two segments */
+	     sys_log_ptr = syserr_log_data.log_ptr (log_idx);
+	     log_size = syserr_log_data.log_size (log_idx) * sys_info$page_size;
+
+	     call log_initialize_ (null (), sys_log_ptr, log_size, "", code);
+	     if (code ^= 0) then
+		call syserr (SYSERR_CRASH_SYSTEM, "^a: Cannot initialize paged syserr log ^p", WHOAMI, sys_log_ptr);
+	     call log_segment_$remove_from_service (sys_log_ptr, (0));
+	end;
+
+	sys_log_ptr = syserr_log_data.log_ptr (syserr_log_data.live_log);
+	call log_segment_$place_in_service (sys_log_ptr, (0));
+	sys_log_ptr -> log_segment.previous_log_dir = log_data_$syserr_log_history_dir;
+	call log_segment_$create_message (sys_log_ptr, length (INITIAL_MESSAGE), 0, "", log_message_ptr, code);
+	if (code ^= 0) then
+	     call syserr (SYSERR_CRASH_SYSTEM, "^a: Cannot write initial message to paged syserr log ^p", WHOAMI, sys_log_ptr);
+
+	log_message.time = clock ();
+	log_message.severity = 0;
+	log_message.process_id = pds$process_id;
+	log_message.text = INITIAL_MESSAGE;
+
+	call log_segment_$finish_message (sys_log_ptr, log_message_ptr, (0));
+
+	wlog.seq_num = log_message.sequence;
+
+	call syserr (SYSERR_PRINT_ON_CONSOLE, log_message.text);
+
+	return;
+     end initialize_log_segments;
+%page;
+
+check_log_segments:
+     procedure ();
+
+declare  last_log_ptr pointer;
+declare  last_message_number fixed bin (35);
+declare  service_bit bit (1) aligned;
+
+	last_log_ptr = syserr_log_data.log_ptr (syserr_log_data.live_log);
+	call log_segment_$last_message_info (last_log_ptr, last_message_number, (0), code);
+	if (code ^= 0) then do;
+	     call syserr$error_code (SYSERR_PRINT_ON_CONSOLE, code,
+		"^a: Cannot get last message info from paged syserr log ^p", WHOAMI, last_log_ptr);
+
+	     initializing = "1"b;
+	     call initialize_log_segments ();
+
+	     return;
+	end;
+
+	call log_segment_$get_service_bit (last_log_ptr, service_bit, code);
+	if (code ^= 0) then do;
+	     call syserr$error_code (SYSERR_PRINT_ON_CONSOLE, code,
+		"^a: Cannot get service bit from paged syserr log ^p", WHOAMI, last_log_ptr);
+	     initializing = "1"b;
+	     call initialize_log_segments ();
+	     return;
+	end;
+
+	if (service_bit ^= "1"b) then do;
+	     call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Service bit off for live paged syserr log ^p.", WHOAMI, last_log_ptr);
+	     initializing = "1"b;
+	     call initialize_log_segments ();
+	     return;
+	end;
+
+	wlog.seq_num = last_message_number;
+
+	return;
+     end check_log_segments;
+%page;
+
+create_syserr_daemon:
+     procedure ();
+
+/* This procedure creates the HPROC and fills in variables so syserr_real knows
+   how to call upon it. Note that its stack, PDS, and DSEG are defined in the header  */
+
+declare  1 syserr_stk aligned based (sb),		/* Overlay for initializing daemon's stack */
+	 2 header like stack_header,
+	 2 frame like stack_frame;
+
+declare  syserr_daemon_dseg$ fixed bin external static;
+declare  syserr_daemon_pds$ fixed bin external static;
+declare  syserr_daemon_stack$ fixed bin external static;
+declare  pds$stack_0_ptr pointer external static;
+
+
+	sb = addr (syserr_daemon_stack$);		/* base of syserr's ring 0 stack */
+	stack_header_overlay = pds$stack_0_ptr -> stack_header_overlay; /* copy the stack header */
+
+	stack_header.stack_begin_ptr = addr (syserr_stk.frame); /* setup first frame ptrs */
+	stack_header.stack_end_ptr = addr (syserr_stk.frame);
+
+	call create_hproc$early_hproc (log_data_$syserr_log_daemon, "0"b, aptep, codeptr (syserr_log_daemon),
+	     addr (syserr_daemon_dseg$), addr (syserr_daemon_pds$), addr (syserr_daemon_stack$), code);
+	if code ^= 0 then do;
+	     call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Cannot create logger process.", WHOAMI);
+	     goto MAIN_RETURN;
+	end;
+
+	syserr_data$logger_proc_id = apte.processid;	/* for use by syserr_real */
+
+/**** In order to create an event channel, a process must know its values
+      of R-Offset and R-Factor.  These were set up when the process was
+      created. Retrieve then now from the APTE.  create_hproc set them. */
+
+	call tc_util$get_ipc_operands_priv (apte.processid, r_offset, r_factor, code);
+	if code ^= 0 then do;
+	     call syserr (SYSERR_PRINT_ON_CONSOLE, "^a: Unable to retrieve IPC operands from APTE.  Syserr log copying disabled.", WHOAMI);
+	     goto MAIN_RETURN;
+	end;
+
+/**** Create a valid (encoded) event channel name. */
+
+	call ipc_validate_$encode_event_channel_name (r_offset, r_factor, "000"b /* flags */, 1 /* index */, 0 /* ring */, FAST_CHANNEL_TYPE, 1 /* unique id */, special_channel);
+
+	syserr_data$logger_ec = special_channel;
+
+	return;
+     end create_syserr_daemon;
+%page;
+
+create_ring_four_test_logger:
+     procedure ();
+
+/* This procedure causes all sorts of nasty error messages if it is included
+   as-is on the system tape, because it goes in a temp-seg, yet contains
+   links to things not in ring zero. So, we have a nasty kludge to avoid it,
+   using comments instead of pl1_macro just to make the thing easier to
+   compile.  The real (external) entry declarations are commented out in
+   the installed version, and replaced by entry variable declarations that
+   all turn into calls to pxss$block (no special reason, save that it's
+   guaranteed not to be found).
+
+   To run this in the outer ring, just un-comment the first set of
+   declarations, and comment out the second. */
+
+/* COMMENTED OUT FOR RING ZERO INSTALLED VERSION
+
+   declare	com_err_ entry options (variable);
+   declare	get_group_id_ entry () returns (char (32) aligned);
+   declare	get_lock_id_ entry () returns (bit (36) aligned);
+   declare	get_process_id_ entry () returns (bit (36) aligned);
+   declare	ioa_ entry options (variable);
+   declare	ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+   declare	ipc_$decl_event_call_chn entry (fixed bin(71), entry, pointer, fixed bin, fixed bin (35));
+
+   COMMENTED OUT FOR RING ZERO INSTALLED VERSION */
+
+/* KLUDGE DECLARATIONS LEFT IN RING ZERO INSTALLED VERSION */
+
+declare  1 kludge_entries variable automatic,
+	 2 com_err_ entry options (variable),
+	 2 get_group_id_ entry () returns (char (32) aligned),
+	 2 get_lock_id_ entry () returns (bit (36) aligned),
+	 2 get_process_id_ entry () returns (bit (36) aligned),
+	 2 ioa_ entry options (variable),
+	 2 ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35)),
+	 2 ipc_$decl_event_call_chn entry (fixed bin (71), entry, pointer, fixed bin, fixed bin (35));
+
+	unspec (kludge_entries) = copy ("040"b3, (4 * size (kludge_entries))); /* Force fault_tag_1 */
+
+/* KLUDGE DECLARATIONS LEFT IN RING ZERO INSTALLED VERSION */
+
+declare  pds$processid bit (36) aligned external static;
+
+
+	call ipc_$create_ev_chn (syserr_data$logger_ec, code);
+	if (code ^= 0) then goto IPC_ERROR;
+
+	call ipc_$decl_event_call_chn (syserr_data$logger_ec, syserr_log_daemon, null (), 0, code);
+	if (code ^= 0) then do;
+IPC_ERROR:     call com_err_ (code, WHOAMI, "Cannot create IPC channel for test logger.");
+	     return;
+	end;
+
+	syserr_data$logger_proc_id = get_process_id_ ();
+	pds$processid = get_lock_id_ ();
+	pds$process_group_id = get_group_id_ ();
+	sd.ocdcm_init_flag = "1"b;			/* Let's claim that ocdcm_ works, too */
+						/* syserr message MUST come BEFORE the log flag is turned on
+						   because logging is not really operational until after
+						   collection 1 is done */
+
+	call ioa_ ("^a: Syserr log test environment initialized", WHOAMI);
+
+	return;
+     end create_ring_four_test_logger;
+
+/* format: off */
+%page; %include add_type;
+%page; %include apte;
+%page; %include ect_structures;
+%page; %include oc_log_meters;
+%page; %include slt;
+%page; %include slte;
+%page; %include stack_frame;
+%page; %include stack_header;
+%page; %include syserr_data;
+%page; %include syserr_log_dcls;
+%page; %include syserr_constants;
+%page; %include log_segment;
+%page; %include log_message;
+%page; %include fs_vol_label;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   init_syserr_log: Size of wired log is inconsistent.
+
+   S:     $crash
+
+   T:     $init
+
+   M:     The definitions in syserr_data.cds are inconsistent with those
+in syserr_data.incl.pl1.  This indicates a programming error.
+
+   A:     $recover
+
+
+   Message:
+   init_syserr_log: No LOG partition found, syserr logging disabled.
+
+   S:     $crash
+
+   T:     $init
+
+   M:     The system requires a LOG partition on the RPV disk to hold
+syserr messages before they are copied into >sc1>syserr_log. This partition
+must exist on the volume, and be defined by a "PART LOG" card in the config deck.
+
+   A:     Create a LOG partition on the RPV and define it in the config
+deck, then re-boot. The LOG partition should be at least 200 records long,
+and may be as large as 513.
+
+
+   Message:
+   init_syserr_log: Size of PTR larger on disk than in header.
+
+   S:     $crash
+
+   T:     $init
+
+   M:     The LOG partition has been damaged. Some messages may be lost
+if the previous shutdown was caused by a crash.
+
+   A:     Reinitialize the LOG partition with the BCE test_disk command and re-boot.
+
+
+   Message:
+   init_syserr_log: LOG partition damaged. Reinitializing.
+
+   S:     $beep
+
+   T:     $init
+
+   M:     The LOG partition has been damaged. Some messages may be lost
+if the previous shutdown was caused by a crash. The partition is automatically
+reinitialized.
+
+   A:     $recover
+
+
+   Message:
+   init_syserr_log: Converting MR10.2 syserr partition.
+
+   S:     $info
+
+   T:     $init
+
+   M:     This message occurs during the first bootload with an MR11.0 system
+tape, and indicates that the LOG partition is now in the new format.
+
+   A:     $ignore
+
+
+   Message:
+   init_syserr_log: Cannot initialize paged syserr log PTR.
+
+   S:     $crash
+
+   T:     $init
+
+   M:     $err
+
+   A:     $recover
+
+
+   Message:
+   init_syserr_log: Cannot write initial message to paged syserr log PTR.  ERROR-MESSAGE
+
+   S:     $crash
+
+   T:     $init
+
+   M:     $err
+
+   A:     $recover
+It may be necessary to reinitialize the LOG partition with the BCE
+test_disk command after this error.
+
+
+   Message:
+   init_syserr_log: Cannot get last message info from paged syserr log PTR.  ERROR-MESSAGE
+
+   S:     $info
+
+   T:     $init
+
+   M:     $err
+
+   A:     $recover
+It may be necessary to reinitialize the LOG partition with the BCE
+test_disk command after this error.
+
+
+   Message:
+   init_syserr_log: Cannot create logger process. ERROR-MESSAGE
+
+   S:     $info
+
+   T:     $init
+
+   M:     $err
+No syserr messages will be logged during this bootload.
+
+   A:     $recover
+
+
+   Message:
+   init_syserr_log: Unable to retrieve IPC operands from APTE.  Syserr log copying disabled.
+
+   S:	$info
+
+   T:	$init
+
+   M:	$err
+No syserr messages will be logged during this bootload.
+
+   A:	$recover
+
+
+   Message:
+   init_syserr_log: Cannot get service bit from paged syserr log PTR.  MESSAGE
+
+   S:	$info
+
+   T:	$init
+
+   M:	$err
+	Some error occurred when attempting to check the in service bit
+	for the specified ring 0 paged log segment.
+
+   A:	$ignore
+	The log partition will be automatically reinitialized.
+
+
+   Message:
+   init_syserr_log: Service bit off for live paged syserr log PTR.
+
+   S:	$info
+
+   T:	$init
+
+   M:	The in service flag for the specified ring 0 paged log segment
+	was found off.  Being this is supposed to be the live log, an
+	error is indicated.  This may occur when booting after a system
+	crash.
+
+   A:	$ignore
+	The syserr log partition will be automatically reinitialized.
+
+
+   END MESSAGE DOCUMENTATION
+   */
+
+          end init_syserr_log;

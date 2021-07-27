@@ -1,0 +1,686 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style1,insnl,ifthendo,indthenelse,^indnoniterdo,^inditerdo,indcom,^indthenbegin,^indprocbody,ind2,ll78,initcol0,dclind4,idind24,struclvlind1,comcol41 */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-07-02,LJAdams), approve(86-07-23,MCR7464),
+     audit(86-07-23,GDixon), install(86-07-24,MR12.0-1103):
+     probe_info.input_switch was not maintaining the correct value through
+     different invocations of probe; e.g., after a break point had been
+     executed.  Problem fixed.
+  2) change(88-09-07,WAAnderson), approve(88-09-30,MCR7952),
+     audit(88-09-30,JRGray), install(88-10-24,MR12.2-1184):
+     Added format control comment to make the source more readable.
+                                                   END HISTORY COMMENTS */
+
+probe_listen_:
+  procedure (P_probe_info_ptr, P_code);
+
+  /* *	Listener procedure for the "probe" debugger
+   *	Created out of subsystem_listen_, 0/22/79 W. Olin Sibert
+   Modified JRD 16 Oct 79
+   Modified 09/21/80 WOS, to fix so errors in breakpoints will call listener (bug 188)
+
+   entries here:
+
+   listen - basic read/eval loop
+   interpret_line and check_line - take line as parameter
+
+   These entries have to be careful of each other, because you can be called with the
+   same probe_info in effect.  For example, while at probe top level (listen_) you can call
+   "if", which used interpret_line, or try to set a break, which uses check_line.
+   You can also be using interpret_line to execute a break list, see a "halt", which
+   will call listen.  In this, rarer, case,  i think it is sufficient to save/restore
+   probe_info.ct
+*/
+  /* Made to skip leading whitespace and not prompt after blank line 09/10/81 S. Herbst */
+  /* Made prompt mode static 04/26/82 S. Herbst */
+  /* Made cleanup handler reset probe_static_info.last_break_segno (recursive breaks in probe) 08/15/83 S. Herbst */
+
+  dcl (
+      P_probe_info_ptr	pointer,	/* -> probe info (Input) */
+      P_request_line_ptr	pointer,
+      P_request_line_lth	fixed bin (21),
+      P_code		fixed binary (35)
+      )			parameter;
+
+  dcl WHITE		char (4) int static options (constant)
+			init /* SP HT FF NL */ (" 	
+");
+
+  dcl execute_bit		bit (1) aligned;
+				/* new value of probe_info.flags.execute */
+
+  dcl 1 saved_info		automatic aligned,
+				/* various information to be saved/restored */
+       2 input_type		fixed bin,
+       2 work_area_ptr	pointer unaligned,
+       2 expression_area_ptr	pointer unaligned,
+       2 request_name	character (32) varying,
+       2 abort_probe_label	label variable,
+       2 abort_line_label	label variable,
+       2 token_info		like probe_info.token_info,
+       2 flags		aligned like probe_info.flags,
+       2 ct		ptr unal;
+
+  dcl code		fixed binary (35);
+
+  dcl (input_ptr, original_input_ptr)
+			pointer;	/* pointer to current location in input string */
+  dcl (input_lth, input_used_lth)
+			fixed bin (21);
+  dcl input_string		char (input_lth) based (input_ptr);
+
+  dcl input_buffer_ptr	pointer;
+  dcl input_buffer_lth	fixed bin (21);
+  dcl input_buffer		char (input_buffer_lth)
+			based (input_buffer_ptr);
+  dcl start		fixed bin (21);
+
+  dcl local_work_area	area (1536) automatic;
+				/* area for tokens, etc. */
+
+  dcl add_char_offset_	entry (ptr, fixed bin (21)) returns (ptr);
+  dcl com_err_		entry () options (variable);
+  dcl cu_$cp		entry (pointer, fixed binary (21),
+			fixed binary (35));
+  dcl cu_$grow_stack_frame	entry (fixed bin (18), ptr, fixed bin (35));
+  dcl continue_to_signal_	entry (fixed bin (35));
+  dcl ioa_$ioa_switch	entry options (variable);
+  dcl ioa_$ioa_switch_nnl	entry options (variable);
+  dcl iox_$control		entry (pointer, char (*), pointer,
+			fixed bin (35));
+  dcl iox_$get_line		entry (pointer, pointer, fixed binary (21),
+			fixed binary (21), fixed binary (35));
+
+  dcl probe_announce_entry_	entry (ptr);
+  dcl probe_listen_		entry (ptr, fixed bin (35));
+  dcl probe_scan_input_	entry (pointer, pointer, fixed bin (21),
+			pointer,
+			fixed bin, fixed bin (21), pointer,
+			fixed bin (35));
+  dcl probe_error_		entry options (variable);
+  dcl probe_fault_handler_	entry (ptr);
+
+  dcl (
+      iox_$user_input,
+      iox_$error_output
+      )			pointer external static;
+
+  dcl (
+      error_table_$unimplemented_version,
+      error_table_$long_record,
+      error_table_$end_of_info,
+      error_table_$short_record
+      )			fixed bin (35) external static;
+
+  dcl (
+      probe_et_$syntax_error,
+      probe_et_$complex_expr,
+      probe_et_$convert_err,
+      probe_et_$error_in_break,
+      probe_et_$program_interrupt
+      )			fixed binary (35) external static;
+
+  dcl (cleanup, program_interrupt, area, conversion, any_other)
+			condition;
+
+  dcl (addr, empty, length, max, null, ptr, size, substr, verify)
+			builtin;
+				/*  */
+
+listen:
+  entry (P_probe_info_ptr, P_code);
+
+  probe_info_ptr = P_probe_info_ptr;
+
+  if probe_info.probe_info_version ^= probe_info_version_1 then do;
+      P_code = error_table_$unimplemented_version;
+      return;
+    end;
+
+  saved_info.ct = probe_info.ct;
+
+  probe_info.abort_probe_label = LISTEN_RETURN;
+  probe_info.abort_line_label = READ;
+
+  on program_interrupt
+    begin;			/* set up our various condition handlers */
+    call process_interruption ();
+    goto probe_info.abort_line_label;	/* do a non-local GOTO out of here */
+  end;
+
+  on cleanup
+    call clean_up_listener ();
+
+  on area
+    begin;			/* catch problems with our areas */
+    if probe_modes.ignore_faults
+      then
+	 call continue_to_signal_ ((0));
+      else call probe_error_ (probe_info_ptr, probe_et_$complex_expr);
+  end;
+
+  on conversion
+    begin;			/* catch conversion errors */
+    if probe_modes.ignore_faults
+      then
+	 call continue_to_signal_ ((0));
+      else call probe_error_ (probe_info_ptr, probe_et_$convert_err);
+  end;
+
+  on any_other
+    begin;			/* this will handle any other problems */
+    if probe_modes.ignore_faults
+      then
+	 call continue_to_signal_ ((0));
+      else call probe_fault_handler_ (probe_info_ptr);
+  end;
+
+  probe_info.in_listener = "1"b;	/* running the listener */
+
+  /* LISTENER LOOP */
+
+  call initialize_console_reading ();
+
+  probe_info.work_area_ptr = addr (local_work_area);
+
+  probe_info.input_type = CONSOLE_INPUT;
+  code = 0;			/* no errors encountered */
+
+  do while ("1"b);			/* exit is via call to abort_probe */
+READ:
+
+    probe_info.flags.executing_request = "0"b;
+				/* not executing now */
+    input_lth = 0;			/* reset the input buffer */
+
+    call read_from_console ();
+    call process_input_line ();
+  end;				/* of listener loop */
+
+LISTEN_RETURN:
+  call clean_up_listener ();
+
+  P_code = code;			/* code will be set if an error or interruption occurred */
+
+  return;
+
+
+clean_up_listener:
+  proc;
+
+  probe_info.static_info_ptr -> probe_static_info.last_break_segno = "0"b;
+  probe_info.ct = saved_info.ct;
+
+  end clean_up_listener;
+				/*  */
+
+interpret_line:
+  entry (P_probe_info_ptr, P_request_line_ptr, P_request_line_lth, P_code);
+
+  /* *	These two entries are used to process individual request lines.
+   *	The interpret_line entry executes the request line, and the check_line
+   *	entry just checks it for syntax. Both entries save the old state of the
+   *	listener, and restore it upon return or cleanup.
+
+   * called from break_handler, or to check syntax
+*/
+
+  execute_bit = "1"b;
+  goto INTERPRET_LINE_COMMON;
+
+
+check_line:
+  entry (P_probe_info_ptr, P_request_line_ptr, P_request_line_lth, P_code);
+
+  execute_bit = "0"b;
+  goto INTERPRET_LINE_COMMON;
+
+
+INTERPRET_LINE_COMMON:
+  probe_info_ptr = P_probe_info_ptr;
+
+  if probe_info.probe_info_version ^= probe_info_version_1 then do;
+      P_code = error_table_$unimplemented_version;
+      return;
+    end;
+
+  if ^probe_info.in_listener & ^probe_info.in_interpret_line then do;
+				/* only if lowest level */
+      probe_info.abort_probe_label = INTERPRET_LINE_RETURN;
+      probe_info.abort_line_label = INTERPRET_LINE_RETURN;
+
+      on program_interrupt
+        begin;			/* if no listener, punt on program_interrupt */
+        code = probe_et_$program_interrupt;
+				/* indicate why we returned */
+        goto probe_info.abort_line_label;
+      end;
+
+      on area
+        begin;			/* set up other handlers as well, if no listener */
+        if probe_modes.ignore_faults
+	then
+	     call continue_to_signal_ ((0));
+	else call probe_error_ (probe_info_ptr, probe_et_$complex_expr);
+      end;
+
+      on conversion
+        begin;			/* catch conversion errors */
+        if probe_modes.ignore_faults
+	then
+	     call continue_to_signal_ ((0));
+	else call probe_error_ (probe_info_ptr, probe_et_$convert_err);
+      end;
+
+      on any_other
+        begin;			/* this will handle any other problems */
+        if probe_modes.ignore_faults
+	then
+	     call continue_to_signal_ ((0));
+	else call probe_fault_handler_ (probe_info_ptr);
+      end;
+
+      probe_info.in_interpret_line = "1"b;
+				/* indicate whats happening */
+    end;				/* of setting up handlers when there is no listener already */
+
+  call save_probe_info ();		/* save the relevant parts */
+
+  on cleanup /* this will restore the things copied above */
+    call clean_up_interpret_line ();
+
+  probe_info.flags.execute = execute_bit;
+  probe_info.flags.executing_request = "0"b;
+  probe_info.work_area_ptr = addr (local_work_area);
+
+  input_ptr = P_request_line_ptr;
+  input_lth = P_request_line_lth;
+  code = 0;			/* no errors encountered yet */
+
+  call process_input_line ();
+
+  call clean_up_interpret_line ();	/* All done */
+  P_code = 0;
+  return;				/* successful return */
+
+INTERPRET_LINE_RETURN:
+
+  call process_interruption ();
+
+  call clean_up_interpret_line ();
+
+  P_code = code;			/* code will be set if an error or interruption occurred */
+  return;				/* end of code for $interpret_line entry */
+
+
+clean_up_interpret_line:
+  proc ();
+
+  /* *	This is the cleanup handler for probe_listen_$interpret_line */
+
+
+  probe_info.input_type = saved_info.input_type;
+  probe_info.work_area_ptr = saved_info.work_area_ptr;
+  probe_info.expression_area_ptr = saved_info.expression_area_ptr;
+  probe_info.request_name = saved_info.request_name;
+  probe_info.abort_probe_label = saved_info.abort_probe_label;
+  probe_info.abort_line_label = saved_info.abort_line_label;
+  probe_info.token_info = saved_info.token_info;
+  probe_info.flags = saved_info.flags;
+  return;
+  end;
+
+save_probe_info:
+  proc ();
+
+  /* *	This procedure saves the relevant parts of probe_info, which are restored by the code above */
+
+  saved_info.input_type = probe_info.input_type;
+  saved_info.work_area_ptr = probe_info.work_area_ptr;
+  saved_info.expression_area_ptr = probe_info.expression_area_ptr;
+  saved_info.request_name = probe_info.request_name;
+  saved_info.abort_probe_label = probe_info.abort_probe_label;
+  saved_info.abort_line_label = probe_info.abort_line_label;
+  saved_info.token_info = probe_info.token_info;
+  saved_info.flags = probe_info.flags;
+  return;
+  end;				/* internal procedure save_probe_info */
+
+  /*  */
+
+process_interruption:
+  proc ();
+
+  /* This procedure exists to flush command streams, and put the user in a consistent
+   state after an error or quit. */
+
+  if probe_info.input_type = CONSOLE_INPUT then do;
+				/* then input is from console */
+      input_lth = 0;		/* flush read ahead */
+      call iox_$control (probe_info.input_switch, "resetread", (null ()), (0))
+	 ;
+      code = probe_et_$program_interrupt;
+    end;
+
+    else do;			/* input was from a break */
+
+      /* the old probe only gave this message in "long" mode - in m y opinion
+   it is too important to ever ignore */
+
+      call ioa_$ioa_switch (iox_$error_output,
+	 "Break aborted. Type ""continue"" to restart program.");
+
+      /* Strategy will be to flush commands left in break command list and "stop"
+   Simulate a stop, then return */
+
+      call probe_announce_entry_ (probe_info_ptr);
+
+      call probe_listen_ (probe_info_ptr, (0));
+
+      code = probe_et_$error_in_break;
+    end;
+
+  end;				/* process_interruption internal procedure */
+
+  /*  */
+
+process_input_line:
+  proc ();
+
+  /* This internal procedure processes the current input buffer
+
+   GLOBAL INPUT/OUTPUT: input_ptr, input_lth, input_used_lth
+   i smell a kludge.
+
+   Note that language can change while executing a request.  probe_scan_input stops at the end
+   of  a statement, so we resume scan, under possibly new conditions
+*/
+
+  dcl first_token		pointer;	/* first token of current command */
+  dcl next_token		pointer;	/* to next command to be parsed */
+  dcl exhausted		bit (1) aligned;
+				/* have we reached the end of an input string */
+
+  probe_info.end_token = SEMI_COLON;
+
+  exhausted = "0"b;			/* to begin with, input string is full */
+
+  do while (^exhausted);		/* execute until we run out of string */
+    work_area = empty ();		/* initialize token storage */
+
+    call probe_scan_input_ (probe_info_ptr, input_ptr, input_lth,
+         addr (work_area),
+         probe_info.language_type, input_used_lth, first_token, code);
+
+    if code ^= 0
+      then /* error detected scanning input */
+	 call probe_error_ (probe_info_ptr, code);
+
+    /* interpret the tokenized input */
+
+    do probe_info.ct = first_token repeat next_token
+         while (probe_info.ct ^= null);
+				/* loop through all the tokens */
+      if probe_info.ct -> token.type = NAME_TYPE then do;
+				/* should be a keyword */
+
+	dcl request_entry_variable  entry variable options (variable);
+
+	dcl old_expression_area_ptr pointer;
+
+	/* *	This is the area used for keeping reference_nodes, among other things. It should
+   *	probably be an extensible area, so it would be smaller and take up less stack frame,
+   *	but I'm not sure whether that works yet.  -- wos, 07/16/79 */
+
+	dcl local_expression_area   area (4100) automatic;
+
+	dcl probe_request_mgr_$find_request
+			        entry (ptr, char (*), entry, pointer,
+			        fixed bin (35));
+
+
+	old_expression_area_ptr = probe_info.expression_area_ptr;
+				/* set up to save/restore */
+
+	on cleanup
+	  begin;
+	  probe_info.expression_area_ptr = old_expression_area_ptr;
+	end;
+
+	local_expression_area = empty ();
+
+	probe_info.expression_area_ptr = addr (local_expression_area);
+
+	call probe_request_mgr_$find_request (probe_info_ptr,
+	     current_identifier_name,
+	     request_entry_variable, probe_request_info_ptr, code);
+
+	if code ^= 0
+	  then call probe_error_ (probe_info_ptr, code);
+
+	probe_request_table_ptr = ptr (probe_request_info_ptr, 0);
+				/* find out its primary name */
+	request_namelist_ptr = ptr (probe_request_table_ptr,
+	     probe_request_info.namelist_loc);
+
+	probe_info.ct = probe_info.ct -> token.next;
+	probe_info.request_name = request_namelist.names (1);
+	probe_info.executing_request = "1"b;
+				/* at last */
+
+	call request_entry_variable (probe_info_ptr);
+
+	probe_info.executing_request = "0"b;
+				/* if it bothers to return */
+
+
+        end;
+
+      else if probe_info.ct -> operator.type = PERIOD then do;
+				/* tell user who we are */
+	probe_info.ct = probe_info.ct -> token.next;
+				/* keep syntax okay */
+	if probe_info.ct -> token.type = PERIOD
+				/* has a .. in bad place */
+	  then call ioa_$ioa_switch (iox_$error_output,
+		  "The .. escape convention can be used only at the beginning of a line"
+		  );
+	if probe_info.ct -> token.type < probe_info.end_token
+	  then
+	       call probe_error_ (probe_info_ptr, probe_et_$syntax_error);
+	if probe_info.execute
+	  then
+	       call ioa_$ioa_switch (probe_info.output_switch,
+		  probe_static_info.version_string);
+        end;
+
+      else if probe_info.ct -> token.type >= probe_info.end_token
+        then ;			/* do nothing, skip this one */
+
+      else call probe_error_ (probe_info_ptr, probe_et_$syntax_error);
+				/* constant doesn't belong here */
+      next_token = probe_info.ct -> token.next;
+    end;				/* of loop through tokens */
+
+    input_ptr = addr (substr (input_ptr -> input_string, input_used_lth + 1));
+    input_lth = max (0, input_lth - input_used_lth);
+    if input_lth = 0
+      then exhausted = "1"b;
+      else exhausted = "0"b;
+  end;				/* of loop through commands in a line */
+  return;
+  end;				/* process_input_line internal procedure */
+
+  /*  */
+
+read_from_console:
+  proc ();
+
+  /* *	This procedure reads input from the current input switch. Since it grows probe's
+   *	stack frame so it can hold the input buffer, it must be quick. It does not
+   *	assume that it is the only procedure extending the stack, and therefore does
+   *	not assume that grow_stack_frame will allocate contiguous blocks.
+
+   * GLOBAL import: original_input_ptr, maybe others? is this a kludge Olin?
+*/
+
+  dcl initial_input_buffer	char (256) aligned based;
+				/* the first console buffer, grown with our first call */
+
+  dcl read_ptr		pointer;
+  dcl (total_input_lth, original_input_lth, this_input_lth)
+			fixed bin (21);
+
+  dcl (old_buffer_ptr, new_buffer_ptr)
+			pointer;
+  dcl (old_buffer_lth, new_buffer_lth)
+			fixed bin (21);
+  dcl old_buffer		char (old_buffer_lth) based (old_buffer_ptr);
+  dcl new_buffer		char (new_buffer_lth) based (new_buffer_ptr);
+
+  total_input_lth = input_lth;	/* it started out empty */
+  original_input_lth = input_lth;	/* so we can revert from a ".." */
+  read_ptr = addr (substr (input_buffer, (total_input_lth + 1), 1));
+				/* start reading right after last input */
+
+print_prompt_and_read:
+  if probe_static_info.prompt_on_sw	/* print the prompt */
+    then call ioa_$ioa_switch_nnl (probe_info.output_switch,
+	    probe_static_info.prompt,
+	    probe_info.depth > 1, probe_info.depth);
+
+console_read_loop:
+  call iox_$get_line (probe_info.input_switch, read_ptr,
+       (input_buffer_lth - total_input_lth), this_input_lth, code);
+
+  if code = 0 then do;		/* read successfully */
+      input_lth = this_input_lth + total_input_lth;
+    end;				/* of case for code = 0 */
+
+  else if code = error_table_$long_record then do;
+				/* must grow stack frame for the rest of this */
+      old_buffer_ptr = input_buffer_ptr;
+      old_buffer_lth = input_buffer_lth;
+      new_buffer_lth = old_buffer_lth * 2;
+				/* twice as much room */
+
+      call cu_$grow_stack_frame (size (new_buffer), new_buffer_ptr, code);
+      if code ^= 0
+        then goto probe_info.abort_line_label;
+
+      new_buffer = old_buffer;
+      read_ptr = addr (substr (new_buffer, old_buffer_lth + 1, 1));
+				/* where to start reading more input */
+      total_input_lth = total_input_lth + this_input_lth;
+
+      input_buffer_ptr = new_buffer_ptr;
+      input_buffer_lth = new_buffer_lth;/* copy into the global values */
+      goto console_read_loop;		/* and try reading some more */
+    end;				/* of case for error_table_$long_record */
+
+  else if code = error_table_$end_of_info then do;
+      call com_err_ (0, probe_static_info.name,
+	 "End of information reached reading switch ""^a"". Reverting to user_input.",
+	 probe_info.input_switch -> iocb.name);
+      probe_info.input_switch = iox_$user_input;
+				/* revert to user_input */
+      input_lth = this_input_lth + total_input_lth;
+    end;				/* of case for error_table_$end_of_info */
+
+  else if code = error_table_$short_record then do;
+				/* pretty unlikely.... */
+      if this_input_lth = 0 then do;
+	call com_err_ (0, probe_static_info.name,
+	     "End of information reached reading switch ""^a"". Reverting to user_input.",
+	     probe_info.input_switch -> iocb.name);
+	probe_info.input_switch = iox_$user_input;
+				/* revert to user_input */
+        end;
+      input_lth = this_input_lth + total_input_lth;
+    end;
+
+  else do;			/* something pretty bonkers.... */
+    call com_err_ (code, probe_static_info.name,
+         "Reading switch ^a. Reverting to user_input.",
+         probe_info.input_switch -> iocb.name);
+    call probe_error_ (probe_info_ptr, code);
+    input_lth = 0;			/* Sorry, nothing there */
+  end;
+
+  if input_lth = 1
+    then go to console_read_loop;	/* no prompt after blank line */
+
+  start = verify (input_buffer, WHITE);
+  if start = 0
+    then go to console_read_loop;	/* line consisting entirely of white space */
+  if start > 1 then do;		/* skip leading whitespace */
+      input_buffer_ptr = add_char_offset_ (input_buffer_ptr, start - 1);
+      input_buffer_lth = input_buffer_lth - start + 1;
+      input_lth = input_lth - start + 1;
+    end;
+  if input_lth > 2 then do;		/* check for ".." escape convention */
+      if substr (input_buffer, 1, 2) = ".." then do;
+	call cu_$cp (addr (substr (input_buffer, 3, 1)), (input_lth - 2),
+	     (0));
+
+	input_lth = original_input_lth;
+				/* revert to original buffer contents, and get more input */
+	read_ptr = addr (substr (input_buffer, (input_lth + 1), 1));
+	total_input_lth = input_lth;
+	goto print_prompt_and_read;
+        end;
+    end;				/* of checking for ".." escape */
+
+  input_ptr, original_input_ptr = input_buffer_ptr;
+  return;				/* end of code for read_from_console entrypoint */
+
+
+initialize_console_reading:
+  entry ();			/* entry to initialize stuff */
+
+  probe_info.input_switch = probe_static_info.input_switch;
+
+  call cu_$grow_stack_frame (size (initial_input_buffer), input_buffer_ptr,
+       code);
+				/* try to grab first buffer */
+  if code ^= 0
+    then goto probe_info.abort_line_label;
+
+  input_buffer_lth = length (input_buffer_ptr -> initial_input_buffer);
+  input_lth = 0;			/* nothing in it, right now */
+
+  input_ptr, original_input_ptr = input_buffer_ptr;
+  return;				/* end of code for initialization entry point */
+  end;				/* read_from_console internal procedure */
+
+%page;
+%include probe_info;
+%page;
+%include probe_static_info;
+%page;
+%include probe_info_constants;
+%page;
+%include probe_modes;
+%page;
+%include probe_tokens;
+%page;
+%include probe_operators;
+%page;
+%include probe_request_table;
+%page;
+%include iocb;
+
+  end probe_listen_;		/* external procedure */

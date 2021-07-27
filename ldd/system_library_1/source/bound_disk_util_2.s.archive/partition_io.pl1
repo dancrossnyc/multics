@@ -1,0 +1,312 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style2 */
+
+partition_io:
+     proc ();
+
+	return;					/* Not an entrypoint */
+
+/* *	Privileged (hphcs_) procedure to write data to/from a disk partition.
+   *	This is intended mostly as a way of writing BOOT partitions.
+   *
+   *
+   *	I also chose this cheerful little program to implement a phcs_ accessable
+   *	volume label reader, something we've needed for years.
+   *
+   *	Created 09/29/80 W. Olin Sibert, for Bootload Multics.
+   *	Fixed to use get_pvtx, added read_label, 10/18/80 WOS
+   *	Modified to add find_partition entry, March 1982, J. Bongiovanni
+   *      Modified to use a real abs_seg, BIM, 3/83.
+   *	Modified for find_partition_given_drive, K. Loepere, 4/84.
+   *	Moved find_partition into its own routine, Keith Loepere, 1/85.
+   */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-12,Farley), approve(86-07-10,MCR7273),
+     audit(86-07-15,Fawcett), install(86-07-17,MR12.0-1097):
+     Set aste.records to correct value and set aste.dnzp to force writting of
+     zero pages back to the partition.
+                                                   END HISTORY COMMENTS */
+
+
+%page;
+	dcl     (
+	        a_pvid		 bit (36) aligned,	/* PVID of volume with partition */
+	        a_part_name		 char (*),	/* Name of partition */
+	        a_offset		 fixed bin (35),	/* Word offset from base of partition */
+	        a_data_ptr		 pointer,		/* Pointer to user supplied data */
+	        a_data_size		 fixed bin (18),	/* Number of words to read or write */
+	        a_label_ptr		 pointer,		/* Pointer to user label area */
+	        a_code		 fixed bin (35)
+	        )			 parameter;	/* Error code */
+
+	dcl     pvid		 bit (36) aligned;
+	dcl     part_name		 char (4) aligned;
+	dcl     offset		 fixed bin (35);
+	dcl     data_ptr		 pointer;
+	dcl     data_size		 fixed bin (18);
+	dcl     data		 (0:data_size - 1) based (data_ptr) bit (36) aligned;
+
+	dcl     code		 fixed bin (35);
+	dcl     pvtx		 fixed bin (8);
+	dcl     ptsi		 fixed bin;
+	dcl     first_record	 fixed bin (18);
+	dcl     offset_in_abs_seg	 fixed bin (18);
+	dcl     part_abs_seg_ptr	 pointer;
+	dcl     tsdwp		 pointer;
+	dcl     tsdw		 bit (72) aligned;
+
+/* These switches should ALL be initialized at EVERY entrypoint. */
+
+	dcl     label_sw		 bit (1) aligned;	/* Whether we're to just return the label */
+	dcl     write_sw		 bit (1) aligned;	/* Wether we're to read or write */
+
+	dcl     part_idx		 fixed bin;
+	dcl     part_start		 fixed bin (18);	/* First record and size of specified partition */
+	dcl     part_nrecs		 fixed bin (18);
+	dcl     (first_word_in_data, last_word_in_data)
+				 fixed bin (35);
+	dcl     first_page		 fixed bin;
+	dcl     n_pages		 fixed bin;
+	dcl     ptp		 pointer;
+	dcl     record_buffer	 (1024) bit (36) aligned;
+	dcl     i			 fixed bin;
+
+	dcl     sys_info$page_size	 fixed bin external;
+	dcl     sys_info$max_seg_size	 fixed bin (18) external;
+	dcl     abs_seg$		 external;
+	dcl     sst$astsize		 fixed bin external;
+	dcl     1 sst$level		 (0:3) aligned external static,
+		2 ausedp		 bit (18) unaligned,
+		2 no_aste		 bit (18) unaligned;
+
+	dcl     condition_		 entry (char (*), entry);
+	dcl     privileged_mode_ut$swap_sdw
+				 ext entry (ptr, ptr);
+	dcl     thread$out		 entry (ptr, bit (18) unal);
+	dcl     read_disk		 entry (fixed bin (8), fixed bin (18), pointer, fixed bin (35));
+	dcl     lock$lock_ast	 entry;
+	dcl     lock$unlock_ast	 entry;
+	dcl     get_ptrs_$given_astep	 ext entry (ptr) returns (bit (72) aligned);
+	dcl     pc$cleanup		 entry (ptr);
+	dcl     get_aste		 ext entry (fixed bin) returns (ptr);
+	dcl     put_aste		 ext entry (ptr);
+	dcl     ptw_util_$make_disk	 entry (pointer, fixed bin (20));
+
+
+	dcl     get_pvtx$get_pvtx	 entry (bit (36) aligned, fixed bin (35)) returns (fixed bin (8));
+	dcl     get_pvtx$hold_pvtx	 entry (bit (36) aligned, fixed bin (8), fixed bin (35));
+	dcl     get_pvtx$release_pvtx	 entry (bit (36) aligned, fixed bin (8));
+
+	dcl     (
+	        error_table_$bad_arg,
+	        error_table_$noentry,
+	        error_table_$out_of_bounds,
+	        error_table_$pvid_not_found
+	        )			 fixed bin (35) external static;
+
+	dcl     (addr, addwordno, bin, bit, divide, fixed, mod, null, setwordno, wordno)
+				 builtin;
+%page;
+partition_io$priv_read:
+     entry (a_pvid, a_part_name, a_offset, a_data_ptr, a_data_size, a_code);
+
+	label_sw = "0"b;
+	write_sw = "0"b;
+	goto COMMON;
+
+
+partition_io$priv_write:
+     entry (a_pvid, a_part_name, a_offset, a_data_ptr, a_data_size, a_code);
+
+	label_sw = "0"b;
+	write_sw = "1"b;
+	goto COMMON;
+
+
+partition_io$read_label:
+     entry (a_pvid, a_label_ptr, a_code);
+
+/* This entry is SPECIAL: it only reads the label, and returns. This is implemented
+   here because it's convenient, but the implementation here does involve a handful
+   of kludgy switches and tests (this is what label_sw means); so, be careful when
+   you modify it. The other entries are relatively unsurprising.
+   */
+
+	label_sw = "1"b;
+	write_sw = "0"b;
+	goto COMMON;
+%page;
+COMMON:
+	pvid = a_pvid;				/* Copy parameters */
+	if ^label_sw
+	then do;					/* Copy partition parameters, if not just reading label */
+		part_name = a_part_name;
+		offset = a_offset;
+		data_ptr = a_data_ptr;
+		data_size = a_data_size;
+		if data_size < 0
+		then do;
+			a_code = error_table_$bad_arg;/* avoid problems with negative values */
+			return;
+		     end;
+		else if data_size = 0
+		then do;
+			a_code = 0;
+			return;
+		     end;
+	     end;
+
+	pvtx = -1;
+	code = 0;
+	astep = null ();
+
+	pvtx = get_pvtx$get_pvtx (pvid, code);
+	if code ^= 0
+	then go to FINISHED;
+
+	call get_pvtx$hold_pvtx (pvid, pvtx, code);
+	if code ^= 0
+	then goto FINISHED;
+
+	labelp = addr (record_buffer);
+	call read_disk (pvtx, 0, labelp, code);		/* First, inspect the label to find the partition */
+	if code ^= 0
+	then /* Can't read the label */
+	     goto FINISHED;
+
+	if label.Multics ^= Multics_ID_String
+	then do;					/* Can't happen, but just in case */
+		code = error_table_$pvid_not_found;
+		goto FINISHED;
+	     end;
+
+	if label_sw
+	then do;					/* We are just to read the label, and return */
+		a_label_ptr -> label = label;		/* copy it out */
+		code = 0;
+		goto FINISHED;
+	     end;					/* ALL DONE with label reading entry */
+%page;
+	do part_idx = 1 to label.nparts;		/* Now, look forthe partition we're supposed to use */
+	     if label.parts (part_idx).part = part_name
+	     then do;				/* Found it */
+		     part_start = label.parts (part_idx).frec;
+		     part_nrecs = label.parts (part_idx).nrec;
+		     goto FOUND_PARTITION;
+		end;
+	end;
+
+	code = error_table_$noentry;			/* If we fall through, it ain't there */
+	goto FINISHED;
+
+
+FOUND_PARTITION:					/* Come here to start doing actual work */
+	if (offset + data_size) > (sys_info$page_size * part_nrecs)
+	then do;					/* Reference outside the partition */
+		code = error_table_$out_of_bounds;	/* Nice try, chum. */
+		goto FINISHED;
+	     end;
+
+	if (wordno (data_ptr) + data_size) > sys_info$max_seg_size
+	then do;					/* Trying to reference past */
+		code = error_table_$out_of_bounds;	/* the end of our input segment? Sorry, no. */
+		goto FINISHED;
+	     end;
+%page;
+	first_word_in_data = offset;			/* The first and last words of user supplied data */
+	last_word_in_data = offset + data_size - 1;
+
+	first_page = divide (first_word_in_data, sys_info$page_size, 18, 0);
+						/* The first and last records we must deal with */
+	n_pages = divide (last_word_in_data, sys_info$page_size, 18, 0) - first_page + 1;
+	first_record = part_start + first_page;
+	offset_in_abs_seg = mod (offset, sys_info$page_size);
+%page;
+
+/* Now create an abs_seg through which to look at the partition */
+
+	part_abs_seg_ptr = addr (abs_seg$);		/* get pointer to abs_seg */
+	tsdwp = addr (tsdw);			/* get a pointer to the SDW to be used */
+	call lock$lock_ast;
+	astep = get_aste (n_pages);			/* get a large page table / ASTE */
+	ptsi = fixed (aste.ptsi, 2);
+	call thread$out (astep, sst$level.ausedp (ptsi));
+	call lock$unlock_ast;
+	ptp = addwordno (astep, sst$astsize);		/* get a pointer to the page table */
+	tsdw = get_ptrs_$given_astep (astep);		/* get the actual SDW to use */
+	call privileged_mode_ut$swap_sdw (part_abs_seg_ptr, tsdwp);
+						/* make abs_seg point to the dump seg */
+	aste.pvtx = pvtx;
+	aste.csl = bit (bin (n_pages, 9), 9);		/* Set correct current length in AST entry. */
+	aste.records = bit (bin (n_pages, 9), 9);	/* Set correct records being used */
+	aste.nqsw = "1"b;				/* indicate no quota for this segment */
+	aste.dnzp = "1"b;				/* force zero pages to the partition */
+%page;
+
+/* Set up a condition in case we bomb out. */
+
+	call condition_ ("any_other", any_other_handler);
+
+	do i = 0 to (n_pages - 1);			/* <= 255 */
+	     call ptw_util_$make_disk (addwordno (ptp, i), (first_record + i));
+						/* The disk record */
+	end;
+
+	aste.npfs = "0"b;				/* Make sure page faults are legal */
+
+	begin;
+	     declare part_ptr	      pointer;
+	     declare part		      (0:data_size - 1) bit (36) aligned based (part_ptr);
+
+	     part_ptr = setwordno (part_abs_seg_ptr, offset_in_abs_seg);
+	     if write_sw
+	     then part = data;
+	     else data = part;
+	end;
+
+	code = 0;
+FINISHED:
+	if astep ^= null ()
+	then do;
+		call pc$cleanup (astep);
+		call lock$lock_ast;
+		call put_aste (astep);		/* return the AST entry */
+		call lock$unlock_ast;
+		tsdw = ""b;
+		call privileged_mode_ut$swap_sdw (part_abs_seg_ptr, tsdwp);
+	     end;
+	if pvtx > 0
+	then /* We had a pvtx, so release it */
+	     call get_pvtx$release_pvtx (pvid, pvtx);
+	a_code = code;				/* copy the error code */
+	return;					/* and return to our caller */
+
+
+any_other_handler:
+     procedure (MC_ptr);
+	declare MC_ptr		 pointer;
+%include mc;
+
+	mcp = MC_ptr;
+	code = mc.errcode;
+	go to FINISHED;
+     end any_other_handler;
+
+
+/* format: off */
+
+%page; %include aste;
+%page; %include fs_vol_label;
+	end partition_io;

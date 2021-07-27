@@ -1,0 +1,361 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+         This  module  is  used  by the caretaker Daemon of a Data Management
+     System (DMS) to do the various steps of  DMS  shutdown  in  the  Daemon's
+     login  ring.   There are currently four entries:  $schedule, $begin, 
+     $bump_users, and $unset_shutdown_timers.  A fifth entry for logging out
+     the Daemon  is  logically  a part  of  DMS shutdown as we will set the DMS
+     state to normal shutdown if the DMS is not in use; it is not here because
+     of its more general nature.
+
+          $schedule:  The Daemon has received  the  system_shutdown_scheduled_
+     IPS  or  a  shutdown  request  over  one  of  its  ipc_ channels.  In the
+     system_shutdown_scheduled_ IPS case, it calculates the times the shutdown
+     steps would occur, puts these times  in  dm_system_data_,  and  sets  the
+     reason  for  shutdown  to  be  "Multics  shutting down @ {time}".  If the
+     operator or administrative interfaces  send  the  shutdown  request,  the
+     times   and   reason   are  taken  from  the  saved_shutdown*  values  in
+     dm_system_data_.
+
+          If  shutdown  has  begun  (see  next  entry),  the new scheduling is
+     ignored  and  a  log entry is made.  A set of utility programs is used to
+     mediate  between  administratively  set values and default system values;
+     this  prevents  the  accidental  setting  of  a  shutdown  past a Multics
+     shutdown.   Administratively  set times earlier than times generated from
+     the  Multics  down time are NEVER ignored.  If a DMS shutdown has already
+     been  scheduled,  but  not begun, then the timers the daemon set up to do
+     the remaining steps are cancelled and new ones set up.
+
+	Three  alarm call timers are set up: (1) when to begin shutdown, (2)
+     when  to bump users who did not execute DM user shutdown, and (3) when to
+     force  logout  the  Daemon  even  if  shutdown has not totally completed.
+     After  the above is done, we start sending the dm_shutdown_scheduled_ IPS
+     to all current users of the DMS.
+
+          $begin_shutdown: this entry sets the DMS state to "shutdown begun"
+     and prevents new transactions from starting.  When this step completes,
+     no new user of the DMS will complete per-process initialization.
+
+          $bump_users:  this entry will bump all users  still  active  in  the
+     DMS.
+
+          After $bump_users has run, we will wait for the  last  timer  to  go
+     off,  adjusting  the  dead  processes that roll in.  If after adjusting a
+     daemon process, no users of the DMS (except the caretaker Daemon)  exist,
+     the sytem state is set to normal shutdown and the Daemon logs out without
+     waiting for the logout timer.
+
+          $unset_shutdown_timers:  this entry gets rid of all timers that may
+     have been set.
+*/
+
+/* HISTORY:
+
+Written by Lindsey L. Spratt, 04/06/84.
+Modified:
+07/26/84 by Lee A. Newcomb:  renamed from dm_shutdown_ to
+	  dm_dmn_system_shutdown_ to highlight this program's use by a DMS'
+	  caretaker Daemon and not users (for the user interface, see
+	  transaction_manager_$user_shutdown).  Also changed all entries
+	  except $bump_users to do the work they are supposed to.  Removed
+	  the $normal_shutdown entry as it is taken care of by
+	  dmsd_overseer_$daemon_logout.
+09/20/84 by Lee A. Newcomb:  Changed to use the new shutdown_info processing
+            methodology, set appropriate timers if a shutdown was really
+	  scheduled (not cancelled), and use the new entry
+	  transaction_manager_$ips_wakeup_all.
+10/28/84 by Lee A. Newcomb:  renamed $begin to $begin_shutdown to match TV
+            call.
+12/05/84 by R. Michael Tague: changed dmsd_overseer_$daemon_logout to
+            dmsd_util_$logout.
+12/06/84 by R. Michael Tague: changed dmsd_util_$* to dm_daemon_util_$*,
+            added $unset_shutdown_timers, and transaction_manager_$bump_all.
+12/10/84 by Lindsey Spratt:  Changed to catch the timer_manager_err condition
+	  when resetting the alarm calls (in $unset_shutdown_timers).  This
+	  condition is raised if the timer was never set.
+12/11/84 by Lee A. Newcomb:  Fixed to send the dm_shutdown_scheduled_ IPS,
+	  not dm_shutdown_warning_.
+03/20/85 by Steve Herbst:  Changed to log all the schedule times.
+03/28/85 by Lindsey Spratt:  Fixed to use dm_misc_util_ and dm_daemon_util_
+	  to get the shutdown times instead of referencing dm_system_data_
+	  directly.
+04/11/85 by Lee A. Newcomb:  To log fact no shutdown was scheduled if shutdown
+            times where not set instead of converting a zero time and
+            reporting it.
+           Added the reason for shutdown to the logged information and added
+            new-lines to improve readability.
+*/
+
+/* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+%page;
+dm_dmn_system_shutdown_$schedule:
+   proc ();
+
+/* START OF DECLARATIONS */
+/* Parameter */
+/* Automatic */
+dcl  (
+     begin_shutdown_time_str		char (32) init (""),
+     daemon_logout_time_str		char (32) init (""),
+     1 local_shutdown_info		aligned like shutdown_info,
+     next_reset_label		label variable,
+     saved_ips_mask			bit (36) aligned init ("0"b),
+     shutdown_reason		char (64) init (""),
+     system_state			char (4) aligned init (""),
+     user_bump_time_str		char (32) init (""),
+     user_shutdown_time_str		char (32) init (""),
+     user_warning_time_str		char (32) init ("")
+     )				automatic;
+
+/* Based */
+/* Builtin */
+dcl  (addr, null, unspec)		builtin;
+
+/* Condition */
+dcl  (cleanup, timer_manager_err)	condition;
+
+/* Constant */
+/* Entry */
+dcl  (
+     date_time_			entry (fixed bin (71), char (*)),
+     dm_daemon_util_$begin_shutdown	entry (),
+     dm_daemon_util_$bump_users	entry (),
+     dm_daemon_util_$get_daemon_logout_time
+				entry () returns (fixed bin (71)),
+     dm_daemon_util_$get_user_bump_time entry () returns (fixed bin (71)),
+     dm_daemon_util_$set_shutdown_info	entry (ptr),
+     dm_daemon_util_$set_system_state	entry (char (4) aligned),
+     dm_daemon_util_$unset_shutdown_timers
+				entry (),
+     dm_misc_util_$get_begin_shutdown_time
+				entry () returns (fixed bin (71)),
+     dm_misc_util_$get_shutdown_reason	entry () returns (char (64)),
+     dm_misc_util_$get_shutdown_warning_time
+				entry () returns (fixed bin (71)),
+     dm_misc_util_$get_system_state	entry returns (char (4) aligned),
+     dm_misc_util_$get_user_shutdown_time
+				entry () returns (fixed bin (71)),
+     dm_daemon_util_$log		entry () options (variable),
+     dm_daemon_util_$logout		entry (),
+     hcs_$reset_ips_mask		entry (bit (36) aligned,
+				bit (36) aligned),
+     hcs_$set_ips_mask		entry (bit (36) aligned,
+				bit (36) aligned),
+     timer_manager_$alarm_call	entry (fixed bin (71), bit (2), entry),
+     timer_manager_$reset_alarm_call	entry (entry),
+     transaction_manager_$begins_off	entry (),
+     transaction_manager_$bump_all	entry (),
+     transaction_manager_$dm_system_in_use
+				entry returns (bit (1) aligned),
+     transaction_manager_$ips_wakeup_all
+				entry (char (*), bit (1) aligned)
+     );
+
+/* External */
+
+/* END OF DECLARATIONS */
+%page;
+/* dm_dmn_system_shutdown_$schedule: */
+/*   proc (); */
+
+/* We have received either the system_shutdown_scheduled_ IPS or a	*/
+/* "shutdown" IPC message from the operator or an administrator.	*/
+
+   on cleanup call FINISH ();
+   call hcs_$set_ips_mask ("0"b, saved_ips_mask);
+
+/* Must make sure shutdown has not started. Any currently set timers	*/
+/* for shutdown are ignored as we have masked all IPS', including the	*/
+/* alrm IPS.  We don't want to have a shutdown being scheduled and	*/
+/* interrupted part way through; otherwise some of the following	*/
+/* might not get done, or done inconsistently.			*/
+
+   system_state = dm_misc_util_$get_system_state ();
+   if system_state = DM_SYSTEM_STATE_NORMAL_SHUTDOWN then
+ALREADY_SHUTDOWN:
+      do;
+      call dm_daemon_util_$log (INFORM_SV,
+	 "DMS is completely shutdown; ignored attempt to shut it down again.")
+	 ;
+      call RETURN ();
+   end ALREADY_SHUTDOWN;
+   else if system_state = DM_SYSTEM_STATE_SHUTDOWN_BEGUN
+        | system_state = DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS then
+SHUTDOWN_IN_PROGRESS:
+      do;
+      call dm_daemon_util_$log (INFORM_SV,
+	 "DMS has started shutdown (state ^a), attempt to reschedule shutdown ignored.",
+	 system_state);
+      call RETURN ();
+   end SHUTDOWN_IN_PROGRESS;
+   else if system_state ^= DM_SYSTEM_STATE_RUNNING then
+CANT_SHUTDOWN_NON_RUNNING_SYSTEM:
+      do;
+      call dm_daemon_util_$log (INFORM_SV,
+	 "DMS is not running (state ^a), attempt to schedule shutdown ignored.",
+	 system_state);
+      call RETURN ();
+   end CANT_SHUTDOWN_NON_RUNNING_SYSTEM;
+   else
+SCHEDULE_NEW_SHUTDOWN:
+      do;
+
+/* We must get the most up-to-date shutdown info in dm_system_data_,	*/
+/* either by using the administratively set values or the implicit	*/
+/* values calculated from the Multics down time.			*/
+
+      unspec (local_shutdown_info) = ""b;
+      local_shutdown_info.version = SHUTDOWN_INFO_VERSION_1;/* call will use sub_err_ if error found */
+      call dm_daemon_util_$set_shutdown_info (addr (local_shutdown_info));
+
+      call dm_daemon_util_$unset_shutdown_timers ();
+
+      if ^local_shutdown_info.no_time_specified then
+SET_NEW_ALARM_TIMERS:
+         do;
+
+/* there is a scheduled shutdown the Daemon should do something about	*/
+/* at various times.					*/
+
+         call timer_manager_$alarm_call (local_shutdown_info
+	    .begin_shutdown_time, "00"b /* abs. usec. */,
+	    dm_daemon_util_$begin_shutdown);
+         call timer_manager_$alarm_call (local_shutdown_info.user_bump_time,
+	    "00"b /* abs. usec. */, dm_daemon_util_$bump_users);
+         call timer_manager_$alarm_call (local_shutdown_info
+	    .daemon_logout_time, "00"b /* abs. usec. */,
+	    dm_daemon_util_$logout);
+
+LOG_SHUTDOWN_INFO:
+         do;
+	  call date_time_ (dm_misc_util_$get_shutdown_warning_time (),
+	       user_warning_time_str);
+	  call date_time_ (dm_misc_util_$get_begin_shutdown_time (),
+	       begin_shutdown_time_str);
+	  call date_time_ (dm_misc_util_$get_user_shutdown_time (),
+	       user_shutdown_time_str);
+	  call date_time_ (dm_daemon_util_$get_user_bump_time (),
+	       user_bump_time_str);
+	  call date_time_ (dm_daemon_util_$get_daemon_logout_time (),
+	       daemon_logout_time_str);
+	  shutdown_reason = dm_misc_util_$get_shutdown_reason ();
+
+	  call dm_daemon_util_$log (INFORM_SV,
+	       "DMS shutdown scheduled:^/Reason: ^a^/User warning at ^a,^/begin shutdown at ^a,^/user shutdown at ^a,^/users bumped at ^a,^/Daemon logout at ^a.",
+	       shutdown_reason, user_warning_time_str,
+	       begin_shutdown_time_str, user_shutdown_time_str,
+	       user_bump_time_str, daemon_logout_time_str);
+         end LOG_SHUTDOWN_INFO;
+
+      end SET_NEW_ALARM_TIMERS;
+      else
+LOG_NO_SHUTDOWN_SCHEDULED:
+         call dm_daemon_util_$log (INFORM_SV,
+	    "DMS shutdown not scheduled due to no scheduled Multics shutdown or administrative action."
+	    );
+
+/* Now we send the dm_shutdown_scheduled_ IPS to all current users of */
+/* the DMS we are taking care of (unless one of our timers goes off). */
+/* We do not optimize the case of the shutdown times not being	*/
+/* changed (see dm_set_shutdown_info.pl1 for more commentary).	*/
+
+SEND_DSS_IPS:
+      do;
+         call transaction_manager_$ips_wakeup_all ("dm_shutdown_scheduled_",
+	    ("0"b) /* don't care if DMS in use */);
+      end SEND_DSS_IPS;
+
+/* continue on and wait for next timer */
+
+   end SCHEDULE_NEW_SHUTDOWN;
+
+   call RETURN ();
+
+/* end dm_dmn_system_shutdown_$scheduled; */
+%page;
+dm_dmn_system_shutdown_$begin_shutdown:
+   entry ();
+
+/* The begin shutdown timer has gone off.  Prevent new transactions	*/
+/* and users and update system state.				*/
+
+   on cleanup call FINISH ();
+   call hcs_$set_ips_mask ("0"b, saved_ips_mask);
+
+   call dm_daemon_util_$set_system_state (DM_SYSTEM_STATE_SHUTDOWN_BEGUN);
+   call transaction_manager_$begins_off ();
+
+   call RETURN ();
+
+/* end dm_dmn_system_shutdown_$begin_shutdown; */
+%page;
+dm_dmn_system_shutdown_$bump_users:
+   entry ();
+
+   call dm_daemon_util_$set_system_state (DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS);
+
+/* If the DMS is not being used, the mark the state as finished and	*/
+/* logout the DM daemon; the logout call will not return.		*/
+
+   if ^transaction_manager_$dm_system_in_use () then
+      call dm_daemon_util_$logout ();			/* goodbye */
+
+   call transaction_manager_$bump_all ();
+
+/* Now wait for logout timer.  At this point, all we should have to	*/
+/* do is cleanup dead processes/transactions.			*/
+
+   call RETURN ();
+
+/* end dm_dmn_system_shutdown_$bump_users */
+%page;
+dm_dmn_system_shutdown_$unset_shutdown_timers:
+   entry ();
+
+   on timer_manager_err goto next_reset_label;
+
+   next_reset_label = BUMP_USERS_RESET;
+   call timer_manager_$reset_alarm_call (dm_daemon_util_$begin_shutdown);
+BUMP_USERS_RESET:
+   next_reset_label = LOGOUT_RESET;
+   call timer_manager_$reset_alarm_call (dm_daemon_util_$bump_users);
+LOGOUT_RESET:
+   next_reset_label = DONE_RESETTING;
+   call timer_manager_$reset_alarm_call (dm_daemon_util_$logout);
+DONE_RESETTING:
+   call RETURN ();					/* end dm_dmn_system_shutdown_$unset_shutdown_timers */
+%page;
+MAIN_RETURN:
+   return;
+%skip (4);
+FINISH:						/* doubles as cleanup handler */
+   proc ();
+
+/* reset the IPS mask if it is set. */
+   if saved_ips_mask ^= "0"b then
+      call hcs_$reset_ips_mask (saved_ips_mask, saved_ips_mask);
+
+   end FINISH;
+%skip (4);
+RETURN:
+   proc ();
+
+   call FINISH ();
+   goto MAIN_RETURN;
+
+   end RETURN;
+%page;
+%include dm_shutdown_spec;
+%page;
+%include dm_system_states;
+%page;
+%include dm_log_sv_codes;
+
+
+   end dm_dmn_system_shutdown_$schedule;

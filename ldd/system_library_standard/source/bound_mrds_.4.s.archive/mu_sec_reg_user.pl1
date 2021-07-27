@@ -1,0 +1,321 @@
+/* ***********************************************************
+   *                                                         *
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   *                                                         *
+   *********************************************************** */
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1976 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+mu_sec_reg_user: reg_user: procedure (ins_dbc_ptr, ins_rdbi_ptr, code);
+
+/*
+   This procedure checks for dead processes and registers users
+   and their associated relations, if applicable, at open time
+*/
+
+/* HISTORY:
+
+   Written by O D Friesen for queued scope requests -- July 1977
+   Modified by A. N. Kepner, Feb 27, 1979 to correct reference to
+   error_table_$lock_wait_time_exceeded (was misspelled.)
+   Modified by A. N. Kepner, March 14, 1979 to remove the quiesce_sw
+   parameter and to add new users to the beginning (as opposed to the end)
+   of the list of open users.
+   Modified by M. Pierret 5 Feb 1980 to correct the use of set_lock_
+   and to de-queue dead procs.
+   Modified by M. Pierret 29 Feb 1980 to fix >one dead processes case.
+
+   80-12-12 Jim Gray : added initialization of pad areas in the user_list structure.
+
+   80-12-23 Jim Gray : added capture of error for no write permission
+   on the database control segment, rather than attempting a write
+   and winding up with an un-handled condition.
+
+   81-05-29 Jim Gray : modified to use new resultant model structures.
+
+   81-09-15 Davids: added the rtrim operator.  this  was  needed  so
+   that the module would compile when -prefix stringsize was used in
+   the call to pl1. The length of rm_rel_array.name.submodel was not
+   changed  to char (30) even though 30 characters is the max length
+   because the current length of 32 is hard-wired in to the code  in
+   several places.
+
+   83-05-20 Davids: explicitly declared builtins that were left implicitly
+   declared and deleted declarations to things that were no longer used.
+*/
+
+	hold_ul_ptr = null;
+	dbc_ptr = ins_dbc_ptr;
+	rdbi_ptr = ins_rdbi_ptr;
+	code, icode, kode, num_filns = 0;
+	if dbc.trouble_switch
+	then do;
+		code = mdbm_error_$trouble_lock;
+		go to exit;
+	     end;
+
+	call set_lock_$lock (dbc.open_lock, mdbm_data_$lock_wait, code); /* lock the open table */
+	if code = error_table_$invalid_lock_reset |
+	     code = error_table_$locked_by_this_process
+	then code = 0;
+						/* ignore these error codes */
+	if code = error_table_$no_w_permission then do;
+		call sub_err_ (code, caller_name, continue, info_ptr, return_value, "^/^a^a^a^a^a",
+		     "No permission to set scope lock on """, rtrim (rm_db_info.db_path),
+		     ">", rtrim (mrds_data_$control_segment_name), """.");
+		goto exit;
+	     end;
+	else if code ^= 0 then do;
+		dbc.trouble_switch = "1"b;		/* prevent further openings while inconsistent */
+		goto exit;
+	     end;
+
+	on cleanup call clean_up;
+
+	call morgue (icode);			/* warning_flag will be examined later */
+	if icode ^= 0 then call error (icode);
+	call register_user (icode);
+
+	if warning_flag then dbc.dead_proc_flag = "1"b;
+	call set_lock_$unlock (dbc.open_lock, kode);
+	if icode ^= 0 then call error (icode);
+	else if kode ^= 0 then call error (kode);
+
+exit:	return;
+
+register_user: proc (icode);
+
+	dcl     i			 fixed bin;
+	dcl     icode		 fixed bin (35);
+	dcl     ptr_bit_string	 bit (72) based;	/* bit string format of pointer variable */
+
+	dbc.open_users = dbc.open_users + 1;
+	rmra_ptr = rm_db_info.ra_ptr;
+	num_filns = rm_rel_array.num_rels;
+	allocate user_list in (dbc.static_area) set (hold_ul_ptr);
+	unspec (hold_ul_ptr -> user_list) = "0"b;	/* zero pad areas */
+
+	ul_ptr = hold_ul_ptr;
+	call get_lock_id_ (user_list.db_lock_id);
+	if icode ^= 0 then call error (icode);
+						/* we must
+						   differentiate between
+						   different openings of the same data base
+						   by one process ... the pointer to the resultant
+						   data base info will serve as the tiebreaker in such cases */
+	user_list.rdbi_bits = addr (rdbi_ptr) -> ptr_bit_string;
+	user_list.num_filns = num_filns;
+	user_list.fil_list_ofs = NULL_OFS;
+	user_list.next_active_ofs = NULL_OFS;
+	user_list.next_waiting_ofs = NULL_OFS;
+	user_list.next_open_ofs = dbc.open_users_ofs;	/* Add user to list of data base
+						   open users. */
+	dbc.open_users_ofs = rel (ul_ptr);
+	user_list.group_id = get_group_id_ ();
+	user_list.open_mode = mdbm_data_$normal_mode;
+	user_list.bypass_count = 0;
+	user_list.allowance_count = 0;
+	user_list.process_id = get_process_id_ ();
+	user_list.ev_chn_id = 0;
+	user_list.dead_proc = "0"b;
+	user_list.dead_proc_conflict = "0"b;
+	user_list.priority_high = "0"b;
+	user_list.waiting_sw = "0"b;
+	user_list.active_sw = "0"b;
+	user_list.event_signal_sw = "0"b;
+	user_list.passive_sw = "1"b;			/* assume passivity */
+	do i = 1 to user_list.num_filns;
+	     user_list.file (i) = rtrim (rm_rel_array.name.submodel (i));
+						/* CHANGE 81-09-15 */
+	end;
+
+     end register_user;
+
+morgue: proc (icode);
+
+/*
+   we are looking for dead processes which still have this data base open.
+   If a dead process is found then see if it has  a -permit stor, modify or delete
+   (denoted by dbc.passive_sw being turned OFF) on any relation.
+   In this case set a warning flag
+   to indicate that the data base is potentially infirm -- then go on and complete the opening process.
+
+   It is the user's choice whether to proceed or give up and call
+   the DBA.
+
+   If the dead process is passive, then de-queue it and continue
+*/
+
+	dcl     icode		 fixed bin (35);
+
+
+	warning_flag = "0"b;
+	if dbc.open_users > 0 then do;
+		icode = 0;
+		ul_ptr = convert (dbc_ptr, dbc.open_users_ofs); /* look at all users who have the data base open */
+		do while (ul_ptr ^= null & icode = 0);
+
+/* determine whether the process represented by this user is dead or alive.
+   If it is dead then set_lock should return a status of invalid_lock_id.
+   If it is alive then set_lock should return a status of locked_by_this_process.
+   Any other status is an error .
+*/
+
+		     de_queue_flag = "0"b;
+
+		     call dead_or_alive (icode);
+
+		     if de_queue_flag		/* If dead proc was de-queued... */
+		     then ul_ptr = next_ul_ptr;	/* ..then next ul ptr was saved */
+		     else if ul_ptr ^= null
+		     then ul_ptr = convert (dbc_ptr, user_list.next_open_ofs);
+
+		end;
+
+	     end;
+
+     end morgue;
+
+
+dead_or_alive: proc (icode);
+
+	dcl     icode		 fixed bin (35);
+
+
+	icode = 0;
+	if user_list.dead_proc then status = DEAD;
+	else do;
+		status = ALIVE;
+		call set_lock_$lock ((user_list.db_lock_id), 0, state);
+		if state ^= 0 then do;
+			if state = error_table_$invalid_lock_reset /* locked by dead  process */
+			then status = DEAD;
+			else if state = error_table_$locked_by_this_process |
+				state = error_table_$lock_wait_time_exceeded
+			then status = ALIVE;
+			else icode = state;
+		     end;
+	     end;
+
+	if icode = 0
+	then if status = DEAD
+	     then if ^user_list.passive_sw
+		then do;
+			warning_flag = "1"b;
+			user_list.dead_proc = "1"b;
+		     end;
+
+		else do;
+			de_queue_flag = "1"b;
+			next_ul_ptr = convert (dbc_ptr, user_list.next_open_ofs); /* After user is dequeued */
+						/* we won't be able to get the next user */
+			call mu_de_queue_user (DQ_OPEN, FREE_FIL_LIST, dbc_ptr, ul_ptr, icode);
+			icode = 0;
+		     end;
+
+
+     end dead_or_alive;
+
+convert: proc (a_ptr, ofs) returns (ptr);
+
+/* this procedure function converts an offset from "0"b to null
+   or from the offset value to a pointer value within the segment denoted by a_ptr
+*/
+
+	dcl     result		 ptr;		/* the reultant pointer value */
+	dcl     a_ptr		 ptr;		/* ptr to the segment to which the offset refers */
+	dcl     ofs		 bit (18) unal;	/* the bit offset */
+
+	dcl     (null, ptr)		 builtin;
+
+	if ofs ^= NULL_OFS
+	then result = ptr (a_ptr, ofs);
+	else result = null;
+
+	return (result);
+
+     end convert;
+
+clean_up: proc;
+	if hold_ul_ptr ^= null
+	then free hold_ul_ptr -> user_list in (dbc.static_area);
+     end clean_up;
+
+error: proc (cd);
+	dcl     cd		 fixed bin (35);
+
+	code = cd;
+	if warning_flag then dbc.dead_proc_flag = "1"b;
+	call clean_up;
+	call set_lock_$unlock (dbc.open_lock, kode);
+	goto exit;
+     end error;
+
+	dcl     code		 fixed bin (35);	/* standard status return code */
+	dcl     kode		 fixed bin (35);
+	dcl     state		 fixed bin (35);
+
+	dcl     status		 bit (1) unal;	/*  ON => process is alive; OFF => process is dead */
+
+	dcl     ins_dbc_ptr		 ptr;		/* points to data base control seg. */
+	dcl     ins_rdbi_ptr	 ptr;		/* points to resultant db info */
+
+	dcl     warning_flag	 bit (1) unal;	/* indicates a relation is in the scope of a dead process */
+	dcl     de_queue_flag	 bit (1) unal;	/* ON => dead proc was de-queued */
+	dcl     icode		 fixed bin (35);
+
+	dcl     hold_ul_ptr		 ptr;		/* holder for ptr to newly allocated user_list entry */
+	dcl     next_ul_ptr		 ptr;		/* holds next ul ptr if user de-queued */
+
+	dcl     (addr, fixed, null, rel, rtrim, unspec) builtin;
+	dcl     cleanup		 condition;
+
+/*	Multics subroutines		*/
+
+	dcl     set_lock_$lock	 entry (bit (36) aligned, fixed bin, fixed bin (35)),
+	        get_group_id_	 entry returns (char (32)),
+	        get_process_id_	 entry returns (bit (36)),
+	        get_lock_id_	 entry (bit (36) aligned),
+	        set_lock_$unlock	 entry (bit (36) aligned, fixed bin (35));
+
+/*	Other subroutines		*/
+
+	dcl     mu_de_queue_user	 entry (bit (1), bit (1), ptr, ptr, fixed bin (35));
+	declare sub_err_		 entry options (variable); /* reports error details */
+	declare continue		 char (1) init ("c") int static options (constant); /* dont stop after printing mesg */
+	declare info_ptr		 ptr init (null ());/* dummy argumnt */
+	declare return_value	 fixed bin (35) init (0); /* dummy argument */
+	declare caller_name		 char (32) init ("mu_sec_reg_user") int static options (constant); /* name of calling routine */
+	declare mrds_data_$control_segment_name char (32) ext; /* name of concurrenty control segment */
+
+
+/*		External data		*/
+
+	dcl     mdbm_data_$normal_mode fixed bin ext,
+	        mdbm_data_$lock_wait	 fixed bin ext,
+	        mdbm_error_$trouble_lock fixed bin (35) ext,
+	        error_table_$no_w_permission fixed bin (35) ext,
+	        error_table_$locked_by_this_process fixed bin (35) ext,
+	        error_table_$invalid_lock_reset fixed bin (35) ext,
+	        error_table_$lock_wait_time_exceeded fixed bin (35) ext,
+	        sys_info$max_seg_size	 fixed bin (35) ext;
+
+%include mdbm_rm_db_info;
+
+%include mdbm_rm_rel_array;
+
+%include mdbm_dbc;
+
+%include mdbm_users;
+
+     end mu_sec_reg_user;
+

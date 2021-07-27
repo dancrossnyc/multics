@@ -1,0 +1,505 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-16,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-05-28,Beattie), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices, 3380 and 3390.
+                                                   END HISTORY COMMENTS */
+
+
+vm_vio: proc;
+
+/* original coding 9/75 by Bensoussan. Use of linear 256k seg for access changed
+   5/76 by Kobziar to be a table of abs segs used round robin fashion  and initialized to 64k size.
+   Modified 03/21/81, W. Olin Sibert, for ADP PTW formats
+   Modified 03/08/82, J. Bongiovanni, for new PVTE
+   */
+
+/* The first abs seg (first 64k) is not releasable, and its ptr is always valid.
+   Handling of reused addresses fits in as there is no dependence on any other abs seg  (ptr) */
+
+/* Optimized for  linearly increasing vtocx index. Only case this not true is in processing
+   a reused address, an event which is too infrequent (and happens only if unlucky hardware
+   failure during crash) to code for. Thus read ahead and write behind will cause extra work
+   due to possible reinitializing already written pages only in this case. */
+
+/* Note that cleanup entry now releases printer */
+
+dcl (pvtx, a_pvtx) fixed bin,
+    (vtocx, a_vtocx, devx) fixed bin,
+    (code, a_code) fixed bin (35);
+
+dcl  rec_size fixed bin internal static options (constant) init (1024);
+dcl  n_rec_per_seg fixed bin internal static options (constant) init (64);
+
+dcl  segnos_initialized bit (1) internal static init ("0"b);
+
+dcl  s (0 : 4) fixed bin internal static;		/* use 5 abs segs for addressibility */
+
+dcl 1 seg_list (0 : 4) internal static,
+    2 basep ptr,					/* seg ptr to be used for this abs seg */
+    2 recno fixed bin,				/* starting addr of this seg w.r.t. disk 0 */
+    2 perm bit (1) aligned,				/* slot frozen for this disk - header ptrs remain valid */
+    2 used bit (1) aligned;				/* indicates slot initialized */
+
+dcl  i fixed bin;
+dcl  ptp pointer;
+
+dcl  dseg$ (0 : 1023) fixed bin (71) external static;
+dcl  pds$processid ext bit (36) aligned;
+dcl  pvt$n_entries fixed bin external;
+dcl  salv_abs_seg_00$ external;
+dcl  salv_data$vol_read_ahead fixed bin external;
+dcl  sst$astl bit (36) aligned external;
+dcl  sst$astsize fixed bin external;
+dcl  1 sst$level (0 : 3) aligned external,
+     2 ausedp bit (18) unaligned,
+     2 no_aste bit (18) unaligned;
+dcl  sst$pts (0 : 3) fixed bin external;
+
+dcl  get_aste entry (fixed bin) returns (ptr);
+dcl  get_ptrs_$given_astep entry (ptr) returns (fixed bin (71) aligned);
+dcl  get_ptrs_$given_segno entry (fixed bin) returns (ptr);
+dcl  lock$lock_ast entry;
+dcl  lock$unlock_ast entry;
+dcl  page$cam entry;
+dcl  pc$cleanup entry (ptr);
+dcl  pc_wired$read entry (ptr, fixed bin, fixed bin);
+dcl  pc_wired$write entry (ptr, fixed bin, fixed bin);
+dcl  ptw_util_$make_disk entry (pointer, fixed bin (20));
+dcl  ptw_util_$make_null entry (pointer, bit (22) aligned);
+dcl  put_aste entry (pointer);
+dcl  syserr entry options (variable);
+dcl  thread$out entry (pointer, bit (18) unaligned);
+
+dcl (addr, addrel, baseno, baseptr, bit, divide, hbound, mod, null, ptr, fixed) builtin;
+
+dcl  cleanup condition;
+
+/*  */
+
+get_vtocep : entry (a_pvtx, a_vtocx) returns (ptr);
+
+	pvtx = a_pvtx;
+	vtocx = a_vtocx;
+	pvt_arrayp = addr (pvt$array);
+	devx = pvt_array (pvtx).device_type;
+	vtocep = GET_VTOCEP (pvtx, vtocx);
+
+	return (vtocep);
+
+
+
+
+
+
+init :	entry (a_pvtx, a_code) returns (ptr);
+
+	pvtx = a_pvtx;
+	code = 0;
+	pvt_arrayp = addr (pvt$array);
+	devx = pvt_array (pvtx).device_type;
+	on cleanup call CLEAN_UP;
+
+	call INIT (pvtx, code);
+
+	a_code = code;
+
+	if code ^= 0 then do; call CLEAN_UP; return (null); end;
+
+	return (seg_list (0).basep);
+
+
+
+
+
+clean_up : entry (a_pvtx);
+
+	pvtx = a_pvtx;
+	pvt_arrayp = addr (pvt$array);
+	devx = pvt_array (pvtx).device_type;
+	call CLEAN_UP;
+
+	return;
+
+GET_VTOCEP : procedure (pvtx, vtocx) returns (ptr);
+
+
+/* FUNCTION - This procedure returns a pointer to the vtoc entry whose  vtoc  index
+   is (vtocx) in the physical volume that has been assigned the entry number (pvtx) in
+   the physical volume table. */
+
+
+dcl  pvtx fixed bin,
+     vtocx fixed bin;
+
+dcl  recno fixed bin;
+dcl  compno fixed bin;
+dcl  segno fixed bin;
+dcl  word_number fixed bin;
+
+dcl  vtoce_size fixed bin;
+dcl  n_vtoce_per_rec fixed bin;
+
+dcl  vtoce_ptr ptr;
+
+dcl  k fixed bin;
+
+
+	     if pvtx <= 0 | pvtx > pvt$n_entries then
+		do;
+		call syserr (ANNOUNCE, "vm_vio: get_vtocep: invalid pvtx: ^oo", pvtx);
+		return (null);
+	     end;
+	  devx = pvt_array (pvtx).device_type;
+
+
+/* The vtoce_size calculation is done this way so that for disk devices that
+   only do 512 word io will appear to have a vtoce size of 512 instead of 192
+   because there is only one vtoce per sector and the remaining 320 are not
+   used. Therefore the calculation of word_number will always point to the
+   begining of the vtoce. */
+
+               vtoce_size = sect_per_vtoc (devx) * words_per_sect (devx);
+	     n_vtoce_per_rec = divide (rec_size, vtoce_size, 17, 0);
+	     recno = divide (vtocx, n_vtoce_per_rec, 17, 0) + VTOC_ORIGIN;
+	     compno = get_segno (recno);
+	     segno = s (compno);
+
+	     if vtocx < 0 | recno >= pvt_array (pvtx).vtoc_size then
+		do;
+		call syserr (ANNOUNCE, "vm_vio: get_vtocep: invalid vtocx ^oo on pvtx ^oo", vtocx, pvtx);
+		return (null);
+	     end;
+
+	     word_number = mod (recno, n_rec_per_seg) * rec_size
+		+ mod (vtocx, n_vtoce_per_rec) * vtoce_size;
+
+	     vtoce_ptr = ptr (baseptr (segno), word_number);
+
+	     k = salv_data$vol_read_ahead;
+	     if k > 0 then if mod (vtocx, n_vtoce_per_rec * k) = 0 then call READ_AHEAD ;
+
+	     return (vtoce_ptr);
+
+
+READ_AHEAD :   proc ;				/* INTERNAL TO GET_VTOCEP */
+
+
+
+dcl (r, r1, r2) fixed bin;
+dcl (j, n (0:1)) fixed bin;
+dcl  first (0:1) fixed bin;
+dcl  astep (0:1) ptr;
+dcl  index fixed bin;
+
+
+		r1 = recno + k;
+		r2 = r1 + k - 1;
+
+		n (0), n (1), j = 0;
+
+		do r = recno + 1 to r2 while (r < pvt_array (pvtx).vtoc_size);
+		     if mod (r, n_rec_per_seg) = 0 then j = 1;
+		     if r >= r1 then n (j) = n (j) + 1;
+		end;
+
+		do j = 0, 1;
+		     if n (j) > 0 then
+			do;
+			if j = 0 then astep (0) = get_ptrs_$given_segno (s (compno));
+			else do;
+			     index = get_segno (recno + n_rec_per_seg);
+			     astep (j) = get_ptrs_$given_segno (s (index));
+			end;
+			if j = 0 then
+			first (j) = mod (r1, n_rec_per_seg); else first (j) = mod (r1 + n (0), n_rec_per_seg);
+			if astep (j) ^= null then call pc_wired$read (astep (j), first (j), n (j));
+			else  call syserr  (CRASH, "vm_vio: no AST pointer at readahead.");
+		     end;
+		end;
+
+
+		index = mod (recno, n_rec_per_seg);
+		if index >= k then
+		     do;
+		     if n (0) = 0 then astep (0) = get_ptrs_$given_segno (s (compno));
+		     if astep (0) ^= null then call pc_wired$write (astep (0), index - k, k);
+		end;
+
+		return;
+
+	     end READ_AHEAD;
+
+
+get_segno:     proc (pageno) returns (fixed bin);
+
+dcl  pageno fixed bin;
+dcl  fbtemp fixed bin;
+
+		do i = 0 to hbound (s, 1);
+		     if seg_list (i).used then if seg_list (i).recno <= pageno
+			then if pageno <= seg_list (i).recno +n_rec_per_seg -1 then return (i);
+		end;
+						/* must update slot */
+		fbtemp = 1;
+						/* used to be only one loop with test for perm bit */
+		do i = 1 to hbound (s, 1);
+		     if seg_list (i).recno < seg_list (fbtemp).recno then fbtemp = i;
+		end;
+
+		call init_seg_list (fbtemp, pageno);
+		return (fbtemp);
+	     end get_segno;
+
+init_seg_list: proc (index, pageno);
+
+dcl (index, pageno) fixed bin;
+dcl  start fixed bin;
+
+		astep = get_ptrs_$given_segno (s (index));
+		call pc_wired$write (astep, 0, -1);
+		call pc$cleanup (astep);
+
+		start = divide (pageno, n_rec_per_seg, 17, 0) * n_rec_per_seg;
+
+		ptp = addrel (astep, sst$astsize);
+		do i = 0 to n_rec_per_seg - 1;
+		     call ptw_util_$make_disk (addrel (ptp, i), start + i); /* Appropriate record, out on disk */
+		end;
+
+		seg_list (index).recno = start;
+
+	     end init_seg_list;
+	end GET_VTOCEP;
+
+INIT :	proc (pvtx, code);
+
+dcl  pvtx fixed bin;
+dcl  code fixed bin (35);
+
+dcl  vtoc_size fixed bin;
+dcl  start_recno fixed bin;
+
+
+	     code = 0;
+
+	     if ^ segnos_initialized then
+		do;
+		seg_list (0).basep = addr (salv_abs_seg_00$);
+		s (0) = fixed (baseno (seg_list (0).basep));
+		seg_list (0).used = "0"b;
+		seg_list (0).perm = "0"b;
+
+		do i = 1 to hbound (s, 1);
+		     s (i) = s (0) + i;
+		     seg_list (i).basep = baseptr (s (i));
+		     seg_list (i).used = "0"b;
+		     seg_list (i).perm = "0"b;
+		end;
+
+		segnos_initialized = "1"b;
+	     end;
+
+	     start_recno = 0;
+	     call INIT_VTOC_SEG (s (0), pvtx, start_recno, n_rec_per_seg, code);
+	     if code ^= 0 then return;
+
+	     seg_list (0).used = "1"b;
+	     seg_list (0).perm = "1"b;
+	     seg_list (0).recno = 0;
+
+	     labelp = ptr (baseptr (s (0)), LABEL_ADDR * rec_size);
+
+	     vtoc_size = label.vtoc_size;
+
+	     do i = 1 to hbound (s, 1);
+		start_recno = start_recno + n_rec_per_seg;
+		call INIT_VTOC_SEG (s (i), pvtx, start_recno, n_rec_per_seg, code);
+		if code ^= 0 then return;
+		seg_list (i).used = "1"b;
+		seg_list (i).perm = "0"b;
+		seg_list (i).recno = start_recno;
+	     end;
+
+	     pvt_array (pvtx).vtoc_size = vtoc_size; /* Needed by vm_vio$get_vtocep */
+	     return;
+
+	end INIT;
+
+INIT_VTOC_SEG : proc (segno, pvtx, first_recno, n_records, code) ;
+
+
+dcl  segno fixed bin,				/* segno assigned to this vtoc segment - input */
+     pvtx fixed bin,				/* PVT index for this vtoc segment - input */
+     first_recno fixed bin,				/* device add for page 0 of this vtoc segment - input */
+     n_records fixed bin,				/* number of pages for this vtoc segment - input */
+     code fixed bin (35);
+
+dcl (i, pts, ptsi) fixed bin;
+
+dcl  tsdw fixed bin (71);
+
+
+/* ALLOCATE AN ASTE OF THE APPROPRIATE SIZE */
+
+	     code = 0;
+
+	     call lock$lock_ast;
+
+	     astep = get_aste (n_records);		/* Get an ASTE with the appropriate size PT */
+
+	     ptsi = fixed (aste.ptsi);
+	     pts = sst$pts (ptsi);
+
+
+/* ZERO THE ASTE */
+
+	     astep -> aste_part.two = "0"b;		/* Zero the rest of the ASTE except ptsi and marker */
+
+/* INITIALIZE THE PAGE TABLE WITH DISK ADDRESSES AND PAGE FAULT BITS */
+
+	     ptp = addrel (astep, sst$astsize);	/* get a pointer to the page table */
+
+	     do i = 0 to n_records - 1;		/* initialize the page table array for the entry */
+		call ptw_util_$make_disk (addrel (ptp, i), first_recno + i); /* Appropriate record, out on disk */
+	     end;
+
+	     do i = n_records to pts - 1;
+		call ptw_util_$make_null (addrel (ptp, i), fill_page_table_null_addr); /* Make up remaining PTWS */
+	     end;
+
+
+
+/* INITIALIZE THE ASTE */
+
+	     astep -> aste.vtocx = -1;		/* show there is no VTOCE for the segment */
+	     astep -> aste.dnzp = "1"b;
+	     astep -> aste.gtpd = "1"b;		/* do not put pages in the paging device */
+	     astep -> aste.nqsw = "1"b;		/* turn on no quota switch */
+	     astep -> aste.strp = bit (fixed (segno, 18), 18); /* store segment number in AST */
+	     astep -> aste.csl = bit (fixed (n_records, 9), 9); /* set the current length */
+	     astep -> aste.msl = bit (fixed (n_records, 9), 9); /* set the max length */
+	     astep -> aste.records = bit (fixed (n_records, 9), 9); /* set the number of records used */
+	     astep -> aste.pvtx = pvtx;		/* store the physical volume table index */
+
+
+
+/* THE CLEAN_UP OPERATION WILL DEPEND ON THE ORDER IN WHICH THE NEXT ACTIONS ARE PERFORMED */
+
+	     tsdw = get_ptrs_$given_astep (astep);	/* Get initial  SDW. */
+	     dseg$ (segno) = tsdw;			/* store temp SDW in the descriptor segment */
+	     call page$cam;
+
+	     astep -> aste.usedf = "1"b;		/* mark it as being used - as late as possible */
+
+	     call thread$out (astep, sst$level (ptsi).ausedp); /* thread the entry out of the used list */
+
+	     call lock$unlock_ast;
+
+	     return;
+
+	end INIT_VTOC_SEG;
+
+CLEAN_UP : proc;
+
+dcl  k fixed bin;
+
+
+	     if ^ segnos_initialized then return;
+
+	     if sst$astl ^= pds$processid then call lock$lock_ast;
+
+	     do k = 0 to hbound (s, 1);;
+		if seg_list (k).used then do;
+		     astep = get_ptrs_$given_segno (s (k));
+
+		     if astep ^= null then
+			if fixed (aste.strp, 18) = s (k) then
+			     do;
+			     dseg$ (s (k)) = 0;
+			     call page$cam;
+			     call pc$cleanup (astep);
+			     call put_aste (astep);
+			end;
+		     seg_list (k).used = "0"b;
+		     seg_list (k).perm = "0"b;
+		end;
+	     end;
+
+	     call lock$unlock_ast;
+
+	     addr (pvt$array) -> pvt_array (pvtx).vtoc_size = 0;
+
+	     return;
+
+	end CLEAN_UP;
+
+%page; %include aste;
+%page; %include disk_pack;
+%page; %include fs_vol_label;
+%page; %include null_addresses;
+%page; %include pvte;
+%page; %include vtoce;
+%page; %include syserr_constants;
+%page; %include fs_dev_types_sector;
+/*  */
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   vm_vio: get_vtocep: invalid pvtx: PPPo
+
+   S: $info
+
+   T: Volume salvaging or disk rebuilding.
+
+   M: The Volume Salvager virtual access package has been given a bad
+   PVT index parameter, PPP (shown in octal).
+   $err
+
+   A: Salvaging will not proceed.
+   $boot_tape
+
+   Message:
+   vm_vio: get_vtocep: invalid vtocx VVVo on pvtx PPPo
+
+   S: $info
+
+   T: Volume salvaging or disk rebuilding.
+
+   M: An out-of-range VTOC index (VVV) has been given to the Volume Salvager
+   virtual access package while processing PV at pvtx PPP. The vtocx and pvtx
+   are shown in octal.
+   $err
+
+   A: Salvaging may fail.
+   $note
+
+   Message:
+   vm_vio: no AST pointer at readahead.
+
+   S: $crash
+
+   T: Volume salvaging or disk rebuilding.
+
+   M: No AST entry pointer was found for a VTOC-addressing
+   segment used by the Volume Salvager virtual access package.
+   $err
+
+   A: $recover
+   $note
+
+   END MESSAGE DOCUMENTATION */
+
+     end vm_vio;

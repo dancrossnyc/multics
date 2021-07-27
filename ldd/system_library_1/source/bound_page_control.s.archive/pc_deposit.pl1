@@ -1,0 +1,552 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style3 */
+pc_deposit:
+     proc (Pvtx, Devadd, Vtocx, Pageno);
+
+/*  Routine to deposit an address or a list of addresses to the Volume
+    Map. It is called from ALM Page Control when the address or addresses
+    cannot be deposited into the record stock. This can happen only if
+    the record stock is full. Asynchronous record stock management
+    will deposit excess addresses to the Volume Map as we update each
+    Volume Map page.
+
+    This routine is also called during a volume scavenge, when addresses
+    are to be deposited to the volume being scavenged. Asynchronous
+    scavenger action is done here (that is, the scavenger data block
+    for this volume is updated - addresses being deposited are checked
+    for conflicts and their states are updated). 
+
+    Written March 1982 by J. Bongiovanni
+    Modified July 1982 by J. Bongiovanni for the scavenger
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-10,Hartogs), approve(86-06-10,MCR7383),
+     audit(86-06-11,Coppola), install(86-07-17,MR12.0-1097):
+     Calls to syserr modified to report on subvolumes.
+                                                   END HISTORY COMMENTS */
+
+
+/*  Parameter  */
+
+dcl	Pvtx		fixed bin parameter;	/* PVTE index */
+dcl	Devadd		bit (36) aligned parameter;	/* Single address to deposit */
+dcl	Vtocx		fixed bin;		/* VTOCE index (used by scavenger) */
+dcl	Pageno		fixed bin;		/* Page number within segment (used by scavenger) */
+dcl	List_ptr		ptr parameter;		/* Pointer to list of addresses */
+dcl	First		fixed bin;		/* First element to deposit in array */
+dcl	Last		fixed bin;		/* Last element to deposit in array */
+dcl	Pageno_list_ptr	ptr;			/* Pointer to list of page numbers */
+
+/*  Automatic  */
+
+dcl	check_scavenger	bit (1) aligned;
+dcl	conflict		bit (1) aligned;
+dcl	grabbed_vpage	fixed bin;
+dcl	listx		fixed bin;
+dcl	listx1		fixed bin;
+dcl	p99		pic "99";
+dcl	pageno		fixed bin;
+dcl	pages		fixed bin;
+dcl	pf_begin		fixed bin (35);
+dcl	pf_end		fixed bin (35);
+dcl	Single_addressp	ptr;
+dcl	this_vpage	fixed bin;
+dcl	vcpu_begin	fixed bin (71);
+dcl	vcpu_end		fixed bin (71);
+dcl	volmap_locked	bit (1);
+dcl	vpage_found	bit (1);
+dcl	vpage_list	(256) fixed bin;
+dcl	vpage_no		fixed bin;
+dcl	vpage_ptr		ptr;
+dcl	vtoc_index	fixed bin;
+
+/*  Static  */
+
+dcl	NULL_SDW		fixed bin (71) int static options (constant) init (0);
+dcl	RECORDS_PER_WORD	fixed bin int static options (constant) init (32);
+
+/*  Based  */
+
+dcl	1 List		(Last) aligned like Single_address based (List_ptr);
+dcl	Pageno_list	(Last) fixed bin based (Pageno_list_ptr);
+dcl	1 Single_address	aligned based (Single_addressp),
+	  2 Null_flag	bit (1) unaligned,
+	  2 Address	fixed bin (17) unsigned unaligned,
+	  2 Pad		bit (18) unaligned;
+
+/*  External  */
+
+dcl	volmap_abs_seg$	external;
+
+/*  Entry  */
+
+dcl	page$grab_volmap_page_unwired
+			entry (ptr, fixed bin, ptr);
+dcl	page$lock_volmap	entry (ptr);
+dcl	page$unlock_volmap	entry (ptr);
+dcl	page$write_volmap_page_unwired
+			entry (ptr, fixed bin);
+dcl	pmut$swap_sdw	entry (ptr, ptr);
+dcl	syserr		entry options (variable);
+dcl	usage_values	entry (fixed bin (35), fixed bin (71));
+
+/*  Condition  */
+
+dcl	cleanup		condition;
+dcl	page_fault_error	condition;
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	convert		builtin;
+dcl	divide		builtin;
+dcl	mod		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	stacq		builtin;
+dcl	unspec		builtin;
+%page;
+/*  Deposit a single record address into the Volume Map  */
+
+	call usage_values (pf_begin, vcpu_begin);
+	pages = 1;
+
+	pvtep = addr (addr (pvt$array) -> pvt_array (Pvtx));
+	record_stockp = pvte.volmap_stock_ptr;
+	Single_addressp = addr (Devadd);
+	volmap_locked = "0"b;
+	grabbed_vpage = -1;
+
+	call CHECK_FOR_SCAVENGE;
+
+	vtoc_index = Vtocx;
+	pageno = Pageno;
+
+	call FIND_VOLMAP_PAGE (Single_addressp, vpage_no, pageno, conflict);
+	if conflict
+	then goto RETURN;
+
+	on cleanup call UNLOCK_RESET;
+
+	call LOCK_SETUP;
+
+	on page_fault_error
+	     begin;
+		call IO_ERROR;
+		goto RETURN;
+	     end;
+
+	call page$grab_volmap_page_unwired (pvtep, vpage_no - 1, vpage_ptr);
+	grabbed_vpage = vpage_no - 1;
+
+	call DEPOSIT_TO_PAGE ((Single_address.Address), vpage_no, vpage_ptr);
+
+	call page$write_volmap_page_unwired (pvtep, vpage_no - 1);
+	grabbed_vpage = -1;
+
+RETURN:
+	revert page_fault_error;
+
+	call UNLOCK_RESET;
+
+	call METER;
+
+	return;
+%page;
+/*  Deposit a list of addresses into the Volume Map. Go through the list
+    some number of times. For each candidate found, compute the Volume
+    Map page number, grab the page, and deposit all addresses in the list
+    which belong to that page.
+*/
+
+pc_deposit$deposit_list:
+     entry (Pvtx, List_ptr, First, Last, Vtocx, Pageno_list_ptr);
+
+	call usage_values (pf_begin, vcpu_begin);
+	pages = Last - First + 1;
+
+	pvtep = addr (addr (pvt$array) -> pvt_array (Pvtx));
+	record_stockp = pvte.volmap_stock_ptr;
+	volmap_locked = "0"b;
+	grabbed_vpage = -1;
+
+	call CHECK_FOR_SCAVENGE;
+
+	vtoc_index = Vtocx;
+
+	do listx = First to Last;
+	     if Pageno_list_ptr = null ()
+	     then pageno = -1;
+	     else pageno = Pageno_list (listx);
+	     call FIND_VOLMAP_PAGE (addr (List (listx)), vpage_list (listx), pageno, conflict);
+	     if conflict
+	     then vpage_list (listx) = -1;
+	end;
+
+	on cleanup call UNLOCK_RESET;
+
+	call LOCK_SETUP;
+
+	on page_fault_error
+	     begin;
+dcl	pagex		fixed bin;
+
+		if grabbed_vpage >= 0
+		then do;
+			do pagex = First to Last;
+			     if vpage_list (pagex) = grabbed_vpage + 1
+			     then vpage_list (pagex) = -1;
+			end;
+			call IO_ERROR;
+		     end;
+		goto VPAGE_RETRY;
+	     end;
+
+VPAGE_RETRY:
+	vpage_found = "0"b;
+	do listx = First to Last;
+	     if vpage_list (listx) > 0
+	     then do;
+		     vpage_found = "1"b;
+		     this_vpage = vpage_list (listx);
+		     call page$grab_volmap_page_unwired (pvtep, this_vpage - 1, vpage_ptr);
+		     grabbed_vpage = this_vpage - 1;
+		     do listx1 = listx to Last;
+			if vpage_list (listx1) = this_vpage
+			then do;
+				call DEPOSIT_TO_PAGE ((List (listx1).Address), this_vpage, vpage_ptr);
+				vpage_list (listx1) = -1;
+			     end;
+		     end;
+		     call page$write_volmap_page_unwired (pvtep, grabbed_vpage);
+		     grabbed_vpage = -1;
+		end;
+	end;
+
+	if vpage_found
+	then goto VPAGE_RETRY;
+
+	revert page_fault_error;
+
+	call UNLOCK_RESET;
+
+	call METER;
+
+	return;
+%page;
+/* Internal Procedure to find the Volume Map page associated with a given
+   address */
+
+FIND_VOLMAP_PAGE:
+     proc (Devaddp, Volmap_pageno, Page_no, Conflict);
+
+dcl	Devaddp		ptr parameter;
+dcl	Volmap_pageno	fixed bin parameter;
+dcl	Page_no		fixed bin parameter;
+dcl	Conflict		bit (1) aligned parameter;
+
+dcl	vpagex		fixed bin;
+dcl	vpage_found	bit (1);
+dcl	address		fixed bin;
+
+dcl	1 Devaddr		aligned like Single_address based (Devaddp);
+
+	vpage_found = "0"b;
+	address = Devaddr.Address;
+	Conflict = "0"b;
+
+	if address < pvte.baseadd | address >= pvte.baseadd + pvte.totrec
+	then call syserr (CRASH, "pc_deposit: Address ^o out of paging region on ^a_^a^[^a^;^s^].", address, pvte.devname,
+		convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name);
+
+	do vpagex = record_stock.n_volmap_pages to 1 by -1 while (^vpage_found);
+	     if address >= record_stock.volmap_page (vpagex).baseadd
+	     then do;
+		     vpage_found = "1"b;
+		     Volmap_pageno = vpagex;
+		end;
+	end;
+
+	if ^vpage_found
+	then call syserr (CRASH, "pc_deposit: Invalid address ^o on ^a_^a^[^a^;^s^].", address, pvte.devname,
+		convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name);
+
+	if check_scavenger
+	then Conflict = CHECK_ADDRESS_FOR_SCAVENGER (address, Page_no);
+
+	return;
+
+
+     end FIND_VOLMAP_PAGE;
+%page;
+/* Internal Procedure to deposit a single record address to the Volume Map */
+
+DEPOSIT_TO_PAGE:
+     proc (Record_address, Vpage_no, Vpage_ptr);
+
+dcl	Record_address	fixed bin;
+dcl	Vpage_no		fixed bin;
+dcl	Vpage_ptr		ptr;
+
+dcl	bit_no		fixed bin;
+dcl	word_no		fixed bin;
+
+dcl	1 Vm_page		aligned based (Vpage_ptr),
+	  2 Word		(0:1023) aligned,
+	    3 Pad1	bit (1) unaligned,
+	    3 Bit		(0:31) bit (1) unaligned,
+	    3 Pad2	bit (3) unaligned;
+
+	word_no = divide (Record_address - record_stock.volmap_page (Vpage_no).baseadd, RECORDS_PER_WORD, 17);
+	if word_no < 0 | word_no > 1023 | (Vpage_no = 1 & word_no < 64)
+	then call syserr (CRASH, "pc_deposit: Invalid address ^o on ^a_^a^[^a^;^s^].", Record_address, pvte.devname,
+		convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name);
+
+	bit_no = mod (Record_address - record_stock.volmap_page (Vpage_no).baseadd, RECORDS_PER_WORD);
+
+	if Vm_page.Word (word_no).Bit (bit_no)
+	then do;
+		call syserr (ANNOUNCE, "pc_deposit: Deposit in-use address ^o on ^a_^a^[^a^;^s^].", Record_address,
+		     pvte.devname, convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name);
+		pvte.vol_trouble_count = pvte.vol_trouble_count + 1;
+						/* Add to inconsistency count */
+	     end;
+	else do;
+		Vm_page.Word (word_no).Bit (bit_no) = "1"b;
+		pvte.nleft = pvte.nleft + 1;
+		record_stock.volmap_page (Vpage_no).n_free = record_stock.volmap_page (Vpage_no).n_free + 1;
+	     end;
+
+	return;
+
+     end DEPOSIT_TO_PAGE;
+%page;
+/*  Internal Procedure to handle I/O Error on the Volume Map  */
+
+IO_ERROR:
+     proc;
+
+	pvte.vol_trouble_count = pvte.vol_trouble_count + 1;
+	if grabbed_vpage >= 0
+	then if record_stock.volmap_page (grabbed_vpage + 1).n_free > 0
+	     then do;
+		     record_stock.volmap_page (grabbed_vpage + 1).n_free = 0;
+		     call syserr (BEEP,
+			"pc_deposit: Unrecoverable I/O error on Volmap page ^d of ^a_^a^[^a^;^s^]. Addresses lost.",
+			grabbed_vpage, pvte.devname, convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name);
+		end;
+
+     end IO_ERROR;
+%page;
+/*  Internal procedure to see whether there's a scavenge goin' on for this
+    physical volume and set a flag accordingly.
+*/
+
+CHECK_FOR_SCAVENGE:
+     proc;
+
+	check_scavenger = "0"b;
+
+	scavenger_blockp = null ();
+	scavenger_datap = addr (scavenger_data$);
+
+	if pvte.scavenger_block_rel ^= ""b
+	then if pvte.scav_check_address
+	     then do;
+		     check_scavenger = "1"b;
+		     scavenger_blockp = ptr (scavenger_datap, pvte.scavenger_block_rel);
+		end;
+
+     end CHECK_FOR_SCAVENGE;
+%page;
+/*  Internal Procedure to check an address against the scavenger block for
+    this physical volume. The state is updated and conflicts marked
+    appropriately. Indication of conflict is returned to the caller,
+    so that the address is not deposited.
+*/
+
+CHECK_ADDRESS_FOR_SCAVENGER:
+     proc (Record_address, Page_no) returns (bit (1) aligned);
+
+dcl	Record_address	fixed bin parameter;
+dcl	Page_no		fixed bin parameter;
+
+dcl	1 A_record_block	aligned like record_block;
+dcl	Ap		ptr;
+dcl	conflict		bit (1) aligned;
+dcl	locked		bit (1) aligned;
+dcl	1 Q_record_block	aligned like record_block;
+dcl	Qp		ptr;
+dcl	Wp		ptr;
+
+dcl	A		bit (36) aligned based (Ap);
+dcl	Q		bit (36) aligned based (Qp);
+dcl	W		bit (36) aligned based (Wp);
+
+
+	record_blockp = addr (scavenger_block.records (Record_address - pvte.baseadd + 1));
+
+	locked = "0"b;
+	Ap = addr (A_record_block);
+	Qp = addr (Q_record_block);
+	Wp = record_blockp;
+	do while (^locked);
+	     unspec (Q_record_block) = unspec (record_block);
+	     unspec (A_record_block) = unspec (Q_record_block);
+	     if ^A_record_block.lock
+	     then do;
+		     A_record_block.lock = "1"b;
+		     locked = stacq (W, A, Q);
+		end;
+	end;
+
+	if record_block.state = STATE_UNSEEN
+	then record_block.state = STATE_FREE;
+	else if record_block.state = STATE_FREE
+	then record_block.state = STATE_CONFLICT;
+	else if record_block.state = STATE_IN_USE
+	then do;
+		if Page_no >= 0 & vtoc_index >= 0 & record_block.vtocx = vtoc_index & record_block.pageno = Page_no
+		then do;
+			record_block.vtocx = 0;
+			record_block.pageno = 0;
+			record_block.state = STATE_FREE;
+		     end;
+		else record_block.state = STATE_CONFLICT;
+	     end;
+
+	if record_block.state = STATE_CONFLICT
+	then conflict = "1"b;
+	else conflict = "0"b;
+
+	record_block.lock = "0"b;
+
+	return (conflict);
+
+
+     end CHECK_ADDRESS_FOR_SCAVENGER;
+
+
+%page;
+/*  Internal Procedure to lock the Volume Map lock, setup volmap_abs_seg  */
+
+LOCK_SETUP:
+     proc;
+
+	call page$lock_volmap (pvtep);
+	volmap_locked = "1"b;
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (pvte.volmap_seg_sdw));
+
+     end LOCK_SETUP;
+%page;
+/*  Internal Procedure to Cleanup  */
+
+UNLOCK_RESET:
+     proc;
+
+	if grabbed_vpage ^= -1
+	then call page$write_volmap_page_unwired (pvtep, grabbed_vpage);
+	grabbed_vpage = -1;
+
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (NULL_SDW));
+
+	if volmap_locked
+	then call page$unlock_volmap (pvtep);
+	volmap_locked = "0"b;
+
+     end UNLOCK_RESET;
+%page;
+/*  Internal Subroutine to meter CPU time, number of calls, and number of pages
+    whose addresses were deposited  */
+
+METER:
+     proc;
+
+	stock_segp = addr (stock_seg$);
+	stock_seg.meters.pc_deposit_calls = stock_seg.meters.pc_deposit_calls + 1;
+	stock_seg.meters.pc_deposit_pages = stock_seg.meters.pc_deposit_pages + pages;
+	call usage_values (pf_end, vcpu_end);
+	stock_seg.meters.pc_deposit_time = stock_seg.meters.pc_deposit_time + vcpu_end - vcpu_begin;
+
+     end METER;
+
+%page;
+%include pvte;
+%page;
+%include scavenger_data;
+%page;
+%include stock_seg;
+%page;
+%include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   pc_deposit: Address XXXXXX out of paging region on dskX_NN{s}.
+
+   S:     $crash
+
+   T:	$run
+
+   M:	An attempt was made to return disk address XXXXXX on device dskX_NN{s}
+   to the free pool. The address is not in the paging region.
+
+   A:	$recover
+   It may be necessary to run the physical volume salvager on the device.
+
+   Message:
+   pc_deposit: Invalid address XXXXXX on dskX_NN{s}.
+
+   S:     $crash
+
+   T:	$run
+
+   M:	In attempting to deposit address XXXXXX on device dskX_NN{s}, an invalid
+   volume map offset was computed. 
+
+   A:	$recover
+   It may be necessary to run the physical volume salvager on the device.
+
+   Message:
+   pc_deposit: Deposit in-use address XXXXXX on dskX_NN{s}.
+
+   S:     $beep
+
+   T:	$run
+
+   M:	An attempt was made to return address XXXXXX on device dskX_NN{s} to
+   the free record pool, but the address was already marked as free. This 
+   indicates damage to control structures on the device. This damage can
+   be corrected by a physical volume salvage.
+
+   A:     $inform
+
+   Message:
+   pc_deposit: Unrecoverable I/O error on Volmap page M of dskX_NN{s}. Addresses lost.
+
+   S:     $beep
+
+   T:	$run
+
+   M:	There was an unrecoverable I/O error on a page of the Volume Map,
+   which describes free records of the volume. All free records described
+   by that page have been lost.
+
+   A:     It may be possible to recover the lost addresses by a volume
+   salvage. If there is a hard device error, the volume salvage will
+   fail. In this case, it will be necessary to recover the volume onto
+   a good pack.
+
+   END MESSAGE DOCUMENTATION */
+
+     end pc_deposit;

@@ -1,0 +1,106 @@
+;; -*- Mode: Lisp; Lowercase: True -*-
+
+(%include defmacro)
+
+(defmacro setf (form val)
+  (do ((form form (funcall mfun form))
+       (mfun))
+      ((atom form)
+       `(setq ,form ,val))
+      (let ((fun (car form)))
+	 (or (symbolp fun)
+	     (error "Barf! Can't setf this: " form 'fail-act))
+	 (cond ((setq mfun (get fun 'setf))
+	        (return (funcall mfun form val)))
+	       ((setq mfun (get fun 'macro)))
+	       (t (error "Barf! Can't find macro or setf property for "
+		       fun 'fail-act))))))
+
+(defmacro defsetf (fun pat var . body)
+  (let ((arg (gensym))
+        (name (intern (make_atom (catenate fun " setf")))))
+       `(progn 'compile
+	     (defprop ,fun ,name setf)
+	     (defun ,name (,arg ,var)
+		  (let ((,pat (cdr ,arg)))
+		       . ,body)))))
+
+(defsetf car (x) y `(rplaca ,x ,y))
+(defsetf cdr (x) y `(rplacd ,x ,y))
+(defsetf get (x y) z `(putprop ,x ,z ,y))
+(defsetf plist (x) y `(setplist ,x ,y))
+(defsetf symeval (x) y `(set ,x ,y))
+(defsetf args (x) y `(args ,x ,y))
+(defsetf arg (n) y `(setarg ,n ,y))
+(defsetf arraycall rest y `(store (arraycall . ,rest) ,y))
+(defsetf nth (i x) y `(rplaca (nthcdr ,i ,x) ,y))
+(defsetf ldb (ppss x) y `(setf ,x (dpb ,y ,ppss ,x)))
+(defsetf status (x) y `(sstatus ,x ,y))
+
+(declare (eval (read)))
+
+(defmacro defcxxr (sym)
+  (let ((p (get_pname sym)))
+    (let ((rplac (cond ( (= (getcharn p 2) 141) ;#/a
+		     'rplaca)
+		   (t 'rplacd)))
+	(cr (intern
+	      (make_atom
+	        (catenate "c"
+		        (substr p 3 (- (stringlength p) 3))
+		        "r")))))
+         `(progn 'compile
+	       (defprop ,sym (,rplac . ,cr) setf-cxxr)
+	       (defprop ,sym setf-cxxr-er setf)))))
+
+(defun setf-cxxr-er (form newval)
+  (let ((pair (get (car form) 'setf-cxxr)))
+       `(,(car pair) (,(cdr pair) ,(cadr form)) ,newval)))
+
+(defcxxr caar)
+(defcxxr cadr)
+(defcxxr cdar)
+(defcxxr cddr)
+(defcxxr caaar)
+(defcxxr caadr)
+(defcxxr cadar)
+(defcxxr caddr)
+(defcxxr cdaar)
+(defcxxr cdadr)
+(defcxxr cddar)
+(defcxxr cdddr)
+(defcxxr caaaar)
+(defcxxr caaadr)
+(defcxxr caadar)
+(defcxxr caaddr)
+(defcxxr cadaar)
+(defcxxr cadadr)
+(defcxxr caddar)
+(defcxxr cadddr)
+(defcxxr cdaaar)
+(defcxxr cdaadr)
+(defcxxr cdadar)
+(defcxxr cdaddr)
+(defcxxr cddaar)
+(defcxxr cddadr)
+(defcxxr cdddar)
+(defcxxr cddddr)
+
+(defprop first car/ setf setf)
+(defprop rest1 cdr/ setf setf)
+
+(defprop second (rplaca . cdr) setf-cxxr)
+(defprop rest2  (rplacd . cdr) setf-cxxr)
+(defprop third  (rplaca . cddr) setf-cxxr)
+(defprop rest3  (rplacd . cddr) setf-cxxr)
+(defprop fourth (rplaca . cdddr) setf-cxxr)
+(defprop rest4  (rplacd . cdddr) setf-cxxr)
+
+(defprop second setf-cxxr-er setf)
+(defprop third  setf-cxxr-er setf)
+(defprop fourth setf-cxxr-er setf)
+(defprop rest2  setf-cxxr-er setf)
+(defprop rest3  setf-cxxr-er setf)
+(defprop rest4  setf-cxxr-er setf)
+
+(sstatus feature setf)

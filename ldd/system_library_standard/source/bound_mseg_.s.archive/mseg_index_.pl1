@@ -1,0 +1,418 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-05-30,Palter), approve(86-02-20,MCR7345),
+     audit(86-02-21,MSharpe), install(86-07-11,MR12.0-1092):
+     Verify proper real access to the segment as this particular check can`t be
+     postponed to the access kernel.  Without this check, a process whose
+     authorization is greater than the access class of a message segment would
+     take a no_write_permission fault when trying to perform most any operation
+     on the segment.
+     Also set mseg_operation.mseg_(index ptr)_valid to ""b inside
+     mseg_index_$close_seg upon removing the entry from the mseg_table and
+     termination of the segment.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+mseg_index_:
+     procedure;
+
+/*
+   Module of the primitive message segment facility which  initiates
+   and  terminates  a  message  segment  in the administrative ring,
+   matching the pointer to the message segment with a  unique  index
+   which is passed to and from the user ring.
+*/
+
+
+/* Modified for version 3 message segments by J. Stern, 10/29/74 */
+/* Modified by Benson Margulies for conversion to unaligned character strings */
+/* Modified 1984-10-11 BIM to stop calling the admin gate. */
+/* Modified February 1985 by M. Pandolf to move access checking to kernel. */
+/* Modified 1985-04-17, BIM: return pointer for speed. */
+
+/* DECLARATIONS */
+/* ------------ */
+
+
+/* fixed bin */
+
+dcl  (
+     i,
+     mseg_index,					/* index to a given message segment (internal) */
+     a_mseg_index					/* used by close */
+     ) fixed bin aligned;
+
+dcl  (
+     a_code,					/* error code (argument) */
+     code init (0),					/* error code (internal) */
+     code2,					/* another error code */
+     error_table_$ai_restricted external,
+     error_table_$bad_subr_arg external,
+     error_table_$dirseg external,
+     error_table_$not_seg_type external,
+     error_table_$notalloc ext,
+     error_table_$segknown ext,
+     error_table_$seg_unknown ext
+     ) fixed bin (35) aligned;
+
+
+/* pointers */
+
+dcl  (
+     a_table_ptr,					/* ptr to mseg_ptr array (argument) */
+     new_table_ptr,					/* ptr for re-allocating table */
+     temp_mseg_ptr,					/* pointer to specific message segment */
+     a_op_ptr
+     ) ptr aligned;
+
+dcl  area_ptr ptr int static init (null);
+
+dcl  linker_area area based (area_ptr);
+
+
+/* character strings */
+
+dcl  dn char (168);
+dcl  en char (32);
+
+/* bit strings */
+
+dcl  effective_access bit (36) aligned;
+dcl  sys_info$ring1_privilege ext bit (36) aligned;
+
+/* built in functions */
+
+dcl  (addr, bit, null) builtin;
+
+/* external entries */
+
+dcl  admin_gate_$syserr entry (/* fixed binary, character (*) */) options (variable);
+dcl  get_user_free_area_ entry returns (ptr);
+dcl  hcs_$get_access_info_seg entry (ptr, ptr, fixed bin (35));
+dcl  hcs_$get_user_access_modes_seg
+	entry (ptr, char (*), fixed bin (3), bit (36) aligned, bit (36) aligned, fixed bin (35));
+dcl  hcs_$initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl  hcs_$terminate_noname ext entry (ptr aligned, fixed bin (35) aligned);
+dcl  pathname_ entry (char (*), char (*)) returns (char (168));
+dcl  sub_err_ entry () options (variable);
+dcl  system_privilege_$initiate ext
+	entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+
+/* conditions */
+
+dcl  area condition;
+%page;
+/**** This entrypoint is called to get a pointer, but not to record
+      in the table of open segments. That recording only happens
+      if the user has access. */
+
+mseg_index_$initiate_seg:
+     entry (a_op_ptr, a_code);
+
+	mseg_operation_ptr = a_op_ptr;
+	if ^mseg_operation.mseg_pathname_valid then
+	     call sub_err_ (error_table_$bad_subr_arg, "mseg_$initiate_seg", ACTION_CANT_RESTART, null (), (0),
+		"The mseg_operation does not include a valid pathname.");
+
+	dn = mseg_operation.dir_name;
+	en = mseg_operation.entryname;
+
+	if mseg_operation.caller.privileges & sys_info$ring1_privilege then
+	     call system_privilege_$initiate (dn, en, "", 0, 1, temp_mseg_ptr, code2);
+	else call hcs_$initiate (dn, en, "", 0, 1, temp_mseg_ptr, code2);
+						/* initiate message segment */
+	if temp_mseg_ptr = null then do;		/* did not get back a pointer */
+	     if code2 = error_table_$dirseg then
+		code = error_table_$not_seg_type;
+	     else code = code2;
+	     go to RETURN;
+	end;
+
+	mseg_operation.mseg_ptr = temp_mseg_ptr;
+	mseg_operation.mseg_ptr_valid = "1"b;
+
+	if mseg_operation.suppress_access_checks then go to RETURN;
+
+/**** We must fetch the segment's access_info here in order to validate
+      that we have RW real effective access to the segment.  We can't delay
+      this check to the mseg_check_access_ kernal as there is at least
+      one gate target (mailbox_$accept_wakeups_index) which performs an
+      mseg_ operation before calling mseg_check_access_.  Since the mseg_
+      operation has to lock the segment, if we don't have the proper real
+      access, we would take a fault in ring 1 which isn't very nice.
+
+      If the user doesn't have RW effective access, we must determine the
+      appropriate error code to return.  If the segment's ring brackets
+      are incorrect, we'll return error_table_$not_seg_type.  If we lack
+      the needed access due to AIM, we'll return error_table_$ai_restricted.
+      If, however, we lack the access due to an incorrect real mode in the ACL,
+      we enter a SYSERR message and stop the user dead by calling sub_err_.
+      In truth, we would prefer to invoke an ACL salvager in this case but,
+      as one does not exist, we stop our caller as any error code we might
+      return would be misleading. */
+
+	call hcs_$get_access_info_seg (temp_mseg_ptr, addr (mseg_operation.access_info), code);
+	if code ^= 0 then do;
+ACCESS_CHECK_FAILED:
+	     call hcs_$terminate_noname (temp_mseg_ptr, (0));
+	     mseg_operation.mseg_ptr_valid = "0"b;	/* the pointer's not usefull if the access isn't right */
+	     go to RETURN;
+	end;
+
+	mseg_operation.access_info_valid = "1"b;
+
+	if (mseg_operation.access_info.effective_access_modes & RW_ACCESS) ^= RW_ACCESS then do;
+
+	     do i = 1 to 3;				/* check that the ring brackets are OK */
+		if mseg_operation.access_info.ring_brackets (i) ^= mseg_data_$execution_ring then do;
+		     code = error_table_$not_seg_type;
+		     go to ACCESS_CHECK_FAILED;
+		end;
+	     end;
+
+	     call hcs_$get_user_access_modes_seg (temp_mseg_ptr, "" /* ourself */, -1 /* this ring */, effective_access,
+		((36)"0"b), code);
+	     if code ^= 0 then go to ACCESS_CHECK_FAILED;
+
+	     if (effective_access & RW_ACCESS) ^= RW_ACCESS then do;
+		/*** The ACL term by which the user received his access to
+		     the segment does not grant RW access. */
+		if mseg_operation.call_admin_gate then
+		     call admin_gate_$syserr ((SYSERR_LOG_OR_DISCARD + SYSERR_RING1_ERROR),
+			"mseg_$initiate_seg: The ACL for ^a is inconsistent -- ^a does not have ""rw"" access.",
+			pathname_ (mseg_operation.access_info.dir_name, mseg_operation.access_info.entryname),
+			mseg_operation.caller.group_id);
+		call sub_err_ (0, "mseg_$initiate_seg", ACTION_CANT_RESTART, null (), 0,
+		     "The ACL for ^a is inconsistent -- you do not have ""rw"" access.",
+		     pathname_ (mseg_operation.access_info.dir_name, mseg_operation.access_info.entryname));
+	     end;
+
+	     /*** Control arrives here only when the reason we lack proper
+		access is due to AIM as, when AIM was ignored, we had
+		the necessary access. */
+
+	     code = error_table_$ai_restricted;
+	     go to ACCESS_CHECK_FAILED;
+	end;
+
+	code = 0;					/* success */
+
+	go to RETURN;
+%page;
+/**** This is called only for the real gate open entrypoint
+      to insert the segment in the table. */
+
+mseg_index_$open_seg:
+     entry (a_op_ptr, a_table_ptr, a_code);
+
+	mseg_operation_ptr = a_op_ptr;
+	table_ptr = a_table_ptr;
+
+	if ^mseg_operation.mseg_ptr_valid then
+	     call sub_err_ (error_table_$bad_subr_arg, "mseg_$open_seg", ACTION_CANT_RESTART, null (), (0),
+		"The mseg_operation does not include a valid mseg_ptr.");
+
+	on condition (area)
+	     begin;
+	     code = error_table_$notalloc;
+	     go to RETURN;
+	end;
+
+	if table_ptr = null then do;
+	     call allocate_table;
+	     a_table_ptr = table_ptr;
+	end;
+
+	temp_mseg_ptr = mseg_operation.mseg_ptr;
+
+/* See if already open */
+
+	do mseg_index = 1 to mseg_table.table_length while (mseg_table.mseg_ptr (mseg_index) ^= temp_mseg_ptr);
+	end;
+
+	if mseg_index <= mseg_table.table_length then go to FOUND_INDEX;
+
+/* Find an unused slot in the table */
+
+	do mseg_index = 1 to mseg_table.table_length while (mseg_table.mseg_ptr (mseg_index) ^= null);
+	end;
+
+	if mseg_index > mseg_table.table_length then do;	/* table full */
+	     call grow_table;
+	     a_table_ptr = table_ptr;
+	end;
+
+FOUND_INDEX:
+	mseg_table.mseg_ptr (mseg_index) = temp_mseg_ptr; /* remember pointer */
+	mseg_table.ref_count (mseg_index) = mseg_table.ref_count (mseg_index) + 1;
+						/* increment reference count */
+	mseg_operation.mseg_index = mseg_index;
+	mseg_operation.mseg_index_valid = "1"b;
+	go to RETURN;
+%page;
+/**** This entrypoint both removes the index from the table
+      and terminates the segment. Since there is a null ref name
+      added per index ref count, we always terminate off a name.
+
+      For convienience, this will also operate correctly when
+      the index is invalid, indicating that the segment just
+      needs terminating */
+
+mseg_index_$close_seg:
+     entry (a_op_ptr, a_table_ptr, a_code);
+
+	mseg_operation_ptr = a_op_ptr;
+
+	code = 0;
+
+	if mseg_operation.mseg_index_valid then do;
+	     mseg_index = mseg_operation.mseg_index;
+	     table_ptr = a_table_ptr;
+
+	     if table_ptr = null then do;
+UNKNOWN:
+		code = error_table_$seg_unknown;
+		go to RETURN;
+	     end;
+
+	     if mseg_index < 1 | mseg_index > mseg_table.table_length then go to UNKNOWN;
+
+	     if mseg_table.mseg_ptr (mseg_index) = null then go to UNKNOWN;
+
+	     mseg_table.ref_count (mseg_index) = mseg_table.ref_count (mseg_index) - 1;
+						/* decrement reference count */
+	     if mseg_table.ref_count (mseg_index) = 0 then mseg_table.mseg_ptr (mseg_index) = null;
+						/* remove ptr from table */
+
+	     mseg_operation.mseg_index_valid = "0"b;
+	end;
+
+	if mseg_operation.mseg_ptr_valid then do;
+	     temp_mseg_ptr = mseg_operation.mseg_ptr;
+	     call hcs_$terminate_noname (temp_mseg_ptr, code2);
+						/* terminate the message segment */
+	     mseg_operation.mseg_ptr_valid = "0"b;
+	end;
+
+RETURN:
+	a_code = code;				/* return error code */
+	return;
+%page;
+mseg_index_$delete:
+     entry (a_op_ptr, a_table_ptr);
+
+
+	mseg_operation_ptr = a_op_ptr;
+
+	if mseg_operation.mseg_ptr_valid then do;
+	     temp_mseg_ptr = mseg_operation.mseg_ptr;
+	     table_ptr = a_table_ptr;
+
+	     if table_ptr = null then return;
+
+	     do mseg_index = 1 to mseg_table.table_length;
+		if mseg_table.mseg_ptr (mseg_index) = temp_mseg_ptr then do;
+		     mseg_table.mseg_ptr (mseg_index) = null ();
+		     mseg_table.ref_count (mseg_index) = 0;
+		     return;
+		end;
+	     end;
+	end;
+
+	return;
+%page;
+allocate_table:
+     proc;
+
+/* This internal procedure allocates mseg_table in the ring 1 linker area segment. */
+
+	if area_ptr = null () then area_ptr = get_user_free_area_ ();
+
+	tlength = 100;
+
+	allocate mseg_table in (linker_area) set (table_ptr);
+
+	do i = 1 to tlength;
+	     mseg_table.mseg_ptr (i) = null;
+	     mseg_table.ref_count (i) = 0;
+	end;
+
+     end allocate_table;
+
+
+grow_table:
+     procedure;
+
+/* This internal procedure doubles mseg_table's size, changing table_ptr and
+   setting mseg_index to the next available slot. */
+
+	mseg_index = mseg_table.table_length + 1;
+	tlength = mseg_table.table_length * 2;
+	allocate mseg_table in (linker_area) set (new_table_ptr);
+
+	do i = 1 to mseg_index - 1;
+	     new_table_ptr -> mseg_table.mseg_ptr (i) = table_ptr -> mseg_table.mseg_ptr (i);
+	     new_table_ptr -> mseg_table.ref_count (i) = table_ptr -> mseg_table.ref_count (i);
+	end;
+
+	free table_ptr -> mseg_table in (linker_area);
+	table_ptr = new_table_ptr;
+
+	do i = mseg_index to mseg_table.table_length;
+	     mseg_table.mseg_ptr (i) = null;
+	     mseg_table.ref_count (i) = 0;
+	end;
+
+     end grow_table;
+
+/* format: off */
+%page; %include mseg_index_table;
+%page; %include mseg_operation;
+%page; %include mseg_message_info;
+%page; %include entry_access_info;
+%page; %include sub_err_flags;
+%page; %include mseg_wakeup_state;
+%page; %include syserr_constants;
+%page; %include access_mode_values;
+%page; %include mseg_data_;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+
+   Message:
+   mseg_$initiate_seg: The ACL for PATH is inconsistent -- USER_ID does not
+	have "rw" access.
+
+   S:	$log
+
+   T:	$run
+
+   M:	$err
+	For proper operation of the message segment primitives, all ACL terms
+	of a message segment or mailbox must specify "rw" access to the
+	segment when running in ring 1.  One or more ACL terms for the
+	segment PATH do not provide the required access.  USER_ID identifies
+	one of the user whose access to the segment is incorrect.
+
+   A:	$inform
+
+
+   END MESSAGE DOCUMENTATION */
+
+/* format: on */
+
+     end mseg_index_;

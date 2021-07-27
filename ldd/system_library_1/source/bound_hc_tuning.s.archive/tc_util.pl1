@@ -1,0 +1,498 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style3 */
+
+tc_util:
+     proc;
+
+/* DESCRIPTION:
+   Various traffic control utility functions which used to live in pxss.
+   They need to run wired and masked, with various traffic control locks,
+   but are called infrequently.
+
+   Entries:
+
+   check_abort         - returns non-zero code if a quit or trm_ IPS signal,
+		     or a stop is pending for the process. Can be used
+		     by long-running ring-0 procedures to simulate quits.
+
+   get_aptep	   - validates a processid and returns the apte pointer.
+
+   get_ipc_operands    - returns to the caller the values of apte.ipc_r_offset
+                         and apte.ipc_r_factor.  These are used by user-ring
+                         (and hardcore) IPC event channel validation and
+                         decoding.  It is the target of hcs_$get_ipc_operands.
+
+   get_ipc_operands_priv
+                       - returns to the caller the values of apte.ipc_r_offset
+		     and apte.ipc_r_factor for a specified process.  This
+		     is a highly privileged entrypoint and intended only
+		     to be used by hardcore IPC (hc_ipc) and the
+		     Initializer process (dialup_).  It is the target
+		     of the gate hphcs_$get_ipc_operands_priv.
+
+   ips_wakeup	   - send a given named IPS signal to a given process.
+
+   process_status      - return information about a process.
+
+   resume_tc	   - unfreeze traffic control scheduling (see suspend_tc
+		     described below).
+
+   set_cpu_monitor     - establishes a wakeup call to the term processid
+		     after a given amount of virtual CPU time has
+		     been used by a specified process.
+
+   set_timax           - sets timax for a process
+
+   suspend_tc	   - freeze traffic control's running of processes, with
+		     the exception of all idles and the calling process.
+
+   validate_processid  - determines whether a processid coresponds to an
+		     active process.
+
+   Moved from pxss and converted to PL1 by J. Bongiovanni, September 1981
+   Modified June 1982, J. Bongiovanni, to add validate_processid
+   Modified September 1982, J. Bongiovanni, to add check_abort
+   Modififed February 1983, E. N. Kittlitz, to clear cpu timer if arg < 0.
+   Modified 831111 for validate_processid_all entry -E. A. Ranzenbach
+   Modified 831213, E. N. Kittlitz, to remove validate_processid_all and 
+      several intermediate changes.
+   Modified: 07/15/84 by R. Michael Tague:  Added ips_wakeup.
+   Modified October 1984 by M. Pandolf to add suspend_tc and resume_tc
+   Modified 1984-11-11 by E. Swenson for IPC event channel validation
+      support of hcs_$get_ipc_operands.  Also added highly privileged
+      entrypoint get_ipc_operands_priv which is used in ring-0 and as
+      the garget of the gate hphcs_$get_ipc_operands_priv.      
+*/
+
+/*  Parameter  */
+
+dcl	a_allow_special_procs
+			bit (1) aligned;		/* allow special processes in get_apte search */
+dcl	a_code		fixed bin (35) parameter;	/* standard error code */
+dcl	a_delta_vcpu	fixed bin (71) parameter;	/* increment to current VCPU for wakeup */
+dcl	a_info_ptr	ptr;			/* pointer to structure of process information */
+dcl	a_ips_signal_name	char (*);			/* name of the ips signal to be sent */
+dcl	a_processid	bit (36) aligned parameter;	/* target process ID */
+dcl	a_timax		fixed bin (35) parameter;	/* value to set timax to */
+dcl	P_ipc_r_offset	fixed bin (18) parameter;	/* IPC validation operand */
+dcl	P_ipc_r_factor	fixed bin (35) parameter;	/* IPC validation operand */
+
+/*  Automatic  */
+
+dcl	arg_list_ptr	ptr;			/* argument list pointer for ips_wakeup */
+dcl	code		fixed bin (35);		/* return code */
+dcl	delta_vcpu	fixed bin (71);		/* copy of increment to VCPU */
+dcl	ipc_r_offset	fixed bin (18);		/* automatic copy for wiring */
+dcl	ipc_r_factor	fixed bin (35);		/* automatic copy for wiring */
+dcl	ips_mask_index	fixed bin;		/* do loop index */
+dcl	ips_signal_name	char (32);		/* copy of ips signal name */
+dcl	oldmask		fixed bin (71);		/* value of interrupt mask at wire_mask */
+dcl	process_mp_state	fixed bin;		/* loaded (ON=1) + eligible (ON=2) */
+dcl	process_state	fixed bin;		/* traffic control state */
+dcl	process_timax	fixed bin (35);		/* copy of value to set timax for process */
+dcl	processid		bit (36) aligned;		/* copy of process ID */
+dcl	ptwp		ptr;			/* pointer to page table for stack */
+
+/*  Based  */
+
+dcl	1 a_process_status	aligned based (a_info_ptr) like process_status_return;
+dcl	1 my_arg_list	aligned based (arg_list_ptr) like arg_list;
+
+/*  Entry  */
+
+dcl	cu_$arg_list_ptr	entry (ptr);
+dcl	lock$lock_fast	entry (ptr);
+dcl	lock$unlock_fast	entry (ptr);
+dcl	pmut$wire_and_mask	entry (fixed bin (71), ptr);
+dcl	pmut$unwire_unmask	entry (fixed bin (71), ptr);
+dcl	pxss$lock_apte	entry (bit (36) aligned, ptr, fixed bin (35));
+dcl	pxss$ips_wakeup	entry (bit (36) aligned, bit (36) aligned);
+dcl	pxss$suspend_getwork
+			entry ();
+dcl	pxss$unlock_apte	entry (ptr);
+dcl	signal_		entry options (variable);
+dcl	wire_proc$unwire_me entry;
+dcl	wire_proc$wire_me	entry;
+
+/*  External  */
+
+dcl	error_table_$quit_term_abort
+			fixed bin (35) external;
+dcl	error_table_$process_unknown
+			fixed bin (35) external;
+dcl	pds$apt_ptr	ptr external;
+dcl	tc_data$		external;
+dcl	tc_data$abort_ips_mask
+			bit (36) aligned external;
+dcl	tc_data$apt	bit (36) aligned external;
+dcl	tc_data$apt_size	fixed bin external;
+dcl	tc_data$tc_suspend_lock
+			bit (36) aligned external;
+dcl	tc_data$timax	fixed bin (35) external;
+
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	bin		builtin;
+dcl	divide		builtin;
+dcl	mod		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	rel		builtin;
+dcl	size		builtin;
+dcl	unspec		builtin;
+
+	return;					/* no tc_util entry */
+						/* END OF DECLARATIONS */
+%page;
+
+/* CHECK_ABORT - checks for quit or term IPS signal pending, or stop pending. */
+
+check_abort:
+     entry (a_code);
+
+	a_code = 0;
+
+	aptep = pds$apt_ptr;
+	if apte.flags.stop_pending | ((apte.ips_message & tc_data$abort_ips_mask) ^= ""b)
+	then a_code = error_table_$quit_term_abort;
+
+	return;
+%page;
+
+/* GET_APTEP	    - validates that a processid corresponds to an active
+		      process and returns the apte pointer.
+*/
+
+get_aptep:
+     entry (a_processid, a_allow_special_procs) returns (ptr);
+
+	aptep = PROCESSID_TO_APTE ((a_processid), (a_allow_special_procs));
+	return (aptep);
+%page;
+
+/* IPS_WAKEUP            - Look up the given ips signal name in sys_info and
+		       send the corresponding ips signal bit string to
+		       pxss$ips_wakeup.
+*/
+
+ips_wakeup:
+     entry (a_processid, a_ips_signal_name);
+
+/* For release MR11, this entry will check its calling arguments
+   to see if the old calling sequence of (bit (36), char (4)) was
+   used.  If so a gate_error signal is raised.  This should be taken
+   out by the next release.
+*/
+	call cu_$arg_list_ptr (arg_list_ptr);
+	if my_arg_list.header.desc_count = 0
+	then call signal_ ("gate_err");
+	else do;
+		processid = a_processid;
+		ips_signal_name = a_ips_signal_name;
+		do ips_mask_index = 1 to sys_info$ips_mask_data.count
+		     while (ips_signal_name ^= sys_info$ips_mask_data.mask (ips_mask_index).name);
+		end;
+		if ips_mask_index <= sys_info$ips_mask_data.count
+		then call pxss$ips_wakeup (processid, sys_info$ips_mask_data.mask (ips_mask_index).mask);
+	     end;
+	return;
+%page;
+
+/* PROCESS_STATUS      - return information about a process.
+
+		     fills in info structure like process_status_return.
+		     If processid not found, aptptr in structure is null.
+
+*/
+
+process_status:
+     entry (a_info_ptr);
+
+	processid = a_process_status.target_proc;	/* copy to stack to be wired */
+	a_process_status.up_exec = 0;
+	a_process_status.up_mp = 0;
+	a_process_status.aptptr = null ();
+
+	process_mp_state = 1;
+
+	aptep = PROCESSID_TO_APTE (processid, "0"b);
+	if aptep ^= null ()
+	then do;
+		process_state = bin (apte.state, 17);
+		if apte.flags.loaded
+		then process_mp_state = process_mp_state + 2;
+		if apte.flags.eligible
+		then process_mp_state = process_mp_state + 1;
+						/* fill in structure */
+		a_process_status.total_page_faults = apte.page_faults;
+		a_process_status.aptptr = aptep;
+		a_process_status.up_exec = process_state;
+		a_process_status.up_mp = process_mp_state;
+		a_process_status.up_block = apte.state_change_time;
+						/* mis-named */
+		a_process_status.up_cpu = apte.time_used_clock;
+		a_process_status.up_page = apte.paging_measure;
+		a_process_status.virtual_cpu = apte.virtual_cpu_time;
+		a_process_status.extra2 = 0;
+	     end;
+
+	return;
+%page;
+/* SET_CPU_MONITOR     - establishes a wakeup call to the term processid
+		     after a given amount of virtual CPU time has
+		     been used by a specified process.
+
+   return code = 0     - wakeup established
+   = error_table_$process_unknown  - no such process
+
+*/
+
+set_cpu_monitor:
+     entry (a_processid, a_delta_vcpu, a_code);
+
+	processid = a_processid;			/* copy to stack to be wired */
+	delta_vcpu = a_delta_vcpu;
+
+	call WIRE_MASK;
+
+/* ---------- WIRED AND MASKED ---------- */
+
+	call pxss$lock_apte (processid, aptep, code);	/* try to lock target APTE */
+	if code = 0
+	then do;
+		if delta_vcpu < 0
+		then apte.cpu_monitor = 0;
+		else apte.cpu_monitor = divide (apte.virtual_cpu_time + delta_vcpu, 1024, 35);
+		call pxss$unlock_apte (aptep);
+	     end;
+
+	call UNWIRE_UNMASK;
+
+/* ---------- UNWIRED AND and UNMASKED ---------- */
+
+	if code ^= 0
+	then a_code = error_table_$process_unknown;
+	else a_code = 0;
+
+	return;
+%page;
+/* SET_TIMAX           - sets timax for a process
+
+   If the value is 0, it is reset to the system default
+*/
+
+set_timax:
+     entry (a_processid, a_timax);
+
+	processid = a_processid;			/* copy to stack to be wired */
+	process_timax = a_timax;
+	if process_timax <= 0
+	then process_timax = tc_data$timax;
+
+	call WIRE_MASK;
+
+/* ---------- WIRED AND MASKED ---------- */
+
+	call pxss$lock_apte (processid, aptep, code);	/* Try to lock target APTE */
+	if code = 0
+	then do;					/* Process exists and is locked */
+		apte.timax = process_timax;
+		call pxss$unlock_apte (aptep);
+	     end;
+
+	call UNWIRE_UNMASK;
+
+/* ---------- UNWIRED AND UNMASKED ---------- */
+
+	return;
+%page;
+/* VALIDATE_PROCESSID  - validates that a processid corresponds to an active
+		     process.
+
+   return code = 0     - process exists
+   = error_table_$process_unknown - no such process
+
+*/
+
+validate_processid:
+     entry (a_processid, a_code);
+
+	a_code = 0;
+
+	aptep = PROCESSID_TO_APTE ((a_processid), "0"b);
+	if aptep = null ()
+	then a_code = error_table_$process_unknown;
+
+	return;
+%page;
+/* SUSPEND_TC	   - turn on the mechanism in getwork (of pxss fame) that
+		     suspends the running of processes, leaving only the
+		     idles and the caller available for running.  this
+		     state occurs only when tc_data$tc_suspend_lock is
+		     locked.  there are no parameters to this routine; its
+		     caller is guarenteed to be the only one running upon
+		     its return.
+*/
+
+suspend_tc:
+     entry ();
+
+	call lock$lock_fast (addr (tc_data$tc_suspend_lock));
+						/* get the lock, possibly */
+						/* entering the WAIT state */
+
+	call pxss$suspend_getwork ();			/* connect all processors */
+						/* and loop until only we remain */
+
+	return;
+
+%page;
+/* RESUME_TC	   - disable the suspension mechanism in getwork. */
+
+resume_tc:
+     entry ();
+
+	call lock$unlock_fast (addr (tc_data$tc_suspend_lock));
+						/* possibly wake others */
+						/* who want the suspend service */
+
+	return;
+%page;
+get_ipc_operands:
+     entry (P_ipc_r_offset, P_ipc_r_factor);
+
+/**** This entry, target of hcs_$get_ipc_operands, allows a process
+      to determine the operands used for IPC validation.  It returns
+      only the operands for the calling process.  These values are
+      retrieved from the apte by the user-ring IPC at Event Channel
+      Table initialization time. */
+
+	aptep = pds$apt_ptr;
+	P_ipc_r_offset = apte.ipc_r_offset;
+	P_ipc_r_factor = apte.ipc_r_factor;
+	return;
+%page;
+get_ipc_operands_priv:
+     entry (a_processid, P_ipc_r_offset, P_ipc_r_factor, a_code);
+
+/**** This entry is a highly priviledged entry to determine the operands
+      used for IPC validation for a specified process.  It is used by
+      ring-0 IPC (hc_ipc) and by the Initializer process through the
+      gate hphcs_$get_ipc_operands_priv. */
+
+	processid = a_processid;
+
+	call WIRE_MASK ();
+
+/***** WIRED AND MASKED *****/
+
+	call pxss$lock_apte (processid, aptep, code);
+	if code = 0
+	then do;
+		ipc_r_offset = apte.ipc_r_offset;	/* copy to wired stack frame */
+		ipc_r_factor = apte.ipc_r_factor;	/* copy to wired stack frame */
+		call pxss$unlock_apte (aptep);
+	     end;
+	call UNWIRE_UNMASK ();
+
+/***** UNWIRED AND UNMASKED *****/
+
+	if code ^= 0
+	then a_code = error_table_$process_unknown;
+	else do;
+		P_ipc_r_offset = ipc_r_offset;
+		P_ipc_r_factor = ipc_r_factor;
+		a_code = 0;
+	     end;
+	return;
+%page;
+/*  Internal procedure to validate that a process ID corresponds to
+    an active process. We're not concerned with races here, since they
+    can happen anyway (between now and when the process ID is used). */
+
+PROCESSID_TO_APTE:
+     proc (processid, allow_special_procs) returns (ptr);
+
+dcl	processid		bit (36) aligned;
+dcl	allow_special_procs bit (1) aligned;
+
+
+dcl	apte_offset	fixed bin (18);		/* Offset of APTE in tc_data */
+dcl	first_apte_offset	fixed bin (18);		/* offset of first APTE in tc_data */
+dcl	1 pid		aligned,			/* decomposition of process ID */
+	  2 offset	bit (18) unaligned,		/* offset of APTE */
+	  2 unique	bit (18) unaligned;		/* unique number assigned by AS */
+dcl	taptep		ptr;
+dcl	1 tapte		aligned like apte based (taptep);
+
+
+	unspec (pid) = processid;
+	apte_offset = bin (pid.offset, 18);
+	taptep = ptr (addr (tc_data$), pid.offset);
+	first_apte_offset = bin (rel (addr (tc_data$apt)), 18);
+
+	if apte_offset < first_apte_offset
+	then return (null ());
+	else if apte_offset >= first_apte_offset + tc_data$apt_size * size (apte)
+	then return (null ());
+	else if mod ((apte_offset - first_apte_offset), size (apte)) ^= 0
+	then return (null ());
+	else if tapte.processid ^= processid
+	then return (null ());
+	else if (^allow_special_procs & (tapte.flags.hproc | tapte.flags.idle))
+	then return (null ());
+	else return (taptep);
+
+     end PROCESSID_TO_APTE;
+%page;
+/* Internal Procedure to wire this procedure (text and linkage), wire
+   stack, and mask to system level */
+
+WIRE_MASK:
+     proc;
+
+	call wire_proc$wire_me;
+	call pmut$wire_and_mask (oldmask, ptwp);
+
+     end WIRE_MASK;
+
+
+
+
+
+
+
+
+/* Internal Procedure to reset mask to previous, unwire stack, unwire
+   text and linkage */
+
+UNWIRE_UNMASK:
+     proc;
+
+	call pmut$unwire_unmask (oldmask, ptwp);
+	call wire_proc$unwire_me;
+
+
+     end UNWIRE_UNMASK;
+
+/* format: off */
+%page; %include apte;
+%page; %include process_status_return;
+%page; %include ips_mask_data;
+%page; %include arg_list;
+/* format: on */
+
+     end tc_util;

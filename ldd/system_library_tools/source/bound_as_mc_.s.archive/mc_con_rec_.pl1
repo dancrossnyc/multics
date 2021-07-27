@@ -1,0 +1,323 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+mc_con_rec_: procedure;
+
+/* *	Modification history:
+   *	75-11-05, Larry Johnson: Modified for new syserr message format
+   *	76-08-13, Robert Coren: Modified to check CDT entry pointer
+   *	81-06-27, T. Casey: Changed for MR9.0 new wakeup priorities
+   *	83-10-08, E. A. Ranzenbach: Changed for new console recovery strategy
+   *	84-10-19, W. Olin Sibert: Temp kludge to avoid calling phcs_$syserr_logger_copy
+   *	84-11-11, W. Olin Sibert: Moved syserr recovery responsibility into
+   *	   syserr_log_man_, and added $queue_message entrypoint for that.
+   *	84-11-16, W. Olin Sibert: Modified to handle zero wakeup from 
+   *	   ocdcm_ as signal to deactivate console recovery.
+   *      1984-10-30 BIM for iox_.
+   */
+
+/****^  HISTORY COMMENTS:
+  1) change(87-02-05,GDixon), approve(87-06-12,MCR7690),
+     audit(87-05-07,Parisek):
+     Modified for a change to mc_anstbl.incl.pl1.
+  2) change(87-02-12,GDixon), approve(87-06-12,MCR7690),
+     audit(87-05-07,Parisek):
+     Correct reference through unset pointer (often null pointer)
+     when mc_con_rec_$output calls QUEUE_MESSAGE. (phx20767)
+                                                   END HISTORY COMMENTS */
+
+/*	This procedure is part of the message coordinator.
+   *	It performs those functions necessary for operator console
+   *	recovery.  It contains the following entries:
+   *
+   *	init:	initializes internal static variables
+   *	check:	checks to see whether or not the recovery mechanism
+   *		should be enabled or disabled
+   *	output:	outputs console traffic.
+   *
+   *	Note that the console recovery mechanism has two states:
+   *	enabled:	there is a tty type device available for use by the
+   *		console recovery mechanism - ocdcm_ has an event
+   *		channel that it can use for console recovery
+   *	disabled:	there are mo MC devices available for recovery.
+   *
+   *	The "active" bit controls whether console recovery is to be 
+   *	used; it depends on the values of the wakeups received by
+   *	mc_con_rec_$output: a zero value deactivates console recovery,
+   *	and a non-zero value activates it. The active/inactive state
+   *	controls whether syserr messages are recovered; non-zero 
+   *	wakeups will only arrive when the console is inoperable, so 
+   *	that the first such wakeup, in effect, turns the mechanism on.
+*/
+
+
+/*		PARAMETER  DATA		*/
+
+declare   arg_mc_ansp pointer parameter;		/* (I) Ptr to message coordinator answer table. */
+declare   arg_io_uid fixed bin (71) parameter;		/* (I) ID of message */
+declare   arg_log_message_ptr pointer parameter;		/* (I) Pointer to log message to be queued */
+declare   arg_alarm_flag bit (1) aligned parameter;	/* (I) Whether to beep */
+
+
+/*		AUTOMATIC  DATA		*/
+
+	dcl     error_code		 fixed bin (35),	/* Standard system error code. */
+	        i			 fixed bin,	/* Work index. */
+	        inzr_text_length	 fixed bin,	/* length returned by ocdcm_...	*/
+	        inzr_text		 char (256),	/* text returned by ocdcm_...		*/
+	        qp		 ptr,		/* Pointer to device queue. */
+	        io_uid		 fixed bin (71);	/* identifier of message to retrieve */
+
+/*		EXTERNAL ENTRIES		*/
+
+	dcl     (addr, length, substr, byte, max)
+				 builtin;
+
+	dcl     date_time_$format	 entry (char (*), fixed bin (71), char (*), char (*)) returns (char (250) varying),
+	        hphcs_$ocdcm_err_event_chan entry (fixed bin (71)),
+	        hphcs_$ocdcm_get_mc_output entry (fixed bin (71), fixed bin (17), char (256)),
+	        ioa_$rsnnl		 entry options (variable),
+	        ipc_$create_ev_chn	 entry (fixed bin (71), fixed bin (35)),
+	        ipc_$decl_ev_call_chn	 entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35)),
+	        ipc_$delete_ev_chn	 entry (fixed bin (71), fixed bin (35)),
+	        mc_util_$queue	 entry (ptr, bit (1), ptr, fixed bin, fixed bin, fixed bin (35)),
+	        mc_wakeups_$con_rec	 entry options (variable),
+	        syserr_log_man_$console_recovery entry (bit (1) aligned, fixed bin (35));
+
+
+/*  */
+
+mc_con_rec_$init: 
+     entry (arg_mc_ansp);
+
+/*	This entry is called by mc_util_$init.  It will copy its two
+   *	arguments into internal static storage.  It also turns OFF
+   *	the console recovery enabled flag.
+*/
+
+	arg_mc_ansp -> mc_anstbl.con_rec.flags.enabled = "0"b;
+
+	return;
+
+check: entry;
+
+/* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*							       */
+/* 	This entry is called whenever a tty type device is added or	       */
+/*	deleted from the message coordinator answer table.	       */
+/*							       */
+/* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+	mc_ansp = sc_stat_$mc_ansp;
+	if mc_anstbl.con_rec.flags.enabled		/* Do we already have a device/ */
+	then do;					/* Yes, make sure we still have it. */
+		mc_atep = mc_anstbl.con_rec.mc_ate_ptr;
+		if mc_ate.active		/* Is device entry still active? */
+		then if mc_ate.tra_vec > MC_WAIT_ANSWERBACK
+		     then return;			/* Yes, we are still enabled. */
+	     end;
+
+
+/*	We do not have a tty type device to use for recovery.  We will look
+   *	through the list of devices asigned to the message coordinator to see
+   *	if there is one that we can use.
+*/
+	do i = 1 to mc_anstbl.current_size;
+	     mc_atep = addr (mc_anstbl.entry (i));	/* Get pointer to device entry. */
+	     if ^mc_ate.the_system_console &
+		mc_ate.active		/* mess. coord. now owns it ... */
+		& mc_ate.tra_vec > MC_WAIT_ANSWERBACK
+	     then do;				/* then we can use it for recovery. */
+		     call ENABLE;			/* Enable console recovery. */
+		     return;
+		end;
+	end;
+
+/*	We could not find a device to use for recovery.  If recovery had been
+   *	enabled, we must turn it OFF.
+*/
+	if mc_anstbl.con_rec.flags.enabled
+	then call DISABLE;
+
+	return;
+						/* 	*/
+mc_con_rec_$output:
+     entry (arg_io_uid);
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+/*										*/
+/* This entry is called by mc_wakeups$con_rec when that procedure receives a wakeup. This wakeup	*/
+/* indicates that the operator's console software is unable to  perform an output and has asked us	*/
+/* to handle the output in its behalf. The io_uid will contain one of the following:		*/
+/*										*/
+/* 	A positive value which is the syserr sequence number of a syserr message for display.	*/
+/* 	In this case we will extract the syserr message from the log and print it.		*/
+/*										*/
+/* 	A negative value which is a UID of the message in oc_data. For these we will call	*/
+/* 	ocdcm_$get_mc_output to extract the message for printing.				*/
+/*										*/
+/* 	A zero, indicating that the console works again and that console recovery is		*/
+/*	to be deactivated.								*/
+/*										*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+	mc_ansp = sc_stat_$mc_ansp;
+	io_uid = arg_io_uid;
+
+	mc_atep = mc_anstbl.con_rec.mc_ate_ptr;		/* -> device entry to write to...	*/
+	qp = mc_ate.queue_ptr;			/* -> device's queue segment...	*/
+
+	if (io_uid = 0) then do;			/* Console working again */
+	     if ^mc_anstbl.con_rec.flags.active then	/* It wasn't active, so ignore the wakeup */
+		return;
+
+	     call syserr_log_man_$console_recovery ("0"b, 0); /* Otherwise, deactivate it */
+	     mc_anstbl.con_rec.flags.active = "0"b;
+	     return;
+	     end;
+
+	if ^mc_anstbl.con_rec.flags.active then do;	/* This is a non-zero (activating) wakeup, */
+	     call syserr_log_man_$console_recovery ("1"b, max (0, io_uid));
+						/* so we activate the mechanism, giving the */
+						/* number of the first message to be recovered, */
+	     mc_anstbl.con_rec.flags.active = "1"b;	/* and turn on the flag (but only the first */
+	     end;					/* time, until we get the deactivate wakeup */
+		
+	if (io_uid > 0) then			/* This is a syserr message, so we let */
+	     return;				/* our counterpart in syserr_log_man_ get it. */
+
+	if ^as_data_$debug_flag then
+	     call hphcs_$ocdcm_get_mc_output (io_uid, inzr_text_length, inzr_text);
+
+	call QUEUE_MESSAGE ("INZR", (-io_uid), 0, "0"b, addr (inzr_text), (inzr_text_length));
+
+	return;
+
+/*  */
+
+mc_con_rec_$queue_log_message:
+     entry (arg_log_message_ptr, arg_alarm_flag);
+
+/* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*							       */
+/* This entrypoint is called by syserr_log_man_ to queue a syserr message    */
+/* into the console recovery mechanism.				       */
+/*							       */
+/* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+	mc_ansp = sc_stat_$mc_ansp;
+	log_message_ptr = arg_log_message_ptr;
+
+	mc_atep = mc_anstbl.con_rec.mc_ate_ptr;		/* -> device entry to write to...	*/
+	qp = mc_ate.queue_ptr;			/* -> device's queue segment...	*/
+
+	call QUEUE_MESSAGE ("HARD", 
+	     (log_message.time), (log_message.sequence), arg_alarm_flag,
+	     addr (log_message.text), length (log_message.text));
+
+	return;
+
+/*  */
+
+ENABLE: procedure;
+
+
+/*	This internal procedure is called to enable the console recovery
+   *	mechanism.  We must give ocdcm_ an event channel that it can use
+   *	to signal that it wants console recovery.  We will also initialize
+   *	the data that must be kept in the mc_anstbl.
+*/
+
+	mc_anstbl.con_rec.mc_ate_ptr = mc_atep;		/* Save pointer to recovery device entry. */
+
+	if mc_anstbl.con_rec.enabled			/* Are we already enabled? */
+	then return;				/* Yes. */
+
+	call ipc_$create_ev_chn (mc_anstbl.con_rec.ec_id, error_code);
+	if error_code ^= 0
+	then return;
+
+	call ipc_$decl_ev_call_chn (mc_anstbl.con_rec.ec_id, mc_wakeups_$con_rec, mc_ansp, MC_PRIO, error_code);
+	if error_code ^= 0
+	then return;
+
+	if ^as_data_$debug_flag then
+	     call hphcs_$ocdcm_err_event_chan (mc_anstbl.con_rec.ec_id);
+
+	mc_anstbl.con_rec.flags.active = "0"b;		/* Initialize con_rec flags. */
+	mc_anstbl.con_rec.flags.enabled = "1"b;
+
+     end ENABLE;
+						/* 	*/
+DISABLE: procedure;
+
+
+/*	This internal procedure is called when we must disable the console
+   *	recovery mechanism.  We must tell ocdcm_ that it can no longer use
+   *	the event channel that it was previously given.
+*/
+
+	mc_anstbl.con_rec.flags.enabled = "0"b;		/* Now all wakeups will be ignored. */
+
+	if ^as_data_$debug_flag then
+	     call hphcs_$ocdcm_err_event_chan (0);		/* Take event channel away. */
+
+	call ipc_$delete_ev_chn (mc_anstbl.con_rec.ec_id, (0));
+
+     end DISABLE;
+						/* 	*/
+QUEUE_MESSAGE: 
+     procedure (P_msg_type, P_msg_time, P_msg_sequence, P_alarm_flag, P_msg_ptr, P_msg_lth);
+
+declare   P_msg_type char (4) parameter;
+declare   P_msg_time fixed bin (71) parameter;
+declare   P_msg_sequence fixed bin (35) parameter;
+declare   P_alarm_flag bit (1) aligned parameter;
+declare   P_msg_ptr pointer parameter;
+declare   P_msg_lth fixed bin (18) parameter;
+
+declare   P_msg char (P_msg_lth) based (P_msg_ptr);
+
+declare   output_buffer char (256);
+declare   out_buf_len fixed bin (18);
+
+	     
+/* *	This internal procedure is called to queue a message for output
+   *	over the assigned console recovery tty type terminal. It creates
+   *	a printable representation of the message, including the time,
+   *	sequence number (if any), and text, adding a newline if one is 
+   *	not present at the end of the message already. */
+
+
+
+	call ioa_$rsnnl ("^x^a^2x^4a ^[#^d^;^s^] ^a^[^/^]",
+	     output_buffer, out_buf_len,
+	     date_time_$format ("^Hd^99.9MH", P_msg_time, "", ""),
+	     P_msg_type, 
+	     (P_msg_sequence ^= 0), P_msg_sequence,
+	     P_msg,
+	     (substr (P_msg, length (P_msg), 1) ^= byte (10)));
+
+	call mc_util_$queue (qp, (P_alarm_flag), addr (output_buffer), (out_buf_len), 0, error_code);
+
+	return;
+
+     end QUEUE_MESSAGE;
+
+/* format: off */
+%page; %include as_data_;
+%page; %include as_wakeup_priorities;
+%page; %include mc_anstbl;
+%page; %include log_message;
+%page; %include sc_stat_;
+
+     end mc_con_rec_;

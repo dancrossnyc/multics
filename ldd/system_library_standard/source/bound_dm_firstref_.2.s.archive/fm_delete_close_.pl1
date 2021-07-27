@@ -1,0 +1,773 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION: 
+
+          This module deletes and closes files.  There are three entries
+     delete_close, close and post_transaction.  The post_transaction
+     entry is used to complete the close a file which was started during
+     a transaction.
+*/
+
+/* HISTORY: 
+Written by Matthew Pierret, 07/12/84.
+           (Taken from fm_open_.pl1, written by Jeff Ives.)
+           (Originally designed in January 1982 by Andre Bensoussan.)
+Modified:
+08/27/84 by Matthew Pierret:  Changed to set p_code to 0.
+10/25/84 by Matthew Pierret:  Changed to answer audit comments, as follows:
+            Moved setting of p_code up to the beginning of delete_close and
+            close entries. Used dm_log_sv_codes.incl.pl1. Removed post_commit
+            entry (it is being replaced by fm_do_$postcommit_do). Changed
+            REALLY_CLOSE to use explicit qualifier references to
+            file_access_info. Changed to use dm_error_$no_current_transaction.
+            Changed to check for valid saved_validation_level before reseting
+            it in FINISH. Moved dm_fm_file_oid to main procedure. Removed
+            check for limit of openings (changes to fm_create_open_ make it
+            unnecessary). Added documentation to explain the closing cases.
+            Added error message when file_oid.uid_tail and
+            file_access_info.uid don't match.
+12/17/84 by Matthew Pierret:  Changed for new state variables in 
+            file_access_info, substituting entry_state for thread and adding
+            file_state. Made this routine set file_state to 
+            FILE_LOGICALLY_DELETED if the file is logically deleted.
+            Other routines will check file_state instead of relying on
+            seg_0_num to be set to ""b for a logically deleted file, which is
+            no longer true.
+01/04/85 by Matthew C. Pierret:  In REALLY_CLOSE, consolidated the two test
+            for seg_0_num not equal to zero into one test, as the then clause
+            of the first test set seg_0_num to zero, causing the second to
+            always fail. Also changed FINISH to understand to try to delete
+            the system-pathname-table entry.
+02/12/85 by Matthew C. Pierret:  Changed to set to zero the seg_0_num and
+            seg_nums in the file_access_info just before deleting a file with
+            no rollback protection.  This fixes a bug in which shuch a file
+            could be deleted but, if directed, file_manager_ would attempt to
+            reference through one of the segment numbers.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+03/08/85 by S. Cox: Added TRANSACTION_BJ_FULL_HANDLER. 
+03/21/85 by S. Cox: TRANSACTION_BJ_FULL_HANDLER: Add revert of txn_bj_full_
+04/25/85 by Matthew C. Pierret:  Changed post_transaction and REALLY_CLOSE to
+            accept a file_state of FILE_DOES_NOT_EXIST as a trigger for
+            really-really-closing.  Changed close to accept a file_state of
+            FILE_LOGICALLY_DELETED as a trigger for really-closing or
+            scheduling for a post-transaction close.  This means that deleting
+            a file closes the file.
+           Changed REALLY_CLOSE to call fm_sys_pn_tbl_util_$redelete_force
+            instead of $delete if the file_state is FILE_DOES_NOT_EXIST.
+*/
+
+/* format: style2,ind3 */
+%page;
+fm_delete_close_$delete_close:
+   proc (p_file_oid, p_code);
+
+/* START OF DECLARATIONS */
+
+/* Parameters */
+
+      dcl	    p_code	       fixed bin (35) parm;
+      dcl	    p_file_oid	       bit (36) aligned parm;
+
+/* Automatic */
+
+      dcl	    code		       fixed bin (35) init (0);
+      dcl	    current_validation_level
+			       fixed bin init (0);
+      dcl	    dir_path	       char (168);
+      dcl	    delete_name	       char (32);
+      dcl	    entry_name	       char (32);
+      dcl	    my_file_oid	       bit (36) aligned init (""b);
+      dcl	    my_fsuid	       bit (36) aligned init (""b);
+      dcl	    file_access_table_idx  fixed bin init (0);
+      dcl	    sys_idx	       fixed bin init (0);
+      dcl	    sys_pn_tbl_index       fixed bin init (0);
+      dcl	    post_actions_thread_idx
+			       fixed bin init (0);
+
+      dcl	    saved_validation_level fixed bin init (-1);	/* for FINISH */
+      dcl	    global_file_uid	       bit (36) aligned init (""b);
+						/* for FINISH */
+      dcl	    global_sys_pn_tbl_idx  fixed bin init (-1);	/* for FINISH */
+      dcl	    global_msf_fcb_ptr     ptr init (null ());	/* for FINISH */
+
+      dcl	    seg_ptr	       ptr init (null ());
+      dcl	    seg_0_ptr	       ptr init (null ());
+
+      dcl	    1 my_file_access_info  aligned like file_access_info;
+      dcl	    1 my_signal_structure  aligned like condition_info_header;
+
+/* Conditions */
+
+      dcl	    cleanup	       condition;
+      dcl	    fm_sub_error_	       condition;
+      dcl	    transaction_bj_full_   condition;
+
+/* Constants */
+
+      dcl	    (
+	    MYNAME	       init ("fm_delete_close_") char (32) varying,
+	    BYTES_PER_WORD	       init (4) fixed bin,
+	    MAX_CHARS_FOR_DELETE_NAME
+			       init (16) fixed bin,
+	    NO_CI_IS_HELD	       init (0) fixed bin (27),
+	    NO_ERROR_MESSAGE       init ("") char (1),
+	    NO_OID	       init (""b) bit (36) aligned,
+	    NO_TRANSACTION_IN_PROGRESS
+			       init (""b) bit (36) aligned
+	    )		       internal static options (constant);
+
+/* Based */
+
+/* Builtin */
+
+      dcl	    (addr, baseptr, char, decimal, lbound, length, min, null, rtrim, size, substr, unspec)
+			       builtin;
+
+/* External */
+
+      dcl	    dm_data_$current_txn_id
+			       bit (36) aligned ext;
+      dcl	    dm_error_$bad_file_oid fixed bin (35) ext;
+      dcl	    dm_error_$bj_journal_full
+			       fixed bin (35) ext;
+      dcl	    dm_error_$file_doesnt_exist
+			       fixed bin (35) ext;
+      dcl	    dm_error_$no_current_transaction
+			       fixed bin (35) ext;
+      dcl	    error_table_$insufficient_access
+			       fixed bin (35);
+      dcl	    error_table_$no_w_permission
+			       fixed bin (35) ext;
+
+/* Entry */
+
+      dcl	    before_journal_manager_$write_fm_postcommit_handler
+			       entry (bit (36) aligned, bit (36) aligned, ptr, fixed bin (21), fixed bin (35));
+      dcl	    before_journal_manager_$write_fm_rollback_handler
+			       entry (bit (36) aligned, bit (36) aligned, ptr, fixed bin (17), fixed bin (27),
+			       fixed bin (71), fixed bin (35));
+      dcl	    cu_$level_get	       entry (fixed bin);
+      dcl	    cu_$level_set	       entry (fixed bin);
+      dcl	    expand_pathname_       entry (char (*), char (*), char (*), fixed bin (35));
+      dcl	    fm_error_util_$get_code
+			       entry () returns (fixed bin (35));
+      dcl	    fm_put_$clear_flush_list
+			       entry (fixed bin (35));
+      dcl	    fm_sys_pn_tbl_util_$delete
+			       entry (bit (36) aligned, fixed bin (17));
+      dcl	    fm_sys_pn_tbl_util_$redelete_force
+			       entry (bit (36) aligned, fixed bin (17));
+      dcl	    fm_sys_pn_tbl_util_$rename
+			       entry (bit (36) aligned, fixed bin (17), char (32));
+      dcl	    get_ring_	       entry () returns (fixed bin (3));
+      dcl	    hcs_$chname_file       entry (char (*), char (*), char (*), char (*), fixed bin (35));
+      dcl	    hcs_$del_dir_tree      entry (char (*), char (*), fixed bin (35));
+      dcl	    hcs_$delentry_file     entry (char (*), char (*), fixed bin (35));
+      dcl	    hcs_$fs_get_path_name  entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+      dcl	    hcs_$get_user_effmode  entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35));
+      dcl	    hcs_$set_safety_sw     entry (char (*), char (*), bit (1), fixed bin (35));
+      dcl	    ioa_$rsnnl	       entry () options (variable);
+      dcl	    lock_manager_$lock     entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+			       fixed bin (35));
+      dcl	    msf_manager_$close     entry (ptr);
+      dcl	    pathname_	       entry (char (*), char (*)) returns (char (168));
+      dcl	    signal_	       entry () options (variable);
+      dcl	    transaction_manager_$abort_txn
+			       entry (bit (36) aligned, fixed bin (35));
+      dcl	    unique_bits_	       entry () returns (bit (70));
+      dcl	    unique_chars_	       entry (bit (*)) returns (char (15));
+
+/* END OF DECLARATIONS */
+%page;
+/* DESCRIPTION of fm_delete_close_$delete_close:
+     
+     delete_close deletes a file, then closes it.  The file must be open,
+     as implied by the fact that an opening id is taken as input.  In the 
+     near future, this entry should be changed to only logically delete
+     files, and set up a post-commit handler to do the actual delete.
+     This is part of the implementation of protected file deletion.
+
+delete_close: entry (p_file_oid, p_code);
+
+*/
+
+      p_code = 0;
+      my_file_oid = p_file_oid;
+
+      call cu_$level_get (saved_validation_level);
+      on cleanup call FINISH ();
+      current_validation_level = get_ring_ ();
+      call cu_$level_set (current_validation_level);
+
+      call GET_ACCESS_INFO (my_file_oid, addr (my_file_access_info), file_access_table_idx);
+
+      if my_file_access_info.seg_0_num = ""b
+      then call ERROR_RETURN (dm_error_$file_doesnt_exist, NO_ERROR_MESSAGE);
+
+      call GET_PATH (my_file_access_info.seg_0_num, dir_path, entry_name);
+
+      sys_pn_tbl_index = my_file_access_info.pn_tbl_idx;
+
+      call VERIFY_ACCESS_TO_DELETE_FILE (dir_path, entry_name, my_file_access_info.ring_brackets.write,
+	 saved_validation_level);
+
+      if my_file_access_info.integrity_switches.transaction
+      then call VERIFY_TRANSACTION_STATE ();
+
+      if my_file_access_info.integrity_switches.lock
+      then call LOCK_FILE (my_file_access_info.uid);
+
+      delete_name =
+	 unique_chars_ (unique_bits_ ()) || "."
+	 || substr (entry_name, 1, min (length (entry_name), MAX_CHARS_FOR_DELETE_NAME));
+
+      if my_file_access_info.integrity_switches.bj
+      then
+         do;
+	  on transaction_bj_full_ goto TRANSACTION_BJ_FULL_HANDLER;
+	  call WRITE_ROLLBACK_HANDLER_FOR_DELETE (my_file_access_info.uid, my_file_oid, sys_pn_tbl_index, dir_path,
+	       entry_name, delete_name);
+         end;
+
+      if my_file_access_info.integrity_switches.transaction
+      then call FLUSH_MODIFIED_PAGES ();
+
+      if my_file_access_info.integrity_switches.bj
+      then
+         do;
+	  call WRITE_POSTCOMMIT_HANDLER_FOR_DELETE (my_file_access_info.uid, my_file_oid, sys_pn_tbl_index, dir_path,
+	       delete_name);
+	  my_file_access_info.state.file_state = FILE_LOGICALLY_DELETED;
+	  file_access_table.e (file_access_table_idx) = my_file_access_info;
+	  call LOGICAL_DELETE (my_file_access_info.uid, sys_pn_tbl_index, dir_path, entry_name, delete_name);
+         end;
+      else
+         do;
+	  my_file_access_info.seg_0_num = ""b;
+	  my_file_access_info.seg_nums (*) = 0;
+	  file_access_table.e (file_access_table_idx) = my_file_access_info;
+	  call REALLY_DELETE (dir_path, entry_name);
+         end;
+
+      go to JOIN_CLOSE;
+%page;
+/* DESCRIPTION of fm_delete_close_$close:
+     
+     close logically closes a file.  It decrements the count of openings
+     for this process for this file, and if the count reaches 0, the file
+     is put on a list of files to be actually closed at the end of the
+     transaction.  This post-transaction action is not to be confused with a 
+     post-commit action, which only happens if a transaction commits.
+*/
+
+close:
+   entry (p_file_oid, p_code);
+
+      p_code = 0;
+      my_file_oid = p_file_oid;
+
+      call cu_$level_get (saved_validation_level);
+      on cleanup call FINISH ();
+      current_validation_level = get_ring_ ();
+      call cu_$level_set (current_validation_level);
+
+      call GET_ACCESS_INFO (my_file_oid, addr (my_file_access_info), file_access_table_idx);
+
+JOIN_CLOSE:
+      p_file_oid = ""b;
+
+/* There are three cases which determine the behavior of the
+   closing, as follows:
+   
+   1) This process has the file open more times than it has
+   closed the file. This is the case if the opens component of
+   my_file_access_info is greater than 0 after it has been
+   decremented for this closing.  In this case, the file cannot
+   be really closed, so just record the new opens count.
+   
+   2) The opens have reached 0, but a transaction is in progress
+   and this file is a file whose opening is recorded in the
+   sys_pn_tbl (for use if the before_journal_manager_ must open
+   the file by its uid).  In this case the actual closing should
+   be delayed until after the transaction has completed.  Put
+   the file_access_table entry on the thread of entries which
+   require post-transaction activity.
+   
+   3) The opens count is done to 0 and either there is not
+   current transaction or the file is not in the sys_pn_tbl.  In
+   this case there is no reason to delay the closing, so really
+   close the file.
+*/
+
+      my_file_access_info.opens = my_file_access_info.opens - 1;
+
+      if my_file_access_info.opens > 0 & my_file_access_info.state.file_state ^= FILE_LOGICALLY_DELETED
+      then file_access_table.e (file_access_table_idx) = my_file_access_info;
+      else if my_file_access_info.pn_tbl_idx > 0 & dm_data_$current_txn_id ^= ""b
+      then
+         do;
+	  do post_actions_thread_idx = file_access_table.h.post_transaction_actions
+	       repeat (file_access_table.e (post_actions_thread_idx).state.entry_state)
+	       while (post_actions_thread_idx > 0 & post_actions_thread_idx ^= file_access_table_idx);
+	  end;
+
+	  if file_access_table_idx ^= post_actions_thread_idx
+						/* If it is not already on the list,		*/
+	  then
+	     do;					/* then add it.				*/
+	        my_file_access_info.state.entry_state = file_access_table.h.post_transaction_actions;
+	        file_access_table.e (file_access_table_idx) = my_file_access_info;
+	        file_access_table.h.post_transaction_actions = file_access_table_idx;
+	     end;
+         end;
+      else
+         do;
+	  if my_file_access_info.integrity_switches.transaction & my_file_access_info.seg_0_num ^= ""b
+	       & dm_data_$current_txn_id ^= ""b
+	  then
+	     do;
+	        call fm_put_$clear_flush_list (code);
+	        if code ^= 0
+	        then call ERROR_RETURN (code, NO_ERROR_MESSAGE);
+	     end;
+
+	  call REALLY_CLOSE (addr (my_file_access_info), file_access_table_idx);
+         end;
+
+      call cu_$level_set (saved_validation_level);
+
+MAIN_RETURN:					/* Only point from which control returns to the caller */
+      return;
+%skip;
+TRANSACTION_BJ_FULL_HANDLER:
+/**** Cannot call bj_report_err_ to do this since BJ cannot be called recursively. */
+/**** See also fm_(create_open_ put), which need to handle this condition. */
+      revert transaction_bj_full_;
+      my_signal_structure.length = size (my_signal_structure);
+      my_signal_structure.version = 1;
+      string (my_signal_structure.action_flags) = "0"b;
+      call ioa_$rsnnl ("Deleting DM file UID ^w OID ^w ^a>^a", my_signal_structure.info_string, (0),
+	 my_file_access_info.uid, my_file_oid, dir_path, entry_name);
+      my_signal_structure.status_code = dm_error_$bj_journal_full;
+
+      call transaction_manager_$abort_txn (dm_data_$current_txn_id, code);
+      call signal_ ("transaction_bj_full_", null (), addr (my_signal_structure));
+      call ERROR_RETURN (dm_error_$bj_journal_full, "");	/* should never get here */
+%page;
+ERROR_RETURN:
+   proc (er_p_code, er_p_message);
+
+      dcl	    er_p_code	       fixed bin (35);
+      dcl	    er_p_message	       char (*);
+
+      dcl	    dm_misc_util_$log      entry () options (variable);
+
+      if er_p_message ^= ""
+      then call dm_misc_util_$log (LOG_SV, er_p_code, MYNAME, "^a", er_p_message);
+
+      p_code = er_p_code;
+      call FINISH ();
+      go to MAIN_RETURN;
+
+   end ERROR_RETURN;
+
+
+FINISH:
+   proc ();
+
+      if global_msf_fcb_ptr ^= null
+      then call msf_manager_$close (global_msf_fcb_ptr);
+      if global_sys_pn_tbl_idx ^= -1
+      then
+         do;
+	  on fm_sub_error_
+	     begin;
+	        go to FINISH_IGNORE_THIS_ERROR;
+	     end;
+	  call fm_sys_pn_tbl_util_$delete (global_file_uid, global_sys_pn_tbl_idx);
+FINISH_IGNORE_THIS_ERROR:
+	  revert fm_sub_error_;
+         end;
+      if saved_validation_level ^= -1
+      then call cu_$level_set (saved_validation_level);
+
+   end FINISH;
+%page;
+/*                DESCRIPTION OF fm_delete_close_$post_transaction :
+     
+          This entry is used to execute actions which cannot be done until
+     after the point at which a transaction is completed, whether committed or
+     aborted.  It is by contract run after file_manager_$undo or 
+     file_manager_$postcommit_do.  Currently it closes all files which were
+     closed during the transaction.  The files are left open until this point
+     in case the transaction is aborted - then the before journal manager will
+     need to have the files open to efficiently roll back modifications.
+*/
+
+post_transaction:
+   entry ();
+
+      call cu_$level_get (saved_validation_level);
+      current_validation_level = get_ring_ ();
+      on cleanup call cu_$level_set (saved_validation_level);
+      call cu_$level_set (current_validation_level);
+
+      do file_access_table_idx = file_access_table.h.post_transaction_actions
+	 repeat (my_file_access_info.state.entry_state) while (file_access_table_idx > 0);
+
+         my_file_access_info = file_access_table.e (file_access_table_idx);
+
+         if my_file_access_info.opens = 0 | my_file_access_info.state.file_state = FILE_DOES_NOT_EXIST
+         then call REALLY_CLOSE (addr (my_file_access_info), file_access_table_idx);
+      end;
+
+      file_access_table.h.post_transaction_actions = -1;
+
+      call cu_$level_set (saved_validation_level);
+
+      return;
+%page;
+FLUSH_MODIFIED_PAGES:
+   proc ();
+
+      dcl	    fmp_code	       fixed bin (35);
+
+      fmp_code = 0;
+      call fm_put_$clear_flush_list (fmp_code);
+      if fmp_code ^= 0
+      then call ERROR_RETURN (code, NO_ERROR_MESSAGE);
+      else return;
+
+   end FLUSH_MODIFIED_PAGES;
+%page;
+GET_PATH:
+   proc (gp_p_seg_0_num, gp_p_dir, gp_p_entry);
+
+      dcl	    gp_p_seg_0_num	       bit (18) unal parm;
+      dcl	    gp_p_dir	       char (168) parm;
+      dcl	    gp_p_entry	       char (32) parm;
+
+      dcl	    gp_seg_0_ptr	       ptr;
+      dcl	    gp_full_path	       char (168);
+      dcl	    gp_code	       fixed bin (35);
+
+      gp_code = 0;
+      gp_seg_0_ptr = baseptr (gp_p_seg_0_num);
+      call hcs_$fs_get_path_name (gp_seg_0_ptr, gp_full_path, (0), gp_p_entry, gp_code);
+      if gp_code ^= 0
+      then call ERROR_RETURN (gp_code,
+	      " Unable to get path name of file with whose first component has segment number "
+	      || char (decimal (gp_p_seg_0_num)) || ".");
+      call expand_pathname_ (gp_full_path, gp_p_dir, gp_p_entry, gp_code);
+      if gp_code ^= 0
+      then call ERROR_RETURN (gp_code, gp_full_path);
+
+      return;
+
+   end GET_PATH;
+%page;
+GET_ACCESS_INFO:
+   proc (gai_p_file_oid, gai_p_file_access_info_ptr, gai_p_file_access_table_idx);
+
+      dcl	    gai_p_file_oid	       bit (36) aligned;
+      dcl	    gai_p_file_access_info_ptr
+			       ptr;
+      dcl	    gai_p_file_access_table_idx
+			       fixed bin;
+
+      dcl	    1 gai_file_oid	       aligned like file_oid;
+
+      unspec (gai_file_oid) = gai_p_file_oid;
+      gai_p_file_access_table_idx = gai_file_oid.file_access_table_idx;
+
+      if gai_p_file_access_table_idx < lbound (file_access_table.e, 1)
+	 | gai_p_file_access_table_idx > file_access_table.h.last_entry
+      then call ERROR_RETURN (dm_error_$bad_file_oid, NO_ERROR_MESSAGE);
+
+      gai_p_file_access_info_ptr -> file_access_info = file_access_table.e (gai_p_file_access_table_idx);
+
+      if gai_p_file_access_info_ptr -> file_access_info.opens = 0
+      then call ERROR_RETURN (dm_error_$bad_file_oid, NO_ERROR_MESSAGE);
+
+      if gai_file_oid.uid_tail ^= substr (gai_p_file_access_info_ptr -> file_access_info.uid, 19, 18)
+      then call ERROR_RETURN (dm_error_$bad_file_oid,
+	      "Opening id contains uid tail " || char (gai_file_oid.uid_tail) || "; file access info contains uid "
+	      || char (gai_p_file_access_info_ptr -> file_access_info.uid));
+
+      return;
+
+   end GET_ACCESS_INFO;
+%page;
+LOCK_FILE:
+   proc (lf_p_file_uid);
+
+      dcl	    lf_p_file_uid	       bit (36) aligned parm;
+      dcl	    lf_code	       fixed bin (35);
+
+      lf_code = 0;
+      call lock_manager_$lock (lf_p_file_uid, LOCK_ENTIRE_FILE, LOCK_MODE_X, 1e9, (0), lf_code);
+      if lf_code ^= 0
+      then call ERROR_RETURN (lf_code, NO_ERROR_MESSAGE);
+
+      return;
+
+   end LOCK_FILE;
+%page;
+LOGICAL_DELETE:
+   proc (ld_p_file_uid, ld_p_sys_pn_tbl_index, ld_p_dir, ld_p_entry_name, ld_p_delete_name);
+
+/* DESCRIPTION of LOGICAL_DELETE:
+
+   This routine logically deletes a file, as follows:
+
+   1) Add the special "delete-name" to the file.
+   2) Change the name of the file in the sys_pn_tbl to the delete-name.
+   3) Remove the real name from the file.
+
+   This method ensures that the entry in sys_pn_tbl will always have
+   a name which corresponds to an actual file. 
+*/
+
+      dcl	    ld_p_file_uid	       bit (36) aligned parm;
+      dcl	    ld_p_sys_pn_tbl_index  fixed bin parm;
+      dcl	    ld_p_dir	       char (168) parm;
+      dcl	    ld_p_entry_name	       char (32) parm;
+      dcl	    ld_p_delete_name       char (32) parm;
+
+      dcl	    ld_code	       fixed bin (35);
+
+      ld_code = 0;
+      call hcs_$chname_file (ld_p_dir, ld_p_entry_name, "", ld_p_delete_name, ld_code);
+      if ld_code ^= 0
+      then call ERROR_RETURN (ld_code, " Logically deleting " || pathname_ (rtrim (ld_p_dir), ld_p_entry_name));
+      call fm_sys_pn_tbl_util_$rename (ld_p_file_uid, ld_p_sys_pn_tbl_index, ld_p_delete_name);
+      call hcs_$chname_file (ld_p_dir, ld_p_entry_name, ld_p_entry_name, "", ld_code);
+      if ld_code ^= 0
+      then call ERROR_RETURN (ld_code, " Logically deleting " || pathname_ (rtrim (ld_p_dir), ld_p_entry_name));
+
+      return;
+
+   end LOGICAL_DELETE;
+%page;
+REALLY_CLOSE:
+   proc (rc_p_file_access_info_ptr, rc_p_file_access_table_idx);
+
+
+      dcl	    rc_p_file_access_info_ptr
+			       ptr;
+      dcl	    rc_p_file_access_table_idx
+			       fixed bin;
+
+      unspec (file_access_table.e (rc_p_file_access_table_idx)) = ""b;
+
+      if rc_p_file_access_table_idx = file_access_table.h.last_entry
+      then
+         do;
+	  do file_access_table.h.last_entry = file_access_table.h.last_entry by -1
+	       to lbound (file_access_table.e, 1)
+	       while (file_access_table.e (file_access_table.h.last_entry).state.entry_state
+	       = FILE_ACCESS_INFO_NOT_IN_USE);
+	  end;
+         end;
+
+      if rc_p_file_access_info_ptr -> file_access_info.seg_0_num ^= ""b
+      then
+         do;
+	  global_msf_fcb_ptr = rc_p_file_access_info_ptr -> file_access_info.msf_ptr;
+	  rc_p_file_access_info_ptr -> file_access_info.msf_ptr = null ();
+	  rc_p_file_access_info_ptr -> file_access_info.seg_0_num = ""b;
+	  unspec (rc_p_file_access_info_ptr -> file_access_info.seg_nums) = ""b;
+
+	  if rc_p_file_access_info_ptr -> file_access_info.pn_tbl_idx > 0
+	       | rc_p_file_access_info_ptr -> file_access_info.state.file_state = FILE_DOES_NOT_EXIST
+	  then
+	     do;
+	        global_file_uid = rc_p_file_access_info_ptr -> file_access_info.uid;
+	        global_sys_pn_tbl_idx = rc_p_file_access_info_ptr -> file_access_info.pn_tbl_idx;
+	        rc_p_file_access_info_ptr -> file_access_info.pn_tbl_idx = -1;
+
+	        if rc_p_file_access_info_ptr -> file_access_info.state.file_state = FILE_DOES_NOT_EXIST
+	        then call fm_sys_pn_tbl_util_$redelete_force (global_file_uid, global_sys_pn_tbl_idx);
+	        else call fm_sys_pn_tbl_util_$delete (global_file_uid, global_sys_pn_tbl_idx);
+	        global_sys_pn_tbl_idx = -1;		/* mark as done */
+	     end;
+
+	  if global_msf_fcb_ptr ^= null
+	  then
+	     do;
+	        call msf_manager_$close (global_msf_fcb_ptr);
+	        global_msf_fcb_ptr = null ();		/* mark as done */
+	     end;
+         end;
+
+      return;
+
+   end REALLY_CLOSE;
+%page;
+REALLY_DELETE:
+   proc (rd_p_dir_path, rd_p_entry_name);
+
+/* DESCRIPTION fo REALLY_DELETE:
+   Physically deletes a file from the Multics file system.  This
+   entails first setting the safety switch to off, as files are
+   created with the safety switch on, then deleting the contents of
+   the file subtree (i.e., the components of the file), and finally
+   deleting the file directory itself.  
+
+   This routine is only called for files which do not have rollback
+   protection.
+   
+   Variables declared in this subroutine are prefixed with rd_ to
+   indicate that they are local to the subroutine.  Parameters ar
+e   further prefixed with a p_, making the full prefix for parameters
+   rd_p_.
+*/
+
+      dcl	    rd_p_dir_path	       char (168);
+      dcl	    rd_p_entry_name	       char (32);
+
+      call hcs_$set_safety_sw (rd_p_dir_path, rd_p_entry_name, "0"b, code);
+      if code ^= 0
+      then call ERROR_RETURN (code,
+	      " Unable to set the safety switch to off for " || pathname_ (rtrim (rd_p_dir_path), rd_p_entry_name)
+	      || ".");
+
+      call hcs_$del_dir_tree (rd_p_dir_path, rd_p_entry_name, code);
+      if code ^= 0
+      then call ERROR_RETURN (code, pathname_ (rtrim (rd_p_dir_path), rd_p_entry_name));
+
+      call hcs_$delentry_file (rd_p_dir_path, rd_p_entry_name, code);
+      if code ^= 0
+      then call ERROR_RETURN (code, pathname_ (rtrim (rd_p_dir_path), rd_p_entry_name));
+
+      return;
+
+   end REALLY_DELETE;
+%page;
+VERIFY_ACCESS_TO_DELETE_FILE:
+   proc (va_p_dir, va_p_entry, va_p_write_bracket, va_p_validation_level);
+
+      dcl	    va_p_dir	       char (168) parm;
+      dcl	    va_p_entry	       char (32) parm;
+      dcl	    va_p_write_bracket     fixed bin (3) uns unal parm;
+      dcl	    va_p_validation_level  fixed bin parm;
+
+      dcl	    va_code	       fixed bin (35);
+      dcl	    va_containing_dir_dir  char (168);
+      dcl	    va_containing_dir_entry
+			       char (32);
+      dcl	    va_modes	       fixed bin (5);
+
+      if va_p_write_bracket < va_p_validation_level
+      then call ERROR_RETURN (error_table_$no_w_permission, " Deleting " || pathname_ (rtrim (va_p_dir), va_p_entry));
+      va_code = 0;
+      call expand_pathname_ (va_p_dir, va_containing_dir_dir, va_containing_dir_entry, va_code);
+      if va_code ^= 0
+      then call ERROR_RETURN (va_code, va_p_dir);
+      call hcs_$get_user_effmode (va_containing_dir_dir, va_containing_dir_entry, "", va_p_validation_level, va_modes,
+	 va_code);
+      if va_code ^= 0
+      then call ERROR_RETURN (va_code, va_p_dir);
+      if va_modes ^= SM_ACCESS_BIN & va_modes ^= SMA_ACCESS_BIN
+      then call ERROR_RETURN (error_table_$insufficient_access, "Deleting " || pathname_ (rtrim (va_p_dir), va_p_entry));
+
+      return;
+
+   end VERIFY_ACCESS_TO_DELETE_FILE;
+
+
+VERIFY_TRANSACTION_STATE:
+   proc ();
+
+      if dm_data_$current_txn_id = NO_TRANSACTION_IN_PROGRESS
+      then call ERROR_RETURN (dm_error_$no_current_transaction, NO_ERROR_MESSAGE);
+
+      return;
+
+   end VERIFY_TRANSACTION_STATE;
+%page;
+WRITE_POSTCOMMIT_HANDLER_FOR_DELETE:
+   proc (wp_p_file_uid, wp_p_file_oid, wp_p_sys_pn_tbl_index, wp_p_dir, wp_p_delete_name);
+
+      dcl	    wp_p_file_uid	       bit (36) aligned parm;
+      dcl	    wp_p_file_oid	       bit (36) aligned parm;
+      dcl	    wp_p_sys_pn_tbl_index  fixed bin parm;
+      dcl	    wp_p_dir	       char (168) parm;
+      dcl	    wp_p_delete_name       char (32) parm;
+
+      dcl	    1 wp_delete_postcommit_info
+			       aligned like delete_postcommit_info;
+      dcl	    wp_code	       fixed bin (35);
+
+      wp_delete_postcommit_info.header.version = POSTCOMMIT_INFO_VERSION_1;
+      wp_delete_postcommit_info.header.operation = DELETE_POSTCOMMIT_OPERATION;
+      wp_delete_postcommit_info.sys_pn_tbl_index = wp_p_sys_pn_tbl_index;
+      wp_delete_postcommit_info.dir_path = wp_p_dir;
+      wp_delete_postcommit_info.file_name = wp_p_delete_name;
+      wp_code = 0;
+      call before_journal_manager_$write_fm_postcommit_handler (wp_p_file_uid, wp_p_file_oid,
+	 addr (wp_delete_postcommit_info), size (wp_delete_postcommit_info) * BYTES_PER_WORD, wp_code);
+      if wp_code ^= 0
+      then call ERROR_RETURN (wp_code,
+	      " Writing postcommit handler for " || pathname_ (rtrim (wp_p_dir), wp_p_delete_name));
+
+      return;
+   end WRITE_POSTCOMMIT_HANDLER_FOR_DELETE;
+%page;
+WRITE_ROLLBACK_HANDLER_FOR_DELETE:
+   proc (wr_p_file_uid, wr_p_file_oid, wr_p_sys_pn_tbl_index, wr_p_dir, wr_p_entry_name, wr_p_delete_name);
+
+      dcl	    wr_p_file_uid	       bit (36) aligned parm;
+      dcl	    wr_p_file_oid	       bit (36) aligned parm;
+      dcl	    wr_p_sys_pn_tbl_index  fixed bin parm;
+      dcl	    wr_p_dir	       char (168) parm;
+      dcl	    wr_p_entry_name	       char (32) parm;
+      dcl	    wr_p_delete_name       char (32) parm;
+
+      dcl	    wr_code	       fixed bin (35);
+      dcl	    wr_time_stamp	       fixed bin (71);	/* dummy variable */
+      dcl	    1 wr_delete_rollback_info
+			       aligned like delete_rollback_info;
+
+      wr_code = 0;
+      wr_delete_rollback_info.header.version = ROLLBACK_INFO_VERSION_1;
+      wr_delete_rollback_info.header.operation = DELETE_ROLLBACK_OPERATION;
+      wr_delete_rollback_info.sys_pn_tbl_index = wr_p_sys_pn_tbl_index;
+      wr_delete_rollback_info.dir_path = wr_p_dir;
+      wr_delete_rollback_info.predelete_name = wr_p_entry_name;
+      wr_delete_rollback_info.postdelete_name = wr_p_delete_name;
+
+      call before_journal_manager_$write_fm_rollback_handler (wr_p_file_uid, wr_p_file_oid,
+	 addr (wr_delete_rollback_info), size (delete_rollback_info) * BYTES_PER_WORD, NO_CI_IS_HELD, wr_time_stamp,
+	 wr_code);
+      if wr_code ^= 0
+      then call ERROR_RETURN (wr_code,
+	      " Writing delete rollback handler for " || pathname_ (rtrim (wr_p_dir), wr_p_entry_name));
+
+      return;
+
+   end WRITE_ROLLBACK_HANDLER_FOR_DELETE;
+%page;
+%include dm_fm_file_oid;
+%page;
+%include dm_fm_file_access_info;
+%page;
+%include dm_fm_file_access_tbl;
+%page;
+%include dm_fm_postcommit_info;
+%page;
+%include dm_fm_rollback_info;
+%page;
+%include dm_lock_modes;
+%page;
+%include dm_log_sv_codes;
+%page;
+%include access_mode_values;
+%page;
+%include condition_info_header;
+
+   end fm_delete_close_$delete_close;

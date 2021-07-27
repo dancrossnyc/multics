@@ -1,0 +1,242 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+/* ioi_suspend_devices - suspend and restore I/O activity on devices */
+/* Rewritten May 1983 by Chris Jones */
+/* Modified March 1984 by Chris Jones for IOM reconfiguration. */
+/* Modified March 1985 by Keith Loepere to properly copy arguments. */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-09-05,Farley), approve(86-07-18,MCR7439),
+     audit(86-09-24,Fawcett), install(86-10-20,MR12.0-1189):
+     Changed to execute in the BCE environment.
+                                                   END HISTORY COMMENTS */
+
+
+/* This procedure is called by a T&D user to suspend or restore I/O on all other devices sharing the same MPC. */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+ioi_suspend_devices:
+     proc (p_devx, p_code);
+
+dcl	p_code		   fixed bin (35) parameter;	/* (O) error code */
+dcl	p_devx		   fixed bin parameter;	/* (I) device table entry pointer */
+
+dcl	code		   fixed bin (35);
+dcl	devx		   fixed bin;
+dcl	locked		   bit (1) aligned;		/* set if we've got the dte locked */
+dcl	mcp		   ptr;			/* pointer to MPC configuration card */
+
+dcl	ioi_config$find_controller_card
+			   entry (char (8) aligned) returns (ptr);
+dcl	ioi_device$get_dtep	   entry (fixed bin, ptr, fixed bin (35));
+dcl	ioi_device$unlock	   entry (ptr);
+dcl	ioi_masked$getwork_channel
+			   entry (ptr);
+dcl	ioi_masked$quiesce_channel
+			   entry (ptr);
+dcl	ioi_usurp_channels$suspend
+			   entry (ptr, ptr, fixed bin (35));
+dcl	ioi_usurp_channels$unassign
+			   entry (ptr, fixed bin (35));
+dcl	lock$lock_fast	   entry (ptr);
+dcl	lock$unlock_fast	   entry (ptr);
+
+dcl	error_table_$no_operation
+			   fixed bin (35) ext;
+
+dcl	sys_info$service_system
+			   bit (1) aligned external static;
+
+dcl	(addr, null, ptr, rel) builtin;
+
+	call setup;				/* lock device to us */
+	if code ^= 0 then
+	     goto EXIT;				/* get out if error */
+
+	if gte.disk_data_subsystem_idx ^= 0 then	/* If suspending disk controller ... */
+	     if (dte.channel_required = "") |		/* Must already have channel required. */
+		^gte.dual_controller then do;		/* Must be dual controller configuration. */
+		code = error_table_$no_operation;	/* Otherwise, error. */
+		goto EXIT;
+	     end;
+
+	call get_channel;
+	if code ^= 0 then
+	     goto EXIT;
+
+	call walk_channels (stop_channel);		/* Find all channels on MPC. */
+
+	call walk_channels (wait_channel);		/* Wait for all devices to come to a halt. */
+
+	dte.suspended = "0"b;			/* Leave our device usable. */
+EXIT:
+	if locked then
+	     call ioi_device$unlock (dtep);
+
+	p_code = code;
+	return;					/* That's all. */
+
+suspend_error:					/* Arrive here by non local goto. */
+	call walk_channels (start_channel);		/* Start up all channels again. */
+	goto EXIT;
+
+ioi_release_devices:
+     entry (p_devx, p_code);
+
+	call setup;				/* Validate call and set up. */
+	if code ^= 0 then
+	     goto EXIT;
+
+	call get_channel;				/* find channel id */
+	if code ^= 0 then
+	     goto EXIT;
+
+	call walk_channels (start_channel);		/* Restart all channels on this controller. */
+	goto EXIT;				/* And exit. */
+
+
+setup:
+     proc;
+
+	p_code, code = 0;
+	devx = p_devx;
+	locked = "0"b;
+	call ioi_device$get_dtep (devx, dtep, code);
+	if code ^= 0 then
+	     return;
+	locked = "1"b;
+
+	idp = addr (ioi_data$);			/* Get pointer to base of IOI data segment. */
+	gtep = ptr (idp, dte.gtep);			/* Get pointer to group table entry for this device. */
+
+	if ^dte.priv | ^gte.psia then			/* Error if not privileged and a PSIA channel. */
+	     code = error_table_$no_operation;
+
+     end setup;
+
+get_channel:
+     proc;
+
+dcl	chanid		   char (8) aligned;	/* name of channel */
+
+	chanid = "";				/* initialize channel name */
+	if dte.channel_required ^= "" then		/* If device requires a channel ... */
+	     chanid = dte.channel_required;		/* ...that's the MPC we're interested in. */
+	else do ctep = ptr (gtep, gte.ctep) repeat ptr (ctep, cte.next_ctep)
+		while ((rel (ctep) ^= "0"b) & (chanid = ""));
+	     if cte.ioi_use then			/* If we found a channel ... */
+		chanid = cte.chanid;		/* Use that channel */
+	end;
+
+	mcp = ioi_config$find_controller_card (chanid);
+	if mcp = null () then			/* Pointer should never be null. */
+	     code = error_table_$no_operation;
+
+     end get_channel;
+
+
+walk_channels:
+     proc (do_cte);
+
+dcl	do_cte		   entry parameter;
+
+dcl	ctx		   fixed bin;
+
+	do ctx = 1 to ioi_data.nct;			/* Iterate through all channels. */
+
+	     ctep = addr (ioi_data.ct (ctx));		/* Get pointer to channel table entry. */
+	     gtep = ptr (idp, cte.gtep);		/* Get pointer to corresponding group table entry. */
+
+	     if ioi_config$find_controller_card (cte.chanid) = mcp then
+						/* If this channel is on this controller ... */
+		call do_cte;			/* Go perform action on this channel. */
+	end;
+
+
+     end walk_channels;
+
+
+
+walk_devices:
+     proc (suspended_sw);
+
+dcl	suspended_sw	   bit (1) aligned parameter;
+
+dcl	done		   bit (1) aligned;
+dcl	list_head		   bit (18);
+dcl	saved_dtep	   ptr;
+
+	saved_dtep = dtep;
+	done = "0"b;
+	list_head = gte.dtep;
+	do dtep = ptr (idp, list_head) repeat ptr (idp, dte.next_dtep) while (^done);
+	     if ^sys_info$service_system then
+		dte.suspended = suspended_sw;		/* No lock worries at BCE */
+	     else do;
+		if dtep ^= saved_dtep then
+		     call lock$lock_fast (addr (dte.lock));
+						/* lock it to ensure this bit gets updated right */
+		dte.suspended = suspended_sw;
+		if dtep ^= saved_dtep then
+		     call lock$unlock_fast (addr (dte.lock));
+	     end;
+	     done = dte.next_dtep = list_head;
+	end;
+	dtep = saved_dtep;
+
+     end walk_devices;
+
+stop_channel:
+     proc;
+
+	if ^gte.suspend_devices then do;		/* If this group has not yet been suspended ... */
+	     if gte.disk_data_subsystem_idx ^= 0 then do; /* If disk, get all channels on controller. */
+		call ioi_usurp_channels$suspend (dtep, gtep, code);
+		if code ^= 0 then
+		     go to suspend_error;
+	     end;
+
+	     gte.suspend_devices = "1"b;		/* Suspend all devices in this group. */
+	     call walk_devices ("1"b);		/* Walk through list and stop each one. */
+	end;
+
+	return;
+
+
+
+wait_channel:
+     entry;
+
+	call ioi_masked$quiesce_channel (ctep);
+	do while (cte.connected | cte.quiescing);	/* Wait for channel to stop. */
+	end;
+
+	return;
+
+
+
+start_channel:
+     entry;
+
+	if gte.suspend_devices then do;		/* If this group is still suspended ... */
+	     gte.suspend_devices = "0"b;		/* Allow devices to run again. */
+	     if gte.disk_data_subsystem_idx ^= 0 then	/* If disk, get rid of any excess channels. */
+		call ioi_usurp_channels$unassign (gtep, code);
+
+	     call walk_devices ("0"b);		/* Walk through list and restore each device. */
+	end;
+
+	if cte.ioi_use then				/* start it if it's one of ours */
+	     call ioi_masked$getwork_channel (ctep);
+
+     end stop_channel;
+
+%include ioi_data;
+
+     end ioi_suspend_devices;

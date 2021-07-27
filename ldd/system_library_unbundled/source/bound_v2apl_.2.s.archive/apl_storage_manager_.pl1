@@ -1,0 +1,1232 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+apl_storage_manager_:
+	procedure;
+
+/*
+ * this module manages the storage heap for APL
+ *
+ * free blocks are remembered in a binary tree structure, sorted by address
+ * there is a seperate tree for each segment
+ * allocation is done by first-fit.
+ * big beads and little beads are kept in seperate segments in the
+ * vain hope that fragmentation and map overhead can be kept down.
+ * (maps are the binary trees of free beads, kept in their own seg)
+ *
+ *
+ * written 7/15/73 by DAM
+ * modified 8/4/73 by DAM for new ws format
+ * modified 8/24/73, 8/26/73 by DAM for newer ws format (version 3) and interrupts
+ * modified 12/06/73 by PG for apl_segment_manager_
+ * modified by G. Gordon Benedict in July 1974 to fix a bug in which unless ws_info.meter_mode is on,
+ * once balance was called free_apl_bead would loop forever; and to change names of entries to appropriate
+ * apl names.
+ * Modified 740910 by PG to flush apl_error_table_$random_system_error, properly compute storage used by
+ * value stacks, and remove last reference to apl_static_$temp_dir (long obsolete).
+ * Modified 750630 by PG to re-type about 120 lines which were lost due to EIS hardware problems.
+ * Modified 760325 by PG to correct balancer to zero out slots that it frees up, and fix allocater to
+ * 	correctly rebalance tree after deleting nodes.
+   Modified 760420 by PG to correct allocater to walk free map in pre-order (not sequential),
+	thus speeding things up when no match is found in (sparse) tree,
+	and to correct problem in rebalancing after deletion.
+   Modified 770413 by PG to add name apl_get_value_stack_ to apl_get_next_value_stack_seg_.
+   Modified 780227 by PG to catch duplicate free requests.
+   Modified 780502 by PG to fix 320 (can't find first free map entry, walking map in postorder instead of inorder),
+	and bug 301 (launder internal procedure not nulling argument).
+   Modified 780517 by William York to make apl_allocate_words_ and the tree
+	balancer in apl_free_words_ walk the free tree correctly, fixing bug 325.
+   Modified 780523 by WMY to round up sizes of allocations to even words to eliminate lost words between
+	storage blocks.
+   Modified 790321 by WMY to fix bug 382 (values that take up exactly 261120 words
+	cause phony WS FULL errors by using up all of the valuse stack segs
+	while looking for one big enough.
+   Modified 790328 by WMY to be able to free lexed_function_beads with no
+	statement map (i.e. no statements).
+ */
+
+/* The allocation/free type codes used by the trace facility are as follows:
+	1 - off end of segment
+	2 - with map
+	3 - left merge
+	4 - left merge simple
+	5 - right merge
+	6 - right merge simple
+	7 - discard
+	8 - error, duplicate free request
+*/
+
+/* automatic */
+
+dcl p pointer unaligned,		/* to bead being allocated or freed */
+    s fixed bin(18);		/* size of it in words */
+dcl depth fixed bin;
+dcl map_stack (11) fixed bin;		/* stack for walking free tree.  dim must be >= log2 (LittleMapSize) */
+dcl found bit (1) aligned;
+dcl  neighbor fixed bin;
+dcl  global_storage_system_data_pointer ptr;
+dcl hash_index fixed bin,
+    which_free fixed bin,				/* for tracing; which way bead was freed */
+    sli fixed bin,				/* index into seg_list of seg currently being munged */
+    new_sli fixed bin,
+    enter_balance_time fixed bin(71),
+    enter_time fixed bin(71),
+    p_rel_loc bit(18),			/* rel(p) */
+    already_balanced bit(1),			/* flag to avoid balance loop when tree is just too big */
+    (q, old_q) pointer unaligned,
+    i fixed bin,
+
+	/* next 3 vars are used for metering only */
+    rangex fixed bin,			/* index of proper element in metric.range, determined from s */
+    endp fixed bin(1),			/* 0 or 1, depending on whether alloced off end of seg */
+    newp fixed bin(1),			/* 0 or 1, depending on whether alloced in new seg */
+
+    mapx fixed bin,				/* index in map of current free bead being looked at */
+    other fixed bin,			/* index in map of some other bead */
+    base fixed bin,				/*  ..  */
+    scan_pos fixed bin,			/* index in map of next bead to look at when allocating */
+
+    esw fixed bin,				/* entry switch */
+    n_left fixed bin(18),			/* number of words left in bead or seg after allocation */
+    required_usage fixed bin,			/* used in searching seg_list for match usage field */
+    temp_ptr ptr,
+    segp pointer aligned,			/* -> some segment involved with file system */
+    small_piece fixed bin(18),		/* value to store into seg_map.smallest_piece */
+    map_size fixed bin,			/* number of map entries to allocate, must be power of 2 - 1 */
+    new_slot fixed bin,
+    data_elements fixed bin(21);
+
+/* conditions */
+
+declare	apl_dirty_stop_ condition;
+
+/* internal static */
+
+dcl (trace_flags bit (36) aligned initial ((36)"0"b),
+     trace_allocate_words bit (36) aligned initial ("1"b),
+     trace_balancer bit (36) aligned initial ("01"b),
+     trace_copy_value bit (36) aligned initial ("001"b),
+/*   trace_unused bit (36) aligned initial ("0001"b), */
+     trace_free bit (36) aligned initial ("00001"b),
+     trace_get_stack_seg bit (36) aligned initial ("000001"b),
+     trace_reference_count_errors bit (36) aligned initial ("0000001"b),
+     trace_clear_storage bit (36) aligned initial ("00000001"b),
+     check_storage_manager bit (36) aligned initial ("000000000000000000000000000000000001"b)
+    ) internal static;
+
+/* external static */
+
+dcl sys_info$max_seg_size fixed bin(18) external;
+
+/* entries called */
+
+dcl apl_segment_manager_$get entry () returns (pointer),
+    apl_segment_manager_$free entry (pointer),
+    apl_get_symbol_ entry(char(*), pointer unaligned, fixed bin),
+    apl_system_error_ entry (fixed bin (35)),
+    (check_storage_manager_$allocate, check_storage_manager_$free) entry (ptr unal, fixed bin (18)),
+     check_storage_manager_$clear entry (),
+    debug entry (),
+    ioa_$ioa_stream entry options (variable),
+    hcs_$truncate_seg entry(pointer, fixed bin(18), fixed bin(35));
+
+/* status codes */
+
+dcl (apl_error_table_$bead_already_free,
+     apl_error_table_$invalid_free_bead,
+     apl_error_table_$uninterned_symbol,
+     apl_error_table_$bead_not_known_to_apl,
+     apl_error_table_$wsfull_alloc_too_big,
+     apl_error_table_$wsfull_out_of_maps,
+     apl_error_table_$wsfull_out_of_segs,
+     apl_error_table_$hash_table_full,
+     apl_error_table_$no_type_bits,
+     apl_error_table_$wsfull_on_stack,
+     apl_error_table_$non_existent_stack,
+     apl_error_table_$wsfull_no_stack_segs,
+     apl_error_table_$tables_inconsistent
+    ) fixed bin(35) external;
+
+/* constants which can be used for tuning */
+
+dcl BreakSize fixed bin(18) static init(64),		/* boundary between "big" beads and "little" beads */
+    BigMapSize fixed bin static init(511),		/* number of entries per map for big beads */
+    LittleMapSize fixed bin static init(2047),		/* number of entries per map for little beads */
+    BigSmallPiece fixed bin(18) static init(40),		/* minimum number of words in a free bead in "big" space */
+    LittleSmallPiece fixed bin(18) static init(4);	/* minimum number of words in a free bead in "little" space */
+
+/* builtin */
+
+dcl (addr, addrel, baseno, binary, bit, dim, divide, fixed, hbound, lbound,	/* that lbound train */
+     max, mod, null, ptr, rel, size, string, substr, unspec, vclock) builtin;
+
+/* include files */
+
+%include apl_storage_system_data;
+%include apl_number_data;
+%include apl_ws_info;
+%include apl_symbol_table;
+%include apl_bead_format;
+%include apl_value_bead;
+%include apl_operator_bead;
+%include apl_symbol_bead;
+%include apl_function_bead;
+%include apl_lexed_function_bead;
+%include apl_group_bead;
+
+trace_storage_manager:
+	entry (bv_trace_flags);
+
+/* parameters */
+
+dcl  bv_trace_flags bit (36) aligned;
+
+/* entry */
+
+	trace_flags = bv_trace_flags;			/* someday we should copy these into the ws */
+	return;					/* during initialization to avoid the extra pagefault */
+
+apl_free_bead_:
+	entry (free_ptr_structure);
+
+dcl 1 free_ptr_structure aligned parameter,
+      2 free_ptr unaligned pointer;
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+	p = free_ptr;				/* -> block to be freed */
+	s = fixed (p -> general_bead.size, 18);		/* number of words to free */
+
+
+	if p -> general_bead.reference_count ^= 0
+	then do;
+		if trace_flags & trace_reference_count_errors
+		then do;
+			call ioa_$ioa_stream ("apl_trace_", "ref ct error: ^d ^d ^p; calling debug",
+			     p -> general_bead.reference_count, s, p);
+			call debug;
+		     end;
+
+		call apl_system_error_ (apl_error_table_$invalid_free_bead);
+	     end;
+
+	/* if necessary, recursively free the components of the bead.  we use actual PL/I recursion since
+	   in the most common case (value beads) it won't be used. */
+
+	if p -> general_bead.type.symbol
+	then if p -> symbol_bead.meaning_pointer = null	/* only throw away symbol if it is truly meaningless */
+	     then do;
+		     call apl_get_symbol_ (p -> symbol_bead.name, q, i);	/* get hash-bucket number */
+		     if q ^= p
+		     then call apl_system_error_ (apl_error_table_$uninterned_symbol);
+
+		     old_q = null;			/* trace hash chain and remove this symbol from table */
+		     do q = hash_bucket_ptr (i) repeat (old_q -> symbol_bead.hash_link_pointer) while (q ^= null);
+			if q = p
+			then do;
+				if old_q = null	/* first on chain */
+				then hash_bucket_ptr (i) = q -> symbol_bead.hash_link_pointer;
+				else old_q -> symbol_bead.hash_link_pointer = q -> symbol_bead.hash_link_pointer;
+
+				go to escape;
+			     end;
+			old_q = q;
+		     end;
+						/* should never take normal exit from loop */
+		     call apl_system_error_ (apl_error_table_$uninterned_symbol);
+
+escape:
+		     ws_info.number_of_symbols = ws_info.number_of_symbols - 1;	/* maintain this count for rsl */
+		end;
+	     else return;				/* meaning ptr non null */
+
+	else if p -> general_bead.type.function
+	     then do;
+		     if p -> function_bead.class <= 1
+		     then call launder (p -> function_bead.lexed_function_bead_pointer);
+					/* check for external function, where is not really bead ptr */
+		     call launder (p -> function_bead.stop_control_pointer);
+		     call launder (p -> function_bead.trace_control_pointer);
+		end;
+
+	else if p -> general_bead.type.group
+	     then do i = 1 to p -> group_bead.number_of_members;
+		     call launder (p -> group_bead.member (i));
+		end;
+
+	else if p -> general_bead.type.lexed_function
+	     then do;
+		     call launder (p -> lexed_function_bead.name);
+		     do i = 1 to p -> lexed_function_bead.number_of_localized_symbols;
+			if p -> lexed_function_bead.localized_symbols (i) ^= null
+			then if p -> lexed_function_bead.localized_symbols (i) -> general_bead.type.symbol
+					/* only does next line if real symbol, not localized system variable */
+			     then call launder (p -> lexed_function_bead.localized_symbols (i));
+		     end;
+		     do i = 1 to p -> lexed_function_bead.number_of_labels;
+			call launder (p -> lexed_function_bead.label_values_ptr -> lexed_function_label_values (i));
+		     end;
+
+		     /* Make sure that there are any statements at all before
+			trying to free their lexemes. */
+
+		     if p -> lexed_function_bead.number_of_statements > 0
+			then do i = 1 to p -> lexed_function_bead.statement_map_ptr -> lexed_function_statement_map (
+			     p -> lexed_function_bead.number_of_statements);
+
+			     call launder (p -> lexed_function_bead.lexeme_array_ptr -> lexed_function_lexeme_array (i));
+			end;
+		end;
+
+	go to free_something;		/* go free up the storage that was occupied by this bead */
+
+apl_free_words_:
+	entry (alloc_amount, alloc_ptr_structure);
+
+dcl alloc_amount fixed bin(18) parameter,
+    1 alloc_ptr_structure aligned parameter,
+      2 alloc_ptr unaligned pointer;
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+
+	p = alloc_ptr;
+	s = alloc_amount;
+
+free_something:				/* p -> bead to free, s is number of words */
+	ws_info.dont_interrupt_storage_manager = "1"b;		/* inhibit interruptions while munging the map seg */
+
+	if ws_info.meter_mode
+	then enter_time = vclock ();
+
+	/* find map for segment in which bead is being freed */
+
+	hash_index = mod(fixed(baseno(p), 18), dim(seg_map_hash_table, 1));
+	do i = hash_index by 1 while (i <= hbound(seg_map_hash_table, 1)),
+	       lbound(seg_map_hash_table, 1) by 1 while (i < hash_index);	/* circular scan of hash table */
+	   if seg_map_hash_table(i).seg_baseno = baseno(p) then go to g0001;
+	   end;
+	call apl_system_error_(apl_error_table_$bead_not_known_to_apl);	/* not in hash table??!?!?!?!!!??? */
+
+g0001:	sli = seg_map_hash_table(i).seg_list_idx;
+	if seg_list(sli).usage ^> 2 then call apl_system_error_(apl_error_table_$bead_not_known_to_apl);
+	seg_map_p = seg_list(sli).pointer;
+
+	p_rel_loc = rel(p);			/* avoid repeated recomputation of this */
+
+	/* check if this free bead falls at end of segmant, in which case don't bother with map */
+
+	if fixed(p_rel_loc, 18) + s = seg_map.amount_of_seg_used then do;
+		seg_map.amount_of_seg_used = fixed(p_rel_loc, 18);
+		mapx = 0;				/* METER */
+		which_free = 1;			/* TRACE; 1 = OFF END */
+		go to tree_search_exit;
+		end;
+
+
+	already_balanced = "0"b;		/* set flag saying have not yet called balance */
+retry_after_balance:			/* re-enter here after balance is called, already_balanced will be "1"b */
+	mapx = 1;				/* start searching from root of tree, looking for place to drop bead */
+
+tree_search_loop:
+	if string (map (mapx)) = ""b			/* found a leaf, drop this bead in */
+	then do;
+		map(mapx).rel_loc = p_rel_loc;
+		map(mapx).size = bit(fixed(s, 18), 18);
+		seg_map.last_entry_used = max(seg_map.last_entry_used, mapx);
+		which_free = 2;				/* TRACE; 2 = WITH MAP */
+		go to tree_search_exit;
+	     end;
+	else if p_rel_loc < map (mapx).rel_loc		/* new bead is to the left of current one */
+	     then if binary (map (mapx).rel_loc, 18) = binary (p_rel_loc, 18) + s
+		then do;				/* combine on the left */
+			map (mapx).rel_loc = p_rel_loc;
+			map (mapx).size = bit (binary (binary (map (mapx).size) + s, 18), 18);
+			other = left_neighbor (mapx);	/* try to combine further on the left */
+
+			if other ^= mapx
+			then if binary (p_rel_loc) = binary (map (other).rel_loc) + binary (map (other).size)
+			     then do;		/* join beads, discard neighbor */
+				     map (mapx).rel_loc = map (other).rel_loc;
+				     map (mapx).size = bit (binary (binary (map (mapx).size)
+					+ binary (map (other).size), 18), 18);
+				     which_free = 3;	/* TRACE; 3 = LEFT MERGE */
+				     go to fill_hole;
+				end;
+			which_free = 4;				/* TRACE; 4 = LEFT MERGE SIMPLE */
+			go to tree_search_exit;
+		     end;
+		else do;				/* not adjacent, move left */
+			mapx = 2*mapx;
+			if mapx > seg_map.number_of_entries
+			then go to balance;
+			else go to tree_search_loop;
+		     end;
+	     else if p_rel_loc = map (mapx).rel_loc
+		then do;				/* new bead is same as current one!!! */
+			call apl_system_error_ (apl_error_table_$bead_already_free);
+			which_free = 8;
+			go to tree_search_exit;
+		     end;
+		else				/* new bead is to the right of current one */
+		     if binary (p_rel_loc) = binary (map (mapx).rel_loc) + binary (map (mapx).size)
+		     then do;			/* combine on the left */
+			     map (mapx).size = bit (binary (binary (map (mapx).size) + s, 18), 18);
+
+			     /* see if can combine further on the right */
+
+			     other = right_neighbor (mapx);	/* other := leftmost bead to right of mapx */
+			     if other ^= mapx
+			     then if binary (map (other).rel_loc) = binary (p_rel_loc) + s
+				then do;
+					map (mapx).size = bit (binary (binary (map (mapx).size)
+					     + binary (map (other).size), 18), 18);
+					which_free = 5; /* TRACE; 5 = RIGHT MERGE */
+
+					go to fill_hole;
+				     end;
+			     which_free = 6;	/* TRACE; 6 = RIGHT MERGE SIMPLE */
+			     go to tree_search_exit;
+			end;
+		     else do;			/* not adjacent, move right */
+			     mapx = 2 * mapx + 1;
+			     if mapx > seg_map.number_of_entries
+			     then go to balance;
+			     else go to tree_search_loop;
+			end;
+
+fill_hole:
+	neighbor = left_neighbor (other);
+
+	if neighbor = other
+	then neighbor = right_neighbor (other);
+
+	if neighbor ^= other
+	then do;
+		string (map (other)) = string (map (neighbor));
+		other = neighbor;
+		go to fill_hole;
+	     end;
+	else string (map (other)) = ""b;
+
+/* come here when the new bead has been successfully dropped into the tree */
+
+tree_search_exit:
+	if trace_flags & trace_free
+	then call ioa_$ioa_stream ("apl_trace_", "free(^d) ^d (^o) ^p", which_free, s, s, p);
+
+	if trace_flags & check_storage_manager
+	then call check_storage_manager_$free (p, s);
+
+	seg_list(sli).words_free = seg_list(sli).words_free + s;
+
+	/* METER */
+
+	if ws_info.meter_mode
+	then do;
+		call compute_range;
+		metric.range(rangex).free_time = metric.range(rangex).free_time + (vclock() - enter_time);
+		metric.range(rangex).free_count = metric.range(rangex).free_count + 1;
+		if mapx ^= 0 then metric.range(rangex).map_free_count = metric.range(rangex).map_free_count + 1;
+		metric.range(rangex).words_freed = metric.range(rangex).words_freed + s;
+	     end;
+
+	ws_info.dont_interrupt_storage_manager = "0"b;
+	if ws_info.dirty_interrupt_pending then signal apl_dirty_stop_;
+	return;
+
+/*** routine to balance the tree -- returns to retry_after_balance ***/
+
+balance:
+	if already_balanced				/* damn! no space left in tree. throw this bead away. */
+	then do;
+		if ws_info.meter_mode
+		then if s < BreakSize		/* meter this */
+		     then do;
+			     metric.little_seg_balance.thrown_away = metric.little_seg_balance.thrown_away + 1;
+			     metric.little_seg_balance.amt_thrown_away = metric.little_seg_balance.amt_thrown_away + s;
+			end;
+		     else do;
+			     metric.big_seg_balance.thrown_away = metric.big_seg_balance.thrown_away + 1;
+			     metric.big_seg_balance.amt_thrown_away = metric.big_seg_balance.amt_thrown_away + s;
+			end;
+		which_free = 7;			/* TRACE; 7 = DISCARD */
+		go to tree_search_exit;
+	     end;
+
+	already_balanced = "1"b;
+
+	if trace_flags & trace_balancer
+	then call ioa_$ioa_stream ("apl_trace_", "balancing");
+
+	if ws_info.meter_mode
+	then enter_balance_time = vclock ();
+
+	begin;			/* need a begin block to get copy-space to make balancing tree easy */
+
+      dcl	1 map_copy (0:seg_map.last_entry_used+1) aligned automatic like seg_map.map,
+				/* 2 extra entries at begin and end are used in linked-list hack below */
+	link_map(0:seg_map.last_entry_used+1) fixed bin aligned based(addr(map_copy)),
+
+	left_link fixed bin,
+	right_link fixed bin,
+	new_link fixed bin,
+   	mapx fixed bin,
+	copyx fixed bin;
+
+	/* move entries from map to map_copy, so that map_copy is sorted array of all of them.
+	   tree is walked without the assistance of a stack.  With this peculiar storage order for
+	   the tree a stack is not necessary */
+
+	copyx = 0;
+	mapx = 1;
+	depth = 0;				/* stack is empty. */
+
+copy_map_recurse_left:
+	if mapx > seg_map.last_entry_used
+	then go to copy_map_pop;
+
+	if string (map (mapx)) = ""b
+	then go to copy_map_pop;
+
+	depth = depth + 1;				/* push current position onto stack */
+	map_stack(depth) = mapx;
+	mapx = 2 * mapx;				/* recurse to left son */
+
+	go to copy_map_recurse_left;
+
+copy_map_pop:
+	if depth = 0
+	then go to copy_map_done;
+
+	mapx = map_stack(depth);
+	depth = depth - 1;				/* pop top element on stack */
+
+	copyx = copyx + 1;
+	string (map_copy (copyx)) = string (map (mapx));
+	string (map (mapx)) = ""b;			/* remove from original map */
+
+	mapx = 2 * mapx + 1;			/* now visit right son */
+	go to copy_map_recurse_left;
+
+	/* At this point map_copy is sorted into order by increasing offsets.
+	   Now we move it back into the real map such that the root of the
+	   tree is the median, the left son of the root is the (1/4) quartile,
+	   the right son of the root is the (3/4) quartile, etc.
+
+	   The way this works is by successive halving, quartering, etc. of copy_map
+	   after each stage a linked, ordered list of all things taken so far is constructed
+	   so that the next stage may be done without any recursion or anything */
+
+	/* first step is to link up a cell at left margin and a cell at right margin */
+
+copy_map_done:
+	link_map(0) = copyx+1;
+	link_map(copyx+1) = 0;
+
+	/* loop down the list and get the map entries in between the ones on the list */
+
+	mapx = 0;				/* outputting to orig map in linear order */
+
+	do while (mapx < 2*copyx);		/* put out enough rows of tree to consume all the entries */
+					/* mapx doubles each time, last time through copyx <= mapx < 2*copyx */
+
+	 do left_link = 0 repeat right_link while("1"b);
+
+	   right_link = link_map(left_link);
+	   if right_link = 0 then go to g0021;	/* come to end, exit out of this loop */
+
+	   new_link = divide(right_link-left_link, 2, 17, 0);	/* half way between left_link & right_link */
+	     if new_link = 0			/* nothing here so put out a zero.  I can prove this works... */
+	     then mapx = mapx + 1;
+	     else do;				/* something here, put it out and change it to a link */
+		     new_link = new_link + left_link;
+		     mapx = mapx + 1;
+		     string(map(mapx)) = string(map_copy(new_link));
+		     link_map(left_link) = new_link;
+		     link_map(new_link) = right_link;
+		end;
+	   end;
+
+g0021:
+	end;
+
+	seg_map.last_entry_used = mapx;
+
+	/* METER THE BALANCER */
+
+	if ws_info.meter_mode
+	then if s < BreakSize
+	     then do;
+		     metric.little_seg_balance.count = metric.little_seg_balance.count + 1;
+		     metric.little_seg_balance.time_spent_balancing = metric.little_seg_balance.time_spent_balancing +
+			(vclock() - enter_balance_time);
+		     metric.little_seg_balance.space_left = metric.little_seg_balance.space_left + copyx;
+		end;
+	     else do;
+		     metric.big_seg_balance.count = metric.big_seg_balance.count + 1;
+		     metric.big_seg_balance.time_spent_balancing = metric.big_seg_balance.time_spent_balancing +
+			(vclock() - enter_balance_time);
+		     metric.big_seg_balance.space_left = metric.big_seg_balance.space_left + copyx;
+		end;
+
+	end;			/* end of balancing the begin block */
+
+	go to retry_after_balance;
+
+/*** here is the allocation part ***/
+
+apl_allocate_words_:
+	entry (alloc_amount, alloc_ptr_structure);
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+
+	s = alloc_amount;
+	/* alloc_ptr is return arg, will be set from p */
+
+
+	esw = 1;
+	if ws_info.meter_mode
+	then enter_time = vclock ();
+
+copy_value_alloc_join:
+
+	s = s + (s - 2 *  divide (s, 2, 19, 0));
+	if s > sys_info$max_seg_size then call apl_system_error_(apl_error_table_$wsfull_alloc_too_big);
+
+	ws_info.dont_interrupt_storage_manager = "1"b;		/* inhibit interruptions while munging the map seg */
+	endp, newp = 0;
+	if s < BreakSize
+	then do;
+		sli = current_little_bead_seg;
+		scan_pos = current_little_scan_pos;
+	     end;
+	else do;
+		sli = current_big_bead_seg;
+		scan_pos = current_big_scan_pos;
+	     end;
+
+	if sli = 0
+	then go to get_new_seg;
+
+	if seg_list (sli).usage ^> 2
+	then call apl_system_error_ (apl_error_table_$tables_inconsistent);
+
+	/* try scanning through this seg's map for a free bead of suitable size */
+
+scan_for_bead_to_alloc:
+	seg_map_p = seg_list (sli).pointer;
+	if seg_list(sli).words_free < s then go to get_new_seg;	/* if hopeless */
+
+	/* Look in free map for a free bead of enough words to meet
+	   allocation request.  We walk the tree in in-order to avoid
+	   zero nodes (the tree is usually pretty sparse), and to favor
+	   the beginning of the segment.  Someday we might want to remember
+	   where we left off the last time. */
+
+	mapx = 1;					/* start at root node */
+	depth = 0;				/* stack is empty. */
+
+search_recurse_left:
+	if mapx > seg_map.last_entry_used		/* mapx increases until too big by one level */
+	then go to search_pop;
+
+	if string (map (mapx)) = ""b			/* have gone too far...null leaf */
+	then go to search_pop;
+
+	depth = depth + 1;				/* push current node onto stack */
+	map_stack(depth) = mapx;
+	mapx = 2 * mapx;				/* try left son */
+	go to search_recurse_left;
+
+search_pop:
+	if depth = 0				/* is stack empty? */
+	then go to search_done;			/* then we have searched whole tree */
+
+	mapx = map_stack(depth);
+	depth = depth - 1;				/* pop top element on stack */
+
+	n_left = binary (map (mapx).size, 18) - s;
+	if n_left >= 0				/* if not hopeless, look more carefully */
+	then do;
+		p = addrel (seg_map.seg_ptr, map (mapx).rel_loc);
+
+		if n_left >= seg_map.smallest_piece	/* if amount left is big enough to go on its own */
+		then do;
+			map (mapx).rel_loc = rel (addrel (p, s));
+			map (mapx).size = bit (fixed (n_left, 18), 18);
+			go to end_alloc;
+		     end;
+		else do;				/* otherwise, use whole bead & move up its subtree */
+			s = s + n_left;
+
+			if s < BreakSize		/* save scan pos for next time */
+			then current_little_scan_pos = mapx;
+			else current_big_scan_pos = mapx;
+
+alloc_fill_hole:
+			other = left_neighbor (mapx);	/* try left first */
+
+			if other = mapx		/* nothing, try right */
+			then other = right_neighbor (mapx);
+
+			if other ^= mapx		/* if neighbor exists */
+			then do;
+				string (map (mapx)) = string (map (other));
+				mapx = other;
+				go to alloc_fill_hole;
+			     end;
+			else string (map (mapx)) = ""b;
+			go to end_alloc;
+		     end;
+	     end;
+
+	mapx = 2 * mapx + 1;			/* nothing here, try right son */
+	go to search_recurse_left;
+
+search_done:					/* no place free, try taking end of seg */
+	if seg_map.amount_of_seg_used + s <= sys_info$max_seg_size
+	then do;
+		p = addrel (seg_map.seg_ptr, seg_map.amount_of_seg_used);
+		n_left = 0;			/* may be uninitialized */
+		seg_map.amount_of_seg_used = seg_map.amount_of_seg_used + s;
+		endp = 1;
+		go to end_alloc;
+	     end;
+
+/** can't alloc in this seg, try another one **/
+
+get_new_seg:
+	newp = 1;
+	/* find big (or small)_seg from list of such which has most words left */
+
+	n_left = 0;
+	if s < BreakSize then required_usage = 3; else required_usage = 4;
+	do i = lbound(seg_list, 1) to hbound(seg_list, 1);
+	   if seg_list(i).usage = required_usage
+	      then if seg_list(i).words_free > n_left
+	         then do;	/* foud new max-free seg */
+		  n_left = seg_list(i).words_free;
+		  new_sli = i;
+		  end;
+	   end;
+	if new_sli ^= sli
+	   then if n_left >= s
+	      then do;
+
+		/* found new seg with more room, try it */
+
+		sli = new_sli;
+remember_new_seg:
+		scan_pos = 1;
+		if s < BreakSize then do;
+		     current_little_bead_seg = sli;
+		     current_little_scan_pos = 0;
+		     end;
+		else do;
+		     current_big_bead_seg = sli;
+		     current_big_scan_pos = 0;
+		     end;
+		go to scan_for_bead_to_alloc;
+		end;
+
+
+	/* no present segments, get a new one */
+
+
+	call get_seg_for_apl;
+	if s < BreakSize then do;
+	   seg_list(sli).usage = 3;
+	   map_size = LittleMapSize;
+	   small_piece = LittleSmallPiece;
+	   end;
+	else do;
+	   seg_list(sli).usage = 4;
+	   map_size = BigMapSize;
+	   small_piece = BigSmallPiece;
+	   end;
+	seg_list(sli).pointer, seg_map_p = last_map;
+	seg_list(sli).words_free = sys_info$max_seg_size;
+	temp_ptr = addrel(seg_map_p, size(seg_map));
+	if fixed(rel(temp_ptr), 18) > sys_info$max_seg_size
+	   then call apl_system_error_(apl_error_table_$wsfull_out_of_maps);	/* check for oob on map seg */
+	else last_map = temp_ptr;		/* update ptr to next free loc in map seg */
+
+	seg_map.seg_ptr = segp;
+	seg_map.smallest_piece = small_piece;
+	seg_map.number_of_entries = map_size;
+	seg_map.last_entry_used = 0;
+	seg_map.amount_of_seg_used = 0;
+	go to remember_new_seg;			/* go rejoin other case of get_new_seg */
+
+apl_copy_value_:
+	entry (from_ptr_structure, to_ptr_structure);
+
+/* parameters */
+
+dcl 1 from_ptr_structure aligned parameter,
+      2 from_ptr pointer unaligned,
+    1 to_ptr_structure aligned parameter,
+      2 to_ptr pointer unaligned;
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+
+	if ws_info.meter_mode
+	then enter_time = vclock ();
+
+	data_elements = from_ptr -> value_bead.total_data_elements;
+
+	if from_ptr -> value_bead.data_type.character_value
+	then do;
+		s = size(character_string_overlay);
+		esw = -1;
+	     end;
+	else if from_ptr -> value_bead.data_type.numeric_value
+	     then do;
+		     s = size (numeric_datum) + 1;
+		     esw = 0;
+		end;
+	     else call apl_system_error_(apl_error_table_$no_type_bits);
+
+	number_of_dimensions = from_ptr -> value_bead.rhorho;
+	s = s + size (value_bead);			/* total number of words needed */
+
+	go to copy_value_alloc_join;
+
+/* come here with p -> bead that has been allocated, s = actual size */
+
+end_alloc:
+	seg_list(sli).words_free = seg_list(sli).words_free - s;
+	ws_info.dont_interrupt_storage_manager = "0"b;
+	if ws_info.dirty_interrupt_pending then signal apl_dirty_stop_;
+
+	/* set up bead header */
+
+	p -> general_bead.reference_count = 1;			/* since our return argument (only) will point at it */
+	p -> general_bead.size = bit(fixed(s, 18), 18);		/* actual number of words allocated */
+		/* caller must set type field */
+
+	/* METER */
+
+	if ws_info.meter_mode
+	then do;
+		call compute_range;
+		metric.range(rangex).alloc_time = metric.range(rangex).alloc_time + (vclock() - enter_time);
+		metric.range(rangex).alloc_count = metric.range(rangex).alloc_count + 1;
+		metric.range(rangex).words_alloced = metric.range(rangex).words_alloced + s;
+		metric.range(rangex).alloc_end_count = metric.range(rangex).alloc_end_count + endp;
+		metric.range(rangex).alloc_new_count = metric.range(rangex).alloc_new_count + newp;
+	     end;
+
+	/* dispatch according to type of alloc */
+
+	go to end_alloc_tv (esw);
+
+end_alloc_tv (1):		/* apl_allocate_words_ */
+
+	if trace_flags & trace_allocate_words
+	then call ioa_$ioa_stream ("apl_trace_", "alloc words ^d ^p", s, p);
+
+	if trace_flags & check_storage_manager
+	then call check_storage_manager_$allocate (p, s);
+
+	alloc_ptr = p;		/* just returns the bead */
+	return;
+
+end_alloc_tv (-1):		/* copy_apl_value_  (character) */
+
+	p -> value_bead.data_pointer = addr (p -> value_bead.rho (from_ptr -> value_bead.rhorho + 1));
+	if data_elements ^= 0			/* avoid illegal procedure fault (kludge hardware) */
+	then p -> value_bead.data_pointer -> character_string_overlay = 
+	     from_ptr -> value_bead.data_pointer -> character_string_overlay;
+	go to copy_apl_value_alloc_return;
+
+end_alloc_tv (0):		/* copy_apl_value_ (numeric) */
+
+	p -> value_bead.data_pointer = addr (p -> value_bead.rho (from_ptr -> value_bead.rhorho + 1));
+	if substr (rel (p -> value_bead.data_pointer), 18, 1)
+	then p -> value_bead.data_pointer = addrel (p -> value_bead.data_pointer, 1);
+
+	if data_elements ^= 0		/* avoid IPR fault */
+	then p -> value_bead.data_pointer -> numeric_datum (*) =
+	     from_ptr -> value_bead.data_pointer -> numeric_datum (*);
+/*	go to copy_apl_value_alloc_return; */
+
+copy_apl_value_alloc_return:
+
+	if trace_flags & trace_copy_value
+	then call ioa_$ioa_stream ("apl_trace_", "copy value ^p ^d ^p", from_ptr, s, p);
+
+	if trace_flags & check_storage_manager
+	then call check_storage_manager_$allocate (p, s);
+
+	string (p -> value_bead.type) = string (from_ptr -> value_bead.type);	/* new bead has same type as old */
+	p -> value_bead.rhorho = from_ptr -> value_bead.rhorho;
+	if p -> value_bead.rhorho ^= 0	/* avoid IPR fault */
+	then unspec (p -> value_bead.rho (*)) = unspec (from_ptr -> value_bead.rho (*));
+
+	p -> value_bead.total_data_elements = from_ptr -> value_bead.total_data_elements;
+	to_ptr = p;			/* set return arg */
+
+	/* METER */
+
+	if ws_info.meter_mode
+	then do;
+		metric.copy_apl_value_calls = metric.copy_apl_value_calls + 1;
+		metric.copy_apl_value_time = metric.copy_apl_value_time + (vclock () - enter_time);
+	     end;
+
+	return;
+
+/* This entry is called by the apl command to initialize apl's working storage. */
+
+apl_initialize_storage_:
+	entry ();
+
+						/* set up map & global-data segment */
+	segp = apl_segment_manager_$get ();
+	global_storage_system_data_pointer, ws_info.alloc_free_info_ptr = segp;
+
+						/* hash table is initially zero */
+	last_map = addr (first_seg_map);		/* there are no maps, yet. */
+
+	/* Initialize some metering data (no matter what ws_info.meter_mode says,
+	   because it probably hasn't been set yet). Only range.size needs to be inited. */
+
+	s = 2;
+	do i = lbound (metric.range, 1) to hbound (metric.range, 1);
+	     s = s * 2;
+	     metric.range (i).size = s;
+	end;
+
+	return;
+
+/* entry to destroy all of apl's free storage. called as dying gasp of an
+   apl session. */
+
+apl_dispose_of_storage_:
+	entry ();
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+	do i = lbound (seg_list, 1) to hbound (seg_list, 1);
+	     /* free up available segs & value stacks */
+
+	     if seg_list (i).usage = 1 | seg_list (i).usage = 2
+	     then call apl_segment_manager_$free ((seg_list (i).pointer));
+
+	     /* free heaps of both kinds */
+
+	     else if seg_list (i).usage = 3 | seg_list (i).usage = 4
+		then call apl_segment_manager_$free ((seg_list (i).pointer -> seg_map.seg_ptr));
+	end;
+
+	/* flush the map & global-data segment */
+
+	call apl_segment_manager_$free ((ws_info.alloc_free_info_ptr));
+
+	/* flush ws_info */
+
+	call apl_segment_manager_$free ((ws_info_ptr));
+	apl_static_$ws_info_ptr = null;
+
+	return;
+
+/* this entry is called by the )CLEAR command */
+
+apl_clear_storage_:
+	entry ();
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+
+	if trace_flags & trace_clear_storage
+	then call ioa_$ioa_stream ("apl_trace_", "storage cleared");
+
+	if trace_flags & check_storage_manager
+	then call check_storage_manager_$clear ();
+
+	ws_info.dont_interrupt_storage_manager = "1"b;		/* inhibit interruptions while munging the map seg */
+
+	do i = lbound (seg_list, 1) to hbound (seg_list, 1);
+	     if seg_list (i).usage > 2		/* a heap of either type? */
+	     then seg_list (i).pointer = seg_list (i).pointer -> seg_map.seg_ptr;
+
+	     if seg_list (i).usage ^= 0		/* in use? */
+	     then do;
+		     call apl_segment_manager_$free ((seg_list (i).pointer));
+		     seg_list (i).usage = 0;
+		end;
+	end;
+
+	/* get rid of the maps in the global-data segment. make sure they really go,
+	   because re-used map space is assumed to be zero. */
+
+	last_map = addr (first_seg_map);
+	call hcs_$truncate_seg (addr (last_map), binary (rel (last_map), 18), (0));
+
+	current_little_bead_seg, current_big_bead_seg = 0;
+
+	/* assign initial segment for the value stack */
+
+	i = lbound (seg_list, 1);			/* always use first seg for value stack root. */
+	go to g0017;				/* since we just gave 'em all back, re-fetch one. */
+
+	/* entry to return number of words of storage in use */
+
+apl_get_storage_usage_:
+	entry (storage_usage);
+
+dcl storage_usage fixed bin(30) aligned parameter;
+dcl  seen_current_value_stack bit (1) aligned;
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+
+	storage_usage = 0;
+	seen_current_value_stack = "0"b;
+	p = ptr (value_stack_ptr, 0);			/* get ptr to base of current value stack */
+	do sli = lbound(seg_list,1) to hbound(seg_list,1);
+	     if seg_list (sli).usage > 2		/* big or little heaps */
+	     then storage_usage = storage_usage + (sys_info$max_seg_size - seg_list (sli).words_free);
+	     else if seg_list (sli).usage = 2		/* a stack segment */
+		then if seen_current_value_stack	/* stacks are ordered: used used current free free */
+		     then;			/* so ignore free value stacks */
+		     else if p = seg_list (sli).pointer	/* if this is current */
+			then do;
+				storage_usage = storage_usage + fixed (rel (value_stack_ptr), 18);
+				seen_current_value_stack = "1"b;
+			     end;
+			else storage_usage = storage_usage + (sys_info$max_seg_size - seg_list (sli).words_free);
+	end;
+
+	return;
+
+	/* this entry is called when a segment of value stack is filled */
+
+apl_get_value_stack_:
+apl_get_next_value_stack_seg_:
+	entry (amt_needed);
+
+dcl amt_needed fixed bin(18) parameter;
+
+	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+
+	if trace_flags & trace_get_stack_seg
+	then call ioa_$ioa_stream ("apl_trace_", "get stack seg ^d", amt_needed);
+
+	/* METER - (not worth checking ws_info.meter_mode for) */
+
+	metric.get_next_value_stack_seg_calls = metric.get_next_value_stack_seg_calls + 1;
+
+	if amt_needed > sys_info$max_seg_size
+	then call apl_system_error_ (apl_error_table_$wsfull_on_stack);
+
+	ws_info.dont_interrupt_storage_manager = "1"b;	/* don't allow interrupts while munging seg_list */
+
+	/* find current position in list of value_stack segs */
+
+	p = ptr(value_stack_ptr, 0);
+	do i = lbound(seg_list, 1) to hbound(seg_list, 1);
+	     if seg_list (i).usage = 2		/* a value stack */
+	     then if seg_list (i).pointer = p		/* this value stack */
+		then go to g0015;
+	end;
+
+	call apl_system_error_(apl_error_table_$non_existent_stack);	/* ???!? */
+
+g0015:						/* update for storage usage entry */
+	seg_list (i).words_free = (sys_info$max_seg_size - fixed (rel (value_stack_ptr), 18));
+	base = i+1;				/* remember first seg in list after current one */
+
+	do i = base to hbound(seg_list, 1);
+	     if seg_list (i).usage = 2		/* found old stack seg which can be re-used */
+	     then do;
+g0016:		     segp, value_stack_ptr = seg_list(i).pointer;
+		     seg_list(i).usage = 2;
+		     call hcs_$truncate_seg(segp, 0, (0));	/* may as well avoid extra paging */
+		     go to unmask_and_return;
+		end;
+	end;
+
+	do i = base to hbound(seg_list, 1);		/* need new seg */
+	     if seg_list (i).usage = 1		/* aha! existing segment that can be reused */
+	     then go to g0016;
+	     else if seg_list (i).usage = 0		/* empty slot, fill it in */
+		then do;
+g0017:
+			segp = apl_segment_manager_$get ();
+			value_stack_ptr, seg_list(i).pointer = segp;
+			seg_list(i).usage = 2;
+			sli = i;
+			call set_up_hash_table;
+			go to unmask_and_return;
+		     end;
+	end;
+
+	/* after a great struggle, still couldn't find any segments to use for a stack.  die die die */
+
+	call apl_system_error_(apl_error_table_$wsfull_no_stack_segs);
+	return;					/* will never be executed */
+
+unmask_and_return:
+	ws_info.dont_interrupt_storage_manager = "0"b;
+	if ws_info.dirty_interrupt_pending then signal apl_dirty_stop_;
+	return;
+
+/* Internal procedure to find the node that is just less
+   than (to the left of) the input node.  Knuth calls
+   this the symmetric predecessor.  See Knuth Vol 3, 6.2.2. */
+
+left_neighbor:
+	procedure (bv_mapx) returns (fixed bin);
+
+/* parameters */
+
+dcl  bv_mapx fixed bin parameter;
+
+/* automatic */
+
+dcl  nodex fixed bin;
+
+/* program */
+
+	found = "0"b;
+	nodex = 2 * bv_mapx;
+	do while (^found);				/* go left once, then right */
+	     if nodex > seg_map.last_entry_used
+	     then found = "1"b;
+	     else if string (map (nodex)) = ""b
+		then found = "1"b;
+		else nodex = 2 * nodex + 1;
+	end;
+	return (divide (nodex, 2, 18, 0));
+
+     end left_neighbor;
+
+/* Internal procedure to find the node that is just greater
+   than (to the right of) the input node.  Knuth calls
+   this the symmetric successor.  See Knuth Vol 3, 6.2.2. */
+
+right_neighbor:
+	procedure (bv_mapx) returns (fixed bin);
+
+/* parameters */
+
+dcl  bv_mapx fixed bin parameter;
+
+/* automatic */
+
+dcl  nodex fixed bin;
+
+/* program */
+
+	found = "0"b;
+	nodex = 2 * bv_mapx + 1;
+	do while (^found);				/* go right once, then left */
+	     if nodex > seg_map.last_entry_used
+	     then found = "1"b;
+	     else if string (map (nodex)) = ""b
+		then found = "1"b;
+		else nodex = 2 * nodex;
+	end;
+	return (divide (nodex, 2, 18, 0));
+
+     end right_neighbor;
+
+/* Internal procedure to help apl_free_bead_ "wash" pointers to beads */
+
+launder:
+     procedure (afp);
+
+/* parameters */
+
+dcl  afp ptr unaligned parameter;
+
+/* automatic */
+
+dcl  fp ptr unaligned;
+
+/* entries */
+
+dcl  apl_free_bead_ entry (pointer unaligned);
+
+/* program */
+
+	fp = afp;					/* do losing unaligned copy only once */
+
+	if fp = null 				/* can get null localized_symbols in a lexed_function_bead */
+	then return;
+
+	if fp -> general_bead.type.operator		/* these read-only beads are not subject to freeing */
+	then return;
+
+	fp -> general_bead.reference_count = fp -> general_bead.reference_count - 1;	/* wash this reference */
+	afp = null;				/* .. */
+
+	if fp -> general_bead.reference_count < 1
+	then call apl_free_bead_ (fp);
+
+     end launder;
+
+compute_range:
+	procedure;
+
+/* given size s, this routine computes proper metric.range entry, returns iss index in rangex */
+
+	do rangex = lbound (metric.range, 1) to hbound (metric.range, 1) - 1;
+	     if s < metric.range (rangex + 1).size	/* found proper range */
+	     then return;
+	end;
+
+	return;			/* rangex == hbound (metric.range, 1) */
+
+end compute_range;
+
+	/* finds a segment, returns segp and sli, and sets up hash_table if necessary. */
+
+get_seg_for_apl:
+	procedure;
+
+	new_slot = 0;
+	do sli = lbound(seg_list, 1) to hbound(seg_list, 1);
+	   if seg_list(sli).usage = 1 	/* available seg */
+	      then do;
+		segp = seg_list(sli).pointer;
+		return;
+		end;
+	   else if seg_list(sli).usage = 0 then new_slot = sli;	/* save loc of last free slot in seg_list */
+	   end;
+
+	/* evidently no usage = 1 segs, need to get a completely new one */
+
+	if new_slot = 0 then call apl_system_error_(apl_error_table_$wsfull_out_of_segs);
+
+	sli = new_slot;
+	segp = apl_segment_manager_$get ();
+	seg_list(sli).pointer = segp;
+	call set_up_hash_table;
+
+end get_seg_for_apl;
+
+set_up_hash_table:		/* put segment indicated by segp and sli into hash table */
+	procedure;
+
+dcl hash_index fixed bin,
+    i fixed bin;
+
+	hash_index = mod(fixed(baseno(segp), 18), dim(seg_map_hash_table, 1));
+	do i = hash_index by 1 while (i <= hbound(seg_map_hash_table, 1)),
+	       lbound(seg_map_hash_table, 1) by 1 while (i < hash_index);
+	   if seg_map_hash_table(i).seg_list_idx = 0
+	      then do;
+		seg_map_hash_table(i).seg_list_idx = sli;
+		seg_map_hash_table(i).seg_baseno = baseno(segp);
+		return;
+		end;
+	   end;
+	call apl_system_error_(apl_error_table_$hash_table_full);	/* cannot happen! */
+end set_up_hash_table;
+
+     end /* apl_storage_manager_ */;

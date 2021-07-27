@@ -1,0 +1,913 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1985 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: ^inddcls,^indattr,indnoniterend,^indnoniterdo,indend,tree,^case,insnl,comcol61,dclind5,declareind5,delnl */
+
+/*DESCRIPTION
+  This subroutine deletes one or more attributes from a MRDS database. Each of
+  the attributes is examined, and a list of relations to be operated upon is
+  created. This is so that if more than one referenced attribute is being
+  deleted, each relation is only reformatted once. If an attribute is
+  unreferenced, it is simply removed from the db_model linked list. If it is
+  referenced, the relations that contain those attribute must be reformatted. */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-02-07,Spitzer), approve(85-02-07,MCR7311),
+     audit(86-09-15,Gilcrease), install(86-10-16,MR12.0-1187):
+     written
+  2) change(86-10-30,Blair), approve(86-10-30,PBF7311), audit(86-12-05,Dupuis),
+     install(86-12-09,MR12.0-1237):
+     Re-arrange the quit handler so that we only hold quits while we're
+     cleaning up the model, switching relation names and updating the xref and
+     history files.  No need elsewhere because once the model is marked
+     inconsistent the salvager will roll back the relations and model if
+     anything goes wrong.
+  3) change(87-09-30,Blair), approve(87-11-03,MCR7792), audit(87-11-30,Dupuis),
+     install(87-12-07,MR12.2-1008):
+     Set the undo_request variable to null so that if a problem occurs during
+     execution of this request we will not loop endlessly trying to execute
+     the request and roll the database back.  Set mstxn-txn_id to zero so we
+     don't get caught if we have a vfile_ database, but we try to abort a txn
+     during cleanup based on some residue value in the field,
+                                                   END HISTORY COMMENTS */
+
+rmdb_delete_attribute:
+     proc (Irmdb_ctl_ptr, Idelete_object_info_ptr, Oerror_message, Ocode);
+
+	rmdb_ctl_ptr = Irmdb_ctl_ptr;
+	delete_object_info_ptr = Idelete_object_info_ptr;
+
+	user_area_ptr = null;
+
+	if delete_object_info.version ^= delete_object_info_version_1
+	then call error (error_table_$unimplemented_version,
+		"Version " || delete_object_info.version || " for delete_object_info structure.");
+
+	db_path = rmdb_ctl.absolute_db_path;		/* Create the xref file if not already created. */
+	if rmdb_ctl.crossref_file_info.iocb_ptr = null
+	then do;
+	     call mdbm_util_$xref_build (rmdb_ctl.temp_dir_path, db_path, rmdb_ctl.db_model_ptr,
+		rmdb_ctl.crossref_file_info.name, rmdb_ctl.crossref_file_info.iocb_ptr, error_message, code);
+	     if code ^= 0
+	     then call error (code, error_message);
+	     end;
+
+	local_iocb = rmdb_ctl.crossref_file_info.iocb_ptr;
+	mstxn_txn_id = "0"b;
+	
+	on cleanup
+	     begin;
+		call mdbm_util_$xref_destroy (rmdb_ctl.crossref_file_info.iocb_ptr, rmdb_ctl.temp_dir_path,
+		     rmdb_ctl.crossref_file_info.name, (""), (0));
+		call cleaner;
+	     end;
+
+	dbm_ptr = rmdb_ctl.db_model_ptr;
+
+	if delete_object_info.all
+	then call rmdb_delete_all$attributes (rmdb_ctl_ptr, error_message, code);
+	else do;
+
+/* Create a non-freeing, non-zeroing extensible area to allocate structures in.
+   When we return and finish using these structures, we will simply throw away
+   the area. */
+	     call mdbm_util_$get_temp_segment_path (rmdb_ctl.temp_dir_path, myname, user_area_ptr, code);
+	     if code ^= 0
+	     then call error (code, "Unable to get a temp segment in the temp dir.");
+
+	     unspec (ai) = "0"b;
+	     ai.version = area_info_version_1;
+	     ai.extend = "1"b;
+	     ai.dont_free = "1"b;
+	     ai.no_freeing = "1"b;
+	     ai.owner = myname;
+	     ai.size = sys_info$max_seg_size;
+	     ai.areap = user_area_ptr;
+
+	     call define_area_ (addr (ai), code);
+	     if code ^= 0
+	     then call error (code, "Defining a user area.");
+
+	     domain_list_ptr, attribute_list_ptr, relation_list_ptr = null;
+	     if delete_object_info.unreferenced
+	     then call make_unreferenced_attribute_list;
+	     else do;
+		call rmdb_relations_used$attributes (rmdb_ctl_ptr, delete_object_info_ptr, user_area_ptr,
+		     domain_list_ptr, attribute_list_ptr, relation_list_ptr, error_message, code);
+		if code ^= 0
+		then call error (code, error_message);
+
+		call check_for_deletion_of_generated_attributes;
+
+		if ^delete_object_info.force
+		then do;
+		     unspec (query_info) = "0"b;
+		     query_info.version = query_info_version_6;
+		     query_info.yes_or_no_sw = "1"b;
+		     query_info.suppress_name_sw = "1"b;
+		     query_info.question_iocbp = delete_object_info.check_iocb_ptr;
+		     query_info.answer_iocbp = delete_object_info.query_iocb_ptr;
+		     query_info.explanation_ptr = addr (QUERY_MSG);
+		     query_info.explanation_len = length (rtrim (QUERY_MSG));
+		     end;
+
+		call print_information;
+
+		if (delete_object_info.long = UNSPEC & delete_object_info.check)
+		then do;
+		     code = 0;
+		     call error (code, error_message);
+		     end;
+	     end;
+
+	     call check_for_deletion_of_primary_key;
+
+	     make_consistent_msg = "";          /* if anything goes wrong we can't retry */
+	
+
+	     call mdbm_util_$inconsistent_set (dbm_ptr, "delete_attribute", "Deleting attributes",
+		rtrim (make_consistent_msg));
+
+
+/* Invalidate the resultant. */
+	     if ^delete_object_info.unreferenced
+	     then do;
+		rmdb_ctl.saved_res_version_ptr -> based_char8 = "RESTRUCT";
+
+		last_unreferenced_attribute_ptr = null;
+		relation_good_count, save_code = 0;
+
+		do relation_index = 1 to relation_list.count;
+		     relation_ptr = relation_list.relation_ptr (relation_index);
+		     relation_good_count = relation_good_count + 1;
+		     call process_single_relation;
+		     if code ^= 0
+		     then do;
+			save_code = code;
+			goto cleanup_directory;
+		     end;				/* do relation_index */
+		end;
+/* If we get here, we have copied all the relations, so now we need to clean
+   up by deleting the copies of the file model and the old relations.       */
+
+cleanup_directory:	
+
+/* The real work starts here - hold quits till we're done */
+	     quit_occurred = "0"b;			/* BEGIN CRITICAL CODE */
+	     on quit quit_occurred = "1"b;
+
+	     do relation_index = 1 to relation_good_count;
+		     relation_ptr = relation_list.relation_ptr (relation_index);
+		     fm_ptr = relation.file_model_ptr;
+		     call transaction_in_progress;
+		     if mstxn_transactions_needed
+		     then do;
+			on cleanup
+			     begin;
+			     call mstxn_cleanup;
+			     call cleaner;
+			     end;
+			on any_other call mstxn_any_other;
+%include mrds_start_transaction;
+                              if mstxn_code ^= 0
+			then call error (mstxn_code, "Could not start a transaction.");
+			end;
+		     call switch_names;
+
+		     if mstxn_transactions_needed
+		     then do;
+			mftxn_code = 0;
+%include mrds_finish_transaction;
+                              end;
+		     end;
+	     end;                               /* do relation_index */
+
+	     if save_code ^= 0
+	     then do;
+		call mdbm_util_$xref_destroy (rmdb_ctl.crossref_file_info.iocb_ptr, rmdb_ctl.temp_dir_path,   
+		     rmdb_ctl.crossref_file_info.name, (""), (0));
+	          call error (save_code, error_message);
+		end;
+	     	     
+/* Unlink the unreferenced_attribute structure in the db_model if any of the
+   attributes being deleted are unreferenced. */
+	     call delete_unreferenced_attribute_list;
+
+	     call mdbm_util_$inconsistent_reset (dbm_ptr);
+	     call process_xref_records;
+
+	     revert quit;				/* END CRITICAL CODE */
+	     if quit_occurred
+	     then signal quit;
+
+	     code = 0;
+	     end;
+
+	call error (code, error_message);
+%page;
+/*DESCRIPTION
+  Error handler and cleanup handler. This is the only way to exit these
+  subroutines.
+*/
+
+error:
+     proc (code, msg);
+
+dcl  code fixed bin (35) parameter;
+dcl  msg char (*) parameter;
+
+	Ocode = code;
+	if code = 0
+	then Oerror_message = "";
+	else Oerror_message = msg;
+	goto RETURN_TO_CALLER;
+     end error;
+
+RETURN_TO_CALLER:
+	call cleaner;
+	return;
+
+cleaner:
+     proc;
+
+	if user_area_ptr ^= null
+	then do;
+	     call release_area_ (user_area_ptr);
+	     call mdbm_util_$free_temp_segment (myname, user_area_ptr, (0));
+	     end;
+
+	if mstxn_txn_id ^= "0"b
+	then do;
+	     call transaction_manager_$abort_txn (mstxn_txn_id, code);
+	     if code ^= 0
+	     then call transaction_manager_$abandon_txn (mstxn_txn_id, (0));
+	     end;
+
+	return;
+     end cleaner;
+
+restore_significant_data:
+     proc;
+	return;
+     end restore_significant_data;
+
+should_rollback:
+     proc returns (bit (1) aligned);
+	return ("0"b);
+     end should_rollback;
+%page;
+make_name:
+     proc (input_name) returns (char (33));
+
+dcl  input_name char (*) parameter;
+
+	return (OBJECT_HEAD || input_name);
+     end make_name;
+
+unmake_name:
+     proc (input_name) returns (char (32));
+
+dcl  input_name char (*) parameter;
+
+	return (substr (input_name, 2, 32));
+     end unmake_name;
+
+/*DESCRIPTION
+  This subroutine ensures that no transaction is in progress, and sets a flag
+  bit for use later. */
+
+transaction_in_progress:
+     proc;
+
+	if db_model.db_type_flags.transactions_needed
+	then do;
+	     mstxn_transactions_needed = "1"b;
+	     call transaction_manager_$get_current_txn_id (mstxn_txn_id, mstxn_code);
+	     if mstxn_code = 0
+	     then do;
+		mstxn_txn_id = "0"b;
+		call error (error_table_$action_not_performed,
+		     "A transaction is in progress. Commit or abort the transaction and try the operation again.");
+		end;
+	     end;
+	else mstxn_transactions_needed = "0"b;
+
+	return;
+     end transaction_in_progress;
+
+%page;
+/*DESCRIPTION
+  This subroutine checks all attributes in the attribute_list structure to
+  ensure that none of the requested attributes are generated attributes
+  (attributes that don't really exist, but are present because for each domain
+  there is a generated attribute with the same name). These cannot be deleted. */
+
+check_for_deletion_of_generated_attributes:
+     proc;
+
+	do attribute_list_idx = 1 to attribute_list.count;
+	     di_ptr = ptr (dbm_ptr, attribute_list.domain_info_ptr (attribute_list_idx));
+	     if domain_info.name = unmake_name (attribute_list.name (attribute_list_idx))
+	     then if delete_object_info.inhibit_errors
+		then attribute_list.name (attribute_list_idx) = "";
+		else call error (error_table_$unsupported_operation,
+			"Attempt to delete a generated attribute " || domain_info.name);
+	     end;					/* do attribute_list_idx */
+
+	return;
+     end check_for_deletion_of_generated_attributes;
+%page;
+check_for_deletion_of_primary_key:
+     proc;
+
+dcl attr_idx fixed bin;
+dcl deletion_attributes char (500);
+dcl no_primary_key bit (1) aligned;
+
+/* Check to make sure that we wouldn't be getting rid of a primary key. */
+
+          deletion_attributes = "";
+	no_primary_key = "1"b;
+	do attribute_list_idx = 1 to attribute_list.count;
+	     attribute_ptr = attribute_list.attribute_ptr (attribute_list_idx);
+	     if attribute_ptr ^= null then do attr_idx = 1 to attribute.count;
+		relation_ptr = relation_list.relation_ptr (attribute.relation_idx (attr_idx));
+		do attribute_idx = 1 to relation.attribute_count;
+		     if relation.attribute(attribute_idx).flags.part_of_key 
+			& relation.attribute_names (attribute_idx) = attribute_list.name (attribute_list_idx)
+		     then do;
+			no_primary_key = "0"b;
+			relation.attribute(attribute_idx).flags.to_be_deleted = "1"b;
+			end;
+		end;
+	     end;
+	end;
+	if ^no_primary_key 
+	then do relation_index = 1 to relation_list.count while (^no_primary_key);
+	     relation_ptr = relation_list.relation_ptr(relation_index);
+	     do attribute_idx = 1 to relation.attribute_count while (^no_primary_key);
+		if relation.attribute(attribute_idx).flags.part_of_key 
+		then if ^relation.attribute(attribute_idx).flags.to_be_deleted
+		     then no_primary_key = "1"b;
+		     else do;
+			attribute_name = unmake_name (relation.attribute_names (attribute_idx));
+			relation.attribute(attribute_idx).flags.to_be_deleted = "0"b;
+			deletion_attributes = rtrim(deletion_attributes) || " " || rtrim(attribute_name);
+			end;
+		end;
+	     if ^no_primary_key 
+	     then do;
+		code = mrds_error_$no_primary_key;
+		call error (code, "Deletion of the attribute(s) " || rtrim(deletion_attributes) || " would result in no primary key in relation "  || rtrim(relation.name) || ".");
+		end;
+	end;
+	end check_for_deletion_of_primary_key;
+%page;
+/*DESCRIPTION
+  Delete all the attribute crossreference records, and update all the domain
+  records to indicate that the attributes in attribute_list don't exist so
+  therefore cannot be referenced by a domain. */
+
+process_xref_records:
+     proc;
+
+	do attribute_list_idx = 1 to attribute_list.count;
+	     if attribute_list.name (attribute_list_idx) ^= ""
+	     then do;
+		attribute_name = unmake_name (attribute_list.name (attribute_list_idx));
+		call mdbm_util_$xref_delete_record (local_iocb, ATTRIBUTE_KEY_HEAD, attribute_name, error_message,
+		     code);
+		if code ^= 0
+		then if (code ^= error_table_$no_record) & (^delete_object_info.inhibit_errors)
+		     then call error (code, error_message);
+
+		di_ptr = ptr (dbm_ptr, attribute_list.domain_info_ptr (attribute_list_idx));
+		call mdbm_util_$xref_dereference (local_iocb, DOMAIN_KEY_HEAD, (domain_info.name), attribute_name,
+		     reference_count , error_message, code);
+		if code ^= 0
+		then if ^delete_object_info.inhibit_errors
+		     then call error (code, error_message);
+
+		if reference_count <= 1 
+		then domain_info.unreferenced = "1"b;
+		
+		call rmdb_add_rmdb_history (dbm_ptr, RMDB_ATTR_TYPE, (domain_info.name), RMDB_DEL_ATTR_OP, attribute_name, (""), (0));
+		end;
+	     end;					/* do attribute_list_idx */
+
+     end process_xref_records;
+%page;
+/*DESCRIPTION
+  This subroutine frees the unreferenced_attribute structure in the db_model for
+  each attribute in the attribute_list. It assumes that each of the entries in
+  that list are unreferenced attributes. */
+
+delete_unreferenced_attribute_list:
+     proc;
+
+	do attribute_list_idx = 1 to attribute_list.count;
+	     if (attribute_list.name (attribute_list_idx) ^= "")
+		& (attribute_list.attribute_ptr (attribute_list_idx) = null)
+	     then do;
+		di_ptr = ptr (dbm_ptr, attribute_list.domain_info_ptr (attribute_list_idx));
+		attribute_name = unmake_name (attribute_list.name (attribute_list_idx));
+		previous_ptr, save_ptr = null;
+		do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+		     repeat ptr (dbm_ptr, unreferenced_attribute.fwd_thread)
+		     while ((rel (ua_ptr) ^= NULL_OFFSET) & (save_ptr = null));
+
+		     if attribute_name = unreferenced_attribute.name
+		     then save_ptr = ua_ptr;
+		     else previous_ptr = ua_ptr;
+		     end;				/* do ua_ptr */
+
+		if save_ptr ^= null
+		then do;
+		     if previous_ptr = null
+		     then db_model.unreferenced_attribute_ptr = save_ptr -> unreferenced_attribute.fwd_thread;
+		     else previous_ptr -> unreferenced_attribute.fwd_thread =
+			     save_ptr -> unreferenced_attribute.fwd_thread;
+
+		     free save_ptr -> unreferenced_attribute in (dbm_area);
+		     end;
+
+		call rmdb_add_rmdb_history (dbm_ptr, RMDB_ATTR_TYPE, (domain_info.name), RMDB_DEL_ATTR_OP, attribute_name, (""), (0));
+
+		end;
+	     end;					/* do attribute_list_idx */
+
+	return;
+     end delete_unreferenced_attribute_list;
+%page;
+/*DESCRIPTION
+  Create an attribute_list structure populated by all the entries in the
+  unreferenced_attribute list in the db_model. */
+
+make_unreferenced_attribute_list:
+     proc;
+
+/* Count up the unreferenced attributes */
+	attribute_list_count = 0;
+	do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+	     repeat ptr (dbm_ptr, unreferenced_attribute.fwd_thread) while (rel (ua_ptr) ^= NULL_OFFSET);
+	     attribute_list_count = attribute_list_count + 1;
+	     end;					/* do ua_ptr */
+
+	if attribute_list_count = 0
+	then if delete_object_info.inhibit_errors
+	     then call error (0, "");
+	     else call error (mrds_error_$no_unref_attr, "");
+
+/* Create the attribute_list structure and populate it. */
+	allocate attribute_list in (user_area) set (attribute_list_ptr);
+	attribute_list_count = 0;
+	do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+	     repeat ptr (dbm_ptr, unreferenced_attribute.fwd_thread) while (rel (ua_ptr) ^= NULL_OFFSET);
+
+	     attribute_list_count = attribute_list_count + 1;
+	     attribute_list.name (attribute_list_count) = make_name ((unreferenced_attribute.name));
+	     attribute_list.attribute_ptr (attribute_list_count) = null;
+	     attribute_list.domain_info_ptr (attribute_list_count) = unreferenced_attribute.domain_ptr;
+	     end;					/* do ua_ptr */
+
+	return;
+     end make_unreferenced_attribute_list;
+%page;
+/*DESCRIPTION
+  Print the information for the -check option. Optionally query to check for
+  deletion. */
+
+print_information:
+     proc;
+
+dcl  cancel_attribute bit (attribute_list.count);
+dcl  first_cancel_attribute fixed bin;
+
+	cancel_attribute = "0"b;
+	first_cancel_attribute = 0;
+
+	do attribute_list_idx = 1 to attribute_list.count;
+	     if attribute_list.name (attribute_list_idx) ^= ""
+	     then do;
+		attribute_ptr = attribute_list.attribute_ptr (attribute_list_idx);
+		attribute_name = unmake_name (attribute_list.name (attribute_list_idx));
+
+		if delete_object_info.check
+		then do;
+		     if attribute_ptr = null
+		     then call ioa_$ioa_switch (delete_object_info.check_iocb_ptr, "^/Attribute ""^a"" is unreferenced.",
+			attribute_name);
+		     else do;
+			call ioa_$ioa_switch_nnl (delete_object_info.check_iocb_ptr,
+			     "^/Attribute ""^a"" is used in relation^[s^]", attribute_name, attribute.count > 1);
+			do attribute_idx = 1 to attribute.count;
+			     relation_name = unmake_name (relation_list.name (attribute.relation_idx (attribute_idx)));
+			     if attribute_idx = 1
+			     then call ioa_$ioa_switch_nnl (delete_object_info.check_iocb_ptr, " ""^a""", relation_name);
+			     else call ioa_$ioa_switch_nnl (delete_object_info.check_iocb_ptr, "^[ and^;,^] ""^a""",
+				(attribute.count = attribute_idx), relation_name);
+			     end;			/* do attribute_idx */
+			call ioa_$ioa_switch_nnl (delete_object_info.check_iocb_ptr, ".^/");
+			end;
+		     end;
+		
+		if (delete_object_info.check & delete_object_info.long = UNSPEC) then;
+		else if ^delete_object_info.force 
+		then if ^query ()
+		     then do;
+			substr (cancel_attribute, attribute_list_idx, 1) = "1"b;
+			if first_cancel_attribute = 0
+			then first_cancel_attribute = attribute_list_idx;
+			end;
+
+		end;
+	     end;					/* do attribute_list_idx */
+
+	if first_cancel_attribute ^= 0
+	then call recalculate_attributes_deleted;
+
+	return;
+%page;
+query:
+     proc returns (bit (1) aligned);
+
+dcl  answer char (3);
+
+	call command_query_ (addr (query_info), answer, delete_object_info.request_name,
+	     "     Do you wish to delete the attribute " || rtrim(attribute_name) || " ?");
+	if answer = "no"
+	then return ("0"b);
+	else return ("1"b);
+
+     end query;
+%page;
+/*DESCRIPTION
+  If any of delete operations have been cancelled, this subroutine recalculates
+  which attributes of which relations have to be deleted. */
+
+recalculate_attributes_deleted:
+     proc;
+
+dcl  have_attributes_to_process bit (1) aligned;
+dcl  position fixed bin;
+dcl  search_name char (33);
+
+/* First mark all attributes in all referenced relations undeleted. */
+	do relation_index = 1 to relation_list.count;
+	     relation_ptr = relation_list.relation_ptr (relation_index);
+	     unspec (relation.attribute (*).flags) = "0"b;
+	     end;					/* do relation_index */
+
+/* Now walk through the attribute list, marking each attribute in the relation
+   structures deleted or not. */
+	have_attributes_to_process = "0"b;
+	do attribute_list_idx = 1 to attribute_list.count;
+	     if substr (cancel_attribute, attribute_list_idx, 1)
+	     then attribute_list.name (attribute_list_idx) = "";
+	     else do;
+		have_attributes_to_process = "1"b;
+		attribute_ptr = attribute_list.attribute_ptr (attribute_list_idx);
+		if attribute_ptr ^= null
+		then do;
+		     search_name = attribute_list.name (attribute_list_idx);
+		     do attribute_idx = 1 to attribute.count;
+			relation_ptr = relation_list.relation_ptr (attribute.relation_idx (attribute_idx));
+			position = index (relation_attribute_names, search_name);
+			if position ^= 0
+			then do;
+			     position = divide (position, 33, 17, 0) + 1;
+			     relation.attribute (position).flags.delete = "1"b;
+			     end;
+			end;			/* do attribute_idx */
+		     end;
+		end;
+	     end;					/* do attribute_list_idx */
+
+	if ^have_attributes_to_process
+	then call error (0, "");
+
+	return;
+     end recalculate_attributes_deleted;
+
+     end print_information;
+%page;
+/*DESCRIPTION
+  This subroutine either deletes all information pertaining to a relation (if
+  all attributes are deleted) or reformats it (if only some attributes are
+  deleted. */
+
+process_single_relation:
+     proc;
+
+	if all_attributes_are_deleted ()
+	then call delete_relation_information;
+	else call rmdb_copy_relation (dbm_ptr, db_path, rmdb_ctl.temp_dir_path, addr (rmdb_ctl.relmgr_entries),
+		relation_ptr, error_message, code);
+	return;
+     end process_single_relation;
+%page;
+/* DESCRIPTION
+*  This module was brought over from rmdb_copy_relation since we can't really 
+*  clean up before we have finished with ALL the relations.  It performs 
+*  several steps;  initiate the copy of the file_model (.k), get the name of
+*  the associated relation, copy contents of new file_model to the old one,
+*  move the data from the old file to the new one, delete the old relation,
+*  rename the new relation to the old name (or physically copy to old name if
+*  dm file), remove the copy of the file_info from the db_model and free the
+*  space.  Finally, we must update the xref file to show that the relation is
+*  no longer in the attribute key record. */
+	 
+
+switch_names:
+     proc;
+
+dcl  1 local_status_branch like status_branch;
+dcl  create_model_name char (32);
+dcl  create_relation_name char (32);
+dcl  data_acl_ptr ptr;
+dcl  r_index fixed bin;
+dcl  index builtin;
+dcl  move_string char (move_string_length) based;
+dcl  move_string_length fixed bin (35);
+dcl  new_model_bit_count fixed bin (24);
+dcl  new_file_model_ptr ptr;
+dcl  last_file_info_ptr ptr;
+dcl  1 co aligned like copy_options;
+dcl  cvds bit (1) aligned;
+dcl  ivds bit (1) aligned;
+dcl  to_char fixed bin;
+
+          create_model_name = rtrim (relation.name) || ".k";
+	status_area_ptr = user_area_ptr;
+	status_ptr = addr (local_status_branch);
+	call hcs_$status_ (db_path, create_model_name, 0, status_ptr, status_area_ptr, code);
+	to_char = index(status_entry_names (1), ".m");
+	to_char = to_char -1;
+	create_relation_name = rtrim(substr(status_entry_names (1), 1, to_char));
+          call initiate_file_ (db_path, create_model_name, RW_ACCESS, new_file_model_ptr, new_model_bit_count, code);
+	if code ^= 0
+          then call error (code, "While initiating the new_file_model for relation " || relation.name);
+	rmdb_relmgr_entries_ptr = addr (rmdb_ctl.relmgr_entries);
+
+/* Move the contents of the new relation.m to old relation.m. */
+	if (file_model.file_model_copy_good & file_model.relation_copy_good & save_code = 0)  
+	then do;
+	     move_string_length = divide (new_model_bit_count, 9, 35, 0);
+	     fm_ptr -> move_string = new_file_model_ptr -> move_string;
+
+/* Move the contents of the data relation. First we must get the attributes of
+   the old data file (ACL, mode switches) and move them to the new data file. */
+	     data_acl_ptr = null;
+	     call fs_util_$list_acl (db_path, relation.name, GENERAL_ACL_VERSION_1, user_area_ptr, data_acl_ptr, code);
+	     if code ^= 0
+	     then call error (code, "Getting the ACL to relation " || relation.name);
+
+	     call fs_util_$replace_acl (db_path, create_relation_name, data_acl_ptr, "1"b, code);
+	     if code ^= 0
+	     then call error (code, "Setting the ACL on relation " || create_relation_name);
+
+	     cvds, ivds = "0"b;
+	     call fs_util_$get_switch (db_path, relation.name, "complete_volume_dump", cvds, (0));
+	     call fs_util_$get_switch (db_path, relation.name, "incremental_volume_dump", ivds, (0));
+	     
+	     call fs_util_$set_switch (db_path, create_relation_name, "complete_volume_dump", cvds, (0));
+	     call fs_util_$set_switch (db_path, create_relation_name, "incremental_volume_dump", ivds, (0));
+
+/* Now get rid of the old data file. */
+	     call rmdb_relmgr_entries.delete_relation (db_path, relation.name, code);
+	     if code ^= 0
+	     then call error (code, "Deleting relation " || relation.name);
+
+/* If we are dealing with DM files, we need to physically copy the relation
+   file. If not, then we can simply rename the new one to the old name. */
+	     if mstxn_transactions_needed
+	     then do;
+		co.version = COPY_OPTIONS_VERSION_1;
+		co.caller_name = myname;
+		co.source_dir, co.target_dir = db_path;
+		co.source_name = create_relation_name;
+		co.target_name = relation.name;
+
+		unspec (co.flags) = "0"b;
+		unspec (co.copy_items) = "0"b;
+
+		call fs_util_$copy (addr (co), code);
+		if code ^= 0
+		then call error (code, "Copying the new data file onto the old data file for relation " || relation.name);
+		end;
+	     else do;
+		call hcs_$chname_file (db_path, create_relation_name, create_relation_name, relation.name, code);
+		if code ^= 0
+		then call error (code, "Renaming relation file from " || rtrim (create_relation_name) || " to " || relation.name);
+		end; 
+	     end;                      /* file_model and relation good */
+
+/* Since we renamed the new to the old, we can get rid of the new names. */
+/* We also replaced the original file_model with the new_one. */
+	call rmdb_relmgr_entries.delete_relation (db_path, create_relation_name, (0));
+	call delete_$path (db_path, create_model_name, "101111"b, myname, (0));
+
+/* Take the copy of the file_model out of the db_model */
+	if relation.copy_file_model_ptr ^= null
+          then do;
+	     do fi_ptr = ptr (dbm_ptr, db_model.file_ptr) repeat ptr (dbm_ptr, file_info.fwd_ptr)
+		while (rel (fi_ptr) ^= rel (copy_file_model_ptr));
+		last_file_info_ptr = fi_ptr;
+		end;
+
+	     last_file_info_ptr -> file_info.fwd_ptr = copy_file_model_ptr -> file_info.fwd_ptr;
+	     free relation.copy_file_model_ptr -> file_info in (dbm_area);
+	     end;
+	
+	if (code ^= 0)
+	then if ^delete_object_info.inhibit_errors
+	     then call error (code, error_message);
+	     else ;				/* ignore the error */
+	else if save_code = 0
+		
+/* Now we have to update the crossreference file records for all attributes that
+   were deleted in this relation. */
+	     then do r_index = 1 to relation.attribute_count;
+		if relation.attribute (r_index).flags.delete
+		then do;
+		     attribute_name = unmake_name (relation.attribute_names (r_index));
+		     call mdbm_util_$xref_dereference (local_iocb, ATTRIBUTE_KEY_HEAD, attribute_name, relation.name,
+			reference_count, error_message, code);
+		     if (code ^= 0) & ^(delete_object_info.inhibit_errors)
+		     then call error (code, error_message);
+
+		     end;
+		end;				/* do relation_index */
+		
+	return;
+     end switch_names;
+%page;
+/*DESCRIPTION
+  This function searches the attribute list of the current relation and returns
+  true if all the attributes are marked for deletion. */
+all_attributes_are_deleted:
+     proc returns (bit (1) aligned);
+
+dcl  attribute_idx fixed bin;
+
+	do attribute_idx = 1 to relation.attribute_count;
+	     if ^relation.attribute (attribute_idx).flags.delete
+	     then return ("0"b);
+	     end;					/* do relation_index */
+
+	return ("1"b);
+     end all_attributes_are_deleted;
+
+
+delete_relation_information:
+     proc;
+
+/* Unlink the file_info structure. */
+	save_ptr, previous_ptr = null;
+	do fi_ptr = ptr (dbm_ptr, db_model.file_ptr) repeat ptr (dbm_ptr, file_info.fwd_ptr)
+	     while ((save_ptr = null) & (rel (fi_ptr) ^= NULL_OFFSET));
+	     if file_info.file_name = relation.name
+	     then save_ptr = fi_ptr;
+	     else previous_ptr = fi_ptr;
+	     end;					/* do fi_ptr */
+
+	if save_ptr ^= null
+	then do;
+	     if previous_ptr = null
+	     then db_model.file_ptr = save_ptr -> file_info.fwd_ptr;
+	     else previous_ptr -> file_info.fwd_ptr = save_ptr -> file_info.fwd_ptr;
+
+	     free save_ptr -> file_info in (dbm_area);
+
+	     call mdbm_util_$xref_delete_record (local_iocb, RELATION_KEY_HEAD, relation.name, error_message, (0));
+	     end;
+
+/* Now delete the relation and relation.m files. */
+	call delete_file (relation.name);
+	call delete_file (rtrim (relation.name) || ".m");
+
+	db_model.num_blk_files = db_model.num_blk_files - 1;
+	db_model.num_rels = db_model.num_rels - 1;
+
+	call rmdb_add_rmdb_history (dbm_ptr, RMDB_REL_TYPE, relation.name, RMDB_DEL_REL_OP, "", (""), (0));
+	return;
+
+delete_file:
+     proc (file_name);
+
+dcl  delete_$path entry (char (*), char (*), bit (36) aligned, char (*), fixed bin (35));
+dcl  file_name char (*) parameter;
+dcl  fs_util_$delentry_file entry (char (*), char (*), fixed bin (35));
+
+	call fs_util_$delentry_file (db_path, file_name, code);
+	if code = error_table_$unsupported_operation
+	then call delete_$path (db_path, file_name, "101111"b, myname, code);
+
+	if (code ^= 0) & (^delete_object_info.inhibit_errors)
+	then call error (code, "Deleting " || file_name);
+
+	return;
+     end delete_file;
+
+     end delete_relation_information;
+
+%page;
+%include access_mode_values;
+%include acl_structures;
+%include area_info;
+%include copy_flags;
+%include copy_options;
+%include mdbm_db_model;
+%include mdbm_file_model;
+%include mrds_rmdb_ctl;
+%include query_info;
+%include rmdb_crossref_info;
+%include rmdb_delete_object_info;
+%include rmdb_history_entry;
+%include status_structures;
+%page;
+dcl  addr builtin;
+dcl  1 ai like area_info aligned;
+dcl  any_other condition;
+dcl  attribute_idx fixed bin;
+dcl  attribute_list_idx fixed bin;
+dcl  attribute_name char (32);
+dcl  based_char8 char (8) based;
+dcl  cleanup condition;
+dcl  code fixed bin (35);
+dcl  command_query_ entry () options (variable);
+dcl  db_path char (168);
+dcl  define_area_ entry (ptr, fixed bin (35));
+dcl  delete_$path entry (char(*), char(*), bit(36) aligned, char(*), fixed bin(35));
+dcl  divide builtin;
+dcl  error_message char (500);
+dcl  error_table_$action_not_performed fixed bin (35) ext static;
+dcl  error_table_$unsupported_operation fixed bin (35) ext static;
+dcl  error_table_$no_record fixed bin (35) ext static;
+dcl  error_table_$unimplemented_version fixed bin (35) ext static;
+dcl  fixed builtin;
+dcl  fs_util_$copy entry (ptr, fixed bin(35));
+dcl  fs_util_$get_switch entry (char(*), char(*), char(*), bit(1) aligned, fixed bin(35));
+dcl  fs_util_$list_acl entry (char(*), char(*), char(*), ptr, ptr, fixed bin(35));
+dcl  fs_util_$replace_acl entry (char(*), char(*), ptr, bit(1), fixed bin(35));
+dcl  fs_util_$set_switch entry (char(*), char(*), char(*), bit(1) aligned, fixed bin(35));
+dcl  hcs_$chname_file entry (char(*), char(*), char(*), char(*), fixed bin(35));
+dcl  hcs_$status_ entry (char(*), char(*), fixed bin(1), ptr, ptr, fixed bin(35));
+dcl  Idelete_object_info_ptr ptr parameter;
+dcl  index builtin;
+dcl  initiate_file_ entry (char(*), char(*), bit(*), ptr, fixed bin(24), fixed bin(35));
+dcl  ioa_$ioa_switch entry () options (variable);
+dcl  ioa_$ioa_switch_nnl entry () options (variable);
+dcl  Irmdb_ctl_ptr ptr parameter;
+dcl  last_unreferenced_attribute_ptr ptr;
+dcl  length builtin;
+dcl  local_iocb ptr;
+dcl  make_consistent_msg char (500);
+dcl  mdbm_util_$get_temp_segment_path entry (char (*), char (*), ptr, fixed bin (35));
+dcl  mdbm_util_$inconsistent_reset entry (ptr);
+dcl  mdbm_util_$inconsistent_set entry options (variable);
+dcl  mdbm_util_$free_temp_segment entry (char (*), ptr, fixed bin (35));
+dcl  mdbm_util_$xref_build entry (char (*), char (*), ptr, char (*), ptr, char (*), fixed bin (35));
+dcl  mdbm_util_$xref_delete_record entry (ptr, char (*), char (*), char (*), fixed bin (35));
+dcl  mdbm_util_$xref_destroy entry (ptr, char (*), char (*), char (*), fixed bin (35));
+dcl  mdbm_util_$xref_dereference entry (ptr, char (*), char (*), char (*), fixed bin (21), char (*), fixed bin (35));
+dcl  mrds_error_$no_primary_key fixed bin (35) ext static;
+dcl  mrds_error_$no_unref_attr fixed bin (35) ext static;
+dcl  myname char (32) int static options (constant) init ("rmdb_delete_attribute");
+dcl  null builtin;
+dcl  NULL_OFFSET bit (18) unaligned int static options (constant) init ((18)"1"b);
+dcl  Ocode fixed bin (35) parameter;
+dcl  Oerror_message char (*) parameter;
+dcl  previous_ptr ptr;
+dcl  (ptr, pointer) builtin;
+dcl  QUERY_MSG char (256) int static options (constant)
+	init ("Answering yes will cause the specified attribute to be deleted from the
+currently readied MRDS database.");
+dcl  quit condition;
+dcl  quit_occurred bit (1) aligned;
+dcl  reference_count fixed bin (21);
+dcl  rel builtin;
+dcl  relation_good_count fixed bin;
+dcl  relation_index fixed bin;
+dcl  relation_name char (32);
+dcl  release_area_ entry (ptr);
+dcl  rmdb_add_rmdb_history entry (ptr, fixed bin, char (32), fixed bin, char (32), char (500), fixed bin (35));
+dcl  rmdb_copy_relation entry (ptr, char (*), char (*), ptr, ptr, char (*), fixed bin (35));
+dcl  rmdb_delete_all$attributes entry (ptr, char (*), fixed bin (35));
+dcl  rmdb_relations_used$attributes entry (ptr, ptr, ptr, ptr, ptr, ptr, char (*), fixed bin (35));
+dcl  rtrim builtin;
+dcl  save_code fixed bin (35);
+dcl  save_ptr ptr;
+dcl  substr builtin;
+dcl  sys_info$max_seg_size fixed bin (35) ext static;
+dcl  unspec builtin;
+dcl  UNSPEC bit (2) aligned int static options (constant) init ("00"b);
+dcl  user_area area based (user_area_ptr);
+dcl  user_area_ptr ptr;
+
+     end rmdb_delete_attribute;

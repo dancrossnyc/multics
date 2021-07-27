@@ -1,0 +1,363 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style2,idind30 */
+
+sc_execute_command_line_:
+     procedure (Sci_ptr, Line_ptr, Line_lth, Code);
+
+/* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*							       */
+/* ssu_ replaceable execute_line procedure for the system control	       */
+/*      environment.					       */
+/*							       */
+/* This procedure has to peek at the request so as to determine whether it   */
+/* is a "special" request which does not parse its argument.	       */
+/*							       */
+/* It also performs masking of ipc events during execution of SPECIAL        */
+/* requests whose sc_request_table_ entries call for this service.	       */
+/* sc_abort_line_util_$invoke_request masks for nonSPECIAL requests.	       */
+/*							       */
+/* The sequence in which procedures are called in order to invoke a request  */
+/* is as follows:						       */
+/*							       */
+/*    ssu_$listen						       */
+/*     |__sc_execute_command_line_				       */
+/*         |__check for special commands; if special		       */
+/*	     |__INVOKE_SPECIAL_PROCEDURE			       */
+/*	    if not special					       */
+/*	     |__SSU's execute_command_line			       */
+/*	         |__sc_abort_line_util_$invoke_request		       */
+/*	            |__SSU's locate_request			       */
+/*		  |__if event calls should be masked for this request    */
+/*		  |   |__ipc_$mask_ev_calls			       */
+/*		  |					       */
+/*		  |__SSU's invoke_request			       */
+/*		  |   |__sc_execute_command_line_$locate_request	       */
+/*		  |   |   |__SSU's locate request		       */
+/*		  |   |	|__check_restrictions		       */
+/*		  |   |					       */
+/*		  |   |__REQUEST PROCEDURE			       */
+/*		  |					       */
+/*		  |__if event calls were masked		       */
+/*		      |__ipc_$unmask_ev_calls			       */
+/*							       */
+/* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+%page;
+/**** Written 1984-11-01 BIM */
+/**** Modified 1985-01-07, BIM: Changed to allow 
+      installation_parms.require_operator_login to be changed on the fly. */
+/**** Modified 1985-02-01, BIM: changed for mapping of abort_line into 
+     "abort_request"  */
+/**** Modified 1985-03-18, E. Swenson to fix sign_on aborts during special
+      requests. */
+/**** Modified 1985-04-17, E. Swenson to fix masking problems. */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-01,Swenson), approve(87-05-25,MCR7680),
+     audit(87-02-05,GDixon), install(87-08-05,MR12.1-1055):
+     Modified to avoid modifying disk_table_ when running in system control
+     test mode.
+  2) change(87-02-05,GDixon), approve(87-05-25,MCR7690),
+     audit(87-05-06,Parisek), install(87-08-05,MR12.1-1055):
+     Modified for changes to mc_anstbl.incl.pl1.
+  3) change(87-02-05,GDixon), approve(87-05-25,MCR7680),
+     audit(87-05-06,Parisek), install(87-08-05,MR12.1-1055):
+     Modified to correct coding standard violations.  Corrected failure to
+     reset sc_subsystem_info.abort_request_label.  Moved masking of IPC event
+     channels for nonSPECIAL requests from this procedure into
+     sc_abort_line_util_$invoke_request.
+  4) change(87-07-02,GDixon), approve(87-07-02,MCR7680),
+     audit(87-05-06,Parisek), install(87-08-05,MR12.1-1055):
+      A) Since our $locate_request is called by the SSU invoke_request
+         procedure, which is called by sc_abort_line_util_$invoke_request,
+         our $locate_request procedure cannot tell sc_abort_line_util_
+         whether or not to mask event call channels.  It must make that
+         decision itself, prior to calling the real SSU invoke_request.
+      B) Since $locate_request no longer needs to communicate with
+         sc_abort_line_util_, we can remove the
+         sc_subsystem_info.dont_mask_calls element from the include file.
+      C) We still do masking for SPECIAL procedures.  Make unmasking
+         dependent upon whether masking was successfully done, rather than
+         upon whether we tried to do masking.
+      D) Call sc_abort_line_util_$real_abort_line to abort the entire request 
+         line if a sign_on fails.
+                                                   END HISTORY COMMENTS */
+
+	declare Sci_ptr		        pointer;
+	declare Line_ptr		        pointer;
+	declare Line_lth		        fixed bin (21);
+	declare Code		        fixed bin (35);
+
+	declare disk_table_$general_mhv       entry (fixed binary (35));
+	declare ipc_$mask_ev_calls	        entry (fixed bin (35));
+	declare ipc_$unmask_ev_calls	        entry (fixed bin (35));
+	declare sc_abort_line_util_$real_abort_line
+				        entry options(variable);
+	declare sc_ipc_mask_$unmask	        entry (fixed bin);
+	declare sc_ipc_mask_$remask	        entry (fixed bin);
+	declare ssu_$abort_line	        entry () options (variable);
+	declare ssu_$execute_line	        entry (ptr, ptr, fixed bin (21), fixed bin (35));
+	declare ssu_$get_info_ptr	        entry (ptr) returns (ptr);
+	declare ssu_$print_message	        entry () options (variable);
+
+	declare WHITESPACE		        char (6) aligned init ("
+	 ") int static options (constant);		/* FF VT NL CR TAB SP */
+	declare ssu_et_$null_request_line     fixed bin (35) ext static;
+
+	declare begin_request_name	        fixed bin (21);
+	declare code		        fixed bin (35);
+	declare dont_mask		        bit (1) aligned;
+	declare ip		        ptr defined (as_data_$rs_ptrs (0));
+	declare 1 l_request_data	        aligned like request_data;
+	declare (masked_ev_calls_code, unmasked_ev_calls_code)
+				        fixed bin (35);
+	declare remask_count	        fixed bin;	/* depth of ipc event masking */
+	declare request_line_ptr	        pointer;
+	declare request_line_lth	        fixed bin (21);
+	declare request_line	        char (request_line_lth) based (request_line_ptr);
+	declare request_name_lth	        fixed bin (21);
+	declare rest_index		        fixed bin (21);
+	declare special_command	        bit (1) aligned;
+	declare ws_at_end		        fixed bin (21);
+
+	dcl     (addr, length, null, reverse, search, string, substr, verify)
+				        builtin;
+
+	declare cleanup		        condition;
+%page;
+
+/* Program */
+
+	sci_ptr = Sci_ptr;
+	sc_subsystem_info_ptr = ssu_$get_info_ptr (sci_ptr);
+	request_data_ptr = addr (l_request_data);	/* we have our own copy for special requests */
+
+	request_line_ptr = Line_ptr;
+	request_line_lth = Line_lth;
+
+	begin_request_name = verify (request_line, WHITESPACE);
+	if begin_request_name = 0
+	then do;
+		Code = ssu_et_$null_request_line;
+		return;
+	     end;
+
+	request_name_lth = search (substr (request_line, begin_request_name), WHITESPACE);
+	if request_name_lth = 0
+	then request_name_lth = request_line_lth - begin_request_name + 1;
+	else request_name_lth = request_name_lth - 1;	/* this cannot come out zero. */
+	code = 0;
+
+	special_command = "0"b;
+	dont_mask = "0"b;				/* most commands mask while executing */
+
+	call sc_subsystem_info
+	     .
+	     real_locate_request (sci_ptr, substr (request_line, begin_request_name, request_name_lth),
+	     addr (request_data), code);
+	if code = 0
+	then do;
+		sc_rf_ptr = addr (request_data.user_flags);
+		if sc_request_flags.dont_parse_arguments
+		then special_command = "1"b;
+		if sc_request_flags.dont_mask_calls
+		then dont_mask = "1"b;
+	     end;
+
+	if special_command
+	then do;
+		rest_index = verify (substr (request_line, begin_request_name + request_name_lth), WHITESPACE);
+		if rest_index = 0
+		then call INVOKE_SPECIAL_PROCEDURE ("");
+		else do;
+			ws_at_end = verify (reverse (request_line), WHITESPACE);
+			if ws_at_end > 0
+			then ws_at_end = ws_at_end - 1;
+
+			begin;
+
+/* format: off */
+declare line_arg
+        char (request_line_lth
+             - (rest_index + begin_request_name + request_name_lth - 2)
+             - ws_at_end
+             ) /* flush the NL */
+        defined (request_line)
+        pos (rest_index + begin_request_name + request_name_lth - 1);
+
+/* format: on */
+
+			     call INVOKE_SPECIAL_PROCEDURE (line_arg);
+			end;
+		     end;
+	     end;
+	else do;
+		call sc_subsystem_info.real_execute_line (sci_ptr, request_line_ptr, request_line_lth, code);
+						/* this will call us to locate */
+	     end;
+	Code = code;
+
+	return;
+%page;
+INVOKE_SPECIAL_PROCEDURE:
+     procedure (rest_of_line) options (non_quick);
+
+	declare rest_of_line	        char (*);
+
+	declare saved_request_data_ptr        pointer;
+	declare saved_executing_request       bit (1) aligned;
+	declare saved_abort_request	        label;
+
+	declare cu_$arg_list_ptr	        entry returns (ptr);
+
+	saved_request_data_ptr = sci.request_processor_info.request_data_ptr;
+	saved_executing_request = sci.executing_request;
+	saved_abort_request = sc_subsystem_info.abort_request_label;
+
+	masked_ev_calls_code, unmasked_ev_calls_code = -1;
+	if ^dont_mask then
+	on cleanup
+	     begin;
+		sci.request_processor_info.request_data_ptr = saved_request_data_ptr;
+		sc_subsystem_info.abort_request_label = saved_abort_request;
+		sci.executing_request = saved_executing_request;
+		if masked_ev_calls_code = 0 & unmasked_ev_calls_code ^= 0
+		then call ipc_$unmask_ev_calls (unmasked_ev_calls_code);
+	     end;
+
+	sci.request_processor_info.request_data_ptr = addr (request_data);
+	sci.executing_request = "1"b;
+	sc_subsystem_info.abort_request_label = ABORT_SPECIAL_REQUEST;
+
+	call check_restrictions ();
+
+	request_data.call_info.arg_list_ptr = cu_$arg_list_ptr ();
+	request_data.call_info.arg_count = 1;
+	request_data.call_info.af_sw = "0"b;
+	request_data.call_info.rv_ptr = null ();
+	request_data.call_info.rv_lth = 0;
+
+	if ^dont_mask
+	then call ipc_$mask_ev_calls (masked_ev_calls_code);
+
+	call request_data.entry (sci_ptr, addr (sc_subsystem_info));
+
+ABORT_SPECIAL_REQUEST:
+	if masked_ev_calls_code = 0 & unmasked_ev_calls_code ^= 0
+	then call ipc_$unmask_ev_calls (unmasked_ev_calls_code);
+	sci.request_processor_info.request_data_ptr = saved_request_data_ptr;
+	sci.executing_request = saved_executing_request;
+	sc_subsystem_info.abort_request_label = saved_abort_request;
+
+	return;
+     end INVOKE_SPECIAL_PROCEDURE;
+%page(2);
+check_restrictions:
+     procedure;
+
+	declare sci_authority	        (1:36) bit (1) unaligned;
+
+	declare SIGN_ON_COMMAND	        character (7) init ("sign_on") int static options (constant);
+
+/**** This program expects request_data to be set up */
+
+
+	sc_rf_ptr = addr (request_data.user_flags);
+	string (sci_authority) = sc_subsystem_info.restriction_flags;
+
+	if sc_request_flags.restriction_type ^= 0
+	then if ^sci_authority (sc_request_flags.restriction_type)
+	     then call ssu_$abort_line (sci_ptr, 0, "Terminal ^a lacks authority to execute the ^a command.",
+		     sc_subsystem_info.source_name, request_data.full_name);
+
+	if sc_request_flags.obsolete
+	then call ssu_$print_message (sci_ptr, 0, "Warning: the ^a command is obsolete.", request_data.full_name);
+
+	if sc_request_flags.requires_no_as & sc_stat_$Multics
+	then call ssu_$abort_line (sci_ptr, 0,
+		"The Answering Service is already initialized.^[ Type ""go"" to start Multics service.^]",
+		^sc_stat_$Go);
+
+	if sc_request_flags.requires_as & ^sc_stat_$Multics
+	then call ssu_$abort_line (sci_ptr, 0,
+		"The ^a request requires the Answering Service to be initialized.^/"
+		|| "Type ""startup"" or ""multics"" to initialize it.", request_data.full_name);
+
+	if ip ^= null ()
+	then /* Is installations parms initiated? If not, assume no login required */
+	     if ^(sc_request_flags.no_login_needed | sc_stat_$no_operator_login | sc_subsystem_info.mc_atep = null ()
+		| ^installation_parms.require_operator_login)
+	     then do;
+		     if ^sc_subsystem_info.mc_atep -> mc_ate.signed_on
+		     then do;
+			     call ssu_$print_message (sci_ptr, 0, "You must sign on before using the ^a command.",
+				request_data.full_name);
+
+/**** We must unmask IPC event calls here to allow the answering service
+      to function while an operator is being queried for his/her userid
+      and password.  We may have been masked during a previous call to
+      ssu_$execute_line on the stack. */
+
+			     call sc_ipc_mask_$unmask (remask_count);
+
+			     call ssu_$execute_line (sci_ptr, addr (SIGN_ON_COMMAND), length (SIGN_ON_COMMAND),
+				code);
+
+/**** Reset the IPC event call mask to whatever it was before we unmasked
+      above. */
+
+			     call sc_ipc_mask_$remask (remask_count);
+			     if code ^= 0
+			     then call sc_abort_line_util_$real_abort_line
+			        (sci_ptr, code, "Failed to sign on.");
+			end;
+		end;
+
+/**** We are prepared to execute command. Call disk_table_ as needed. */
+
+	if ^sc_stat_$test_mode & sc_request_flags.complete_disks_first
+	then do;
+		call disk_table_$general_mhv (code);
+		if code ^= 0
+		then call ssu_$abort_line (sci_ptr, code, "Failed to mount logical volumes.");
+	     end;
+     end check_restrictions;
+%page;
+/**** Note -- caller supplies request_data */
+
+locate_request:
+     entry (Sci_ptr, Request_name, Request_data_ptr, Code);
+
+	declare Request_name	        char (*);
+	declare Request_data_ptr	        pointer;
+
+	sci_ptr = Sci_ptr;
+	sc_subsystem_info_ptr = ssu_$get_info_ptr (sci_ptr);
+	call sc_subsystem_info.real_locate_request (sci_ptr, Request_name, Request_data_ptr, Code);
+	if Code ^= 0
+	then return;
+
+	request_data_ptr = Request_data_ptr;
+	call check_restrictions;			/* can we execute this? */
+	if sc_request_flags.dont_parse_arguments
+	then call ssu_$abort_line (sci_ptr, 0,
+		"The ^a command was found in an invalid context.  Special^/"
+		|| "commands may only occur at the beginning of lines.", request_data.full_name);
+	return;
+
+/* format: off */
+%page; %include as_data_;
+%page; %include installation_parms;
+%page; %include mc_anstbl;
+%page; %include sc_stat_;
+%page; %include sc_subsystem_info_;
+%page; %include "_ssu_sci";
+%page; %include "_ssu_request_data";
+
+     end sc_execute_command_line_;

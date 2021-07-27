@@ -1,0 +1,301 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+/* format: style2,indcomtxt */
+
+syserr_copy_wired_log:
+     procedure;
+
+/**** This procedure copies all the messages from the wired buffer
+      to the paged syserr log partition.
+
+      It is called by the SyserrLogger the Hproc.
+
+      This procedure expects to be called unwired, with neither the
+      paged log lock nor the wired log lock held.
+
+      1) It locks the paged log.
+
+      2) It wires down.
+
+      3) It locks the wired log (a spin lock)
+
+      4) It copies the wired buffer and marks it empty.
+
+      5) It unlocks the wired log.
+
+      6) It unwires and unmasks.
+
+      7) It calls syserr_copy to actually put the text from
+      the copy of the wired buffer into the paged log.
+
+      8) It unlocks the paged log and returns.
+
+      NOTE
+      This would be considerably more robust if syserr_copy
+      were able to copy directly into the paged log from the
+      wired log, by temp-wiring the neccessary pages of paged log,
+      copying, and then unwiring. The wired buffer should not
+      be marked AVAILABLE until the messages have been successfully
+      disposed of.
+*/
+
+/**** History
+      Created 1984-11-26 BIM: from syserr_log_daemon of Sibert.
+      Modified 1985-01-25 Keith Loepere: fix race in syserr_real copying.
+      Modified 1985-02-19 Keith Loepere: for making the paged syserr lock
+      the highest paged lock.
+      Modified 1985-03-08 EJ Sharpe: added adjust_wired_log_sequence
+*/
+%page;
+
+	declare P_sequence_increment	 fixed bin (35) parameter;
+
+	declare automatic_buffer	 (syserr_data$wired_log_size) bit (36) aligned automatic;
+	declare based_buffer	 (syserr_data$wired_log_size) bit (36) aligned based;
+
+	declare msg_idx		 fixed bin;
+	declare sequence_increment	 fixed bin (35);	/* arg copy */
+	declare temp_mask		 bit (72) aligned;	/* global since it is unwise to call unwire_unmask in a condition handler */
+	declare wire_arg		 fixed bin (71);
+	declare wire_ptr		 pointer;
+
+	declare pmut$read_mask	 entry (bit (72) aligned);
+	declare pmut$wire_and_mask	 entry (fixed bin (71), pointer);
+	declare pmut$unwire_unmask	 entry (fixed bin (71), pointer);
+	declare syserr		 entry options (variable);
+	declare syserr_copy$lock	 entry ();
+	declare syserr_copy$unlock	 entry ();
+	declare syserr_copy$wired_log	 entry (pointer);
+
+	declare pds$processid	 bit (36) external aligned;
+	declare syserr_data$wired_log_size
+				 external fixed bin (35);
+	declare scs$sys_level	 bit (72) aligned external;
+
+	declare any_other		 condition;
+
+	declare (addr, null, rel, stacq, unspec)
+				 builtin;
+%page;
+	syserr_log_data_ptr = addr (syserr_log_data$);
+	sd_ptr = addr (syserr_data$syserr_area);
+	wlog_ptr = addr (syserr_data$wired_log_area);
+
+	call syserr_copy$lock ();			/* Lock the paged log */
+
+	call pmut$wire_and_mask (wire_arg, wire_ptr);
+
+	call get_wired_log ();
+
+	call pmut$unwire_unmask (wire_arg, wire_ptr);	/* Permit faults to occur and be handled */
+
+	on any_other call condition_handler;
+
+	call syserr_copy$wired_log (addr (automatic_buffer));
+
+	if syserr_log_data.take_a_fault
+	then do;					/* For use to test fault recovery: patch this bit on */
+		syserr_log_data.take_a_fault = "0"b;	/* and get a fault. Turn it off, of course, since we */
+		null () -> syserr_log_data.take_a_fault = "0"b;
+						/* only want one fault at a time */
+	     end;
+
+	revert any_other;
+
+	call syserr_copy$unlock ();			/* Unlock the paged log */
+	return;
+
+RETURN_ERROR:
+	if (syserr_log_data.lock.pid = pds$processid)
+	then call syserr_copy$unlock ();
+
+	if temp_mask = scs$sys_level
+	then call pmut$unwire_unmask (wire_arg, wire_ptr);
+
+	if (syserr_log_data.error_count > 5) & sd.log_flag
+	then do;					/* We turn off logging after five errors */
+		call syserr (BEEP, "syserr_copy_wired_log: Too many faults: log copying will be disabled.");
+		sd.log_flag = "0"b;			/* to avoid getting into a loop doing this */
+	     end;
+	syserr_log_data.error_count = syserr_log_data.error_count + 1;
+
+	return;
+%page;
+
+/* The following entrypoint is called from syserr_seg_manager during
+   answering service initialization.  The task is to increase all sequence
+   numbers in the wired log by the value supplied.   This is to get the paged
+   and wired log messages consistant with what the AS has found in the syserr
+   log history (i.e. the permanent log segments). */
+
+adjust_wired_log_sequence:
+     entry (P_sequence_increment);
+
+	sequence_increment = P_sequence_increment;
+	sd_ptr = addr (syserr_data$syserr_area);
+	wlog_ptr = addr (syserr_data$wired_log_area);
+
+	call pmut$wire_and_mask (wire_arg, wire_ptr);
+
+	if (sd.lock = pds$processid)
+	then call lock_error ();
+
+	do while (^stacq (sd.lock, pds$processid, ""b));
+	end;
+
+	wlog.seq_num = wlog.seq_num + sequence_increment; /* make sure next incoming message will be right */
+
+	wmess_ptr = addr (wlog.buffer);		/* first message */
+
+	do msg_idx = 1 to wlog.head.count;
+	     wmess.seq_num = wmess.seq_num + sequence_increment;
+	     wmess_ptr = addrel (wmess_ptr, currentsize (wmess));
+						/* Move on to the next message */
+	end;
+
+	if ^stacq (sd.lock, ""b, pds$processid)
+	then call lock_error ();
+
+	call pmut$unwire_unmask (wire_arg, wire_ptr);
+
+	return;
+%page;
+
+get_wired_log:
+     procedure ();
+
+	declare message_count	 fixed bin;
+
+/* This procedure copies the contents of the wired log into our buffer in automatic
+   storage (also wired, at the moment).	 It locks the wired log, copies the message(s),
+   resets the wired log to say that it's now empty, unlocks the wired log, and
+   returns.  Once we unlock, the next message will be put at the top of the wired
+   buffer.  If we can do all of this before the wired buffer is full, we will never
+   lose any messages. */
+
+
+	if (sd.lock = pds$processid)
+	then /* MYLOCK error */
+	     call lock_error ();
+
+	do while (^stacq (sd.lock, pds$processid, ""b));
+	end;
+
+/* We will copy the whole wired log buffer plus its extension into our own buffer. */
+
+	unspec (automatic_buffer) = unspec (wlog_ptr -> based_buffer);
+
+	message_count = wlog.count;			/* Save for metering */
+
+/* This is where a call to meter_oc_log_ used to be made, but it was removed
+   because meter_oc_log_ is so silly, and because there isn't anything to
+   extract the meters, anyway. Real metering ought to be added back someday. */
+
+	wlog.next = rel (addr (wlog.buffer));		/* Start next message at top of buffer. */
+	wlog.count = 0;				/* No entries in buffer now. */
+
+	if ^stacq (sd.lock, ""b, pds$processid)
+	then call lock_error ();
+
+	return;
+     end get_wired_log;
+
+
+lock_error:
+     procedure ();
+
+/* This procedure crashes the system when a locking error occurs on the
+   wired syserr data lock-- but first, it turns off logging just in case
+   it gets restarted or other messages are generated before the crash. */
+
+	sd.log_flag = "0"b;
+	call syserr (CRASH, "syserr_copy_wired_log: Bad syserr_data lock ^w.", sd.lock);
+
+	return;
+     end lock_error;
+
+condition_handler:
+     procedure ();
+
+	declare severity		 fixed bin;
+	declare buf_ptr		 pointer;
+	declare mess_ptr		 pointer;
+
+	call pmut$read_mask (temp_mask);
+	if temp_mask = scs$sys_level
+	then /* If we took a fault while wired, we should have */
+	     severity = CRASH;			/* crashed already (fim detects this), but just in case... */
+	else severity = BEEP;
+
+	buf_ptr = addr (automatic_buffer);
+	mess_ptr = addr (buf_ptr -> wlog.buffer);
+
+	call syserr (severity,
+	     "syserr_copy_wired_log: Fault occurred while copying into LOG partition. Messages ^d to ^d may be lost",
+	     mess_ptr -> wmess.seq_num, buf_ptr -> wlog.head.seq_num);
+
+	go to RETURN_ERROR;				/* main line uses temp_mask to decide to unwire. */
+     end condition_handler;
+
+%page;
+%include syserr_data;
+%page;
+%include syserr_log_dcls;
+%page;
+%include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   syserr_copy_wired_log: Bad lock WWWWWWWWWWWW at SSS|OOOOOO
+
+   S:	$crash
+
+   T:	$run
+
+   M:	$err
+   The contents of the lock word and its address are printed, as an aid
+   for debugging.
+
+   A:	$recover
+
+   Message:
+   syserr_copy_wired_log: Fault occurred while copying into LOG partition. Messages NNNN to NNNN may be lost.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	$err
+   A fault has occurred while copying data from the wired syserr log buffer
+   to the paged syserr log. This
+   usually results from a disk error on the LOG partition, which would
+   also generate disk error messages.  The sequence numbers of the
+   affected messages are given because those messages may not appear
+   in the LOG partition.
+
+   A:	$recover
+
+
+   Message:
+   syserr_copy_wired_log: Too many faults, log copying disabled.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	$err
+   If too many errors occur updating the LOG partition, log copying will
+   be disabled, which causes all further messages to be printed on the
+   console but not entered in the log.
+
+   A:	$notify
+
+   END MESSAGE DOCUMENTATION */
+
+     end syserr_copy_wired_log;

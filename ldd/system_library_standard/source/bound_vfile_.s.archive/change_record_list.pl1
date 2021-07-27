@@ -1,0 +1,754 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* The initial design and implementation of this program was
+   by M. D. MacLaren (1974) */
+/* All changes since 1975 by M. Asherman:
+   Modified to support recovery from interruptions.
+   Extended to support stationary type records.
+   Modified to avoid wasting first two words of each record component.
+   Extended to support transaction mode updates.
+   Changed for new comp_array format in file header to avoid csl's. */
+/* the following conventions must be observed in manipulating the
+   file statistics giving the number_of_allocated_records and the
+   number_of_free_blocks:
+
+   fs_ptr->number_of_free_blocks is reconstructed, using the protected
+   variable old_number_of_free_blocks in the allocation logic, and
+   using the protected variable old_num_free in the freeing logic.
+
+   fs_ptr->number_of_allocated_records is always protected.
+
+   the alternate state statistics are always reconstructed. */
+change_record_list:
+     proc (iocb_ptr, record_action, buff_ptr, abort_exit);
+	indx_cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	f_b_ptr = file_base_ptr;
+	fs_ptr = indx_cb.file_state_ptr;
+	os_ptr = indx_cb.o_s_ptr;
+	if record_action = allocate_action
+	then do;
+		header_size = 2;
+		call set_required_block_size;
+		call allocate;
+		if ^indx_cb.repeating		/* non-recovery execution */
+		then addr (seg_array (block_offset)) -> excess_words = required_block_size - needed_block_size;
+						/* save min block size info for later
+						   attempt to replace tail in compact form */
+	     end;
+	else if record_action = free_action
+	then do;					/* get rid of preceding allocation */
+		call find_new_ind_block;		/* locate after image block */
+		call free;			/* disposes of allocation */
+	     end;					/* done with cleaning up interrupted stat rewrite */
+	else if record_action = insert_action
+	then if ^file_base.was_stat			/* non-stationary record */
+	     then do;				/* requires smaller block header in this case */
+		     header_size = 2;		/* block size and record length words */
+		     call set_required_block_size;
+		     call allocate;			/* finds available block of sufficient size */
+		end;
+	     else do;				/* make a new stationary record */
+		     header_size = stat_header_size;	/* reserve space for lock and counts */
+		     call set_required_block_size;
+		     call allocate;
+		     if ^indx_cb.repeating		/* non-recovery execution */
+		     then do;			/* mark record as such */
+			     stat_block.ref_count = file_base.old_ref_count;
+						/* for initial key or ref count in record_status */
+			     block_head.stationary = "1"b;
+						/* keeps descriptor valid during rewrites */
+			     if file_base.was_transaction
+			     then do;
+				     stat_block.ref_count_after = file_base.old_ref_count;
+				     stat_block.ind_comp = new_rec_des.comp_num;
+				     time_stamp_struct.ind_offset = new_rec_des.offset;
+				     stat_block.prev_mod = -3;
+						/* signifies pre-creation */
+				end;
+			     else stat_block.time_stamp_words = clock ();
+			end;
+		end;
+	else do;
+		call find_old_block;
+		if record_action = delete_action
+		then if ^file_base.was_stat
+		     then call free;		/* completely dispose of record allocation */
+		     else do;			/* logically delete the record, but leave around until ref_count diminishes */
+			     if ^file_base.is_partial_deletion & ^file_base.out_of_index
+						/* key also deleted */
+			     then do;
+				     new_count = file_base.old_ref_count - 1;
+						/* will decrement for
+						   deleted key pointing to this record */
+				     if ^indx_cb.repeating
+						/* protect during recovery */
+				     then ind_head.ref_count = new_count;
+				end;
+			     else new_count = file_base.old_ref_count;
+						/* count stays the same */
+			     if ^indx_cb.repeating	/* not recovery case */
+			     then do;		/* otherwise allocation is protected */
+				     block_head.after_applies = "1"b;
+				     time_stamp_struct.time_last_modified = clock ();
+				     ind_head.prev_desc = -1;
+						/* stands for logical deletion */
+				     ind_head.prev_mod = file_base.old_modifier;
+				     block_head.indirect = "1"b;
+				     block_head.after_applies = "0"b;
+				end;
+			     if file_base.was_ind	/* already in indirect form */
+			     then do;		/* dispose of indirect allocation, if any */
+				     if file_base.old_ind_desc > 0
+						/* additional block does exist */
+				     then do;
+					     call find_old_ind_block;
+					     call free;
+					     os_ptr -> number_of_allocated_records = number_of_allocated_records;
+						/* don't count ind block as separate */
+					end;
+				     if new_count <= 0
+						/* no more references to this record */
+				     then do;	/* dispose of entirely */
+					     call find_old_block;
+						/* locate fixed portion */
+					     call free;
+						/* garbage collect */
+					end;
+				     else os_ptr -> number_of_allocated_records = number_of_allocated_records;
+				end;
+			     else if new_count <= 0	/* no more references to this compact stat record */
+			     then call free;	/* can completely dispose of */
+			     else do;		/* logically delete a compact stationary record */
+				     required_block_size = minimum_block_size;
+				     residue = file_base.prior_block_size - minimum_block_size;
+				     go to check_tail;
+				end;
+			end;
+		else do;				/* replace action */
+						/* replace the current record image, using
+						   buffer pointed to by buff_ptr arg
+						   for the case of non-stationary records */
+			if ^file_base.was_stat	/* non-stationary type record */
+			then do;			/* rewrite a movable record */
+				header_size = 2;
+				call set_required_block_size;
+				residue = prior_block_size - required_block_size;
+				if residue < 0
+				then do;		/* get a new block */
+					call allocate;
+					call find_old_block;
+						/* restore former location */
+					call free;
+				     end;
+				else do;		/* use old block */
+					new_descriptor = old_record_designator;
+					block_head.lock_flag = "1"b;
+						/* in case of record level synch */
+					call copy_buffer;
+						/* must do before touching residue */
+check_tail:
+					if residue >= minimum_block_size
+					then do;	/* use first part of block and free residual space */
+						if ^indx_cb.repeating
+						/* not recovery case */
+						then do;
+						/* otherwise protect block header */
+							block_head.block_size = required_block_size;
+						/* make residue allocated block and free it */
+							block_offset = block_offset + required_block_size;
+							seg_array (block_offset) = 0;
+						/* clear flags and first word stuff */
+							block_head.block_size = residue;
+						     end;
+						/* this can't be repeated since the
+						   free logic is not repeatable, and it
+						   involves subsequent changes to these same
+						   locations; i.e. we must consistently
+						   protect these values, since we have
+						   chosen not to reconstruct them during
+						   recovery execution */
+						else block_offset = block_offset + required_block_size;
+						call free;
+					     end;
+				     end;
+			     end;			/* end of non-stat rewrite case */
+
+			else /* rewrite a stationary record */
+			     /* replace the current image with that pointed
+						   to by new_descriptor */
+			     if file_base.was_transaction
+						/* transaction */
+			then if (^file_base.was_ind) & (file_base.old_prev_mod = -3)
+						/* compact, pre-created record */
+			     then go to compact_case; /* replace after image in compact tail */
+			     else do;		/* replace new indirect image */
+				     call find_old_ind_block;
+						/* locate old new contents */
+				     call free;	/* dispose of previous after-image */
+				end;
+			else if file_base.was_ind	/* indirect record */
+			then do;
+				block_head.after_applies = "1"b;
+				time_stamp_struct.time_last_modified = clock ();
+				ind_head.prev_mod = file_base.old_modifier;
+				ind_head.prev_desc = file_base.new_descriptor;
+				block_head.after_applies = "0"b;
+				if file_base.old_ind_desc ^= 0
+						/* old block existed */
+				then do;		/* dispose of old indirect block */
+					call find_old_ind_block;
+					call free;/* de-allocates */
+				     end;
+			     end;			/* end of indirect record rewrite logic */
+			else do;			/* rewrite compact stationary type record */
+compact_case:
+				if file_base.new_descriptor > 0
+				then do;
+					block_ptr = addr (seg_array (block_offset));
+					record_ptr = addr (seg_array (block_offset + stat_header_size - 1));
+					call find_new_ind_block;
+						/* after image */
+					call save_needed_blksz;
+					required_block_size = file_base.needed_blksz;
+					if (file_base.prior_block_size
+					     >= required_block_size /* old alloc big enough */)
+					then do;	/* copy back into initial block */
+						if ^indx_cb.repeating
+						then if file_base.was_transaction
+						     then do;
+						/* replace compact after image */
+							     record_head.record_length =
+								file_base.new_record_length;
+							     record_head.record =
+								addr (seg_array (block_offset + 1))
+								-> record_head.record;
+							end;
+						     else do;
+						/* non-TP case */
+							     block_ptr -> block_head.after_applies = "1"b;
+							     addr (block_ptr -> stat_block.time_stamp_words)
+								-> time_stamp_struct.time_last_modified =
+								clock ();
+							     record_head.record_length =
+								file_base.new_record_length;
+							     record_head.record =
+								addr (seg_array (block_offset + 1))
+								-> record_head.record;
+						/* copy back into old */
+							     block_ptr -> stat_block.prev_mod =
+								file_base.old_modifier;
+							     block_ptr -> block_head.after_applies = "0"b;
+							     addr (block_ptr -> stat_block.time_stamp_words)
+								-> time_stamp_struct.time_last_modified =
+								clock ();
+							end;
+						call free;
+						/* deallocate after image */
+						call find_old_block;
+						/* back to header */
+						residue = file_base.prior_block_size - required_block_size;
+						go to check_tail;
+						/* see how much extra */
+					     end; /* record left in compact form */
+					else call find_old_block;
+						/* back to header */
+				     end;
+						/* convert compact record into
+						   indirect form */
+				if file_base.was_transaction
+				then do;		/* replace after image under TP */
+						/* record was created in this
+						   transaction, and is being
+						   subsequently rewritten, deleted,
+						   or rolled back */
+					ind_head.prev_desc = -1;
+					block_head.indirect = "1"b;
+				     end;
+				else do;		/* called by rewrite or checkpoint  logic */
+					block_head.after_applies = "1"b;
+					time_stamp_struct.time_last_modified = clock ();
+					ind_head.prev_desc = file_base.new_descriptor;
+					block_head.indirect = "1"b;
+					stat_block.prev_mod = file_base.old_modifier;
+					block_head.after_applies = "0"b;
+				     end;
+				required_block_size = minimum_block_size;
+				residue = file_base.prior_block_size - minimum_block_size;
+						/* tail of init block */
+				go to check_tail;	/* free tail, if large enough */
+			     end;
+			os_ptr -> number_of_allocated_records = number_of_allocated_records;
+		     end;
+	     end;
+	os_ptr -> number_of_free_blocks = number_of_free_blocks;
+	return;					/* end main code */
+
+find_old_block:
+     proc;					/* locate previously existing record */
+	comp_num = old_rec_des.comp_num;
+	seg_ptr = seg_ptr_array (comp_num);
+	block_offset = fixed (old_rec_des.offset, 18);
+     end find_old_block;
+
+find_new_ind_block:
+     proc;					/* locates newly allocated image block */
+	comp_num = new_rec_des.comp_num;		/* locate the new allocation */
+	block_offset = fixed (new_rec_des.offset, 18);
+	seg_ptr = seg_ptr_array (comp_num);		/* logic of rewrite guarantees
+						   that this comp is initiated */
+     end find_new_ind_block;
+
+find_old_ind_block:
+     proc;					/* finds old indirect allocation */
+	comp_num = old_ind_des.comp_num;
+	seg_ptr = seg_ptr_array (comp_num);
+	block_offset = fixed (old_ind_des.offset, 18);
+     end find_old_ind_block;
+
+set_required_block_size:
+     proc;
+	min_recl = max (file_base.saved_min_cap, new_record_length + file_base.saved_min_res);
+	needed_block_size = header_size + 2 * divide (min_recl + 7, 8, 18, 0);
+	required_block_size = max (minimum_block_size, needed_block_size);
+     end set_required_block_size;
+
+save_needed_blksz:
+     proc;
+	if indx_cb.repeating
+	then do;
+		call check_file_substate;
+		return;
+	     end;
+	file_base.needed_blksz =
+	     6 + addr (seg_array (block_offset)) -> block_head.block_size
+	     - addr (seg_array (block_offset)) -> block_head.excess_words;
+						/* enforce min block size */
+	file_substate = file_substate + 1;
+     end save_needed_blksz;
+
+allocate:
+     proc;					/* grabs a block of space from the free list */
+	call find_free_block;
+	if need_new_seg
+	then do;
+		call use_new_segment;		/* creates new component if necessary */
+		if indx_cb.repeating		/* recovery in progress */
+		then return;			/* protect permanent file variables */
+	     end;
+	else do;					/* allocate block of space in existing segment */
+		rover_seg_ptr = seg_ptr;
+		old_rover_comp_num = comp_num;
+		if indx_cb.repeating
+		then return;			/* protect state during recovery execution */
+		rover_comp_num = comp_num;
+		is_this_block_free = "0"b;
+		if residue < minimum_block_size
+		then call allocate_whole_block;
+		else call allocate_part_block;	/* frees the residue */
+	     end;
+	os_ptr -> number_of_allocated_records = number_of_allocated_records + 1;
+
+copy_buffer:
+     entry;					/* does the assignment of the record's contents */
+	block_offset = fixed (new_rec_des.offset);	/* locate allocated record block */
+	record_ptr = addr (seg_array (block_offset + header_size - 1));
+	record_head.record_length = new_record_length;	/* set len in block header */
+	if buff_ptr ^= null
+	then record_head.record = buffer;		/* does the assignment */
+	else if block_head.block_size > header_size	/* room for record contents */
+	then do;					/* just zero first and last words, in case non-zero */
+		seg_array (block_offset + header_size) = 0;
+						/* free list thread word */
+		seg_array (block_offset + block_head.block_size - 1) = 0;
+						/* free block size tail word */
+	     end;
+	return;					/* end of allocate code */
+
+find_free_block:
+     proc;					/* searches free list for block of sufficient size */
+	if repeating
+	then do;					/* restore non-permanent vars and skip search */
+		call check_file_substate;
+		comp_num = new_rec_des.comp_num;
+		block_offset = fixed (new_rec_des.offset);
+		residue = old_residue;
+		seg_ptr = get_seg_ptr (iocb_ptr, comp_num);
+		return;
+	     end;
+	need_new_seg = "0"b;			/* will be set if no adequate block */
+	seg_ptr = rover_seg_ptr;
+	comp_num = rover_comp_num;
+	block_offset = rover_offset;
+	file_base.old_number_of_free_blocks = number_of_free_blocks;
+	search_not_done = "1"b;
+	do while (search_not_done);			/* look for suitable block */
+	     if block_offset = 0			/* indicates segment is full */
+	     then do;				/* try another component */
+		     comp_num = comp_link (comp_num);
+		     block_offset = init_offset (comp_num);
+		     seg_ptr = get_seg_ptr (iocb_ptr, comp_num);
+		     go to check_rover;		/* give up search if at starting point */
+		end;
+	     else do;				/* check this block's size */
+		     block_offset = non_neg (block_offset);
+		     residue = block_head.block_size - required_block_size;
+		     if residue >= 0
+		     then do;			/* satisfactory block found */
+			     new_rec_des.comp_num = comp_num;
+			     new_rec_des.offset = bit (block_offset);
+			     old_prev_free_block = prev_free_block;
+						/* save for recovery */
+			     old_next_free_block = next_free_block;
+			     old_residue = residue;
+			     search_not_done = "0"b;
+			end;
+		     else do;			/* block too small -- try next on list */
+			     block_offset = next_free_block;
+check_rover:
+			     if block_offset = rover_offset
+			     then if comp_num = rover_comp_num
+				then do;		/* back at start--search failed */
+					new_rec_des.comp_num = last_comp_num + 1;
+					new_rec_des.offset = "0"b;
+					need_new_seg = "1"b;
+					search_not_done = "0"b;
+				     end;
+			end;
+		end;
+	end;
+	file_substate = file_substate + 1;
+	dcl     search_not_done	 bit (1) aligned;
+     end find_free_block;
+
+use_new_segment:
+     proc;					/* finds new component and allocates record block */
+	comp_num = new_rec_des.comp_num;
+	call get_new_seg (iocb_ptr, comp_num, seg_ptr, file_substate, abort_exit);
+	block_offset = 0;
+	old_rover_comp_num = comp_num;
+	rover_seg_ptr = seg_ptr;
+	call set_new_comp_link;
+	if indx_cb.repeating			/* recovery case */
+	then return;				/* protect state */
+	comp_link (0) = comp_num;
+	residue = max_seg_limit - required_block_size - block_offset;
+	if residue < minimum_block_size		/* use whole seg */
+	then do;
+		block_head.block_size = max_seg_limit;	/* whole segment is allocated block */
+		seg_limit (comp_num) = max_seg_limit;
+		init_offset (comp_num) = 0;
+		rover_offset = 0;
+	     end;
+	else do;
+		block_head.block_size = required_block_size;
+		block_offset = required_block_size + block_offset;
+		is_preceding_block_free = "0"b;
+		is_this_block_free = "1"b;
+		block_head.block_size = residue;
+		next_free_block = 0;
+		prev_free_block = 0;
+		init_offset (comp_num) = block_offset;
+		rover_offset = block_offset;
+		seg_limit (comp_num) = block_offset + size (block_head);
+		number_of_free_blocks = old_number_of_free_blocks + 1;
+	     end;
+     end use_new_segment;
+
+set_new_comp_link:
+     proc;
+	if repeating
+	then do;
+		call check_file_substate;
+		return;
+	     end;
+	is_preceding_block_free = "0"b;
+	is_this_block_free = "0"b;
+	rover_comp_num = comp_num;
+	comp_link (comp_num) = comp_link (0);
+	file_substate = file_substate + 1;
+     end;
+
+allocate_whole_block:
+     proc;					/* uses entire block for new record */
+	rover_offset = old_next_free_block;
+	if old_prev_free_block ^= 0
+	then addr (seg_array (non_neg (old_prev_free_block))) -> next_free_block = old_next_free_block;
+	else init_offset (comp_num) = old_next_free_block;
+	if old_next_free_block ^= 0
+	then addr (seg_array (non_neg (old_next_free_block))) -> prev_free_block = old_prev_free_block;
+	following_block_offset = block_offset + block_head.block_size;
+	if following_block_offset = max_seg_limit
+	then seg_limit (comp_num) = max_seg_limit;	/* allocating last block in segment */
+	else addr (seg_array (following_block_offset)) -> is_preceding_block_free = "0"b;
+						/* set block end */
+	number_of_free_blocks = old_number_of_free_blocks - 1;
+     end allocate_whole_block;
+
+allocate_part_block:
+     proc;					/* allocates first part and frees the residual space */
+	residue_offset = block_offset + required_block_size;
+	rover_offset = residue_offset;
+						/* Set links in residue and free block list */
+	if old_prev_free_block ^= 0
+	then addr (seg_array (non_neg (old_prev_free_block))) -> next_free_block = residue_offset;
+	else init_offset (comp_num) = residue_offset;
+	if old_next_free_block ^= 0
+	then addr (seg_array (non_neg (old_next_free_block))) -> prev_free_block = residue_offset;
+	addr (seg_array (residue_offset)) -> prev_free_block = old_prev_free_block;
+	addr (seg_array (residue_offset)) -> next_free_block = old_next_free_block;
+	block_head.block_size = required_block_size;
+						/* set header info for residue of block */
+	block_offset = residue_offset;
+	is_preceding_block_free = "0"b;
+	is_this_block_free = "1"b;
+	block_head.block_size = residue;
+						/* set block end */
+	following_block_offset = block_offset + residue;
+	if following_block_offset = max_seg_limit
+	then seg_limit (comp_num) = block_offset + size (block_head);
+	else seg_array (following_block_offset - 1) = residue;
+     end allocate_part_block;
+
+	dcl     residue		 fixed (19);
+	dcl     residue_offset	 fixed (18);
+     end allocate;
+
+free:
+     proc;					/* places new block onto the free list */
+	call save_old_vars;
+	call make_free;				/* does the work in protected procedure--in case called twice */
+	return;					/* end of free routine */
+
+make_free:
+     proc;
+	if repeating
+	then do;
+		call check_file_substate;
+		return;
+	     end;
+	if prec_block_was_free
+	then call merge_preceding_block;
+	else call free_this_block;
+	if following_block_offset = max_seg_limit
+	then seg_limit (comp_num) = block_offset + size (block_head);
+						/* last block in segment--set new seg_limit */
+	else do;					/* take care of next block */
+		p = addr (seg_array (following_block_offset));
+		if next_block_was_free
+		then call merge_next_block;
+		else do;				/* set next block's prior block info */
+			p -> is_preceding_block_free = "1"b;
+			seg_array (following_block_offset - 1) = former_block_size;
+		     end;
+	     end;
+	number_of_free_blocks = old_num_free + 1 - times_merged;
+	os_ptr -> number_of_allocated_records = number_of_allocated_records - 1;
+	file_substate = file_substate + 1;
+     end make_free;
+
+save_old_vars:
+     proc;					/* sets permanent block info for crash recovery */
+	if repeating
+	then do;
+		call check_file_substate;
+		return;
+	     end;
+	old_init_offset = init_offset (comp_num);
+	old_block_size = block_head.block_size;
+	prec_block_was_free = is_preceding_block_free;
+	old_num_free = number_of_free_blocks;
+	former_rover_comp_num = rover_comp_num;
+	former_rover_offset = rover_offset;
+	if prec_block_was_free
+	then do;
+		prev_block_size = seg_array (block_offset - 1);
+		former_block_size = prev_block_size + old_block_size;
+	     end;
+	else former_block_size = old_block_size;
+	following_block_offset = block_offset + old_block_size;
+	if following_block_offset < max_seg_limit
+	then do;
+		p = addr (seg_array (following_block_offset));
+						/* p-> next block */
+		next_block_size = p -> block_head.block_size;
+		next_next_free_block = p -> next_free_block;
+		next_block_was_free = p -> is_this_block_free;
+		if (following_block_offset = old_init_offset) & ^prec_block_was_free
+		then next_prev_free_block = non_zero (block_offset);
+						/* thread will be changed */
+		else next_prev_free_block = p -> prev_free_block;
+						/* usual case */
+	     end;
+	file_substate = file_substate + 1;
+     end save_old_vars;
+
+merge_preceding_block:
+     proc;					/* combines new block with preceding free block */
+	times_merged = 1;
+	old_block_offset = block_offset;
+	block_offset = old_block_offset - prev_block_size;
+	call zero_words (addr (seg_array (old_block_offset - 1)), 1 + old_block_size);
+	block_head.block_size = prev_block_size + old_block_size;
+						/* combined size */
+	following_block_offset = block_offset + block_head.block_size;
+     end merge_preceding_block;
+
+free_this_block:
+     proc;					/* puts new block onto the free list */
+	times_merged = 0;
+	next_free_block = old_init_offset;
+	prev_free_block = 0;
+	nzbo = non_zero (block_offset);
+	init_offset (comp_num) = nzbo;
+	if next_free_block ^= 0
+	then addr (seg_array (non_neg (next_free_block))) -> prev_free_block = nzbo;
+	is_this_block_free = "1"b;
+	unspec (block_head.flags) = "0"b;
+	call zero_words (addr (seg_array (block_offset + size (block_head))), old_block_size - size (block_head));
+	following_block_offset = block_offset + old_block_size;
+	return;
+	dcl     nzbo		 fixed (18) unsigned;
+     end free_this_block;
+
+merge_next_block:
+     proc;					/* combines new block with following free block */
+	times_merged = times_merged + 1;
+	block_head.block_size = former_block_size + next_block_size;
+						/* Adjust links to-from removed block */
+	if next_prev_free_block ^= 0
+	then addr (seg_array (non_neg (next_prev_free_block))) -> next_free_block = next_next_free_block;
+	else init_offset (comp_num) = next_next_free_block;
+	if next_next_free_block ^= 0
+	then addr (seg_array (non_neg (next_next_free_block))) -> prev_free_block = next_prev_free_block;
+						/* Adjust rover if it designates block being removed from free list */
+	if following_block_offset = former_rover_offset
+	then if comp_num = former_rover_comp_num
+	     then rover_offset = non_zero (block_offset);
+						/* Set end of merged block */
+	if (following_block_offset + next_block_size) = max_seg_limit
+	then do;					/* merged block is last in seg */
+		call zero_words (p, size (block_head));
+		seg_limit (comp_num) = block_offset + size (block_head);
+	     end;
+	else do;
+		call zero_words (p, next_block_size - 1);
+		seg_array (block_offset + block_head.block_size - 1) = block_head.block_size;
+	     end;
+	return;
+     end merge_next_block;
+
+	dcl     p			 ptr;
+	dcl     times_merged	 fixed;
+	dcl     old_block_offset	 fixed (18);
+     end free;
+
+non_neg:
+     proc (offset) returns (fixed (18));
+	if offset = 262143				/* 2**18 - 1 */
+	then return (0);				/* stands for offset 0 */
+	return (offset);
+	dcl     offset		 fixed (18);
+     end non_neg;
+
+non_zero:
+     proc (offset) returns (fixed (18));
+	if offset = 0
+	then return (262143);
+	return (offset);
+	dcl     offset		 fixed (18);
+     end non_zero;
+
+zero_words:
+     proc (p, n);
+	if n > 0
+	then unspec (words) = "0"b;
+	return;
+
+	dcl     words		 (n) fixed based (p);
+	dcl     p			 ptr;
+	dcl     n			 fixed (19);
+     end;						/* end zero words */
+
+check_file_substate:
+     proc;
+	next_substate = next_substate + 1;
+	if file_substate = next_substate
+	then repeating = "0"b;			/* execution resumes normally */
+     end check_file_substate;
+
+/* Declarations */
+	dcl     new_count		 fixed (34);
+	dcl     os_ptr		 ptr;
+	dcl     buff_ptr		 ptr;
+	dcl     buffer		 char (new_record_length) based (buff_ptr);
+	dcl     iocb_ptr		 ptr;
+	dcl     record_action	 fixed;
+	dcl     abort_exit		 label;
+	dcl     pos_ptr		 ptr;		/* not used in this procedure */
+	dcl     header_size		 fixed;
+	dcl     min_recl		 fixed (21);
+	dcl     block_ptr		 ptr;
+	dcl     1 block_head	 based (addr (seg_array (block_offset))),
+		2 is_preceding_block_free
+				 bit (1) unal,
+		2 is_this_block_free bit (1) unal,
+		2 block_size	 fixed (19) unal,
+		2 flags,
+		  3 lock_flag	 bit (1) unal,
+		  3 stationary	 bit (1) unal,
+		  3 indirect	 bit (1) unal,
+		  3 after_applies	 bit (1) unal,
+		  3 pad		 bit (6) unal,
+		  3 excess_words	 fixed (3) unal,	/* only used in indirect allocations */
+		2 prev_free_block	 fixed (18) aligned,
+		2 next_free_block	 fixed (18) aligned;
+	dcl     1 stat_block	 based (addr (seg_array (block_offset))),
+		2 pad		 bit (26) unal,
+		2 ref_count_after	 fixed (15) unal,
+		2 ind_comp	 fixed (13) unal,
+		2 ref_count	 fixed (15) unal,
+		2 record_lock	 bit (36) aligned,
+		2 modifier	 fixed (35),
+		2 time_stamp_words	 fixed (71) aligned,
+		2 prev_mod	 fixed (35),
+		2 record_length	 fixed (21),
+		2 record		 char (0 refer (stat_block.record_length));
+	dcl     1 ind_head		 based (addr (seg_array (block_offset))),
+		2 pad		 bit (26) unal,
+		2 ref_count_after	 fixed (15) unal,
+		2 ind_comp	 fixed (13) unal,
+		2 ref_count	 fixed (15) unal,
+		2 record_lock	 bit (36) aligned,
+		2 modifier	 fixed (35),
+		2 time_stamp_words	 fixed (71) aligned,
+		2 prev_mod	 fixed (35),
+		2 prev_desc	 fixed (35);
+	dcl     1 time_stamp_struct	 based (addr (stat_block.time_stamp_words)),
+		2 ind_offset	 bit (18) unal,
+		2 time_last_modified fixed (53) unal;
+	dcl     record_ptr		 ptr;
+	dcl     1 record_head	 based (record_ptr),
+		2 record_length	 fixed (21) aligned,
+		2 record		 char (0 refer (record_head.record_length));
+	dcl     1 old_rec_des	 like designator_struct aligned based (addr (old_record_designator));
+	dcl     1 old_ind_des	 like designator_struct aligned based (addr (file_base.old_ind_desc));
+	dcl     1 new_rec_des	 like designator_struct aligned based (addr (new_descriptor));
+	dcl     comp_num		 fixed;
+	dcl     block_offset	 fixed (18);
+	dcl     following_block_offset fixed (18);
+	dcl     required_block_size	 fixed (19);
+	dcl     residue		 fixed (19);
+
+%include vfile_indx;
+%include iocbv;
+	dcl     clock		 builtin;
+	dcl     needed_block_size	 fixed (19);
+     end /* end change_record_list */;

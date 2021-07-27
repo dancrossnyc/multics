@@ -1,0 +1,2267 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(89-04-23,Zimmerman), approve(89-04-23,MCR8087),
+     audit(89-05-05,RWaters), install(89-05-24,MR12.3-1048):
+     MCR8087 cmcs_queue_ctl_.pl1 Shorten wait time for cmcs_station_ctl_.
+                                                   END HISTORY COMMENTS */
+
+
+/* Modified on 10/10/84 by FCH, [5.3-1], BUG565(phx18385), wait time for set_lock_$lock */
+/* Modified on 05/06/81 by FCH, [4.4-6], activate and deactivate commands, BUG468 */
+/* Modified on 05/05/81 by FCH, [4.4-5], emi and egi are equiv, BUG468 */
+/* Modified on 04/29/81 by FCH, [4.4-3], test station_ctl_entry.output_disabled_sw in send, BUG468 */
+/* Modified on 04/25/81 by FCH, [4.4-2], once per process initialization, BUG468 */
+/* Modified on 04/27/81, [4.4-1], check for now_much^=0 caused abort, BUG468 */
+/* Modified since Version 4.3 */
+
+
+
+
+
+
+
+/* format: style3 */
+cmcs_queue_ctl_:
+     proc;
+
+	return;					/* bad entrypoint */
+
+/* This COBOL MCS subroutine manages the queue related CMCS functions of
+   ACCEPT, SEND, RECEIVE, PURGE, and ENABLE/DISABLE INPUT (QUEUE).
+   Common code is shared by receive/print, and purge/stop_run.
+
+   Bob May, 6/30/77 */
+
+/* Note: The disable/enable entrypoints all accept a char (10) password string. This string is ignored
+   because it was already checked by cobol_mcs_. Current ANSI rules on the use of multiple passwords for CMCS
+   terminals and queues is unclear and requests for clarification have been submitted. Until the clarification
+   is issued, this implementation will use a single password. Thus, cobol_mcs_ can do the checking for everybody. */
+
+dcl	a_input_cdp	ptr,
+	a_output_cdp	ptr,
+	a_cdp		ptr,			/* when we don't know yet whether input or output (purge) */
+	a_code		fixed bin (35),
+	a_iocb_ptr	ptr,			/* print entrypoint only */
+	a_buffer_ptr	ptr,
+	a_buffer_len	fixed bin,
+	a_station_count	fixed bin,		/* send entrypoint only */
+	a_slew_ctl	fixed bin (35),		/* send entrypoint only */
+	a_password	char (10),
+	a_io_subtype	fixed bin;
+
+dcl	cdp		ptr;			/* intermediate value for purge and stop_run */
+
+dcl	buffer_len	fixed bin (21),
+	buffer_left_index	fixed bin (35),
+	buffer_left_len	fixed bin (35),
+	buffer_ptr	ptr,
+	buffer		char (buffer_len) based (buffer_ptr);
+						/* for copying data */
+
+dcl	(msg_no, seg_no)	fixed bin (35);
+
+dcl	sysprint		file env (interactive);	/* for DEBUG */
+
+dcl	program_interrupt	condition;
+
+dcl	test_sw		bit (1) int static init ("0"b);
+
+dcl	iocb_ptr		ptr;			/* for all the queue I/O, one at atime */
+
+dcl	1 min_blksz_info	int static,		/* to ensure space for vfile lockword in each record */
+	  2 min_residue	fixed bin (21),
+	  2 min_capacity	fixed bin (21);
+
+dcl	my_name		char (15) init ("cmcs_queue_ctl_");
+						/* for DEBUG */
+
+dcl	(addr, char, fixed, index, min, null, rtrim, size, string, substr)
+			builtin;
+
+dcl	(
+	ioa_,
+	ioa_$rsnnl,
+	sub_err_
+	)		entry options (variable);
+
+dcl	sub_err_retval	fixed bin (35);		/* dummy for sub_err_ */
+
+dcl	get_process_id_	entry () returns (bit (36)),
+	get_group_id_	entry () returns (char (32)),
+	hcs_$truncate_seg	entry (ptr, fixed bin (18), fixed bin (35)),
+	clock_		entry () returns (fixed bin (71));
+
+dcl	get_temp_segments_	entry (char (*), (*) ptr aligned, fixed bin (35)),
+	release_temp_segments_
+			entry (char (*), (*) ptr aligned, fixed bin (35));
+
+dcl	set_lock_$lock	entry (bit (36) aligned, fixed bin, fixed bin (35)),
+	set_lock_$unlock	entry (bit (36) aligned, fixed bin (35));
+
+dcl	(i, code)		fixed bin (35);
+
+dcl	(
+	error_table_$action_not_performed,
+	error_table_$bad_new_key,
+	error_table_$no_record,
+	error_table_$not_open
+	)		fixed bin (35) external;
+
+dcl	(old_status, new_status)
+			fixed bin,		/* for status_list_ctl_ */
+	(io_subtype, io_type)
+			fixed bin,
+	station_name	char (12),
+	station_count	fixed bin;
+
+dcl	overlay_len	fixed bin,		/* to erase structure data */
+	overlay		(overlay_len) fixed bin (35) based;
+
+dcl	dest_table_index	fixed bin,
+	flag		bit (1);
+
+dcl	1 msg_descr	like vfile_descr;
+
+dcl	zero		fixed bin (35) int static options (constant) init (0);
+
+dcl	zero_descr_ptr	ptr int static;
+
+dcl	1 zero_descr	like vfile_descr based (zero_descr_ptr);
+
+/*  */
+
+/* declarations for SEND */
+
+dcl	send_init_sw	bit (1) int static init ("0"b);
+
+dcl	ptr_array		(1) ptr static internal;	/* to pick up temp segs, one at a time */
+dcl	tseg_ptr		ptr,			/* temporary buffer for partial messages, per queue */
+	tseg_len		fixed bin (21),
+	tseg		char (tseg_len) based (tseg_ptr);
+dcl	tseg_max_len	fixed bin (21) init (64 * 1024 * 4);
+						/* arbitrary */
+dcl	switch_no		fixed bin int static init (0);/* to generate switch names for same queue */
+dcl	attach_descr	char (256);		/* for iox_$attach */
+dcl	attach_descr_len	fixed bin;		/* returned by ioa_$rsnnl */
+dcl	switch_pic	pic "99";			/* to generate switch name from queue_name, number */
+
+dcl	1 send_vfile_rs	like vfile_rs int static;	/* to allocate records for send */
+
+dcl	send_vfile_rs_ptr	ptr int static;
+
+dcl	1 send_descr	like vfile_descr int static;
+dcl	seek_len		fixed bin (21);		/* for record_status allocate */
+dcl	fb21		fixed bin (21);		/* dummy output variable for seek_key */
+
+/* */
+
+/* Declarations for RECEIVE */
+
+dcl	init_queue_table_sw bit (1) int static init ("0"b);
+
+dcl	queue_table_ptr	ptr int static;
+
+dcl	1 queue_table_struc based (queue_table_ptr),
+	  2 queue_table_len fixed bin,
+	  2 queue_table	(tree_ctl.current_size refer (queue_table_struc.queue_table_len)) fixed bin;
+						/* table of queue indices for subtree */
+dcl	copy_len		fixed bin (35);
+
+dcl	1 rcv_vfile_rs	like vfile_rs int static;
+
+dcl	1 rcv_descr	like vfile_descr int static;
+
+dcl	rcv_vfile_rs_ptr	ptr int static;
+
+dcl	rcv_descr_ptr	ptr int static;
+
+dcl	subtree_count	fixed bin;
+
+dcl	rcv_init_sw	bit (1) int static init ("0"b);
+
+/* Declarations for ACCEPT_MESSAGE_COUNT */
+
+dcl	msg_count		fixed bin (35);		/* careful, inside input_cd, it's a char item */
+
+/*  */
+%include cmcs_cd_dcls;
+%include cmcs_control_hdr;
+%include cmcs_entry_dcls;
+%include cmcs_error_table_dcls;
+%include cmcs_iox_processing;
+%include cmcs_key_dcls;
+%include cmcs_msg_hdr;
+%include cmcs_msg_seg;
+%include cmcs_queue_ctl;
+%include cmcs_slew_ctl;
+%include cmcs_station_ctl;
+%include cmcs_system_ctl;
+%include cmcs_tree_ctl;
+%include cmcs_user_ctl;
+%include cmcs_vfile_rs;
+%include cmcs_wait_ctl;
+/*  */
+set:
+     proc;
+
+/*[4.4-2]*/
+	if ^external_user_ctl_ptr -> user_ctl.init_sw.queue_ctl
+	then call setup;
+
+     end;
+
+accept_message_count:
+     entry (a_input_cdp, a_io_subtype, a_code);
+
+/*[4.4-2]*/
+	call set;
+
+	input_cdp = a_input_cdp;
+	io_type = 5;
+	io_subtype = a_io_subtype;
+
+	call build_queue_table ();
+
+	if a_code ^= 0
+	then return;				/* build_queue_table sets status_key */
+
+	msg_count = 0;				/* accumulative */
+
+	do i = 1 to queue_table_len;			/* sum individual counts for this specific request */
+
+	     queue_ctl_eindex = queue_table (i);
+	     queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+/* accumulated count is not a "locked" count, since it can change before the user does a receive anyway */
+
+	     msg_count = msg_count + queue_ctl_entry.status_list_ctl_entries (2).count;
+						/* count only available msgs */
+
+	end;
+
+	input_cd.msg_count = msg_count;		/* fixed bin -> char, required by COBOL */
+	input_cd.status_key = "00";
+
+	return;
+
+/* end of accept_message_count entrypoint */
+
+/*  */
+
+disable:
+     entry (a_input_cdp, a_io_subtype, a_password, a_code); /* strictly for queues, not stations */
+
+/*[4.4-2]*/
+	call set;
+
+	input_cdp = a_input_cdp;
+	io_type = 4;
+	io_subtype = a_io_subtype;
+
+	call build_queue_table;
+
+	if a_code ^= 0
+	then return;
+
+	code = 0;
+
+	do i = 1 to queue_table_len;
+
+	     queue_ctl_eindex = queue_table (i);
+	     queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+	     if ^queue_ctl_entry.input_disabled_sw
+	     then queue_ctl_entry.input_disabled_sw = "1"b;
+	     else code = cmcs_error_table_$queue_already_disabled;
+
+	end;
+
+	a_code = code;				/* whatever the results, status_key here is "00" */
+	input_cd.status_key = "00";
+
+	return;
+
+/* end of disable entrypoint */
+
+/*  */
+
+enable:
+     entry (a_input_cdp, a_io_subtype, a_password, a_code); /* strictly for queues, not stations */
+
+/*[4.4-2]*/
+	call set;
+
+	input_cdp = a_input_cdp;
+	io_type = 3;
+	io_subtype = a_io_subtype;
+
+	call build_queue_table;
+
+	if a_code ^= 0
+	then return;
+
+	code = 0;
+
+	do i = 1 to queue_table_len;
+
+	     queue_ctl_eindex = queue_table (i);
+	     queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+	     if queue_ctl_entry.input_disabled_sw
+	     then queue_ctl_entry.input_disabled_sw = "0"b;
+
+	     else code = cmcs_error_table_$queue_already_enabled;
+
+	end;
+
+	a_code = code;				/* whatever the results, status_key here is "00" */
+	input_cd.status_key = "00";
+
+	return;
+
+/* end of enable entrypoint */
+
+/*  */
+
+stop_run:
+     entry (a_io_subtype, a_code);			/* for now, a_io_subtype must always be 1 */
+
+	io_type = 8;				/* for use in purge_common */
+	cdp = null ();
+
+	go to purge_common;
+
+/* */
+
+purge:
+     entry (a_cdp, a_io_subtype, a_code);
+
+	io_type = 6;				/* to identify purge request */
+	cdp = a_cdp;
+
+/* From now on, purge and stop_run share common code. */
+
+purge_common:
+	dest_table_index = 0;
+	a_code = 0;
+
+/*[4.4-2]*/
+	call set;
+
+	io_subtype = a_io_subtype;
+
+/* if the cdp is null, we delete all sends and/or receives */
+
+	if cdp = null ()
+	then do;
+
+		do tree_ctl_eindex = 1 to tree_ctl.hdr.current_size;
+
+		     tree_ctl_eptr = addr (tree_ctl.entries (tree_ctl_eindex));
+		     if tree_ctl_entry.subtree_count = 0
+		     then if tree_ctl_entry.io_in_process_sw
+			then do;			/* active entry */
+
+				call get_tce_parms;
+
+				if tree_ctl_entry.io_type = 1
+				then if ^(io_type = 6 & io_subtype = 2)
+						/* specifically shouldn't do sends */
+				     then do;
+
+					     call purge_send_entry;
+					end;
+				     else ;
+				else if tree_ctl_entry.io_type = 2 | tree_ctl_entry.io_type = 7
+				then if ^(io_type = 6 & io_subtype = 1)
+						/* specifically shouldn't do receives */
+				     then do;
+
+					     call purge_rcv_entry;
+
+					end;
+
+			     end;
+
+		     if tree_ctl_entry.iocb_ptr ^= null ()
+		     then call close;
+
+		end;
+
+		a_code = 0;
+
+		return;
+	     end;					/* of code for null cdp */
+
+/* Drop-thru means the cdp wasn't null. Thus, we must be in purge, not stop_run. */
+
+
+	a_code = 0;				/* set zero now, to let first error set non-zero */
+
+	if io_subtype = 1
+	then do;					/* purge sends only */
+
+		output_cdp = cdp;
+		output_cd.status_key = "00";		/* initialize good, set only on first error */
+
+		station_count = output_cd.station_count;/* thank heavens for pictures */
+
+		do dest_table_index = 1 to station_count;
+
+		     station_name = output_cd.dest_table (dest_table_index).station_name;
+
+		     call cmcs_tree_ctl_$find_destination (station_name, tree_ctl_eindex, tree_ctl_eptr, code);
+
+		     if code ^= 0
+		     then do;
+			     if a_code = 0
+			     then do;
+
+				     a_code = code;
+				     output_cd.status_key = "20";
+
+				end;
+
+			     output_cd.dest_table (dest_table_index).error_key = "1";
+
+			     go to send_loop_end;
+			end;
+
+		     call get_tce_parms;
+		     call purge_send_entry;
+
+		     if code ^= 0
+		     then do;
+
+			     if a_code = 0
+			     then do;
+				     a_code = code;
+				     output_cd.status_key = "20";
+				end;
+
+			     output_cd.dest_table (dest_table_index).error_key = "1";
+
+			     go to send_loop_end;
+
+			end;
+		end;
+	     end;					/* of purges of sends, using supplied cdp */
+
+	else if a_io_subtype = 2			/* just purge the receives */
+	then do;
+
+		input_cdp = cdp;
+		input_cd.status_key = "00";		/* set good now, change if needed */
+
+		call cmcs_tree_ctl_$find_tree_path (input_cdp, tree_ctl_eindex, subtree_count, tree_ctl_eptr, code);
+
+		if code ^= 0
+		then do;
+
+purge_set_input_err:
+			input_cd.status_key = "20";
+			a_code = code;
+			return;
+		     end;
+
+		if subtree_count = 0
+		then do;
+
+			call get_tce_parms;
+			call purge_rcv_entry;
+
+			if code ^= 0
+			then go to purge_set_input_err;
+
+		     end;
+		else do i = tree_ctl_eindex to tree_ctl_eindex + subtree_count - 1;
+
+			tree_ctl_eptr = addr (tree_ctl.entries (i));
+
+			if tree_ctl_entry.subtree_count = 0
+			then do;
+
+				call get_tce_parms;
+				call purge_rcv_entry;
+
+				if code ^= 0
+				then if a_code = 0
+				     then do;
+
+					     a_code = code;
+					     input_cd.status_key = "20";
+
+					end;
+			     end;
+		     end;				/* purge rcv subtree loop */
+
+	     end;
+
+	return;
+
+/*  */
+
+get_tce_parms:
+     proc ();
+
+	queue_ctl_eindex = tree_ctl_entry.queue_ctl_eindex;
+	queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+	iocb_ptr = tree_ctl_entry.iocb_ptr;
+	msg_descr = tree_ctl_entry.msg_descr;
+	msg_no = tree_ctl_entry.msg_no;
+
+	return;
+
+     end /* get_tce_parms */;
+
+/* */
+
+purge_rcv_entry:
+     proc ();
+
+	if ^tree_ctl_entry.io_in_process_sw
+	then do;
+
+		code = cmcs_error_table_$no_partial_messages;
+
+		return;
+
+	     end;
+
+/* Move the message from in-process back to available */
+
+	call cmcs_status_list_ctl_$move (queue_ctl_eptr, iocb_ptr, addr (msg_descr), 3, 2, code);
+
+	if code ^= 0
+	then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+		"Attempting to move message (^d in ^a) from status-3 back to status-2. Continuing.", msg_no,
+		tree_ctl_entry.queue_name);
+
+	call reset_tce_io;
+
+	return;
+
+     end /* purge_rcv_entry */;
+
+/* */
+
+purge_send_entry:
+     proc ();
+
+/* This procedure assumes that tree_ctl_eptr and dest_table_index are correctly set by the caller */
+
+	if ^tree_ctl_entry.io_in_process_sw
+	then do;
+
+		code = cmcs_error_table_$no_partial_messages;
+
+		return;
+
+	     end;
+
+	if tree_ctl_entry.partial_in_process_sw
+	then do;
+
+		tree_ctl_entry.tseg_len = 0;
+
+		call hcs_$truncate_seg (tree_ctl_entry.tseg_ptr, 0, code);
+
+		if code ^= 0
+		then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			"Attempting to truncate the temporary data segment for ^a. Continuing.",
+			tree_ctl_entry.queue_name);
+		tree_ctl_entry.partial_in_process_sw = "0"b;
+
+	     end;					/* of partial seg processing */
+
+	if tree_ctl_entry.seg_count > 0
+	then do;					/* physical records exist and must be deleted */
+
+		call cmcs_status_list_ctl_$delete (queue_ctl_eptr, iocb_ptr, addr (msg_descr), 1, code);
+
+		if code ^= 0
+		then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			"Attempting to delete message (^d in ^a) from status-1. Continuing.", msg_no,
+			tree_ctl_entry.queue_name);
+
+		key_struc.msg_no = msg_no;
+		do seg_no = 1 to tree_ctl_entry.seg_count;
+
+		     key_struc.seg_no = seg_no;
+		     key = based_key;		/* to keep vfile_ happy */
+
+		     call iox_$seek_key (iocb_ptr, key, fb21, code);
+
+		     if code ^= 0
+		     then do;
+
+			     call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+				"Attempting to seek message segment (^d/^d in ^a) for deletion. Continuing.",
+				msg_no, seg_no, tree_ctl_entry.queue_name);
+
+			     go to end_delete_msg_seg_loop;
+
+			end;
+
+		     call iox_$delete_record (iocb_ptr, code);
+
+		     if code ^= 0
+		     then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			     "Attempting to delete message segment (^d/^d in ^a). Continuing.", msg_no, seg_no,
+			     tree_ctl_entry.queue_name);
+
+end_delete_msg_seg_loop:
+		end;
+	     end;					/* seg_count > 0 */
+
+	if io_type = 6 & dest_table_index ^= 0
+	then do;
+
+		call cmcs_station_ctl_$validate (station_name, station_ctl_eindex, code);
+						/* just to get the entry index */
+		call cmcs_station_ctl_$output_disabled (station_ctl_eindex, flag, code);
+
+		if flag
+		then do;
+			code = cmcs_error_table_$dest_disabled;
+
+			if a_code = 0
+			then do;
+
+				a_code = code;
+				output_cd.status_key = "10";
+			     end;
+
+			output_cd.dest_table (dest_table_index).error_key = "1";
+
+		     end;
+	     end;
+
+	call reset_tce_io;
+
+	return;
+
+     end /* purge_send_entry */;
+
+/*  */
+
+print:
+     entry (a_input_cdp, a_io_subtype, a_iocb_ptr, a_code);
+
+	io_type = 7;				/* to distinguish from receive in common code */
+
+	go to rcv_common;
+
+/* */
+
+receive:
+     entry (a_input_cdp, a_io_subtype, a_buffer_ptr, a_buffer_len, a_code);
+
+	io_type = 2;				/* to indicate receive in common code */
+
+rcv_common:					/* from here on, receive and print are nearly the same */
+						/*[4.4-2]*/
+	call set;
+
+	if ^rcv_init_sw
+	then do;					/* do only 1st time entered */
+
+		rcv_descr_ptr = addr (rcv_descr);
+		rcv_vfile_rs_ptr = addr (rcv_vfile_rs);
+		overlay_len = size (rcv_vfile_rs);
+		rcv_vfile_rs_ptr -> overlay (*) = 0;
+		rcv_vfile_rs.version = vfile_rs_version;
+		rcv_vfile_rs.lock_sw,		/* locate switch set dynamically */
+		     rcv_vfile_rs.unlock_sw = "0"b;
+
+/* We don't need to lock individual records because no two processes will ever be operating
+   on the same message number at the same time. They are locked out at queue_ctl level. */
+
+		rcv_init_sw = "1"b;
+
+	     end;
+
+/* set basic controls */
+
+	input_cdp = a_input_cdp;
+	io_subtype = a_io_subtype;
+
+/* First check for ambiguous tree_path. ANSI says that results from the specification of an ambiguous tree path
+   are vendor defined. This implementation defines this situation to be an error. */
+
+	call build_queue_table;			/* sets tree_ctl_e(index ptr) */
+
+	if a_code ^= 0
+	then return;				/* status key already set */
+
+	if subtree_count ^= 0
+	then do;
+
+		call rcv_check_io_in_process;
+
+		if a_code ^= 0
+		then return;			/* nonzero is ambiguous_tree_path */
+
+	     end;
+	else if tree_ctl_entry.io_in_process_sw
+	then do;
+
+		if io_type ^= tree_ctl_entry.io_type	/* don't let them do a receive, for example */
+		then do;
+
+			a_code = error_table_$action_not_performed;
+
+/*[4.4-6]*/
+			if ^user_ctl.rec
+			then call sub_err_ (a_code, my_name, "c", null (), sub_err_retval,
+				"Attempting to do a receive on tree path ""^a""
+when another I/O operation (^d) is already in process.
+Returning a status key of ""20"".", string (tree_ctl_entry.tree_path), tree_ctl_entry.io_type);
+
+			input_cd.status_key = "20";
+
+			return;
+
+		     end;
+
+		iocb_ptr = tree_ctl_entry.iocb_ptr;
+		queue_ctl_eindex = tree_ctl_entry.queue_ctl_eindex;
+		queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+		call rcv_set_type;			/* reset  the old and set the new */
+
+		if io_type = 7
+		then go to rcv_get_next_seg;		/* only for print */
+
+		call rcv_set_buffer;
+
+		go to rcv_copy_seg_data;		/* only for receive */
+
+	     end;
+
+/* drop-through means no io_in_process, check first if terminal output disabled */
+
+rcv_find_msg:
+	if user_ctl.terminal_sw
+	then do;
+
+		call cmcs_station_ctl_$output_disabled (user_ctl.station_ctl_eindex, flag, a_code);
+
+		if a_code ^= 0
+		then return;
+
+		if flag
+		then do;
+			a_code = cmcs_error_table_$dest_disabled;
+			return;
+		     end;
+
+	     end;
+
+	call qc_lock;				/* so we can safely acquire a message */
+
+	if code ^= 0
+	then do;					/* should never happen */
+
+rcv_lock_err:					/*[4.4-6]*/
+		if ^user_ctl.rec
+		then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			"Problem locking queue_ctl to receive message. Return to COBOL program with status key of ""20""."
+			);
+		a_code = code;
+
+		input_cd.status_key = "20";
+		return;
+
+	     end;
+
+	if subtree_count = 0
+	then do;					/* user gave abs_tree_path */
+
+		queue_ctl_eindex = tree_ctl_entry.queue_ctl_eindex;
+		queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+		if queue_ctl_entry.status_list_ctl_entries (2).count = 0
+		then do;
+
+rcv_no_msg:
+			if io_type = 2 & (io_subtype = 3 | io_subtype = 4)
+			then go to rcv_wait_msg;
+
+			a_code = cmcs_error_table_$no_message;
+			input_cd.status_key = "00";	/* no-message is not an error */
+
+			call qc_unlock;
+
+			return;
+
+		     end;
+
+		go to rcv_found_msg;
+
+	     end;
+
+/* no abs path, must look in entire subtree */
+
+	else do;					/* queue ctl still locked from above */
+
+		do i = 1 to queue_table_len;
+
+		     queue_ctl_eindex = queue_table (i);
+		     queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+		     if queue_ctl_entry.status_list_ctl_entries (2).count ^= 0
+		     then go to rcv_found_msg;
+
+		end;
+
+/* fell through, no messages in the subtree */
+
+		go to rcv_no_msg;
+
+	     end;
+
+rcv_wait_msg:					/* come here to sit and wait */
+	call qc_unlock;				/* don't keep locked or we'll have problems */
+
+	on program_interrupt
+	     begin;				/* interactive user got tired of waiting */
+
+		call cmcs_wait_ctl_$delete (user_ctl.wait_ctl_eindex, a_code);
+
+		a_code = cmcs_error_table_$no_message;
+		input_cd.status_key = "20";		/* we can't say anything more meaningful */
+
+/*[4.4-6]*/
+		if ^user_ctl.rec
+		then call sub_err_ (a_code, my_name, "h", null (), sub_err_retval,
+			"Program Interrupt occurred while waiting for message.
+	Type ""start"" to return to COBOL program with status key of ""20"".");
+
+		go to rcv_error_return;
+
+	     end;
+
+	call cmcs_wait_ctl_$add (string (input_cd.tree_path), user_ctl.wait_ctl_eindex, a_code);
+
+/* When we reach here, we either went to sleep and have been awakened with a message, or
+		   wait ctl rejected our request to add our entry to its list. */
+
+	revert program_interrupt;
+
+	if a_code ^= 0
+	then do;					/* should never happen */
+
+rcv_error_return:
+		input_cd.status_key = "20";
+		return;
+
+	     end;
+
+
+/* We had a good sleep and were awakened with a message. Get the info about the message from the wait ctl entry
+   and attempt to get it before someone else does. If we fail, just loop back on the wait again. */
+
+
+	wait_ctl_eindex = user_ctl.wait_ctl_eindex;
+	wait_ctl_eptr = addr (wait_ctl.entries (wait_ctl_eindex));
+
+	queue_ctl_eindex = wait_ctl_entry.queue_ctl_eindex;
+	queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+	tree_ctl_eindex = wait_ctl_entry.tree_ctl_eindex;
+	tree_ctl_eptr = addr (tree_ctl.entries (tree_ctl_eindex));
+
+	call qc_lock;
+
+	if code ^= 0
+	then go to rcv_lock_err;			/* should never happen */
+
+	if queue_ctl_entry.status_list_ctl_entries (2).count = 0
+	then do;					/* we missed it */
+
+/*[4.4-6]*/
+		if ^user_ctl.rec
+		then call sub_err_ (0, my_name, "c", null (), sub_err_retval,
+			"Missed locking record from receive wait. Will wait for another.");
+
+		go to rcv_wait_msg;			/* unlock queue ctl there */
+
+	     end;
+
+/* Getting here means that we actually detected an available msg in queue ctl.
+			   Now we must access it to be sure we really did get it. */
+
+	call cmcs_wait_ctl_$delete (wait_ctl_eindex, code);
+
+	if code ^= 0
+	then do;
+
+/*[4.4-6]*/
+		if ^user_ctl.rec
+		then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			"Unexpected error code from deleting entry in wait_ctl. Continuing.");
+
+	     end;
+
+	go to rcv_set_msg_busy;			/* all indices and ptrs already set */
+
+rcv_found_msg:					/* Getting here means that we found a message without having to wait for it. queue_ctl_eindex and queue_ctl_eptr
+   must have been set already. */
+	tree_ctl_eindex = queue_ctl_entry.tree_ctl_eindex;
+	tree_ctl_eptr = addr (tree_ctl.entries (tree_ctl_eindex));
+
+rcv_set_msg_busy:					/* the lock, all ptrs, etc, must already be set */
+	call reset_tce_io;				/* start clean */
+	call open;				/* make sure the file is usable */
+
+	if code ^= 0
+	then do;
+
+rcv_queue_err:					/* should never happen */
+						/*[4.4-6]*/
+		if ^user_ctl.rec
+		then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			"Attempting to process queue ""^a"" for receive. Returning to COBOL program with status key of ""20"".",
+			tree_ctl_entry.queue_name);
+
+		a_code = code;
+		input_cd.status_key = "20";
+
+		call qc_unlock;			/* ignore error code */
+
+		return;
+
+	     end;
+
+	rcv_descr, tree_ctl_entry.msg_descr = queue_ctl_entry.status_list_ctl_entries (2).f_descr;
+
+	call cmcs_status_list_ctl_$move (queue_ctl_eptr, iocb_ptr, rcv_descr_ptr, 2, 3, code);
+
+/* move msg from available to busy */
+
+	if code ^= 0
+	then go to rcv_queue_err;			/* should never happen */
+
+/* The msg is now truly ours. Indicate that I/O is truly in_process and set appropriate control info */
+
+	call qc_unlock;				/* ignore status */
+
+/* Initialize Message Control Info */
+
+	call rcv_set_type;
+
+	call rcv_seek_descr;			/* make msg known to process */
+
+	if code ^= 0
+	then go to rcv_queue_err;			/* should never happen */
+
+	msg_hdr_ptr, tree_ctl_entry.msg_hdr_ptr = rcv_vfile_rs.rec_ptr;
+
+	tree_ctl_entry.seg_count = msg_hdr.seg_count;	/* don't reference the hdr again until we're thru with it */
+	tree_ctl_entry.msg_len = msg_hdr.msg_len;
+
+
+/* Set Input CD Info */
+
+	input_cd.station_name = msg_hdr.source_station;
+
+	call cmcs_date_time_ (msg_hdr.clock_available, input_cd.msg_date, input_cd.msg_time);
+
+	string (input_cd.tree_path) = string (tree_ctl_entry.tree_path);
+
+	msg_no, tree_ctl_entry.msg_no, key_struc.msg_no = msg_hdr.msg_no;
+	seg_no, tree_ctl_entry.seg_no, key_struc.seg_no = msg_hdr.seg_no;
+	msg_seg_ptr, tree_ctl_entry.msg_seg_ptr = addr (msg_hdr.msg_seg);
+
+/* Check for and Initialize Buffer Control */
+
+	if io_type = 2
+	then do;					/* it's a rcv request */
+		call rcv_set_buffer;
+	     end;
+
+/* Initialize Segment Control */
+
+rcv_set_seg_ctl:
+	tree_ctl_entry.msg_seg_len, tree_ctl_entry.msg_seg_left_len = msg_seg.hdr.seg_len;
+	tree_ctl_entry.msg_seg_left_index = 1;
+
+	if io_type = 7
+	then do;					/* must be a print request (7) */
+
+		call cmcs_print_ (a_iocb_ptr, addr (msg_seg.data.seg_data), msg_seg.hdr.seg_len,
+		     addr (msg_seg.hdr.slew_ctl), code);
+
+		go to rcv_check_for_more_segs;	/* ignore return status */
+
+	     end;
+
+/* Processing a receive request instead */
+
+rcv_copy_seg_data:
+	if tree_ctl_entry.msg_seg_left_len = 0
+	then go to rcv_check_for_more_segs;
+
+	if tree_ctl_entry.buffer_left_len = 0
+	then do;					/* couldn't use up segment/message */
+
+		input_cd.text_len = tree_ctl_entry.buffer_len;
+		input_cd.text_delim = 0;		/* more to come */
+		input_cd.status_key = "00";
+		a_code = 0;
+
+		return;
+	     end;
+
+	copy_len = min (tree_ctl_entry.msg_seg_left_len, tree_ctl_entry.buffer_left_len);
+
+	substr (buffer, tree_ctl_entry.buffer_left_index, copy_len) =
+	     substr (msg_seg.data.seg_data, tree_ctl_entry.msg_seg_left_index, copy_len);
+
+	tree_ctl_entry.msg_seg_left_index = tree_ctl_entry.msg_seg_left_index + copy_len;
+	tree_ctl_entry.msg_seg_left_len = tree_ctl_entry.msg_seg_left_len - copy_len;
+	tree_ctl_entry.buffer_left_index = tree_ctl_entry.buffer_left_index + copy_len;
+	tree_ctl_entry.buffer_left_len = tree_ctl_entry.buffer_left_len - copy_len;
+
+	go to rcv_copy_seg_data;			/* one of the two tests must fail */
+
+rcv_check_for_more_segs:
+	if tree_ctl_entry.seg_count = tree_ctl_entry.seg_no
+	then do;					/* no more segs, message is exhausted */
+
+		msg_hdr_ptr = tree_ctl_entry.msg_hdr_ptr;
+		msg_hdr.clock_deleted = clock_ ();	/* for future statistics */
+		input_cd.text_delim = msg_hdr.final_delim;
+		input_cd.text_len = tree_ctl_entry.buffer_left_index - 1;
+		tree_ctl_entry.io_in_process_sw = "0"b;
+		rcv_descr = tree_ctl_entry.msg_descr;
+
+
+		call qc_lock;
+
+		if code ^= 0
+		then go to rcv_queue_err;
+
+		call cmcs_status_list_ctl_$move (queue_ctl_eptr, tree_ctl_entry.iocb_ptr, rcv_descr_ptr, 3, 4, code);
+						/* move from busy to used */
+
+		if code ^= 0
+		then do;				/* should never happen */
+
+/*[4.4-6]*/
+			if ^user_ctl.rec
+			then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+				"Attempting to put msg in ""used"" status list. Continuing.");
+		     end;
+
+		call qc_unlock;			/* ignore status */
+
+		input_cd.status_key = "00";
+		a_code = 0;
+
+		return;
+
+	     end;
+
+/* more segs available if we want them */
+
+	if tree_ctl_entry.rcv_seg_sw
+	then do;					/* just wants one seg at a time */
+
+		input_cd.text_delim = 1;		/* mark as seg delim */
+		input_cd.text_len = tree_ctl_entry.buffer_left_index - 1;
+		input_cd.status_key = "00";
+		a_code = 0;
+
+		return;
+
+	     end;
+
+/* User does want full message instead of just a segment */
+
+rcv_get_next_seg:					/* we already know there is one */
+	seg_no, key_struc.seg_no, tree_ctl_entry.seg_no = tree_ctl_entry.seg_no + 1;
+
+	msg_no, key_struc.msg_no = tree_ctl_entry.msg_no;
+
+	call rcv_seek_key;
+
+	if code ^= 0
+	then do;
+
+/*[4.4-6]*/
+		if ^user_ctl.rec
+		then call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			"Attempting to seek another segment of current message.
+	Returning to COBOL program with status key of ""20"".");
+
+		a_code = code;
+		input_cd.status_key = "20";
+
+		return;
+
+	     end;
+
+	msg_seg_ptr, tree_ctl_entry.msg_seg_ptr = rcv_vfile_rs.rec_ptr;
+
+	go to rcv_set_seg_ctl;
+
+
+/*  */
+
+rcv_seek_key:
+     proc ();
+
+	key = based_key;
+
+	call iox_$seek_key (tree_ctl_entry.iocb_ptr, key, fb21, code);
+
+	if code ^= 0
+	then return;
+
+	rcv_vfile_rs.locate_sw = "0"b;		/* use the record found by the seek */
+
+	call iox_$control (tree_ctl_entry.iocb_ptr, "record_status", rcv_vfile_rs_ptr, code);
+
+	if code = 0
+	then rcv_descr = rcv_vfile_rs.descr;
+	else rcv_descr = zero_descr;
+
+	return;					/* with last code */
+
+     end /* rcv_seek_key */;
+
+/* */
+
+rcv_seek_descr:
+     proc ();
+
+	rcv_vfile_rs.descr = rcv_descr;
+	rcv_vfile_rs.locate_sw = "1"b;
+
+	call iox_$control (tree_ctl_entry.iocb_ptr, "record_status", rcv_vfile_rs_ptr, code);
+
+	return;
+
+     end /* rcv_seek_descr */;
+
+/* */
+
+rcv_check_io_in_process:
+     proc ();
+
+/* Assumes that tree_ctl_entry is set to starting node of subtree to be checked, and that subtree_count,
+   always non_zero, includes the starting node. Both get set in call to build_queue_table.
+
+   This procedure leaves the tree_ctl_eindex and tree_ctl_eptr intact with their original values upon exit. */
+
+
+
+	do i = tree_ctl_eindex + 1 to tree_ctl_eindex + subtree_count;
+						/* we know the top node is not a queue */
+
+	     tree_ctl_eptr = addr (tree_ctl.entries (i));
+
+	     if tree_ctl_entry.subtree_count = 0	/* first find an entry for a queue */
+	     then if tree_ctl_entry.io_in_process_sw
+		then if tree_ctl_entry.io_type = 2 | tree_ctl_entry.io_type = 7
+		     then do;
+
+			     a_code = cmcs_error_table_$ambiguous_tree_path;
+			     input_cd.status_key = "20";
+			     return;
+
+			end;
+	end;
+
+	tree_ctl_eptr = addr (tree_ctl.entries (tree_ctl_eindex));
+						/* restore to original value just in case */
+	a_code = 0;
+
+	return;
+
+     end /* rcv_check_io_in_process */;
+
+/*  */
+
+build_queue_table:
+     proc ();
+
+/* If subtree_count = 0, then tree_ctl_eindex and tree_ctl_eptr are set. Otherwise not. */
+
+	if ^init_queue_table_sw
+	then do;
+
+		allocate queue_table_struc;
+		init_queue_table_sw = "1"b;
+	     end;
+
+	call cmcs_tree_ctl_$find_tree_path (input_cdp, tree_ctl_eindex, subtree_count, tree_ctl_eptr, a_code);
+
+	if a_code ^= 0
+	then do;
+
+		input_cd.status_key = "20";
+
+		return;
+	     end;
+
+	if subtree_count = 0
+	then do;					/* we hit a queue entry all by itself */
+
+		queue_table_len = 1;
+		queue_table (1) = tree_ctl.entries (tree_ctl_eindex).queue_ctl_eindex;
+
+		return;
+
+	     end;
+	else do;
+
+		queue_table_len = 0;
+
+		do i = tree_ctl_eindex + 1 to tree_ctl_eindex + subtree_count;
+
+		     tree_ctl_eptr = addr (tree_ctl.entries (i));
+
+		     if tree_ctl_entry.subtree_count = 0
+		     then do;			/* found a queue entry */
+
+			     queue_table_len = queue_table_len + 1;
+			     queue_table (queue_table_len) = tree_ctl_entry.queue_ctl_eindex;
+
+			end;
+		end;
+	     end;
+
+	return;
+
+     end /* build_queue_table */;
+
+/* */
+
+rcv_set_type:
+     proc ();
+
+	string (tree_ctl_entry.io_flags) = (36)"0"b;
+	tree_ctl_entry.io_in_process_sw = "1"b;
+	tree_ctl_entry.io_type = io_type;
+	tree_ctl_entry.io_subtype = io_subtype;
+
+	if io_type = 2
+	then if io_subtype = 3 | io_subtype = 4
+	     then tree_ctl_entry.rcv_wait_sw = "1"b;
+
+	tree_ctl_entry.rcv_seg_sw, tree_ctl_entry.rcv_msg_sw = "0"b;
+						/* init both to false and then set one true */
+
+	if io_subtype = 1 | io_subtype = 3
+	then tree_ctl_entry.rcv_seg_sw = "1"b;		/* print subtype 1 and rcv subtype 1 are the same */
+	else tree_ctl_entry.rcv_msg_sw = "1"b;
+
+	return;
+
+     end /* rcv_set_type */;
+
+
+/* */
+
+rcv_set_buffer:
+     proc ();
+
+	buffer_ptr = a_buffer_ptr;
+	buffer_len, tree_ctl_entry.buffer_len, tree_ctl_entry.buffer_left_len = a_buffer_len;
+
+	buffer_left_index, tree_ctl_entry.buffer_left_index = 1;
+
+     end /* rcv_set_buffer */;
+
+/*  */
+
+send:
+     entry (a_output_cdp, a_io_subtype, a_buffer_ptr, a_buffer_len, a_station_count, a_slew_ctl, a_code);
+
+/*[4.4-2]*/
+	call set;
+
+	if ^send_init_sw
+	then call send_init;
+
+/* from now on, a_code gets set only with the first non-zero status code returned */
+
+	output_cdp = a_output_cdp;
+	io_type = 1;
+	new_status, io_subtype = a_io_subtype;		/* get old status later from tree_ctl_entry */
+
+	if new_status = 3
+	then new_status = 2;			/* EMI and EGI are the same for us */
+
+	buffer_ptr = a_buffer_ptr;
+	buffer_len = a_buffer_len;
+	station_count = a_station_count;
+
+	call send_check_slew;
+
+	if a_code ^= 0
+	then do;
+
+		output_cd.status_key = "60";		/* indicates no action taken */
+
+		return;
+
+	     end;
+
+/* No other checks needed here because cobol_mcs_ has already verified text-len, max-text-len,
+   station-count, and max-station-count. */
+
+
+
+	output_cd.status_key = "00";			/* start clean, change only on first error */
+
+
+
+/* The BIG Loop! The loop processes the message data for each destination (station)
+   in the output_cd. It is possible, and legal, for the various destinations to have
+   different statuses. That is, the message could be the first piece of a message for
+   one destination and the middle piece for another destination. Thus, each station must
+   be handled independently from the others. */
+
+/* Note: To keep the do/end code from nesting too deeply, gotos are used in the outer controls */
+
+
+
+
+
+	do dest_table_index = 1 to station_count;	/* cobol_mcs_ ensures count of at least 1 */
+
+	     station_name = output_cd.dest_table (dest_table_index).station_name;
+
+/*[4.4-3]*/
+	     call cmcs_station_ctl_$find_destination (station_name, station_ctl_eindex, station_ctl_eptr, code);
+
+	     call cmcs_tree_ctl_$find_destination (station_name, tree_ctl_eindex, tree_ctl_eptr, code);
+
+	     if code ^= 0
+	     then do;
+
+		     if a_code = 0
+		     then do;			/* always report the first error encountered */
+
+			     a_code = code;
+			     output_cd.status_key = "20";
+			end;
+
+		     output_cd.dest_table (dest_table_index).error_key = "1";
+
+/*[4.4-3]*/
+		     return;
+
+		end;
+
+	     output_cd.dest_table (dest_table_index).error_key = "0";
+						/* initialize to good now, reset only on error */
+
+	     queue_ctl_eindex = tree_ctl_entry.queue_ctl_eindex;
+
+	     tree_ctl_entry.queue_ctl_eptr, queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+	     if tree_ctl_entry.io_in_process_sw
+	     then do;
+		     if tree_ctl_entry.io_type > 1
+		     then call E9;
+
+		     msg_hdr_ptr = tree_ctl_entry.msg_hdr_ptr;
+		     old_status = tree_ctl_entry.io_subtype;
+						/* always 0 or 1 */
+
+
+
+
+
+
+
+
+		end;
+	     else do;
+		     call reset_tce_io;		/* reset message dep params */
+
+		     tree_ctl_entry.io_type = 1;	/* send */
+
+		     old_status = 0;		/* for use in key computation */
+
+
+		end;
+
+	     call test_subtype;
+
+/*[4.4-4]*/
+	     call set_new_status;			/* 0(partial), 1(esi), 2(emi,egi) */
+
+send_loop_end:					/* set/reset io_in_process_sw. Only if there are no errors and the message is still not completed (just 0/EsI delim),
+   will we set the busy switch. All other cases force it to be reset. This can cause garbage pieces (segments), to be left
+   in the file. These can be cleaned up later with the cobol_mcs_admin request of purge_queues. At a later time,
+   we may do dynamic purging. */
+	     if (new_status ^= 2 & output_cd.dest_table (dest_table_index).error_key ^= "1")
+	     then tree_ctl_entry.io_in_process_sw = "1"b;
+
+/* set busy only if no errors and not (EMI or EGI) */
+
+	     else tree_ctl_entry.io_in_process_sw = "0"b;
+
+/* force reset, for subsequent I/O */
+
+	end;
+
+	return;
+
+
+test_subtype:
+     proc;
+
+	if io_subtype = 0
+	then call send_partial;
+	else call send_non_partial;			/* esi,emi,egi */
+
+
+     end;
+
+E1:
+     proc;					/* queue was disabled */
+
+	a_code = code;
+	output_cd.status_key = "10";
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+E2:
+     proc;					/* output terminal was disabled */
+
+	a_code = code;
+	output_cd.status_key = "10";
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+/*[4.4-3]*/
+/*go to send_loop_end;*/
+
+     end;
+
+E3:
+     proc;					/* input terminal was disabled */
+
+	if a_code = 0
+	then do;
+
+		a_code = code;
+		output_cd.status_key = "20";		/* for lack of a better status key */
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+E4:
+     proc;					/* check status after send_get_key */
+
+	call sub_err_ (code, my_name, "c", sub_err_retval,
+	     "Attempting to lock queue_ctl to get message number for ""^a"".", station_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = code;
+		output_cd.status_key = "50";
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+
+E5:
+     proc;					/* check status after open */
+
+	call sub_err_ (code, my_name, "c", null (), sub_err_retval, "Attempting to open queue for message to ""^a"".",
+	     station_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = code;
+		output_cd.status_key = "20";
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+
+E6:
+     proc;					/* check status after send_seek_key */
+
+	call sub_err_ (code, my_name, "c", sub_err_retval, "Attempting to seek space for message to ""^a"".",
+	     station_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = code;
+		output_cd.status_key = "20";
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+E8:
+     proc;					/* check status after qc_lock, cmcs_status_list_ctl$(move,add) */
+
+	call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+	     "Attempting to add message for ""^a"" to status list. Contact CMCS Administrator. Continuing.",
+	     tree_ctl_entry.queue_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = cmcs_error_table_$bad_dest;
+		output_cd.status_key = "20";
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+     end;
+
+E9:
+     proc;
+
+	call sub_err_ (error_table_$action_not_performed, my_name, "c", null (), sub_err_retval,
+	     "Attempting to perform send to ""^a"" while other I/O in process.", station_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = cmcs_error_table_$bad_dest;
+		output_cd.status_key = "20";
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+
+E10:
+     proc;					/* check status in send_append_tag */
+
+	code = cmcs_error_table_$bad_message_length;
+
+	call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+	     "Maximum size exceeded for partial message to ""^a"".", station_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = code;
+		output_cd.status_key = "20";
+
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+E11:
+     proc;					/* check status after get_temp_segments */
+
+	call sub_err_ (code, my_name, "s", null (), sub_err_retval,
+	     "Attempting to get temp seg for send to ""^a"". Contact CMCS Administrator.", station_name);
+
+	if a_code = 0
+	then do;
+
+		a_code = code;
+		output_cd.status_key = "20";
+
+	     end;
+
+	output_cd.dest_table (dest_table_index).error_key = "1";
+
+	go to send_loop_end;
+
+     end;
+
+
+send_partial:
+     proc;
+
+	if tree_ctl_entry.tseg_ptr = null ()
+	then do;					/* allocate one temp seg */
+
+		call get_temp_segments_ (my_name, ptr_array, code);
+
+		if code ^= 0
+		then call E11;
+
+		tseg_ptr, tree_ctl_entry.tseg_ptr = ptr_array (1);
+
+		tseg_len, tree_ctl_entry.tseg_len = 0;
+	     end;
+
+	else do;
+		tseg_ptr = tree_ctl_entry.tseg_ptr;
+		tseg_len = tree_ctl_entry.tseg_len;
+	     end;
+
+	if tree_ctl_entry.tseg_len + buffer_len > tseg_max_len
+	then call E10;
+
+/* exceeded implementation limit for msg seg size */
+
+	substr (tseg, tseg_len + 1, buffer_len) = substr (buffer, 1, buffer_len);
+
+/* copy data to temp seg */
+
+	tree_ctl_entry.tseg_len = tree_ctl_entry.tseg_len + buffer_len;
+	tree_ctl_entry.partial_in_process_sw = "1"b;
+
+
+     end;
+
+
+send_non_partial:
+     proc;					/* send delim ^= 0 */
+
+
+
+	if user_ctl.terminal_sw
+	then do;					/* terminals are restricted, mp's aren't */
+
+		if ^tree_ctl_entry.io_in_process_sw	/* check only for brand-new messages */
+		then do;				/* once they are started, it's ok */
+
+			if queue_ctl_entry.input_disabled_sw
+			then do;			/* can't let them through */
+
+				code = cmcs_error_table_$queue_disabled;
+
+				if a_code = 0
+				then call E1;
+
+			     end;
+
+
+			if station_ctl_entry.output_disabled_sw
+			then do;
+				code = cmcs_error_table_$dest_disabled;
+
+				if a_code = 0
+				then call E2;
+			     end;
+
+
+			call cmcs_station_ctl_$input_disabled (user_ctl.station_ctl_eindex, flag, code);
+
+			if code ^= 0
+			then call E3;
+
+			if flag
+			then do;
+
+				code = cmcs_error_table_$source_disabled;
+				call E3;
+			     end;
+
+		     end;
+
+	     end;
+
+	call send_get_key;
+
+	if code ^= 0
+	then call E4;
+
+	call open;				/* be sure we have a good IO switch */
+
+	if code ^= 0
+	then call E5;
+
+	if tree_ctl_entry.seg_no = 1
+	then seek_len = msg_hdr_len + msg_seg_hdr_len;
+	else seek_len = msg_seg_hdr_len;
+
+	seek_len = 4 * seek_len + buffer_len;
+
+
+	if tree_ctl_entry.partial_in_process_sw
+	then seek_len = seek_len + tree_ctl_entry.tseg_len;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	call send_seek_key;
+
+	if code ^= 0
+	then call E6;
+
+	tree_ctl_entry.seg_count = seg_no;		/* so we know how many we have altogether */
+
+	if tree_ctl_entry.seg_no = 1
+	then do;					/* first segment of message */
+
+		msg_hdr_ptr, tree_ctl_entry.msg_hdr_ptr = send_vfile_rs.rec_ptr;
+
+		call send_fillin_msg_hdr;
+
+		tree_ctl_entry.msg_descr = send_vfile_rs.descr;
+						/* will be needed later for changing status */
+		msg_seg_ptr, tree_ctl_entry.msg_seg_ptr = addr (msg_hdr.msg_seg);
+
+	     end;
+	else do;					/* not the first segment of the message */
+
+		msg_seg_ptr, tree_ctl_entry.msg_seg_ptr = send_vfile_rs.rec_ptr;
+		tree_ctl_entry.msg_seg_descr = send_vfile_rs.descr;
+
+/* may be useful sometime, but not now */
+
+	     end;
+
+	call send_fillin_seg_hdr;			/* then copy the real data */
+
+	if ^tree_ctl_entry.partial_in_process_sw
+	then substr (msg_seg.data.seg_data, 1, buffer_len) = substr (buffer, 1, buffer_len);
+
+	else do;					/* do a gather-copy of the tseg and a_buffer */
+
+		tseg_ptr = tree_ctl_entry.tseg_ptr;
+		tseg_len = tree_ctl_entry.tseg_len;
+		msg_seg.hdr.seg_len = msg_seg.hdr.seg_len + 1;
+
+		substr (msg_seg.data.seg_data, 1, tseg_len) = substr (tseg, 1, tseg_len);
+						/* part 1 */
+		substr (msg_seg.data.seg_data, tseg_len + 1, 1) = "
+";
+		substr (msg_seg.data.seg_data, tseg_len + 2, buffer_len) = substr (buffer, 1, buffer_len);
+						/* part 2 */
+
+		tree_ctl_entry.partial_in_process_sw = "0"b;
+		tree_ctl_entry.tseg_len = 0;
+
+	     end;
+
+	if new_status = 2
+	then do;					/* this is the latest possible moment to set this info */
+
+		msg_hdr.clock_available = clock_ ();
+		msg_hdr.source_station = user_ctl.station_name;
+		msg_hdr.source_group_id = get_group_id_ ();
+		msg_hdr.msg_len = tree_ctl_entry.msg_len;
+		msg_hdr.final_delim = io_subtype;	/* EMI or EGI */
+		msg_hdr.seg_count = tree_ctl_entry.seg_count;
+
+	     end;
+
+
+	call qc_lock;				/* ipc_$wakeup called herein */
+
+	if code ^= 0
+	then call E8;
+	else do;
+
+		if new_status = 2 & old_status = 1
+		then call cmcs_status_list_ctl_$move (queue_ctl_eptr, iocb_ptr, addr (tree_ctl_entry.msg_descr),
+			old_status, new_status, code);
+		else call cmcs_status_list_ctl_$add (queue_ctl_eptr, iocb_ptr, addr (tree_ctl_entry.msg_descr),
+			new_status, code);
+
+		if code ^= 0
+		then call E8;
+
+	     end;
+
+	call qc_unlock;				/* ignore return status */
+
+     end;
+
+/*  */
+
+send_check_slew:
+     proc ();
+
+	slew_ctl_ptr = addr (a_slew_ctl);		/* for overlay processing */
+
+	if a_slew_ctl = 0
+	then do;					/* when = 0, what = 0, how_much = 0 */
+
+ret_good_slew:
+		a_code = 0;
+		return;
+	     end;
+	else if slew_ctl.when = 0
+	then do;
+ret_bad_slew:
+		a_code = cmcs_error_table_$bad_slew;
+
+		call sub_err_ (a_code, my_name, "c", null (), sub_err_retval,
+		     "From check of the slew control. The slew control supplied is:
+	when (^d), what (^d), how much (^d).
+	Error keys set for all destinations.", slew_ctl.when, slew_ctl.what, slew_ctl.how_much);
+
+		output_cd.status_key = "20";
+
+		do i = 1 to station_count;
+		     output_cd.dest_table (i).error_key = "1";
+		end;
+
+		return;
+
+	     end;
+	else if slew_ctl.when < 0 | slew_ctl.when > 2
+	then go to ret_bad_slew;
+
+	if slew_ctl.what < 0 | slew_ctl.what > 3
+	then go to ret_bad_slew;
+
+	if slew_ctl.what = 1
+	then if slew_ctl.how_much < 0 | slew_ctl.how_much > 128
+	     then go to ret_bad_slew;
+	     else ;
+	else if slew_ctl.what = 2
+	then slew_ctl.how_much = 0;			/*[4.4-1]*/
+
+	else if slew_ctl.what = 3
+	then if slew_ctl.how_much < 1 | slew_ctl.how_much > 16
+	     then go to ret_bad_slew;
+
+	go to ret_good_slew;
+
+     end /* send_check_slew */;
+
+/* */
+
+send_init:
+     proc ();
+
+	send_vfile_rs_ptr = addr (send_vfile_rs);
+	overlay_len = size (send_vfile_rs);
+	send_vfile_rs_ptr -> overlay (*) = 0;
+
+	send_vfile_rs.version = vfile_rs_version;
+	send_vfile_rs.create_sw = "1"b;		/* send will always create new records */
+
+	send_init_sw = "1"b;
+
+	return;
+
+     end /* send_init */;
+
+/*  */
+
+send_seek_key:
+     proc ();
+
+	send_vfile_rs.rec_len, send_vfile_rs.max_rec_len = seek_len + 8;
+						/* to give space for vfile lockword, if needed */
+
+	key = based_key;				/* for vfile_ char (256) var key */
+
+	call iox_$seek_key (iocb_ptr, key, fb21, code);
+
+	if code = 0
+	then do;					/* must never happen, should always be not_found */
+
+		code = error_table_$bad_new_key;
+
+		return;
+	     end;
+	else if code ^= error_table_$no_record
+	then return;
+
+/* Seek OK, now create new space */
+
+	call iox_$control (iocb_ptr, "record_status", addr (send_vfile_rs), code);
+	return;
+
+     end /* send_seek_key */;
+
+/* */
+
+send_fillin_msg_hdr:
+     proc ();
+
+	overlay_len = msg_hdr_len;
+	msg_hdr_ptr -> overlay (*) = 0;		/* erase any existing garbage */
+	msg_hdr.lockword = get_process_id_ ();		/* temporary id of author */
+	msg_hdr.version = msg_hdr_version;
+	msg_hdr.source_station = user_ctl.station_name;
+	msg_hdr.msg_no = tree_ctl_entry.msg_no;
+	msg_hdr.seg_no = 1;				/* always 1 in the msg_hdr */
+	msg_hdr.seg_count = -1;			/* don't have a good number yet */
+	msg_hdr.msg_status = new_status;
+	msg_hdr.final_delim = io_subtype;		/* can only be 1-3 */
+
+	return;
+
+     end /* send_fillin_msg_hdr */;
+
+/* */
+
+send_fillin_seg_hdr:
+     proc ();
+
+	msg_seg.hdr.msg_no = tree_ctl_entry.msg_no;
+	msg_seg.hdr.seg_no = tree_ctl_entry.seg_no;
+	msg_seg.hdr.slew_ctl = a_slew_ctl;
+
+	if ^tree_ctl_entry.partial_in_process_sw
+	then msg_seg.hdr.seg_len = buffer_len;
+	else msg_seg.hdr.seg_len = buffer_len + tree_ctl_entry.tseg_len;
+
+	tree_ctl_entry.msg_len = tree_ctl_entry.msg_len + msg_seg.hdr.seg_len;
+	tree_ctl_entry.seg_count = tree_ctl_entry.seg_no; /* may need in case of purge */
+
+	return;
+
+     end /* send_fillin_seg_hdr */;
+
+/*  */
+
+reset_tce_io:
+     proc;
+
+/* Procedure to reset all message dependent parameters */
+
+/* tree_ctl_eptr must be set to the tree_ctl_entry to be reset */
+
+	string (tree_ctl_entry.io_flags) = (36)"0"b;
+
+	tree_ctl_entry.msg_hdr_ptr = null ();
+	tree_ctl_entry.io_type = 0;
+	tree_ctl_entry.io_subtype = 0;
+	string (tree_ctl_entry.io_flags) = (36)"0"b;
+	tree_ctl_entry.seg_count = 0;
+	tree_ctl_entry.msg_len = 0;
+	tree_ctl_entry.msg_descr = zero_descr;
+	tree_ctl_entry.msg_no = 0;
+	tree_ctl_entry.seg_no = 0;
+	tree_ctl_entry.tseg_len = 0;
+	tree_ctl_entry.msg_seg_ptr = null ();
+	tree_ctl_entry.msg_seg_descr = zero_descr;
+	tree_ctl_entry.msg_seg_len = 0;
+	tree_ctl_entry.msg_seg_left_index = 0;
+	tree_ctl_entry.msg_seg_left_len = 0;
+	tree_ctl_entry.buffer_len = 0;
+	tree_ctl_entry.buffer_left_index = 0;
+	tree_ctl_entry.buffer_left_len = 0;
+
+	return;
+
+     end /* reset_tce_io */;
+
+/*  */
+
+open:
+     proc ();
+
+	queue_ctl_eindex = tree_ctl_entry.queue_ctl_eindex;
+	queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+	if tree_ctl_entry.vfile_status = 2
+	then do;					/* already open */
+
+		iocb_ptr = tree_ctl_entry.iocb_ptr;
+		code = 0;
+
+		return;
+	     end;
+	else if tree_ctl_entry.vfile_status = 0
+	then do;					/* brand new use */
+iox_attach:
+		switch_no = switch_no + 1;		/* build "unique" switch name */
+		switch_pic = switch_no;
+		tree_ctl_entry.switch_name = rtrim (tree_ctl_entry.queue_name) || "." || switch_pic;
+						/* aaa.nn */
+
+		call ioa_$rsnnl ("vfile_ ^a>^a -share ^d -old", attach_descr, attach_descr_len, user_ctl.cmcs_dir,
+		     queue_ctl_entry.queue_name, system_ctl.lock_wait_time);
+
+/* q name already has suffix */
+
+		call iox_$attach_name (tree_ctl_entry.switch_name, iocb_ptr,
+		     substr (attach_descr, 1, attach_descr_len), null (), code);
+
+		if code ^= 0
+		then return;
+
+		tree_ctl_entry.vfile_status = 1;	/* log in case of trouble */
+
+iox_open:
+		call iox_$open (iocb_ptr, 13, "0"b, code);
+						/* 13 = direct_update */
+
+		if code ^= 0
+		then return;
+
+		call iox_$control (iocb_ptr, "min_block_size", addr (min_blksz_info), code);
+
+		if code ^= 0
+		then do;
+
+			call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			     "Attempting to perform min_block_size control order for queue ^a (switch ^a). Continuing.",
+			     tree_ctl_entry.queue_name, tree_ctl_entry.switch_name);
+
+		     end;
+
+		tree_ctl_entry.vfile_status = 2;
+		tree_ctl_entry.iocb_ptr = iocb_ptr;
+
+	     end;
+	else if tree_ctl_entry.vfile_status = 1
+	then go to iox_open;
+	else do;					/* unrecognized vfile status */
+
+		code = error_table_$not_open;
+	     end;
+
+	return;
+
+     end /* open */;
+
+/*  */
+
+close:
+     proc ();
+
+/* This procedure assumes that tree_ctl_eptr is set to the entry to be closed. */
+
+	if tree_ctl_entry.vfile_status > 0
+	then do;
+
+		if tree_ctl_entry.vfile_status = 2
+		then do;
+
+			call iox_$close (tree_ctl_entry.iocb_ptr, code);
+
+			if code ^= 0
+			then do;
+close_err:
+				call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+				     "Attempting to close the ^a queue.", tree_ctl_entry.queue_name);
+
+				return;
+			     end;
+
+			tree_ctl_entry.vfile_status = 1;
+
+		     end;
+
+		call iox_$detach_iocb (tree_ctl_entry.iocb_ptr, code);
+
+		if code ^= 0
+		then go to close_err;
+
+		tree_ctl_entry.iocb_ptr = null ();
+		tree_ctl_entry.vfile_status = 0;
+	     end;
+
+	else if tree_ctl_entry.iocb_ptr ^= null ()
+	then do;
+
+		code = cmcs_error_table_$bad_call_parm;
+
+		call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+		     "Inconsistent vfile_ status for queue ^a (switch ^a). File closed.", tree_ctl_entry.queue_name,
+		     tree_ctl_entry.switch_name);
+
+		call iox_$close (tree_ctl_entry.iocb_ptr, code);
+						/* ignore return */
+		call iox_$detach_iocb (tree_ctl_entry.iocb_ptr, code);
+						/* ignore return */
+
+		tree_ctl_entry.iocb_ptr = null ();
+		tree_ctl_entry.vfile_status = 0;
+	     end;
+
+	else code = 0;
+
+	if tree_ctl_entry.tseg_ptr ^= null ()
+	then do;
+
+		ptr_array (1) = tree_ctl_entry.tseg_ptr;
+
+		call release_temp_segments_ (my_name, ptr_array, code);
+
+		if code ^= 0
+		then do;
+
+			call sub_err_ (code, my_name, "c", null (), sub_err_retval,
+			     "Attempting to release temporary buffer segment for ^a. Continuing.",
+			     tree_ctl_entry.queue_name);
+
+			code = 0;
+		     end;
+	     end;
+
+	return;
+
+     end /* close */;
+
+/*  */
+
+send_get_key:
+     proc ();
+
+	if tree_ctl_entry.msg_no = 0
+	then do;					/* 1st segment of new msg */
+
+/*[5.3-1]*/
+		call cmcs_set_lock_$lock (queue_ctl.hdr.lockword, system_ctl.lock_wait_time, code);
+
+		if code ^= 0
+		then return;
+
+		queue_ctl_eindex = tree_ctl_entry.queue_ctl_eindex;
+		queue_ctl_eptr = addr (queue_ctl.entries (queue_ctl_eindex));
+
+		msg_no, tree_ctl_entry.msg_no, key_struc.msg_no, queue_ctl_entry.msg_no = queue_ctl_entry.msg_no + 1;
+						/* update all related fields at once */
+
+		call cmcs_set_lock_$unlock (queue_ctl.hdr.lockword, code);
+
+		if code ^= 0
+		then do;				/* also should never happen */
+			call sub_err_ (code, my_name, "c", sub_err_retval,
+			     "From attempt to unlock queue_ctl for ""^a"".", station_name);
+			code = 0;
+		     end;
+
+		seg_no, key_struc.seg_no, tree_ctl_entry.seg_no = 1;
+						/* starting fresh msg always uses segno of 1 */
+	     end;
+
+	else do;					/* msgno already exists, just bump the segno */
+
+		msg_no, key_struc.msg_no = tree_ctl_entry.msg_no;
+
+		seg_no, key_struc.seg_no, tree_ctl_entry.seg_no = tree_ctl_entry.seg_no + 1;
+	     end;
+
+	return;
+
+     end /* send_get_key */;
+
+/*  */
+
+setup:
+     proc;
+
+	if ^(external_user_ctl_ptr -> user_ctl.init_sw.queue_ctl)
+	then do;
+
+		user_ctl_ptr = external_user_ctl_ptr;	/* set local variable from global */
+
+		queue_ctl_ptr = user_ctl.queue_ctl_ptr;
+		system_ctl_ptr = user_ctl.system_ctl_ptr;
+		tree_ctl_ptr = user_ctl.tree_ctl_ptr;
+		wait_ctl_ptr = user_ctl.wait_ctl_ptr;
+
+	     end;
+
+/* The following code initializes the data for the vfile_ control "min_block_size".
+   This control ensures at least 8 extra characters will be left for the vfile record lockword. */
+
+	min_blksz_info.min_residue = 8;
+	min_blksz_info.min_capacity = 8;
+
+	zero_descr_ptr = addr (zero);			/* for assignments of "null" descriptors */
+
+	user_ctl.init_sw.queue_ctl = "1"b;
+	a_code = 0;
+	return;
+
+     end /* setup */;
+
+test:
+     entry ();
+
+	test_sw = "1"b;
+	return;
+
+/* */
+
+qc_lock:
+     proc ();
+
+/*[5.3-1]*/
+	call cmcs_set_lock_$lock (queue_ctl.hdr.lockword, system_ctl.lock_wait_time, code);
+
+	if code ^= 0
+	then do;
+		call sub_err_ (code, my_name, "c", null (), sub_err_retval, "Attempting to lock queue_ctl.");
+	     end;
+
+	return;
+
+     end /* qc_lock */;
+
+/* */
+
+qc_unlock:
+     proc ();
+
+	call cmcs_set_lock_$unlock (queue_ctl.hdr.lockword, code);
+
+	return;
+
+     end /* qc_unlock */;
+
+set_new_status:
+     proc;
+
+/*[4.4-4]*/
+	new_status, io_subtype, tree_ctl_entry.io_subtype = a_io_subtype;
+
+/*[4.4-4]*/
+	if new_status = 3
+	then new_status = 2;			/* egi = emi */
+
+     end;
+
+     end /* cmcs_queue_ctl_ */;

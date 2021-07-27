@@ -1,0 +1,1392 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/*
+
+
+
+   salvage_pv (pvtx, code);
+
+
+   INPUT ASSUMPTIONS.
+
+   1. There is a segment header for each of the following segments:
+
+   salv_abs_seg_00 to n, where n is the no. of 256k segs required to
+   to linearly address the entire vtoc.
+   pv_salv_seg
+
+   2. This procedure can be executed by any process. However a given physical
+   volume can be salvaged by only one process at a time.
+
+   3. The physical volume being salvaged is not available for normal vtoc_man
+   operations.
+
+   4. The following items are supposed to have been checked prior to calling
+   this procedure and are assumed to have a correct value:
+
+   label.vol_size
+   label.vtoc_size
+
+   vol_map.n_rec
+   vol_map.base_add
+   vol_map.bit_map_n_words
+
+   vtoc_header.n_vtoce
+
+   pvte.being_salvaged = 0
+   pvte.vtoc_segno     = 0
+   pvte.vtoc_size      = 0
+
+   Written by Andre Bensoussan 1976
+   Extensively modified by Andrew Kobziar, who integrated it with rest of salvager, 1976.
+   5/13/76 by Greenberg for seg-by-seg PD flusher.
+   6/25/76 by Greenberg for last n bits of bit map being zero.
+   11/1/76 by Greenberg for fixing disk_rebuild-created problems,
+   pc$truncate_deposit_all, summary report.
+   03/22/81, W. Olin Sibert, for ADP PTW formats
+   03/07/82, J. Bongiovanni, for new PVTE, validate vtoce.trp, vtoce.trp_time,
+	   convert_vtoc, VTOC map
+   06/15/82, J. Bongiovanni, to free per-bootload VTOCEs and print summary of 
+             damaged segments
+   10/26/82, J. Bongiovanni, for fm_damaged
+
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-16,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-17,Beattie), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices, 3380 and 3390.
+  2) change(89-08-14,Farley), approve(89-09-18,MCR8134),
+     audit(89-09-21,WAAnderson), install(89-09-29,MR12.3-1075):
+     Corrected the VTOCE.records adjustment in the RESOLVE_CONFLICT procedure.
+     It was using (vtoce.records - 1), which was causing an incorrect records
+     setting, resulting in et$invalid_vtoce errors.
+                                                   END HISTORY COMMENTS */
+
+
+
+
+salvage_pv : procedure (a_pvtx, a_code);
+
+
+dcl (a_pvtx, pvtx) fixed bin;				/* Physical volume table index of vol to be salvaged */
+dcl (a_code, code) fixed bin (35);			/* Error code */
+
+dcl  no_free_aste_err fixed bin (35) internal static init (1);
+dcl  get_vtocep_err fixed bin (35) internal static init (3);
+
+dcl  table1p ptr;					/* Pointer to table1, i.e. bit_table */
+dcl  table2p ptr;					/* Pointer to table2, i.e. vtocx_table */
+dcl  table3p ptr;					/* Pointer to table3, i.e. new_bit_map */
+dcl  table4p ptr;					/* Pointer to incremental dump table */
+dcl  table5p ptr;					/* Pointer to consolidated dump table */
+dcl  table6p ptr;					/* Pointer to VTOC map */
+
+dcl  s_ptr ptr;
+
+dcl  r0 fixed bin;					/* First record number used for paging on this volume */
+dcl  r1 fixed bin;					/* Last record number used for paging on this volume */
+dcl  ptp pointer;					/* Pointer to page table in aste */
+dcl  vtocx fixed bin;				/* Index of the vtoc entry being processed */
+dcl  pvid bit (36) aligned;				/* ID of volume being processed */
+dcl  n_used_rec fixed bin;				/* Number of records used */
+dcl  n_free_vtoce fixed bin;				/* Number of free vtoc entries */
+dcl  max_n_vtoc_seg fixed bin internal static init (4);
+dcl  damaged_count fixed bin;				/* Count damaged segments */
+dcl  damaged_by_me fixed bin;				/* Count of segments damaged by this salvage */
+dcl  salvage_call bit (1);				/* TRUE is called for salvage */
+dcl  previous_damaged_sw bit (1);			/* TRUE if vtoce.damaged on at top of loop */
+dcl  complained bit (1);				/* TRUE if set damaged and wrote message */
+dcl  not_enabled_sw bit (1) aligned;			/* dumper threading operational? */
+dcl  free_count fixed bin;				/* count of free vtoces added to consolidated list */
+dcl  comp_time fixed bin (71);			/* fb time */
+dcl  hdr_time (2) bit (36) aligned;			/* bit time in label */
+dcl  root_pack bit (1) aligned;			/* set to indicate directories ok on this pack */
+dcl  salv_mode char (32) var;				/* mode of volsalv */
+dcl  p99 pic "99";
+dcl  curtime bit (36);				/* Current file system time */
+dcl  trp_bad bit (1) aligned;				/* Flag for trp validation */
+	   
+
+dcl 1 table1 based (table1p) aligned,
+    2 bit_table (0 : label.vol_size - 1) bit (1) unaligned;
+
+dcl 1 table2 based (table2p) aligned,
+    2 vtocx_table (0 : label.vol_size - 1) fixed bin (17) unaligned;
+
+dcl 1 table3 based (table3p) aligned,
+    2 new_map (1 : vol_map.map_n_words) bit (36) aligned;
+
+dcl 1 table4 based (table4p) aligned,
+    2 incr_map (0 : vtoc_header.n_vtoce -1) bit (1) unaligned;
+
+dcl 1 table5 based (table5p) aligned,
+    2 cons_map (0 : vtoc_header.n_vtoce -1) bit (1) unaligned;
+
+dcl  1 salv_vtoc_map aligned based (table6p) like vtoc_map;
+
+dcl  sst$astl bit (36) aligned external;
+dcl  sst$astsize fixed bin external;
+dcl  sst$damaged_ct fixed bin external;
+dcl  1 sst$level (0 : 3) aligned external,
+     2 ausedp bit (18) unaligned,
+     2 no_aste bit (18) unaligned;
+dcl  sst$pts (0 : 3) fixed bin external;
+dcl  sst$root_pvtx fixed bin external;
+
+dcl  pds$processid ext bit (36) aligned;
+
+dcl  dseg$ (0 : 1023) fixed bin (71) external static;
+dcl  pv_salv_seg$ ext;
+
+dcl  dir_dump$vtoce ext entry (ptr);
+dcl  get_aste entry (fixed bin) returns (ptr);
+dcl  get_ptrs_$given_astep entry (ptr) returns (fixed bin (71) aligned);
+dcl  get_ptrs_$given_segno entry (fixed bin) returns (ptr);
+dcl  get_pvtx$hold_pvtx entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  get_pvtx$release_pvtx entry (bit (36) aligned, fixed bin (35));
+dcl  lock$lock_ast entry;
+dcl  lock$unlock_ast entry;
+dcl  page$cam entry;
+dcl  pc$truncate_deposit_all entry (ptr);
+dcl  pc_wired$write_wait entry (ptr, fixed bin, fixed bin);
+dcl  ptw_util_$make_null entry (pointer, bit (22) aligned);
+dcl  put_aste entry (ptr);
+dcl  salv_err_msg entry options (variable);
+dcl  salv_err_msg$code entry options (variable);
+dcl  syserr entry options (variable);
+dcl  syserr$binary ext entry options (variable);
+dcl  thread$out entry (ptr, bit (18));
+dcl  vm_vio$clean_up entry (fixed bin);
+dcl  vm_vio$get_vtocep entry (fixed bin, fixed bin) returns (ptr);
+dcl  vm_vio$init entry (fixed bin, fixed bin (35)) returns (ptr);
+
+dcl  cleanup condition;
+dcl  (addr, addrel, baseno, bin, bit, ceil, clock, convert, divide, fixed, max, mod, null, ptr, rel, substr, unspec) builtin;
+
+
+/* MAIN PROGRAM */
+
+          salvage_call = "1"b;
+	salv_mode = "Volume salvage";
+	goto COMMON;
+
+convert_vtoc:
+	entry (a_pvtx, a_code);
+
+	salvage_call = "0"b;
+	salv_mode = "VTOC conversion";
+
+COMMON:	
+	pvtx = a_pvtx;
+	code = 0;
+	pvt_arrayp = addr (pvt$array);
+	pvtep = addr (pvt_array (pvtx));
+	curtime = substr (bit (bin (clock (), 71), 71), 20, 36);
+
+	on cleanup call CLEAN_UP;
+
+	s_ptr = vm_vio$init (pvtx, code); if code ^= 0 then goto RTN;
+
+	labelp = ptr (s_ptr, LABEL_ADDR * 1024);
+	vol_mapp = ptr (s_ptr, VOLMAP_ADDR * 1024);
+	vtoc_headerp = ptr (s_ptr, DUMPER_BIT_MAP_ADDR * 1024);
+	vtoc_mapp = ptr (s_ptr, VTOC_MAP_ADDR * 1024);
+
+	pvid = label.pvid;
+
+
+	call salv_err_msg (SALV_ANNOUNCE, "salvage_pv: ^a of ^a_^a, volume ^a of logical vol ^a.",
+	     salv_mode, pvte.devname, (convert (p99, pvte.logical_area_number) || pvte.sv_name),
+	     label.pv_name, label.lv_name);
+
+	comp_time = clock ();
+
+	if salvage_call then do;
+	     call CHECK_LABEL_VOLMAP_HEADER (code); if code ^= 0 then goto CLEAN;
+               n_used_rec = 0;
+	     free_count = 0;
+
+	     r0 = vol_map.base_add;
+	     r1 = vol_map.n_rec - 1 + r0;
+	end;
+
+	damaged_count = 0;
+	damaged_by_me = 0;
+
+	call INIT_TABLES (table1p, table2p, table3p, table4p, table5p, table6p, code); if code ^= 0 then goto CLEAN;
+
+	n_free_vtoce = 0;
+
+	if label.volmap_version = 1
+	     | label.volmap_version = 2		/* VTOC Map exists */
+	     then do;
+	     salv_vtoc_map.n_vtoce = vtoc_map.n_vtoce;
+	     salv_vtoc_map.n_free_vtoce = vtoc_map.n_free_vtoce;
+	     salv_vtoc_map.bit_map_n_words = vtoc_map.bit_map_n_words;
+	     salv_vtoc_map.vtoc_last_recno = vtoc_map.vtoc_last_recno;
+	end;
+	else do;
+	     salv_vtoc_map.n_vtoce = vtoc_header.n_vtoce;
+	     salv_vtoc_map.n_free_vtoce = vtoc_header.n_free_vtoce;
+	     salv_vtoc_map.bit_map_n_words
+		= divide (vtoc_header.n_vtoce + 31, 32, 17);
+	     salv_vtoc_map.vtoc_last_recno = vtoc_header.vtoc_last_recno;
+	end;
+	
+
+	do vtocx = 0 to vtoc_header.n_vtoce - 1;
+
+	     vtocep = vm_vio$get_vtocep (pvtx, vtocx);
+	     if vtocep = null then do;
+		code = get_vtocep_err;
+		goto CLEAN;
+	     end;
+
+
+	     if vtoce.uid = "0"b then do;
+		vtoce.pad_free_vtoce_chain = ""b;	/* Clean out old field */
+		if vtoce_parts (1) ^= "0"b then call salv_err_msg (SALV_DEBUG,
+		     "salvage_pv: vtoce ^oo free but not zero", vtocx);
+		call FREE_VTOCE;
+	     end;
+	     else if salvage_call then do;
+		complained = "0"b;			/* Only report damage if we didn't set it ourself */
+		previous_damaged_sw = vtoce.damaged;
+		if ^vtoce.dirsw then do;
+		     if vtoce.per_process then do;
+			if salv_data$debug then call salv_err_msg (SALV_DEBUG,
+			     "salvage_pv: freeing ^w per process vtocx ^oo: ^a",
+			     vtoce.uid, vtocx, vtoce.primary_name);
+			call FREE_VTOCE;
+			go to NEXT_VTOCE;
+		     end;
+		     else if vtoce.deciduous then do;
+			if salv_data$debug then call salv_err_msg (SALV_DEBUG,
+			     "salvage_pv: freeing ^w deciduous vtocx ^oo: ^a",
+			     vtoce.uid, vtocx, vtoce.primary_name);
+			call FREE_VTOCE;
+			go to NEXT_VTOCE;
+		     end;
+		     else if vtoce.perm_flags.per_bootload then do;
+			if salv_data$debug then call salv_err_msg (SALV_DEBUG,
+			     "salvage_pv: freeing ^w per-bootload vtocx ^oo: ^a",
+			     vtoce.uid, vtocx, vtoce.primary_name);
+			call FREE_VTOCE;
+			goto NEXT_VTOCE;
+		     end;
+		end;
+		call CHECK_VTOCE;
+		if previous_damaged_sw & ^complained
+		then call salv_err_msg (SALV_DEBUG, "salvage_pv: damaged switch found on for ^w vtocx ^oo: ^a",
+		     vtoce.uid, vtocx, vtoce.primary_name);
+		if vtoce.damaged then do;
+		     damaged_count = damaged_count + 1;
+		     if ^previous_damaged_sw
+			then damaged_by_me = damaged_by_me + 1;
+		     if complained then do;
+			segdamage.pvid = label.pvid;
+			segdamage.lvid = label.lvid;
+			segdamage.uid = vtoce.uid;
+			segdamage.vtocx = vtocx;
+			segdamage.pno = -1;
+			segdamage.uid_path = vtoce.uid_path;
+			call syserr$binary (SALV_LOG, addr (segdamage), SB_vtoc_salv_dam, SBL_vtoc_salv_dam,
+			     "salvage_pv: setting damaged switch on ^a (^oo) on pv ^a.",
+			     vtoce.primary_name, vtocx, label.pv_name);
+			sst$damaged_ct = sst$damaged_ct + 1;
+		     end;
+		end;
+
+	     end;
+NEXT_VTOCE:
+	end;
+
+	if salvage_call
+	     then do;
+	     call UPDATE_VOL_MAP;
+	     pvte.vol_trouble_count = 0;
+	end;
+
+	call UPDATE_VTOC_MAP;
+
+	call FORCE_VTOC_ON_DISK;
+
+	call UPDATE_LABEL;
+
+	call FORCE_LABEL_ON_DISK;
+
+	if free_count > 0 then call salv_err_msg (SALV_DEBUG, "salvage_pv: ^d free vtoces added to free list.", free_count);
+	if damaged_count > 0
+	     then call salv_err_msg (SALV_ANNOUNCE,
+	     "salvage_pv: ^d damaged segments on volume ^a (^d damaged in this salvage)",
+	     damaged_count, label.pv_name, damaged_by_me);
+CLEAN:	if code = 0 then call salv_err_msg (SALV_DEBUG, "salvage_pv: ^a finished.", salv_mode);
+	else call salv_err_msg$code (SALV_DEBUG, "", "salvage_pv: ^a finished with error.", code, salv_mode);
+	call CLEAN_UP;
+
+RTN:	a_code = code;
+
+	return;
+
+CHECK_VTOCE : proc;
+
+dcl (records, csl, msl, i, r, conflict) fixed bin;
+
+	     csl, records, conflict = 0;
+	     msl = 256;
+
+	     do i = 0 to msl - 1;
+
+SAME_I:		if substr (vtoce.fm (i), 1, 1) = "1"b then goto NEXT_I; /* Null address */
+
+		r = fixed (substr (vtoce.fm (i), 2, 17), 17);
+
+		if r < r0 | r > r1 then
+		     do;
+		     call report_out_of_range;
+		     vtoce.fm (i) = pv_salv_null_addr; goto NEXT_I;
+		end;
+
+		if bit_table (r) = "1"b then
+		     do;
+		     conflict = 1; call RESOLVE_CONFLICT (i); goto SAME_I;
+		end;
+
+		vtocx_table (r) = vtocx;
+		bit_table (r) = "1"b;
+		records = records + 1;
+		csl = i + 1;
+NEXT_I:
+	     end;
+
+	     do i = msl to 255;
+		if substr (vtoce.fm (i), 1, 1) = "0"b then vtoce.fm (i) = pv_salv_null_addr;
+	     end;
+
+	     if conflict ^= 0 then do; csl = RECOMPUTE_CSL (vtocep); records = RECOMPUTE_RECORDS (vtocep); end;
+
+	     n_used_rec = n_used_rec + records;
+
+	     if fixed (vtoce.records, 9) ^= records then
+		do;
+		call report_records;
+		vtoce.records = bit (fixed (records, 9));
+	     end;
+
+	     if fixed (vtoce.csl, 9) ^= csl then
+		do;
+		call report_csl;
+		vtoce.csl = bit (fixed (csl, 9));
+	     end;
+
+	     if fixed (vtoce.msl, 9) > msl | fixed (vtoce.msl, 9) < csl then
+		do;
+		call report_msl;
+		vtoce.msl = bit (fixed (msl, 9));
+	     end;
+
+	     trp_bad = "0"b;
+	     do i = 0 to 1;
+		if vtoce.trp (i) < 0 | fixed (vtoce.trp_time (i), 36) > fixed (curtime, 36)
+		     then trp_bad = "1"b;
+	     end;
+	     if trp_bad then do;
+		call report_trp;
+		do i = 0 to 1;
+		     vtoce.trp (i) = 0;
+		     vtoce.trp_time = curtime;
+		end;
+	     end;
+
+	     if vtoce.dirsw then if ^root_pack then do;
+		     call salv_err_msg (SALV_DEBUG,
+			"salvage_pv: dirsw turned off for vtocx ^oo: ^a", vtocx, vtoce.primary_name);
+		     if salv_data$dump then call dir_dump$vtoce (vtocep);
+		     vtoce.dirsw = "0"b;
+		     vtoce.damaged, complained = "1"b;
+		end;
+
+	     vtoce.fm_damaged = "0"b;
+	     vtoce.fm_checksum_valid = "0"b;
+	     vtoce.fm_checksum = ""b;
+
+	     if fixed (vtoce.dtm) > fixed (hdr_time (1)) then call THREAD_FOR_DUMPER (1);
+	     if fixed (vtoce.dtm) > fixed (hdr_time (2)) then call THREAD_FOR_DUMPER (2);
+
+	     return;
+
+
+
+
+report_out_of_range : proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: vtoce ^a at ^oo: page ^oo disk_addr ^oo bad",
+		     vtoce.primary_name, vtocx, i, r);
+		vtoce.damaged, complained = "1"b;
+		return;
+	     end;
+
+report_records : proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: vtoce ^a at ^oo: rec used changed from ^oo to ^oo",
+		     vtoce.primary_name, vtocx, fixed (vtoce.records), records);
+		vtoce.damaged, complained = "1"b;
+		return;
+	     end;
+
+report_csl :   proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: vtoce ^a at ^oo: cur len changed from ^oo to ^oo",
+		     vtoce.primary_name, vtocx, fixed (vtoce.csl), csl);
+		vtoce.damaged, complained = "1"b;
+		return;
+	     end;
+
+report_msl :   proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: vtoce ^a at ^oo: max len changed from ^oo to ^oo",
+		     vtoce.primary_name, vtocx, fixed (vtoce.msl), msl);
+		vtoce.damaged, complained = "1"b;
+		return;
+	     end;
+
+report_trp:    proc;
+	          call salv_err_msg (SALV_DEBUG, "salvage_pv: vtoce ^a at ^oo: time-record-product reset to zero",
+		     vtoce.primary_name, vtocx);
+		return;
+	     end;
+
+	end CHECK_VTOCE;
+
+
+
+
+
+FREE_VTOCE : proc;
+
+dcl  bit_no fixed bin;
+dcl  word_no fixed bin;
+
+	     if vtoce.uid ^= "0"b then free_count = free_count + 1;
+
+	     unspec (vtoce) = "0"b;
+
+	     n_free_vtoce = n_free_vtoce + 1;
+
+	     word_no = divide (vtocx, 32, 17);
+	     bit_no = mod (vtocx, 32);
+	     bit_map_wordp = addr (salv_vtoc_map.bit_map (word_no));
+	     substr (bit_map_word.bits, bit_no + 1, 1) = "1"b;
+
+	     call THREAD_FOR_DUMPER (2);
+
+	     return;
+
+	end FREE_VTOCE;
+
+
+THREAD_FOR_DUMPER: proc (index);
+
+dcl  index fixed bin;
+
+	     if not_enabled_sw then return;
+
+	     if index = 1 then
+		incr_map (vtocx) = "1"b;
+	     else
+	     cons_map (vtocx) = "1"b;
+
+	     return;
+
+	end THREAD_FOR_DUMPER;
+
+
+RESOLVE_CONFLICT : proc (i);
+
+dcl (i, I, r, VTOCX, del, DEL) fixed bin;
+
+dcl  VTOCEP ptr;
+dcl 1 VTOCE like vtoce aligned based (VTOCEP);
+
+
+
+	     r = fixed (substr (vtoce.fm (i), 2, 17), 17);
+
+	     VTOCX = vtocx_table (r);
+	     VTOCEP = vm_vio$get_vtocep (pvtx, VTOCX);
+
+	     do I = 0 to 255 while (VTOCE.fm (I) ^= vtoce.fm (i));
+	     end;
+
+	     if I > 255 then go to del_eq_1;;
+
+	     DEL, del = 0;
+
+	     if vtoce.dirsw = VTOCE.dirsw then DEL, del = 1;
+	     if vtoce.dirsw & ^VTOCE.dirsw then DEL = 1;
+	     if ^vtoce.dirsw & VTOCE.dirsw then del = 1;
+
+	     if del = 1 then
+del_eq_1:		do;
+		call report_page_del;
+		vtoce.fm (i) = pv_salv_null_addr;
+	     end;
+
+	     if DEL = 1 then
+		do;
+		call report_page_DEL;
+		vtocx_table (r) = 0;
+		bit_table (r) = "0"b;
+
+		VTOCE.fm (I) = pv_salv_null_addr;
+
+		if vtocep ^= VTOCEP then
+		     do;
+		     VTOCE.csl = bit (fixed (RECOMPUTE_CSL (VTOCEP), 9));
+		     VTOCE.records = bit (fixed (fixed (VTOCE.records, 9) - 1, 9), 9);
+
+		     n_used_rec = n_used_rec - 1;
+		end;
+	     end;
+
+	     return;
+
+report_page_del : proc;
+		call salv_err_msg (SALV_DEBUG,
+		     "salvage_pv: vtoce ^a at ^oo: ref to pageno ^oo at addr ^oo deleted, dirsw is ^b",
+		     vtoce.primary_name, vtocx, i, r, vtoce.dirsw);
+		vtoce.damaged, complained = "1"b;
+		return;
+	     end;
+
+report_page_DEL : proc;
+		call salv_err_msg (SALV_DEBUG,
+		     "salvage_pv: vtoce ^a at ^oo: ref to pageno ^oo at addr ^oo deleted, dirsw is ^b",
+		     VTOCE.primary_name, VTOCX, I, r, VTOCE.dirsw);
+		if ^VTOCE.damaged & VTOCX < vtocx then do;
+		     damaged_count = damaged_count + 1;
+		     damaged_by_me = damaged_by_me + 1;
+		end;
+		if VTOCE.damaged | VTOCX > vtocx then return;
+		segdamage.pvid = label.pvid;
+		segdamage.lvid = label.lvid;
+		segdamage.uid = VTOCE.uid;
+		segdamage.vtocx = VTOCX;
+		segdamage.pno = I;
+		segdamage.uid_path = VTOCE.uid_path;
+		call syserr$binary (SALV_LOG, addr (segdamage), SB_vtoc_salv_dam, SBL_vtoc_salv_dam,
+		     "salvage_pv: setting damaged switch on ^a (^oo) on pv ^a.",
+		     VTOCE.primary_name, VTOCX, label.pv_name);
+		sst$damaged_ct = sst$damaged_ct + 1;
+		VTOCE.damaged = "1"b;
+		return;
+	     end;
+
+	end RESOLVE_CONFLICT;
+
+
+
+
+RECOMPUTE_CSL : proc (vtoce_ptr) returns (fixed bin);
+
+dcl  vtoce_ptr ptr;
+dcl (i, csl) fixed bin;
+
+	     csl = 0;
+	     do i = 0 to 255; if substr (vtoce_ptr -> vtoce.fm (i), 1, 1) = "0"b then csl = i + 1;
+	     end;
+	     return (csl);
+
+	end RECOMPUTE_CSL;
+
+
+
+RECOMPUTE_RECORDS : proc (vtoce_ptr) returns (fixed bin);
+
+dcl  vtoce_ptr ptr;
+dcl (i, records) fixed bin;
+
+	     records = 0;
+	     do i = 0 to 255; if substr (vtoce_ptr -> vtoce.fm (i), 1, 1) = "0"b then records = records + 1;
+	     end;
+	     return (records);
+
+	end RECOMPUTE_RECORDS;
+
+CHECK_LABEL_VOLMAP_HEADER: proc (code);
+
+dcl  code fixed bin (35);
+dcl  rightsize fixed bin (24);
+
+
+	     code = 0;
+
+	     if label.time_last_dmp (1) = 0 then not_enabled_sw = "1"b;
+	     else do;
+		if comp_time < max (label.time_mounted, label.time_map_updated,
+		label.time_unmounted, label.time_salvaged, label.time_of_boot) then do;
+		     call salv_err_msg (SALV_ANNOUNCE,
+			"salvage_pv: Label times in advance of clock. The clock may be wrong.");
+		end;
+	     end;
+
+	     hdr_time (1) = substr(bit (fixed (label.time_last_dmp (1), 52), 52),1,36);
+	     hdr_time (2) = substr(bit (fixed (label.time_last_dmp (2), 52), 52),1,36);
+
+	     root_pack = (label.lv_name = "root");
+
+	     rightsize = ceil (vol_map.n_rec/32);
+	     if vol_map.bit_map_n_words ^= rightsize then do;
+		call salv_err_msg (SALV_DEBUG,
+		     "salvage_pv: Bit map size is ^d. (^oo) words, s/b ^d. (^oo), changing to latter.",
+		     vol_map.bit_map_n_words, vol_map.bit_map_n_words, rightsize, rightsize);
+		vol_map.bit_map_n_words = rightsize;
+	     end;					/* COULD BE MAKING MISTAKE BY MAKING LARGER, OR n_rec MIGHT BE
+						   WRONG. MORE POWERFUL HEURISTIC NEEDED. FIXES ERRORS CAUSED
+						   BY 4.1 disk_rebuild. */
+
+
+
+	     return;
+
+	end CHECK_LABEL_VOLMAP_HEADER;
+
+
+
+UPDATE_VOL_MAP : proc;
+
+dcl 1 old_map (vol_map.bit_map_n_words) based (addr (vol_map.bit_map)) aligned,
+    2 pad1 bit (1) unaligned,
+    2 bits bit (32) unaligned,
+    2 pad2 bit (3) unaligned;
+
+dcl 1 new_map (vol_map.bit_map_n_words) based (table3p) aligned like old_map;
+
+dcl  bit_table_map (1000) bit (32) based (addr (bit_table (r0))) unaligned;
+
+dcl  w fixed bin;
+dcl  j fixed bin;
+dcl  n_free_rec fixed bin;
+
+
+
+	     unspec (new_map) = "0"b;
+
+	     do w = 1 to vol_map.bit_map_n_words;
+		new_map (w).bits = ^ bit_table_map (w);
+	     end;
+
+	     j = mod (vol_map.n_rec, 32);
+	     if j ^= 0 then substr (new_map (w - 1).bits, j + 1) = "0"b;
+
+	     if unspec (old_map) ^= unspec (new_map) then
+		do;
+		call report_bit_map_changed;
+		unspec (old_map) = unspec (new_map);
+	     end;
+
+	     n_free_rec = vol_map.n_rec - n_used_rec;
+
+	     if vol_map.n_free_rec ^= n_free_rec then
+		do;
+		call report_n_free_rec_changed;
+		vol_map.n_free_rec = n_free_rec;
+	     end;
+	     return;
+
+
+report_bit_map_changed : proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: map of assigned addresses changed");
+		return;
+	     end;
+
+report_n_free_rec_changed : proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: no. of free recs changed from ^d to ^d",
+		     vol_map.n_free_rec, n_free_rec);
+		return;
+	     end;
+
+	end UPDATE_VOL_MAP;
+
+UPDATE_VTOC_MAP : proc;
+	     
+	     if (salv_vtoc_map.n_free_vtoce ^= n_free_vtoce) & salvage_call
+		then call report_n_free_vtoce;
+	     salv_vtoc_map.n_free_vtoce = n_free_vtoce;
+	     
+	     unspec (vtoc_map) = unspec (salv_vtoc_map);
+
+	     return;
+
+
+report_n_free_vtoce : proc;
+		call salv_err_msg (SALV_DEBUG, "salvage_pv: no. of free vtoces changed from ^d to ^d",
+		     salv_vtoc_map.n_free_vtoce, n_free_vtoce);
+		return;
+	     end;
+
+	end UPDATE_VTOC_MAP;
+
+
+
+
+
+
+
+FORCE_VTOC_ON_DISK : proc;
+
+dcl  i fixed bin;
+
+
+	     do i = 1 to max_n_vtoc_seg - 1;
+		astep = get_ptrs_$given_segno (fixed (baseno (s_ptr)) + i);
+		if astep ^= null then call pc_wired$write_wait (astep, 0, -1);
+	     end;
+
+	     return;
+
+	end FORCE_VTOC_ON_DISK;
+
+UPDATE_LABEL : proc;
+
+	     label.time_map_updated = comp_time;
+	     label.time_salvaged = comp_time;
+						/* copy dump maps back into label */
+
+	     label.vol_trouble_count = 0;		/* Either salvage or conversion, OK in either case */
+
+	     if label.volmap_version ^= 1 then do;	/* Converted VTOC */
+		if label.volmap_version ^= 2		/* From pre-MR10 */
+		     then do;
+		     old_labelp = labelp;
+		     label.time_unmounted = old_label.time_unmounted;
+		end;
+		label.volmap_version = 1;		/* Force salvage on pre-MR10 system */
+
+	     end;
+
+	     return;
+
+	end UPDATE_LABEL;
+
+
+
+
+
+
+
+FORCE_LABEL_ON_DISK : proc;
+
+
+	     astep = get_ptrs_$given_segno (fixed (baseno (s_ptr)));
+
+	     if astep ^= null then call pc_wired$write_wait (astep, LABEL_ADDR, 1);
+
+	     return;
+
+	end FORCE_LABEL_ON_DISK;
+
+CLEAN_UP : proc;
+
+
+dcl segno fixed bin;
+
+
+	     segno = fixed (baseno (addr (pv_salv_seg$)), 18);
+
+	     astep = get_ptrs_$given_segno (segno);
+
+	     if astep ^= null then
+		do;
+
+		dseg$ (segno) = 0;
+		call page$cam;
+
+		call pc$truncate_deposit_all (astep);
+		if aste.usedf then call get_pvtx$release_pvtx ((pvt_array.pvid (aste.pvtx)), (aste.pvtx));
+		if sst$astl ^= pds$processid then call lock$lock_ast;
+		call put_aste (astep);
+		call lock$unlock_ast;
+
+
+	     end;
+
+	     call vm_vio$clean_up (pvtx);		/* this releases printer and abs segs */
+
+	     return;
+
+	end CLEAN_UP;
+
+INIT_TABLES : proc (table1p, table2p, table3p, table4p, table5p, table6p, code);
+
+dcl  table1p ptr;
+dcl  table2p ptr;
+dcl  table3p ptr;
+dcl  table4p ptr;
+dcl  table5p ptr;
+dcl  table6p ptr;
+dcl  code fixed bin (35);
+
+dcl 1 pv_salv_seg based (addr (pv_salv_seg$)) aligned,
+
+    2 table1,
+      3 bit_table (0 : label.vol_size - 1) bit (1) unaligned,
+
+    2 table2,
+      3 vtocx_table (0 : label.vol_size - 1) fixed bin (17) unaligned,
+
+    2 table3,
+      3 new_map (1 : vol_map.bit_map_n_words) bit (36) aligned,
+
+    2 table4,
+      3 incr_map (0 : vtoc_header.n_vtoce -1) bit (1) unaligned,
+
+    2 table5,
+      3 cons_map (0 : vtoc_header.n_vtoce -1) bit (1) unaligned,
+
+    2 table6 aligned like vtoc_map,
+
+    2 end bit (36) aligned;
+
+dcl  segno fixed bin,				/* segno assigned to this segment  */
+     pvtx fixed bin,				/* PVT index for this segment  */
+     msl fixed bin;					/* number of pages for this segment  */
+
+dcl (i, pts, ptsi) fixed bin;
+
+dcl  tsdw fixed bin (71);
+
+
+	     code = 0;
+
+	     segno = fixed (baseno (addr (pv_salv_seg$)), 18);
+	     pvtx = sst$root_pvtx;
+	     msl = divide (fixed (rel (addr (pv_salv_seg.end)), 18), 1024, 17, 0) + 1;
+
+
+/* ALLOCATE AN ASTE OF THE APPROPRIATE SIZE */
+
+	     call lock$lock_ast;
+
+	     astep = get_aste (msl);			/* Get an ASTE with the appropriate size PT */
+
+	     if astep = null then
+		do;
+		call lock$unlock_ast;
+		code = no_free_aste_err;
+		call syserr (ANNOUNCE, "salvage_pv: INIT_TABLES: aste pool ^oo too small", msl);
+		return;
+	     end;
+
+	     ptsi = fixed (aste.ptsi);
+	     pts = sst$pts (ptsi);
+
+
+/* ZERO THE ASTE  */
+
+	     astep -> aste_part.two = "0"b;		/* Zero the rest of the ASTE except ptsi and marker */
+
+
+/* INITIALIZE THE PAGE TABLE WITH NULL ADDRESSES AND PAGE FAULT BITS */
+
+	     ptp = addrel (astep, sst$astsize);		/* get a pointer to the page table */
+
+	     do i = 0 to pts - 1;
+		call ptw_util_$make_null (addrel (ptp, i), fill_page_table_null_addr); /* Make up remaining PTWS */
+	     end;
+
+
+/* INITIALIZE THE ASTE */
+
+	     astep -> aste.vtocx = -1;		/* show there is no VTOCE for the segment */
+	     astep -> aste.dnzp = "1"b;
+	     astep -> aste.nqsw = "1"b;		/* turn on no quota switch */
+	     astep -> aste.strp = bit (fixed (segno, 18), 18); /* store segment number in AST */
+	     astep -> aste.msl = bit (fixed (msl, 9), 9); /* set the max length */
+	     astep -> aste.pvtx = pvtx;		/* store the root physical volume table index */
+
+
+/* THE CLEAN_UP OPERATION WILL DEPEND ON THE ORDER IN WHICH THE NEXT ACTIONS ARE PERFORMED */
+
+	     tsdw = get_ptrs_$given_astep (astep);	/* Get initial  SDW. */
+	     dseg$ (segno) = tsdw;			/* store temp SDW in the descriptor segment */
+	     call page$cam;
+
+
+	     call get_pvtx$hold_pvtx ((pvt_array.pvid (pvtx)), pvtx, (0));	/* Hold the RPV */
+	     astep -> aste.usedf = "1"b;		/* mark it as being used - as late as possible */
+
+	     call thread$out (astep, sst$level (ptsi).ausedp); /* thread the entry out of the used list */
+
+	     call lock$unlock_ast;
+
+
+/* INITIALIZE POINTERS TO TABLES */
+
+	     table1p = addr (pv_salv_seg.table1);
+	     table2p = addr (pv_salv_seg.table2);
+	     table3p = addr (pv_salv_seg.table3);
+	     table4p = addr (pv_salv_seg.table4);
+	     table5p = addr (pv_salv_seg.table5);
+	     table6p = addr (pv_salv_seg.table6);
+
+	     return;
+
+	end INIT_TABLES;
+
+%page; %include aste;
+%page; %include disk_pack;
+%page; %include fs_vol_label;
+%page; %include null_addresses;
+%page; %include old_fs_vol_label;
+%page; %include pvte;
+%page; %include salv_data;
+%page; %include salvager_severities;
+%page; %include segdamage_msg;
+%page; %include syserr_binary_def;
+%page; %include syserr_constants;
+%page; %include vol_map;
+%page; %include vtoc_header;
+%page; %include vtoc_map;
+%page; %include vtoce;
+
+/*  */
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   salvage_pv: INIT_TABLES: aste pool WWWo too small.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The physical volume salvager was unable to
+   obtain a temporary AST entry for segment requiring
+   WWWo ptws. No salvaging was done.
+
+   A:	Shut down,
+   manually correct the SST card,
+   and reboot.
+   Then salvage all volumes,
+   since the indicator that volumes need salvaging
+   may have been lost.
+
+   Message:
+   salvage_pv: Volume salvage of dskX_NN{s}, volume PVNAME of logical vol LVNAME.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	This message is printed when volume salvaging begins.
+
+   A:	$ignore
+
+   Message:
+   salvage_pv: VTOC Conversion of dskX_NN{s}, volume PVNAME of logical vol LVNAME.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	This message is printed when a pre-MR10 disk pack is first
+   mounted on an MR10 or later system. The equivalent of a salvage
+   is being done to create the VTOC Map, which did not exist prior
+   to MR10.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: Bit map size is DD. (WWo) words, s/b EE. (FFo), changing to latter.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The bit map size in the volume label was incorrect and has been corrected.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: Label times in advance of clock. The clock may be wrong.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The label of the volume being salvaged
+   contains one or more clock readings in advance of the current clock.
+   Salvaging will proceed.
+   The times are not corrected.
+   If there is reason to believe that the system clock is incorrect,
+   shut the system down as soon as possible and take steps to recover
+   that part of the hierarchy which may have been contaminated with bad
+   clock values.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: NN free vtoces added to free list.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	NN free VTOC entries
+   were found while salvaging and added to the list of free VTOC entries.
+   This is a normal message.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: damaged switch found on for UUUU vtocx XXXo: NAME
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   with unique ID UUUU at vtoc index XXXo
+   was found to have its damaged switch on.
+   The damaged switch can be set during the running of the system
+   if page control encounters an I/O error.
+   Damaged segments cannot be used until the damaged switch is reset.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: dirsw turned off for vtocx XXXo: NAME
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   has had its directory switch turned off.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: freeing UUUU deciduous vtocx XXXo: NAME
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   with unique ID UUUU
+   at vtoc index XXXo
+   was deciduous, and has been deleted from the RPV.
+   This is debugging output
+   printed for system programmers
+   if a SALV DEBG card is supplied.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: freeing UUUU per-bootload vtocx XXXo: NAME
+
+   S:     $salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME with unique ID UUU
+   at vtoc index XXXo was per-bootload (inferior to a prior >sl1),
+   and has been deleted. This is debugging output printed for system 
+   programmers if a SALV DEBG card is supplied.
+
+   A:  $ignore
+
+
+   Message:
+   salvage_pv: freeing UUUU per process vtocx XXXo: NAME
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   with unique ID UUUU
+   at vtoc index XXXo
+   was per-process
+   and has been deleted.
+   This is debugging output
+   printed for system programmers
+   if a SALV DEBG card is used.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: map of assigned addresses changed.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	If any corrections were made to the
+   map on the volume
+   which shows which addresses are free and which are in use,
+   this message is printed.
+   If the volume was not properly shut down, this message is to be expected.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: no. of free recs changed from OLD to NEW (dec).
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	If the number of free records
+   in the volume label
+   is changed by a volume salvage,
+   this message is printed.
+   If the volume was not properly shut down, this message is to be expected.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: no. of free vtoces changed from OLD to NEW (dec).
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	If the number of
+   free VTOC entries
+   in the volume label
+   is changed by a volume salvage,
+   this message is printed.
+
+   A:	$ignore
+
+
+
+   Message:
+   salvage_pv: vtoce NAME at XXXo: cur len changed from OLD to NEW (octal)
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   had a current length which did not agree
+   with the file map.
+   The current length was corrected
+   and the damaged switch set on the segment.
+   This message usually indicates that a segment was damaged before a crash
+   by failure to write out its pages to disk before the crash.
+   The segment may have to be recovered.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: vtoce NAME at XXXo: max len changed from OLD to NEW (octal).
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   had a maximum segment length which did not agree
+   with the file map
+   or was less than the current length.
+   The maximum length was corrected
+   and the damaged switch set.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: vtoce NAME at XXXo: time-record-product reset to zero.
+
+   S:     $salvout
+
+   T:     $salvt
+
+   M:     The segment originally named NAME at vtoc index XXXo
+   had an invalid value for one of the time-record-product fields.
+   All time-record-product fields have been reset to zero.
+
+   A:     $ignore
+
+
+   Message:
+   salvage_pv: vtoce NAME at XXXo: page PPPo disk_addr DDDDo bad.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   had an invalid disk address DDDDo for page PPPo.
+   The address is nulled,
+   causing a page of zeroes,
+   and the damaged switch set.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: vtoce NAME at XXXo: rec used changed from OLD to NEW (octal).
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   had a records used which
+   did not agree with the file map.
+   The records used field was corrected
+   and the damaged switch set.
+   This message usually indicates that a segment was damaged before a
+   crash by failure to write out its pages to disk before the crash.
+   The segment may have to be recovered.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: vtoce NAME at XXXo: ref to pageno PPo at addr DDDDo deleted, dirsw is X.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The segment originally named NAME
+   at vtoc index XXXo
+   had a reused address conflict with another segment.
+   The page reference
+   was determined to be incorrect,
+   and a null address placed in the segment's file map,
+   causing a page of zeroes,
+   and the damaged switch set.
+   This message may be symptomatic of disk or other hardware problems.
+
+   A:	$ignore
+
+
+   Message:
+   salvage_pv: vtoce XXXo free but not zero.
+
+   S:	$salvout
+
+   T:	$salvt
+
+   M:	The VTOC entry with index XXXo
+   was marked free but was not all zero.
+   It was zeroed and made free.
+
+   A:	$ignore
+
+   Message:
+   salvage_pv: setting damaged switch on PRIMARYNAME (VTOCXo) on pv PVNAME.
+
+   S: $log
+
+   T: $salvt
+
+   M: The volume salvager has discovered possible damage to a segment and has
+   turned on the damaged switch.
+
+   A: $ignore
+   This message is logged in order to trigger automatic processing of damaged
+   segments.
+
+
+   Message:
+   salvage_pv: VTOC conversion finished.
+
+   S: $salvout
+
+   T: $salvt
+
+   M: VTOC conversion finished.
+
+   A: $ignore
+
+
+   Message:
+   salvage_pv: VTOC conversion finished with errors.
+
+   S: $salvout
+
+   T: $salvt
+
+   M: VTOC conversion finished with errors.
+
+   A: $inform
+
+
+   Message:
+   salvage_pv: Volume salvage finished.
+
+   S: $salvout
+
+   T: $salvt
+
+   M: Volume salvage finished.
+
+   A: $ignore
+
+
+   Message:
+   salvage_pv: Volume salvage finished with errors.
+
+   S: $salvout
+
+   T: $salvt
+
+   M: Volume salvage finished with errors.
+
+   A: $inform
+
+
+   Message:
+   salvage_pv: DDD damaged segments on volume PVNAME (NNN damaged in this salvage).
+
+   S: $info
+
+   T: $salvt
+
+   M: DDD damaged segments were found on the volume PVNAME, which has
+   just been volume-salvaged. The damaged switch was set for NNN of these
+   segments during this volume salvage. The  damaged switch  for the 
+   other segments had been set prior to the salvage.
+
+   A: Inspect the syserr and Answering Service log to identify
+   damaged segments.  Prepare to recover them if necessary.
+
+
+
+   END MESSAGE DOCUMENTATION */
+
+
+     end salvage_pv;

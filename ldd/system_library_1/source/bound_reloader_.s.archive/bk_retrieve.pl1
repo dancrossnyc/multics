@@ -1,0 +1,524 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+bk_retrieve: proc;					/* extracted from backup_load */
+
+/* Modified 16 June 1970, R H Campbell. */
+/* Modified 21 October 1970, R. J. Feiertag */
+/* Modified 10 May 1971, R. A. Tilden */
+/* Modified 22 July 1974 RE Mullen */
+/* Modified 23 July 1975, R. Bratt to remove knowledge of pre 18-0 backup tape formats */
+/* Entry points check_structure and parse structure added 11/9/77 by Steve Herbst */
+/* -no_primary added 08/03/79 S. Herbst */
+/* Modified to avoid page boundary hardware bug 098; installed on MCR 4311 to fix errmsgs 02/05/80 S. Herbst */
+/* Hierarchy level restriction removed for reloading commands 07/18/80 S. Herbst */
+/* Changed not to cross-retrieve a segment in place of an existing directory 01/21/82 S. Herbst */
+/* Changed to retrieve an entire MSF without ">**" 02/05/82 S. Herbst */
+
+dcl (i, j, k, l, n, htype) fixed bin,			/* temporary storage */
+     path_name char (168),				/* Complete path name of entry. */
+     old_dname char (168) init (""),			/* Previous directory name. */
+     code fixed bin (35);
+
+
+dcl  line char (300) static,				/* Output line(s) buffer. */
+     line_pointer ptr static,				/* Pointer to line buffer. */
+     hp ptr static,
+     a_hp ptr;
+
+dcl  nl char (1) static;				/* Newline used in parsing retrieval control */
+
+dcl  rname char (168) aligned,			/* Retrieval control input name, dirname */
+     rdname char (168) static aligned,			/* Retrieval control dirname */
+     rename char (32) aligned static,			/* ..entry name */
+    (rsize, rbc) fixed bin;				/* size of rname, bit count of file */
+
+dcl (rptr, reqptr) ptr static;			/* ptr to retrieval control (raw, parsed) */
+
+dcl (parsed, next, stop, terminate, reported, checked) fixed bin static;
+
+dcl  label_index fixed bin;
+
+dcl (rlines, rfin, rcomp,				/* no. requests, no. complete, no. unique */
+     rcurr, ncurr) fixed bin static,			/* current request, next newname */
+     grt_count fixed bin;				/* number of >'s in a pathname */
+
+dcl  1 req based (reqptr) aligned,			/* parsed request array */
+     2 path_copy char (168),				/* to avoid CMPC failure near page boundary, Bug 098 */
+     2 opt (1000),					/* options for, status of, a request */
+     3 (rename,					/* new name was provided */
+     exact,					/* load only this entity */
+     synonym,					/* this entry is a synonym for the one specified by renamo */
+     found,					/* something by this name was found */
+     finished,					/* request has been satisfied fully */
+     spare) bit (1) unaligned,
+     2 srch (1000),					/* data by which to retrieve */
+     3 (len,					/* significant chars in search name */
+     grt,						/* number of >'s in search name */
+     control_index,					/* index of backup_control entry for backup_load_ */
+     renamo) fixed bin,				/* index of newname or of primary entry if a synonym */
+     3 name char (168),				/* name to look for */
+     2 newn (200),					/* name by which to reload */
+     3 (ndlen, nelen, ngrt) fixed bin,			/* lengths of next fields, number of ">"s in dname */
+     3 ndname char (168);				/* new pathname */
+
+dcl (rscan (1000000) char (1), rmove char (1000000)) based, /* overlays for parsing */
+     rset bit (6) based;				/* overlay for setting field of bits */
+
+dcl (error_table_$badcall, error_table_$bad_string,
+     error_table_$smallarg, error_table_$badpath, error_table_$noentry,
+     error_table_$no_dir, error_table_$no_s_permission,
+     error_table_$moderr, error_table_$no_info,
+     error_table_$arg_ignored, error_table_$segknown) external fixed bin (35);
+
+dcl (addr, baseptr, divide, fixed, index, length, reverse, rtrim, substr, unspec, verify) builtin;
+
+dcl  backup_map_$fs_error_line entry (fixed bin (35), char (*) aligned, char (*) aligned, char (*) aligned),
+     backup_map_$on_line entry (ptr, fixed bin),
+     backup_util$get_real_name entry (ptr, ptr, fixed bin, fixed bin (35)),
+     expand_pathname_ entry (char (*) aligned, char (*) aligned, char (*) aligned, fixed bin (35));
+
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35)),
+     hcs_$terminate_noname entry (ptr, fixed bin (35)),
+     hcs_$truncate_seg entry (ptr, fixed bin, fixed bin (35)),
+     hcs_$initiate_count entry (char (*) aligned, char (*) aligned, char (*), fixed bin, fixed bin (2), ptr, fixed bin (35));
+
+dcl (com_err_, ioa_, ioa_$rsnnl) ext entry options (variable);
+
+/*  */
+
+%include bk_ss_;
+%page;
+%include backup_control;
+%page;
+%include backup_preamble_header;
+%page;
+%include backup_record_types;
+
+/*  */
+
+/* Check whether this tape record is to be reloaded by scanning retrieval request segment. */
+
+check_retrieval: entry (label_index);
+
+	if rfin = rcomp then do;			/* If all unique requests are fully satisfied */
+	     call ioa_$rsnnl ("^a: all requests satisfied.", line, n, bk_ss_$myname);
+	     call backup_map_$on_line (line_pointer, n);	/* inform the world of success */
+	     label_index = stop;			/* and terminate retrieval */
+	     go to exit;
+	end;
+
+	htype = hp -> h.record_type;
+	hp -> h.dlen = length (rtrim (hp -> h.dname));
+	path_name = substr (hp -> h.dname, 1, hp -> h.dlen) || ">"; /* prepare full name of tape record */
+	n = hp -> h.dlen + 1;			/* set the length */
+	if hp -> h.elen ^= 0 then do;			/* if there is an entry name, tack it on */
+	     hp -> h.elen = length (rtrim (hp -> h.ename));
+	     substr (path_name, n + 1) = substr (hp -> h.ename, 1, hp -> h.elen) || ">";
+	     n = n + hp -> h.elen + 1;		/* recompute length */
+	end;
+	if rcurr ^= 0 then do;			/* if we are currently working on a subtree request */
+	     i = rcurr;				/* set i in case of match */
+	     req.path_copy = req.srch.name (i);
+	     if substr (path_name, 1, req.srch.len (i)) = req.path_copy then
+		go to match;			/* first part of pathname matches */
+	     if bk_ss_$onlysw & req.opt.found (i) then do; /* no longer matching, and wanted only first */
+		req.opt.finished (i) = "1"b;		/* mark previous request completed */
+		if req.opt.synonym (i) then req.opt.finished (req.srch.renamo (i)) = "1"b; /* and his twin */
+		rfin = rfin + 1;			/* number of fully completed increases */
+	     end;
+	end;
+	do i = 1 to rlines;				/* look for applicable request */
+	     if i = rcurr then go to next_test;		/* skip possible request previously checked */
+	     if req.opt.finished (i) then go to next_test; /* skip completed request */
+	     if req.opt.exact (i) then do;		/* exact means don't load subtree */
+		if n = req.srch.len (i) & substr (path_name, 1, n) = req.srch.name (i) then
+		     go to match;			/* exactly the item requested */
+	     end;
+	     else do;
+		req.path_copy = req.srch.name (i);
+		if substr (path_name, 1, req.srch.len (i)) = req.path_copy then
+		     go to match;			/* pathname matches */
+	     end;
+next_test: end;
+	rcurr = 0;				/* not working on anything */
+	label_index = next;				/* don't process this tape record */
+	go to exit;
+
+match:	bk_ss_$retrieval_index = i;			/* save; backup_load uses it */
+	if bk_ss_$sub_entry then bk_ss_$path_index = req.srch.control_index (i);
+	if htype ^= ndc_directory & htype ^= sec_dir then do;
+	     req.opt.found (i) = "1"b;		/* indicate something interesting encountered */
+	     if req.opt.synonym (i) then req.opt.found (req.srch.renamo (i)) = "1"b; /* on twin too */
+	     if bk_ss_$sub_entry then
+		bk_ss_$control_ptr -> backup_control.found (bk_ss_$path_index) = "1"b;
+	end;
+	if bk_ss_$onlysw then do;			/* special processing with -first option */
+	     if req.opt.exact (i) then do;		/* if only exact match was wanted, this is it */
+		if htype ^= ndc_directory & htype ^= sec_dir then do;
+		     req.opt.finished (i) = "1"b;	/* so mark it, and its brother if any */
+		     if req.opt.synonym (i) then req.opt.finished (req.srch.renamo (i)) = "1"b;
+		     rfin = rfin + 1;		/* count number of requests complete */
+		end;
+	     end;
+	     if rcurr ^= 0 then			/* avoid OOB */
+		if req.opt.finished (rcurr) then rcurr = 0; /*  we delayed resetting this so it could be used in loop */
+	end;
+	if ^req.opt.exact (i) then rcurr = i;		/* indicate we are currently interested in a subtree */
+	if req.opt.rename (i) then do;		/* check whether to load it under its own name */
+	     bk_ss_$cross_retrievesw = "1"b;
+	     ncurr = req.srch.renamo (i);		/* get index of new name */
+	     if req.opt.synonym (i) then ncurr = req.srch.renamo (ncurr); /* indirect if necessary */
+	     grt_count = req.srch.grt (i);
+	     j = 0;				/* count of ">"s in tape dirname */
+	     if req.newn.ndlen (ncurr) = 0 then do;	/* check whether replacing only entry name */
+		if (htype = ndc_directory_list) then do;
+		     do i = 1 to hp -> h.dlen;	/* scan for entry name portion */
+			if addr (hp -> h.dname) -> rscan (i) = ">" then do;
+			     j = j + 1;		/* count subpath */
+			     if j = grt_count then do;  /* found the place */
+				hp -> h.dname = substr (hp -> h.dname, 1, i) ||
+				     substr (req.newn.ndname (ncurr), 1, req.newn.nelen (ncurr));
+				hp -> h.dlen = i + req.newn.nelen (ncurr);
+				go to renamed;	/* finished renaming */
+			     end;
+			end;
+		     end;
+		     go to renamed;
+		end;
+		hp -> h.ename = req.newn.ndname (ncurr); /* change name */
+		hp -> h.elen = req.newn.nelen (ncurr);	/* and its length */
+		go to renamed;			/* go load it */
+	     end;
+	     if (htype = ndc_directory_list) then do;
+		do i = 1 to hp -> h.dlen;		/* scan old dirname */
+		     if addr (hp -> h.dname) -> rscan (i) = ">" then do;
+			j = j + 1;		/* count partial path */
+			if j = grt_count + 1 then do;  /* looking for one > beyond the old path */
+partial:			     hp -> h.dname = substr (req.newn.ndname (ncurr), 1, req.newn.ndlen (ncurr))
+				|| substr (hp -> h.dname, i, hp -> h.dlen - i + 1);
+			     hp -> h.dlen = hp -> h.dlen - i + 1 + req.newn.ndlen (ncurr);
+			     go to renamed;		/* partial path substituted */
+			end;
+		     end;
+		end;
+dironly:		hp -> h.dlen = req.newn.ndlen (ncurr);	/* complete replacement */
+		hp -> h.dname = substr (req.newn.ndname (ncurr), 1, hp -> h.dlen);
+		go to renamed;
+	     end;
+	     do i = 1 to hp -> h.dlen;		/* scan entire tape dirname */
+		if addr (hp -> h.dname) -> rscan (i) = ">" then do; /* if it is end of partial path, count it */
+		     j = j + 1;			/* increment total */
+		     if j = grt_count then do;	/* check whether this is size of dirname */
+			k = index (substr (hp -> h.dname, i + 1), ">"); /* look for another one */
+			if k = 0 then go to dironly;	/* if not, dirname only needs changing */
+			i = i + k;		/* replace this many levels of dirname */
+			go to partial;		/* rename front end of path */
+		     end;
+		end;
+	     end;
+	     hp -> h.dlen = req.newn.ndlen (ncurr) - req.newn.nelen (ncurr) - 1; /* replace both d- and e- names */
+	     hp -> h.dname = substr (req.newn.ndname (ncurr), 1, hp -> h.dlen);
+	     hp -> h.elen = req.newn.nelen (ncurr);
+	     hp -> h.ename = substr (req.newn.ndname (ncurr), hp -> h.dlen + 2, hp -> h.elen);
+renamed:	end;
+	else bk_ss_$cross_retrievesw = "0"b;
+	label_index = checked;			/* reload (renamed) entity */
+	go to exit;
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+
+flag_msf: entry (A_index);
+
+dcl A_index fixed bin;
+
+	rcurr = A_index;				/* doing a subtree (MSF) */
+
+	req.opt.exact (A_index) = "0"b;		/* retrieve the whole subtree */
+	if req.opt.synonym (A_index) then req.opt.exact (req.srch.renamo (A_index)) = "0"b;
+						/* get the twin too in case it matters */
+	return;
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+
+/* Entry to parse the retrieval file and convert it into tabular form */
+
+parse_retrieval_control: entry (rname, rsize, a_hp, label_index);
+
+	if bk_ss_$sub_entry then do;
+	     call backup_map_$fs_error_line (error_table_$badcall, "bk_retrieve$parse_retrieval_control",
+		"^/This entry point must be called via backup_load, reload or retrieve", "");
+	     label_index = terminate;
+	end;
+	go to COMMON;
+
+parse_structure: entry (a_hp, label_index);
+
+	if ^bk_ss_$sub_entry then do;
+	     call backup_map_$fs_error_line (error_table_$badcall, "bk_retrieve$parse_structure",
+		"^/This entry point must be called via backup_load_", "");
+	     label_index = terminate;
+	end;
+
+COMMON:	hp = a_hp;				/* Copy argument into static and save */
+	unspec (nl) = "000001010"b;			/* Newline character */
+	rfin, rlines = 0;				/* convert retrieval file to tabular form */
+	parsed = 1;				/* set up label index words */
+	next = 2;
+	stop = 3;
+	terminate = 4;
+	reported = 5;
+	checked = 6;
+	if ^bk_ss_$sub_entry then do;
+	     line_pointer = addr (line);
+
+	     call expand_pathname_ (substr (rname, 1, rsize), rdname, rename, code);
+	     if code ^= 0 then do;
+		call com_err_ (code, bk_ss_$myname, rname);
+		go to reported_exit;		/* cannot proceed without legal pathname */
+	     end;
+
+	     call hcs_$initiate_count (rdname, rename, "", rbc, 1, rptr, code);
+	     if code ^= 0 & code ^= error_table_$segknown then do;
+		call com_err_ (code, bk_ss_$myname, "^a>^a", rdname, rename);
+		go to reported_exit;		/* cannot proceed without instructions */
+	     end;
+	end;
+
+	call hcs_$make_seg ("", "retrieval_control", "", 01011b, reqptr, code);
+	if code ^= 0 & code ^= error_table_$segknown then do;
+	     call com_err_ (code, bk_ss_$myname, "retrieval_control");
+reported_exit: label_index = reported;			/* cannot proceed without storage */
+	     go to exit;
+	end;
+	call hcs_$truncate_seg (reqptr, 0, 0);		/* be sure it's zeroes */
+
+	ncurr, rcurr, i = 1;			/* new names, requests, character cursors */
+
+	if bk_ss_$sub_entry then do;
+	     rlines, rcomp = bk_ss_$control_ptr -> backup_control.request_count;
+	     if rlines > 500 then go to parsed_enough;
+	     do rcurr = 1 to rlines;
+		line = bk_ss_$control_ptr -> backup_control.path (rcurr);
+		if substr (line, 1, 1) ^= ">" then do;
+		     bk_ss_$control_ptr -> backup_control.status_code (rcurr) = error_table_$badpath;
+		     label_index = terminate;
+		     go to exit;
+		end;
+		req.srch.control_index (rcurr) = rcurr;  /* one req.srch per backup_control entry so far */
+		req.srch.name (rcurr) = line;
+		req.srch.len (rcurr) = length (line) + 1 - verify (reverse (line), " ");
+		if bk_ss_$control_ptr -> backup_control.new_path (rcurr) ^= "" then do;    /* cross-retrieval */
+		     req.opt.rename (rcurr) = "1"b;
+		     req.srch.renamo (rcurr) = ncurr;
+		     j = 0;			/* count >'s in search name */
+		     do k = 1 to req.srch.len (rcurr);
+			if addr (req.srch.name (rcurr)) -> rscan (k) = ">" then j = j + 1;
+		     end;
+		     req.srch.grt (rcurr) = j;
+		     line = bk_ss_$control_ptr -> backup_control.new_path (rcurr);
+		     n = length (rtrim (line));
+		     bk_ss_$no_primary = bk_ss_$control_ptr -> backup_control.no_primary_sw (rcurr);
+		     j = 0;
+		     call count_grts;
+		     ncurr = ncurr + 1;
+		     n = req.srch.len (rcurr);
+		end;
+		else req.opt.rename (rcurr) = "0"b;
+		req.opt.exact (rcurr) = "0"b;		/* load everything underneath specified entry */
+	     end;
+	end;
+
+	else do;
+	     rbc = divide (rbc, 9, 17, 0);		/* compute number of characters to scan */
+	     do while (i < rbc);			/* scan the file one line at a time */
+		if rlines > 500 then go to parsed_enough; /* maximum requests at one time */
+		do j = i by 1 to rbc while (rptr -> rscan (j) ^= nl); /* isolate one request line */
+		end;
+		n = j - i;			/* length without newline character */
+		k = i;				/* save beginning of line index */
+		i = j + 1;			/* one past the newline */
+		if n = 0 then go to parse_next;	/* ignore blank line */
+		line = substr (rptr -> rmove, k, n);	/* extract line to facilitate further scanning */
+		if substr (line, 1, 1) ^= ">" then do;	/* at least the lefthand side must be a pathname */
+		     call com_err_ (error_table_$badpath, bk_ss_$myname, "search arg of ^a", line);
+		     go to bad_p;
+		end;
+		j = index (line, "=");		/* check for rename option */
+		if j = 0 then do;			/* renaming was not specified */
+		     req.opt.rename (rcurr) = ""b;	/* turn off the switch */
+		     req.srch.name (rcurr) = substr (line, 1, n); /* move in pathname to seek */
+		     req.srch.len (rcurr) = n;	/* and its length */
+		end;
+		else do;				/* renaming was specified */
+		     if j = n then do;		/* line ending in "=" is an error */
+			call com_err_ (error_table_$bad_string, bk_ss_$myname, "no new name in ^a", line);
+			go to bad_p;		/* give up */
+		     end;
+		     req.opt.rename (rcurr) = "1"b;	/* so indicate */
+		     req.srch.name (rcurr) = substr (line, 1, j - 1); /* move search argument */
+		     req.srch.len (rcurr) = j - 1;	/* length of sought pathname */
+		     req.srch.renamo (rcurr) = ncurr;	/* location of new name */
+		     call count_grts;		/* count ">"'s in pathname */
+		     ncurr = ncurr + 1;		/* prepare for next renaming */
+		     n = j - 1;			/* length ignoring righthand side */
+		end;
+		call see_stars;			/* look for stars in search name */
+		j = 0;				/* count >'s in search name */
+		do k = 1 to req.srch.len (rcurr);
+		     if addr (req.srch.name (rcurr)) -> rscan (k) = ">" then j = j + 1;
+		end;
+		req.srch.grt (rcurr) = j;
+		rcurr = rcurr + 1;			/* next request */
+		rlines = rlines + 1;
+parse_next:    end;
+	     call hcs_$terminate_noname (rptr, code);	/* ascii version no longer needed */
+	     if code ^= 0 then
+		call backup_map_$fs_error_line (code, "terminate_noname", rname, "");
+	     rcomp = rlines;			/* number of requests to fulfill first option */
+	end;
+	do i = 1 to rlines;				/* see if abbreviations were typed and get fuller names */
+	     if bk_ss_$sub_entry then
+		bk_ss_$no_primary = bk_ss_$control_ptr -> backup_control.no_primary_sw (i);
+	     if ^bk_ss_$no_primary then do;
+		call backup_util$get_real_name
+		     (addr (req.srch.name (i)), addr (req.srch.name (rcurr)), req.srch.len (rcurr), code);
+		if code > 1 & code ^= error_table_$noentry & code ^= error_table_$no_dir &
+		  code ^= error_table_$no_s_permission & code ^= error_table_$moderr &
+		  code ^= error_table_$no_info then do;
+		     bk_ss_$path_index = i;
+		     call backup_map_$fs_error_line (code, (bk_ss_$myname),
+			"get_real_name for "||req.srch.name (i), "");
+		     go to bad_p;
+		end;
+		else if code = 1 then do;		/* another name was generated */
+		     req.opt (rcurr) = req.opt (i);
+		     req.opt.synonym (rcurr) = "1"b;	/* indicate duplicate entry */
+		     req.srch.renamo (rcurr) = i;	/* point out original request */
+		     req.srch.control_index (rcurr) = req.srch.control_index (i);
+						/* index of backup_control entry for backup_load_ */
+		     req.srch.grt (rcurr) = req.srch.grt (i);  /* copy the original's > count */
+		     req.srch.name (rcurr) = substr (req.srch.name (rcurr), 1, req.srch.len (rcurr)) || ">";
+		     req.srch.len (rcurr) = req.srch.len (rcurr) + 1; /* ">" added for comparisons */
+		     rcurr = rcurr + 1;
+		     rlines = rlines + 1;
+		end;
+	     end;
+	     else code = 0;
+	     req.srch.name (i) = substr (req.srch.name (i), 1, req.srch.len (i)) || ">"; /* append ">" for comparisons */
+	     req.srch.len (i) = req.srch.len (i) + 1;	/* adjust size */
+	end;
+	rcurr = 0;				/* indicate no "current" request */
+	label_index = parsed;			/* proceed to load the tape */
+	go to exit;
+
+parsed_enough: call ioa_$rsnnl			/* here if too many requests for request table */
+	     ("^a: over 500 retrieval requests. Reload ended.", line, n, bk_ss_$myname);
+	call backup_map_$on_line (line_pointer, n);	/* print complaint */
+bad_p:	call hcs_$terminate_noname (rptr, code);	/* get rid of useless parsed data */
+	code = error_table_$arg_ignored;
+	rlines = 0;				/* say we don't have any requests */
+	label_index = terminate;			/* abort run */
+
+	return;
+
+
+count_grts: proc;
+
+	     req.newn.ngrt (ncurr) = 0;		/* prepare to count ">"s */
+	     if substr (line, j + 1, 1) = ">" then do;	/* see if dirname or entry name */
+		req.newn.ndname (ncurr) = substr (line, j + 1, n - j); /* save new dirname */
+		req.newn.ndlen (ncurr) = n - j;	/* ..and its length */
+		if ^bk_ss_$no_primary then call backup_util$get_real_name  /* use primary pathname */
+		     (addr (req.newn.ndname (ncurr)), addr (req.newn.ndname (ncurr)), req.newn.ndlen (ncurr), code);
+		else code = 0;
+		do k = 1 to req.newn.ndlen (ncurr);	/* count its ">"s */
+		     if addr (req.newn.ndname (ncurr)) -> rscan (k) = ">" then do;
+			req.newn.ngrt (ncurr) = req.newn.ngrt (ncurr) + 1;
+			l = k;			/* we need to know where the last one was */
+		     end;
+		end;
+		req.newn.nelen (ncurr) = req.newn.ndlen (ncurr) - l; /* split off and save entry name */
+	     end;
+	     else do;				/* store entry name */
+		req.newn.ndlen (ncurr) = 0;		/* no dirname */
+		req.newn.ndname (ncurr) = substr (line, j + 1, n - j);
+		req.newn.nelen (ncurr) = n - j;
+	     end;
+
+	end count_grts;
+
+
+see_stars: proc;
+
+	     if substr (req.srch.name (rcurr), n - 2, 3) = ">**" then do; /* hierarchy load is wanted */
+		req.opt.exact (rcurr) = ""b;		/* don't want exact match only */
+		substr (req.srch.name (rcurr), n - 2, 3) = ""; /* reset global indicator */
+		req.srch.len (rcurr) = n - 3;		/* lower length */
+		if req.opt.rename (rcurr) then do;	/* special rules for subtree renaming */
+		     l = 1;			/* prepare to count ">"s in search name */
+		     do k = 2 to req.srch.len (rcurr);	/* to check that request is not to change hierarchy level */
+			if addr (req.srch.name (rcurr)) -> rscan (k) = ">" then l = l + 1;
+		     end;
+		end;
+	     end;
+	     else req.opt.exact (rcurr) = "1"b;		/* exact match is wanted */
+	     req.opt.found (rcurr), req.opt.finished (rcurr), req.opt.synonym (rcurr) = ""b;
+
+	end see_stars;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+
+/* Entry to prepare notification of what was accomplished */
+
+report_retrieval: entry;
+
+dcl  unsatisfied bit (1) aligned;
+
+	if rlines = 0 then go to exit;
+	if bk_ss_$sub_entry then go to reportend;
+	call hcs_$initiate_count (rdname, rename, "", rbc, 1, rptr, code);
+	if code ^= 0 & code ^= error_table_$segknown then do; /* cannot report if we can't access request file */
+	     call backup_map_$fs_error_line (code, "initiate", rdname, rename);
+	     go to reportend;
+	end;
+	rbc = divide (rbc, 9, 17, 0);			/* who knows if it changed? */
+	i, k = 1;					/* ascii index, request index */
+	unsatisfied = ""b;				/* Flags first unsatisfied request */
+
+next_req:	n = index (substr (rptr -> rmove, i, rbc), nl);	/* Look for next new line character */
+	if n ^= 0 then				/* Found one */
+	     if ^req.opt (k).found then do;		/* Was this request satisfied? */
+		if ^unsatisfied then do;		/* Was previous unsatisfied request found? */
+		     call ioa_ ("The following requests were not satisfied:"); /* NO! */
+		     unsatisfied = "1"b;		/* Mark unsatisfied request encountered */
+		end;
+
+		call ioa_ ("^a^/   Search name: ^a",
+		     substr (rptr -> rmove, i, n-1),
+		     substr (req.srch (k).name, 1, req.srch (k).len));
+	     end;
+
+	i = i + n;				/* Increment index to continue scan of request file */
+	k = k + 1;				/* Increment parsed request index */
+
+	if i < rbc then go to next_req;		/* Continue if more input */
+
+	call hcs_$terminate_noname (rptr, code);	/* get rid of ascii requests */
+reportend: call hcs_$truncate_seg (reqptr, 0, code);	/* get rid of parsed requests */
+exit:	return;
+     end;

@@ -1,0 +1,281 @@
+/* Begin include file ...... dskdcl.incl.pl1 */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Fawcett), approve(85-09-09,MCR6979),
+     audit(86-01-17,CLJones), install(86-03-21,MR12.0-1033):
+     Support for FIPS dev 0.
+  2) change(88-05-10,Farley), approve(88-06-03,MCR7906),
+     audit(88-08-03,Fawcett), install(88-08-08,MR12.2-1080):
+     Added reconnect_announce_time to chantab to allow announcement of
+     reconnects at a throttled rate.  Otherwise only report them in the syserr
+     log.  Also added IO_TYPE constant array for displaying I/O type.
+                                                   END HISTORY COMMENTS */
+
+/* Structures used by the Disk DIM */
+
+/* Modified 84-03-21 by T. Oke for system wide free queue. */
+/* Modified 84-04-24 by T. Oke for dynamic channel table. */
+/* Modified 84-05-03 by T. Oke to hold sx for azm analysis. */
+/* Modified 84-05-14 by T. Oke for larger quentry and adaptive optimization. */
+/* Modifies 84-11-26 by R. A. Fawcett for device 0 (fips) */
+
+/* format: style4,delnl,insnl,tree,ifthenstmt,indnoniterend */
+
+dcl  disk_seg$ ext;					/* disk data segment */
+
+dcl  disksp ptr,					/* pointer to disk subsystem info */
+     diskp ptr,					/* pointer to disk DIM info structure */
+     optp ptr,					/* pointer to opt_info */
+     sysp ptr;					/* pointer to sys_info */
+
+dcl  1 disk_data based (disksp) aligned,		/* disk subsystem information */
+       2 subsystems fixed bin,			/* number of subsystems */
+       2 free_offset bit (18),			/* offset of first unused location in segment */
+       2 status_mask bit (36),			/* mask for checking for disk error */
+       2 lock bit (36) unal,				/* disk_data lock */
+       2 free_q like qht,				/* head/tail offsets */
+       2 free_q_size fixed bin,			/* length of queue */
+       2 array (32),				/* per subsystem info */
+         (
+         3 offset bit (18),				/* location of data for this subsystem */
+         3 mbz bit (18),				/* low 18 of old  style indirect word */
+         3 name char (4)
+         ) unal,					/* name of subsystem */
+       2 stagnate_time fixed bin (35),			/* stagnatation period */
+       2 bail_outs fixed bin (35),			/* times ALM called PL1 */
+       2 pad bit (36),				/* double word align */
+       2 max_depth_reset_time fixed bin (71),		/* time max_reset done */
+						/* Upper bound is MAX_IO_TYPE, hard coded to avoid dynamic calculation */
+       2 sys_info (0:6) like sys_info,			/* MUST BE DOUBLE WORD ALIGNED */
+       2 free_q_entries (2 refer (disk_data.free_q_size)) like quentry;
+
+
+/* The following system table is used to hold the maximum queue loading
+   permitted system-wide for each IO type.  From the current loading and
+   the maximum loading a multiplier fraction is calculated.  These combine
+   to produce the final optimization multiplier to derive a Logcial Seek
+   from a Physical Seek. */
+
+dcl  1 sys_info aligned based (sysp),
+       3 depth float bin (27),			/* current load */
+       3 max_depth float bin (27),			/* max permissible */
+       3 fraction float bin (27),			/* load fraction */
+       3 depth_map bit (18) unaligned,			/* which depth counter */
+       3 pad bit (18) unaligned;
+%page;
+/* Maximum number of channels per sub-system.  Must be a power of two.  It must
+   be at or below the size of disk_init's chan_array size.  Shift factor is for
+   dctl's use. */
+
+dcl  dskdcl_chans_per_subsys fixed bin static options (constant) initial (32);
+dcl  dskdcl_chans_per_subsys_shift fixed bin static options (constant) initial (5);
+
+
+dcl  1 disktab based (diskp) aligned,			/* control structure for DIM's */
+       2 lock bit (36) unal,				/* data base lock */
+       2 nchan fixed bin,				/* number of disk channels */
+       2 first_dev fixed bin unal,			/* frist device number  0 or 1 */
+       2 last_dev fixed bin unal,			/* highest disk drive number */
+       2 channels_online fixed bin,			/* number of disk channels actually in use */
+       2 dev_busy bit (72),				/* busy bit for each device (only 0-63 used) */
+       2 dev_queued bit (72),				/* requests queued bit for each device (only 0-63 used) */
+       2 abs_mem_addr fixed bin (26) unsigned,		/* absolute memory address of this structure */
+       2 channels bit (18) unal,			/* location of chantab for this subsystem */
+       2 dev_index fixed bin (17) unal,			/* current device to check */
+       2 errors fixed bin,				/* error count */
+       2 ferrors fixed bin,				/* fatal error count */
+       2 edac_errors fixed bin,			/* count of EDAC correctable errors */
+       2 call_lock_meters like disk_lock_meters,		/* lock meters for call side of DIM */
+       2 int_lock_meters like disk_lock_meters,		/* lock meters for interrupt side of DIM */
+       2 alloc_wait_meters like disk_lock_meters,		/* meters for queue entry allocations */
+       2 run_lock_meters like disk_lock_meters,		/* lock meters for run calls */
+       2 devtab (0:0 refer (disktab.last_dev)) like devtab; /* device information table */
+
+dcl  1 disk_channel_table (1 refer (disktab.nchan)) like chantab based aligned;
+
+
+dcl  qp ptr,					/* pointer to queue entry */
+     cp ptr;					/* pointer to channel information table */
+%page;
+
+/* Queue entry, 6 words.  Cylinder and sector variables are over-size for
+   expansion space.  They will always be positive and upper bits can be
+   stolen for other fields.
+
+   Entries are forward and back linked to permit easy chasing and removal. */
+
+dcl  1 quentry based (qp) aligned,			/* queue entry */
+						/* WORD 1 */
+       2 next bit (18) unaligned,			/* forward link */
+       2 prev bit (18) unaligned,			/* back link */
+						/* WORD 2 */
+       2 intrpt bit (1) unaligned,			/* completion interrupt desired */
+       2 used bit (1) unaligned,			/* entry in use */
+       2 type fixed bin (4) unsigned unaligned,		/* IO type */
+       2 pad bit (6) unaligned,			/* future expansion */
+       2 coreadd bit (24) unaligned,			/* main memory address */
+						/* WORD 3 */
+       2 pvtx fixed bin (8) unsigned unaligned,		/* for AZM/ol_dump */
+       2 pdi fixed bin (6) unsigned unaligned,		/* physical device */
+       2 dev fixed bin (6) unsigned unaligned,		/* device in sub-sys */
+       2 pad2 bit (5) unaligned,
+       2 cylinder fixed bin (11) unsigned unaligned,	/* cylinder of request */
+						/* WORD 4 */
+       2 n_sectors fixed bin (6) unsigned unaligned,	/* # sectors of IO */
+       2 pad3 bit (9) unaligned,
+       2 sector bit (21) unaligned,			/* device sector desired */
+						/* WORDS 5&6 */
+       2 time fixed bin (71);				/* clock at queue */
+
+
+
+dcl  1 chantab based (cp) aligned,			/* channel information table */
+       2 chx fixed bin (35),				/* io_manager channel index */
+       2 ioi_ctx fixed bin (35),			/* ioi channel table index */
+       2 statusp ptr,				/* pointer to hardware status word */
+       2 chanid char (8),				/* channel name */
+       (
+       2 pad0 bit (18),
+       2 in_use bit (1),				/* non-zero if channel being used */
+       2 active bit (1),				/* non-zero if channel active */
+       2 rsr bit (1),				/* non-zero if RSR in progress */
+       2 ioi_use bit (1),				/* non-zero if channel usurped by IOI */
+       2 inop bit (1),				/* non-zero if channel inoperative */
+       2 broken bit (1),				/* non-zero if channel broken */
+       2 action_code bit (2),				/* saved from status */
+       2 pad1 bit (10)
+       ) unal,
+       (
+       2 qrp bit (18),				/* rel ptr to queue entry */
+       2 pad2 bit (3),
+       2 command bit (6),				/* peripheral command */
+       2 erct fixed bin (8)
+       ) unal,					/* error retry count */
+       2 select_data,				/* data passed to IOM on select */
+         (
+         3 limit bit (12),				/* limit on number of sectors */
+         3 mbz bit (3),
+         3 sector bit (21)
+         ) unaligned,				/* sector address */
+       2 reconnect_announce_time fixed bin (52),		/* reconnect announcement throttle */
+       2 connect_time fixed bin (52),			/* time of last connect */
+       2 connects fixed bin,				/* count of connects performed */
+       2 detailed_status (0:17) bit (8) unal,		/* detailed status bytes */
+       2 rstdcw bit (36),				/* restore command */
+       2 scdcw bit (36),				/* select command */
+       2 sddcw bit (36),				/* select data xfer */
+       2 dcdcw bit (36),				/* command to read or write */
+       2 dddcw bit (36),				/* data xfer DCW */
+       2 dscdcw bit (36),				/* RSR command */
+       2 dsddcw bit (36),				/* RSR data xfer */
+       2 rssdcw bit (36),				/* RSS command */
+       2 status bit (36) aligned,			/* saved status */
+						/* Lossage counters for interrupt loss. */
+       2 no_io_terminate fixed bin (35),		/* no t bit from io_manager$get_status */
+       2 terminate_not_active fixed bin (35),		/* terminate, but not active */
+       2 no_status_terminate fixed bin (35),		/* interrupt with no terminate */
+       2 status_from_run fixed bin (35);		/* status missed til run called */
+%page;
+dcl  1 qht aligned based,				/* queue head/tail structure */
+       2 sum fixed bin (35),				/* sum of depths */
+       2 count fixed bin (35),			/* allocs */
+       2 max_depth fixed bin (17) unaligned,		/* high water mark */
+       2 depth fixed bin (17) unaligned,		/* current depth */
+       2 head bit (18) unaligned,			/* queue head */
+       2 tail bit (18) unaligned;			/* queue tail */
+
+dcl  dp ptr,					/* pointer to device information table */
+     pvtdip ptr;					/* pointer to dim_info in PVT entry */
+
+dcl  1 devtab based (dp) aligned,			/* device information table */
+       (
+       2 pvtx fixed bin (8),				/* index of PVT entry for device */
+       2 inop bit (1),				/* device inoperative */
+       2 was_broken bit (1),				/* device previously broken */
+       2 broken bit (1),				/* device down */
+       2 abandoned bit (1),				/* device lost and gone forever */
+       2 forward bit (1),				/* moving low->high */
+       2 pad bit (10),
+       2 buddy unsigned fixed bin (6),			/* other device on this spindle or 0 */
+       2 pdi unsigned fixed bin (6)
+       ) unal,					/* primary device index */
+       2 cylinder fixed bin (35),			/* current cylinder position */
+       2 comb fixed bin (35),				/* number of combs */
+       2 pad1 fixed bin (35),
+       2 time_inop fixed bin (52),			/* time drive became inoperative */
+       2 wq like qht,				/* work queue */
+						/* Upper bound must be MAX_IO_TYPE, constant to avoid dynamic calculation. */
+       2 opt_info (0:6) like opt_info;			/* optimizer */
+
+
+/* Optimizing table for device. Must be even multiple words long. */
+/* Slope and intercept define a straight line of y = intercept - slope*x
+   Multiplier is calculated from this and current system loading.
+
+   sys_info is the offset to the relevant system queue loading fraction. */
+
+dcl  1 opt_info aligned based (optp),
+       3 multiplier float bin (27),			/* depth mult */
+       3 slope float bin (27),			/* slope of line */
+       3 intercept float bin (27),			/* Y intercept */
+       3 sys_info bit (18) unaligned,			/* offset to sys_info */
+       3 depth fixed bin (17) unaligned,		/* elements in queue */
+       3 channel_wait fixed bin (52),			/* total channel time waiting */
+       3 queue_wait fixed bin (52),			/* total queue time waiting */
+       3 seek_sum fixed bin (35) unaligned,		/* sum of seeks */
+       3 seek_count fixed bin (35) unaligned;		/* number of seeks */
+
+
+dcl  1 pvtdi based (pvtdip) aligned,			/* disk DIM info in PVT entry */
+       (
+       2 sx fixed bin (11),				/* structure index */
+       2 usable_sect_per_cyl fixed bin (11),		/* # of usable sectors on disk cylinder */
+       2 unused_sect_per_cyl fixed bin (11)
+       ) unal;					/* # of unused sectors at end of cylinder */
+
+dcl  1 disk_lock_meters based aligned,			/* lock meters for disk DIM */
+       2 count fixed bin,				/* total number of attempts */
+       2 waits fixed bin,				/* number of attempts which required waiting */
+       2 wait_time fixed bin (52);			/* total time spent waiting */
+
+dcl  (
+     RST_LISTX init (1),				/* listx for restore */
+     SC_LISTX init (2),				/* listx for select */
+     DSC_LISTX init (6),				/* listx for RSR */
+     RSS_LISTX init (8)
+     ) fixed bin (12) static options (constant);		/* listx for RSS */
+
+/* IO types defined.  Value is also index of write_map to determine if
+   the IO type is a read or a write. */
+
+dcl  (
+     PAGE_READ init (0),
+     PAGE_WRITE init (1),
+     VTOC_READ init (2),
+     VTOC_WRITE init (3),
+     TEST init (4),
+     BOOTLOAD_READ init (5),
+     BOOTLOAD_WRITE init (6),
+     MAX_IO_TYPE init (6)
+     ) fixed bin (4) static options (constant);
+
+dcl  IO_TYPE (0:6) char (16)
+	initial ("Page Read", "Page Write", "VTOC Read", "VTOC Write", "Test", "Bootload Read", "Bootload Write")
+	static options (constant);
+
+/* Map indexed by IO type to determine if operation is a read or write. */
+
+dcl  write_mapping bit (7) initial ("0101001"b) static options (constant);
+dcl  write_map (0:6) bit (1) defined (write_mapping);
+
+/* Map indexed by IO type to determine if operation is a sector IO. */
+
+dcl  sector_mapping bit (7) initial ("0011111"b) static options (constant);
+dcl  sector_map (0:6) bit (1) defined (sector_mapping);
+
+/* Map indexed by IO type to determine if operation is done on behalf of bce */
+
+dcl  bootload_mapping bit (7) initial ("0000011"b) static options (constant);
+dcl  bootload_map (0:6) bit (1) defined (bootload_mapping);
+
+/* End of include file ...... dskdcl.incl.pl1 */

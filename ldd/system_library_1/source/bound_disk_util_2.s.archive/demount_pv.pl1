@@ -1,0 +1,344 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-04-07,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-05-13,Coppola), install(86-07-17,MR12.0-1097):
+     Add support for printing subvolume name.
+  2) change(88-05-11,Parisek), approve(88-05-27,MCR7907),
+     audit(88-06-02,Fawcett), install(88-09-27,MR12.2-1122):
+     Changed to make sure the pack is removable before trying to unload it.
+     Declare builtins in the main (outer) block as some are referenced there.
+     To conform to configuration management. (phx20612)
+                                                   END HISTORY COMMENTS */
+
+
+demount_pv:
+     procedure (a_pvtx, a_code);
+
+/*    This procedure implements the hardcore portion of the physical
+   volume demounter.  It is called from the hardcore logical  volume
+   manager  when  the  latter  is asked to demount a logical volume.
+   The current implementation assumes that  no  salvaging  involving
+   the   volume   to   be   demounted   is  going  on.  The  current
+   implementation also does not attempt to overlap deactivation  I/O
+   with outer ring events.
+
+   This  procedure  is also called at system shutdown time
+   to demount the entire storage hierarchy. At this time, it  avoids
+   calling  deactivate,  in order to avoid dealing with possibly bad
+   threads or trailers.
+
+   Although this procedure turns on  pvte.being_demounted,
+   this bit may turned on by the caller.  demount_pv will deactivate
+   all segments residing on physical volumes with this bit on.  When
+   parallelism  with  outer-ring  events  is  implemented, this will
+   allow total parallelism during multi-volume demounts.
+
+   Initial coding March 26, 1976 by Bernard Greenberg
+   Modified 2/27/77 for drive-down ESD, BSG.
+   Modified December 1981 by C. Hornig to remove Page Multilevel.
+   Modified March 1982 by J. Bongiovanni for new PVTE
+   Modified September 1982 by J. Bongiovanni for scavenger
+*/
+
+dcl  sst$astap ptr external;
+dcl  sst$astsize fixed bin external;
+dcl  1 sst$level (0:3) aligned external,
+     2 ausedp bit (18) unal,
+     2 no_aste bit (18) unal;
+dcl  sst$pts (0:3) fixed bin external;
+dcl  tc_data$system_shutdown ext fixed bin;
+dcl  pvt$n_in_use fixed bin external;
+
+dcl  error_table_$dev_nt_assnd ext fixed bin (35);
+dcl  error_table_$scavenge_in_progress ext fixed bin (35);
+dcl  error_table_$unable_to_do_io ext fixed bin (35);
+dcl  error_table_$vtoc_io_err ext fixed bin (35);
+
+dcl  get_pvtx$drain_pvtx entry (fixed bin);
+dcl  vtoc_man$cleanup_pv entry (fixed bin, fixed bin (35));
+dcl  fsout_vol entry (fixed bin, fixed bin);
+dcl  (
+     syserr,
+     syserr$error_code
+     ) entry options (variable);
+
+dcl  (addr, addrel, fixed) builtin;
+
+dcl  pvtx fixed bin;				/* pvtx being demounted */
+dcl  sys_shut bit (1) aligned;			/* ON if system shutdown */
+dcl  pic99 pic "99";
+dcl  devname char (9);				/* Device name */
+dcl  code fixed bin (35);
+
+
+dcl  a_code fixed bin (35);
+dcl  a_pvtx fixed bin;
+
+
+%page;
+	pvt_arrayp = addr (pvt$array);
+	pvtx = a_pvtx;
+	pvtep = addr (pvt_array (pvtx));		/* Develop pointers */
+
+	if ^(pvte.used & pvte.storage_system) then do;
+	     a_code = error_table_$dev_nt_assnd;	/* Dont work on bad drives */
+	     return;
+	     end;
+
+	if pvte.device_inoperative then do;
+	     a_code = error_table_$unable_to_do_io;
+	     return;
+	     end;
+
+	if pvte.scavenger_block_rel ^= ""b then do;
+	     a_code = error_table_$scavenge_in_progress;
+	     return;
+	end;
+
+	pvte.being_demounted = "1"b;			/* Cause all future get_pvtx's
+						   and get_pvtx$hold_pvtx's to fail. */
+
+	pic99 = pvte.logical_area_number;		/* Cons up devname */
+	devname = pvte.devname || "_" || pic99 || pvte.sv_name;
+
+	call get_pvtx$drain_pvtx (pvtx);		/* Wait out all current protectors of this pvtx.
+						   When this is finished, no process is in the middle
+						   of an indivisible vtoc operation (delete, truncate),
+						   and by virtue of previous line,
+						   no process can start one */
+
+	sys_shut = (tc_data$system_shutdown ^= 0);	/* Determine if shutting down system */
+						/* */
+						/* */
+						/* DEACTIVATE_ALL_SEGS will lock the AST.
+						   If any process is activating on  this
+						   PV, he must either not have yet locked
+						   the AST, or has it locked. If he has it locked,
+						   DEACTIVATE_ALL_SEGS cannot commence until
+						   he releases it. If not, he will find
+						   being_demounted on when he gets it, and will fail */
+
+	call DEACTIVATE_ALL_SEGS;			/*  We have already asserted that no one can
+						   activate, so we deactivate all */
+
+	pvte.being_demounted2 = "1"b;			/* Allow no further vtoc I/O to start */
+						/* Vtoc I/O in progress will be allowed to complete.
+						   From this point on, divisible calls to
+						   vtoc_man (vtoc_attributes, reclassify, etc.),
+						   will fail. */
+
+	call vtoc_man$cleanup_pv (pvtx, code);		/* Await all vtoc I/O which had been started
+						   to finish. No new I/O will start. */
+
+	if code ^= 0 then call syserr$error_code (ANNOUNCE, code, "demount_pv: vtoc cleanup of ^a:", devname);
+
+	call fsout_vol (pvtx, 1);			/* Write out label, vol map. */
+
+	if ^sys_shut then do;
+	     if ^pvte.permanent then call REWIND_UNLOAD;	/* unload non-perm's, only at non-shut time */
+	     call syserr (ANNOUNCE, "demounted ^a", devname);
+	     end;
+
+	call CLEANUP_PVTE;				/* Tuck the bits into bed. */
+
+	a_code = 0;
+	return;
+
+DEMOUNT_FAILS:					/* Arrive here if cannot demount */
+	call UNDO_FOR_LOSSAGE;			/* undo what we have done */
+	a_code = code;				/* Reflect error */
+	return;
+%page;
+DEACTIVATE_ALL_SEGS:
+     procedure;
+
+/* This procedure deactivates all segments on the physical volume being
+   demounted. At the time it has begun by locking the AST lock, it has
+   been insured thatno further activations on this instance of this pvte
+   can take place.
+
+   If a system shutdown is taking place, an "in-line deactivate" is
+   performed, to avoid dealing with possibly bad data in the ESD case.
+
+*/
+
+dcl  (px, astx) fixed bin;				/* AST indices */
+dcl  tpvtx fixed bin;				/* PVTX of seg under consideration */
+dcl  (
+     lock$lock_ast,
+     lock$unlock_ast
+     ) ext entry;
+dcl  deactivate entry (ptr, fixed bin (35));
+dcl  pc$cleanup entry (ptr);
+dcl  update_vtoce$deact entry (ptr, fixed bin (35));
+dcl  tpvtep ptr;					/* Corresponding pointer */
+
+	     astep = sst$astap;			/* WALK the AST, don't "list-hack" it */
+	     call lock$lock_ast;
+
+	     do px = 0 to 3;			/* pool index */
+		do astx = 1 to fixed (sst$level.no_aste (px), 18); /* Scan all of this size */
+		     if aste.uid ^= "0"b & aste.pvtx ^= 0 /* Elect only fs entries */
+		     & (aste.uid = (36)"1"b | aste.par_astep ^= "0"b) /* root or par must be */
+						/* These are superfluous gullibility checks
+						   to avoid tragedy */
+		     & ^aste.hc_sdw			/* Don't update segments in hardcore partition */
+		     then if fixed (aste.ptsi, 2) = px then do; /* All ok */
+			     tpvtx = aste.pvtx;	/* Get pvtx. */
+			     tpvtep = addr (pvt_array (tpvtx));
+			     if tpvtep -> pvte.being_demounted then do; /* Get 'em all. */
+				aste.fmchanged = aste.fmchanged | aste.fmchanged1; /* Fix window. */
+				aste.ddnp = "0"b;		/* Let pc return the addresses. */
+				if sys_shut then do;	/* Avoid AST threads. */
+				     if ^aste.ehs then call pc$cleanup (astep);
+				     call update_vtoce$deact (astep, code); /* Update the vtoce */
+				     if code ^= 0 then if code ^= error_table_$vtoc_io_err
+				     then if tpvtx = pvtx then go to DEMOUNT_FAILS;
+				     aste.uid = "000000000000"b3;	/* Last update here. */
+				end;
+				else do;
+				     call deactivate (astep, code);
+				     if code ^= 0 then if tpvtx = pvtx then go to DEMOUNT_FAILS;
+				end;
+			     end;
+			end;
+		     else call syserr (CRASH, "demount_pv: ast out of sync");
+		     astep = addrel (astep, fixed (sst$pts (px) + sst$astsize, 18));
+	     end;
+	end;
+
+	call lock$unlock_ast;
+
+
+     end DEACTIVATE_ALL_SEGS;
+%page;
+CLEANUP_PVTE:
+     procedure;
+
+/* This procedure puts the pvt entry of the disk being demounted
+   in a credible state for reuse. An fsout_vol has already been done. */
+
+	     pvte.nleft = 0;			/* Dont let fsdct be used */
+	     pvte.n_free_vtoce = 0;			/* or vtoc allocates */
+	     pvte.lvid = "0"b;
+	     pvte.pvid = "0"b;
+	     pvte.being_demounted2 = "0"b;
+	     pvte.being_demounted = "0"b;
+	     pvte.vacating = "0"b;			/* In case this was going on */
+	     pvte.used = "0"b;			/* Drive not used */
+	     pvt$n_in_use = pvt$n_in_use - 1;		/* ? */
+
+	end CLEANUP_PVTE;
+
+%page;
+UNDO_FOR_LOSSAGE: procedure;
+
+/* This procedure undoes what has been done by the demounter, because
+   the volume cannot be demounted due to an entry hold scgment */
+
+dcl  lock$unlock_ast entry;
+
+	call lock$unlock_ast;
+
+
+	pvte.being_demounted = "0"b;
+
+     end UNDO_FOR_LOSSAGE;
+%page;
+REWIND_UNLOAD:
+     procedure;
+
+/* This procedure tries to unload the disk pack. */
+
+dcl  disk_control$unload_drive entry (fixed bin);
+dcl  disk_run entry;
+
+          if ^pvte.removable_pack then return;             /* Pack can not be unloaded */
+	pvte.testing = "1"b;
+	call disk_control$unload_drive (pvtx);
+	do while (pvte.testing);			/* Noel has sworn that something will come back */
+	     call disk_run;
+	end;
+
+	if pvte.device_inoperative then do;
+	     call syserr (BEEP, "demount_pv: Unload ^a for storage system.", devname);
+	     pvte.device_inoperative = "0"b;
+	     end;
+
+	return;
+
+     end REWIND_UNLOAD;
+%page; %include aste;
+%page; %include iom_pcw;
+%page; %include pvte;
+%page; %include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   demount_pv: vtoc cleanup of DRIVENAME: ERRORMESSAGE
+
+   S: $info
+
+   T: Volume demounting or shutdown.
+
+   M: An unexpected error was encountered in flushing VTOC information
+   out to a volume being shut down or demounted.  The volume will not be demounted.
+   message.
+
+   A: $notify
+   Attempt to repeat the demount of the logical volume, if this is not during shutdown.
+   The physical volume involved may have to be salvaged.
+
+   Message:
+   demounted DRIVENAME
+
+   S: $info
+
+   T: Volume demounting, in response to delete_lv command or user action.
+
+   M: The disk pack on drive DRIVENAME was successfully demounted.
+
+   A: $ignore
+
+   Message:
+   demount_pv: ast out of sync
+
+   S: $crash
+
+   T: Volume demounting or system shutdown.
+
+   M: The volume demounter has detected irreparable damage to the
+   system segment table (SST).
+
+   A: Emergency shutdown will fail, and need not be attempted.
+   Follow normal recovery procedures for ESD failure.
+
+   Message:
+   demount_pv: ioi_PROGNAME for DRIVENAME: ERRORMESSAGE
+
+   S: $info
+
+   T: Volume demounting.
+
+   M: In attempting to cycle down drive DRIVENAME, an unexpected
+   error was received from the I/O Interfacer. The drive may not
+   be cycled down.
+
+   A: Notify the system programming staff. Cycle down the drive if it was not cycled down.
+
+   END MESSAGE DOCUMENTATION */
+     end demount_pv;

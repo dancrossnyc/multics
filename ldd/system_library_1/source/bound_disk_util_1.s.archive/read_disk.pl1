@@ -1,0 +1,250 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+read_disk$init: proc;
+
+/* This procedure performs I/O from/to a given disk address. In the current
+   implementation, this will always be a one-page record. The initializer
+   process uses the ASTE created by initialization to avoid calling AST
+   management during collection 1, and to speed up disk initializations via
+   initializer_gate. Shutdown uses this ASTE as well to avoid getting involved
+   with AST management. */
+
+/* coded	03/07/75 by Bernard S. Greenberg. */
+/* Modified by BSG 04/09/76 for disk_control$test_drive */
+/* Modified by BSG 08/31/76 for dynamic ASTE getting, for volume dumper */
+/* Modified by J. A. Bush 2/22/80 to fix an infinite loop bug in ESD */
+/* Modified 04/16/81, W. Olin Sibert, for ADP PTWs and SDWs, and to use sst external static */
+/* Modified 03/01/82 by J. Bongiovanni for new PVTE include file */
+/* Modified '82 for english disk error codes */
+/* Modified 11/01/83 by Keith Loepere for swapping rdisk sdw at init */
+/* Modified 1/13/84 by Keith Loepere for $no_test */
+/* Modified 84-01-16 BIM for records = 0 */
+/* Modified 84-05-04 for bce_abs_seg$add, Keith Loepere */
+/* Modified 84-10-23 by Keith Loepere to null ptw when done. */
+
+dcl  a_dataptr ptr parameter;
+dcl  a_pvtx fixed bin parameter;			/* params */
+dcl  a_recno fixed bin (18) parameter;
+
+dcl  code fixed bin;				/* error code */
+dcl  dataptr ptr;					/* pointer to transferable data */
+dcl  ptp pointer;					/* pointer to its ASTE */
+dcl  pvtx fixed bin (17);				/* phys vol table index */
+dcl  rdskp ptr;					/* pointer to rdisk_seg */
+dcl  record_no fixed bin (18);			/* record number on disk */
+dcl  static_rdisks_astep ptr internal static init (null ()); /* Ditto astep */
+dcl  static_rdisks_sdw fixed bin (71) aligned internal static init (0); /* SDW form initialization forever */
+dcl  testsw bit (1);				/* "1"b => test */
+dcl  tsdw fixed bin (71) aligned;			/* sdw temp */
+dcl  use_init bit (1) aligned;			/* 1 = use init SDW, astep */
+dcl  writesw bit (1);				/* "1"b => write */
+
+dcl  bdata (1024) fixed bin (35) based; 		/* block of data */
+
+dcl  pds$processid bit (36) aligned external static;	/* equal to tc_data$initializer_id during init. */
+dcl  rdisk_seg$ ext fixed bin;			/* segment for I/O */
+dcl  sst$astsize fixed bin external static;
+dcl 1 sst$level (0 : 3) aligned external static,
+    2 ausedp bit (18) unaligned,
+    2 no_aste bit (18) unaligned;
+dcl  sys_info$page_size fixed bin external static;
+dcl  tc_data$initializer_id bit (36) aligned external static;
+dcl  tc_data$system_shutdown bit (1) aligned external;
+
+dcl  bce_abs_seg$add entry (fixed bin (15));
+dcl  disk_control$test_drive entry (fixed bin);
+dcl  disk_run entry;
+dcl  get_aste entry (fixed bin) returns (ptr);
+dcl  get_ptrs_$ptw_to_cmep entry (pointer, pointer);
+dcl  get_ptrs_$given_astep entry (ptr, fixed bin (71) aligned);
+dcl  lock$lock_ast entry ();
+dcl  lock$unlock_ast entry ();
+dcl  make_sdw$unthreaded entry (fixed bin (18), fixed bin (71) aligned, ptr, ptr);
+dcl  pc$cleanup entry (ptr);
+dcl  pmut$swap_sdw entry (ptr, ptr);
+dcl  ptw_util_$make_disk entry (pointer, fixed bin (20));
+dcl  ptw_util_$make_null entry (ptr, bit (22) aligned);
+dcl  ptw_util_$make_null_disk entry (pointer, fixed bin (20));
+dcl  ptw_util_$set_unwired entry (pointer);
+dcl  ptw_util_$set_wired entry (pointer);
+dcl  put_aste entry (ptr);
+dcl  sdw_util_$set_size entry (pointer, fixed bin (19));
+dcl  thread$cin entry (ptr, bit (18));
+dcl  thread$out entry (ptr, bit (18));
+
+dcl  page_fault_error condition;
+
+dcl  (error_table_$fsdisk_phydev_err, error_table_$fsdisk_not_ready)
+     ext static fixed bin (35);
+
+dcl (addr, addrel, baseno, bit, fixed, segno) builtin;
+%page;
+	rdskp = addr (rdisk_seg$);			/* similarly, rdisk_seg */
+	call make_sdw$unthreaded (fixed (baseno (rdskp), 18), tsdw, astep, ptp);
+						/* force seg to become paged */
+	call sdw_util_$set_size (addr (tsdw), (sys_info$page_size)); /* A single page */
+						/* do not allow any access xcept page 0 */
+
+	astep -> aste. dnzp,			/* pages may never be nulled/deposited */
+	     astep -> aste.nqsw = "1"b;		/* or complained about. */
+	static_rdisks_sdw = tsdw;
+	static_rdisks_astep = astep;			/* Save for posterity */
+	call pmut$swap_sdw (rdskp, addr (tsdw));	/* Install SDW */
+	call bce_abs_seg$add (segno (rdskp));		/* free at shut */
+	return;
+
+read_disk_no_test: entry (a_pvtx, a_recno, a_dataptr, code);	/* entry to read data */
+
+	writesw = "0"b;
+	go to no_test;
+
+write_disk_no_test: entry (a_pvtx, a_recno, a_dataptr, code);
+
+	writesw = "1"b;
+
+no_test:
+	record_no = a_recno;
+	dataptr = a_dataptr;
+	pvtx = a_pvtx;				/* copy parms */
+
+	rdskp = addr (rdisk_seg$);			/* set up special seg ptr */
+	pvt_arrayp = addr (pvt$array);		/* Get pointer to PVTE array */
+	pvtep = addr (pvt_array (pvtx));		/* Get pvte pointer. */
+	go to operate;
+
+read_disk: entry (a_pvtx, a_recno, a_dataptr, code);	/* entry to read data */
+
+	writesw = "0"b;
+	testsw = "0"b;				/* Not a test */
+	record_no = a_recno;
+	dataptr = a_dataptr;
+	go to merge;
+
+write_disk: entry (a_pvtx, a_recno, a_dataptr, code);
+
+	writesw = "1"b;
+	testsw = "0"b;
+	record_no = a_recno;
+	dataptr = a_dataptr;
+	go to merge;
+
+test_disk: entry (a_pvtx, code);
+
+	testsw = "1"b;
+
+merge:
+	pvtx = a_pvtx;				/* copy parms */
+
+	rdskp = addr (rdisk_seg$);			/* set up special seg ptr */
+	pvt_arrayp = addr (pvt$array);		/* Get pointer to PVTE array */
+	pvtep = addr (pvt_array (pvtx));		/* Get pvte pointer. */
+
+	pvte.testing = "1"b;			/* Turn on disk dim protocol bit. */
+	call disk_control$test_drive (pvtx);		/* Start a RQS op up */
+	do while (pvte.testing);			/* Noel has sworn that SOMETHING will come back. */
+	     call disk_run;				/* in case something doesn't come back, force looking at status */
+	end;
+	if pvte.device_inoperative then do;		/* If we found disk not operaable, */
+	     pvte.device_inoperative = "0"b;		/* Clear silly flag, and */
+	     code = error_table_$fsdisk_not_ready;		/* return a usable diagnostic. */
+	     return;
+	end;
+
+	if testsw then do;				/* Successful test. */
+	     code = 0;
+	     return;
+	end;
+
+
+/* If this is not the initializer or shutdown, an ASTE must be gotten and inserted.
+   Otherwise, use the ASTE created by initialization. */
+
+operate:
+	use_init = (tc_data$initializer_id = pds$processid) | tc_data$system_shutdown;
+
+
+	if use_init then do;
+	     tsdw = static_rdisks_sdw;
+	     astep = static_rdisks_astep;
+	end;
+	else do;					/* Must get_aste */
+	     call lock$lock_ast;
+	     astep = get_aste (1);			/* Need 1 page ASTE */
+	     call thread$out (astep, sst$level.ausedp (0)); /* thread aste out of used list */
+	     call lock$unlock_ast;			/* and unlock ast */
+	     call get_ptrs_$given_astep (astep, tsdw);	/* Generate SDW */
+	     astep -> aste.nqsw, astep -> aste.dnzp = "1"b;
+	end;
+
+	astep -> aste.records, astep -> aste.csl, astep -> aste.np = ""b;
+	ptp = addrel (astep, sst$astsize);
+	call pmut$swap_sdw (rdskp, addr (tsdw));	/* Install SDW */
+
+/* Now make this seg reflect the given pvtx, with the first and only page being
+   the given record. */
+
+	astep -> aste.pvtx = pvtx;			/* copy supplied pvtx */
+
+	if writesw then				/* If writing, then pages contents aren't there yet */
+	     call ptw_util_$make_null_disk (ptp, (record_no));
+	else call ptw_util_$make_disk (ptp, (record_no));	/* Otherwise, they are, and we want them */
+	call ptw_util_$set_wired (ptp);		/* Page is "wired" */
+
+	astep -> aste.npfs = "0"b;			/* Previous cleanup turned on npfs- it was good to leave
+						   it on until now. */
+
+/* Now copy the data to/from this abs-seg. Notice that even in the write case, we
+   fault in the page. */
+
+	on page_fault_error begin;
+	     code = error_table_$fsdisk_phydev_err;
+	     go to fini;
+	end;
+
+	if writesw then rdskp -> bdata = dataptr -> bdata;
+	else dataptr -> bdata = rdskp -> bdata;
+
+/* Now comes the peculiar part. If this is a write_disk, we magically migrate the page to disk. */
+
+	if writesw then do;
+	     call get_ptrs_$ptw_to_cmep (ptp, cmep);	/* Find its CME, and do magic with it */
+	     cmep -> mcme.record_no = bit (fixed (record_no, 18), 18);
+	     cmep -> mcme.add_type = add_type.disk;	/* Note that record # is changed first */
+	     call ptw_util_$set_unwired (ptp);		/* rdisk_seg is now at the mercy of page_fault */
+	end;
+
+	code = 0;
+
+fini:
+	call pc$cleanup (astep);
+
+/* This gets all the pages out of core. In the write case,
+   It is guaranteed to actually write (phm will be on)
+   and wait for done. */
+
+	if ^use_init then do;
+	     tsdw = 0;				/* Leave around in shutdown for debugging */
+	     call pmut$swap_sdw (rdskp, addr (tsdw));
+	     call lock$lock_ast;			/* lock ast */
+	     call thread$cin (astep, sst$level.ausedp (0)); /* thread aste back in */
+	     call put_aste (astep);			/* Return the ASTE */
+	     call lock$unlock_ast;
+	end;
+	else call ptw_util_$make_null (ptp, make_sdw_null_addr); /* null ptw so dumpers won't be confused */
+
+	return;
+
+%page; %include add_type;
+%page; %include aste;
+%page; %include cmp;
+%page; %include null_addresses;
+%page; %include pvte;
+
+	end read_disk$init;

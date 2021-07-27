@@ -1,0 +1,1430 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/*
+			  vtoc_man$get_vtoce
+				$read_ahead_vtoce
+				$put_vtoce
+				$alloc_and_put_vtoce
+				$free_vtoce
+				$free_vtoce_for_scavenge
+				$cleanup_pv
+				$stabilize
+				$crawlout
+	
+	The specification of each function is given with the entry point declaration.
+	
+	Modified by :
+	08/14/75	Andre Bensoussan - Written for the new storage system.
+	06/02/76 by Bernard Greenberg for non-fatal write errors (hot buffers).
+	06/07/76 by Bernard Greenberg for vtoc_man$stabilize.
+	09/17/76 by R. Bratt to add per-process meters.
+	03/12/80 by J. A. Bush to fix "out of buffers" bug
+	04/16/81 by J. Bongiovanni to recover on crawlout with vtoc buffer lock ,
+                   bug in cleanup_pv (vtoce 4 trashing), validate vtoc index
+          03/08/82 by J. Bongiovanni for new PVTE and stocks
+	07/07/82 by J. Bongiovanni - rewritten for new buffer strategy
+	         (almost always read entire VTOCE, do write in 1 I/O).
+          07/26/82 by J. Bongiovanni to add free_vtoce_for_scavenge and
+	         read_ahead_vtoce
+          11/06/82 by J. Bongiovanni to add pseudo-clock for scavenger race
+	09/20/83 by E. N. Kittlitz to implement the former's last request: clear pad when writing
+	01/17/84 by Jeffrey I. Schiller to requeue I/O for "hot" buffers.
+	*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-16,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-02,GDixon), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices, (one vtoce per sector), and add
+     software RAR.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style3 */
+vtoc_man$get_vtoce:
+     proc (Pvid, Pvtx, Vtocx, Parts, Copy_Vtocep, Code);
+
+/*  Parameter  */
+
+dcl	Copy_Vtocep	ptr;			/* Pointer to copy of VTOCE to be written or read into */
+dcl	Code		fixed bin (35);		/* Status code */
+dcl	Parts		bit (3);			/* Mask of parts of interest */
+dcl	Pvid		bit (36) aligned;		/* Physical Volume ID */
+dcl	Pvtx		fixed bin;		/* PVTE index */
+dcl	Vtocx		fixed bin;		/* VTOCE index on volume */
+
+/*  Automatic  */
+
+dcl	bufx		fixed bin;
+dcl	code		fixed bin (35);
+dcl	dev_type		fixed bin;
+dcl	hot_buffer_tried	bit (1);
+dcl	1 local_vtoce_buffer
+			aligned like vtoce_buffer;
+dcl	old_pseudo_clock	fixed bin (35);
+dcl	p99		pic "99";
+dcl	parts		bit (3) aligned;
+dcl	parts_to_write	bit (3) aligned;
+dcl	pvid		bit (36) aligned;
+dcl	pvtx		fixed bin;
+dcl	return_vtocx	fixed bin;
+dcl	sector_read_required
+			bit (1) aligned;
+dcl	vtocx		fixed bin;
+dcl	wait_event	bit (36) aligned;
+
+/*  Static  */
+
+dcl	ALL_PARTS		bit (3) aligned int static options (constant) init ("111"b);
+dcl	CORE_OFFSET	(0:7) fixed bin int static options (constant) init (0, 128, 64, 64, 0, 0, 0, 0);
+dcl	MAX_PSEUDO_CLOCK	fixed bin (35) int static options (constant) init (1000000);
+dcl	MAX_STEPS		fixed bin int static options (constant) init (10000);
+dcl	SECTOR_OFFSET	(0:7) fixed bin int static options (constant) init (0, 2, 1, 1, 0, 0, 0, 0);
+dcl	SECTORS_TO_WRITE	(0:7) fixed bin int static options (constant) init (0, 1, 1, 2, 1, 0, 2, 3);
+dcl	VALID_WRITE	(0:7) bit (1) aligned int static options (constant)
+			init ("0"b, "1"b, "1"b, "1"b, "1"b, "0"b, "1"b, "1"b);
+
+/*  Based  */
+
+dcl	1 Copy_Vtoce	aligned like vtoce_buffer based (Copy_Vtocep);
+
+/*  External  */
+
+dcl	error_table_$invalid_pvtx
+			fixed bin (35) external;
+dcl	error_table_$invalid_vtocx
+			fixed bin (35) external;
+dcl	error_table_$pvid_not_found
+			fixed bin (35) external;
+dcl	error_table_$vtoc_io_err
+			fixed bin (35) external;
+dcl	error_table_$vtoce_free
+			fixed bin (35) external;
+dcl	pds$processid	bit (36) aligned external;
+dcl	pds$process_group_id
+			char (32) aligned external;
+dcl	pds$vtoc_reads	fixed bin (35) external;
+dcl	pds$vtoc_writes	fixed bin (35) external;
+dcl	pvt$n_entries	fixed bin external;
+
+/*  Entry  */
+
+dcl	dctl$read_sectors	entry (fixed bin, fixed bin (24), bit (18) aligned, fixed bin, fixed bin);
+dcl	dctl$write_sectors	entry (fixed bin, fixed bin (24), bit (18) aligned, fixed bin, fixed bin);
+dcl	disk_run		entry;
+dcl	lock$lock_fast	entry (ptr);
+dcl	lock$unlock_fast	entry (ptr);
+dcl	pxss$addevent	entry (bit (36) aligned);
+dcl	pxss$delevent	entry (bit (36) aligned);
+dcl	pxss$wait		entry;
+dcl	syserr		entry options (variable);
+dcl	vtoc_search$hash_in entry (ptr);
+dcl	vtoc_search$hash_out
+			entry (ptr);
+dcl	vtoc_search$search	entry (fixed bin, fixed bin, ptr);
+dcl	vtoce_stock_man$check_in_use
+			entry (ptr, fixed bin, fixed bin (35));
+dcl	vtoce_stock_man$get_free_vtoce
+			entry (ptr, fixed bin);
+dcl	vtoce_stock_man$return_if_not_free
+			entry (ptr, fixed bin, fixed bin (35));
+dcl	vtoce_stock_man$return_free_vtoce
+			entry (ptr, fixed bin);
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	bin		builtin;
+dcl	bit		builtin;
+dcl	convert		builtin;
+dcl	divide		builtin;
+dcl	mod		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	rel		builtin;
+dcl	size		builtin;
+dcl	substr		builtin;
+dcl	unspec		builtin;
+%page;
+/*        GET_VTOCE
+
+	FUNCTION - This procedure copies the  vtoc  entry  defined  by  the
+	input  arguments  (pvtx,vtocx)  into  the  caller's area pointed to by
+	(copy_vtocep). The argument (parts) specifies  what  portions  of  the
+	vtoc  entry is to be copied. The 64-word portion number i of the vtoce
+	is copied into the user area only  if  bit  number  i  is  ON  in  the
+	argument  parts.  Three  error  code may be returned: pvid_not_found,
+	vtoc_io_err, or invalid_vtocx. */
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	vtocx = Vtocx;
+	parts = Parts;
+	Code = 0;
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto GET_VTOCE_RETURNS;
+
+	call VALIDATE_VTOCX (vtocx, code);
+	if code ^= 0
+	then goto GET_VTOCE_RETURNS;
+
+
+	call READ (pvtx, vtocx, parts, vtoc_buf_descp, vtoc_bufp, sector_read_required, code);
+	if code ^= 0
+	then goto GET_VTOCE_RETURNS;
+
+	unspec (local_vtoce_buffer) = unspec (vtoce_buffer);
+
+GET_VTOCE_RETURNS:
+	call UNLOCK;
+	vtoc_buffer.meters.call_get = vtoc_buffer.meters.call_get + 1;
+
+	if code = 0
+	then call COPY_PARTS (parts, addr (local_vtoce_buffer), Copy_Vtocep);
+
+	Code = code;
+
+	return;
+%page;
+/*        READ_AHEAD_VTOCE -
+
+	FUNCTION - This procedure initiates a read to a specified VTOC entry,
+	unless the VTOC entry is already in a VTOC buffer. It is similar to
+	get_vtoce, except that it does not wait, and it returns no data
+	to the caller. It is intended for routines which scan the VTOC
+	sequentially (or in any predetermined order), to overlap VTOC I/O
+	with processing. Three error codes may be returned: pvid_not_found,
+	vtoc_io_err, or invalid_vtocx. */
+
+read_ahead_vtoce:
+     entry (Pvid, Pvtx, Vtocx, Parts, Code);
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	vtocx = Vtocx;
+	parts = Parts;
+	Code = 0;
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto READ_AHEAD_VTOCE_RETURNS;
+
+	call VALIDATE_VTOCX (vtocx, code);
+	if code ^= 0
+	then goto READ_AHEAD_VTOCE_RETURNS;
+
+	call READ_AHEAD (pvtx, vtocx, parts, vtoc_buf_descp, vtoc_bufp, sector_read_required, code);
+
+READ_AHEAD_VTOCE_RETURNS:
+	call UNLOCK;
+
+
+	Code = code;
+
+	return;
+
+
+%page;
+/*        PUT_VTOCE -
+
+	FUNCTION - This procedure copies the vtoc  entry  from  the  user's
+	area  located at (copy_vtocep) into the real vtoc entry defined by the
+	(pvtx,vtocx) pair. The argument (parts) specifies what portions of the
+	user's area is to be copied into the  real  vtoc  entry.  The  64-word
+	portion  number  i  of  the user's vtoce is copied into the real vtoce
+	only if bit number i is ON in the input argument parts. Three error
+	codes may be returned: pvid_not_found, vtoc_io_err, or invalid_vtocx. */
+
+put_vtoce:
+     entry (Pvid, Pvtx, Vtocx, Parts, Copy_Vtocep, Code);
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	vtocx = Vtocx;
+	parts = Parts;
+	Code = 0;
+	sector_read_required = "0"b;
+	parts_to_write = parts;
+	call COPY_PARTS (parts, Copy_Vtocep, addr (local_vtoce_buffer));
+						/* Avoid segfault with buffers locked */
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto PUT_VTOCE_RETURNS;
+
+	call VALIDATE_VTOCX (vtocx, code);
+	if code ^= 0
+	then goto PUT_VTOCE_RETURNS;
+
+	vtoc_buffer.unsafe_pvtx = pvtx;		/* Update in progress */
+	if (SECTORS_PER_VTOCE (pvte.device_type) = 1) & (parts ^= ALL_PARTS)
+	then do;					/* 512_word sector device and not all parts */
+		call READ (pvtx, vtocx, ALL_PARTS, vtoc_buf_descp, vtoc_bufp, sector_read_required, code);
+		if code ^= 0
+		then goto PUT_VTOCE_RETURNS;
+		parts_to_write = ALL_PARTS;
+	     end;
+
+	else call GET_BUFFER (pvtx, vtocx, vtoc_buf_descp, vtoc_bufp, code);
+						/* Get a buffer, wait until not out-of-service */
+	if code ^= 0
+	then goto PUT_VTOCE_RETURNS;
+	call CLEAR_PAD (addr (local_vtoce_buffer), parts);/* No dirty bits */
+	call COPY_PARTS (parts, addr (local_vtoce_buffer), vtoc_bufp);
+						/* Update the buffer */
+
+	call WRITE (parts_to_write, vtoc_buf_descp);	/* Write it out */
+	if sector_read_required
+	then vtoc_buffer.meters.soft_rar = vtoc_buffer.meters.soft_rar + 1;
+PUT_VTOCE_RETURNS:
+	vtoc_buffer.unsafe_pvtx = 0;
+	call UNLOCK;
+	vtoc_buffer.meters.call_put = vtoc_buffer.meters.call_put + 1;
+	Code = code;
+	return;
+%page;
+/*        ALLOC_AND_PUT_VTOCE -
+
+	FUNCTION - This procedure removes a vtoc entry from the  free  pool
+	for  the  physical volume defined by (pvtx), initializes the allocated
+	VTOC entry with the data for the segment being created and returns the
+	VTOC index of that entry. If there is no more free VTOC entry  in  the
+	specified  physical  volume, it returns the value (-1). Three error code
+	may be returned: pvid_not_found, vtoc_io_err, or invalid_vtocx. Whenever
+	a  non  zero code is returned, the returned vtoc index is (-1). */
+
+alloc_and_put_vtoce:
+     entry (Pvid, Pvtx, Copy_Vtocep, Code) returns (fixed bin (17));
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	Code = 0;
+	return_vtocx = -1;
+
+	unspec (local_vtoce_buffer) = unspec (Copy_Vtoce);/* Avoid segfaults with buffers locked */
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto ALLOC_PUT_RETURNS;
+
+RETRY_ALLOC:
+	old_pseudo_clock = vtoc_buffer.scavenger_free_p_clock;
+
+	call vtoce_stock_man$get_free_vtoce (pvtep, vtocx);
+	if vtocx = -1
+	then goto ALLOC_PUT_RETURNS;			/* None left */
+
+	call VALIDATE_VTOCX (vtocx, code);		/* Make sure a valid index */
+	if code ^= 0
+	then do;
+		call SET_VOL_TROUBLE (pvtep, vtocx, "Invalid free");
+		goto RETRY_ALLOC;			/* Might win */
+	     end;
+
+	call READ (pvtx, vtocx, ALL_PARTS, vtoc_buf_descp, vtoc_bufp, sector_read_required, code);
+	if code ^= 0
+	then goto ALLOC_PUT_RETURNS;
+	vtocep = vtoc_bufp;
+	if vtoce.uid ^= ""b
+	then do;
+		call SET_VOL_TROUBLE (pvtep, vtocx, "UID ^= 0 in free VTOCE");
+		goto RETRY_ALLOC;
+	     end;
+
+	if vtoc_buffer.scavenger_free_p_clock ^= old_pseudo_clock
+	then do;					/* Scavenger has freed a VTOCE - better make sure it isn't this one */
+		vtoc_buffer.meters.scavenger_free_checks = vtoc_buffer.meters.scavenger_free_checks + 1;
+		call vtoce_stock_man$check_in_use (pvtep, vtocx, code);
+		if code ^= 0
+		then do;				/* Lost race */
+			vtoc_buffer.meters.scavenger_free_losses = vtoc_buffer.meters.scavenger_free_losses + 1;
+			goto RETRY_ALLOC;
+		     end;
+	     end;
+
+	vtoc_buffer.unsafe_pvtx = pvtx;		/* Update in progress */
+
+	call CLEAR_PAD (addr (local_vtoce_buffer), ALL_PARTS);
+						/* wash the naughty bits */
+	unspec (vtoce_buffer) = unspec (local_vtoce_buffer);
+	call WRITE (ALL_PARTS, vtoc_buf_descp);
+
+	return_vtocx = vtocx;
+
+ALLOC_PUT_RETURNS:
+	vtoc_buffer.unsafe_pvtx = 0;
+	call UNLOCK;
+	vtoc_buffer.meters.call_alloc = vtoc_buffer.meters.call_alloc + 1;
+
+	Code = code;
+	return (return_vtocx);
+%page;
+/*        FREE_VTOCE -
+
+	FUNCTION - This procedure zeros the vtoc entry defined by the input
+	arguments (pvtx,vtocx). Then it adds that vtoc entry in the free  pool
+	for  the  physical  volume  defined  by  (pvtx). Three error codes may be
+	returned: pvid_not_found, vtoc_io_err, or invalid_vtocx. */
+
+free_vtoce:
+     entry (Pvid, Pvtx, Vtocx, Code);
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	vtocx = Vtocx;
+	Code = 0;
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto FREE_VTOCE_RETURNS;
+
+	call VALIDATE_VTOCX (vtocx, code);
+	if code ^= 0
+	then goto FREE_VTOCE_RETURNS;
+
+	call GET_BUFFER (pvtx, vtocx, vtoc_buf_descp, vtoc_bufp, code);
+						/* Get a buffer, wait for not out-of-service */
+	if code ^= 0
+	then goto FREE_VTOCE_RETURNS;
+
+	unspec (vtoce_buffer.parts) = ""b;		/* Mark it free - the whole thing */
+	call WRITE (ALL_PARTS, vtoc_buf_descp);
+
+	call vtoce_stock_man$return_free_vtoce (pvtep, vtocx);
+						/* Return it to the stock */
+
+FREE_VTOCE_RETURNS:
+	call UNLOCK;
+	vtoc_buffer.meters.call_free = vtoc_buffer.meters.call_free + 1;
+
+	Code = code;
+	return;
+%page;
+/*        FREE_VTOCE_FOR_SCAVENGE -
+
+          FUNCTION - frees a VTOCE that the volume scavenger thinks is lost
+	(free but not in map). Under appropriate locks, it checks that the
+	VTOCE is still free. It calls a special entry in vtoce_stock_man
+	that frees it only if it is not already free. Four error codes may
+	be returned: pvid_not_found, vtoc_io_err, invalid_vtocx, or 
+	vtoce_free.
+
+	There is a race here, but it is safe. The VTOCE being freed could
+	be in allocation, with the allocating process waiting for the
+	read to complete. If we see the read completing before the
+	allocating process, we will think that the VTOCE is free and
+	mark it as such in the map. This is safe, since the VTOCE will
+	never be allocated with a non-zero UID.
+
+	On the other hand, it is annoying, since it causes spurious volume
+	inconsistencies. The race is avoided by using a pseudo-clock, which
+	is incremented under the VTOC Buffer Lock each time we free a
+	VTOCE for the scavenger. VTOCE allocation checks the value of this
+	pseudo-clock when it is given a vtocx and after the VTOCE read
+	completes. If it has changed, it makes sure that the vtocx is
+	in-use.
+*/
+
+free_vtoce_for_scavenge:
+     entry (Pvid, Pvtx, Vtocx, Code);
+
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	vtocx = Vtocx;
+	Code = 0;
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto FREE_FOR_SCAVENGE_RETURNS;
+
+	call VALIDATE_VTOCX (vtocx, code);
+	if code ^= 0
+	then goto FREE_FOR_SCAVENGE_RETURNS;
+
+	call READ (pvtx, vtocx, ALL_PARTS, vtoc_buf_descp, vtoc_bufp, sector_read_required, code);
+	if code ^= 0
+	then goto FREE_FOR_SCAVENGE_RETURNS;
+
+	vtocep = vtoc_bufp;
+	if vtoce.uid ^= ""b
+	then do;
+		code = error_table_$vtoce_free;	/* Someone else did it */
+		goto FREE_FOR_SCAVENGE_RETURNS;
+	     end;
+
+	unspec (vtoce) = ""b;
+	call WRITE (ALL_PARTS, vtoc_buf_descp);
+
+	call vtoce_stock_man$return_if_not_free (pvtep, vtocx, code);
+
+	vtoc_buffer.scavenger_free_p_clock = vtoc_buffer.scavenger_free_p_clock + 1;
+	if vtoc_buffer.scavenger_free_p_clock > MAX_PSEUDO_CLOCK
+	then vtoc_buffer.scavenger_free_p_clock = 0;
+
+FREE_FOR_SCAVENGE_RETURNS:
+	call UNLOCK;
+
+	Code = code;
+	return;
+
+
+%page;
+/*        AWAIT_VTOCE -
+
+	FUNCTION - This procedure is called by  programs which  update vtoces
+	and subsequently deposit addresses. It awaits all  pendant I/O on a sel-
+	ected vtoce, so that the addresses  to  be  deposited will not be avail-
+	able for  reassignment until it is  known that  they no longer appear in
+	the old vtoce. This is solely for unrecoverable disk failures. The error
+	codes which may be returned are pvid_not_found, vtoc_io_err, and invalid_vtocx. */
+
+await_vtoce:
+     entry (Pvid, Pvtx, Vtocx, Code);
+
+	pvid = Pvid;
+	pvtx = Pvtx;
+	vtocx = Vtocx;
+	Code = 0;
+
+	call SETUP_LOCK (pvtx, code);
+	if code ^= 0
+	then goto AWAIT_RETURNS;
+
+	call VALIDATE_VTOCX (vtocx, code);
+	if code ^= 0
+	then goto AWAIT_RETURNS;
+
+RETRY_AWAIT:
+	call vtoc_search$search (pvtx, vtocx, vtoc_buf_descp);
+						/* See if the VTOCE still has a buffer */
+	if vtoc_buf_descp = null ()
+	then goto AWAIT_RETURNS;			/* No - easy case */
+
+	if vtoc_buf_desc.os
+	then do;
+		call WAIT (vtoc_buf_descp, code);	/* Wait until not out-of-service */
+		if code ^= 0
+		then goto AWAIT_RETURNS;		/* Might have disappeared */
+		goto RETRY_AWAIT;
+	     end;
+
+	if vtoc_buf_desc.write_sw & vtoc_buf_desc.err	/* Hot buffer */
+	then code = error_table_$vtoc_io_err;
+
+AWAIT_RETURNS:
+	call UNLOCK;
+	vtoc_buffer.meters.call_await = vtoc_buffer.meters.call_await + 1;
+
+	Code = code;
+	return;
+%page;
+/*        CLEANUP_PV - 
+
+	FUNCTION - Guarantees that the physical volume supplied does not have 
+	any portion of its VTOC in the vtoc_buffers. If it does, and nothing can be
+	done about it (hot buffer, hard I/O error), the volume inconsistency
+	count is increased. */
+
+cleanup_pv:
+     entry (Pvtx, Code);
+
+	pvid = ""b;
+	pvtx = Pvtx;
+	vtocx = -1;
+	Code = 0;
+
+	call SETUP_LOCK (pvtx, code);			/* Will get non-zero code during demount */
+
+	do bufx = 1 to vtoc_buffer.n_bufs;		/* Requeue writes on hot buffers */
+	     vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+	     if vtoc_buf_desc.pvtx = pvtx & vtoc_buf_desc.used = "1"b /* This volume, Buffer in use */
+		& vtoc_buf_desc.err & vtoc_buf_desc.write_sw & ^vtoc_buf_desc.os
+						/* Hot buffer */
+	     then call WRITE ((vtoc_buf_desc.parts_used), vtoc_buf_descp);
+	end;
+
+	do bufx = 1 to vtoc_buffer.n_bufs;		/* Wait for all out-of-service */
+	     vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+	     do while (vtoc_buf_desc.pvtx = pvtx & vtoc_buf_desc.used /* This volume, Buffer in use */
+		& vtoc_buf_desc.os);		/* Out-of-service */
+		call WAIT (vtoc_buf_descp, code);
+	     end;
+	end;
+
+	code = 0;
+	do bufx = 1 to vtoc_buffer.n_bufs;		/* Flush buffers, abandon hot buffers */
+	     vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+	     if vtoc_buf_desc.pvtx = pvtx & vtoc_buf_desc.used
+						/* This volume, Buffer in use */
+	     then do;
+		     if vtoc_buf_desc.os
+		     then call syserr (CRASH, "vtoc_man: Buffer out-of-service during cleanup");
+		     if vtoc_buf_desc.write_sw & vtoc_buf_desc.err
+						/* Hot buffer */
+		     then do;
+			     call SET_VOL_TROUBLE (pvtep, (vtoc_buf_desc.vtocx),
+				"Hot buffer abandoned during cleanup");
+			     code = error_table_$vtoc_io_err;
+			end;
+		     call FLUSH_BUFFER (vtoc_buf_descp);
+		end;
+	end;
+
+	call UNLOCK;
+
+	Code = code;
+	return;
+%page;
+/*        STABILIZE - 
+
+	FUNCTION - This entry is called only during emergency shutdown. It
+	makes the vtoc_buffer consistent so that shutdown can succeed. This
+	process includes busting the lock, rethreading all buffers into
+	the hash table, abandoning in-progress reads, and setting in-progress
+	writes to "hot". */
+
+stabilize:
+     entry;
+
+	pvid = ""b;
+	pvtx = -1;
+	vtocx = -1;
+
+	vtoc_buffer_segp = addr (vtoc_buffer_seg$);
+	vtoc_buffer.lock.processid = ""b;		/* Bust the lock */
+
+	call SETUP_LOCK (pvtx, code);
+
+	call RETHREAD;
+
+	do bufx = 1 to vtoc_buffer.n_bufs;
+	     vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+	     if vtoc_buf_desc.used & vtoc_buf_desc.os	/* Buffer in use, I/O in progress */
+	     then if vtoc_buf_desc.write_sw
+		then do;				/* Write */
+			vtoc_buf_desc.err = "1"b;	/* Make hot */
+			vtoc_buf_desc.os = "0"b;
+		     end;
+		else call FLUSH_BUFFER (vtoc_buf_descp);
+	end;
+
+	call UNLOCK;
+
+	return;
+%page;
+/*        CRAWLOUT -
+
+	FUNCTION - This entry is called only by verify_lock when it has
+	found the vtoc buffer lock held by the process.  It checks for
+	inconsistent buffer states and corrects them (specifically, 
+	out-of-service but no I/O queued).  Before doing this, it waits
+	for the associated event, to cover the case where the I/O
+	was queued successfully, but the crawlout occurred afterwards.
+	If the I/O was not queued successfully, the wait will end
+	via notify-time-out.  If a physical volume is
+	potentially inconsistent ("unsafe"), the volume inconsistency
+	count is increased. Note that the vtoc buffer lock is left locked
+	on exit - verify_lock busts it for us. */
+
+crawlout:
+     entry;
+
+
+	vtoc_buffer_segp = addr (vtoc_buffer_seg$);
+	vtoc_buf_desc_arrayp = ptr (vtoc_buffer_segp, vtoc_buffer.buf_desc_offset);
+	vtoc_buf_arrayp = ptr (vtoc_buffer_segp, vtoc_buffer.buf_offset);
+	pvt_arrayp = addr (pvt$array);
+
+	if vtoc_buffer.lock.processid ^= pds$processid
+	then return;				/* Invalid call */
+
+	call RETHREAD;				/* May be inconsistent */
+
+	if vtoc_buffer.unsafe_pvtx ^= 0
+	then do;					/* Update in progress */
+		pvtep = addr (pvt_array (vtoc_buffer.unsafe_pvtx));
+		call SET_VOL_TROUBLE (pvtep, -1, "Update in progress on crawlout by " || pds$process_group_id);
+	     end;
+
+	do bufx = 1 to vtoc_buffer.n_bufs;		/* Look for inconsistent buffers */
+	     vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+	     if vtoc_buf_desc.used & vtoc_buf_desc.os & ^vtoc_buf_desc.ioq
+						/* buffer in use, out-of-service, not queued */
+	     then do;
+		     pvtx = vtoc_buf_desc.pvtx;
+		     vtocx = vtoc_buf_desc.vtocx;
+		     wait_event = bit (bin (vtoc_buffer.wait_event_constant + vtoc_buf_desc.wait_index, 36), 36);
+		     call pxss$addevent (wait_event);
+		     call lock$unlock_fast (addr (vtoc_buffer.lock));
+		     call pxss$wait;		/* Wait 1 NTO interval */
+		     call lock$lock_fast (addr (vtoc_buffer.lock));
+		     if vtoc_buf_desc.used & vtoc_buf_desc.os
+			& ^vtoc_buf_desc.ioq /* Buffer in use, out-of-service, not queued */
+			& vtoc_buf_desc.pvtx = pvtx & vtoc_buf_desc.vtocx = vtocx
+						/* Still the same one */
+		     then do;
+			     pvtep = addr (pvt_array (pvtx));
+			     if vtoc_buf_desc.write_sw
+			     then do;		/* Write */
+				     call syserr (LOG,
+					"vtoc_man: write I/O recovered on crawlout by ^a for ^a_^a^a vtocx ^o",
+					pds$process_group_id, pvte.devname,
+					convert (p99, pvte.logical_area_number), pvte.sv_name, vtocx);
+				     vtoc_buf_desc.os = "0"b;
+				     call WRITE ((vtoc_buf_desc.parts_used), vtoc_buf_descp);
+				end;
+			     else do;		/* Read */
+				     call syserr (LOG,
+					"vtoc_man: read reset on crawlout by ^a for ^a_^a^a vtocx ^o",
+					pds$process_group_id, pvte.devname,
+					convert (p99, pvte.logical_area_number), pvte.sv_name, vtocx);
+				     call FLUSH_BUFFER (vtoc_buf_descp);
+				end;
+			end;
+		end;
+	end;
+
+
+	return;
+%page;
+/*	CLEAR_PAD - clears pad fields in the vtoce prior to copying to buffer for write. */
+
+CLEAR_PAD:
+     proc (Clear_ptr, Parts);
+
+dcl	Clear_ptr		ptr;
+dcl	Parts		bit (3) aligned;
+
+dcl	1 Clear_vtoce	aligned like vtoce based (Clear_ptr);
+
+	if (Parts & "100"b)
+	then do;
+		Clear_vtoce.pad_free_vtoce_chain = ""b;
+		Clear_vtoce.pad2 = ""b;
+		Clear_vtoce.pad3 = ""b;
+		Clear_vtoce.pad4 = ""b;
+	     end;
+	if (Parts & "001"b)
+	then do;
+		unspec (Clear_vtoce.pad6) = ""b;
+		Clear_vtoce.pad7 = ""b;
+		Clear_vtoce.pad8 = ""b;
+		Clear_vtoce.pad9 = ""b;
+	     end;
+
+     end CLEAR_PAD;
+%page;
+/*        COPY_PARTS - copies VTOCE parts between two buffers as specified
+	by a mask.
+*/
+
+COPY_PARTS:
+     proc (Parts, From_ptr, To_ptr);
+
+dcl	Parts		bit (3) aligned;
+dcl	From_ptr		ptr;
+dcl	To_ptr		ptr;
+
+dcl	partsx		fixed bin;
+
+dcl	1 From_Vtoce_Buffer aligned like vtoce_buffer based (From_ptr);
+dcl	1 To_Vtoce_Buffer	aligned like vtoce_buffer based (To_ptr);
+
+	do partsx = 1 to N_PARTS_PER_VTOCE;
+	     if substr (Parts, partsx, 1) = "1"b
+	     then unspec (To_Vtoce_Buffer.parts (partsx)) = unspec (From_Vtoce_Buffer.parts (partsx));
+	end;
+
+     end COPY_PARTS;
+%page;
+/*        Routines to compute parameters needed by disk control
+
+	CORE   - computes the absolute memory address
+
+	RECORD - computes the Multics record number
+
+	SECTOR - computes the sector within record
+*/
+
+CORE:
+     proc (Vtoc_buf_descp) returns (fixed bin (24));
+
+dcl	Vtoc_buf_descp	ptr;
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+	return (vtoc_buffer.abs_addr + bin (Vtoc_buf_desc.buf_rel));
+
+     end CORE;
+
+
+
+RECORD:
+     proc (Vtoc_buf_descp) returns (bit (18) aligned);
+
+dcl	Vtoc_buf_descp	ptr;
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+	return (bit (bin (VTOC_ORIGIN + divide (Vtoc_buf_desc.vtocx, VTOCES_PER_RECORD (dev_type), 17), 18), 18));
+
+     end RECORD;
+
+
+SECTOR:
+     proc (Vtoc_buf_descp) returns (fixed bin (17));
+
+dcl	Vtoc_buf_descp	ptr;
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+
+	return (mod (Vtoc_buf_desc.vtocx, VTOCES_PER_RECORD (dev_type)) * SECTORS_PER_VTOCE (dev_type));
+
+     end SECTOR;
+
+
+%page;
+/*        SET_VOL_TROUBLE - increments the count of volume inconsistencies
+	and logs a message into syserr.
+*/
+
+SET_VOL_TROUBLE:
+     proc (Pvtep, Vtocx, Msg);
+
+dcl	Pvtep		ptr;
+dcl	Vtocx		fixed bin;
+dcl	Msg		char (*);
+
+dcl	1 Pvte		aligned like pvte based (Pvtep);
+
+	Pvte.vol_trouble_count = Pvte.vol_trouble_count + 1;
+
+	call syserr (LOG, "vtoc_man: ^a ^[vtocx ^o ^;^1s^]on ^a_^a^a", Msg, (Vtocx ^= -1), Vtocx, Pvte.devname,
+	     convert (p99, Pvte.logical_area_number), Pvte.sv_name);
+
+     end SET_VOL_TROUBLE;
+%page;
+/*        RETHREAD - procedure to walk the vtoc_buffer linearly and
+	thread all in-use buffers into the hash table. This is called
+	if damage is suspected.
+*/
+
+RETHREAD:
+     proc;
+
+	unspec (vtoc_buffer.hash_table) = ""b;		/* Clear out the old hash table */
+
+	do bufx = 1 to vtoc_buffer.n_bufs;
+	     vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+	     if vtoc_buf_desc.used
+	     then call vtoc_search$hash_in (vtoc_buf_descp);
+	end;
+
+     end RETHREAD;
+%page;
+/*        FLUSH_BUFFER - procedure to clear a buffer descriptor and thread
+	it out of the hash table.
+*/
+
+FLUSH_BUFFER:
+     proc (Vtoc_buf_descp);
+
+dcl	Vtoc_buf_descp	ptr;
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+	call vtoc_search$hash_out (Vtoc_buf_descp);
+
+	vtoc_buffer.search_index =
+	     divide (bin (rel (Vtoc_buf_descp)) - bin (rel (vtoc_buf_desc_arrayp)), size (vtoc_buf_desc), 17) + 1;
+						/* Set to look at this one first */
+
+	unspec (Vtoc_buf_desc) = ""b;
+
+
+     end FLUSH_BUFFER;
+%page;
+/*        GET_BUFFER - procedure to find a buffer given a pvtx and vtocx.
+	If the VTOCE so defined already has a buffer, it is returned.
+	Otherwise, one is allocated. This routine does not return until
+	the buffer is not out-of-service.
+	
+	GET_BUFFER_NOWAIT - identical to GET_BUFFER, except that it does
+	not wait for the buffer to be not out-of-service.
+*/
+
+GET_BUFFER:
+     proc (Pvtx, Vtocx, Vtoc_buf_descp, Vtoc_bufp, Code);
+
+dcl	Pvtx		fixed bin;
+dcl	Vtocx		fixed bin;
+dcl	Vtoc_buf_descp	ptr;
+dcl	Vtoc_bufp		ptr;
+dcl	Code		fixed bin (35);
+
+dcl	first_time	bit (1) aligned;
+dcl	skip_waiting	bit (1) aligned;
+dcl	steps		fixed bin;
+dcl	wait_sw		bit (1) aligned;
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+
+	wait_sw = "1"b;
+	goto GET_BUFFER_JOIN;
+
+
+GET_BUFFER_NOWAIT:
+     entry (Pvtx, Vtocx, Vtoc_buf_descp, Vtoc_bufp, Code);
+
+	wait_sw = "0"b;
+
+GET_BUFFER_JOIN:
+	Code = 0;
+	vtoc_buffer.meters.get_buffer_calls = vtoc_buffer.meters.get_buffer_calls + 1;
+	first_time = "1"b;
+
+
+GET_BUFFER_RETRY:
+	call vtoc_search$search (Pvtx, Vtocx, Vtoc_buf_descp);
+						/* Look for existing buffer with this VTOCE */
+	if Vtoc_buf_descp ^= null () & first_time
+	then vtoc_buffer.meters.get_buffer_hits = vtoc_buffer.meters.get_buffer_hits + 1;
+	first_time = "0"b;
+
+	if Vtoc_buf_descp = null ()
+	then do;					/* Not there */
+		steps = 0;
+		skip_waiting = "1"b;		/* Skip those with notify_sw the first pass */
+		bufx = vtoc_buffer.search_index;	/* Roving pointer */
+		do while ("1"b);
+		     vtoc_buffer.meters.steps = vtoc_buffer.meters.steps + 1;
+		     steps = steps + 1;
+		     Vtoc_buf_descp = addr (vtoc_buf_desc_array (bufx));
+
+		     if ^Vtoc_buf_desc.used
+		     then goto FOUND;
+
+		     if Vtoc_buf_desc.os
+		     then vtoc_buffer.meters.skip_os = vtoc_buffer.meters.skip_os + 1;
+		     else if Vtoc_buf_desc.write_sw & Vtoc_buf_desc.err
+		     then vtoc_buffer.meters.skip_hot = vtoc_buffer.meters.skip_hot + 1;
+		     else if Vtoc_buf_desc.notify_sw & skip_waiting
+		     then vtoc_buffer.meters.skip_wait = vtoc_buffer.meters.skip_wait + 1;
+		     else goto FOUND;		/* Nemine contradiscente */
+
+		     if steps > MAX_STEPS
+		     then call syserr (CRASH, "vtoc_man: Out of buffers");
+		     bufx = bufx + 1;
+		     if bufx > vtoc_buffer.n_bufs
+		     then bufx = 1;
+		     if bufx = vtoc_buffer.search_index
+		     then do;			/* Went around once more */
+			     skip_waiting = "0"b;	/* Only skip these on first pass */
+			     call disk_run;		/* Poll for lost interrupts */
+			end;
+		end;
+
+FOUND:
+		if bufx >= vtoc_buffer.n_bufs
+		then vtoc_buffer.search_index = 1;
+		else vtoc_buffer.search_index = bufx + 1;
+						/* Set to look at next first */
+
+		if Vtoc_buf_desc.used
+		then call FLUSH_BUFFER (Vtoc_buf_descp);
+
+		Vtoc_buf_desc.pvtx = Pvtx;
+		Vtoc_buf_desc.vtocx = Vtocx;
+		Vtoc_buf_desc.used = "1"b;
+		Vtoc_buf_desc.wait_index = bufx;
+		Vtoc_buf_desc.buf_rel = rel (addr (vtoce_buffer_array (bufx)));
+
+		call vtoc_search$hash_in (Vtoc_buf_descp);
+
+	     end;
+
+	if Vtoc_buf_desc.os & wait_sw
+	then do;
+		call WAIT (Vtoc_buf_descp, Code);
+		if Code ^= 0
+		then do;
+			Vtoc_buf_descp = null ();
+			Vtoc_bufp = null ();
+			return;
+		     end;
+		goto GET_BUFFER_RETRY;
+	     end;
+
+
+	Vtoc_bufp = ptr (vtoc_buffer_segp, Vtoc_buf_desc.buf_rel);
+
+     end GET_BUFFER;
+
+%page;
+/*        READ - Routine to read a VTOCE. It gets a buffer (possibly containing
+	part of all of the VTOCE in question). If the parts desired are
+	in the buffer, it returns with the buffer. If not, it reads the
+	entire VTOCE and waits for the completion of the read. Note that
+	the buffer can disappear if READ waits for an I/O (since it unlocks
+	the vtoc buffers, waits, and relocks).
+
+	READ_AHEAD - Similar to READ, except that it does not wait.
+*/
+
+READ:
+     proc (Pvtx, Vtocx, Parts, Vtoc_buf_descp, Vtoc_bufp, Sector_read_required, Code);
+
+dcl	Pvtx		fixed bin;
+dcl	Vtocx		fixed bin;
+dcl	Parts		bit (3) aligned;
+dcl	Vtoc_buf_descp	ptr;
+dcl	Vtoc_bufp		ptr;
+dcl	Sector_read_required
+			bit (1) aligned;
+dcl	Code		fixed bin (35);
+
+dcl	wait_sw		bit (1) aligned;
+
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+
+	wait_sw = "1"b;
+	goto READ_JOIN;
+
+
+READ_AHEAD:
+     entry (Pvtx, Vtocx, Parts, Vtoc_buf_descp, Vtoc_bufp, Sector_read_required, Code);
+
+	wait_sw = "0"b;
+
+READ_JOIN:
+	Sector_read_required = "0"b;
+	Code = 0;
+	hot_buffer_tried = "0"b;			/* first time to retry_read */
+RETRY_READ:
+	if wait_sw
+	then call GET_BUFFER (Pvtx, Vtocx, Vtoc_buf_descp, Vtoc_bufp, Code);
+	else call GET_BUFFER_NOWAIT (Pvtx, Vtocx, Vtoc_buf_descp, Vtoc_bufp, Code);
+	if Code ^= 0
+	then return;
+
+	if ^wait_sw & Vtoc_buf_desc.os
+	then return;
+
+	if Vtoc_buf_desc.err			/* I/O error */
+	then do;
+		if ^Vtoc_buf_desc.write_sw		/* Not hot buffer */
+		then call FLUSH_BUFFER (Vtoc_buf_descp);
+		else if ^hot_buffer_tried
+		then do;				/* Hot buffer, retry write */
+			hot_buffer_tried = "1"b;
+			pvt_arrayp = addr (pvt$array);
+			pvtep = addr (pvt_array (Pvtx));
+			call syserr (LOG, "vtoc_man: Write I/O being retried by ^a for ^a_^a^a vtocx ^o",
+			     pds$process_group_id, pvte.devname, convert (p99, pvte.logical_area_number),
+			     pvte.sv_name, Vtocx);
+			Vtoc_buf_desc.os = "0"b;	/* Should be anyhow... */
+
+			call WRITE ((Vtoc_buf_desc.parts_used), Vtoc_buf_descp);
+			goto RETRY_READ;
+		     end;
+
+		Code = error_table_$vtoc_io_err;
+		Vtoc_buf_descp = null ();
+		Vtoc_bufp = null ();
+		return;
+	     end;
+
+	if (Vtoc_buf_desc.parts_used & Parts) = Parts	/* Got what they want */
+	then return;
+
+	Vtoc_buf_desc.write_sw = "0"b;
+	Vtoc_buf_desc.err = "0"b;
+	Vtoc_buf_desc.notify_sw = "0"b;
+	Vtoc_buf_desc.ioq = "0"b;
+	Vtoc_buf_desc.os = "1"b;
+
+	dev_type = addr (pvt_array (Pvtx)) -> pvte.device_type;
+
+	call dctl$read_sectors (Pvtx, CORE (Vtoc_buf_descp), RECORD (Vtoc_buf_descp), SECTOR (Vtoc_buf_descp),
+	     SECTORS_PER_VTOCE (dev_type));
+	Sector_read_required = "1"b;
+	Vtoc_buf_desc.ioq = "1"b;
+	Vtoc_buf_desc.parts_used = ALL_PARTS;
+
+	vtoc_buffer.meters.disk_reads = vtoc_buffer.meters.disk_reads + 1;
+	pds$vtoc_reads = pds$vtoc_reads + 1;
+
+	if wait_sw
+	then goto RETRY_READ;
+
+	return;
+
+     end READ;
+%page;
+/*        WRITE - This procedure writes the parts specified for a given
+	vtoc buffer. It does not await its completion.
+*/
+
+WRITE:
+     proc (Parts, Vtoc_buf_descp);
+
+dcl	Parts		bit (3) aligned;
+dcl	Vtoc_buf_descp	ptr;
+
+dcl	partsx		fixed bin;
+
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+dcl	n_sectors		fixed bin;
+	if Vtoc_buf_desc.os
+	then call syserr (CRASH, "vtoc_man: buffer out-of-service on write.");
+
+	partsx = bin (Parts, 3);
+	if ^VALID_WRITE (partsx)
+	then call syserr (CRASH, "vtoc_man: Invalid write");
+
+	Vtoc_buf_desc.err = "0"b;
+	Vtoc_buf_desc.notify_sw = "0"b;
+	Vtoc_buf_desc.ioq = "0"b;
+	Vtoc_buf_desc.write_sw = "1"b;
+	Vtoc_buf_desc.os = "1"b;
+
+	dev_type = addr (pvt_array (Vtoc_buf_desc.pvtx)) -> pvte.device_type;
+
+	if SECTORS_PER_VTOCE (dev_type) = 1
+	then do;
+		n_sectors = 1;
+		if Parts ^= ALL_PARTS
+		then do;
+			call syserr (CRASH, "vtoc_man: Attempt to write less than entire VTOCE to ^d device.",
+			     MODELN (dev_type));
+		     end;
+	     end;
+	else n_sectors = SECTORS_TO_WRITE (partsx);
+	call dctl$write_sectors ((Vtoc_buf_desc.pvtx), CORE (Vtoc_buf_descp) + CORE_OFFSET (partsx),
+	     RECORD (Vtoc_buf_descp), SECTOR (Vtoc_buf_descp) + SECTOR_OFFSET (partsx), n_sectors);
+
+	Vtoc_buf_desc.ioq = "1"b;
+	if VALID_WRITE (bin ((Parts | Vtoc_buf_desc.parts_used), 3))
+	then Vtoc_buf_desc.parts_used = Vtoc_buf_desc.parts_used | Parts;
+	else Vtoc_buf_desc.parts_used = Parts;
+
+	vtoc_buffer.meters.disk_writes = vtoc_buffer.meters.disk_writes + 1;
+	pds$vtoc_writes = pds$vtoc_writes + 1;
+
+     end WRITE;
+%page;
+/*        WAIT - Procedure to wait until a specified buffer is no longer
+	out-of-service.
+*/
+
+WAIT:
+     proc (Vtoc_buf_descp, Code);
+
+dcl	Vtoc_buf_descp	ptr;
+dcl	Code		fixed bin (35);
+
+dcl	1 Vtoc_buf_desc	aligned like vtoc_buf_desc based (Vtoc_buf_descp);
+
+	Code = 0;
+	vtoc_buffer.meters.wait_calls = vtoc_buffer.meters.wait_calls + 1;
+
+	do while (Vtoc_buf_desc.os);
+	     wait_event = bit (bin (vtoc_buffer.wait_event_constant + Vtoc_buf_desc.wait_index, 36), 36);
+	     call pxss$addevent (wait_event);
+	     Vtoc_buf_desc.notify_sw = "1"b;
+	     if Vtoc_buf_desc.os
+	     then do;
+		     vtoc_buffer.meters.wait_os = vtoc_buffer.meters.wait_os + 1;
+		     call UNLOCK;
+		     call pxss$wait;
+		     call LOCK_CHECK (Code);
+		     if Code ^= 0
+		     then return;
+		end;
+	     else call pxss$delevent (wait_event);
+	     Vtoc_buf_desc.notify_sw = "0"b;
+	end;
+
+     end WAIT;
+
+%page;
+/*        VALIDATE_VTOCX - Routine to check whether a given VTOCE index
+	corresponds to a VTOCE on the volume. 
+*/
+
+VALIDATE_VTOCX:
+     proc (Vtocx, Code);
+
+dcl	Vtocx		fixed bin;
+dcl	Code		fixed bin (35);
+
+	if Vtocx < 0 | Vtocx >= pvte.n_vtoce
+	then Code = error_table_$invalid_vtocx;
+	else Code = 0;
+
+     end VALIDATE_VTOCX;
+%page;
+/*        Setup, Locking, and Unlocking Routines
+
+	SETUP_LOCK  - sets up global pointers, locks vtoc_buffers,
+		    checks PVTE for still there, not being demounted
+
+          LOCK_CHECK  - locks vtoc_buffers,
+		    checks PVTE for still there, not being demounted
+
+          UNLOCK      - unlocks vtoc_buffers
+*/
+
+SETUP_LOCK:
+     proc (Pvtx, Code);
+
+dcl	Pvtx		fixed bin;
+dcl	Code		fixed bin (35);
+
+
+dcl	code		fixed bin (35);
+
+	vtoc_buffer_segp = addr (vtoc_buffer_seg$);
+	vtoc_buf_desc_arrayp = ptr (vtoc_buffer_segp, vtoc_buffer.buf_desc_offset);
+	vtoc_buf_arrayp = ptr (vtoc_buffer_segp, vtoc_buffer.buf_offset);
+	pvt_arrayp = addr (pvt$array);
+
+	Code = 0;
+	pvtep = null ();
+
+	if Pvtx < 0 | Pvtx > pvt$n_entries
+	then Code = error_table_$invalid_pvtx;
+	else pvtep = addr (pvt_array (Pvtx));
+
+	call LOCK_CHECK (code);
+	if code ^= 0
+	then Code = code;
+
+     end SETUP_LOCK;
+
+
+
+LOCK_CHECK:
+     proc (Code);
+
+dcl	Code		fixed bin (35);
+
+	Code = 0;
+
+	if pvtep ^= null ()
+	then do;
+		if (pvid ^= ""b & pvid ^= pvte.pvid)
+		then Code = error_table_$pvid_not_found;
+		else if pvte.device_inoperative
+		then Code = error_table_$vtoc_io_err;
+		else if pvte.being_demounted2
+		then Code = error_table_$pvid_not_found;
+	     end;
+
+	call lock$lock_fast (addr (vtoc_buffer.lock));
+
+
+     end LOCK_CHECK;
+
+
+UNLOCK:
+     proc;
+
+	call lock$unlock_fast (addr (vtoc_buffer.lock));
+
+
+     end UNLOCK;
+
+%page;
+%include disk_pack;
+%page;
+%include pvte;
+%page;
+%include syserr_constants;
+%page;
+%include vtoc_buffer;
+%page;
+%include vtoce;
+%page;
+%include fs_dev_types;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+Message:
+vtoc_man: Invalid free vtocx XXXXX on dskX_NN{s}
+
+S:        $log
+
+T:	$run
+
+M:	A free VTOCE was allocated which has an invalid VTOCE index for the 
+volume. This is indicative of damage to volume control structures. This
+damage can be corrected by a volume salvage.
+
+A:        $ignore
+
+Message:
+vtoc_man: Out of buffers try number N
+
+S:        $info
+
+T:        $run
+
+M:        There may be a disk problem which prevents the vtoc buffers 
+from being written to disk, or there may be a disk tuning problem. 
+The system may crash within the next few minutes.
+
+A:        $contact_sa
+
+Message:
+vtoc_man: UID ^= 0 in free VTOCE vtocx XXXXX dskX_NN{s}
+
+S:        $log
+
+T:        $run
+
+M:        The contents of VTOCE XXXXX on dskX_NN{s} are incorrect, as free
+VTOCEs should have a zero UID. The system attempts to find another free
+VTOCE. This may indicate damage to volume control structures. This damage
+can be corrected by a volume salvage.
+
+A:        $ignore
+
+
+Message:
+vtoc_man: Buffer out-of-service during cleanup
+
+S:        $crash
+
+T:        When a volume is being demounted or during system shutdown.
+
+M:        A likely software error in VTOC buffer management which caused
+an inconsistency in the VTOC buffer.
+
+A:        $recover
+
+
+Message:
+vtoc_man: Hot buffer abandoned during cleanup vtocx XXXXX dskX_NN{s}
+
+S:        $log
+
+T:        When a volume is being demounted or during system shutdown.
+
+M:        An update to VTOCE XXXXX on dskX_NN{s} could not be completed
+due to I/O errors. The VTOCE may be inconsistent or damaged.
+
+A:        The VTOCE should be examined by means of dump_vtoce the next time
+the volume is online. Any inconsistency can be corrected by a volume salvage.
+
+
+Message:
+vtoc_man: Write I/O being retried by PERSON.PROJECT.TAG for dskX_NN{s} vtocx XXXXX
+
+S:	$log
+
+T:	$run
+
+M:	A buffer previously marked as "hot" is being requeued for I/O.
+
+A:	$ignore
+
+
+Message:
+vtoc_man: write I/O recovered on crawlout by PERSON.PROJECT.TAG for dskX_NN{s} vtocx XXXXX
+
+S:        $log
+
+T:	$run
+
+M:        The process of PERSON.PROJECT.TAG crawled out of ring-0 or terminated
+with the VTOC buffer lock held. A buffer was marked out-of-service for write
+to VTOCE XXXXX on dskX_NN{s} for which no I/O had been queued. The write I/O
+was requeued.
+
+A:        $ignore
+
+
+Message:
+vtoc_man: read reset of crawlout by PERSON.PROJECT.TAG for dskX_NN{s} vtocx XXXXXX
+
+S:        $log
+
+T:	$run
+
+M:	The process of PERSON.PROJECT.TAG crawled out of ring-0 or terminated
+with the VTOC buffer lock held. A buffer was marked out-of-service for read
+to VTOCE XXXXX on dskX_NN{s} for which no I/O had been queued. The read I/O was
+abandoned.
+
+A:        $ignore
+
+
+Message:
+vtoc_man: Update in progress on crawlout by PERSON.PROJECT.TAG dskX_NN{s}
+
+S:        $log
+
+T:	$run
+
+M:        The process of PERSON.PROJECT.TAG crawled out of ring-0 or terminated
+with the vtoc buffer lock held and an update in progress for a VTOCE on dskX_NN{s}.
+The VTOCE may be inconsistent. Any inconsistency can be corrected by a volume salvage.
+
+A:        $ignore
+
+Message:
+vtoc_man: Invalid write
+
+S:        $crash
+
+T:        $run
+
+M:        A likely software error in the calling sequence for output of a VTOCE.
+
+A:        $recover
+
+
+Message:
+vtoc_man: buffer out-of-service on write
+
+S:        $crash
+
+T:	$run
+
+M:	A likely software problem has caused an inconsistency in 
+the VTOC buffer.
+
+A:        $recover
+
+
+Message:
+vtoc_man: Attempt to write less than entire VTOCE to MODEL device.
+
+S:        $crash
+
+T:	$run
+
+M:        An attempt has been made to write less than the entire VTOCE to a 
+device MODEL that only supports a 512_word sector. For these devices the 
+entire 192 word VTOCE must be written at one time. A likely software error 
+n VTOC buffer management.
+
+A:        $recover
+
+
+END MESSAGE DOCUMENTATION */
+     end vtoc_man$get_vtoce;

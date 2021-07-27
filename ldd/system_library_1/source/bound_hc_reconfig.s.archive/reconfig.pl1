@@ -1,0 +1,824 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* This program is the ring zero portion of the dynamic reconfiguration software
+   for system controllers and processors. It is callable only through hphcs_ and assumes
+   the caller has validated the arguments so that they within proper range.
+
+   Modified March 1976 by Steve Webber -- Initial coding
+   modified 4/6/76 by Noel I. Morris
+   last modified 4/13/78 by J. A. Bush to add code for cpu testing
+   Modified 16 Feb 79 by D. Spector to recompute write_limit when reconfiguring memory
+   Modified 09/11/80 by J. A. Bush for the DPS8/70M cpu
+   Modified April 1982 by J. Bongiovanni for expanded SCS switch/mask
+   Modified June 1982 by J. Bongiovanni to fix bug in adding an SCU with
+   less memory than the port size
+   Modified Sept 1983 by J. A. Bush to increase ISOLTS required memory to 128K for DPS8 cpus
+   Modified 6/14/83 by S. Krupp to add rc_lock entry.
+
+*/
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+
+reconfig:
+     proc;
+
+/* Parameters */
+
+dcl	tag		   fixed bin (3);
+dcl	(cpu_tag, scu_tag, scu_port)
+			   fixed bin (5);
+dcl	switches		   (4) bit (36) aligned;
+dcl	lace		   bit (1) aligned;
+dcl	badtag		   fixed bin (3);
+dcl	code		   fixed bin (35);
+dcl	first_frame	   fixed bin;
+dcl	n_frames		   fixed bin;
+dcl	(rci_ptr, wseg_p)	   ptr;
+
+/* Automatic */
+
+dcl	tcode		   fixed bin (35);
+dcl	errtag		   fixed bin (3);
+dcl	first		   fixed bin (3);
+dcl	last		   fixed bin (3);
+dcl	(i, k)		   fixed bin;
+dcl	j		   fixed bin (3);
+dcl	vl		   fixed bin (3);
+dcl	req_mem		   fixed bin;
+dcl	size		   fixed bin;
+dcl	base		   fixed bin;
+dcl	top		   fixed bin;
+dcl	abs_seg_p		   ptr;
+dcl	p_mess		   bit (1);
+dcl	switchesp		   ptr;
+dcl	1 tsdw		   aligned like sdw;
+
+/* Based */
+
+dcl	based_switches	   (4) bit (36) aligned based (switchesp);
+
+/* External */
+
+dcl	error_table_$bad_subr_arg fixed bin(35) ext static;
+dcl	pds$processid	   bit (36) aligned ext;
+dcl	pds$process_group_id   char (32) aligned ext;
+dcl	isolts_abs_seg$	   ext;
+
+/* Entries */
+
+dcl	syserr		   entry options (variable);
+dcl	start_cpu		   entry (fixed bin (3), fixed bin (35));
+dcl	configure_test_cpu	   entry (fixed bin (35));
+dcl	configure_test_cpu$isolts_final
+			   entry;
+dcl	level$get		   entry returns (fixed bin (3));
+dcl	privileged_mode_ut$swap_sdw
+			   entry (ptr, ptr);
+dcl	config_$find_2	   entry (char (4) aligned, fixed bin, ptr);
+dcl	config_$update	   entry ();
+dcl	stop_cpu		   entry (fixed bin (3), fixed bin (35));
+dcl	add_scu		   entry (fixed bin (3), fixed bin (3), fixed bin (35));
+dcl	freecore		   entry (fixed bin);
+dcl	pc_abs$remove_core	   entry (fixed bin, fixed bin, fixed bin (35));
+dcl	add_scu$remove_scu	   entry (fixed bin (3));
+dcl	validate_cpu_card	   entry (fixed bin (3), ptr);
+
+/* Builtins */
+
+dcl	(addr, bin, bit, divide, hbound, max, mod, null, rel, stac, stacq, string, substr, unspec)
+			   builtin;
+
+/* constants */
+
+dcl	letters		   char (15) int static options (constant) init ("abcdefghijklmo");
+
+/*
+   ADD_CPU               ADD_CPU               ADD_CPU
+
+   This entry is called to add a processor to the system
+
+*/
+
+add_cpu:
+     entry (tag, switches, code);
+
+	if check_lock () then
+	     return;				/* not locked to us */
+
+	if scs$processor_data (tag).online then do;	/* If already online ... */
+	     code = rcerr_online;
+	     call UNLOCK;
+	     return;
+	end;
+
+	if ^scs$processor_data (tag).offline then do;	/* If not offline ... */
+	     code = rcerr_no_config;
+	     call UNLOCK;
+	     return;
+	end;
+
+	call start_cpu (tag, tcode);			/* do the work */
+
+/* Perform error checking and recovery. */
+
+	if tcode ^= 0 then do;
+	     code = tcode;				/* Return the error code. */
+	     switchesp = addr (scs$processor_switch_compare (1));
+	     switches = based_switches;		/* Return switch 1-4 descrepancies */
+
+	end;
+
+	call UNLOCK;
+
+	return;
+
+/*
+   DEL_CPU               DEL_CPU               DEL_CPU
+
+
+   This entry is called to delete a processor from the system
+
+*/
+
+del_cpu:
+     entry (tag, code);
+
+	if check_lock () then
+	     return;
+
+	if ^scs$processor_data (tag).online then do;	/* If not online ... */
+	     code = rcerr_not_online;
+	     call UNLOCK;
+	     return;
+	end;
+
+	if scs$nprocessors <= 1 then do;		/* If only one processor ... */
+	     code = rcerr_delcpu_last;
+	     call UNLOCK;
+	     return;
+	end;
+
+	call stop_cpu (tag, tcode);
+	if tcode ^= 0 then
+	     code = tcode;
+
+	call UNLOCK;
+
+	return;
+
+/*
+   ADD_SCU               ADD_SCU               ADD_SCU
+
+   This entry is called to add a system controller and its memory to the system. If the
+   system controller is one of a pair of externally interlaced
+   controllers, both controllers are added.
+
+*/
+
+add_scu:
+     entry (tag, lace, badtag, code);
+
+	if check_lock () then
+	     return;
+
+	if scs$controller_data (tag).online then do;	/* If already online ... */
+	     code = rcerr_online;
+	     call UNLOCK;
+	     return;
+	end;
+	if ^scs$controller_data (tag).offline then do;	/* If not offline ... */
+	     code = rcerr_no_config;
+	     call UNLOCK;
+	     return;
+	end;
+	if scs$controller_data (tag).ext_interlaced then do;
+	     first = tag - mod (tag, 2);
+	     last = first + 1;
+	     lace = "1"b;
+	end;
+	else do;
+	     first, last = tag;
+	     lace = "0"b;
+	end;
+
+	do j = first to last;
+	     call add_scu (j, errtag, tcode);
+	     if tcode ^= 0 then do;
+		code = tcode;			/* Return the error code. */
+		badtag = errtag;
+
+		if (first ^= last) & (j = last) then	/* must undo for first */
+		     call add_scu$remove_scu (first);
+
+		call UNLOCK;
+
+		return;
+	     end;
+	end;
+
+	do j = first to last;
+	     call free_all_of (j);
+	end;
+
+	call UNLOCK;
+
+	call recompute_write_limit;
+
+	return;
+
+/*
+   DEL_SCU               DEL_SCU               DEL_SCU
+
+
+   This entry is called to delete a system controller and its memory from the system. If the system
+   controller is one of a pair of externally interlaced controllers, the
+   other controller of the pair is also deleted.
+
+*/
+
+del_scu:
+     entry (tag, lace, code);
+
+	if check_lock () then
+	     return;
+
+	if ^scs$controller_data (tag).online then do;
+	     code = rcerr_not_online;
+	     call UNLOCK;
+	     return;
+	end;
+	if scs$controller_data (tag).ext_interlaced then do;
+	     first = tag - mod (tag, 2);
+	     last = first + 1;
+	     lace = "1"b;
+	end;
+	else do;
+	     first, last = tag;
+	     lace = "0"b;
+	end;
+
+	do j = first to last;
+	     base = scs$controller_data (j).base;
+	     size = scs$controller_config_size (j);
+
+
+	     call pc_abs$remove_core (base, size, tcode);
+	     if tcode ^= 0 then do;
+		if (first ^= last) & (j ^= first) then
+		     call free_all_of (first);
+
+		call UNLOCK;
+
+		if tcode = 1 then
+		     code = rcerr_delmain_nomem;
+		else if tcode = 2 then
+		     code = rcerr_delmain_abs_wired;
+		else code = tcode;
+
+		return;
+	     end;
+	end;
+
+	do j = first to last;
+	     call add_scu$remove_scu (j);
+	end;
+
+	call UNLOCK;
+
+	call recompute_write_limit;
+
+	return;
+
+/*
+   ADD_MAIN              ADD_MAIN              ADD_MAIN
+
+
+   This entry is used to add a subregion of a controller to the system.
+
+*/
+
+add_main:
+     entry (first_frame, n_frames, code);
+
+	if check_lock () then
+	     return;
+
+	if check_range () then
+	     return;
+
+	do k = first_frame to first_frame + n_frames - 1;
+	     call freecore (k);
+	end;
+
+	call UNLOCK;
+
+	call recompute_write_limit;
+
+	return;
+
+
+
+
+/*
+   DEL_MAIN              DEL_MAIN              DEL_MAIN
+
+
+   This entry is used to remove selected regions of a controller from the system
+
+*/
+
+del_main:
+     entry (first_frame, n_frames, code);
+
+	if check_lock () then
+	     return;
+
+	if check_range () then
+	     return;
+
+	call pc_abs$remove_core (first_frame, n_frames, tcode);
+	if tcode ^= 0 then do;
+	     if tcode = 1 then
+		code = rcerr_delmain_nomem;
+	     else if tcode = 2 then
+		code = rcerr_delmain_abs_wired;
+	     else code = tcode;
+	end;
+
+	call UNLOCK;
+
+	call recompute_write_limit;
+
+	return;
+
+/*	RECOMPUTE_WRITE_LIMIT		RECOMPUTE_WRITE_LIMIT
+
+   When memory is reconfigured, write_limit is set to 1/8 of pages used
+   (but no less than 30).  This overrides any explicit change via
+   change_tuning_parameters.
+
+*/
+
+recompute_write_limit:
+     proc;
+
+declare  sst$write_limit	  fixed bin (35) external static;
+declare  sst$nused		  fixed bin (35) external static;
+
+	sst$write_limit = max (30, divide (sst$nused, 8, 17, 0));
+
+     end;
+
+/*
+   RC_FORCE_UNLOCK       RC_FORCE_UNLOCK       RC_FORCE_UNLOCK
+
+
+   This entry is called to unlock the reconfig lock.
+
+*/
+
+rc_unlock:
+     entry;
+
+	if scs$reconfig_lock ^= pds$processid then
+	     return;				/* not locked to us */
+
+
+rc_force_unlock:
+     entry;
+
+	call UNLOCK;
+
+	return;
+
+
+/*
+   RC_LOCK               RC_LOCK               RC_LOCK
+
+   This entry is called to set the reconfiguration lock.
+
+   If the lock is already locked, the error code set by check_lock
+   is returned. Otherwise, check_lock locks the lock and a code of 0
+   is returned.
+*/
+
+rc_lock:
+     entry (code);
+
+	if ^check_lock () then
+	     code = 0;
+
+	return;
+
+
+/* UNLOCK                UNLOCK                UNLOCK */
+
+UNLOCK:
+     proc;
+
+	if ^stacq (scs$reconfig_lock, (36)"0"b, scs$reconfig_lock) then
+	     call syserr (0, "reconfig: trouble unlocking scs$reconfig_lock");
+
+     end UNLOCK;
+
+
+
+/* CHECK_LOCK            CHECK_LOCK            CHECK_LOCK */
+
+check_lock:
+     proc returns (bit (1) aligned);
+
+	code = 0;
+
+	if ^stac (addr (scs$reconfig_lock), pds$processid) then do;
+	     code = rcerr_locked;
+	     return ("1"b);
+	end;
+
+	else do;
+	     scs$reconfig_locker_id = pds$process_group_id;
+	     return ("0"b);
+	end;
+
+
+     end check_lock;
+
+/* FREE_ALL_OF           FREE_ALL_OF           FREE_ALL_OF */
+
+free_all_of:
+     proc (mem);
+
+dcl	mem		   fixed bin (3);
+
+dcl	i		   fixed bin;
+dcl	base		   fixed bin;
+dcl	top		   fixed bin;
+
+	base = scs$controller_data (mem).base;
+	top = scs$controller_config_size (mem) + base - 1;
+	do i = base to top;
+	     call freecore (i);
+	end;
+
+     end free_all_of;
+
+
+
+/* CHECK_RANGE           CHECK_RANGE           CHECK_RANGE */
+
+check_range:
+     proc returns (bit (1) aligned);
+
+dcl	i		   fixed bin;
+dcl	base		   fixed bin;
+dcl	top		   fixed bin;
+
+	if n_frames < 0 then do;
+	     code = error_table_$bad_subr_arg;
+	     goto check_range_error;
+	end;
+
+	do i = 0 to 7;
+	     if scs$controller_data (i).online then do;
+		base = scs$controller_data (i).base;
+		top = base + scs$controller_config_size (i) - 1;
+		if (first_frame >= base) & (first_frame + n_frames - 1 <= top) then
+		     return ("0"b);
+	     end;
+	end;
+
+	code = rcerr_range;
+check_range_error:
+	call UNLOCK;
+
+	return ("1"b);
+
+     end check_range;
+
+/*
+   RECONFIG_INFO         RECONFIG_INFO         RECONFIG_INFO
+
+
+   This entry is used to return information about the current configuration. The reconfig lock in
+   scs is also set. If the lock is not settable (locked to other logged in process) the
+   process_group_id of that process is returned, along with an error code
+
+*/
+
+reconfig_info:
+     entry (rci_ptr, code);
+
+	if ^stac (addr (scs$reconfig_lock), pds$processid) then do;
+	     rci_ptr -> rci.locker_group_id = scs$reconfig_locker_id;
+	     code = rcerr_locked;
+	     return;
+	end;
+
+	code = 0;
+	scs$reconfig_locker_id = pds$process_group_id;
+
+/* Now copy the data from the SCS */
+
+	rci_ptr -> rci.controller_data = scs$controller_data;
+	rci_ptr -> rci.processor_data = scs$processor_data;
+
+	return;
+
+/*
+   CHECK_RESOURCE	CHECK_RESOURCE	CHECK_RESOURCE
+
+
+   This entry is the initial entry for the ISOlTS reconfiguration software. It is called by the ISOLTS driver
+   to check if the Processor and Memory resources required to test a CPU are present. Note that the reconfig
+   lock is set upon entry but is not reset on exit. The reconfig lock will remain set until the destroy_cpu_test_env
+   entry is called.
+*/
+
+check_resource:
+     entry (cpu_tag, scu_tag, scu_port, code);
+
+	code = 0;					/* preset return code  to 0 */
+
+	if check_lock () then do;			/* lock reconfig lock if possible */
+	     code = rcerr_isolts_locked;		/* data base already locked */
+	     return;
+	end;
+
+	if cpu_tag > hbound (scs$processor_data, 1) then do;
+						/* trying to test non existant cpu */
+	     code = rcerr_isolts_illegal_cpu;
+	     call UNLOCK;				/* unlock reconfig lock */
+	     return;
+	end;
+
+	if scs$processor_data (cpu_tag).online then do;	/* cpu must be offline */
+	     code = rcerr_isolts_cpu_online;
+	     call UNLOCK;
+	     return;
+	end;
+
+	if ^scs$processor_data (cpu_tag).offline then do; /* trying to test cpu that is not configured */
+	     code = rcerr_isolts_no_config;
+	     call UNLOCK;
+	     return;
+	end;
+
+	if scu_tag = -1 then do;			/* We will determine which SCU to use */
+
+/* find scu that is not zero based and has the smallest amount of memory */
+
+	     k = -1;
+	     do i = 0 to hbound (scs$controller_data, 1); /* iterate through all possible scu's */
+		if scs$controller_data (i).online then	/* if scu online */
+		     if scs$controller_data (i).base ^= 0 then
+						/* and not zero based */
+			if scs$controller_data (i).size >= 128 then
+						/* and if memory size is at least 128k */
+			     if ^scs$controller_data (i).abs_wired then
+						/* and no abs wired pages */
+				if ^scs$controller_data (i).ext_interlaced then
+						/* and not ext interlaced */
+				     if k ^= -1 then/* not first time through */
+					if scs$controller_data (i).size <
+						/* if size of this scu is less */
+					     scs$controller_data (k).size then
+						/* then previous saved */
+					     k = i;
+						/* save this tag */
+					else ;
+				     else k = i;	/* first time through, save this tag */
+	     end;
+
+	     if k = -1 then do;			/* Not enough SCUs to continue */
+		code = rcerr_isolts_two_scu;
+		call UNLOCK;
+		return;
+	     end;
+	     scu_tag = k;				/* save the scu tag to return to user */
+	end;
+
+	else do;					/* user wants to run with particular SCU */
+
+	     if scu_tag > hbound (scs$controller_data, 1) then do;
+						/* check it for legality */
+		code = rcerr_isolts_illegal_scu;
+		call UNLOCK;
+		return;
+	     end;
+
+	     if scu_tag = scs$interrupt_controller then do;
+						/* can't use bootload controller */
+		code = rcerr_isolts_bootload_scu;
+		call UNLOCK;
+		return;
+	     end;
+
+	     if ^scs$controller_data (scu_tag).online then do;
+						/* scu must be online */
+		code = rcerr_isolts_scu_not;
+		call UNLOCK;
+		return;
+	     end;
+
+	end;
+
+	scu_port = scs$processor_data (cpu_tag).controller_port;
+						/* set port for user */
+
+	return;					/*  return with no error and reconfig lock locked */
+
+/*
+   CREATE_CPU_TEST_ENV	CREATE_CPU_TEST_ENV	CREATE_CPU_TEST_ENV
+
+
+   This entry is called by the ISOLTS driver after  manual reconfiguration of a CPU to test and the SCU to be
+   used for testing is accomplished by the Operator.
+
+*/
+
+create_cpu_test_env:
+     entry (cpu_tag, scu_tag, switches, wseg_p, code);
+
+	code = 0;					/* preset return code */
+	wseg_p = null;				/* set work seg ptr to null initially */
+
+	if scs$reconfig_lock ^= pds$processid then do;	/* not locked to us */
+	     code = rcerr_isolts_not;
+	     return;
+	end;
+	scs$processor_test_data.cpu_tag = cpu_tag;	/* initialize  processor_test_data structure */
+	scs$processor_test_data.scu_tag = scu_tag;
+	scs$processor_test_data.scu_state = "00"b;
+	scs$processor_test_data.active = "1"b;		/* set active flag */
+
+	call configure_test_cpu (tcode);		/* go do the work */
+	switchesp = addr (scs$processor_switch_compare (1));
+	switches = based_switches;			/* return switch info 1-4 */
+	if tcode ^= 0 then do;			/* bad problems */
+	     call destroy_cpu_test_env_no_mess;		/* give back all resources */
+	     code = tcode;
+	     return;
+	end;
+	abs_seg_p = addr (isolts_abs_seg$);		/* get ptr to isolts_abs_seg */
+	req_mem = scs$processor_test_data.req_mem;	/* get auto copy of memory required */
+
+/* set up an sdw for isolts_abs_seg that points to the base of our scu */
+
+	vl = level$get ();				/* get users current validation level */
+	string (tsdw) = "0"b;
+	tsdw.add = bit (bin (scs$controller_data (scu_tag).base * 1024, 24), 24);
+	tsdw.r1, tsdw.r2, tsdw.r3 = bit (bin (vl, 3), 3); /* set ring brks to users validation level */
+	tsdw.df = "1"b;				/* do not want seg fault on this segment */
+	tsdw.read = "1"b;
+	tsdw.write = "1"b;				/* set read and write access for user */
+	tsdw.unpaged = "1"b;			/* this is an unpaged segment */
+	tsdw.bound = bit (bin (divide (req_mem * 1024, 16, 14) - 1, 14), 14);
+						/* set bounds for <req_mem>k */
+	call privileged_mode_ut$swap_sdw (abs_seg_p, addr (tsdw));
+						/* swap new sdw with current one */
+	wseg_p = abs_seg_p;				/* give ptr to isolts abs seg to user */
+	call config_$find_2 (CPU_CARD_WORD, cpu_tag + 1, cpu_cardp);
+						/* set up target cpu card */
+	cpu_card.state = "test";			/* for test state */
+	call config_$update ();
+	call validate_cpu_card ((cpu_tag), addr (scs$processor_switch_compare (2)));
+						/* validate cpu type and model */
+
+	call syserr (0, "reconfig: Assigned CPU ^a to ^a for testing",
+						/* tell operator what we are doing */
+	     substr (letters, cpu_tag + 1, 1), pds$process_group_id);
+	call syserr (0, "reconfig: Using base ^dk of MEM ^a for testing CPU ^a", req_mem,
+	     substr (letters, scu_tag + 1, 1), substr (letters, cpu_tag + 1, 1));
+
+	return;					/* return to caller */
+
+/*
+   DESTROY_CPU_TEST_ENV	DESTROY_CPU_TEST_ENV	DESTROY_CPU_TEST_ENV
+
+   This entry is called by the ISOLTS driver to undo any reconfiguration that was done for cpu testing.
+   It is also called by the answering service hardcore module deact_proc if the condition of the reconfig_lock is set
+   with the process_id of the process in termination and the processor_test_data.active flag is on.
+   this acts as a system cleanup handler in case of ISOLTS process abnormal termination.
+
+*/
+
+destroy_cpu_test_env:
+     entry;
+
+	p_mess = "1"b;				/* set flag to display unassign message */
+	go to destroy_test_env_com;			/* go join common code */
+
+destroy_cpu_test_env_no_mess:
+     entry;
+
+	p_mess = "0"b;				/* reset flag do not print unassign messages */
+
+destroy_test_env_com:
+	if scs$processor_test_data.active then do;	/* if test active */
+	     call configure_test_cpu$isolts_final;	/* give back SCU and memory to system */
+	     abs_seg_p = addr (isolts_abs_seg$);	/* destroy users sdw to isolts_abs_seg */
+	     string (tsdw) = "0"b;
+	     call privileged_mode_ut$swap_sdw (abs_seg_p, addr (tsdw));
+	     call config_$find_2 (CPU_CARD_WORD, scs$processor_test_data.cpu_tag + 1, cpu_cardp);
+	     cpu_card.state = "off ";			/* reset cpu state to off */
+	     call config_$update ();
+	     if p_mess then do;			/* only output messages if entry by destroy_cpu_test_env */
+		call syserr (0, "reconfig: Unassigned CPU ^a from ^a",
+						/* tell operator what we are doing */
+		     substr (letters, scs$processor_test_data.cpu_tag + 1, 1), scs$reconfig_locker_id);
+		call syserr (0, "reconfig: Releasing base ^dk of MEM ^a", scs$processor_test_data.req_mem,
+		     substr (letters, scs$processor_test_data.scu_tag + 1, 1));
+	     end;
+	     unspec (scs$processor_test_data) = "0"b;	/* initialize test data structure */
+	end;
+
+/* reset reconfig_lock, and return */
+
+	call UNLOCK;
+
+	return;
+
+%include config_cpu_card;
+%page;
+%include scs;
+%page;
+%include sdw;
+%page;
+%include rcerr;
+%include rci;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   reconfig: trouble unlocking scs$reconfig_lock
+
+   S:	$info
+
+   T:	$run
+
+   M:	The reconfiguration lock
+   could not be unlocked.
+   It is left in its current state.
+   Further attempts at reconfiguration may fail.
+
+   A:	$ignore
+
+   Message:
+   reconfig: Assigned CPU <cputag> to <Person.Project.instance> for testing
+
+   S: $info
+
+   T: $run
+
+   M: Successful reconfiguration of the indicated processor has been
+   performed by the processor testing (ISOLTS) subsystem.
+
+   A: $ignore
+
+   Message:
+   reconfig: Using base <req_mem>k of MEM <scutag> for testing CPU cputag
+
+   S: $info
+
+   T: $run
+
+   M: Successful reconfiguration of the indicated memory has been
+   performed by the processor testing (ISOLTS) subsystem.
+
+   A: $ignore
+
+   Message:
+   reconfig: Unassigned CPU <cputag> from <Person.Project.instance>
+
+   S: $info
+
+   T: $run
+
+   M: Processor testing has been terminated and the indicated
+   processor is now available for reconfiguration.
+
+   A: $ignore
+
+   Message:
+   reconfig: Releasing base <req_mem>k of MEM <scutag>
+
+   S: $info
+
+   T: $run
+
+   M: Processor testing has been terminated and the indicated
+   memory is now available for reconfiguration.
+
+   A: $ignore
+
+   END MESSAGE DOCUMENTATION */
+
+     end reconfig;

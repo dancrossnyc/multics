@@ -1,0 +1,252 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+iodd_get_cmd_: proc (a_wp, a_max_chars, a_chars_read, ctl, a_msg, a_source, a_code);
+
+/* This is the procedure used by the io daemon to read a command line from
+   either of the terminals which can give commands to the driver.
+
+   It may wait for a command to be read, or it may return if no command
+   was typed on either terminal as determined by the ctl (flags) arg.
+*/
+
+/* Coded in August 1977 by J. C. Whitmore */
+/* Modified Mar 1978 by J. C. Whitmore for bug fix, clearing prompt slave flag */
+/* Modified Aug 1978 by J. C. Whitmore to fix the ctl declaration and add slave echo */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-25,Wallman), install(88-10-28,MR12.2-1199):
+     Upgraded to version 5 iod tables.
+                                                   END HISTORY COMMENTS */
+
+
+/*	ENTRIES		*/
+
+	dcl     iodd_msg_		 entry options (variable);
+	dcl     continue_to_signal_	 entry (fixed bin (35));
+	dcl     convert_ipc_code_	 entry (fixed bin (35));
+	dcl     ioa_$rs		 entry options (variable);
+	dcl     iox_$get_line	 entry (ptr, ptr, fixed bin (24), fixed bin (24), fixed bin (35));
+	dcl     iox_$put_chars	 entry (ptr, ptr, fixed bin (24), fixed bin (35));
+	dcl     iox_$control	 entry (ptr, char (*), ptr, fixed bin (35));
+	dcl     ios_$attach		 entry (char (*), char (*), char (*), char (*), bit (72) aligned);
+	dcl     ipc_$block		 entry (ptr, ptr, fixed bin (35));
+	dcl     ipc_$drain_chn	 entry (fixed bin (71), fixed bin (35));
+
+
+/*	ARGUMENTS		*/
+
+	dcl     a_wp		 ptr;		/* workspace pointer to input buffer */
+	dcl     a_max_chars		 fixed bin (24);	/* sixe of the workspace */
+	dcl     a_chars_read	 fixed bin (24);	/* number of chars actually read */
+	dcl     a_msg		 char (*);	/* added message for Enter command(a_msg): */
+	dcl     a_source		 fixed bin;	/* was the cmd from the master(1) or the slave(2) */
+	dcl     a_code		 fixed bin (35);	/* you guessed it! error code */
+
+
+
+/*	AUTOMATIC		*/
+
+	dcl     code		 fixed bin (35);
+	dcl     prompt_msg		 char (128);	/* command request message */
+	dcl     msg_len		 fixed bin (24);
+	dcl     quit_signaled	 bit (1);
+
+	dcl     master		 fixed bin int static options (constant) init (1); /* constant  indicating input from master device */
+	dcl     slave		 fixed bin int static options (constant) init (2); /* constant indicating input from slave */
+
+	dcl     1 ctl		 aligned parameter,
+		2 wait_for_input	 bit (1) unal,	/* true if we should wait for a cmd line */
+		2 prompt_master	 bit (1) unal,	/* true if we should ask master for cmd */
+		2 prompt_slave	 bit (1) unal,	/* true if we should ask slave for cmd */
+		2 pad		 bit (33) unal;
+
+
+	dcl     1 read_info		 aligned,		/* structure for ios_$order "read_status" */
+		2 read_ev_chan	 fixed bin (71),
+		2 input_ready	 bit (1) unal;
+
+	dcl     1 event_info	 aligned,		/* info about a wakeup received */
+		2 chan		 fixed bin (71),
+		2 ev_msg		 fixed bin (71),
+		2 sender		 bit (36),
+		2 origin		 fixed bin,
+		2 wait_list_index	 fixed bin;
+
+
+	dcl     1 input_list	 aligned,		/* IPC wait list for operator input */
+		2 number		 fixed bin,	/* number of entries in the list = 2 */
+		2 channel		 (2) fixed bin (71);/* ipc event channels */
+
+
+/*	CONDITIONS	*/
+
+	dcl     (daemon_unclaimed, re_init, quit) condition;
+
+
+/*	BUILTINS		*/
+
+	dcl     (addr, null)	 builtin;
+
+
+/*	BASED STRUCTURES AND INCLUDE FILES		*/
+
+
+	dcl     chan_list_ptr	 ptr;		/* pointer to event channel list */
+
+	dcl     1 ev_chan_list	 aligned based (chan_list_ptr), /* wait list for all drivers and consoles */
+		2 number		 fixed bin,
+		2 channel		 (12) fixed bin (71);
+
+
+/*	EXT STATIC	*/
+
+	dcl     iodd_stat_p		 ptr ext static;
+
+
+%include iod_tables_hdr;
+%include iodd_static;
+
+	stat_p = iodd_stat_p;			/* get pointer to iodd_static */
+
+	quit_signaled = "0"b;
+
+	a_code = 0;
+	a_chars_read = 0;
+
+	chan_list_ptr = iodd_static.chan_list_ptr;	/* get pointer to list of event channels */
+	input_list.number = 2;			/* two input devices, master and slave */
+	input_list.channel (1) = ev_chan_list.channel (1);/* copy from the full list */
+	input_list.channel (2) = ev_chan_list.channel (2);
+	read_info.read_ev_chan = ev_chan_list.channel (1);/* in case the order fails first time */
+	read_info.input_ready = "0"b;
+
+	if ^iodd_static.slave.accept_input then do;
+		ctl.prompt_master = "1"b;		/* no slave, so force the master flag */
+	     end;
+	ctl.prompt_slave = (ctl.prompt_slave | ^ctl.prompt_master); /* ask slave if not master */
+
+	prompt_msg = "";				/* start clean */
+	call ioa_$rs ("Enter command^[(^a)^]:", prompt_msg, msg_len, ^(a_msg = ""), a_msg); /* format the prompt message */
+
+	on quit begin;				/* check for a quit */
+		quit_signaled = "1"b;		/* tell main proc about it */
+		call continue_to_signal_ ((0));	/* and pass it on */
+	     end;
+
+	go to read;
+
+wait:	if ctl.prompt_slave & iodd_static.slave.accept_input then do;
+		call iox_$put_chars (iodd_static.slave_out, addr (prompt_msg), msg_len, code);
+		if code ^= 0 then ctl.prompt_master = "1"b; /* be sure we prompt someone */
+		call iox_$control (iodd_static.slave_out, "runout", null, code);
+		ctl.prompt_slave = "0"b;		/* don't repeat til needed */
+	     end;
+
+	if ctl.prompt_master then do;			/* do we ask for a command? */
+		call iox_$put_chars (iodd_static.master_out, addr (prompt_msg), msg_len, code);
+		ctl.prompt_master = "0"b;		/* don't ask again til necessary */
+	     end;
+
+	quit_signaled = "0"b;			/* watch for a quit while blocked */
+
+	call ipc_$block (addr (input_list), addr (event_info), code); /* wait for a response */
+	if code ^= 0 then do;
+		call convert_ipc_code_ (code);	/* make it an error_table_code */
+		call iodd_msg_ (2, master, code, "iodd_get_cmd_", "Fatal error: blocking for terminal input");
+		if iodd_static.test_entry then signal daemon_unclaimed; /* give programmer a look */
+		else signal re_init;
+	     end;
+	if quit_signaled then ctl.prompt_master, ctl.prompt_slave = "1"b; /* get a quit while blocked? */
+
+read:	call iox_$control (iodd_static.master_in, "read_status", addr (read_info), code);
+
+	input_list.channel (1), ev_chan_list.channel (1) = read_info.read_ev_chan; /* master will always prevail */
+
+	if input_ready then do;
+
+		call ipc_$drain_chn (input_list.channel (1), code); /* we only want new wakeups later */
+		call ipc_$drain_chn (input_list.channel (2), code); /* for the slave too! */
+
+		ctl.prompt_master = "1"b;		/* be sure we ask for more input */
+
+		call iox_$get_line (iodd_static.master_in, a_wp, a_max_chars, a_chars_read, code);
+
+		if a_chars_read = 0 then go to read;	/* not likely...., but... */
+
+		a_code = code;
+		a_source = master;
+		return;
+
+	     end;
+
+/*	Now see if the slave has anything, if we can accept a cmd line  */
+
+	if iodd_static.slave.accept_input then do;
+
+		call iox_$control (iodd_static.slave_in, "read_status", addr (read_info), code);
+		if code ^= 0 then go to bad_slave;
+						/* redefine the slave event channel, may change */
+		input_list.channel (2), ev_chan_list.channel (2) = read_ev_chan;
+
+		if input_ready then do;
+
+			call ipc_$drain_chn (input_list.channel (2), code); /* clear old wakeups */
+
+			ctl.prompt_slave = "1"b;	/* be sure we ask for more later */
+
+			call iox_$get_line (iodd_static.slave_in, a_wp, a_max_chars, a_chars_read, code);
+
+			if code ^= 0 then do;	/* we can drop the slave on errors */
+bad_slave:			iodd_static.slave.accept_input = "0"b;
+				iodd_static.slave.print_errors = "0"b;
+				iodd_static.slave.allow_quits = "0"b;
+				iodd_static.slave.log_msg = "0"b;
+				iodd_static.slave.echo_cmd = "0"b;
+				call iox_$control (iodd_static.slave_out, "quit_disable", null, (0)); /* lets try */
+				call ios_$attach ("error_output", "syn", "error_i/o", "", ("0"b)); /* just to be sure */
+				call iodd_msg_ (2, master, code, "iodd_get_cmd_", "Slave input terminated.");
+				call iox_$control (iodd_static.master_in, "resetread", null, code);
+				ctl.prompt_master = "1"b; /* we must ask for guidance */
+				ctl.wait_for_input = "1"b;
+				ctl.prompt_slave = "1"b; /* in case we come back later */
+				go to read;
+			     end;
+
+			if a_chars_read = 0 then go to read; /* possible due to g115 dim bug */
+
+			a_code = code;
+			a_source = slave;
+
+			if iodd_static.slave.echo_cmd then do;
+				call iox_$put_chars (iodd_static.slave_out, a_wp, (a_chars_read), code); /* echo cmd line */
+				if code ^= 0 then go to bad_slave;
+			     end;
+
+			return;
+
+		     end;
+	     end;
+
+	if ctl.wait_for_input then go to wait;		/* wakeup, but no input...go and wait */
+
+	a_source = 0;				/* There was no input */
+	a_chars_read = 0;
+	a_code = 0;
+
+	return;
+
+
+
+     end iodd_get_cmd_;

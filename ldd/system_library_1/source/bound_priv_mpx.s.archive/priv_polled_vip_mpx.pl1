@@ -1,0 +1,459 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/* format: style4,delnl,insnl,^ifthendo */
+priv_polled_vip_mpx:
+     proc;
+
+/* This procedure contains the privileged entry points to the polled
+   vip multiplexer.  These entries are never referenced at interrupt
+   time and therefore need not be wired.
+
+   Coded December 1978 by J. Stern
+   Modified November 1984 by Robert Coren to use tty_area_manager entries
+*/
+
+
+/* Parameters */
+
+dcl  pm_code fixed bin (35);				/* error code */
+dcl  pm_devx fixed bin;				/* device (LCT) index */
+dcl  pm_infop ptr;					/* ptr to control order info structure */
+dcl  pm_miip ptr;					/* ptr to mux_init_info structure */
+dcl  pm_order char (*);				/* control order name */
+dcl  pm_pvmdp ptr;					/* ptr to pvmd (polled vip multiplexer data base) */
+
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  devx fixed bin;
+dcl  meter_ptr ptr;
+dcl  infop ptr;
+
+dcl  1 lc_info aligned,				/* info structure for line control order */
+       2 type fixed bin (17) unal,
+       2 arg1 fixed bin (17) unal,
+       2 station_mask (0:35) bit (1) unal;
+
+dcl  major_name_len fixed bin;
+dcl  order char (32);
+dcl  subchan fixed bin;
+
+
+/* Internal static */
+
+dcl  init_sw bit (1) int static init ("0"b);
+
+
+/* External static */
+
+dcl  error_table_$action_not_performed fixed bin (35) ext;
+dcl  error_table_$bad_channel fixed bin (35) ext;
+dcl  error_table_$bad_mode fixed bin (35) ext;
+dcl  error_table_$bad_mpx_load_data fixed bin (35) ext;
+dcl  error_table_$bigarg fixed bin (35) ext;
+dcl  error_table_$invalid_state fixed bin (35) ext;
+dcl  error_table_$noalloc fixed bin (35) ext;
+dcl  error_table_$undefined_order_request fixed bin (35) ext;
+dcl  error_table_$unimplemented_version fixed bin (35) ext;
+dcl  pds$process_id bit (36) aligned ext;
+
+/* Constants */
+
+dcl  (
+     CONTROLLER_POLL fixed bin init (2),
+     ECHO_MASK fixed bin init (5),
+     PAUSE_TIME fixed bin init (4),
+     STATION_POLL fixed bin init (1)
+     ) int static options (constant);
+
+
+/* Conditions */
+
+dcl  (area, cleanup) condition;
+
+
+/* Builtins */
+
+dcl  (addr, bin, length, max, min, null, rtrim, size, string, substr, verify) builtin;
+
+
+/* Entries */
+
+dcl  tty_area_manager$allocate entry (fixed bin, ptr);
+dcl  tty_area_manager$free entry (fixed bin, ptr);
+dcl  polled_vip_mpx$crash entry (ptr);
+dcl  polled_vip_mpx$dialup entry (ptr, fixed bin);
+dcl  polled_vip_mpx$system_init entry;
+
+%include polled_vip_mpx_data;
+
+%include polled_vip_load_info;
+
+%include mux_init_info;
+
+%include lct;
+
+%include tty_buf;
+
+%include channel_manager_dcls;
+
+%include polled_vip_mpx_meters;
+
+%include pvip_subchan_meters;
+
+%include tty_space_man_dcls;
+
+%include get_comm_meters_info;
+
+/* Entry to allocate and initialize the  multiplexer data base for a given major channel */
+
+init_multiplexer:
+     entry (pm_devx, pm_miip, pm_pvmdp, pm_code);
+
+	devx = pm_devx;
+	miip = pm_miip;
+	pm_pvmdp = null;
+
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	lcntp = lct.lcnt_ptr;
+
+	pvmd_nchan = mux_init_info.no_channels;		/* size (pvmd) depends on this */
+	if pvmd_nchan > 32
+	then do;
+	     pm_code = error_table_$bigarg;
+	     return;
+	end;
+	pvmdp = null;
+	on cleanup
+	     begin;
+		if pvmdp ^= null
+		then call tty_space_man$free_space (size (pvmd), pvmdp);
+	     end;
+
+	call tty_space_man$get_space (size (pvmd), pvmdp);/* allocate space for multiplexer data base */
+	if pvmdp = null
+	then do;
+noalloc:
+	     pm_code = error_table_$noalloc;
+	     return;
+	end;
+
+	pvmd.nchan = pvmd_nchan;			/* init major channel data */
+	pvmd.devx = devx;
+	pvmd.name = lcnt.names (devx);
+	major_name_len = length (rtrim (pvmd.name));
+	string (pvmd.flags) = ""b;
+
+	pvmd.nstation = 0;				/* init subchannel data */
+	string (pvmd.station_mask) = ""b;
+	pvmd.station_to_subchan (*).display = 0;
+	pvmd.station_to_subchan (*).printer = 0;
+
+	on area
+	     begin;
+		call tty_space_man$free_space (size (pvmd), pvmdp);
+		go to noalloc;
+	     end;
+
+	call tty_area_manager$allocate (size (pvip_mpx_meters), pvmd.saved_meters_ptr);
+
+	do subchan = 1 to pvmd.nchan;			/* init subchannel entries */
+	     pvstep = addr (pvmd.subchan_table (subchan));
+	     pvste.devx = mux_init_info.devx (subchan);
+	     pvste.name = substr (mux_init_info.name (subchan), major_name_len + 2);
+						/* get last component of channel name */
+	     if verify (substr (pvste.name, 1, 1), "dpx") ^= 0
+	     then go to bad_chan;
+	     if verify (substr (pvste.name, 2, 2), "0123456789") ^= 0
+	     then go to bad_chan;
+	     pvste.station_addr = bin (substr (pvste.name, 2, 2), 8);
+	     if pvste.station_addr < 0 | pvste.station_addr > 31
+	     then go to bad_chan;
+
+	     if ^pvmd.station_mask (pvste.station_addr)
+	     then do;
+		pvmd.station_mask (pvste.station_addr) = "1"b;
+		pvmd.nstation = pvmd.nstation + 1;
+	     end;
+
+	     string (pvste.flags) = ""b;
+	     if substr (pvste.name, 1, 1) = "p"
+	     then do;
+		if pvmd.station_to_subchan (pvste.station_addr).printer ^= 0
+		then go to bad_chan;
+		pvmd.station_to_subchan (pvste.station_addr).printer = subchan;
+	     end;
+	     else do;
+		if pvmd.station_to_subchan (pvste.station_addr).display ^= 0
+		then go to bad_chan;
+		pvmd.station_to_subchan (pvste.station_addr).display = subchan;
+	     end;
+
+	     call tty_area_manager$allocate (size (pvip_subchan_meters), pvste.saved_meters_ptr);
+
+	     lctep = addr (lct.lcte_array (pvste.devx));
+	     lcte.subchannel = subchan;
+	end;
+
+	if ^init_sw
+	then do;
+	     call polled_vip_mpx$system_init;
+	     init_sw = "1"b;
+	end;
+
+	pm_pvmdp = pvmdp;
+	pm_code = 0;
+	return;
+
+
+bad_chan:						/* come here for invlaid channel name */
+	call tty_space_man$free_space (size (pvmd), pvmdp);
+	pm_code = error_table_$bad_channel;
+	return;
+
+
+
+/* Entry to discard the multiplexer data base for a given major channel */
+
+terminate_multiplexer:
+     entry (pm_pvmdp, pm_code);
+
+	pvmdp = pm_pvmdp;
+	pvmd_nchan = pvmd.nchan;			/* size (pvmd) depends on this */
+	do subchan = 1 to pvmd_nchan;			/* free all the saved meters */
+	     pvstep = addr (pvmd.subchan_table (subchan));
+	     call tty_area_manager$free (size (pvip_subchan_meters), pvste.saved_meters_ptr);
+	end;
+
+	call tty_area_manager$free (size (pvip_mpx_meters), pvmd.saved_meters_ptr);
+	call tty_space_man$free_space (size (pvmd), pvmdp);
+
+	pm_pvmdp = null;
+	pm_code = 0;
+	return;
+
+
+
+/* Entry to allow dialups on multiplexer subchannels */
+
+start:
+     entry (pm_pvmdp, pm_code);
+
+	pvmdp = pm_pvmdp;
+	if ^pvmd.mpx_loaded
+	then do;
+	     pm_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	call channel_manager$control (pvmd.devx, "set_input_message_size", addr (pvmd.max_message_len), code);
+
+	if pvmd.crlf_echo
+	then call send_echo_mask;
+
+	lc_info.type = PAUSE_TIME;			/* set poll cycle pause time */
+	lc_info.arg1 = pvmd.pause_time;
+	call channel_manager$control (pvmd.devx, "line_control", addr (lc_info), code);
+
+	if pvmd.controller_poll
+	then lc_info.type = CONTROLLER_POLL;
+	else do;
+	     lc_info.type = STATION_POLL;
+	     lc_info.arg1 = pvmd.nstation;
+	     lc_info.station_mask = pvmd.station_mask;
+	end;
+	call channel_manager$control (pvmd.devx, "line_control", addr (lc_info), code);
+	if code = 0
+	then pvmd.polling_started = "1"b;
+
+	pvmd.mpx_started = "1"b;
+	do subchan = 1 to pvmd.nchan;			/* look for subchans that can dial up now */
+	     pvstep = addr (pvmd.subchan_table (subchan));
+	     if pvste.listen & ^pvste.dialed & pvste.slave
+	     then call polled_vip_mpx$dialup (pvmdp, subchan);
+						/* make dialup happen */
+	end;
+
+	pm_code = 0;
+	return;
+
+
+
+/* Entry to forbid dialups on multiplexer subchannels */
+
+stop:
+     entry (pm_pvmdp, pm_code);
+
+	pvmdp = pm_pvmdp;
+	pvmd.mpx_started = "0"b;
+	pm_code = 0;
+	return;
+
+
+
+/* Entry to shut down the multiplexer (equivalent to a crash) */
+
+shutdown:
+     entry (pm_pvmdp, pm_code);
+
+	pvmdp = pm_pvmdp;
+	if pvmd.mpx_loading | pvmd.mpx_loaded
+	then call channel_manager$control (pvmd.devx, "hangup", null, code);
+	call polled_vip_mpx$crash (pvmdp);		/* simulate a crash */
+	pm_code = 0;
+	return;
+
+
+
+/* Entry to perform privileged control orders */
+
+priv_control:
+     entry (pm_pvmdp, pm_order, pm_infop, pm_code);
+
+	pvmdp = pm_pvmdp;
+	order = pm_order;
+	infop = pm_infop;
+
+	if order = "copy_meters"
+	then do;
+	     pvmd.saved_meters_ptr -> pvip_mpx_meters = pvmd.error_counters;
+	     call channel_manager$control (pvmd.devx, order, infop, pm_code);
+	end;
+
+	else if order = "get_meters"
+	then do;
+	     if infop -> get_comm_meters_info.version ^= GET_COMM_METERS_INFO_VERSION_1
+	     then pm_code = error_table_$unimplemented_version;
+	     else do;
+		meter_ptr = infop -> get_comm_meters_info.subchan_ptr;
+		if meter_ptr ^= null ()
+		then if meter_ptr -> pvip_mpx_meter_struc.version ^= PVIP_MPX_METERS_VERSION_1
+		     then pm_code = error_table_$unimplemented_version;
+		     else do;
+			meter_ptr -> pvip_mpx_meter_struc.current_meters = pvmd.error_counters;
+			meter_ptr -> pvip_mpx_meter_struc.saved_meters = pvmd.saved_meters_ptr -> pvip_mpx_meters;
+			call channel_manager$control (pvmd.devx, order, infop, pm_code);
+		     end;
+	     end;
+	end;
+
+	else pm_code = error_table_$undefined_order_request;
+	return;
+
+
+
+/* Entry to perform highly privileged control orders */
+
+hpriv_control:
+     entry (pm_pvmdp, pm_order, pm_infop, pm_code);
+
+	pvmdp = pm_pvmdp;
+	order = pm_order;
+	code = 0;
+
+	if order = "load_mpx"			/* bootload the multiplexed device */
+	then do;					/* listen to major channel and wait for dialup */
+	     if pvmd.mpx_loading | pvmd.mpx_loaded	/* one at a time, please */
+	     then do;
+		pm_code = error_table_$action_not_performed;
+		return;
+	     end;
+
+	     pv_load_infop = pm_infop;		/* save load info */
+	     if pv_load_info.nchan ^= pvmd.nchan
+	     then do;
+bad_load_data:
+		pm_code = error_table_$bad_mpx_load_data;
+		return;
+	     end;
+
+	     pvmd.controller_poll = pv_load_info.controller_poll;
+	     pvmd.crlf_echo = pv_load_info.crlf_echo;
+	     pvmd.omit_nl = pv_load_info.omit_nl;
+	     pvmd.omit_ff = pv_load_info.omit_ff;
+	     pvmd.gcos_break = pv_load_info.gcos_break;
+	     pvmd.etb_mode = pv_load_info.etb_mode;
+
+	     pvmd.load_proc_id = pds$process_id;
+	     pvmd.load_ev_chan = pv_load_info.ev_chan;
+	     pvmd.pause_time = pv_load_info.pause_time;
+	     pvmd.max_text_len = min (1920, max (64, pv_load_info.max_text_len));
+	     pvmd.max_message_len = min (1024, max (73, pv_load_info.max_message_len));
+	     pvmd.quit = pv_load_info.quit;
+	     pvmd.formfeed = pv_load_info.formfeed;
+
+	     pvmd.mpx_started, pvmd.polling_started, pvmd.send_output, pvmd.partial_frame = "0"b;
+	     pvmd.writep = null;
+	     pvmd.write_chan = 0;
+	     pvmd.input_timeouts, pvmd.input_frames_lost, pvmd.output_frames_lost, pvmd.bad_output_frames,
+		pvmd.output_timeouts = 0;
+
+	     do subchan = 1 to pvmd.nchan;		/* init some subchannel data */
+		pvstep = addr (pvmd.subchan_table (subchan));
+		pvste.write_chain = 0;
+		pvste.naks = 0;
+		pvste.pgofs, pvste.writes = 0;
+		string (pvste.flags) = ""b;
+		pvste.printer = (substr (pvste.name, 1, 1) = "p");
+		pvste.slave = pv_load_info.slave (subchan);
+		if pvste.devx ^= pv_load_info.devx (subchan)
+		then go to bad_load_data;
+		pvste.baud_rate = pv_load_info.baud_rate (subchan);
+	     end;
+
+	     call channel_manager$control (pvmd.devx, "listen", null, code);
+	     if code ^= 0
+	     then do;
+		pm_code = code;
+		return;
+	     end;
+
+	     pvmd.mpx_loading = "1"b;
+	     pvmd.cur_station_mask = pvmd.station_mask;
+	     pvmd.cur_nstation = pvmd.nstation;
+	end;
+
+	else code = error_table_$undefined_order_request;
+
+	pm_code = code;
+	return;
+
+/* Subroutine to send the echo mask to the FNP */
+
+send_echo_mask:
+     proc;
+
+dcl  p ptr;
+dcl  i fixed bin;
+dcl  count fixed bin;
+
+	string (lc_info.station_mask) = ""b;
+	count = 0;
+	do i = 1 to pvmd.nchan;			/* find the subchans that require echoing */
+	     p = addr (pvmd.subchan_table (i));
+	     if substr (p -> pvste.name, 1, 1) = "d"	/* only display stations get echos */
+	     then do;
+		lc_info.station_mask (p -> pvste.station_addr) = "1"b;
+		count = count + 1;
+	     end;
+	end;
+
+	lc_info.type = ECHO_MASK;
+	lc_info.arg1 = count;
+	call channel_manager$control (pvmd.devx, "line_control", addr (lc_info), code);
+     end;
+
+     end;						/* priv_polled_vip_mpx */

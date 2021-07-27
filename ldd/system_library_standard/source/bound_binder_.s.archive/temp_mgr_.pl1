@@ -1,0 +1,465 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-24,Elhard), approve(85-09-24,MCR7198),
+     audit(86-06-30,Weaver), install(86-07-16,MR12.0-1094):
+     Improved documentation and readability, changed errname to use the
+     caller-supplied name instead of "binder_", changed make_object and
+     close_files entrypoints to use a process dir temporary until binding is
+     complete and then copy into the working dir.
+                                                   END HISTORY COMMENTS */
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1978 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+
+
+/* procedure to do temporary database management for the binder.
+
+Designed and originally coded by Michael J. Spier, August 19, 1970  */
+/* Modified 9/78 by David Spector to use get_temp_segment_ and release_temp_segment_ */
+/*		Note: -debug no longer stores temp segs in wdir!	*/
+/* Modified 9/20/84 by M Sharpe to 1) use nd_handler_;
+	2) check for null pointers before using them;
+*/
+
+/* format: style3,^indnoniterdo */
+
+temp_mgr_:
+     procedure;
+
+
+/* DECLARATION OF EXTERNAL ENTRIES */
+
+declare	com_err_		external entry options (variable);
+declare	error_table_$segnamedup
+			external fixed bin (35);
+declare	error_table_$namedup
+			external fixed bin (35);
+declare	error_table_$rqover external fixed bin (35);
+declare	get_pdir_		external entry () returns (char (168));
+declare	get_wdir_		external entry () returns (char (168));
+declare	get_temp_segment_	external entry (char (*), ptr, fixed bin (35));
+declare	hcs_$chname_seg	ext entry (ptr, char (*) aligned, char (*) aligned, fixed bin (35));
+declare	initiate_file_$create
+			ext
+			entry (char (*), char (*), bit (*), ptr, bit (1) aligned, fixed bin (24), fixed bin (35));
+declare	nd_handler_	ext entry (char (*), char (*), char (*), fixed bin (35));
+declare	release_temp_segment_
+			external entry (char (*), ptr, fixed bin (35));
+declare	sys_info$max_seg_size
+			external fixed bin (19);
+declare	terminate_file_	ext entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+declare	tssi_$clean_up_segment
+			entry (ptr);
+declare	tssi_$get_segment	external entry (char (*) aligned, char (*) aligned, pointer, ptr, fixed bin (35));
+declare	tssi_$finish_segment
+			external entry (pointer, fixed bin (24), bit (36) aligned, ptr, fixed bin (35));
+
+/* DECLARATION OF INTERNAL STATIC VARIABLES */
+
+declare	pdir		char (168) internal static initial ("");
+declare	wdir		char (168) aligned internal static initial (" ");
+declare	limit		fixed bin (18) internal static;
+declare	mask		bit (36) aligned internal static initial ("000000000000000000111111111111111000"b);
+declare	errname		char (16) aligned internal static;
+
+/* DECLARATION OF AUTOMATIC STORAGE VARIABLES */
+
+declare	bound_segl	fixed bin (21);
+declare	bound_segp	ptr;
+declare	created		bit (1) aligned;
+declare	offset		fixed bin (18);
+declare	i		fixed bin;
+declare	code		fixed bin (35);
+declare	(p, sp, ip)	pointer;
+declare	segname		char (32) aligned;
+
+
+/* DECLARATION OF BUILTIN FUNCTIONS */
+
+declare	(addr, divide, null, ptr, rel, rtrim, substr)
+			builtin;
+
+/* DECLARATION OF CONDITIONS */
+
+declare	cleanup		condition;
+declare	record_quota_overflow
+			condition;
+
+/* DECLARATION OF BASED STRUCTURES */
+
+declare	1 temp_seg	based aligned,		/* format of temp segments */
+	  2 next_temp_ptr	ptr,			/* ptr to next chained temp seg */
+	  2 storage	bit (0);			/* start of temp_mgr_ storage */
+
+declare	bound_seg		char (bound_segl) based;
+
+declare	1 offset_overlay	aligned based (addr (offset)),
+	  2 dum		bit (18) unaligned,
+	  2 relp		bit (18) unaligned;
+declare	offset_bits	bit (36) aligned based (addr (offset));
+
+%include access_mode_values;
+%page;
+%include terminate_file;
+
+%page;
+reserve:
+     entry (last_used);
+
+/**********************************************************************/
+/*							*/
+/*	Name:	temp_mgr_$reserve				*/
+/*	Input:	last_used					*/
+/*	Function:	reserves a block of storage from the current	*/
+/*		address pointed to by bx_$freep to the address	*/
+/*		pointed to by last_used and realigns bx_$freep	*/
+/*		to a 0 mod 8 boundary.  If the new value for	*/
+/*		bx_$freep is past a preset limit, a new temp_seg	*/
+/*		is procured and chained in and bx_$freep set to	*/
+/*		point to the start of it's storage area.	*/
+/*		NB.  Since no guarantees can be made about the	*/
+/*		     amount of space remaining in the temp_seg	*/
+/*		     temp_mgr_$allocate should be called prior	*/
+/*		     to calling temp_mgr_$reserve to insure that	*/
+/*		     sufficient space is available.		*/
+/*	Output:	none					*/
+/*							*/
+/**********************************************************************/
+
+declare	last_used		pointer;
+
+	offset = 0;				/* preset to zero */
+	offset_overlay.relp = rel (last_used);		/* get offset of last-used location */
+	offset = offset + 7;			/* make new offset 0 mod 8 */
+	offset_bits = offset_bits & mask;		/* ... */
+	if offset <= limit
+	then /* segment not yet overflowing */
+	     do;					/* generate new free pointer */
+	     bx_$freep = ptr (last_used, offset_overlay.relp);
+	     return;
+	end;
+
+/* arrived here we have an overflowing temporary segment, and must create a new one */
+
+create_temp:					/* Initialize a new temp segment.  bx_$temp contains a pointer (initially null) to the
+   latest temp seg.  Each temp seg contains a pointer to the previous one in the list.
+   Exact format is described by declaration for "temp_seg". */
+	call get_temp_segment_ ("bind", p, code);
+	if code ^= 0
+	then do;
+	     call com_err_ (code, errname, "unable to create temporary segment.");
+	     bx_$fatal_error = 1;
+	     return;
+	end;
+
+/* Push new temp segment onto chained list of temp segs, for later releasing. */
+
+	p -> temp_seg.next_temp_ptr = bx_$temp;
+	bx_$temp = p;
+
+/* Initialize for storing into space following the fwd ptr. */
+
+	bx_$freep = addr (bx_$temp -> temp_seg.storage);
+
+	return;
+
+
+allocate:
+     entry (area_size);
+
+declare	area_size		fixed bin;
+
+/**********************************************************************/
+/*							*/
+/*	Name:	temp_mgr_$allocate				*/
+/*	Input:	area_size					*/
+/*	Function:	checks to make sure that <area_size> words can be	*/
+/*		allocated within the current temp_seg, and gets a	*/
+/*		new one if not.				*/
+/*	Output:	none					*/
+/*							*/
+/**********************************************************************/
+
+	offset = 0;
+	offset_overlay.relp = rel (bx_$freep);		/* get current offset */
+	if offset + area_size <= limit
+	then return;				/* there is enough room for area */
+
+	goto create_temp;				/* go make another temporary */
+%page;
+
+close_files:
+     entry;
+
+/**********************************************************************/
+/*							*/
+/*	Name:	temp_mgr_$close_files			*/
+/*	Input:	none					*/
+/*	Function:	copies the process directory copy of the bound	*/
+/*		object segment into the working dir and adds the	*/
+/*		appropriate names to the new object segment.	*/
+/*		If an Addname statement occurred in the bindfile	*/
+/*		add the given names if any were given or add the	*/
+/*		names off all retained entrypoints if no names	*/
+/*		were specified.  The object segment bit count and	*/
+/*		acl are set and the temp_segs are released.	*/
+/*	Output:	none					*/
+/*							*/
+/**********************************************************************/
+
+
+	bx_$bseg_acinfop = null;
+	bound_segp = null;
+
+	if bx_$fatal_error ^= 0
+	then do;
+
+	     call close_file_cleanup ();
+
+	     return;				/* forget the rest */
+						/* save the bad version */
+	end;
+
+/* move the new bound object from the pdir temporary into the final	*/
+/* working dir copy.					*/
+
+	on cleanup
+	     begin;
+		call close_file_cleanup ();
+	     end;
+
+/* create the working dir copy of the bound object segment	*/
+
+	call tssi_$get_segment (wdir, bx_$bound_segname, bound_segp, bx_$bseg_acinfop, code);
+	if code ^= 0
+	then do;
+	     call com_err_ (code, errname, "^/Unable to create ^a, a copy exists in [pd]>^a", bx_$bound_segname,
+		bx_$bound_segname);
+	     bx_$fatal_error = 1;
+	     call close_file_cleanup ();
+	     return;
+	end;
+
+/* if a record quota overflow occurs while we are copying, print	*/
+/* a message indicating that an intact copy of the bound segment is	*/
+/* available in the process directory, and then abort.		*/
+
+	on record_quota_overflow
+	     begin;
+		call com_err_ (error_table_$rqover, errname, "^/Unable to complete ^a, a copy exists in [pd]>^a",
+		     bx_$bound_segname, bx_$bound_segname);
+		call close_file_cleanup;		/* clean up what would have been the final version */
+		goto close_file_return;
+	     end;
+
+/* calculate the length of the bound segment expressed in terms of	*/
+/* characters for the string overlay copy operation.		*/
+
+	bound_segl = divide (bx_$bseg_bitcount, 9, 21, 0);
+
+/* copy the new bound segment into the working dir copy		*/
+
+	bound_segp -> bound_seg = bx_$temp_bsegp -> bound_seg;
+
+	revert record_quota_overflow;
+	bx_$bsegp = bound_segp;			/* now operate on the real thing */
+
+/* now delete the copy of the bound object in the process dir	*/
+
+	call terminate_file_ (bx_$temp_bsegp, 0, TERM_FILE_DELETE, code);
+	bx_$temp_bsegp = null;			/* done with this */
+
+
+/* add the appropriate synonyms to the bound segment */
+
+	if bx_$addname = 1
+	then do;
+	     adnp = bx_$adnp;
+
+/* add all names explicitly asked for by Addname statement by	*/
+/* direct extraction from the addname table.			*/
+
+	     if an.n_an > 0
+	     then do i = 1 to an.n_an;
+		     segname = an.syn (i);
+		     call Addname;
+		end;
+
+/* add names specified by implicit addname (ie. "Addname;") by	*/
+/* scanning the segname table, and for each component, scanning the	*/
+/* definition list for retained definitions and adding the name of	*/
+/* the definition to the bound segment.			*/
+
+	     else do i = 1 to bx_$sntp -> snt.n_names;
+		     sp = addr (bx_$sntp -> snt.entry (i));
+		     ip = sp -> seg.comp -> comp.insymentp;
+		     if ip -> insym.retained = "1"b
+		     then do;
+			segname = substr (sp -> seg.name, 2, sp -> seg.lng - 1);
+			call Addname;
+		     end;
+		end;
+	end;					/* finished processing Addname */
+
+
+	do p = bx_$temp repeat bx_$temp while (p ^= null);
+	     bx_$temp = p -> temp_seg.next_temp_ptr;
+	     call release_temp_segment_ ("bind", p, code);
+	end;
+
+	if bx_$bseg_acinfop ^= null
+	then call tssi_$finish_segment (bx_$bsegp, bx_$bseg_bitcount, "1100"b, bx_$bseg_acinfop, code);
+
+close_file_return:
+	return;
+
+
+
+close_file_cleanup:
+     proc ();
+
+	if bx_$bseg_acinfop ^= null
+	then call tssi_$clean_up_segment (bx_$bseg_acinfop);
+
+/* Return all temp segments to free pool. */
+
+	do p = bx_$temp repeat bx_$temp while (p ^= null);
+	     bx_$temp = p -> temp_seg.next_temp_ptr;
+	     call release_temp_segment_ ("bind", p, code);
+	end;
+
+	return;
+     end close_file_cleanup;
+%page;
+
+init:
+     entry;
+
+/**********************************************************************/
+/*							*/
+/*	Name:	temp_mgr_$init				*/
+/*	Input:	none					*/
+/*	Function:	sets up the name for error messages and the limit	*/
+/*		on how full temp_segs will be allowed to grow.	*/
+/*		It then creates the first temp_seg.		*/
+/*	Output:	none					*/
+/*							*/
+/**********************************************************************/
+
+	if bx_$debug = 1
+	then errname = "temp_mgr_";
+	else errname = bx_$caller;
+	wdir = get_wdir_ ();			/* get name of working directory */
+	pdir = get_pdir_ ();			/* get name of process directory */
+	if sys_info$max_seg_size <= 65536
+	then limit = sys_info$max_seg_size - 8192;
+	else limit = sys_info$max_seg_size - 16384;	/* Slack in temporary will be 8K when 64K segments are maximum */
+						/* and will be 16K when 256K segments are maximum. */
+	bx_$temp = null;				/* Clear list of temp segments. */
+	goto create_temp;
+
+make_object:
+     entry;
+
+/**********************************************************************/
+/*							*/
+/*	Name:	temp_mgr_$make_object			*/
+/*	Input:	none					*/
+/*	Function:	creates a working copy of the new object in the	*/
+/*		process directory with the name specified by	*/
+/*		bx_$bound_segname and saves the segment pointer	*/
+/*	Output:	none					*/
+/*							*/
+/**********************************************************************/
+
+	bx_$bseg_acinfop = null;
+
+	call initiate_file_$create (pdir, (bx_$bound_segname), RW_ACCESS, bx_$temp_bsegp, created, (0), code);
+	if code ^= 0
+	then do;
+	     call com_err_ (code, errname, "unable to create temporary copy of ^a", bx_$bound_segname);
+	     bx_$fatal_error = 1;
+	     return;
+	end;
+
+	if ^created
+	then do;
+	     call terminate_file_ (bx_$temp_bsegp, 0, TERM_FILE_TRUNC, code);
+	     if code ^= 0
+	     then do;
+		call com_err_ (code, errname, "unable to truncate temporary copy of ^a", bx_$bound_segname);
+		bx_$fatal_error = 1;
+		return;
+	     end;
+	end;
+
+	bx_$bsegp = bx_$temp_bsegp;			/* bind into the temp */
+
+	return;
+
+
+
+
+Addname:
+     procedure;
+
+/**********************************************************************/
+/*							*/
+/*	Name:	Addname					*/
+/*	Input:	none					*/
+/*	Function:	adds the name specified by the global variable	*/
+/*		segname to the output object segment.  If the	*/
+/*		name is on another segment, the nd_handler_ is	*/
+/*		called to take care of things.		*/
+/*	Output:	none					*/
+/*							*/
+/**********************************************************************/
+
+TRY_ADDNAME:
+	call hcs_$chname_seg (bx_$bsegp, "", segname, code);
+						/* add name to the bound segment */
+	if code ^= 0
+	then do;					/* this is a name duplication */
+	     if code = error_table_$segnamedup
+	     then ;				/*   do nothing if seg already has the addname   */
+	     else if code = error_table_$namedup	/*   normal handling for name duplication   */
+	     then do;
+		call nd_handler_ ((bx_$caller), rtrim (wdir), (segname), code);
+		if code = 0
+		then go to TRY_ADDNAME;
+	     end;
+	end;
+
+
+     end Addname;
+
+
+%page;
+%include bindext;
+%page;
+%include bndtbl;
+%page;
+%include comptbl;
+%page;
+%include insym;
+
+
+
+     end temp_mgr_;

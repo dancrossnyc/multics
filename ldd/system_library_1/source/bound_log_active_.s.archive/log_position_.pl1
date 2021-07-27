@@ -1,0 +1,401 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+log_position_:
+     procedure ();
+
+/* *	LOG_POSITION_
+   *
+   *	Primitives for motion within a log segment.  This includes moving
+   *	forward and backward by a single message, and also positioning, by
+   *	time or sequence number, within a single log segment.
+   *
+   *	84-08-17, WOS: Initial coding.
+   *	85-03-25, EJ Sharpe: msgs with zero length text are now valid
+*/
+
+declare  P_log_segment_ptr pointer parameter;		/* Input: Log segment being positioned within */
+declare  P_log_message_ptr pointer parameter;		/* Input/Output: Message in log */
+declare  P_log_damage bit (1) aligned parameter;		/* Output: Whether we had to search for message boundaries */
+declare  P_message_time fixed bin (71) parameter;		/* Input: Time to start searching for message */
+declare  P_message_sequence fixed bin (35) parameter;	/* Input: Sequence number to search for */
+declare  P_sequence_direction bit (1) aligned parameter;	/* Input: Sequence number to search for */
+
+declare  last_message_offset fixed bin (18);		/* Global variables, all initialized by the */
+declare  last_message_sequence fixed bin (35);		/* set_log_ptr internal procedure. */
+declare  time_now fixed bin (71);
+declare  log_damage bit (1) aligned;
+
+declare  log_segment_$last_message_info entry (pointer, fixed bin (35), fixed bin (18), fixed bin (35));
+
+declare  log_data_$complete_message_flag bit (36) aligned external static;
+
+declare  SEQUENCE_SLOP init (5) fixed bin (35) internal static options (constant);
+declare  TIME_SLOP init (15000) fixed bin (71) internal static options (constant);
+
+declare  OLDEST_TIME init (2015000000000000) fixed bin (71) internal static options (constant); /* 1965-01-01 */
+declare  ONE_MONTH init (2592000000000) fixed bin (71) internal static options (constant);
+
+declare  (addr, addrel, clock, currentsize, null, pointer, wordno) builtin;
+
+/**/
+
+/* NEXT_MESSAGE -- Move on to the next message in the log segment. If we're not
+   looking at a message already, find the first one. */
+
+log_position_$next_message:
+     entry (P_log_segment_ptr, P_log_message_ptr, P_log_damage);
+
+	call set_log_ptr ();			/* Sets log_segment_ptr and log_damaged */
+	log_message_ptr = P_log_message_ptr;
+
+	if (log_message_ptr = null ()) then
+	     log_message_ptr = addr (log_segment.data);
+	else log_message_ptr = addrel (log_message_ptr, currentsize (log_message));
+
+	call find_next_valid_message ();
+
+	call set_message_ptr ();			/* Sets log_message_ptr and P_log_damage as needed */
+	return;
+
+/**/
+
+/* PREV_MESSAGE -- Move on to the previous message in the log segment. If we're not
+   looking at a message already, position to the last one in the segment. */
+
+log_position_$prev_message:
+     entry (P_log_segment_ptr, P_log_message_ptr, P_log_damage);
+
+	call set_log_ptr ();			/* Sets log_segment_ptr and log_damaged */
+	log_message_ptr = P_log_message_ptr;
+
+	if (log_message_ptr = null ()) then
+	     log_message_ptr = pointer (log_segment_ptr, last_message_offset);
+	else log_message_ptr = addrel (log_message_ptr, -1);
+
+/* We can't detect damage while doing the search in this direction, unfortunately, since
+   we don't have sentinels at message ends. Instead, we just search backwards, hoping to
+   encounter a message start sentinel somewhere */
+
+	do while (^likely_message ());
+	     log_message_ptr = addrel (log_message_ptr, -1);
+	end;
+
+	call set_message_ptr ();			/* Sets log_message_ptr and P_log_damage as needed */
+	return;
+
+/**/
+
+/* All these searching entrypoints just do a linear search of the log segment,
+   which, while slow, is at least simple to understand. A binary search can be
+   added later. */
+
+
+
+log_position_$find_time:
+     entry (P_log_segment_ptr, P_message_time, P_sequence_direction, P_log_message_ptr, P_log_damage);
+
+	call set_log_ptr ();			/* Sets log_segment_ptr and log_damaged */
+
+	call time_search (P_message_time, P_sequence_direction);
+
+	call set_message_ptr ();			/* Sets log_message_ptr and P_log_damage as needed */
+	return;
+
+
+
+log_position_$find_sequence:
+     entry (P_log_segment_ptr, P_message_sequence, P_sequence_direction, P_log_message_ptr, P_log_damage);
+
+	call set_log_ptr ();			/* Sets log_segment_ptr and log_damaged */
+
+	call sequence_search (P_message_sequence, P_sequence_direction);
+
+	call set_message_ptr ();			/* Sets log_message_ptr and P_log_damage as needed */
+	return;
+
+/**/
+
+set_log_ptr:
+     procedure ();
+
+/* This routine sets some global variables used for damage detection, and must
+   be called by all entrypoints before any work is done. */
+
+	log_segment_ptr = P_log_segment_ptr;
+	log_damage = "0"b;
+	time_now = clock ();
+	call log_segment_$last_message_info (log_segment_ptr, last_message_sequence, last_message_offset, (0));
+
+	return;
+     end set_log_ptr;
+
+
+
+
+set_message_ptr:
+     procedure ();
+
+/* This routine is used to set the output message pointer, and the damage flag
+   if necessary, and must be called by all entrypoints before returning. */
+
+	P_log_message_ptr = log_message_ptr;
+	if log_damage then				/* Set the output flag only if new damage found */
+	     P_log_damage = "1"b;
+
+	return;
+     end set_message_ptr;
+
+/**/
+
+sequence_search:
+     procedure (P_sequence, P_after_sw);
+
+/* This procedure searches for a message given its sequence number. It and time_search
+   are essentially identical, differing only in the declarations and names of variables.
+   They both perform a linear search of the log segment, stopping when an exact match,
+   or the closest "nearby" inexact match, is found. */
+
+
+declare  P_sequence fixed bin (35) parameter;
+declare  P_after_sw bit (1) aligned parameter;
+
+declare  wanted_sequence fixed bin (35);
+declare  after_sw bit (1) aligned;
+declare  closest_message pointer;
+declare  sequence_difference fixed bin (35);
+declare  sequence_delta fixed bin (35);
+declare  search_tries fixed bin;
+declare  this_sequence fixed bin (35);
+
+
+	wanted_sequence = P_sequence;
+	after_sw = P_after_sw;
+
+	if ^after_sw then				/* Return oldest message even if way later */
+	     if ((wanted_sequence + SEQUENCE_SLOP) < log_segment.first_sequence) then do;
+		log_message_ptr = null ();		/* for this_or_greater case */
+		return;				/* Otherwise, return null (as here) */
+	     end;
+
+	if after_sw then				/* Return latest message even if way before */
+	     if ((wanted_sequence - SEQUENCE_SLOP) > log_segment.last_sequence) then do;
+		log_message_ptr = null ();		/* for this_or_before case */
+		return;				/* Otherwise, return null (as here) */
+	     end;
+
+	log_message_ptr = addr (log_segment.data);	/* Note that a null return will cause the following */
+	call find_next_valid_message ();		/* loop to be ignored, as it should be. */
+
+	sequence_delta = 1f8;			/* Very large number */
+	closest_message = log_message_ptr;
+	if after_sw then				/* Number of extra messages we will check to find a close one */
+	     search_tries = SEQUENCE_SLOP;		/* Larger in "at or before" mode because the target is */
+	else search_tries = SEQUENCE_SLOP * 2;		/* approached from below (see explanation below) */
+
+	do while ((log_message_ptr ^= null ()) & (search_tries > 0));
+	     this_sequence = log_message.sequence;
+
+/* If an exact match is found, return immediately, regardless. */
+
+	     if (this_sequence = wanted_sequence) then return;
+
+	     if after_sw then
+		sequence_difference = this_sequence - wanted_sequence;
+	     else sequence_difference = wanted_sequence - this_sequence;
+
+/* If we are looking for "at or after", sequence_difference will be positive as soon as
+   we encounter a message after the desired number, and contrariwise in "at or before"
+   mode.	Once that happens, we start looking for the closest "nearby" message, but no
+   more that SEQUENCE_SLOP times.  In "at or before" mode, sequence_difference will be
+   positive at least until we find the desired message, and smaller than SEQUENCE_SLOP
+   all the while we're near but below, which is why we give it twice SEQUENCE_SLOP
+   chances to find the nearest.  */
+
+	     if (sequence_difference > 0) then
+		if (sequence_difference < sequence_delta) then do;
+		     closest_message = log_message_ptr;
+		     sequence_delta = sequence_difference;
+		end;
+
+	     if (sequence_delta < SEQUENCE_SLOP) then
+		search_tries = search_tries - 1;
+
+	     log_message_ptr = addrel (log_message_ptr, currentsize (log_message));
+	     call find_next_valid_message ();
+	end;
+
+	log_message_ptr = closest_message;
+	return;
+
+     end sequence_search;
+
+/**/
+
+time_search:
+     procedure (P_time, P_after_sw);
+
+declare  P_time fixed bin (71) parameter;
+declare  P_after_sw bit (1) aligned parameter;
+
+declare  wanted_time fixed bin (71);
+declare  after_sw bit (1) aligned;
+declare  closest_message pointer;
+declare  time_difference fixed bin (71);
+declare  time_delta fixed bin (71);
+declare  search_tries fixed bin;
+declare  this_time fixed bin (71);
+
+
+	wanted_time = P_time;
+	after_sw = P_after_sw;
+
+	if ^after_sw then				/* Return oldest message even if way later */
+	     if ((wanted_time + TIME_SLOP) < log_segment.first_time) then do;
+		log_message_ptr = null ();		/* for this_or_greater case */
+		return;				/* Otherwise, return null (as here) */
+	     end;
+
+	if after_sw then				/* Return latest message even if way before */
+	     if ((wanted_time - TIME_SLOP) > log_segment.last_time) then do;
+		log_message_ptr = null ();		/* for this_or_before case */
+		return;				/* Otherwise, return null (as here) */
+	     end;
+
+	log_message_ptr = addr (log_segment.data);	/* Note that a null return will cause the following */
+	call find_next_valid_message ();		/* loop to be ignored, as it should be. */
+
+	time_delta = 1f70b;				/* Very large number */
+	closest_message = log_message_ptr;
+	if after_sw then				/* Number of extra messages we check to find a close one */
+	     search_tries = SEQUENCE_SLOP;		/* Larger in "at or before" mode because the target is */
+	else search_tries = SEQUENCE_SLOP * 2;		/* approached from below (see explanation below) */
+
+	do while ((log_message_ptr ^= null ()) & (search_tries > 0));
+	     this_time = log_message.time;
+
+/* If an exact match is found, return immediately, regardless. */
+
+	     if (this_time = wanted_time) then return;
+
+	     if after_sw then
+		time_difference = this_time - wanted_time;
+	     else time_difference = wanted_time - this_time;
+
+/* If we are looking for "at or after", time_difference will be positive as soon as
+   we encounter a message after the desired number, and contrariwise in "at or before"
+   mode.	Once that happens, we start looking for the closest "nearby" message, but no
+   more that SEQUENCE_SLOP times.  In "at or before" mode, time_difference will be
+   positive at least until we find the desired message, and smaller than TIME_SLOP
+   all the while we're near but below, which is why we give it twice SEQUENCE_SLOP
+   chances to find the nearest.  */
+
+	     if (time_difference > 0) then
+		if (time_difference < time_delta) then do;
+		     closest_message = log_message_ptr;
+		     time_delta = time_difference;
+		end;
+
+	     if (time_delta < TIME_SLOP) then
+		search_tries = search_tries - 1;
+
+	     log_message_ptr = addrel (log_message_ptr, currentsize (log_message));
+	     call find_next_valid_message ();
+	end;
+
+	log_message_ptr = closest_message;
+	return;
+
+     end time_search;
+
+/**/
+
+find_next_valid_message:
+     procedure ();
+
+/* This procedure simply sets log_message_ptr to a valid message. If it
+   already points to a valid message, it remains unchanged; otherwise, it is
+   advanced, one word at a time, until it either points to a valid message,
+   or is set to null, indicating that there are no valid messages.  The global
+   log_damage flag is set to indicate that log_message_ptr started out
+   pointing to an invalid message.
+
+   If this program (log_position_) ever learns to do searches by a binary
+   positioning mechanism, another version of find_next_valid message will be
+   required, since the first attempt to find a message after a binary probe
+   will likely not find a valid message, and a search will almost always be
+   necessary. */
+
+
+	do while (^likely_message ());
+	     log_damage = "1"b;			/* Let our caller know that we had to search */
+	     log_message_ptr = addrel (log_message_ptr, 1);
+	end;
+
+	return;
+     end find_next_valid_message;
+
+/**/
+
+likely_message:
+     procedure () returns (bit (1) aligned);
+
+declare  message_offset fixed bin (18);
+declare  message_time fixed bin (71);
+
+/* This procedure inspects a possible log message to see whether it appears
+   to be a completed message. If any of the tests fail, it will return "0"b. */
+
+/* Null pointer is a flag meaning "log contents exhausted"; it's checked here
+   to make the do while (likely_message) loops easier to code */
+
+	if (log_message_ptr = null ()) then return ("1"b);
+
+/* We have to detect running over the bounds first, before checking the message
+   contents, in order to avoid running outside the bounds of the data area.
+   Fortunately, these checks should be reasonably quick. */
+
+	message_offset = wordno (log_message_ptr);
+	if (message_offset < wordno (addr (log_segment.data))) then do;
+	     log_message_ptr = null ();		/* Can only happen searching backwards (or from caller's */
+	     return ("1"b);				/* error)-- means we've run out going back, which is */
+	end;					/* signalled by the null message pointer */
+
+	if (message_offset > last_message_offset) then do;
+	     log_message_ptr = null ();		/* Similarly, we've run out looking forward. Give up */
+	     return ("1"b);
+	end;
+
+	if (log_message.sentinel ^= log_data_$complete_message_flag) then /* Bad sentinel, means not a message or an */
+	     return ("0"b);				/* unfinished message. Try again. */
+
+	message_time = log_message.time;
+	if (message_time < OLDEST_TIME) then		/* No messages from before 1965, thank you */
+	     return ("0"b);
+	if (message_time > (time_now + ONE_MONTH)) then	/* Allow some slop for jumping clocks */
+	     return ("0"b);
+
+	if (log_message.text_lth < 0) then		/* Must at least have *some* text, */
+	     return ("0"b);
+	if (log_message.data_lth < 0) then		/* but not necessarily any data */
+	     return ("0"b);
+	if (log_message.data_class_lth < 0) then
+	     return ("0"b);
+
+	if ((currentsize (log_message) + message_offset - 1) > last_message_offset) then
+	     return ("0"b);				/* Bogus lengths in message, it would appear */
+
+	return ("1"b);				/* It's passed all the syntactic tests */
+     end likely_message;
+
+%page; %include log_message;
+%page; %include log_segment;
+
+     end log_position_;

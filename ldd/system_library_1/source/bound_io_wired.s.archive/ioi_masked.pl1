@@ -1,0 +1,1142 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+
+ioi_masked:
+     procedure;
+
+/* This program contains all of IOI that must be run while wired and masked. */
+/* Finished March 1983 by Chris Jones, from what Charlie Hornig left me. */
+/* Changed once or twice since then by Chris Jones */
+/* Changed December 1983 by Chris Jones to handle timeout on device which cannot be identified by dental records */
+/* Modified 27 February 1984 by Chris Jones to initialize idp in reset_device. */
+/* Modified August 1984 by Chris Jones to ensure dtep is initialized from all paths to getwork_channel_proc */
+/* Modified 1984-08-10 BIM for direct channel support */
+/* Modified Nov. 2 1984 By Paul Farley to correct a bug where dtep was not
+   getting initialized. Also to only get detailed status if the command
+   opcode is ^= "0"b. */
+/* Modified 121784 by Paul Farley to only call ioi_wire$unwire if the
+   workspace_astep is non-null. */
+/* Modified February 1985 by Chris Jones to add $online_device_count */
+/* Modified 042585 by Paul Farley to put last bad status (and detailed status)
+   in the dte for priv attachments, but still not log the error. */
+/* Modified July 1985 by Paul Farley to reset dte.detailed_status before
+   processing current status. */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-06-24,Farley), approve(86-03-08,MCR6979),
+     audit(86-03-07,CLJones), install(86-03-21,MR12.0-1033):
+     Changed the mask_channel proc to have iom_connect set the PGE & ^PTP
+     flags in the second word of the PCW for the execution of the reset-status
+     IDCW, after doing the MASK.  This will cause an IOM system-fault if the
+     channel tries to do a data-transfer.
+  2) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+     audit(86-03-07,CLJones), install(86-03-21,MR12.0-1033):
+     Support FIPS and IMU.
+  3) change(85-11-06,Farley), approve(86-04-01,MCR7332),
+     audit(86-04-02,Fawcett), install(86-04-07,MR12.0-1036):
+     Changed mask_channel to leave channel masked if it times out on the first
+     unmask connect.
+  4) change(86-03-04,CLJones), approve(86-07-30,MCR7461),
+     audit(86-07-31,Coren), install(86-08-19,MR12.0-1120):
+     Always zero unused fields in auto_istat and message; don't call
+     io_manager$get_status for direct channels, but do deliver status for
+     direct channels.
+  5) change(86-09-17,Farley), approve(86-07-18,MCR7439),
+     audit(86-10-08,Fawcett), install(86-10-20,MR12.0-1189):
+     Changed to execute in the BCE environment.
+  6) change(86-11-17,Farley), approve(86-11-20,MECR0002),
+     audit(86-11-19,Fawcett), install(86-11-20,MR12.0-1222):
+     Changed timer code to not operate on unassigned devices (dte.process_id =
+     ""b).
+  7) change(86-12-19,Farley), approve(86-12-19,MCR7587),
+     audit(86-12-19,Fawcett), install(87-01-05,MR12.0-1253):
+     Formal installation to close out above MECR0002.
+                                                   END HISTORY COMMENTS */
+
+dcl	p_ctep		   ptr parameter;		/* (I) pointer to a channel table entry */
+dcl	p_dtep		   ptr parameter;		/* (I) pointer to a device table entry */
+dcl	p_cterp		   fixed bin (35) parameter;	/* (I) offset of the channel table entry on interrupts */
+dcl	p_level		   fixed bin (3) parameter;	/* (I) interrupt level */
+dcl	p_status		   bit (36) aligned parameter;/* (I) word of fault status or special status */
+dcl	p_subsystem_name	   char (*) parameter;	/* (I) name of subsystem we're interested in */
+
+dcl	1 auto_istat	   like istat aligned;
+dcl	broadcast		   bit (1) aligned;
+dcl	count		   fixed bin;
+dcl	done		   bit (1) aligned;
+dcl	ctx		   fixed bin;
+dcl	dtx		   fixed bin;
+dcl	gtx		   fixed bin;
+dcl	1 ima		   aligned like io_manager_arg;
+dcl	level		   fixed bin (3);
+dcl	message		   fixed bin (71);
+dcl	status		   bit (36) aligned;
+dcl	1 status_entry	   aligned like io_status_entry;
+dcl	wm_mask		   fixed bin (71);
+dcl	wm_ptwp		   ptr;
+
+dcl	ioi_abs_seg$	   external;
+dcl	pds$process_id	   bit (36) aligned external static;
+dcl	sys_info$service_system
+			   bit (1) aligned external static;
+
+dcl	absadr		   entry (ptr, fixed bin (35)) returns (fixed bin (26));
+dcl	bce_ioi_post	   entry (fixed bin (71), fixed bin (71));
+dcl	ioi_wire$unwire	   entry (ptr);
+dcl	pmut$swap_sdw	   entry (ptr, ptr);
+dcl	pmut$unwire_unmask	   entry (fixed bin (71), ptr);
+dcl	pmut$wire_and_mask	   entry (fixed bin (71), ptr);
+dcl	pxss$io_wakeup	   entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl	pxss$notify	   entry (bit (36) aligned);
+dcl	syserr		   entry options (variable);
+dcl	syserr$binary	   entry options (variable);
+
+dcl	FIFTEEN_SECONDS	   fixed bin (71) static options (constant) init (15000000);
+dcl	MAX_LOG_STATUS_COUNT   fixed bin (17) static options (constant) init (63);
+dcl	ME		   char (32) static options (constant) init ("ioi_masked");
+dcl	ONE_MINUTE	   fixed bin (71) static options (constant) init (60000000);
+
+dcl	(addr, addrel, bin, bit, clock, hbound, lbound, length, null, ptr, rel, size, stac, stacq, string, substr,
+	unspec)		   builtin;
+
+/**** getwork_device ****/
+
+/* This entry finds an available an unconnected channel for a given device.  If no channels are available, the
+   count of pending connects in the group table entry is incremented.  If a channel is found, it is connected.
+   This entry can be called while unmasked.  It masks and unmasks itself. */
+
+getwork_device:
+     entry (p_dtep);
+
+	dtep = p_dtep;
+	idp = addr (ioi_data$);
+	gtep = ptr (idp, dte.gtep);
+
+	call mask;				/* mask interrupts */
+	call lock_gte;
+
+	gte.pending_connects = gte.pending_connects + 1;
+
+	if dte.direct & dte.active			/* we can always send another */
+	then do;
+	     ctep = ptr (idp, dte.cur_ctep);
+	     call connect;
+	     gte.pending_connects = gte.pending_connects - 1;
+	     call unlock_gte;
+	     call unmask;
+	     return;
+	end;
+
+	/*** Here is its indirect or not pre-bound. */
+
+	dte.active = "1"b;
+
+	if ^dte.suspended then
+	     do ctep = ptr (idp, gte.ctep) repeat ptr (idp, cte.next_ctep) while (rel (ctep));
+	     if cte.ioi_use & ^cte.deleting & ^cte.deleted & ^cte.connected & ^cte.quiescing
+		& (dte.channel_required = "" | (dte.channel_required = cte.chanid)) then do;
+						/* found a channel we can use */
+		call connect;
+		gte.pending_connects = gte.pending_connects - 1;
+		call unlock_gte;
+		call unmask;
+		return;
+	     end;
+	end;
+
+	call unlock_gte;
+	call unmask;
+	return;
+
+/**** getwork_channel ****/
+/* This entry is analogous to getwork_device, but looks for work for a channel to do. */
+
+getwork_channel:
+     entry (p_ctep);
+
+	ctep = p_ctep;
+	idp = addr (ioi_data$);
+	gtep = ptr (idp, cte.gtep);
+
+	call mask;				/* mask interrupts */
+	call lock_gte;
+	dtep = null ();
+	call getwork_channel_proc;
+	call unlock_gte;
+	call unmask;
+	return;
+
+/**** reset_device ****/
+
+reset_device:
+     entry (p_dtep);
+
+	idp = addr (ioi_data$);
+	dtep = p_dtep;
+	gtep = ptr (dtep, dte.gtep);
+	call mask;
+	call lock_gte;
+	if dte.connected then do;
+	     ctep = ptr (dtep, dte.cur_ctep);
+	     call mask_channel;
+	end;
+	else if dte.active then do;
+	     gte.pending_connects = gte.pending_connects - 1;
+	     dte.active = "0"b;
+	end;
+	call unlock_gte;
+	call unmask;
+	return;
+
+/**** timer ****/
+
+/* This entry is called by pxss.  It checks running channels to see if they've been running too long.  If so, it masks
+   them and restarts them on new I/Os.  It also checks to see if workspaces should be unwired. */
+
+timer:
+     entry;
+
+	idp = addr (ioi_data$);
+	if ^ioi_data.setup then
+	     return;
+	do ctx = 1 to ioi_data.nct;
+	     ctep = addr (ioi_data.ct (ctx));
+	     gtep = ptr (idp, cte.gtep);
+	     call lock_gte;
+	     if cte.ioi_use & ^cte.direct then
+		if cte.connected & (cte.time_limit ^= 0) & (clock () > cte.time_limit) then do;
+		     if cte.cur_dtep = ""b then do;
+			dtep = null ();
+			call syserr (ANNOUNCE, "^a$timer: Timeout on channel ^a (no device).", ME, cte.chanid);
+		     end;
+		     else do;
+			dtep = ptr (ctep, cte.cur_dtep);
+			call syserr (ANNOUNCE, "^a$timer: Timeout on channel ^a (device ^a^[_^[0^]^d^]).", ME,
+			     cte.chanid, gte.name, gte.mplex, bin (dte.device) < 10, bin (dte.device));
+		     end;
+		     call mask_channel;		/* stop the channel from touching memory any more */
+		     call setup_timeout_status;	/* for delivery to the user */
+		     call getwork_channel_proc;
+		     call deliver_status;
+		     if dtep ^= null () then
+			call wakeup_user;
+		end;
+	     call unlock_gte;
+	end;
+	do dtx = 1 to ioi_data.ndt;
+	     dtep = addr (ioi_data.dt (dtx));
+	     if dte.in_use & ^dte.direct & dte.process_id ^= ""b then do;
+						/* if IOI is managing this device and it is assigned... */
+		gtep = ptr (dtep, dte.gtep);
+		call lock_gte;
+		if clock () > dte.last_log_time + ONE_MINUTE then
+		     call flush_status_proc;
+		call unlock_gte;
+
+/**** Lock the device by hand.  If we fail, don't even think about unwiring. ****/
+		if stac (addr (dte.lock.pid), pds$process_id) then do;
+		     if ^dte.active & dte.workspace_wired & (clock () > dte.unwire_time) then do;
+			if dte.workspace_astep ^= null () then
+			     call ioi_wire$unwire (dtep);
+			else do;
+			     call syserr (ANNOUNCE,
+				"^a$timer: Attempt to unwire NULL workspace. (device ^a^[_^[0^]^d^]).", ME,
+				gte.name, gte.mplex, bin (dte.device) < 10, bin (dte.device));
+			     dte.workspace_wired = "0"b;
+			end;
+		     end;
+
+/**** This code is stolen from lock$unlock_fast.  If idle procs get block_lock_counts, it could be removed. ****/
+
+
+		     do while (^stacq (dte.lock.pid, "000000000000"b3, pds$process_id));
+		     end;
+
+		     if dte.lock.notify_sw then do;
+			dte.lock.notify_sw = "0"b;
+			call pxss$notify (dte.lock.event);
+		     end;
+
+		end;
+	     end;
+	end;
+	return;
+
+/**** interrupt ****/
+/* This is the interrupt handler for all IOI controlled devices.  It handles waking up the user, logging errors,
+   reconnecting channels which have terminated, and in general, does the right things. */
+
+interrupt:
+     entry (p_cterp, p_level, p_status);
+
+	idp = addr (ioi_data$);
+	ctep = ptr (idp, p_cterp);			/* point to cte of interrupting channel */
+	gtep = ptr (idp, cte.gtep);			/* and its gte */
+	level = p_level;
+	status = p_status;
+
+	if level = IO_SPECIAL_INTERRUPT_LEVEL then do;	/* special status, not necessarily in response to I/O */
+	     io_special_status_ptr = addr (status);	/* base the proper structure */
+	     imp = addr (message);			/* build the message for any wakeups we send */
+	     string (imess) = ""b;
+	     imess.st = "1"b;
+	     imess.level = bit (level, 3);
+	     imess.status = status;
+
+	     broadcast =				/* tell everyone on this group if... */
+		^io_special_status.t | ^gte.mplex	/* it's invalid (?) or not multiplexed */
+		| (substr (io_special_status.byte2, 1, 1) & (io_special_status.device = "00"b3));
+						/* or it's a controller interrupt */
+	     do gtx = 1 to ioi_data.ngt;
+		gtep = addr (ioi_data.gt (gtx));
+		if special_could_come_from_channel (gtep, ctep) then do;
+		     begin;
+
+dcl	done		   bit (1) aligned;
+
+			call lock_gte;
+			done = "0"b;		/* so loop will loop */
+			do dtep = ptr (idp, gte.dtep) repeat ptr (idp, dte.next_dtep) while (^done);
+			     if (dte.process_id ^= ""b) & (broadcast | (dte.device = io_special_status.device))
+			     then do;
+				dte.special_status = status;
+				dte.special_interrupt = "1"b;
+				call wakeup_user;
+			     end;
+			     done = (dte.next_dtep = gte.dtep);
+			end;
+			call unlock_gte;
+		     end;
+		end;
+	     end;
+	end;
+	else do;					/* system fault, terminate, or marker */
+	     call lock_gte;
+	     if cte.direct then
+		unspec (status_entry) = ""b;
+	     else call io_manager$get_status (cte.chx, addr (status_entry));
+	     if cte.toss_status | (cte.cur_dtep = ""b) then do;
+		cte.toss_status = "0"b;		/* ignore this interrupt */
+		cte.connected = "0"b;
+		dtep = null ();
+		call getwork_channel_proc;
+		call unlock_gte;
+		goto DISMISS_INTERRUPT;
+	     end;
+
+	     dtep = ptr (idp, cte.cur_dtep);		/* let's talk about the correct device */
+	     if ^dte.active then do;
+		call syserr (CRASH,
+		     "^a$interrupt: Interrupt for inactive device (device ^a^[_^[0^]^d^]).^/Type go to continue.", ME,
+		     gte.name, gte.mplex, bin (dte.device) < 10, bin (dte.device));
+		call unbind;
+		call getwork_channel_proc;
+		call unlock_gte;
+		goto DISMISS_INTERRUPT;
+	     end;
+	     if dte.reading_detailed_status then
+		call restore_previous_status;		/* leave the "reading" flag set for log_status later */
+
+	     if level = IO_SYSTEM_FAULT_INTERRUPT_LEVEL then
+		call setup_fault_status;
+	     else do;				/* normal status */
+		if ^dte.direct then do;		/* for direct channels, expect no status and trust level number */
+		     if ^status_entry.t then do;
+			ioi_data.spurious_interrupts = ioi_data.spurious_interrupts + 1;
+			call unlock_gte;
+			goto DISMISS_INTERRUPT;
+		     end;
+		     if ^status_entry.word1.marker then
+			level = IO_TERMINATE_INTERRUPT_LEVEL;
+		end;
+		call setup_normal_status;
+	     end;
+
+	     call log_status_if_appropriate;
+	     if dte.reading_detailed_status then do;
+		call unlock_gte;
+		goto DISMISS_INTERRUPT;		/* we'll pick this up later */
+	     end;
+
+	     if ^auto_istat.run then do;		/* channel terminated, get more work */
+		call unbind;
+		call getwork_channel_proc;
+	     end;
+	     else if dte.timeout ^= 0 then
+		cte.time_limit = clock () + dte.timeout;/* restart the clock */
+
+	     call deliver_status;
+	     call wakeup_user;
+	     call unlock_gte;
+	end;
+
+	goto DISMISS_INTERRUPT;
+DISMISS_INTERRUPT:
+	return;
+
+/* Entry to set a channel up for quiescing.  If the channel is not currently connected, this call is a no-op.
+   If the channel is connected, the quiescing bit is turned on.  It's up to interrupt side to notice and turn it off. */
+
+quiesce_channel:
+     entry (p_ctep);
+
+	ctep = p_ctep;
+	gtep = ptr (ctep, cte.gtep);
+	call mask;
+	call lock_gte;
+
+	if cte.connected then
+	     cte.quiescing = "1"b;
+
+	call unlock_gte;
+	call unmask;
+	return;
+
+/* Entry to flush any status accumulated so far. */
+
+flush_status:
+     entry (p_dtep);
+
+	dtep = p_dtep;
+	gtep = ptr (dtep, dte.gtep);
+	call mask;
+	call lock_gte;
+	call flush_status_proc;
+	call unlock_gte;
+	call unmask;
+	return;
+
+/* Entry to count the number of non-deleted devices on a given subsystem.  It doesn't count controllers
+   and returns -1 if it can't find the subsystem. */
+
+online_device_count:
+     entry (p_subsystem_name) returns (fixed bin);
+
+	idp = addr (ioi_data$);
+	do gtx = lbound (ioi_data.gt, 1) to hbound (ioi_data.gt, 1);
+	     gtep = addr (ioi_data.gt (gtx));
+	     if gte.name = p_subsystem_name then do;
+		done = "0"b;
+		count = 0;
+		call mask;
+		call lock_gte;
+		do dtep = ptr (gtep, gte.dtep) repeat ptr (dtep, dte.next_dtep) while (^done);
+		     if ^dte.deleted & dte.device ^= "00"b3 then
+			count = count + 1;
+		     done = dte.next_dtep = gte.dtep;
+		end;
+		call unlock_gte;
+		call unmask;
+		return (count);
+	     end;
+	end;
+	return (-1);
+
+/* Procedure which issues a connect for the device pointed to by dtep on the channel pointed to by ctep. */
+
+connect:
+     proc;
+
+	ima.chx = cte.chx;
+	ima.bound = dte.bound;
+	ima.ptp = dte.ptp;
+	ima.listx = dte.listx;
+	ima.pcw = dte.pcw;
+	cte.time_limit = 0;				/* in case polling goes off */
+
+	if ^gte.psia then do;
+	     if cte.direct then
+		call io_manager$connect_direct (ima);
+	     else call io_manager$connect (ima);
+	end;
+	else do;
+	     ima.listp, ima.dcw_pair_ptr = addr (dte.idcw);
+	     call io_manager$workspace_tdcw (ima);
+	     call io_manager$connect_abs (ima);
+	end;
+
+	cte.cur_dtep = rel (dtep);
+	dte.cur_ctep = rel (ctep);
+	cte.connected, dte.connected = "1"b;
+	if dte.timeout ^= 0 then
+	     cte.time_limit = clock () + dte.timeout;
+
+	pcwp = addr (dte.pcw);
+	if pcw.mask then do;			/* if this PCW masked the channel... */
+	     call mask_channel;
+	     call setup_timeout_status;
+	     call deliver_status;
+	     call wakeup_user;
+	end;
+
+     end connect;
+
+/* Procedure which finds work for a channel do. */
+
+getwork_channel_proc:
+     proc;
+
+	if cte.quiescing then do;
+	     cte.quiescing = "0"b;
+	     return;
+	end;
+
+	if cte.deleting then do;			/* someone wants to know when this channel is free */
+	     call pxss$notify (unspec (IO_CHANNEL_LOCK_TEMPLATE) || rel (ctep));
+	     return;
+	end;
+	if cte.connected | ^cte.ioi_use | gte.suspend_devices then
+	     return;				/* this channel shouldn't be used */
+
+	gte.dtep = ptr (gtep, gte.dtep) -> dte.next_dtep; /* rotate circular list */
+	if gte.pending_connects > 0 then do;
+	     begin;
+
+dcl	done		   bit (1) aligned;
+dcl	saved_dtep	   ptr;
+
+		done = "0"b;
+		saved_dtep = dtep;
+		do dtep = ptr (gtep, gte.dtep) repeat ptr (dtep, dte.next_dtep) while (^done);
+		     if dte.active & ^dte.connected & ^dte.suspended then do;
+			gte.pending_connects = gte.pending_connects - 1;
+			call connect;
+			done = "1"b;
+		     end;
+		     else done = dte.next_dtep = gte.dtep;
+		end;
+		dtep = saved_dtep;
+	     end;
+	end;
+
+     end getwork_channel_proc;
+
+/* Procedure to stop the current activity on a channel. */
+
+mask_channel:
+     proc;
+
+	call io_manager$get_status (cte.chx, addr (status_entry));
+	if dtep ^= null () then
+	     call unbind;
+	call io_manager$mask (cte.chx);
+	if ^gte.mplex then do;
+	     if dtep ^= null () then
+		if dte.direct then
+		     call ioi_wire$unwire (dtep);	/* unwire this instant */
+	     return;				/* we don't have to unmask if channel not shared */
+	end;
+
+/* The dtep will be null if this is the second time through the code for
+   this channel. The first time through a call is made to "unbind" which
+   sets cte.cur_dtep to zero. The second time through the timer entry it
+   will set dtep to null because cte.cur_dtep is zero. */
+
+	if dtep = null () then do;			/* we've already tried to unmask */
+	     cte.connected = "0"b;			/* free channel */
+	     cte.toss_status = "0"b;
+	     call syserr (ANNOUNCE, "^a: Channel ^a not responding, will remain masked.", ME, cte.chanid);
+	     return;
+	end;
+
+	ima.chx = cte.chx;
+
+/* Set pcw to a unique string that iom_connect will recognize. iom_connect
+   will use the default pcw, but turn ON the PGE and turn OFF the PTP flags
+   in the second word of the pcw. This will cause a system-fault if the
+   channel trys to do a data transfer. */
+
+	ima.pcw = "000000777777"b3;			/* set unique string */
+	ima.ptp = null ();
+	ima.listp = addr (ioi_data.rss_idcw);
+	call io_manager$connect_abs (ima);
+	cte.time_limit = cte.time_limit + ONE_MINUTE;
+	cte.toss_status = "1"b;
+	cte.connected = "1"b;
+
+     end mask_channel;
+
+/* Procedure to remove the binding between a channel and a device. */
+
+unbind:
+     proc;
+
+	cte.cur_dtep, dte.cur_ctep = ""b;
+	cte.connected, dte.connected, dte.active = ""b;
+	dte.unwire_time = clock () + FIFTEEN_SECONDS;
+
+     end unbind;
+
+/* This routine saves away parts of the status so we can read detailed status using the same IDCW, status entry, etc.
+   It's restored when we've read the detailed status. */
+
+save_status:
+     proc;
+
+	cte.saved_status.word1 = unspec (status_entry.word1);
+	cte.saved_status.word2 = unspec (status_entry.word2);
+	cte.saved_status.word4 = unspec (status_entry.word4);
+	cte.saved_status.next_lpw_offset = bit (bin (auto_istat.offset + 1, 18), 18);
+	cte.saved_status.command = addr (dte.idcw) -> idcw.command;
+
+     end save_status;
+
+/* The following routine is called when we have had to read the detailed status.  It restores the saved status
+   (i.e. the status that caused us to decide to read the detailed status). */
+
+restore_previous_status:
+     proc;
+
+	level = IO_TERMINATE_INTERRUPT_LEVEL;
+	unspec (status_entry.word1) = cte.saved_status.word1;
+	unspec (status_entry.word2) = cte.saved_status.word2;
+	unspec (status_entry.word4) = cte.saved_status.word4;
+	status_entry.next_lpw_offset = cte.saved_status.next_lpw_offset;
+	addr (dte.idcw) -> idcw.command = cte.saved_status.command;
+	status_entry.workspace = "1"b;
+
+     end restore_previous_status;
+
+/* Procedures to setup the auto_istat entry on our stack for delivery to the user. */
+
+setup_normal_status:
+     proc;
+
+	unspec (auto_istat) = ""b;
+	auto_istat.er = ((unspec (status_entry.word1) & IO_STATUS_ERROR_MASK) ^= ""b);
+	auto_istat.iom_stat = unspec (status_entry.word1) || unspec (status_entry.word4);
+	goto setup_status_interrupt_join;
+
+setup_fault_status:
+     entry;
+
+	unspec (auto_istat) = ""b;
+	auto_istat.er = "1"b;
+	auto_istat.iom_stat = status;
+
+setup_status_interrupt_join:
+	auto_istat.run = (level = IO_MARKER_INTERRUPT_LEVEL) | cte.direct;
+	auto_istat.time_out = "0"b;
+	auto_istat.level = level;
+	goto setup_status_common;
+
+setup_timeout_status:
+     entry;
+
+	unspec (auto_istat) = ""b;
+	auto_istat.er, auto_istat.time_out = "1"b;
+	auto_istat.level = IO_TERMINATE_INTERRUPT_LEVEL;	/* since the $'#((&% T&Ds expect this... */
+
+setup_status_common:
+	if ^cte.direct then do;			/* no dcws here */
+	     if status_entry.workspace then
+		auto_istat.offset = bin (status_entry.next_lpw_offset, 18) - 1;
+	     else if dtep ^= null () then
+		auto_istat.offset = dte.idcw_listx;
+	     auto_istat.lpw = unspec (status_entry.word2);
+	end;
+	auto_istat.absaddr = 0;
+
+	imp = addr (message);			/* set up the message for wakeups */
+	unspec (imess) = ""b;
+	imess.completion = auto_istat.completion;
+	imess.st = "1"b;				/* be sure this bit is on (it's set separately in istat) */
+	imess.level = bit (auto_istat.level, 3);
+	imess.offset = bit (auto_istat.offset, 18);
+	imess.status = substr (auto_istat.iom_stat, 1, length (imess.status));
+						/* only the first 36 bits, actually */
+
+     end setup_normal_status;
+
+/* Routine to put the status in the user's workspace. */
+
+deliver_status:
+     proc;
+
+dcl	ioi_abs_seg_ptr	   ptr;
+dcl	workspace_sdw_ptr	   ptr;
+
+	if dtep = null () then
+	     return;
+	if dte.status_entries = 0 then
+	     return;
+
+	ioi_abs_seg_ptr = addr (ioi_abs_seg$);
+	workspace_sdw_ptr = addr (dte.workspace_sdw);
+	call pmut$swap_sdw (ioi_abs_seg_ptr, workspace_sdw_ptr);
+						/* since we may not own the workspace, get our own pointer */
+	ptr (ioi_abs_seg_ptr, dte.status_offset + size (istat) * dte.status_entry_idx) -> istat = auto_istat;
+	ptr (ioi_abs_seg_ptr, dte.status_offset + size (istat) * dte.status_entry_idx) -> istat.st = "1"b;
+	dte.status_entry_idx = dte.status_entry_idx + 1;
+	if dte.status_entry_idx = dte.status_entries then
+	     dte.status_entry_idx = 0;
+
+     end deliver_status;
+
+/* Routine to send the user a wakeup, informing of the arrival of status */
+
+wakeup_user:
+     proc;
+
+	if sys_info$service_system then
+	     call pxss$io_wakeup (dte.process_id, dte.ev_chn, message, (0));
+	else call bce_ioi_post (dte.ev_chn, message);
+
+     end wakeup_user;
+
+/* A routine which lives up to its name. */
+
+log_status_if_appropriate:
+     proc;
+
+dcl	log_detail	   bit (1) aligned;
+dcl	major		   fixed bin (4);
+dcl	sub		   fixed bin (6);
+
+dcl	detailed_status_in_status_entry
+			   bit (36) aligned based (addr (status_entry.detailed_status));
+dcl	status_entry_array	   (16) bit (36) aligned based (addr (status_entry));
+dcl	1 second_status_word   aligned like io_status_entry.word4 based (addrel (addr (auto_istat.iom_stat), 1));
+
+/**** First, figure out whether it's appropriate.  (If not, our job is easy). ****/
+
+	if dte.reading_detailed_status then do;		/* we already decided to log this, so do it */
+	     dte.detailed_status_valid = "1"b;
+	     call log_this_status;
+	     dte.reading_detailed_status = "0"b;
+	     return;
+	end;
+
+	unspec (dte.detailed_status (*)) = ""b;		/* reset */
+
+	if level = IO_SPECIAL_INTERRUPT_LEVEL then
+	     return;				/* don't log specials */
+	if level ^= IO_SYSTEM_FAULT_INTERRUPT_LEVEL then do;
+						/* we're going to log any system faults, check the rest */
+	     if gte.io_log_info_index = 0 then do;	/* if no table, use heuristic */
+		if ^auto_istat.er then
+		     return;			/* not an error, don't log */
+		log_detail = "0"b;
+	     end;
+	     else do;				/* we have a table to guide us on which statuses to log */
+		io_log_infop = addr (io_log_status_info$io_log_status_info);
+		logp = addr (io_log_info.log_entry (gte.io_log_info_index));
+		major = bin (status_entry.major);
+		sub = bin (status_entry.sub);
+		if ^log.status (major, sub) then
+		     return;			/* no one is interested in this status */
+		log_detail = log.detail (major, sub);
+	     end;
+	end;
+	else log_detail = "0"b;			/* no detailed status for system faults */
+
+	if dte.priv then do;			/* save status in dte for priv attachments, but don't log */
+	     unspec (dte.log_status) = ""b;		/* clear everything */
+	     dte.log_status_cnt = "0"b;
+	     dte.log_status.level = auto_istat.level;
+	     dte.log_status.time_out = auto_istat.time_out;
+	     dte.log_status.type = second_status_word.action_code;
+	     dte.log_status.command = addr (dte.idcw) -> idcw.command;
+	     dte.log_status.channel = rel (ctep);
+	     dte.log_status.status = substr (auto_istat.iom_stat, 1, length (dte.log_status.status));
+						/* takes only high 36 bits */
+	     if log_detail & detailed_status_in_status_entry ^= "000000000000"b3 then do;
+		dte.detailed_status = status_entry.detailed_status;
+		dte.detailed_status_valid = "1"b;
+	     end;
+	     dte.log_detailed_status = dte.detailed_status;
+	     dte.last_log_time = clock ();
+	     return;
+	end;
+
+/**** If we've gotten this far, we want to log the status.  The log_detail flag says whether we want to log detailed
+      status as well.  If we do, we may have to perform some magic at this point to reconnect to read the detailed
+      status (if the detailed status was stored as part of the status store, we're in better shape). ****/
+
+	if log_detail & detailed_status_in_status_entry ^= "000000000000"b3 then do;
+	     dte.detailed_status = status_entry.detailed_status;
+	     dte.detailed_status_valid = "1"b;
+	     call log_this_status;
+	     return;
+	end;
+
+	if log_detail then do;			/* must get the detailed status */
+	     if gte.detailed_status_cmd = "0"b then do;	/* Not able to get it, complain that it was not available. */
+		call syserr (LOG,
+		     "^a: No Ext. Stat. with ^o/^o status on chnl ^a (^a^[_^[0^]^d^]).^4(^/^10x^w ^w ^w ^w^)", ME,
+		     major, sub, cte.chanid, gte.name, gte.mplex, bin (dte.device) < 10, bin (dte.device),
+		     status_entry_array);
+		call log_this_status;
+		return;
+	     end;
+	     call save_status;
+
+/* Now build dcw list to read detailed status */
+
+	     dte.idcw, dte.tdcw = "0"b;
+	     idcwp = addr (dte.idcw);
+	     dcwp = addr (dte.tdcw);
+	     idcw.command = gte.detailed_status_cmd;	/* Read detailed status */
+	     idcw.device = dte.device;
+	     idcw.code = "111"b;
+	     idcw.count = "01"b3;
+
+	     dcw.address = absaddr_18 (addr (dte.detailed_status));
+	     dcw.tally = "0006"b3;
+
+	     dte.detailed_status_valid = "0"b;
+	     unspec (dte.detailed_status) = "0"b;
+
+/* connect to do actual I/O */
+
+	     ima.chx = cte.chx;
+	     ima.pcw = ""b;
+	     ima.ptp = null ();
+	     ima.listp = addr (dte.idcw);
+	     call io_manager$connect_abs (ima);
+	     if dte.timeout ^= 0 then			/* reset clock */
+		cte.time_limit = clock () + dte.timeout;
+	     dte.reading_detailed_status = "1"b;
+	     return;
+	end;
+
+	call log_this_status;
+	return;
+
+absaddr_18:
+	proc (p) returns (bit (18));
+
+dcl	p		   ptr;
+
+dcl	absaddr		   fixed bin (26);
+dcl	code		   fixed bin (35);
+
+	     absaddr = absadr (p, code);
+	     if code ^= 0 then
+		call syserr (CRASH, "^a$interrupt: absadr failed.", ME);
+	     return (bit (bin (absaddr, 18), 18));
+
+	end absaddr_18;
+
+log_this_status:
+	proc;
+
+/**** Here is where the status is actually logged.  Status is accumulated, and if it is identical to the previous
+      status, a count is bumped.  If the count reaches its max, or a different status comes along, the accumulated
+      status is written to the syserr log. ****/
+
+dcl	1 test_status	   like dte.log_status;
+
+	     unspec (test_status) = ""b;		/* clear everything */
+	     test_status.level = auto_istat.level;
+	     test_status.time_out = auto_istat.time_out;
+	     test_status.channel = rel (ctep);
+	     test_status.status = substr (auto_istat.iom_stat, 1, length (test_status.status));
+						/* takes only high 36 bits */
+	     if auto_istat.level ^= IO_SPECIAL_INTERRUPT_LEVEL then do;
+		test_status.type = second_status_word.action_code;
+		test_status.command = addr (dte.idcw) -> idcw.command;
+	     end;
+	     test_status.count = dte.log_status.count;	/* for equality comparision */
+/**** See if this status matches a previous one. ****/
+	     if (dte.log_status_cnt & (unspec (test_status) = unspec (dte.log_status))
+		& (unspec (dte.detailed_status) = unspec (dte.log_detailed_status))) then do;
+						/* it matches */
+		dte.log_status.count = dte.log_status.count + 1;
+		if dte.log_status.count = MAX_LOG_STATUS_COUNT then
+		     call flush_status_proc;
+	     end;
+	     else do;				/* doesn't match */
+		call flush_status_proc;
+		dte.log_status = test_status;
+		dte.log_status.count = 0;		/* print_syserr_msg_ expects actual count - 1 */
+		dte.log_status_cnt = "1"b;
+		dte.log_detailed_status = dte.detailed_status;
+	     end;
+
+	end log_this_status;
+
+     end log_status_if_appropriate;
+
+/* Routine to flush the status accumulated so far. */
+
+flush_status_proc:
+     proc;
+
+dcl	1 auto_io_msg	   aligned like io_msg;
+dcl	msg_length	   fixed bin;
+dcl	msg_type		   fixed bin;
+
+	if ^dte.log_status_cnt then
+	     return;				/* nothing to log */
+
+	io_msgp = addr (auto_io_msg);
+	io_msg.level = bit (dte.log_status.level);
+	io_msg.device = dte.device;
+	io_msg.time_out = dte.log_status.time_out;
+	io_msg.type = dte.log_status.type;
+	io_msg.command = dte.log_status.command;
+	io_msg.count = bit (dte.log_status.count);
+	io_msg.channel = ptr (dtep, dte.log_status.channel) -> cte.chanid;
+	io_msg.status = dte.log_status.status;
+	io_msg.devname = ptr (dtep, dte.gtep) -> gte.name;
+	if unspec (dte.log_detailed_status) ^= ""b then do;
+	     io_msg.detailed_status = substr (unspec (dte.log_detailed_status), 1, length (io_msg.detailed_status));
+	     msg_type = SB_io_err_detail;
+	     msg_length = SBL_io_err_detail;
+	end;
+	else do;
+	     msg_type = SB_io_err;
+	     msg_length = SBL_io_err;
+	end;
+
+	call syserr$binary (JUST_LOG, io_msgp, msg_type, msg_length, "^a$interrupt: ^[I/O error^;Special^].", ME,
+	     bin (io_msg.level) ^= IO_SPECIAL_INTERRUPT_LEVEL);
+	dte.last_log_time = clock ();
+	dte.log_status_cnt = "0"b;
+
+     end flush_status_proc;
+
+special_could_come_from_channel:
+     proc (gtp, ctp) returns (bit (1) aligned);
+
+dcl	ctp		   ptr parameter;
+dcl	gtp		   ptr parameter;
+
+dcl	tctp		   ptr;
+
+	do tctp = ptr (gtp, gtp -> gte.ctep) repeat ptr (tctp, tctp -> cte.next_ctep) while (rel (tctp) ^= ""b);
+	     if tctp -> cte.base_ctep = ctp -> cte.base_ctep then
+		return ("1"b);
+	end;
+	return ("0"b);
+
+     end special_could_come_from_channel;
+
+/* Routines which handle the masking and unmasking of interrupts, and the locking and unlocking of the gte. */
+
+mask:
+     proc;
+
+	call pmut$wire_and_mask (wm_mask, wm_ptwp);
+
+     end mask;
+
+unmask:
+     proc;
+
+	call pmut$unwire_unmask (wm_mask, wm_ptwp);
+
+     end unmask;
+
+lock_gte:
+     proc;
+
+	if gte.lock = pds$process_id then
+	     call syserr (CRASH, "^a: Mylock error on subsystem ^a.", ME, gte.name);
+
+	do while (^stac (addr (gte.lock), pds$process_id));
+						/* seize the loop lock */
+	end;
+
+     end lock_gte;
+
+unlock_gte:
+     proc;
+
+	if ^stacq (gte.lock, ""b, pds$process_id) then
+	     call syserr (CRASH, "^a: Lock for subsystem ^a not locked to process ^w.", ME, gte.name, pds$process_id);
+
+     end unlock_gte;
+
+%include ioi_data;
+%page;
+%include io_manager_dcls;
+%page;
+%include interrupt_levels;
+%page;
+%include ioi_stat;
+%page;
+%include io_status_entry;
+%page;
+%include io_special_status;
+%page;
+%include io_log_status_info;
+%page;
+%include iom_pcw;
+%include iom_dcw;
+%page;
+%include io_syserr_msg;
+%page;
+%include syserr_binary_def;
+%page;
+%include syserr_constants;
+%page;
+/*	BEGIN MESSAGE DOCUMENTATION
+
+
+   Message:
+   ioi_masked$interrupt: I/O error.
+
+   S:	$log
+
+   T:	$run
+
+   M:	An error, or accumulation of like errors, has occured.  All
+   needed information is contained in the binary portion of the entry.
+
+   A:	$ignore
+
+   Message:
+   ioi_masked$interrupt: Interrupt for inactive device (device DEVID).
+   Type go to continue.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	An interrupt has been received over a channel for which the
+   device is not marked "active".  This could indicate an error in the I/O
+   hardware or in the setting/checking of the device active flag.
+
+   A:	Typing "go" at BCE will cause Multics to be reentered and
+   ioi_masked to dismiss this error and properly cleanup.
+
+   Message:
+   ioi_masked$interrupt: Special.
+
+   S:	$log
+
+   T:	$run
+
+   M:	A special interrupt, or accumulation of special interrupts, has
+   occured.  All needed information is contained in the binary portion of the
+   entry.
+
+   A:	$ignore
+
+   Message:
+   ioi_masked$interrupt: absadr failed.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A call to the absadr function returned a non-zero error code,
+   indicating that the absolute address of the workspace could not be obtained.
+   Since the workspace is wired, this error should never have occurred.
+
+   A:	$inform
+   $recover
+
+   Message:
+   ioi_masked$timer: Attempt to unwire NULL workspace. (device DEVID).
+
+   S:	$info
+
+   T:	$run
+
+   M:	Device entry flag and time stamp indicated that its workspace
+   required unwiring.  However the pointer to the ASTE for the workspace was
+   null.
+   $err
+
+   A:	$inform
+   $recover
+
+   Message:
+   ioi_masked: Channel CHANID not responding, will remain masked.
+
+   S:	$info
+
+   T:	$run
+
+   M:	The time limit has expired waiting for status from a previous
+   unmask connect (reset-status idcw). It is apparent that the channel is
+   inoperative. No further attempt will be made to re-open the channel.
+
+   A:	Contact your Customer Service Account Representative if the
+   errors persist.
+
+   Message:
+   ioi_masked$timer: Timeout on channel CHANID (device DEVID).
+
+   S:	$info
+
+   T:	$run
+
+   M:	The time limit has expired waiting for status from CHANID for a
+   previous connect.  The channel will be masked "OFF", then unmasked if
+   multiple devices exist (i.e. tapes and disks) so that special interrupts
+   can be received.
+
+   A:	Contact your Customer Service Account Representative if the
+   errors persist.
+
+   Message:
+   ioi_masked$timer: Timeout on channel CHANID (no device).
+
+   S:	$info
+
+   T:	$run
+
+   M:	The time limit has expired waiting for status from CHANID for
+   the connect to unmask the channel.  The channel will be masked "OFF", then
+   then unmask will be tried again.
+
+   A:	Contact your Customer Service Account Representative if the
+   errors persist.
+
+   Message:
+   ioi_masked: Lock for subsystem SUBSYSTEM not locked to process OOOOOO.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	An unlock of the subsystem lock was attempted, but is was not
+   locked by this process.
+   $err
+
+   A:	$inform
+   $recover
+
+   Message:
+   ioi_masked: Mylock error on subsystem SUBSYSTEM.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	An lock of the subsystem lock was attempted, but is was already
+   locked by this process.
+   $err
+
+   A:	$inform
+   $recover
+
+   Message:
+   ioi_masked: No Ext. Stat. with MAJOR/SUB status on chnl CHANID (DEVID).
+
+   S:	$log
+
+   T:	$run
+
+   M:	An error status has occured that requires detailed status.  This
+   CHANID should have supplied this with the status, but did not.  This
+   CHANID is also not capable of requesting the detailed status.  An octal
+   dump of the status_entry area will be displayed along with the error
+   message.
+
+   A:	$ignore
+
+   END MESSAGE DOCUMENTATION */
+
+     end ioi_masked;

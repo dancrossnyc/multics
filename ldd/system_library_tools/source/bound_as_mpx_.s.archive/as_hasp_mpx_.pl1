@@ -1,0 +1,859 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+/* HASP multiplexer:  This multiplexer processes most of the HASP RJE protocol in either host or workstation mode.
+   This multiplexer expects data from the user ring to be already compressed and converted to EBCDIC.
+   This procedure implements support of the multiplexer for the Answering Service and the cv_cmf command.
+*/
+
+/* Created:  October 1979 by G. Palter */
+/* Modified: 5 November 1980 by G. Palter to allow infinite initial connection timeout (connect_timeout= none) (TR8034) */
+/* Modified: 16 April 1981 by G. Palter to add rts_mode and message documentation */
+/* Modified: 22 July 1981 by G. Palter to use proper IPC priority for multiplexer loads/crashes */
+/* Modified: 25 November 1981 by G. Palter to add max_device_input_records parameter */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1055):
+     Correct error message documentation.
+  2) change(87-03-20,Beattie), approve(87-04-06,MCR7656),
+     audit(87-07-16,Parisek), install(87-08-04,MR12.1-1055):
+     Add support for login service on operator console subchannel.
+                                                   END HISTORY COMMENTS */
+
+as_hasp_mpx_:
+     procedure ();
+
+	return;					/* not an entry */
+
+
+/* Parameters */
+
+dcl  P_mpx_channel_name character (*) parameter;		/* name of the multiplexer's channel */
+
+dcl  (P_cdtp,					/* -> the CDT */
+     P_cdtep,					/* -> the CDT entry of the multiplexer */
+     P_subchannel_list_ptr,				/* -> list of sub-channels for this multiplexer */
+     P_event_call_info_ptr)				/* -> description of the event wakeup */
+	pointer parameter;
+
+dcl  P_error entry (fixed binary, fixed binary, character (*), character (*), character (*), character (*))
+	variable parameter;				/* procedure to report errors for cv_cmf */
+
+dcl  P_check_sw bit (1) aligned parameter;
+dcl  P_code fixed binary (35) parameter;
+
+
+/* Remaining declarations */
+
+dcl  1 subchannel_list aligned based (subchannel_list_ptr), /* configured sub-channels */
+       2 count fixed binary,
+       2 cdteps (0 refer (subchannel_list.count)) pointer unaligned;
+dcl  subchannel_list_ptr pointer;
+
+dcl  system_area area aligned based (system_area_ptr);
+dcl  system_area_ptr pointer;
+
+dcl  code fixed binary (35);
+
+dcl  (mpx_channel_name, load_parameter_name) character (32);
+
+dcl  start_subchannel_name_idx fixed binary;
+dcl  (found_console,
+     (found_readers, found_printers, found_punches) dimension (8)) bit (1) aligned;
+
+dcl  idx fixed binary;
+dcl  event_message_array (2) bit (36);
+
+dcl  saved_cdtp pointer internal static;		/* saved for use by event call handler */
+
+dcl  NAME character (32) static options (constant) initial ("as_hasp_mpx_");
+
+dcl  error_table_$action_not_performed fixed binary (35) external;
+
+dcl  convert_ipc_code_ entry (fixed binary (35));
+dcl  error entry (fixed binary, fixed binary, character (*), character (*), character (*), character (*)) variable;
+dcl  get_process_id_ entry () returns (bit (36) aligned);
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  hphcs_$tty_control entry (character (*), character (*), pointer, fixed binary (35));
+dcl  ipc_$create_ev_chn entry (fixed binary (71), fixed binary (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed binary (71), entry, pointer, fixed binary, fixed binary (35));
+dcl  ipc_$delete_ev_chn entry (fixed binary (71), fixed binary (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (character (*), bit (1) aligned, fixed binary (35));
+dcl  (multiplexer_mgr_$mpx_load_failed,
+     multiplexer_mgr_$mpx_loaded) entry (character (*), fixed binary (35));
+dcl  (sys_log_, sys_log_$error_log) entry () options (variable);
+dcl  ttt_info_$additional_info entry (character (*), character (512) varying, fixed binary (35));
+
+dcl  (addr, binary, index, length, low, maxlength, null, rtrim, search, string, substr, unspec, verify) builtin;
+%page;
+/* Load a multiplexer */
+
+hasp_load:
+     entry (P_mpx_channel_name, P_cdtp, P_cdtep, P_subchannel_list_ptr, P_check_sw, P_code);
+
+	mpx_channel_name = P_mpx_channel_name;
+	cdtp,					/* for references now */
+	     saved_cdtp = P_cdtp;			/* need for wakeup handler later */
+	cdtep = P_cdtep;
+	subchannel_list_ptr = P_subchannel_list_ptr;
+	P_code = 0;				/* assume success */
+
+	mpxep = addr (cdte.initial_command);		/* -> multiplexer data in the CDT */
+	system_area_ptr = get_system_free_area_ ();
+	hld_ptr = null ();				/* haven't allocated bootload data yet */
+
+	if cdte.event ^= 0 then
+	     call ipc_$delete_ev_chn (cdte.event, (0));	/* flush old channel */
+
+	call ipc_$create_ev_chn (cdte.event, code);
+	if code ^= 0 then do;
+EVENT_CHANNEL_LOSS: call convert_ipc_code_ (code);
+	     call sys_log_$error_log (SL_LOG, code, NAME, "Creating event channel for multiplexer ^a.",
+		mpx_channel_name);
+	     P_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	call ipc_$decl_ev_call_chn (cdte.event, hasp_wakeup_handler, cdtep, MPX_LOAD_PRIO, code);
+	if code ^= 0 then go to EVENT_CHANNEL_LOSS;
+
+	call prepare_load_data ();			/* get bootload data from channel names and additional info */
+
+	call hphcs_$tty_control (mpx_channel_name, "load_mpx", hld_ptr, code);
+	free hasp_load_data in (system_area);		/* ring-0 copies all essential data */
+
+	P_code = code;
+
+	return;
+
+
+BAD_LOAD_PARAMETER:
+	call sys_log_ (SL_LOG, "^a: Invalid ^a specification in terminal type ^a for multiplexer ^a.",
+	     NAME, load_parameter_name, cdte.initial_terminal_type, mpx_channel_name);
+
+ABORT_LOAD:
+	if hld_ptr ^= null () then
+	     free hasp_load_data in (system_area);	/* flush it */
+
+	P_code = error_table_$action_not_performed;
+	return;
+%page;
+/* Handle wakeups over the bootload event channel */
+
+hasp_wakeup_handler:
+     entry (P_event_call_info_ptr);
+
+	event_call_info_ptr = P_event_call_info_ptr;
+
+	cdtp = saved_cdtp;
+	cdtep = event_call_info.data_ptr;		/* -> channel definition of the multiplexer */
+	mpxep = addr (cdte.initial_command);
+
+	if (event_call_info.ring ^= 0) & (event_call_info.sender ^= get_process_id_ ()) then do;
+						/* not myself or ring-0, must be a lie */
+	     string (event_message_array) = unspec (event_call_info.message);
+	     call sys_log_ (SL_LOG, "^a: Unexpected wakeup (^w ^w) from process ^w.", NAME, event_message_array,
+		event_call_info.sender);
+	     return;
+	end;
+
+	mpx_channel_name = cdte.name;			/* for other reference */
+
+	if (event_call_info.message ^= HASP_MPX_UP) & (event_call_info.message ^= HASP_MPX_DOWN) & (event_call_info.message ^= HASP_MPX_MASKED) then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup for multiplexer ^a has invalid state code ^d.", NAME,
+		mpx_channel_name, event_call_info.message);
+	     return;
+	end;
+
+	call sys_log_ (SL_LOG, "^a: ^[Load^;Crash^] signalled for multiplexer ^a.", NAME,
+	     (event_call_info.message = HASP_MPX_UP), mpx_channel_name);
+
+	if mpxe.state = MPX_BOOT then			/* multiplexer is booting */
+	     if event_call_info.message = HASP_MPX_UP then
+		call multiplexer_mgr_$mpx_loaded (mpx_channel_name, code);
+	     else call multiplexer_mgr_$mpx_load_failed (mpx_channel_name, code);
+
+
+	else if mpxe.state = MPX_UP then		/* multiplexer is running */
+	     if event_call_info.message ^= HASP_MPX_UP then
+		call multiplexer_mgr_$mpx_crashed (mpx_channel_name, (event_call_info.message = HASP_MPX_DOWN), code);
+
+	return;
+%page;
+/* Dump a multiplexer */
+
+hasp_dump:
+     entry (P_mpx_channel_name, P_cdtp, P_cdtep, P_code);
+
+	P_code = 0;				/* none yet implemented (and may never be either) */
+
+	return;
+%page;
+/* Validate a HASP multiplexer:  called from cv_cmf */
+
+hasp_cv_cmf:
+     entry (P_cdtp, P_cdtep, P_mpx_channel_name, P_subchannel_list_ptr, P_error);
+
+	cdtp = P_cdtp;
+	cdtep = P_cdtep;
+	mpx_channel_name = P_mpx_channel_name;
+	subchannel_list_ptr = P_subchannel_list_ptr;
+	error = P_error;				/* error reporting procedure */
+
+
+/* Validate that the major channel is not a FNP and has a BISYNC line type */
+
+	if index (mpx_channel_name, ".") = 0 then
+	     call error (1, 2, "A HASP multiplexer cannot be configured as an FNP.  ^a", "^a", mpx_channel_name, "");
+
+	if cdte.line_type ^= LINE_BSC then
+	     call error (2, 2, "A HASP multiplexer must have a line type of BSC.  ^a", "^a", mpx_channel_name, "");
+
+
+/* Validate the names of the sub-channels */
+
+	if subchannel_list.count > 17 then
+	     call error (3, 2, "More than 17 subchannels specified for HASP multiplexer ^a.", "^a",
+		mpx_channel_name, "");
+
+	start_subchannel_name_idx = length (rtrim (cdte.name)) + 2;
+
+	found_console = "0"b;			/* haven't seen a console yet */
+	found_readers (*),				/* haven't found any devices yet either */
+	     found_printers (*),
+	     found_punches (*) = ""b;
+
+	do idx = 1 to subchannel_list.count;
+
+	     call parse_subchannel_name ("0"b, (subchannel_list.cdteps (idx)), (0), (0));
+NEXT_SUBCHANNEL:
+	end;
+
+	if ^found_console then			/* must have an operator's console */
+	     call error (7, 2, "No operator's console configured for HASP multiplexer ^a.", "^a", mpx_channel_name, "");
+
+	return;
+%page;
+/* Prepare the data structure for the "load_mpx" control order */
+
+prepare_load_data:
+     procedure ();
+
+dcl  additional_info_str character (512) varying;
+dcl  value character (32) varying;
+dcl  p pointer;
+dcl  idx fixed binary;
+
+	if subchannel_list.count > 17 then do;
+	     call sys_log_ (SL_LOG, "^a: More than 17 subchannels specified for HASP multiplexer ^a (^d).",
+		NAME, mpx_channel_name, subchannel_list.count);
+	     go to ABORT_LOAD;
+	end;
+
+	hasp_load_data_n_subchannels = subchannel_list.count;
+
+	allocate hasp_load_data in (system_area) set (hld_ptr);
+						/* sets hasp_load_data.n_subchannels */
+
+	hasp_load_data.event_channel = cdte.event;
+	hasp_load_data.configuration_data = DEFAULT_HASP_CONFIGURATION_DATA;
+
+
+/* Validate the sub-channel names:  check for duplicate sub-channel names and determine each sub-channel's device type and
+   device number */
+
+	start_subchannel_name_idx = length (rtrim (cdte.name)) + 2;
+
+	found_console = "0"b;			/* haven't seen a console yet */
+	found_readers (*),				/* haven't found any devices yet either */
+	     found_printers (*),
+	     found_punches (*) = ""b;
+
+	do idx = 1 to subchannel_list.count;
+
+	     p = subchannel_list.cdteps (idx);
+
+	     hasp_load_data.subchannels (idx).devx = p -> cdte.twx;
+
+	     call parse_subchannel_name ("1"b, p,
+		hasp_load_data.subchannels (idx).device_type, hasp_load_data.subchannels (idx).device_number);
+	end;
+
+
+/* Get configuration data from additional_info for the channel's terminal type (if any) */
+
+	if (cdte.initial_terminal_type = "") |		/* no terminal type:  use default configuration data */
+	     (cdte.initial_terminal_type = low (length (cdte.initial_terminal_type))) then
+	     return;
+
+	call ttt_info_$additional_info (cdte.initial_terminal_type, additional_info_str, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (SL_LOG, code, NAME,
+		"Cannot get additional info from terminal type ^a for multiplexer ^a.",
+		cdte.initial_terminal_type, mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+
+	if length (additional_info_str) = 0 then	/* no information:  use default */
+	     return;
+
+	if find_parameter ("type", value) then		/* check type of other side:  set multiplexer's type */
+	     if (value = "workstation") then
+		hasp_load_data.type = HASP_HOST;	/* foreign side is the workstation */
+	     else if (value = "host") then
+		hasp_load_data.type = HASP_WORKSTATION;
+	     else go to BAD_LOAD_PARAMETER;
+
+	call find_switch_parameter ("suspend_all_mode", hasp_load_data.suspend_all_mode);
+
+	call find_switch_parameter ("signon_mode", hasp_load_data.signon_mode);
+
+	call find_switch_parameter ("multileave_mode", hasp_load_data.multileave_mode);
+
+	call find_switch_parameter ("trace_mode", hasp_load_data.trace_mode);
+
+	if find_parameter ("rts_mode", value) then
+	     if (value = "yes") then
+		hasp_load_data.rts_mode = "1"b;
+	     else if (value = "no") then
+		hasp_load_data.rts_mode = "0"b;
+	     else go to BAD_LOAD_PARAMETER;
+	else					/* default setting depends on multiplexer's type ... */
+	     if (hasp_load_data.type = HASP_HOST) then
+	     hasp_load_data.rts_mode = "0"b;		/* ... host doesn't need to ask permission */
+	else hasp_load_data.rts_mode = "1"b;		/* ... but a workstation usually does */
+
+	call find_numeric_parameter
+	     ("block_size", hasp_load_data.max_block_size, HASP_MIN_MAX_BLOCK_SIZE, HASP_MAX_MAX_BLOCK_SIZE);
+
+	call find_numeric_or_none_parameter ("connect_timeout", hasp_load_data.ic_timeout, 1, 60, 0);
+
+	call find_numeric_parameter ("receive_timeout", hasp_load_data.receive_timeout, 1, 60);
+
+	call find_numeric_parameter ("transmit_timeout", hasp_load_data.transmit_timeout, 1, 60);
+
+	call find_numeric_parameter ("max_naks", hasp_load_data.max_naks, 5, 100);
+
+	call find_numeric_parameter ("max_device_input_records", hasp_load_data.max_device_input_records, 3, 30);
+
+	return;
+%page;
+/* Find the specified parameter in the additional_info_str and return it's value */
+
+find_parameter: procedure (P_parameter_name, P_parameter_value) returns (bit (1) aligned);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  P_parameter_value character (*) varying parameter;
+
+dcl  (idx, jdx) fixed binary;
+
+	     idx = index (additional_info_str, P_parameter_name || "=");
+	     if idx = 0 then			/* not specified */
+		return ("0"b);
+
+	     load_parameter_name = P_parameter_name;
+
+	     idx = idx + length (P_parameter_name) + 1;	/* past the parameter name, pick up value */
+	     if idx > length (additional_info_str) then
+		go to BAD_LOAD_PARAMETER;		/* no parameter value */
+
+	     jdx = verify (substr (additional_info_str, idx), " ");
+	     if jdx = 0 then			/* white space only */
+		go to BAD_LOAD_PARAMETER;
+
+	     idx = idx + jdx - 1;			/* skip the whitespace */
+
+	     jdx = search (substr (additional_info_str, idx), " ,");
+	     if jdx = 0 then			/* rest of string */
+		jdx = length (additional_info_str) - idx + 2;
+	     if (jdx - 1) > maxlength (P_parameter_value) then
+		go to BAD_LOAD_PARAMETER;		/* too long */
+
+	     P_parameter_value = substr (additional_info_str, idx, (jdx - 1));
+
+	     return ("1"b);				/* got it */
+
+	end find_parameter;
+%page;
+/* Find the specified switch parameter in additional_info_str:  the value must be either "yes" or "no" */
+
+find_switch_parameter:
+	procedure (P_parameter_name, P_parameter);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  P_parameter bit (1) unaligned parameter;
+
+dcl  value character (3) varying;
+
+	     if find_parameter (P_parameter_name, value) then
+						/* if the parameter is there */
+		if (value = "yes") then
+		     P_parameter = "1"b;
+
+		else if (value = "no") then
+		     P_parameter = "0"b;
+
+		else go to BAD_LOAD_PARAMETER;
+
+	     return;
+
+	end find_switch_parameter;
+%page;
+/* Find the specified numeric parameter in additional_info_str and validate it */
+
+find_numeric_parameter:
+	procedure (P_parameter_name, P_parameter_value, P_parameter_min, P_parameter_max);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  (P_parameter_value, P_parameter_min, P_parameter_max) fixed binary parameter;
+
+dcl  value character (12) varying;
+dcl  numeric_value fixed binary (35);
+
+	     if find_parameter (P_parameter_name, value) then do;
+						/* if the parameter is there */
+		if verify (value, "0123456789") ^= 0 then
+		     go to BAD_LOAD_PARAMETER;	/* non-numeric string */
+
+		numeric_value = binary (value, 35, 0);
+		if (numeric_value < P_parameter_min) | (numeric_value > P_parameter_max) then
+		     go to BAD_LOAD_PARAMETER;
+
+		P_parameter_value = numeric_value;	/* a good value */
+	     end;
+
+	     return;
+
+	end find_numeric_parameter;
+
+
+
+/* Find the specified numeric parameter in additional_info_str and validate it: permit "none" as a special case */
+
+find_numeric_or_none_parameter:
+	procedure (P_parameter_name, P_parameter_value, P_parameter_min, P_parameter_max, P_none_parameter_value);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  (P_parameter_value, P_parameter_min, P_parameter_max, P_none_parameter_value) fixed binary parameter;
+
+dcl  value character (12) varying;
+dcl  numeric_value fixed binary (35);
+
+	     if find_parameter (P_parameter_name, value) then do;
+						/* if the parameter is there */
+		if (value = "none") then do;
+		     P_parameter_value = P_none_parameter_value;
+		     return;			/* "none" is not necessarily the same as default */
+		end;
+
+		if verify (value, "0123456789") ^= 0 then
+		     go to BAD_LOAD_PARAMETER;	/* non-numeric string */
+
+		numeric_value = binary (value, 35, 0);
+		if (numeric_value < P_parameter_min) | (numeric_value > P_parameter_max) then
+		     go to BAD_LOAD_PARAMETER;
+
+		P_parameter_value = numeric_value;	/* a good value */
+	     end;
+
+	     return;
+
+	end find_numeric_or_none_parameter;
+
+     end prepare_load_data;
+%page;
+/* Parse a sub-channel name:  validate that the channel name is legal and not a duplicate */
+
+parse_subchannel_name:
+     procedure (P_called_from_load, P_cdtep, P_subchannel_type, P_subchannel_number);
+
+dcl  P_called_from_load bit (1) aligned parameter;
+dcl  P_cdtep pointer parameter;
+dcl  (P_subchannel_type, P_subchannel_number) fixed binary;
+
+dcl  p pointer;
+dcl  name_part character (3) varying;
+dcl  number_part character (1) varying;
+dcl  (device_number, name_lth) fixed binary;
+
+	p = P_cdtep;
+
+	name_lth = length (rtrim (p -> cdte.name)) - start_subchannel_name_idx + 1;
+	if (name_lth < 3) | (name_lth > 4) then go to BAD_NAME;
+
+	name_part = substr (p -> cdte.name, start_subchannel_name_idx, 3);
+
+	if name_lth > 3 then			/* seems to have a device number */
+	     number_part = substr (p -> cdte.name, (start_subchannel_name_idx + 3), (name_lth - 3));
+	else number_part = "";
+
+	if (name_part ^= "opr") & (name_part ^= "rdr") & (name_part ^= "prt") & (name_part ^= "pun") then
+	     go to BAD_NAME;			/* unknown device type */
+
+
+/* Determine device number */
+
+	if (name_part = "opr") then			/* the "operator's" console */
+	     if length (number_part) ^= 0 then		/* can't have a number */
+		go to BAD_NAME;
+	     else device_number = 1;
+
+	else do;					/* reader/printer/punch */
+	     if length (number_part) = 0 then		/* must have device number */
+		go to BAD_NAME;
+	     if verify (number_part, "0123456789") ^= 0 then go to BAD_NAME;
+	     device_number = binary (number_part, 17, 0);
+	     if (device_number < 1) | (device_number > 8) then go to BAD_NAME;
+	end;
+
+
+/* Determine device type and whether this is a duplicate */
+
+	if (name_part = "opr") then
+	     if found_console then go to DUPLICATE_NAME;
+	     else do;
+		found_console = "1"b;
+		P_subchannel_type = HASP_CONSOLE;
+	     end;
+
+	else if (name_part = "rdr") then
+	     if found_readers (device_number) then go to DUPLICATE_NAME;
+	     else do;
+		found_readers (device_number) = "1"b;
+		P_subchannel_type = HASP_READER;
+	     end;
+
+	else if (name_part = "prt") then
+	     if found_printers (device_number) then
+		go to DUPLICATE_NAME;
+	     else if found_punches (9 - device_number) then
+		go to OVERLAPPING_PRINTERS_AND_PUNCHES;
+	     else do;
+		found_printers (device_number) = "1"b;
+		P_subchannel_type = HASP_PRINTER;
+	     end;
+
+	else if (name_part = "pun") then		/* last possibility */
+	     if found_punches (device_number) then
+		go to DUPLICATE_NAME;
+	     else if found_printers (9 - device_number) then
+		go to OVERLAPPING_PRINTERS_AND_PUNCHES;
+	     else do;
+		found_punches (device_number) = "1"b;
+		P_subchannel_type = HASP_PUNCH;
+	     end;
+
+	if P_subchannel_type ^= HASP_CONSOLE then do;
+	     if (p -> cdte.service_type ^= SLAVE_SERVICE) then
+		go to NOT_SLAVE_SERVICE;
+	end;
+	else do;
+	     if (p -> cdte.service_type ^= SLAVE_SERVICE & p -> cdte.service_type ^= ANS_SERVICE) then
+		go to NOT_SLAVE_OR_LOGIN_SERVICE;
+
+	     if (p -> cdte.service_type = ANS_SERVICE)
+	     then do;
+		if (p -> cdte.line_type ^= LINE_HASP_OPR) then
+		     go to BAD_OPR_LINE_TYPE;
+						/* have to special case and use an IOCB */
+		p -> cdte.use_iocb = "1"b;
+	     end;
+	end;
+
+	P_subchannel_number = device_number;
+
+	return;
+
+
+/* Error handlers */
+
+BAD_NAME: if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Invalid subchannel name ^a for HASP multiplexer ^a.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (4, 2, "Invalid subchannel name ^a for HASP multiplexer ^a.", "^a for ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+BAD_OPR_LINE_TYPE:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG,
+		"^a: Line type for hasp operator console on multiplexer ^a must be ""HASP_OPR"" when configured for login service.",
+		NAME, cdte.name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (8, 2,
+		"Line type for hasp operator console on multiplexer ^a must be ""HASP_OPR"" when configured for login service.",
+		"^a", (cdte.name), "");
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+DUPLICATE_NAME:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Duplicate subchannel name ^a for HASP multiplexer ^a.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (5, 2, "Duplicate subchannel name ^a for HASP multiplexer ^a.", "^a for ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+NOT_SLAVE_SERVICE:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Subchannel ^a of multiplexer ^a does not have a slave service type.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (9, 2, "Subchannel ^a of multiplexer ^a does not have a slave service type.",
+		"subchannel ^a of multiplexer ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+NOT_SLAVE_OR_LOGIN_SERVICE:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Subchannel ^a of multiplexer ^a does not have a slave or login service type.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (10, 2, "Subchannel ^a of multiplexer ^a does not have a slave or login service type.",
+		"subchannel ^a of mux ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+OVERLAPPING_PRINTERS_AND_PUNCHES:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Too many printers and punches configured for HASP multiplexer ^a.",
+		NAME, mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (6, 2, "Too many printers and punches configured for HASP multiplexer ^a.", "^a",
+		mpx_channel_name, "");
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+     end parse_subchannel_name;
+%page;
+%include hasp_load_data;
+%page;
+%include cdt;
+%page;
+%include author_dcl;
+%page;
+%include line_types;
+%page;
+%include as_wakeup_priorities;
+
+%include event_call_info;
+%page;
+%include sys_log_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   as_hasp_mpx_: ERROR_MESSAGE. Creating event channel for multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  A system error arose during the initialization of the HASP multiplexer
+   on channel TTY.
+
+   A:  $inform
+
+
+   Message:
+   as_hasp_mpx_: Invalid PARM specification in terminal type NAME for multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The value specified for the configuration parameter PARM in the additional info string of the terminal type NAME
+   used for the HASP multiplexer on channel TTY is not acceptable to the system.
+
+   A:  Correct the value of the parameter in the TTT and reload the multiplexer.
+
+
+   Message:
+   as_hasp_mpx_: Unexpected wakeup (DATA1 DATA2) from process ID.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  A message was received from the process whose processid is the 12-digit octal value ID; the contents of the message
+   are given by the two 12-digit octal values DATA1 and DATA2.  No message was expected at this time.  The wakeup is
+   ignored.
+
+   A:  $ignore
+
+
+   Message:
+   as_hasp_mpx_: Wakeup from multiplexer TTY has invalid state code VALUE.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  A message was received indicating a change of state for the multiplexer on channel TTY; however, the new state of
+   the multiplexer, given by the decimal number VALUE, is not recognized by this module.
+
+   A:  $inform
+
+
+   Message:
+   as_hasp_mpx_: Load signalled for multiplexer TTY.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  The physical connection and initial connection protocl for the HASP multiplexer on channel TTY has been completed
+   successfully.  The multiplexer is now ready for use.
+
+   A:  Start the appropriate I/O daemon processes for the multiplexer as indicated by the system administrators or by the
+   user who requested the multiplexer be loaded.
+
+
+   Message:
+   as_hasp_mpx_: Crash signalled for multiplexer TTY.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  The physical connection for the HASP multiplexer on channel TTY has been broken either because of an error or
+   or because of a request from the remote host/workstation.
+
+   A:  Check the console for a message concerning this channel from hasp_mpx.  If such a message is found, refer to its
+   documentation for further action; otherwise, the remote host/workstation has requested termination of the connection
+   and the I/O daemons using this channel should be logged out.
+
+
+   Message:
+   as_hasp_mpx_: More than 17 subchannels specified for HASP multiplexer TTY (COUNT).
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The definition of the HASP multiplexer on channel TTY contains too many subchannels.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: ERROR_MESSAGE. Cannot get additional info from terminal type NAME for multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The terminal type specified by NAME was not given an additional_info string in its TTT entry.  This string is
+   required to specify the configuration parameters for the HASP multiplexer on channel TTY.
+
+   A:  Check both the CDT entry for this multiplexer and the TTT entry for the terminal type.  Either the wrong terminal
+   type was specified in the CDT or the terminal type's definition is incomplete.  Correct whichever table is in error and
+   reload the multiplexer.
+
+
+   Message:
+   as_hasp_mpx_: Invalid subchannel name NAME for HASP multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The name specified for a subchannel of the HASP multiplexer on channel TTY does not conform to the conventions
+   defined in MAM Communications for naming such channels.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Line type for hasp operator console on multiplexer TTY must be
+   "HASP_OPR" when configured for login service.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system
+   initialization.
+
+   M:  The line type must be set for HASP_OPR on a hasp operator console
+   subchannel when it is configured for login service.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Duplicate subchannel name NAME for HASP multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The same name has been used for two or more subchannels of the HASP multiplexer on channel TTY.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Subchannel NAME of multiplexer TTY does not have TYPE service type.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The specified subchannel of the HASP multiplexer on channel TTY was not
+   given the slave service type or, in the case of operator console
+   subchannels, slave or login.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Too many printers and punches configured for HASP multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  More than 8 card punches and line printers have been specified for the HASP multiplexer on channel TTY or a card
+   punch and line printer which use the same flow control flag have been specified.  (See MAM Communications for a
+   description of the rules for naming card punches and line printers.)
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+   END MESSAGE DOCUMENTATION */
+
+     end as_hasp_mpx_;

@@ -1,0 +1,1338 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* This module supports I/O on blocked files */
+
+open_blk_file:
+     proc (iocb_ptr, fcb_ptr_arg, first_seg_ptr, is_new_file, mode, close_x, first_seg_bitcount, max_comp_size, code);
+	code = 0;
+	if is_new_file | ((first_seg_ptr -> bf_head.end_pos = 0) & (mode > 4) & (atb.max_rec_len > 0) & ^atb.inv_lock_reset)
+	then do;					/* initialize empty file */
+		first_seg_ptr -> bf_head.max_rec_len = iocb_ptr -> iocb.attach_data_ptr -> atb.max_rec_len;
+						/* determines block size */
+		first_seg_ptr -> bf_head.max_comp_size = max_comp_size;
+		if is_new_file
+		then call hcs_$set_bc_seg (first_seg_ptr, 36 * (size (bf_head)), code);
+						/*
+						   sets initial bitcount */
+		first_seg_ptr -> bf_head.version = current_bf_version;
+	     end;
+	call create_initialize_cb;			/* prepare control block */
+	call create_seg_ptrs;			/* allocates seg_ptr_array if msf */
+	if (cb_ptr -> cb.file_base_ptr -> bf_head.file_action ^= 0) & (mode > 4)
+						/*
+						   operation in progress and output opening */
+	then call adjust_op;			/* adjusts the inconsistency */
+	if (code = 0) & (file_base_ptr -> bf_head.version ^= current_bf_version /* old or bad file */)
+	then if mode > 4				/* modify opening */
+	     then call convert_file;			/* brings version up to date */
+	     else cb.old_version = "1"b;		/* can use without converting if input-only */
+	if code = 0
+	then call set_entries_and_positions;		/* opening is successful */
+	else do;					/* cleanup */
+		call free_seg_ptrs;			/* de-allocates seg_ptr_array if msf */
+		call free_cb_file (size (cb), cb_ptr);	/* release open_data_block */
+		return;
+	     end;
+	if mode > 4
+	then if ^cb.shared
+	     then do;				/* set action and time_stamp */
+		     file_base_ptr -> bf_head.file_action = unshared_opening;
+		     file_base_ptr -> bf_head.time_last_modified = clock ();
+		     return;
+		end;
+	     else go to unlock;			/* leave unlocked for shared openings */
+exit:
+	return;					/* end of open routine */
+
+verify_done:
+	if cb.shared
+	then if file_base_ptr -> bf_head.time_last_modified ^= initial_time_stamp
+	     then do;				/* asynch changes--must retry or abort */
+		     cb.scan_backward = was_scan_backward;
+		     cb.current_pos = old_current_pos;
+		     cb.next_pos = old_next_pos;
+		     cb.current_status = old_current_status;
+		     if clock () < time_limit		/* time left to keep trying */
+		     then go to retry_ent (current_entry);
+		     code = error_table_$file_busy;	/* unable to verify result in time */
+		end;
+	return;					/* back to caller */
+
+init_entry:					/* initialization for passive shared operations */
+	if cb.wait_time < 0
+	then time_limit = forever;
+	else time_limit = clock () + cb.micro_wait_time;
+	was_scan_backward = cb.scan_backward;
+	old_current_pos = cb.current_pos;
+	old_next_pos = cb.next_pos;
+	old_end_pos = cb.end_pos;			/* save for detecting asynch eof changes */
+	old_current_status = cb.current_status;
+	cb.as_ins_del = "00"b;			/* set if asynch insertion or deletion detected */
+	if cb.handler_required			/* asynch component deletions possible */
+	then do;
+setup_handler:
+		comp_num = 0;			/* initial ref is to header comp */
+		on seg_fault_error
+		     begin;			/* deals with asynch comp deletions */
+			on seg_fault_error
+			     system;		/* fuck you */
+			dname = substr (attach_descrip_string, 8, dname_len);
+			ename = substr (attach_descrip_string, 9 + dname_len, ename_len);
+			on seg_fault_error
+			     go to inv_header;
+			call hcs_$status_mins (cb.file_base_ptr, type, bc, foo);
+			if foo ^= 0
+			then do;			/* re-initiate header ptr */
+inv_header:
+				on seg_fault_error
+				     system;
+				call hcs_$terminate_seg (cb.file_base_ptr, 1, foo);
+				call hcs_$initiate ((dname), (ename), "", 1, 1, cb.file_base_ptr, foo);
+						/*
+						   re-initiate header component, in case this was cause of fault */
+				if foo = 0
+				then go to resume;
+				dname = dname || ">" || ename;
+						/* probably is an msf */
+				call hcs_$initiate ((dname), "0", "", 1, 1, cb.file_base_ptr, foo);
+				if foo = 0	/* header ptr had to be re-initialized, msf case */
+				then go to resume;
+			     end;
+			else if comp_num > 0	/* may have faulted because of ref to later comp */
+			then do;			/* try re-initiating this component if necessary */
+				on seg_fault_error
+				     system;
+				call hcs_$status_mins (cb.seg_ptr_array_ptr -> seg_ptr_array (comp_num), type, bc,
+				     foo);
+				if foo ^= 0
+				then do;		/* re-obtain ptr to component */
+					dname = dname || ">" || ename;
+					call hcs_$terminate_seg (seg_ptr_array (comp_num), 1, foo);
+					call hcs_$initiate ((dname), ltrim (char (comp_num)), "", 1, 1,
+					     cb.seg_ptr_array_ptr -> seg_ptr_array (comp_num), foo);
+					if foo = 0/* that was the problem */
+					then go to resume;
+				     end;
+			     end;
+			call continue_to_signal_ (foo);
+						/* unaccountable error */
+resume:
+			dcl     dname		 char (168) var;
+			dcl     ename		 char (32) var;
+			dcl     type		 fixed (2);
+			dcl     bc		 fixed (24);
+			dcl     foo		 fixed (35);
+		     end;				/* end of handler logic */
+	     end;
+	go to retry_ent (current_entry);		/* continue with operation */
+
+position_blk_file:
+     entry (iocb_ptr, pos_type, n_recs, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	if cb.shared
+	then do;
+		current_entry = 1;
+		go to init_entry;
+retry_ent (1):
+		call prepare_process;
+	     end;
+	code = 0;
+
+	if pos_type = 2				/* direct positioning */
+	then if n_recs < 0				/* absolute position must be >=0 */
+	     then code = error_table_$negative_nelem;
+	     else if (n_recs > cb_ptr -> cb.end_pos) & ^cb.noend
+						/* attempt to pass eof */
+	     then do;				/* signal error and go to end of file */
+eof_error:
+		     call position_eof;
+		     code = error_table_$end_of_info;
+		end;
+	     else do;				/* successful position operation */
+		     cb_ptr -> cb.next_pos = n_recs;
+		     cb_ptr -> cb.current_pos = n_recs;
+		     cb.current_status = "00"b;	/* indicates that record is
+						   not definitely known to be either present or absent */
+		end;
+	else if pos_type = 0			/* relative positioning */
+	then if (cb.as_ins_del = "01"b) & ^cb.noend
+	     then do;
+		     code = error_table_$asynch_deletion;
+						/* warn user his
+						   position is not where he may think */
+		     cb.current_status = "01"b;	/* current known absent */
+		end;
+	     else do;				/* skip forward or backward */
+		     cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos + n_recs;
+						/* move next position */
+		     if cb_ptr -> cb.next_pos < 0	/* attempt to pass bof */
+		     then do;			/* signal error and go to file base */
+			     call position_bof;
+			     code = error_table_$end_of_info;
+			end;
+		     else if (cb_ptr -> cb.next_pos > cb_ptr -> cb.end_pos) & ^cb.noend
+						/* attempt to pass eof */
+		     then go to eof_error;
+		     else do;
+			     cb.current_status = "00"b;
+			     cb_ptr -> cb.current_pos = cb_ptr -> cb.next_pos;
+						/* successful skip */
+			end;
+		end;
+
+	else if pos_type = -1			/* beginning of file */
+	then call position_bof;
+
+	else if pos_type = 1			/* end of file */
+	then call position_eof;
+	else do;
+		code = error_table_$bad_arg;
+		return;				/* don't alter scan state */
+	     end;
+	cb_ptr -> cb.scan_backward = ((code = 0) & (pos_type = 0) & (n_recs < 0));
+						/* for masking logically absent records */
+	go to verify_done;				/* end of main position routine */
+
+read_length_blk_file:
+     entry (iocb_ptr, rec_len, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	if cb.shared
+	then do;
+		current_entry = 2;
+		go to init_entry;
+retry_ent (2):
+		call prepare_process;
+	     end;
+	call find_next_record;			/* sets code */
+	if code = 0				/* record found at next position */
+	then rec_len = max (0, seg_ptr -> seg (pos));	/* record length at record head */
+	go to verify_done;				/* end of read_length routine */
+
+read_blk_file:
+     entry (iocb_ptr, buff_ptr, buff_len, rec_len, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	if cb.shared
+	then do;
+		current_entry = 3;
+		go to init_entry;
+retry_ent (3):
+		call prepare_process;
+	     end;
+	call find_next_record;
+	if code = 0				/* record found */
+	then do;					/* read the record */
+		rec_len = max (0, seg_ptr -> seg (pos));/* length in record header */
+		if rec_len > buff_len		/* record too big for buffer */
+		then do;				/* signal error, but still prepare to move part record */
+			code = error_table_$long_record;
+			n = buff_len;		/* smaller than rec_len */
+		     end;
+		else n = rec_len;			/* move entire record into buffer */
+		if n > 0				/* in case negative */
+		then substr (buff_ptr -> buffer, 1, n) = substr (seg_ptr -> seg_str, 4 * (pos + 1) + 1, n);
+						/* move record into buffer */
+		cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos + 1;
+						/* advance next record position */
+	     end;
+	go to verify_done;				/* end of read_record routine */
+
+end_update:
+	if cb.shared
+	then do;
+		file_base_ptr -> bf_head.file_action = 0;
+						/* mark operation complete */
+		go to unlock;
+	     end;
+	return;
+
+unlock_exit:
+	if cb.shared
+	then do;
+unlock:
+		if stacq (file_base_ptr -> bf_head.file_lock, "0"b, cb.saved_lock_copy)
+						/* resets the lock */
+		then ;
+	     end;
+	return;					/* exit */
+
+write_blk_file:
+     entry (iocb_ptr, buff_ptr, buff_len, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	code = 0;
+	if buff_len > cb_ptr -> cb.max_rec_len		/* record length exceeds maximum */
+	then code = error_table_$long_record;
+	else if buff_len < 0
+	then code = error_table_$negative_nelem;
+	else do;
+		if cb.shared
+		then do;
+			if cb.handler_required	/* comps may vanish */
+			then do;			/* handle seg_fault_errors */
+				current_entry = 6;	/* handler must be in my frame */
+				go to setup_handler;/* kludged call */
+			     end;			/* now OK to reference file */
+retry_ent (6):
+			call lock_file_check;
+		     end;
+		if cb_ptr -> cb.next_pos < cb_ptr -> cb.end_pos
+						/* not at end of file */
+		then if cb_ptr -> cb.appending | (cb_ptr -> cb.mode = 5)
+		     then do;			/* go to eof--not an error */
+			     action = append;
+			     call position_eof;	/* instead go to end of file */
+			end;
+		     else if cb.as_ins_del = "10"b
+		     then do;			/* warn user he is not appending as expected */
+			     code = error_table_$asynch_insertion;
+			     cb.current_status = "00"b;
+						/* still may be logically
+						   deleted, however */
+			     cb.scan_backward = "0"b;
+			end;
+		     else if cb_ptr -> cb.mode = 6	/* input_output */
+		     then action = write_trunc;	/* truncate after write */
+		     else action = rewrite;		/* replace an existing rec */
+		else if cb.as_ins_del = "01"b
+		then if ^cb_ptr -> cb.noend & (cb_ptr -> cb.mode = 5)
+						/* output opening */
+		     then do;			/* no error--just get back to eof */
+			     action = append;
+			     call position_eof;
+			end;
+		     else do;			/* asynchronously moved to eof--warn him */
+			     code = error_table_$asynch_deletion;
+			     cb.current_status = "01"b;
+						/* known absent */
+			     cb.scan_backward = "0"b;
+			end;
+		else action = append;		/* extending file */
+		cb_ptr -> cb.current_pos = cb_ptr -> cb.next_pos;
+						/* set current position */
+		if code ^= 0			/* asynch insertion or deletion */
+		then go to unlock_exit;
+	     end;
+	if code = 0
+	then do;
+		if cb_ptr -> cb.ssf_sw		/* might be full */
+		then if cb_ptr -> cb.current_pos >= cb_ptr -> cb.capacity
+						/* not enough room */
+		     then do;
+			     code = error_table_$file_is_full;
+			     go to unlock_exit;
+			end;
+		call init_update (action);
+		call get_current_pos;
+		if comp_num > cb_ptr -> cb.last_comp_num/* must extend msf */
+		then do while (comp_num > cb.last_comp_num);
+			call set_bc (cb_ptr -> cb.capacity);
+						/* set bitcount of full component */
+			call extend_seg_ptr_array (cb.last_comp_num + 1);
+						/* may re-allocate seg_ptr_array */
+			cb_ptr -> cb.last_comp_num = cb.last_comp_num + 1;
+			call msf_manager_$get_ptr (cb.fcb_ptr, cb.last_comp_num, "1"b, seg_ptr, foo24, code);
+						/* create a new component */
+			if code ^= 0
+			then go to exit;
+			cb.seg_ptr_array_ptr -> seg_ptr_array (cb.last_comp_num) = seg_ptr;
+			file_base_ptr -> bf_head.last_comp = cb.last_comp_num;
+		     end;
+		else seg_ptr = get_seg_ptr (comp_num);
+		call insert_record;			/* does the assignment */
+		if cb_ptr -> cb.current_pos >= cb_ptr -> cb.end_pos
+						/* at eof */
+		then do;
+			if cb.shared
+			then file_base_ptr -> bf_head.end_pos = cb.next_pos;
+			cb_ptr -> cb.end_pos = cb_ptr -> cb.next_pos;
+						/* advance end */
+		     end;
+		else if action = write_trunc		/* must truncate now */
+		then do;
+			call truncate_file;		/* truncates at next position */
+			cb.current_pos = cb.next_pos - 1;
+		     end;				/* current_pos at record just written, next at eof */
+		go to end_update;			/* clears action and unlocks if shared */
+	     end;
+	return;					/* end of write_record routine */
+
+rewrite_blk_file:
+     entry (iocb_ptr, buff_ptr, buff_len, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	if buff_len > cb_ptr -> cb.max_rec_len		/* record length exceeds maximum */
+	then code = error_table_$long_record;
+	else if buff_len < 0
+	then code = error_table_$negative_nelem;
+	else do;					/* proceed with rewrite */
+		if cb.shared
+		then do;
+			if cb.handler_required
+			then do;
+				current_entry = 7;
+				go to setup_handler;
+			     end;
+retry_ent (7):
+			call lock_file_check;
+		     end;
+		if cb.current_pos >= cb.end_pos	/* end of file */
+		then do;
+			if cb.as_ins_del = "01"b
+			then code = error_table_$asynch_deletion;
+			else code = error_table_$no_record;
+			cb.current_status = "01"b;	/* known absent */
+			cb.scan_backward = "0"b;
+			go to unlock_exit;		/* abort */
+		     end;
+		call get_current_pos;
+		seg_ptr = get_seg_ptr (comp_num);
+		if seg_ptr -> seg (pos) = 0		/* logically absent record--error */
+		then do;
+			if cb.current_status = "10"b	/* should be present */
+			then code = error_table_$asynch_deletion;
+			else code = error_table_$no_record;
+			cb.current_status = "01"b;	/* now we know it's absent */
+		     end;
+		else do;				/* successful rewrite */
+			call init_update (rewrite);
+			code = 0;
+			call insert_record;		/* does the work */
+			go to end_update;
+		     end;
+		go to unlock_exit;
+	     end;
+	return;					/* end of rewrite routine */
+
+delete_blk_file:
+     entry (iocb_ptr, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	if cb.shared
+	then do;
+		if cb.handler_required
+		then do;
+			current_entry = 8;
+			go to setup_handler;
+		     end;
+retry_ent (8):
+		call lock_file_check;
+	     end;
+	if cb.current_pos >= cb.end_pos		/* at or beyond eof */
+	then do;					/* treat as an error */
+		if cb.as_ins_del = "01"b
+		then code = error_table_$asynch_deletion;
+		else code = error_table_$no_record;
+		cb.current_status = "01"b;
+		cb.scan_backward = "0"b;
+		go to unlock_exit;
+	     end;
+	call get_current_pos;
+	seg_ptr = get_seg_ptr (comp_num);
+	if seg_ptr -> seg (pos) = 0			/* already deleted or not present */
+	then do;
+		if cb.current_status = "10"b
+		then code = error_table_$asynch_deletion;
+		else code = error_table_$no_record;
+		cb.current_status = "01"b;
+	     end;
+	else do;					/* successful deletion */
+		if cb.current_pos = cb.end_pos - 1	/* last record */
+		then action = eof_delete;
+		else action = non_eof_delete;
+		call init_update (action);
+		code = 0;
+		unspec (addr (seg_ptr -> seg (pos)) -> record_block) = "0"b;
+						/* zero entire block */
+		if action = non_eof_delete
+		then do;
+			cb.current_status = "00"b;
+			cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos + 1;
+						/* advance */
+		     end;
+		else call set_true_eof;		/* finds last non-deleted record */
+		cb_ptr -> cb.next_pos = cb_ptr -> cb.current_pos;
+						/* by convention after delete */
+		cb_ptr -> cb.scan_backward = "0"b;	/* resume default forward scanning */
+		go to end_update;
+	     end;
+	go to unlock_exit;
+
+control_blk_file:
+     entry (iocb_ptr, order, info_ptr, code);
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	code = 0;
+
+	if order = "read_position"
+	then do;					/* return next record and end of file positions */
+		if cb.shared
+		then do;
+			current_entry = 4;
+			go to init_entry;
+retry_ent (4):
+			call prepare_process;
+		     end;
+		info_ptr -> info1.end_pos = cb_ptr -> cb.end_pos;
+						/* get eof position */
+		info_ptr -> info1.next_pos = cb_ptr -> cb.next_pos;
+						/* get next position */
+		go to verify_done;
+	     end;
+
+	else if order = "record_status"
+	then do;
+		rs_info_ptr = info_ptr;
+		if (rs_info.version < rs_info_version_1) | (rs_info.version > rs_info_version_2)
+		then code = error_table_$unimplemented_version;
+		else if substr (string (rs_info.flags), 1, 6) ^= "0"b
+						/* only 7th bit is supported */
+		then code = error_table_$bad_arg;
+		else do;				/* fill in info structure */
+			if cb.shared
+			then do;
+				current_entry = 5;
+				go to init_entry;
+retry_ent (5):
+				call prepare_process;
+			     end;
+
+			if rs_info.locate_pos_sw	/* set position */
+			then if (rs_info.record_length >= cb.end_pos) & ^cb_ptr -> cb.noend
+			     then go to norec;
+			     else do;		/* use record_length arg as absolute pos */
+				     cb.next_pos = rs_info.record_length;
+				     cb.current_pos = rs_info.record_length;
+				     cb.scan_backward = "0"b;
+				end;
+			else if cb.current_pos >= cb.end_pos
+			then do;
+norec:
+				if cb.as_ins_del = "01"b
+				then code = error_table_$asynch_deletion;
+				else code = error_table_$no_record;
+				cb.current_status = "01"b;
+				go to exit;	/* no need to verify */
+			     end;
+			call get_current_pos;
+			seg_ptr = get_seg_ptr (comp_num);
+			rs_info.max_rec_len = cb.max_rec_len;
+			rs_desc.comp_num = comp_num;
+			rs_desc.offset = pos_bits;
+			if seg_ptr ^= null
+			then do;
+				rs_info.record_ptr = addr (seg_ptr -> seg (pos + 1));
+				rs_info.record_length = max (0, seg_ptr -> seg (pos));
+			     end;
+			if (seg_ptr = null) | ((seg_ptr -> seg (pos) = 0) & ^cb_ptr -> cb.old_version)
+			then do;			/* error--logically absent record */
+				if cb.current_status = "10"b
+				then code = error_table_$asynch_deletion;
+				else code = error_table_$no_record;
+				cb.current_status = "01"b;
+				rs_info.record_ptr = null;
+				rs_info.record_length = 0;
+			     end;
+			else code = 0;
+			go to verify_done;
+		     end;
+	     end;
+
+	else if (order = "truncate") & (cb_ptr -> cb.mode > 4)
+	then do;
+		if cb.shared
+		then do;
+			if cb.handler_required
+			then do;
+				current_entry = 9;
+				go to setup_handler;
+			     end;
+retry_ent (9):
+			call lock_file_check;
+		     end;
+		if cb.next_pos > cb.end_pos		/* beyond end of file--error */
+		then do;
+			if cb.as_ins_del = "01"b
+			then code = error_table_$asynch_deletion;
+			else code = error_table_$end_of_info;
+			cb.current_status = "01"b;
+			go to unlock_exit;
+		     end;
+		cb.current_pos = cb.next_pos;
+		cb.scan_backward = "0"b;
+		if ^cb.shared
+		then do;
+			file_base_ptr -> bf_head.file_action = truncate;
+			call truncate_file;
+			file_base_ptr -> bf_head.file_action = unshared_opening;
+			return;
+		     end;
+		call init_update (truncate);
+		call truncate_file;			/* does the truncation at next_record_pos */
+		go to end_update;
+	     end;
+
+	else if order = "max_rec_len"
+	then do;					/* obtain and possibly set the file's max_rec_len */
+		info_ptr -> info2.old_max_recl = cb_ptr -> cb.max_rec_len;
+		if info_ptr -> info2.new_max_recl < 0	/* negative length is meaningless */
+		then code = error_table_$negative_nelem;
+		else if info_ptr -> info2.new_max_recl > 0
+						/* indicates setting desired */
+		then if (cb_ptr -> cb.mode = 4)	/* changing
+						   max_rec_len not permitted unless file empty and opened for output */
+		     then code = error_table_$no_operation;
+		     else do;			/* OK to change max_rec_len */
+			     if cb.shared
+			     then do;
+				     if cb.handler_required
+				     then do;
+					     current_entry = 10;
+					     go to setup_handler;
+					end;
+retry_ent (10):
+				     call lock_file_check;
+				     file_base_ptr -> bf_head.time_last_modified = clock ();
+				     cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+				end;
+			     if cb.end_pos > 0
+			     then code = error_table_$no_operation;
+			     else do;
+				     cb_ptr -> cb.file_base_ptr -> bf_head.max_rec_len =
+					info_ptr -> info2.new_max_recl;
+				     call set_maxl; /* propagates change to cb variables */
+				end;
+			     go to unlock_exit;
+			end;
+	     end;
+
+	else if order = "file_status"
+	then do;
+		call vfile_status_$seg (iocb_ptr, cb.file_base_ptr, info_ptr, code);
+		return;
+	     end;
+
+	else if order = "io_call"
+	then call vfile_io_control (iocb_ptr, cb.file_base_ptr, info_ptr, code);
+	else code = error_table_$no_operation;		/* invalid order call */
+	return;					/* end of main control routine */
+
+close_blk_file:
+     entry (iocb_ptr);				/* cleanup routine called by vfile_attach */
+	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+	if cb_ptr -> cb.mode > 4			/* eof may have moved */
+	then do;					/* set end of file properly */
+		if cb.shared			/* file not locked */
+		then do;
+			if cb.handler_required
+			then do;
+				current_entry = 11;
+				go to setup_handler;
+			     end;
+retry_ent (11):
+			if ^stac (addr (file_base_ptr -> bf_head.file_lock), cb.saved_lock_copy)
+			then go to just_cleanup;	/* unable to lock--let other user close */
+			else if file_base_ptr -> bf_head.file_action ^= 0
+			then do;			/* leave locked invalidly */
+leave_locked:
+				if stacq (file_base_ptr -> bf_head.file_lock, (36)"1"b, cb.saved_lock_copy)
+				then ;		/* make the lock invalid */
+				go to just_cleanup;
+			     end;
+			else if cb.old_time_stamp ^= file_base_ptr -> bf_head.time_last_modified
+			then call reinit_cb_vars;	/* for asynch changes */
+			else ;			/* cb info is valid */
+		     end;
+		else if (file_base_ptr -> bf_head.file_action ^= unshared_opening)
+			& (file_base_ptr -> bf_head.file_action ^= 0)
+		then go to leave_locked;
+		call position_eof;
+		call get_current_pos;
+		rel_pos = cb_ptr -> cb.end_pos - base_pos;
+						/* eof position relative to base of last comp */
+		if (rel_pos = 0) & (cb_ptr -> cb.end_pos > 0)
+						/* eof at seg_end */
+		then rel_pos = cb_ptr -> cb.capacity;	/* indicates last comp is full */
+		call set_bc (rel_pos);		/* set bitcount of last_comp_num */
+		cb_ptr -> cb.file_base_ptr -> bf_head.end_pos = cb_ptr -> cb.end_pos;
+						/* set end position in header */
+		file_base_ptr -> bf_head.file_action = 0;
+		if stacq (file_base_ptr -> bf_head.file_lock, "0"b, cb.saved_lock_copy)
+						/* unlock the file */
+		then ;
+	     end;
+just_cleanup:
+	call free_seg_ptrs;				/* de-allocates seg_ptr_array, if any */
+	call free_cb_file (size (cb), cb_ptr);		/* deallocates open data block */
+	return;					/* end of close routine */
+
+find_next_record:
+     proc;					/* locates record at next position */
+
+	do while ("1"b);				/* may loop past logically absent records */
+	     cb_ptr -> cb.current_pos = cb_ptr -> cb.next_pos;
+	     if cb_ptr -> cb.current_pos >= cb_ptr -> cb.end_pos
+						/* beyond eof */
+	     then do;				/* error--at end of file */
+		     cb.current_status = "01"b;	/* no current record */
+		     if cb.as_ins_del = "01"b
+		     then code = error_table_$asynch_deletion;
+		     else code = error_table_$end_of_info;
+		     cb_ptr -> cb.scan_backward = "0"b; /* reset to default forward scanning */
+		     return;
+		end;
+	     else do;				/* next record found */
+		     call get_current_pos;
+		     seg_ptr = get_seg_ptr (comp_num);
+		     if (seg_ptr -> seg (pos) ^= 0) | cb.old_version
+						/* not logically absent */
+		     then do;
+			     code = 0;
+			     cb.current_status = "10"b;
+						/* known to be present */
+			     cb.scan_backward = "0"b;
+			     return;
+			end;
+		     else if cb.current_status = "10"b	/* should have been present */
+		     then do;
+			     code = error_table_$asynch_deletion;
+			     cb.current_status = "01"b;
+			     return;
+			end;
+		     cb.current_status = "00"b;	/* will have to scan */
+		     if cb_ptr -> cb.scan_backward	/* preceding operation was backspace */
+		     then if cb_ptr -> cb.next_pos <= 0 /* at bof */
+			then do;			/* error--scanned to bof */
+				code = error_table_$end_of_info;
+				cb.scan_backward = "0"b;
+				cb.current_status = "01"b;
+				return;
+			     end;
+			else cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos - 1;
+						/* scan backward */
+		     else cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos + 1;
+						/* scan forward--default case */
+		end;
+	end;					/* end of scan loop */
+
+     end find_next_record;
+
+get_seg_ptr:
+     proc (comp) returns (ptr);
+	if cb.seg_ptr_array_ptr -> seg_ptr_array (comp) = null
+	then call msf_manager_$get_ptr (cb.fcb_ptr, comp, "0"b, cb.seg_ptr_array_ptr -> seg_ptr_array (comp), foo24, foo);
+	return (cb.seg_ptr_array_ptr -> seg_ptr_array (comp));
+	dcl     comp		 fixed;
+     end get_seg_ptr;
+
+get_current_pos:
+     proc;
+	comp_num = divide (cb_ptr -> cb.current_pos, capacity, 34, 0);
+	base_pos = comp_num * cb_ptr -> cb.capacity;
+	pos = (cb.current_pos - base_pos) * cb.block_size + size (bf_head);
+     end get_current_pos;
+
+prepare_process:
+     proc;					/* initialize for attempt at passive shared operation */
+	code = 0;
+
+	do while ("1"b);				/* wait loop */
+	     initial_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+	     if file_base_ptr -> bf_head.file_action = 0
+	     then go to not_busy;
+	     lock_copy = file_base_ptr -> bf_head.file_lock;
+	     if stac (addr (lock_copy), cb.saved_lock_copy)
+	     then go to not_busy;
+	     if clock () >= time_limit
+	     then do;
+file_busy:
+		     code = error_table_$file_busy;
+		     go to exit;			/* abort entire operation */
+		end;
+	     call set_lock_$lock (lock_copy, 1, code);
+	     if code ^= error_table_$lock_wait_time_exceeded
+	     then go to file_busy;
+	end;					/* end of wait loop */
+
+not_busy:
+	if initial_time_stamp ^= cb.old_time_stamp
+	then do;
+		call reinit_cb_vars;		/* note asynch header changes */
+		cb.old_time_stamp = initial_time_stamp;
+	     end;
+	dcl     lock_copy		 bit (36) aligned;
+     end prepare_process;
+
+reinit_cb_vars:
+     proc;					/* used to reinitialize cb variables to corresponding
+						   header values after detecting asynch changes since last saving these vals */
+	if cb.end_pos ^= file_base_ptr -> bf_head.end_pos
+	then do;
+		if (cb.current_pos < old_end_pos) & (cb.current_pos >= file_base_ptr -> bf_head.end_pos)
+		then cb.as_ins_del = "01"b;
+		else if (cb.current_pos >= old_end_pos) & (cb.current_pos < file_base_ptr -> bf_head.end_pos)
+		then cb.as_ins_del = "10"b;
+		else cb.as_ins_del = "00"b;
+		cb.end_pos = file_base_ptr -> bf_head.end_pos;
+	     end;
+	if ^cb.noend
+	then if cb.current_pos >= cb.end_pos		/* asynch deletions from eof */
+	     then call position_eof;			/* might be more reasonable to return an
+						   error code as well--in any case we can't let user stay at an
+						   impossible position */
+	if cb.last_comp_num ^= file_base_ptr -> bf_head.last_comp
+	then do;
+		call extend_seg_ptr_array (file_base_ptr -> bf_head.last_comp);
+		cb.last_comp_num = file_base_ptr -> bf_head.last_comp;
+	     end;
+	if cb.max_rec_len ^= file_base_ptr -> bf_head.max_rec_len
+	then call set_maxl;				/* asynch record size change */
+     end reinit_cb_vars;
+
+insert_record:
+     proc;					/* places buffer contents into current record position */
+	cb_ptr -> cb.next_pos = cb_ptr -> cb.current_pos + 1;
+						/* set next position to following record */
+	if buff_len <= 0				/* special case zero length records to distinguish from logically absent */
+	then seg_ptr -> seg (pos) = -1;		/* convention for zero-length records */
+	else do;					/* copy buffer and set record_length */
+		substr (seg_ptr -> seg_str, 4 * (pos + 1) + 1, buff_len) = substr (buff_ptr -> buffer, 1, buff_len);
+						/* copy buffer contents */
+		seg_ptr -> seg (pos) = buff_len;	/* sets record length */
+	     end;
+	cb_ptr -> cb.scan_backward = "0"b;		/* resume default forward scanning */
+	cb.current_status = "10"b;
+     end insert_record;
+
+lock_file_check:
+     proc;					/* used to lock file in shared openings */
+	if ^stac (addr (file_base_ptr -> bf_head.file_lock), cb.saved_lock_copy)
+	then do;					/* more effort required to set lock */
+		call set_lock_$lock (file_base_ptr -> bf_head.file_lock, cb.wait_time, code);
+		if code ^= 0			/* as we expect unless it was just unlocked */
+		then if code = error_table_$invalid_lock_reset
+		     then code = 0;			/* file_action will still be checked */
+		     else do;			/* locked by live process--abort or may interfere */
+			     code = error_table_$file_busy;
+			     go to exit;		/* external return to caller */
+			end;
+	     end;
+	old_end_pos = cb.end_pos;
+	cb.as_ins_del = "00"b;
+	if cb.old_time_stamp ^= file_base_ptr -> bf_head.time_last_modified
+	then do;
+		call reinit_cb_vars;		/* note asynch header changes */
+		cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+	     end;
+	if file_base_ptr -> bf_head.file_action ^= 0	/* update in progress */
+	then call adjust_op;			/* cleans up interrupted operation */
+     end lock_file_check;
+
+init_update:
+     proc (action_code);				/* sets file_action and time_last_modified */
+						/* for shared updates--otherwise header is only altered on closing
+						   or when a truncate operation occurs */
+	if ^cb.shared
+	then return;
+	file_base_ptr -> bf_head.change_pos = cb.current_pos;
+						/* save position
+						   at which change is to occur */
+	file_base_ptr -> bf_head.file_action = action_code;
+						/* identifies which
+						   update entry is involved */
+	file_base_ptr -> bf_head.time_last_modified = clock ();
+						/* tells shared
+						   readers that the file has changed asynchronously */
+	cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+	dcl     action_code		 fixed;
+     end init_update;				/* file marked as having an operation in progress */
+
+position_eof:
+     proc;					/* sets positions to end of file */
+	cb.current_status = "01"b;			/* current record not defined */
+	cb_ptr -> cb.next_pos = cb_ptr -> cb.end_pos;
+	cb_ptr -> cb.current_pos = cb_ptr -> cb.end_pos;
+     end position_eof;
+
+position_bof:
+     proc;					/* sets positions to beginning of file */
+	cb.current_status = "00"b;			/* current record status unknown */
+	cb_ptr -> cb.next_pos = 0;
+	cb_ptr -> cb.current_pos = 0;
+     end position_bof;
+
+set_true_eof:
+     proc;					/* sets eof after last non-deleted record */
+
+	do while (cb.current_pos > 0);		/* find true eof */
+	     cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos - 1;
+						/* backspace */
+	     call get_current_pos;			/* look at preceding record */
+	     seg_ptr = get_seg_ptr (comp_num);
+	     if seg_ptr -> seg (pos) ^= 0		/* record found */
+	     then do;
+		     cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos + 1;
+		     go to set_eof;			/* exit from loop */
+		end;
+	end;					/* backspace loop */
+
+set_eof:
+	cb_ptr -> cb.end_pos = cb_ptr -> cb.current_pos;
+	if cb.shared
+	then file_base_ptr -> bf_head.end_pos = cb.end_pos;
+	cb.current_status = "01"b;
+     end set_true_eof;
+
+create_initialize_cb:
+     proc;					/* prepares open data block */
+	call alloc_cb_file (size (cb), cb_ptr);		/* allocates space in linkage section */
+	iocb_ptr -> iocb.open_data_ptr = cb_ptr;	/* set pointer in iocb */
+	cb_ptr -> cb.mode = mode;			/* save opening mode */
+	cb_ptr -> cb.file_base_ptr = first_seg_ptr;	/* pointer to base of file component */
+	cb_ptr -> cb.appending = iocb_ptr -> iocb.attach_data_ptr -> atb.appending;
+						/*
+						   causes positioning to eof instead of truncation in input_output openings */
+	cb.fcb_ptr = fcb_ptr_arg;
+	cb.is_msf = atb.msf;
+	cb.ssf_sw = atb.ssf;
+	cb.noend = atb.noend_sw;
+	cb.scan_backward = "0"b;			/* determines direction of scanning over logically absent records */
+	cb.old_version = "0"b;			/* for read-only openings on old version files */
+	cb.shared = atb.shared;
+	cb.saved_lock_copy = "0"b;
+	cb.as_ins_del = "00"b;
+	call set_lock_$lock (cb.saved_lock_copy, 0, foo);
+	if cb.shared
+	then do;
+		current_entry = 12;
+		go to setup_handler;
+	     end;
+retry_ent (12):
+	if file_base_ptr -> bf_head.version = current_bf_version
+	then cb.last_comp_num = file_base_ptr -> bf_head.last_comp;
+	else cb.last_comp_num = atb.last_comp;
+	if (mode > 4) & (file_base_ptr -> bf_head.max_comp_size <= 0)
+						/* old file */
+	then file_base_ptr -> bf_head.max_comp_size = max_comp_size;
+	cb_ptr -> cb.max_comp_size = file_base_ptr -> bf_head.max_comp_size;
+						/* needed to determine capacity */
+	call set_maxl;				/* initializes max_len dependent cb variables */
+	cb_ptr -> cb.end_pos = file_base_ptr -> bf_head.end_pos;
+						/* get eof position */
+	if cb.shared
+	then do;					/* see if asynch component deletions possible */
+		call hcs_$get_safety_sw_seg (file_base_ptr, safety_sw, code);
+		cb.handler_required = ^ssf_sw & (^safety_sw | ^is_msf);
+		cb.wait_time = atb.wait_time;
+		cb.micro_wait_time = 1000000 * cb.wait_time;
+		cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+	     end;
+     end create_initialize_cb;
+
+set_entries_and_positions:
+     proc;					/* sets iocb entries for valid operations and positions
+						   to start or end of file depending on opening mode */
+	close_x = close_blk_file;			/* close routine called by vfile_attach */
+	call position_bof;
+	if mode ^= 5				/* input operations supported */
+	then do;					/* set passive entries */
+		iocb_ptr -> iocb.read_record = read_blk_file;
+		iocb_ptr -> iocb.read_length = read_length_blk_file;
+		iocb_ptr -> iocb.position = position_blk_file;
+		iocb_ptr -> iocb.control = control_blk_file;
+	     end;
+	else do;					/* output-only opening */
+		iocb_ptr -> iocb.control = control_blk_file;
+		iocb_ptr -> iocb.write_record = write_blk_file;
+	     end;
+	if mode = 6				/* input_output */
+	then iocb_ptr -> iocb.write_record = write_blk_file;
+	else if mode = 7				/* sequential_update */
+	then do;					/* output operations also supported */
+		iocb_ptr -> iocb.write_record = write_blk_file;
+		iocb_ptr -> iocb.rewrite_record = rewrite_blk_file;
+		iocb_ptr -> iocb.delete_record = delete_blk_file;
+	     end;
+	if (mode = 5) | ((mode = 6) & (^cb_ptr -> cb.appending))
+						/* output or input_output
+						   without -append attach option */
+	then call position_eof;			/* position at open should be eof */
+     end set_entries_and_positions;
+
+truncate_file:
+     proc;					/* truncates file at next record position */
+	cb_ptr -> cb.current_pos = cb.next_pos;
+	cb_ptr -> cb.end_pos = cb_ptr -> cb.next_pos;	/* next position becomes eof */
+	cb_ptr -> cb.file_base_ptr -> bf_head.end_pos = cb_ptr -> cb.end_pos;
+						/* mark new eof in file header */
+	if ^cb.is_msf
+	then call hcs_$truncate_seg (cb_ptr -> cb.file_base_ptr,
+		size (bf_head) + cb_ptr -> cb.end_pos * cb_ptr -> cb.block_size, code);
+						/* truncates the file */
+	else do;
+		call get_current_pos;
+		if (base_pos = cb.end_pos) & (comp_num > 0)
+						/* end of segment case */
+		then do;				/* don't keep last seg with just a header */
+			comp_num = comp_num - 1;	/* true last comp */
+			pos = size (bf_head) + cb.capacity * cb.block_size;
+						/* word offset of first word
+						   beyond last record in the file */
+		     end;
+		call msf_manager_$adjust (cb.fcb_ptr, comp_num, 36 * pos, "010"b, code);
+		file_base_ptr -> bf_head.last_comp = comp_num;
+		cb.last_comp_num = comp_num;
+	     end;
+	call set_true_eof;				/* in case preceding records are absent anyway */
+	cb.next_pos = cb.end_pos;
+     end truncate_file;
+
+set_maxl:
+     proc;					/* sets cb variables which depend on max_rec_len */
+	cb_ptr -> cb.max_rec_len = cb_ptr -> cb.file_base_ptr -> bf_head.max_rec_len;
+						/* use max from file header */
+	cb_ptr -> cb.block_size = divide (cb_ptr -> cb.max_rec_len + 7, 4, 19, 0);
+						/* block
+						   has single word header */
+	cb_ptr -> cb.capacity = divide (cb_ptr -> cb.max_comp_size - size (bf_head), cb_ptr -> cb.block_size, 17, 0);
+						/* capacity of each seg, in records */
+     end set_maxl;
+
+create_seg_ptrs:
+     proc;					/* allocates seg_ptr_array if file is an msf */
+	if cb.last_comp_num <= 0
+	then do;					/* ssf case--just return */
+		cb_ptr -> cb.seg_ptr_array_limit = -1;	/* indicates no separate allocation */
+		cb_ptr -> seg_ptr_array_ptr = addr (cb.file_base_ptr);
+						/* superimpose array */
+		return;
+	     end;
+	cb.seg_ptr_array_limit = max (3, cb.last_comp_num);
+	call alloc_cb_file (size (seg_ptr_array), cb.seg_ptr_array_ptr);
+
+	do i = 0 to cb.seg_ptr_array_limit;		/* initialize array to null */
+	     cb.seg_ptr_array_ptr -> seg_ptr_array (i) = null;
+	end;
+
+	seg_ptr_array (0) = cb.file_base_ptr;
+     end create_seg_ptrs;
+
+free_seg_ptrs:
+     proc;					/* de-allocates seg_ptr_array, if any */
+	if cb_ptr -> cb.seg_ptr_array_limit < 0		/* no array */
+	then return;
+	call free_cb_file (size (seg_ptr_array), cb_ptr -> cb.seg_ptr_array_ptr);
+     end free_seg_ptrs;
+
+extend_seg_ptr_array:
+     proc (new_last_comp);				/* may re-allocate seg_ptr_array to accomodate
+						   a new msf component */
+	if new_last_comp <= cb.seg_ptr_array_limit	/* enough room */
+	then return;
+	if ^cb_ptr -> cb.is_msf			/* msf not yet opened */
+	then do;
+		call msf_manager_$open (substr (attach_descrip_string, 8, dname_len),
+		     substr (attach_descrip_string, 9 + dname_len, ename_len), cb.fcb_ptr, foo);
+		cb_ptr -> cb.is_msf = "1"b;
+		atb.fcbp = cb.fcb_ptr;
+	     end;
+	old_array_limit = cb.seg_ptr_array_limit;
+	cb.seg_ptr_array_limit = 4 * divide (new_last_comp + 4, 4, 17, 0) - 1;
+	old_array_ptr = cb.seg_ptr_array_ptr;
+	call alloc_cb_file (size (seg_ptr_array), cb.seg_ptr_array_ptr);
+
+	do i = 0 to cb.seg_ptr_array_limit;		/* initialize array to null */
+	     cb.seg_ptr_array_ptr -> seg_ptr_array (i) = null;
+	end;
+
+
+	do i = 0 to cb.last_comp_num;
+	     cb.seg_ptr_array_ptr -> seg_ptr_array (i) = old_seg_ptr_array (i);
+	end;
+
+	if old_array_limit > 0			/* old array was separately allocated */
+	then call free_cb_file (size (old_seg_ptr_array), old_array_ptr);
+
+	dcl     old_seg_ptr_array	 (0:old_array_limit) ptr based (old_array_ptr);
+	dcl     old_array_limit	 fixed;
+	dcl     old_array_ptr	 ptr;
+	dcl     new_last_comp	 fixed;
+     end extend_seg_ptr_array;
+
+set_bc:
+     proc (nrecs);					/* sets bitcount on last comp */
+	call hcs_$set_bc_seg (get_seg_ptr (cb.last_comp_num), 36 * (size (bf_head) + nrecs * cb.block_size), foo);
+	dcl     nrecs		 fixed (19);
+     end set_bc;
+
+adjust_file:
+     proc;					/* called when an interrupted opening is detected */
+	call adjust_bit_count_ (substr (attach_descrip_string, 8, dname_len),
+	     substr (attach_descrip_string, 9 + dname_len, ename_len), "0"b, bc, code);
+						/* find last non-zero word */
+	if bc > 0
+	then do;					/* proceed with adjustment */
+		tot_nz_words = divide (bc, 36, 34, 0);
+		full_comp_size = size (bf_head) + cb.capacity * cb.block_size;
+		full_comps = divide (tot_nz_words, full_comp_size, 17, 0);
+		nz_words = tot_nz_words - full_comps * full_comp_size;
+						/* words in last comp */
+		base_pos = cb.capacity * full_comps;	/* rec_no at base of last comp */
+		nz_recs =
+		     divide (nz_words - size (bf_head) + cb_ptr -> cb.block_size - 1, cb_ptr -> cb.block_size, 17, 0);
+						/* count of non-zero records */
+		tot_nz_recs = base_pos + nz_recs;	/* total adjusted record count */
+		file_base_ptr -> bf_head.last_comp = full_comps;
+		cb.last_comp_num = full_comps;
+		if (tot_nz_recs > cb_ptr -> cb.end_pos)
+		     |
+		     /* eof is not properly set */ ((tot_nz_recs ^= cb.end_pos)
+		     & (file_base_ptr -> bf_head.version = current_bf_version))
+		then if get_seg_ptr (cb.last_comp_num)
+			-> seg (size (bf_head) + cb_ptr -> cb.block_size * (nz_recs - 1)) ^= 0
+						/*
+						   last record is valid */
+		     then do;
+			     cb_ptr -> cb.end_pos = tot_nz_recs;
+			     file_base_ptr -> bf_head.end_pos = tot_nz_recs;
+			end;
+		     else do;			/* last record is incomplete--delete it */
+			     cb_ptr -> cb.next_pos = tot_nz_recs - 1;
+			     call truncate_file;	/* removes dubious last record */
+			end;
+		     end;
+     end adjust_file;
+
+adjust_op:
+     proc;					/* makes file consistent */
+	if (file_base_ptr -> bf_head.file_action = eof_delete) | (file_base_ptr -> bf_head.file_action = unshared_opening)
+	     | (file_base_ptr -> bf_head.file_action = append)
+	then call adjust_file;
+	else if file_base_ptr -> bf_head.file_action = write_trunc
+	then if file_base_ptr -> bf_head.end_pos > file_base_ptr -> bf_head.change_pos + 1
+						/* rewrite phase */
+	     then call print_warning;			/* contents may be bad */
+	     else go to finish_trunc;			/* just do the truncation */
+	else if file_base_ptr -> bf_head.file_action = non_eof_delete
+	then call re_zero;				/* clean up garbage */
+	else if file_base_ptr -> bf_head.file_action = truncate
+	then do;					/* finish a truncation */
+finish_trunc:
+		call position_eof;
+		call truncate_file;
+	     end;
+	else call print_warning;			/* non_eof_replacement */
+	cb.current_pos = old_current_pos;		/* reset positions */
+	cb.next_pos = old_next_pos;
+	file_base_ptr -> bf_head.file_action = 0;
+	return;					/* operation in progress has been adjusted */
+
+print_warning:
+     proc;					/* signals fact that record may have bad contents */
+	call sub_err_ (0, "vfile_", "c", null, foo, "Record contents may be damaged for position: ^d",
+	     file_base_ptr -> bf_head.change_pos);
+     end print_warning;
+
+re_zero:
+     proc;					/* handles interrupted deletions */
+	cb.current_pos = file_base_ptr -> bf_head.change_pos;
+	call get_current_pos;
+	seg_ptr = get_seg_ptr (comp_num);
+	unspec (addr (seg_ptr -> seg (pos)) -> record_block) = "0"b;
+	cb.current_pos = old_current_pos;
+     end re_zero;
+
+     end adjust_op;
+
+convert_file:
+     proc;					/* brings old file up to current version, or detects bad version */
+	if first_seg_ptr -> bf_head.version ^= bf_version_0
+						/* previous version file? */
+	then do;					/* not previous version */
+		code = error_table_$unimplemented_version;
+						/* unknown version--abort */
+		return;				/* opening will fail */
+	     end;
+	if atb.inv_lock_reset			/* old file was being updated */
+	then call adjust_file;			/* not really necessary if operation was truncate */
+	call position_bof;
+
+	do while (cb_ptr -> cb.current_pos < cb_ptr -> cb.end_pos);
+						/* convert zero-length records */
+	     call get_current_pos;
+	     seg_ptr = get_seg_ptr (comp_num);
+	     if seg_ptr -> seg (pos) = 0		/* old-style zero-length record */
+	     then seg_ptr -> seg (pos) = -1;		/* new representation for zero-length records */
+	     cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos + 1;
+						/* advance through file */
+	end;					/* end of loop which converts records */
+
+	file_base_ptr -> bf_head.last_comp = cb.last_comp_num;
+	first_seg_ptr -> bf_head.version = current_bf_version;
+						/* completes conversion atomically */
+     end convert_file;
+
+	dcl     (vfile_io_control, vfile_status_$seg)
+				 entry (ptr, ptr, ptr, fixed (35));
+	dcl     current_entry	 fixed;
+	dcl     full_comp_size	 fixed (19);
+	dcl     stacq		 builtin;
+	dcl     set_lock_$lock	 entry (bit (36) aligned, fixed, fixed (35));
+	dcl     seg_ptr		 ptr;
+	dcl     sub_err_		 entry options (variable);
+	dcl     action		 fixed;
+	dcl     clock		 builtin;
+	dcl     (iocb_ptr, fcb_ptr_arg, first_seg_ptr)
+				 ptr;
+	dcl     rel_pos		 fixed (19);
+	dcl     base_pos		 fixed (34);
+	dcl     tot_nz_words	 fixed (34);
+	dcl     full_comps		 fixed;
+	dcl     tot_nz_recs		 fixed;
+	dcl     comp_num		 fixed;
+	dcl     seg_ptr_array	 (0:cb_ptr -> cb.seg_ptr_array_limit) ptr based (cb.seg_ptr_array_ptr);
+	dcl     msf_manager_$open	 entry (char (*), char (*), ptr, fixed (35));
+	dcl     msf_manager_$adjust	 entry (ptr,	/* fcb_ptr */
+				 fixed bin,	/* component number of segment to be
+						   made last segment */
+				 fixed bin (24),	/* bit count for that seg */
+				 bit (3),		/* "010" = dont set bit counts, truncate
+						   segment, dont terminate components */
+				 fixed bin (35));	/* status code */
+	dcl     msf_manager_$get_ptr	 entry (ptr,	/* fcb_ptr */
+				 fixed bin,	/* component number of desired segment */
+				 bit (1),		/* create switch */
+				 ptr,		/* ptr to seg or null if error, output */
+				 fixed bin (24),	/* bitcount of segment, output */
+				 fixed bin (35));	/* status code */
+	dcl     adjust_bit_count_	 entry (char (168) aligned, char (32) aligned, bit (1) aligned, fixed (24),
+				 fixed (35));
+	dcl     d_name		 char (168) aligned;
+	dcl     e_name		 char (32) aligned;
+	dcl     d_len		 fixed;
+	dcl     bc		 fixed (24);
+	dcl     hcs_$fs_get_path_name	 entry (ptr, char (*) aligned, fixed, char (*) aligned, fixed (35));
+	dcl     hcs_$status_mins	 entry (ptr, fixed (2), fixed (24), fixed (35));
+	dcl     hcs_$terminate_seg	 entry (ptr, fixed (1), fixed (35));
+	dcl     hcs_$initiate	 entry (char (*), char (*), char (*), fixed (1), fixed (2), ptr, fixed (35));
+	dcl     is_new_file		 bit (1) aligned;
+	dcl     mode		 fixed;		/* may be 4,5,6, or 7 */
+	dcl     close_x		 entry;
+	dcl     first_seg_bitcount	 fixed (24);	/* of no interest in this module */
+	dcl     max_comp_size	 fixed (19);
+	dcl     code		 fixed (35);
+	dcl     1 bf_head		 aligned based,	/* standard header for blocked files */
+		2 common_header_words,
+		  3 file_type_code	 fixed (35),
+		  3 file_lock	 bit (36) aligned,
+		  3 time_last_modified
+				 fixed (71),
+		2 version		 fixed,
+		2 change_pos	 fixed (34),	/* record being modified when shared */
+		2 reserved1	 (1) fixed,
+		2 last_comp	 fixed,		/* last msf component number */
+		2 max_rec_len	 fixed (21),	/* bytes */
+		2 end_pos		 fixed,		/* number of records */
+		2 file_action	 fixed,		/* non-zero value indicates truncation in progress */
+		2 max_comp_size	 fixed (19),
+		2 reserved2	 (4) fixed;
+%include iocbv;
+%include rs_info;
+%include vf_attach_block;
+	dcl     hcs_$set_bc_seg	 entry (ptr, fixed (24), fixed (35));
+	dcl     (size, max, null, divide)
+				 builtin;
+	dcl     i			 fixed;
+	dcl     cb_ptr		 ptr;
+	dcl     bf_version_0	 static internal fixed options (constant) init (0);
+	dcl     current_bf_version	 static internal fixed options (constant) init (1);
+	dcl     1 cb		 based (cb_ptr) aligned,
+						/* open data block--controls blocked files */
+		2 file_base_ptr	 ptr,		/* points to base of segment */
+		2 seg_ptr_array_ptr	 ptr,
+		2 fcb_ptr		 ptr,
+		2 mode		 fixed,		/* opening mode (=4,5,6, or 7) */
+		2 appending	 bit (1) aligned,	/* -append option */
+		2 max_comp_size	 fixed (19),	/* determines capacity of file */
+		2 max_rec_len	 fixed (21),	/* determines block size */
+		2 block_size	 fixed (19),	/* words, including header */
+		2 capacity	 fixed (19),	/* max number of records per comp */
+		2 current_pos	 fixed (34),	/* current record number */
+		2 next_pos	 fixed (34),	/* next record position (0,1,2,...) */
+		2 end_pos		 fixed (34),	/* number of records in file */
+		2 last_comp_num	 fixed,
+		2 is_msf		 bit (1) aligned,
+		2 ssf_sw		 bit (1) aligned,
+		2 seg_ptr_array_limit
+				 fixed,
+		2 noend		 bit (1) aligned,	/* if on, user pay position beyond eof */
+		2 scan_backward	 bit (1) aligned,	/* for masking logically absent records */
+		2 old_version	 bit (1) aligned,	/* set if file does not support logical deletion */
+		2 shared		 bit (1) aligned,	/* on if -share attachment */
+		2 wait_time	 fixed,		/* applies only if shared */
+		2 saved_lock_copy	 bit (36) aligned,	/* copy of my lock id */
+		2 micro_wait_time	 fixed (71),	/* wait_time in microseconds */
+		2 old_time_stamp	 fixed (71),
+		2 handler_required	 bit (1) aligned,	/* applies if sharing */
+		2 current_status	 bit (2) aligned,
+		2 as_ins_del	 bit (2) aligned;
+	dcl     old_end_pos		 fixed (34);
+	dcl     old_current_status	 bit (2) aligned;
+	dcl     (pos_type, n_recs)	 fixed;
+	dcl     seg_fault_error	 condition;
+	dcl     time_limit		 fixed (71);
+	dcl     forever		 static internal fixed (54) aligned init (1.801e16);
+	dcl     (error_table_$negative_nelem, error_table_$asynch_insertion, error_table_$asynch_deletion,
+	        error_table_$lock_wait_time_exceeded, error_table_$invalid_lock_reset, error_table_$safety_sw_on,
+	        error_table_$file_busy, error_table_$unimplemented_version, error_table_$end_of_info,
+	        error_table_$no_record, error_table_$bad_arg, error_table_$no_operation, error_table_$long_record,
+	        error_table_$file_is_full)
+				 external fixed (35);
+	dcl     seg		 (0:cb.max_comp_size) fixed aligned based;
+	dcl     pos		 fixed (19);
+	dcl     1 pos_struct	 based (addr (pos)),
+		2 pad_bits	 bit (18) unal,
+		2 pos_bits	 bit (18) unal;
+	dcl     buff_ptr		 ptr;
+	dcl     (buff_len, rec_len)	 fixed (21);
+	dcl     buffer		 char (buff_len) based (buff_ptr);
+	dcl     n			 fixed (21);
+	dcl     substr		 builtin;
+	dcl     order		 char (*);
+	dcl     info_ptr		 ptr;
+	dcl     was_scan_backward	 bit (1) aligned;
+	dcl     (old_next_pos, old_current_pos)
+				 fixed (34);
+	dcl     write_trunc		 static internal fixed options (constant) init (-9);
+	dcl     rewrite		 static internal fixed options (constant) init (-2);
+	dcl     eof_delete		 static internal fixed options (constant) init (-3);
+	dcl     non_eof_delete	 static internal fixed options (constant) init (-10);
+	dcl     unshared_opening	 static internal fixed options (constant) init (-11);
+	dcl     append		 static internal fixed options (constant) init (-1);
+	dcl     truncate		 static internal fixed options (constant) init (1);
+	dcl     1 info1		 based (info_ptr),	/* for "read_position" order */
+		2 next_pos	 fixed,		/* output */
+		2 end_pos		 fixed;		/* output */
+	dcl     continue_to_signal_	 entry (fixed (35));
+	dcl     initial_time_stamp	 fixed (71);
+	dcl     safety_sw		 bit (1);
+	dcl     hcs_$get_safety_sw_seg entry (ptr, bit (1), fixed (35));
+	dcl     1 info2		 based (info_ptr),	/* for "max_rec_len" order */
+		2 old_max_recl	 fixed (21),	/* output */
+		2 new_max_recl	 fixed (21);	/* input */
+	dcl     foo		 fixed (35);
+	dcl     foo24		 fixed (24);
+	dcl     nz_words		 fixed (19);
+	dcl     nz_recs		 fixed;
+	dcl     addr		 builtin;
+	dcl     1 record_block	 based,
+		2 recl		 fixed (21),
+		2 rec_words	 (cb.block_size - 1) fixed;
+	dcl     seg_str		 char (1000000) aligned based;
+	dcl     alloc_cb_file	 entry (fixed, ptr);
+	dcl     free_cb_file	 entry (fixed, ptr);
+	dcl     hcs_$truncate_seg	 entry (ptr, fixed (18), fixed (35));
+     end open_blk_file;

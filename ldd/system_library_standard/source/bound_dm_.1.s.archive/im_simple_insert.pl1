@@ -1,0 +1,479 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+
+/* DESCRIPTION:
+     
+           This module attempts to allocate the specified key_string into
+     a control and slot as specified by the p_element_id_string. If
+     successful, it updates the index_header.  If not successful, it just
+     returns the amount of additional storage needed to complete the storage
+     operation in the specified control interval.  This information is used by
+     im_rotate_insert.
+
+          This module does all of the modification to the control interval
+     (node) in which the key to be inserted exists necessary to insert it.
+     For reasons of efficiency, it makes these modifications by bypassing
+     the collection_manager_ and calling file_manager_ directly.  Again for
+     reasons of efficiency, it does so in one call to file_manager_ by 
+     consolidating all of the modifications in one ci_parts structure.
+
+          Because this module bypasses the collection_manager_, it must
+     understand the format of the control interval.  The format is described
+     by the basic_control_interval structure (dm_cm_basic_ci.incl.pl1).
+     Following is a diagram of a control interval accompanied with the names
+     of some of the structures which overlay it:
+     
+     basic_control_interval.header, bci_header
+     |          basic_control_interval.datum_position_table, slots
+     |          |
+     v          v
+      ------------------------------------------------------------------
+     |          | | | | | | | | |               |    | / / |    | / |   |
+     | 20 bytes | | four bytes| | un-used space |    |/ / /|    |/ /|   |
+     |          | | per  slot | |  (free pool)  |    | / / |    | / |   |
+      ------------------------------------------------------------------
+                                                  ^     ^         ^   ^
+                                                  |     |         |   |
+                                                  |     free space    |
+                                                  |                   |
+                                                  stored data - keys and
+                                                     index CI header
+     
+     This control interval is not modified in place. New values for parts
+     of the control interval are kept in local buffers.  Modifiactions are
+     actually made by creating a ci_parts structure describing the offset and
+     length of the new value in the control interval and a pointer to a local
+     buffer, then by calling file_manager_$put to do the modification.
+     
+     Four or five modifications are made:
+      1) the bci_header is updated to reflect existence of new datum;
+      2) trailing slots are shifted one slot to the right to make room for the
+         new slot if the new slot is not the last slot;
+      3) the new key is placed in the free pool;
+      4) the slot for the new key is updated with the correct values for it
+         offset and length;
+      5) the element which holds the index CI header is updated.
+
+     It is possible that the control interval will have to be compacted to get
+     rid of scattered free space and concentrate all free space in the free
+     pool.  This module is not equipped to handle this and must call
+     collection_manager_$compact_control_interval.  It is important that any
+     information copied out of the control interval into local storage prior
+     to the compaction be copied out again after the compaction as its value
+     may have changed during the compaction.
+     
+     Both the bci_header and the slots from the slot for the new key to the
+     last slot (the trailing slots) are copied into local buffers.  This is
+     because the bci_header will be modified.  The trailing slots are not
+     modified, just moved, so it would seem that they need not be copied out
+     of the control interval.  In fact, when shifting slots to the left, one
+     can give file_manager_ a pointer to the beginning of the slots and
+     pretend they are in a local buffer.  When shifting to the right,
+     file_manager_ is implemented such that it would over-write the buffer if
+     a pointer into the control interval were given as the local buffer
+     pointer.  For this reason the trailing slots must be copied out of the
+     control interval into local storage.
+
+     The parameter p_index_opening_info_ptr points to an index_opening_info
+     structure.  This contains general information about the index and
+     information specific to this process's activity relative to the index.
+     
+     The parameter p_common_ci_header_ptr points to the index CI header
+     (the structure common_ci_header and one of leaf_ci_header or
+     branch_ci_header).  This must not point directly into the control
+     interval but point to some local copy of the index CI header.  The index
+     CI header is stored as the first element in the control interval.
+
+     The parameter p_insert_key is a flag which, if on, indicates that the
+     input key is to be inserted as a new key.  If off, the input key is to
+     replace an existing key.
+          
+     The parameter p_key_id_string consists of two parts, the control interval
+     id of the control interval to which p_node_ptr points and the index in
+     the slot table (datum_position_table) of the key to be inserted/replaced.
+     If a key is inserted, slots to the right of the specified slot must be
+     shifted one slot to the right to make room for the new slot.
+     
+     The output parameter p_additional_storage_required has one of two
+     meanings.  If the operation is successful (p_code is equal to 0), it is
+     the amount of free space in bits left in the control interval after the
+     insertion; if the operation fails for a lack of room (p_code is equal to
+     dm_error_$long_element), it is the amount of used space in bits that must
+     be removed from the control interval in order for the key to fit; if the
+     operation fails for any other reason, the parameter has no meaning.
+     
+*/
+
+/* HISTORY:
+
+Written by Lindsey Spratt, 04/07/82.
+Modified:
+06/16/82 by Matthew Pierret: Removed the beginning_offset argument from
+            calls to collection_manager_$put_element.
+10/28/82 by Lindsey Spratt:  Changed to not modify the key_count.  This is
+	  now done by im_put_key.
+11/01/82 by Lindsey Spratt:  Changed to use the index_opening_info instead of
+	  the index_cursor and index_header.
+11/16/82 by Matthew Pierret: Changed the meaning of total_storage_available.
+            cm_$(allocate put)_element now returns a negative value for
+            total_storage_available, it is the additional space required.
+11/08/83 by Lindsey L. Spratt:  Changed to use the "buffered" access method
+            when p_insert_new_key is "1"b.  This was forced by
+            im_update_branches requiring a node_buffer.
+04/03/84 by Matthew Pierret:  Changed extensively to do its own storage 
+            management.  This module was taught about control interval
+            format so that it could bypass collection_manager_
+            $allocate_element and $put_element.
+06/12/84 by Matthew Pierret:  Re-named cm_$put_element to cm_$modify.
+10/12/84 by Matthew Pierret:  Changed to use new dm_cm_basic_ci and
+            dm_cm_basic_ci_const include files.
+10/28/84 by Lindsey L. Spratt:  Changed to use the version 2
+            index_opening_info structure.  Changed CHECK_VERSION to take
+            char(8) aligned parameters, and changed it use ACTION_CANT_RESTART
+            instead of the obsolete "s" flag.
+03/07/85 by R. Michael Tague:  Changed opening info version to version 3.
+*/
+
+/* format: style2,ind3 */
+
+im_simple_insert:
+   proc (p_index_opening_info_ptr, p_common_ci_header_ptr, p_insert_new_key, p_key_string, p_key_id_string,
+        p_additional_storage_required, p_code);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+      dcl	    p_index_opening_info_ptr
+			       ptr parameter;
+      dcl	    p_common_ci_header_ptr ptr;
+      dcl	    p_insert_new_key       bit (1) aligned;
+      dcl	    p_key_string	       bit (*);
+      dcl	    p_key_id_string	       bit (36) aligned;
+      dcl	    p_additional_storage_required
+			       fixed bin (35);
+      dcl	    p_code	       fixed bin (35);
+
+/* Automatic */
+
+      dcl	    code		       fixed bin (35) init (0);
+      dcl	    free_bytes_in_ci       fixed bin (35) init (-1);
+      dcl	    free_bytes_in_pool     fixed bin (35) init (-1);
+      dcl	    index_ci_header_slot_offset_in_bytes
+			       fixed bin;
+      dcl	    index_ci_header_slot_ptr
+			       ptr init (null);
+      dcl	    key_ci_id	       fixed bin (24) unsigned;
+      dcl	    key_index	       fixed bin (12) unsigned;
+      dcl	    key_slot_offset_in_bytes
+			       fixed bin (35);
+      dcl	    key_string_offset_in_bytes
+			       fixed bin (35);
+      dcl	    key_string_length_in_bits
+			       fixed bin (35);
+      dcl	    key_string_length_in_bytes
+			       fixed bin (35);
+      dcl	    key_string_ptr	       ptr init (null);
+      dcl	    local_ci_parts_buffer  (12) fixed bin (71) init ((12) 0);
+						/* 5 parts */
+      dcl	    1 local_bci_header     aligned like bci_header;
+      dcl	    1 local_key_slot       aligned like datum_slot;
+      dcl	    local_slots_buffer     (404) fixed bin (71);	/* Largest possible slot table */
+      dcl	    new_number_of_slots    fixed bin;
+      dcl	    node_ptr	       ptr init (null);
+      dcl	    number_of_new_slots    fixed bin;
+      dcl	    number_of_slots_to_shift
+			       fixed bin (35);
+      dcl	    slots_in_ci_ptr	       ptr init (null);
+      dcl	    slots_in_local_ptr     ptr init (null);
+      dcl	    total_storage_available
+			       fixed bin (35) init (0);
+
+/* Based */
+
+      dcl	    1 p_key_id	       aligned like element_id based (addr (p_key_id_string));
+      dcl	    1 index_ci_header_slot aligned like datum_slot based (index_ci_header_slot_ptr);
+      dcl	    key_string	       bit (key_string_length_in_bits) based (key_string_ptr);
+      dcl	    1 shifted_slots	       aligned based,
+	      2 slot	       (number_of_slots_to_shift) fixed bin (35);
+
+/* Builtin */
+
+      dcl	    (length, null, addr, abs, unspec)
+			       builtin;
+
+/* Controlled */
+/* Constant */
+
+      dcl	    (
+	    BITS_PER_BYTE	       init (9),
+	    BYTES_PER_WORD	       init (4),
+	    BEGINNING_OF_ELEMENT   init (-1)
+	    )		       fixed bin (35) internal static options (constant);
+      dcl	    myname	       init ("im_simple_insert") char (32) varying internal static options (constant);
+      dcl	    (
+	    BCI_HEADER_PART_IDX    init (1),
+	    INDEX_CI_HEADER_PART_IDX
+			       init (2),
+	    KEY_SLOT_PART_IDX      init (3),
+	    KEY_PART_IDX	       init (4),
+	    SHIFTED_SLOTS_PART_IDX init (5),
+	    DEFAULT_NUMBER_OF_PARTS
+			       init (5)
+	    )		       fixed bin internal static options (constant);
+
+/* Entry */
+
+      dcl	    file_manager_$get_ci_ptr
+			       entry (bit (36) aligned, fixed bin (27), ptr, fixed bin (35));
+      dcl	    file_manager_$put      entry (bit (36) aligned, fixed bin (27), ptr, fixed bin (35));
+      dcl	    im_update_branches     entry (ptr, bit (36) aligned, bit (36) aligned, ptr, fixed bin (24) unsigned unal,
+			       fixed bin (12) unsigned unal, fixed bin (35));
+      dcl	    sub_err_	       entry () options (variable);
+
+/* External */
+
+      dcl	    dm_error_$long_element fixed bin (35) ext;
+      dcl	    dm_error_$programming_error
+			       fixed bin (35) ext;
+      dcl	    error_table_$unimplemented_version
+			       fixed bin (35) ext;
+
+/* END OF DECLARATIONS */
+
+/* format: indcomtxt,^indblkcom */
+
+/**** Copy parameters into local storage. */
+
+      index_opening_info_ptr = p_index_opening_info_ptr;
+      call CHECK_VERSION (index_opening_info.version, INDEX_OPENING_INFO_VERSION_3, "index_opening_info");
+
+      common_ci_header_ptr = p_common_ci_header_ptr;
+      leaf_ci_header_ptr, branch_ci_header_ptr = null;
+
+      key_string_ptr = addr (p_key_string);
+      key_string_length_in_bits = length (p_key_string);
+      key_string_length_in_bytes = ceil (divide (key_string_length_in_bits, BITS_PER_BYTE, 35, 18));
+
+      key_ci_id = p_key_id.control_interval_id;
+      key_index = p_key_id.index;
+
+/**** Insert or replace key. */
+
+      if p_insert_new_key
+      then
+INSERT_KEY:
+         do;
+
+         /*** Get a pointer to the control interval which is the node which
+	    is to contain the new key. */
+
+	  call file_manager_$get_ci_ptr (index_opening_info.file_opening_id, (key_ci_id), node_ptr, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Copy bci_header from control interval to local storage.  This is necessary
+	    because the control interval cannot be modified directly.  A local copy is
+	    made and updated, then replaced in the control interval by file_manager_. */
+
+	  unspec (local_bci_header) = unspec (node_ptr -> bci_header);
+
+         /*** Init ci_parts structure. */
+
+	  ci_parts_ptr = addr (local_ci_parts_buffer);
+	  ci_parts.number_of_parts = DEFAULT_NUMBER_OF_PARTS;
+
+
+	  new_number_of_slots = max (key_index, local_bci_header.number_of_datums + 1);
+						/* Is the max really necessary? */
+
+         /*** Determine if there is enough space in the control interval for the key. */
+
+	  number_of_new_slots = new_number_of_slots - local_bci_header.number_of_datums;
+	  free_bytes_in_pool =
+	       local_bci_header.start_of_used_space
+	       - (DATUM_POSITION_TABLE_OFFSET_IN_BYTES + new_number_of_slots * BYTES_PER_WORD);
+	  free_bytes_in_ci =
+	       free_bytes_in_pool + local_bci_header.scattered_free_space - key_string_length_in_bytes
+	       - (number_of_new_slots * BYTES_PER_WORD);
+
+	  if free_bytes_in_ci < 0
+	  then
+	     do;
+	        p_additional_storage_required = abs (free_bytes_in_ci) * BITS_PER_BYTE;
+	        call ERROR_RETURN (dm_error_$long_element);
+	     end;
+
+/* Must the control interval be compacted? */
+	  if free_bytes_in_pool < key_string_length_in_bytes
+	  then
+	     do;
+	        call collection_manager_$compact_control_interval (index_opening_info.file_opening_id, key_ci_id, code);
+	        if code ^= 0
+	        then call ERROR_RETURN (code);
+	        unspec (local_bci_header) = unspec (node_ptr -> bci_header);
+						/* The bci_header may have been modified by the previous call */
+						/* so refresh it. */
+	     end;
+
+         /*** The key can now be inserted in the free pool. */
+
+	  key_string_offset_in_bytes = local_bci_header.start_of_used_space - key_string_length_in_bytes;
+
+	  ci_parts.part (KEY_PART_IDX).offset_in_bytes = key_string_offset_in_bytes;
+	  ci_parts.part (KEY_PART_IDX).length_in_bytes = key_string_length_in_bytes;
+	  ci_parts.part (KEY_PART_IDX).local_ptr = key_string_ptr;
+
+	  unspec (local_key_slot) = "0"b;
+	  local_key_slot.offset_in_bytes = key_string_offset_in_bytes;
+	  local_key_slot.length_in_bits = key_string_length_in_bits;
+
+	  key_slot_offset_in_bytes = DATUM_POSITION_TABLE_OFFSET_IN_BYTES + BYTES_PER_WORD * (key_index - 1);
+
+	  ci_parts.part (KEY_SLOT_PART_IDX).offset_in_bytes = key_slot_offset_in_bytes;
+	  ci_parts.part (KEY_SLOT_PART_IDX).length_in_bytes = BYTES_PER_WORD;
+	  ci_parts.part (KEY_SLOT_PART_IDX).local_ptr = addr (local_key_slot);
+
+         /*** If necessary, shift trailing slots one to the rigth to make room. */
+
+	  if key_index < new_number_of_slots
+	  then
+	     do;					/* Slots to the right must be shifted to make room */
+
+	     /*** Copy slots from control interval to local buffer.  This copy must be done
+		after the potential call to collection_manager_$compact_control_interval
+		since that routine alters the values of the slots. */
+
+	        slots_in_ci_ptr = addcharno (node_ptr, key_slot_offset_in_bytes);
+	        slots_in_local_ptr = addr (local_slots_buffer);
+	        number_of_slots_to_shift = new_number_of_slots - key_index;
+
+	        unspec (slots_in_local_ptr -> shifted_slots) = unspec (slots_in_ci_ptr -> shifted_slots);
+
+/* Setup part for shifted slots. */
+	        ci_parts.part (SHIFTED_SLOTS_PART_IDX).offset_in_bytes = key_slot_offset_in_bytes + BYTES_PER_WORD;
+	        ci_parts.part (SHIFTED_SLOTS_PART_IDX).length_in_bytes = number_of_slots_to_shift * BYTES_PER_WORD;
+	        ci_parts.part (SHIFTED_SLOTS_PART_IDX).local_ptr = slots_in_local_ptr;
+	     end;
+	  else if key_index > new_number_of_slots
+	  then call sub_err_ (dm_error_$programming_error, myname, ACTION_CANT_RESTART, null, 0);
+
+         /*** Update the bci_header to reflect the new state of the control interval. */
+
+	  local_bci_header.start_of_used_space = key_string_offset_in_bytes;
+	  local_bci_header.number_of_datums = new_number_of_slots;
+
+	  ci_parts.part (BCI_HEADER_PART_IDX).offset_in_bytes = 0;
+	  ci_parts.part (BCI_HEADER_PART_IDX).length_in_bytes = BCI_HEADER_LENGTH_IN_BYTES;
+	  ci_parts.part (BCI_HEADER_PART_IDX).local_ptr = addr (local_bci_header);
+
+         /*** Since the key fits, no more storage is required. */
+
+	  p_additional_storage_required = 0;
+
+         /*** Update the index ci header to include new key. */
+
+	  if common_ci_header.key_range.last = 0
+	  then common_ci_header.key_range.last, common_ci_header.key_range.first = key_index;
+	  else common_ci_header.key_range.last = common_ci_header.key_range.last + 1;
+	  common_ci_header.key_tail_space_used_since_last_prefix_compaction =
+	       common_ci_header.key_tail_space_used_since_last_prefix_compaction + key_string_length_in_bits;
+
+	  index_ci_header_slot_offset_in_bytes =
+	       DATUM_POSITION_TABLE_OFFSET_IN_BYTES + (DEFAULT_INDEX_CONTROL_INTERVAL_HEADER_SLOT - 1) * BYTES_PER_WORD;
+	  index_ci_header_slot_ptr = addcharno (node_ptr, index_ci_header_slot_offset_in_bytes);
+
+	  ci_parts.part (INDEX_CI_HEADER_PART_IDX).offset_in_bytes = index_ci_header_slot.offset_in_bytes;
+	  ci_parts.part (INDEX_CI_HEADER_PART_IDX).length_in_bytes =
+	       divide (index_ci_header_slot.length_in_bits, BITS_PER_BYTE, 17, 0);
+	  ci_parts.part (INDEX_CI_HEADER_PART_IDX).local_ptr = common_ci_header_ptr;
+
+         /*** Finally, make the actual modification to the control interval in the file. */
+
+	  call file_manager_$put (index_opening_info.file_opening_id, (key_ci_id), ci_parts_ptr, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+         /*** Update branches if this is a branch key and some branch keys have shifted. */
+
+	  if ^common_ci_header.is_leaf & common_ci_header.key_range.last > key_index
+	  then
+	     do;
+	        call im_update_branches (node_ptr, index_opening_info.file_opening_id, index_opening_info.collection_id,
+		   common_ci_header_ptr, (key_ci_id), key_index + 1, code);
+	        if code ^= 0
+	        then call ERROR_RETURN (code);
+	     end;
+
+         end INSERT_KEY;
+      else
+REPLACE_KEY:
+         do;
+	  call collection_manager_$modify (index_opening_info.file_opening_id, index_opening_info.collection_id,
+	       addr (p_key_string), length (p_key_string), p_key_id_string, total_storage_available, code);
+	  if code ^= 0
+	  then call CHECK_ERROR (code);
+         end REPLACE_KEY;
+
+      p_code = 0;
+MAIN_RETURN:
+      return;
+
+
+FINISH:
+   proc ();
+   end FINISH;
+
+
+ERROR_RETURN:
+   proc (er_p_code);
+      dcl	    er_p_code	       fixed bin (35);
+      call FINISH;
+      p_code = er_p_code;
+      goto MAIN_RETURN;
+   end ERROR_RETURN;
+
+
+CHECK_ERROR:
+   proc (ce_p_code);
+      dcl	    ce_p_code	       fixed bin (35);
+      if ce_p_code = dm_error_$long_element
+      then p_additional_storage_required = abs (total_storage_available);
+
+      call ERROR_RETURN (ce_p_code);
+   end CHECK_ERROR;
+%page;
+CHECK_VERSION:
+   proc (cv_p_received_version, cv_p_expected_version, cv_p_structure_name);
+      dcl	    cv_p_received_version  char (8) aligned parameter;
+      dcl	    cv_p_expected_version  char (8) aligned parameter;
+      dcl	    cv_p_structure_name    char (*) parameter;
+
+      if cv_p_received_version ^= cv_p_expected_version
+      then call sub_err_ (error_table_$unimplemented_version, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected version ^a of the ^a structure.
+Received version ^a instead.", cv_p_expected_version, cv_p_structure_name, cv_p_received_version);
+
+   end CHECK_VERSION;
+%page;
+%include dm_im_ci_header;
+%page;
+%include dm_collmgr_entry_dcls;
+%page;
+%include dm_im_header;
+%page;
+%include dm_element_id;
+%page;
+%include dm_im_opening_info;
+%page;
+%include dm_cm_basic_ci;
+%page;
+%include dm_cm_basic_ci_const;
+%page;
+%include dm_ci_parts;
+%page;
+%include sub_err_flags;
+   end im_simple_insert;

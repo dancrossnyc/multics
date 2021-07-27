@@ -1,0 +1,350 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+
+move_non_perm_wired_segs:
+     procedure;
+
+/* bootload_loader loads collection 1 into an artficially restricted */
+/* memory area, currently the first 512K of absolute addresses. */
+/* In a service environment, this may conflict with the desired */
+/* layout of the low controller -- SST and Core Map high, firmware */
+/* and I/O buffers low. Thus init_segs and to-be-made-paged segs */
+/* are moved into high memory by this program, where bootstrap1 */
+/* used to put them. This program does not work on dseg, or the 
+unpaged page tables, but these won't be moved, anyway. */
+/* BIM 7/82 */
+/* Modified 9/83 by Keith Loepere for paged, wired segment support */
+/* Modified 12/83 by Keith Loepere for breakpoint page support. */
+/* Modified 10/84 by Allen Ball to fix a bad call to syserr. */
+/* Modified 3/85 by Keith Loepere for one more attempt to tell apart the
+   segments that should be moved from those that shouldn't. */
+
+declare  int_unpaged_page_tables$	  ext static;
+declare  unpaged_page_tables$		  ext static;
+declare  slt$			  ext static;
+
+declare  absadr			  entry (ptr, fixed bin (35)) returns (fixed bin (26));
+declare  config_$find		  entry (char (4) aligned, pointer);
+declare  pmut$camp			  entry;
+declare  pmut$swap_sdw		  entry (ptr, ptr);
+declare  ptw_util_$make_core		  entry (ptr, fixed bin (26));
+declare  rsw_util$port_info		  entry (fixed bin (3), bit (1) aligned, fixed bin (17), fixed bin (17), fixed bin (3));
+declare  sdw_util_$construct		  entry (ptr, ptr);
+declare  sdw_util_$dissect		  entry (ptr, ptr);
+declare  sdw_util_$get_address	  entry (ptr, fixed bin (26));
+declare  syserr			  entry options (variable);
+
+declare  top			  fixed bin (18);	/* K words of it */
+declare  new_free_core_size		  fixed bin (26);	/* words of it */
+declare  new_abs_sdw		  fixed bin (71);
+declare  port_base			  fixed bin;
+declare  port_size			  fixed bin;
+declare  port_tag			  fixed bin (3);
+declare  port_enabled		  bit (1) aligned;
+declare  port_interlaced		  fixed bin (3);
+
+declare  (init_segnum, sup_segnum)
+				  fixed bin (18);
+
+declare  sys_boot_info$bootload_mem_size
+				  fixed bin (26) ext static;
+declare  sys_boot_info$contig_mem_size
+				  fixed bin (26) ext static;
+
+declare  ME			  char (32) init ("move_non_perm_wired_segs") int static options (constant);
+
+%include config_mem_card;
+%include sdw_info;
+
+declare  upt_absloc			  fixed bin (26);
+declare  iupt_absloc		  fixed bin (26);
+declare  abs_page_table_absloc	  fixed bin (26);
+declare  abs_page_table_ptr		  ptr;
+declare  abs_seg$			  ext static;	/* for referencing new address for copy */
+declare  abs_seg0$			  ext static;	/* for copying paged segments */
+declare  abs_seg_ptr		  pointer;
+declare  old_abs_seg_sdw		  fixed bin (71);
+
+declare  1 abs_si			  aligned like sdw_info;
+declare  1 (init_si, sup_si)		  aligned like sdw_info;
+
+declare  dseg$			  (0:4095) fixed bin (71) ext;
+declare  (addr, baseno, baseptr, bin, null, segno, substr)
+				  builtin;
+
+%page; %include stack_frame;
+%page; %include syserr_constants;
+%page; %include slt;
+%page; %include slte;
+
+
+	sltp = addr (slt$);
+	top = 0;
+	port_size = 0;
+	port_base = 0;
+
+	mem_cardp = null;
+	do while ("1"b);				/* a goto will leave the loop */
+NEXT_CARD:
+	     call config_$find (MEM_CARD_WORD, mem_cardp);
+	     if mem_cardp = null then go to DONE_LOOP;
+
+	     if mem_card.state = "off" then go to NEXT_CARD;
+
+	     port_tag = mem_card.tag - 1;
+
+	     call rsw_util$port_info (port_tag, port_enabled, port_base, port_size, port_interlaced);
+
+	     if ^port_enabled then call syserr (CRASH, "^a: mem ^a on in config, but port off.", ME,
+		     substr ("abcdefgh", mem_card.tag, 1));
+
+	     if port_size > mem_card.size then port_size = mem_card.size; /* obey config */
+	     if port_size < mem_card.size then call syserr (CRASH, "^a: mem ^a size ^dK in config, ^dK on port.", ME, substr ("abcdefgh", (port_tag), 1), mem_card.size, port_size);
+
+	     if port_base > top then go to DONE_LOOP;	/* hit a hole */
+
+	     top = top + port_size;			/* count in new data */
+	end;					/* loop to next mem card */
+
+DONE_LOOP:
+	if top = 0 then call syserr (CRASH, "^a: no main memory configured.", ME);
+
+	sys_boot_info$contig_mem_size = top * 1024;
+
+	if sys_boot_info$contig_mem_size <= sys_boot_info$bootload_mem_size then return;
+
+/* This free core size will have each high-loaded segment subtracted */
+/* from it as it is moved into its new home. */
+
+	new_free_core_size = sys_boot_info$contig_mem_size - slt.free_core_start;
+
+	iupt_absloc = absadr (addr (int_unpaged_page_tables$), (0));
+	call sdw_util_$get_address (addr (dseg$ (segno (addr (abs_seg0$)))), abs_page_table_absloc);
+	abs_page_table_ptr = ptr (addr (int_unpaged_page_tables$), abs_page_table_absloc - iupt_absloc);
+
+/* set up some static data about abs_seg$ */
+
+	old_abs_seg_sdw = dseg$ (bin (baseno (addr (abs_seg$)), 18));
+						/* saved sdw */
+
+/* Now the segments that were loaded high are to be moved up, */
+/* starting from the highest. */
+/* bootload_loader was known to */
+/* start at the top and work down, but to intersperse init_seg's */
+/* and paged segs. Thus by working up the two lists of SLTE's */
+/* we can get the ordered list */
+
+	init_segnum = slt.first_init_seg - 1;
+	sup_segnum = slt.first_sup_seg - 1;
+
+/* Here they start out faulted. When we find a seg to move, we */
+/* turn off the faulted bit. When we move it, we turn it back on. */
+
+	unspec (init_si), unspec (sup_si) = ""b;
+	init_si.faulted, sup_si.faulted = "1"b;		/* for do loops */
+
+	do while ("1"b);				/* exited in middle with goto */
+	     if init_segnum <= slt.last_init_seg then do while (init_si.faulted);
+		init_segnum = init_segnum + 1;
+		if init_segnum > slt.last_init_seg then go to NO_MORE_INIT;
+		sltep = addr (slt.seg (init_segnum));
+		if slte_uns.layout_seg | slte_uns.abs_seg then init_si.faulted = "1"b;
+		else do;
+		     call sdw_util_$dissect (addr (dseg$ (init_segnum)), addr (init_si));
+		     if ^init_si.faulted then do;
+			init_si.address = absadr (baseptr (init_segnum), (0));
+			if init_si.address <= slt.free_core_start + slt.free_core_size then init_si.faulted = "1"b;
+		     end;				/* move anybody in high memory */
+		end;
+	     end;
+
+NO_MORE_INIT:					/* Now we have the topmost non-abs-seg init_seg disected, and segnum in init_segnum */
+	     if sup_segnum <= slt.last_sup_seg then do while (sup_si.faulted);
+		sup_segnum = sup_segnum + 1;
+		if sup_segnum > slt.last_sup_seg then go to NO_MORE_SUP;
+		sltep = addr (slt.seg (sup_segnum));
+		if slte_uns.layout_seg | slte_uns.abs_seg then sup_si.faulted = "1"b; /* force it to be ignored */
+		else do;
+		     call sdw_util_$dissect (addr (dseg$ (sup_segnum)), addr (sup_si));
+		     if ^sup_si.faulted then do;
+			sup_si.address = absadr (baseptr (sup_segnum), (0));
+			if sup_si.address <= slt.free_core_start + slt.free_core_size then sup_si.faulted = "1"b;
+		     end;				/* move anybody in high memory */
+		end;
+	     end;
+
+NO_MORE_SUP:
+	     if (sup_segnum > slt.last_sup_seg & init_segnum > slt.last_init_seg) | (sup_si.faulted & init_si.faulted) then go to DONE_MOVE;
+
+/* Now the two si structures contain the lowest segnum'd (and by implication  */
+/* highest addr'd) sdw's */
+/* if we have run out of either, their address will show as zero */
+
+	     if sup_si.faulted | (^init_si.faulted & (init_si.address > sup_si.address)) then do; /* they CANNOT both be faulted */
+		call MOVE (init_segnum, init_si);
+		init_si.faulted = "1"b;
+	     end;
+	     else do;
+		call MOVE (sup_segnum, sup_si);
+		sup_si.faulted = "1"b;
+	     end;
+	end;					/* loop moving segments */
+
+DONE_MOVE:
+	slt.free_core_size = new_free_core_size;	/* update SLT header */
+	new_abs_sdw = 0;
+	call pmut$swap_sdw (addr (abs_seg$), addr (new_abs_sdw));
+	return;
+
+MOVE:
+     procedure (segnum, si);
+declare  segnum			  fixed bin (18);
+declare  1 si			  aligned like sdw_info;
+declare  new_abs_sdw		  fixed bin (71);
+declare  new_address		  fixed bin (26);
+declare  new_seg_sdw		  fixed bin (71);
+declare  old_seg_sdw		  fixed bin (71);
+declare  page			  fixed bin;
+declare  page_table_absloc		  fixed bin (26);
+declare  page_table_ptr		  ptr;
+
+declare  seg_ptr			  pointer;
+declare  copy_the_seg		  (si.size) bit (36) aligned based;
+
+	seg_ptr = baseptr (segnum);
+
+/* First, allocate some space */
+
+	if si.paged then do;
+
+/* paged segment; build paged abs_seg0 onto it and move. */
+
+	     sltep = addr (slt.seg (segnum));		/* subtract off breakpoint page from amt to move */
+	     if slte.breakpointable then si.size = si.size - 1024;
+
+	     call sdw_util_$get_address (addr (dseg$ (segnum)), page_table_absloc);
+	     page_table_ptr = ptr (addr (int_unpaged_page_tables$), page_table_absloc - iupt_absloc);
+
+	     new_address = new_free_core_size + slt.free_core_start - si.size;
+
+/* copy page table to abs seg page table with new addresses */
+
+	     do page = 0 to divide (si.size, 1024, 17) - 1;
+		call ptw_util_$make_core (addrel (abs_page_table_ptr, page), new_address + page * 1024);
+	     end;
+	     call pmut$camp;
+	     abs_seg_ptr = addr (abs_seg0$);
+
+	     new_free_core_size = new_free_core_size - si.size;
+	     old_seg_sdw = dseg$ (segnum);
+	     new_seg_sdw = dseg$ (segno (abs_seg_ptr));
+	end;
+	else do;
+
+/* Simple unpaged segment; build unpaged abs_seg onto it and move. */
+
+	     unspec (abs_si) = ""b;			/* no attributes when we rearrange it */
+	     abs_si.read, abs_si.write = "1"b;		/* always RW for copying */
+	     abs_si.address = new_free_core_size + slt.free_core_start - si.size;
+	     new_free_core_size = new_free_core_size - si.size;
+	     abs_si.size = si.size;
+
+	     call sdw_util_$construct (addr (new_abs_sdw), addr (abs_si));
+
+	     si.address = abs_si.address;		/* move it */
+	     call sdw_util_$construct (addr (new_seg_sdw), addr (si));
+
+	     call pmut$swap_sdw (abs_seg_ptr, addr (new_abs_sdw));
+	     abs_seg_ptr = addr (abs_seg$);
+	end;
+
+/* Move the contents */
+
+/* Now move the real segment onto the new copy */
+/* if it is this program's text that just got moved, it is pure, and all is 
+/* jolly. */
+/* inzr_stk0, though, is another kettle of fish. If we swapped its sdw */
+/* with the return address put on it after the copy, the return */
+/* address would vanish.  So we patch the return address in in advance */
+
+	stackframeptr () -> stack_frame.return_ptr = codeptr (PMUT_RETURN_HERE);
+						/* please */
+
+	abs_seg_ptr -> copy_the_seg = seg_ptr -> copy_the_seg;
+
+	call pmut$swap_sdw (seg_ptr, addr (new_seg_sdw));
+
+PMUT_RETURN_HERE:
+	;
+	if si.paged then do;
+
+/* We now have both abs_seg$ and the seg in question pointing to the abs_seg0
+page table and the new memory.  We need to fix up the orig seg's page table
+and get it's sdw back to pointing there. */
+
+	     do page = 0 to divide (si.size, 1024, 17) - 1;
+		call ptw_util_$make_core (addrel (page_table_ptr, page), new_address + page * 1024);
+	     end;
+	     call pmut$camp;
+	     call pmut$swap_sdw (seg_ptr, addr (old_seg_sdw));
+	end;
+
+	return;
+     end MOVE;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   move_non_perm_wired_segs: mem TAG on in config deck, but port off.
+
+   S:  $crash
+
+   T:  $init
+
+   M:  Memory controller TAG is specified ON on its MEM card,
+   but its port is disabled on the bootload CPU.
+
+   A:  Enable the port or set the MEM OFF and reboot.
+
+   Message:
+   move_non_perm_wired_segs: mem TAG size nK in config, mK on port.
+
+   S:  $crash
+
+   T:  $init
+
+   M:  Memory controller TAG has a size of nK in the config deck,
+   but the address assignment and port size switches specify mK.
+
+   A:  Fix the switches or config deck and reboot.
+
+   Message:
+   move_non_perm_wired_segs: no main memory configured.
+
+   S:  $crash
+
+   T:  $init
+
+   M:  No MEM cards were found ON in the config deck.
+
+   A:  Fix the config deck and reboot.
+
+   END MESSAGE DOCUMENTATION */
+
+     end move_non_perm_wired_segs;

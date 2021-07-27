@@ -1,0 +1,296 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-27,Pierret), approve(86-02-27,MCR7340),
+     audit(86-04-28,Newcomb), install(86-05-06,MR12.0-1054):
+     Changed to execute file_mangaer_$post_transaction before unlocking locks.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,ifthenstmt,^indproc,^indcomtxt */
+/*---------------*/
+
+tm_abandon: proc (A_txn_id, A_code);
+
+/* DESCRIPTION:
+
+   The entry point $tm_abandon abandons the user's current transaction by
+   turning on its abandoned_sw and giving the user process a new TDT slot
+   to work with.
+
+   The entry point $tm_kill kills a user's own transaction by deleting it
+   without a rollback. This is done immediately if the transaction belongs to
+   the user's current process and has not already been abandoned, otherwise
+   a message is sent to the daemon to perform the kill.
+
+/* HISTORY:
+Written by Steve Herbst 10/12/82
+Modified:
+12/10/82 by Steve Herbst: Made to call lock_manager_$(adopt abandon).
+01/13/83 by Steve Herbst: Added $tm_kill and made $tm_abandon work on the
+	user's own transaction.
+02/22/83 by Steve Herbst: Changed to not call lock_manager_$abandon.
+03/14/83 by Steve Herbst: Fixed argument validation.
+04/29/83 by Steve Herbst: Changed to call file_manager_$adopt before
+	calling before_journal_manager_$adopt.
+05/03/83 by Steve Herbst: Changed $tm_kill to kill immediately if same
+	process and txn not abandoned.
+05/04/83 by Steve Herbst: Split tm_adopt into tm_abandon (this module) and
+	tm_daemon_adopt for daemon to call.
+05/11/83 by Steve Herbst: Changed kill to allow killing another user's
+	transaction.
+05/13/83 by Steve Herbst: Changed to call fm_$abandon.
+08/23/84 by Steve Herbst: Responded to audit comments.
+02/07/85 by S. Cox: Added fm$post_transaction call (moved from lm_per_system_)
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+04/23/85 by Matthew C. Pierret:  Switched order of calls to
+            file_manager_$post_transaction and lock_manager_$unlock_all.
+            Having the file_manager_ call first allows it to operate under the
+            locks acquired by the transaction.
+*/
+
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  A_txn_id bit (36) aligned parameter;
+dcl  A_code fixed bin (35) parameter;
+
+
+/* Constants */
+
+/* Based */
+
+/* Static */
+
+/* Automatic */
+
+dcl  txn_id bit (36) aligned;
+dcl  txn_index fixed bin;
+
+/* External */
+
+dcl  dm_data_$current_txn_id bit (36) aligned external;
+dcl  dm_data_$current_txn_index fixed bin external;
+dcl  dm_data_$my_process_id bit (36) aligned external;
+dcl  dm_data_$my_tdt_index fixed bin external;
+dcl  dm_data_$suspended_txn_index fixed bin external;
+dcl  dm_data_$tm_tdt_ptr ptr external;
+dcl  dm_error_$invalid_current_txn fixed bin (35) ext;
+dcl  dm_error_$no_current_transaction fixed bin (35) ext;
+dcl  dm_error_$not_own_transaction fixed bin (35) external;
+dcl  dm_error_$tdt_full fixed bin (35) ext;
+dcl  dm_error_$transaction_not_current fixed bin (35) ext;
+dcl  dm_error_$transaction_suspended fixed bin (35) ext;
+
+/* Entries */
+
+dcl  before_journal_manager_$write_aborted_mark entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  dm_misc_util_$log entry options (variable);
+dcl  dm_send_request_$adjust_txn entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  file_manager_$abandon entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  file_manager_$post_transaction entry ();
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  lock_manager_$unlock_all entry;
+dcl  tm_get_txn_index entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+
+/* Builtins */
+
+dcl  (addr, before, fixed, stac, unspec) builtin;
+
+/* Conditions */
+
+dcl  cleanup condition;
+
+/* END OF DECLARATIONS */
+%page;
+/* When a process abandons its own transaction, the transaction goes into an abandoned state (abandoned_sw = "1"b).
+   When it is in this state, only the Daemon can touch it. The owner process gets a new TDT entry and
+   can begin transactions */
+
+	A_code = 0;
+
+	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+
+	if dm_data_$current_txn_index = 0 then
+	     if dm_data_$suspended_txn_index ^= 0 then call ERROR_RETURN (dm_error_$transaction_suspended);
+	     else call ERROR_RETURN (dm_error_$no_current_transaction);
+
+	txn_index = dm_data_$current_txn_index;
+
+	if txn_index < 1 | txn_index > tm_tdt.entry_count then
+	     call ERROR_RETURN (dm_error_$invalid_current_txn);
+
+	if A_txn_id = "0"b | A_txn_id = tm_tdt.txn_id (txn_index) then
+	     txn_id = tm_tdt.txn_id (txn_index);
+	else call ERROR_RETURN (dm_error_$transaction_not_current);
+
+	if tm_tdt.process_id (txn_index) ^= dm_data_$my_process_id then
+	     call ERROR_RETURN (dm_error_$not_own_transaction);
+
+	tm_tdt.abandoned_sw (txn_index) = "1"b;
+
+	call file_manager_$abandon (txn_id, txn_index, A_code);
+	if A_code ^= 0 then call ERROR_RETURN (A_code);
+
+	call GET_NEW_TDT_SLOT;
+
+	call dm_send_request_$adjust_txn (txn_id, txn_index, 0);
+
+	call dm_misc_util_$log (INFORM_SV, "User abandoned transaction ^d, TID = ^o, pid = ^w, owner = ^a, state = ^d",
+	     txn_index, fixed (tm_tdt.txn_id (txn_index)), tm_tdt.process_id (txn_index),
+	     PERSON_ID (txn_index), tm_tdt.state (txn_index));
+
+RETURN:
+	return;
+%page;
+tm_kill: entry (A_txn_id, A_code);
+
+/* Killing a transaction causes it to disappear from the TDT even if it cannot be aborted or otherwise completed.
+   The transaction to be killed must be the user's own, either in the current process or in a previous process.
+   If the transaction belongs to the user's current process and has not already been abandoned, it is killed
+   immediately. Otherwise, the transaction's kill_sw is turned on and a message is sent to the daemon to perform
+   the actual kill. In the latter case, the user's process immediately gets a new TDT entry to play with. */
+
+	A_code = 0;
+
+	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+
+	if A_txn_id = "0"b then do;
+	     txn_index = dm_data_$current_txn_index;
+	     if txn_index = 0 then call ERROR_RETURN (dm_error_$no_current_transaction);
+	     else if txn_index < 1 | txn_index > tm_tdt.entry_count then
+		call ERROR_RETURN (dm_error_$invalid_current_txn);
+	     txn_id = tm_tdt.txn_id (txn_index);
+	end;
+
+	else do;
+	     txn_id = A_txn_id;
+	     txn_index = tm_get_txn_index (txn_id, A_code);
+	     if A_code ^= 0 then call ERROR_RETURN (A_code);
+	end;
+
+	if tm_tdt.abandoned_sw (txn_index) |		/* previously abandoned; daemon must kill */
+	     tm_tdt.process_id (txn_index) ^= dm_data_$my_process_id then do; /* same for old process's txn */
+
+	     tm_tdt.abandoned_sw (txn_index) = "1"b;	/* abandon for sure */
+
+	     if get_process_id_ () = tm_tdt.process_id (txn_index) then call GET_NEW_TDT_SLOT;
+
+	     tm_tdt.kill_sw (txn_index) = "1"b;		/* mark the old slot killed in any case */
+
+	     call dm_send_request_$adjust_txn (txn_id, txn_index, 0);
+
+	     call dm_misc_util_$log (INFORM_SV,
+		"User requested kill, transaction ^d, TID = ^o, pid = ^w, owner = ^a, state = ^d",
+		txn_index, fixed (tm_tdt.txn_id (txn_index)), tm_tdt.process_id (txn_index),
+		PERSON_ID (txn_index), tm_tdt.state (txn_index));
+
+	     return;
+	end;
+
+/* Kill the transaction immediately */
+
+	if OK_TO_WRITE_MARK ((tm_tdt.state (txn_index))) then
+	     call before_journal_manager_$write_aborted_mark (txn_id, txn_index, 0);
+
+	call file_manager_$post_transaction;
+
+	call lock_manager_$unlock_all;
+
+	unspec (tm_tdt.transaction (txn_index)) = "0"b;
+
+	call file_manager_$abandon (txn_id, txn_index, 0);
+
+	dm_data_$current_txn_id = "0"b;
+	dm_data_$current_txn_index = 0;
+
+	call dm_misc_util_$log (INFORM_SV, "User killed transaction ^d, pid = ^w, owner = ^a",
+	     txn_index, tm_tdt.process_id (txn_index), PERSON_ID (txn_index));
+
+	return;
+%page;
+ERROR_RETURN: proc (P_code);
+
+dcl  P_code fixed bin (35);
+
+	A_code = P_code;
+	go to RETURN;
+
+     end ERROR_RETURN;
+%page;
+GET_NEW_TDT_SLOT: proc;
+
+dcl  tdt_index fixed bin;
+
+	do tdt_index = 1 to tm_tdt.entry_count;
+
+	     if stac (addr (tm_tdt.process_id (tdt_index)), dm_data_$my_process_id) then do; /* a free one */
+
+		tm_tdt.owner_name (tdt_index) = tm_tdt.owner_name (txn_index);
+		tm_tdt.event_channel (tdt_index) = tm_tdt.event_channel (txn_index);
+
+		on cleanup call SET_DM_DATA;
+
+		call SET_DM_DATA;
+
+		return;
+	     end;
+	end;
+
+	call ERROR_RETURN (dm_error_$tdt_full);
+
+
+SET_DM_DATA: proc;
+
+	dm_data_$my_tdt_index = tdt_index;
+	dm_data_$current_txn_index = 0;
+	dm_data_$current_txn_id = "0"b;
+
+     end SET_DM_DATA;
+
+     end GET_NEW_TDT_SLOT;
+%page;
+OK_TO_WRITE_MARK: proc (P_state) returns (bit (1));
+
+dcl  (P_state, state) fixed bin;
+
+	state = P_state;
+
+	if state > TM_ERROR_INCREMENT then state = state - TM_ERROR_INCREMENT;
+
+	if state ^= TM_ABORT_UNLOCKING_STATE		/* don't write a second abort mark if possible */
+	     & state ^= TM_ABORT_METERING_STATE
+
+	     & state ^= TM_COMMIT_UNLOCKING_STATE	/* also don't abort if commit mark has been written */
+	     & state ^= TM_COMMIT_METERING_STATE then return ("1"b);
+
+	else return ("0"b);
+
+     end OK_TO_WRITE_MARK;
+%page;
+PERSON_ID: proc (P_txn_index) returns (char (32));
+
+dcl  P_txn_index fixed bin;
+dcl  name char (32);
+
+	name = tm_tdt.owner_name (P_txn_index);
+	return (before (name, "."));
+
+     end PERSON_ID;
+%page;
+%include dm_tm_tdt;
+%page;
+%include dm_tm_states;
+%page;
+%include dm_log_sv_codes;
+
+
+     end tm_abandon;

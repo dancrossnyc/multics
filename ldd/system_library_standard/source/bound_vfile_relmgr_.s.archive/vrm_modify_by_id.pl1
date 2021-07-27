@@ -1,0 +1,367 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+vrm_modify_tuples_by_id: modify_tuples_by_id: proc (I_cursor_ptr, element_id_list_ptr, I_typed_vector_ptr, O_number_of_tuples_modified, O_code);
+
+/* .			BEGIN_DESCRIPTION
+
+   Modify the tuples identified in the element_id_list to have the attributes
+   and values specified in the general_typed_vector. The number of tuples
+   modified will be returned.
+
+   .			END_DESCRIPTION
+*/
+
+/*  History:
+
+    82-09-28  R. Harvey:  Initially written.
+    82-11-16  Roger Lackey : Added new call to  metering and locking
+    83-01-04  Roger Lackey : changed the way that the tuple was copied from 
+    the data file  to temp space to use the length of the vfile record instead
+    of the max_tuple_length.
+  
+    83-02-16 Roger Lackey : Added check for zero length record after call to record status.
+
+    84-12-19 Thanh Nguyen : Added code to continue on to the next tuple if the
+    tuple was deleted by another parallel process in share mode and stop the
+    premature tuple_not_found.
+*/
+%page;
+/* vrm_modify_tuples_by_id: proc (I_cursor_ptr, element_id_list_ptr, I_typed_vector_ptr, O_number_of_tuples_modified, O_code); */
+
+
+/*	dcl     element_id_list_ptr	 ptr parameter;	 broken rule due to allocation dependency of vfile_desc_list */
+	dcl     I_typed_vector_ptr	 ptr parameter;
+	dcl     I_cursor_ptr	 ptr parameter;
+	dcl     O_number_of_tuples_modified fixed bin (35) parameter;
+	dcl     O_code		 fixed bin (35) parameter;
+
+
+	general_typed_vector_ptr = I_typed_vector_ptr;
+	vrm_cursor_ptr = I_cursor_ptr;
+	O_number_of_tuples_modified = 0;		/* true so far */
+
+	file_locked = "0"b;
+
+	on cleanup call tidy_up;
+
+	if element_id_list.version ^= ELEMENT_ID_LIST_VERSION_1
+	then call error (error_table_$unimplemented_version);
+
+	call init_modify;
+
+	do i = 1 to element_id_list.number_of_elements;
+
+	     tid_ptr = addr (element_id_list.id (i));
+	     vfd_ptr = addr (vfile_desc);
+
+	     vfile_desc = 0;
+	     vfd.comp_number = tid.comp_num;
+	     vfd.comp_offset = tid.offset;
+
+	     call modify_one_tuple (element_id_list.id (i), vfile_desc, general_typed_vector_ptr);
+	     O_number_of_tuples_modified = i;
+	end;
+
+	O_code = 0;
+
+Exit:	call tidy_up;
+	return;
+%page;
+init_modify: proc;
+
+	if vrm_cursor.switches.meter_sw then do;
+
+		call cpu_time_and_paging_ (pf_1, t1, pf_dummy);
+		vrm_meter_ptr = vrm_cursor.meter_ptr;
+		vrm_meter.last_call_stats = 0;
+	     end;
+
+	if general_typed_vector.type ^= GENERAL_TYPED_VECTOR_TYPE
+	then call error (error_table_$unimplemented_version);
+
+	vrm_open_info_ptr = vrm_cursor.open_info_ptr;
+	vrm_cursor.switches.shared = vrm_cursor.open_info_ptr -> vrm_open_info.switches.shared;
+
+	vrm_rel_desc_ptr = vrm_cursor.vrm_relation_desc_ptr;
+	vrm_com_ptr = vrm_open_info.com_ptr;
+
+	if vrm_com.mod_seg_ptr = null () then do;
+		call get_temp_segment_ ("vrm_modify", vrm_com.mod_seg_ptr, code);
+		if code ^= 0 then call error (code);
+	     end;
+	temp_seg_ptr = vrm_com.mod_seg_ptr;
+
+	add_key_list_ptr = temp_seg_ptr;
+	add_key_list_ptr -> key_list.number_of_keys = vrm_rel_desc.number_sec_indexes;
+
+	i = currentsize (add_key_list_ptr -> key_list);
+
+	delete_key_list_ptr = addrel (add_key_list_ptr, i);
+	delete_key_list_ptr -> key_list.number_of_keys = vrm_rel_desc.number_sec_indexes;
+
+	change_bits_ptr = addrel (delete_key_list_ptr, i);
+	change_bits.number_of_change_bits = vrm_rel_desc.number_attrs;
+
+	i = currentsize (change_bits);
+	tuple_ptr = addrel (change_bits_ptr, i + mod (i, 2));
+
+	string (change_bits.position) = "0"b;
+
+/* Now insure that the primary key is not being modified (and set up change bits as well) */
+	vrm_collection_info_ptr = vrm_open_info.primary_key_info_ptr;
+	do i = 1 to general_typed_vector.number_of_dimensions;
+	     attr_no = general_typed_vector.dimension (i).identifier;
+
+	     do z = 1 to vrm_collection_info.number_of_attributes;
+		if attr_no = vrm_collection_info.attribute (z).attr_index then
+		     call error (mdbm_error_$mod_key_attr);
+	     end;
+
+	     change_bits.position (attr_no) = "1"b;
+	end;
+
+	string (rs_info.flags) = "0"b;		/* Clear flags */
+	rs_info.locate_sw = "1"b;			/* set for search by descriptor */
+
+     end init_modify;
+%page;
+modify_one_tuple: proc (element_id, vfile_descriptor, general_typed_vector_ptr);
+
+/* Parameters */
+
+	dcl     element_id		 bit (36) aligned parameter;
+	dcl     vfile_descriptor	 fixed bin (35) parameter;
+	dcl     general_typed_vector_ptr ptr parameter;
+
+
+	rs_info.descriptor = vfile_descriptor;		/* This is record to locate */
+
+	if vrm_cursor.switches.shared then do;
+		if vrm_cursor.opening_mode = KSQU then call lock;
+	     end;
+
+	call iox_$control (vrm_cursor.iocb_ptr, "record_status", addr (rs_info), code);
+	if code ^= 0 then call error (error_table_$no_record);
+	else if vrm_cursor.switches.shared then
+	     if rs_info.record_length = 0 | rs_info.block_ptr -> block_head.is_this_block_free
+	     then go to exit_of_modify_one_tuple;
+
+	tuple_ptr -> tuple_templet = rs_info.record_ptr -> tuple_templet; /* Copy tuple to workspace */
+
+	if vrm_rel_desc.switches.indexed then do;
+		call vrmu_build_index_list (vrm_rel_desc_ptr, vrm_open_info_ptr, tuple_ptr, change_bits_ptr, delete_key_list_ptr, code);
+		if code ^= 0 then call error (code);
+	     end;
+
+	call vrmu_cv_vector_to_tuple (vrm_rel_desc_ptr, tuple_ptr, general_typed_vector_ptr, "1"b /* MODIFY */, tuple_length, code);
+	if code ^= 0 then call error (code);
+
+	if vrm_rel_desc.switches.indexed then do;
+		call vrmu_build_index_list (vrm_rel_desc_ptr, vrm_open_info_ptr, tuple_ptr, change_bits_ptr, add_key_list_ptr, code);
+		if code ^= 0 then call error (code);
+	     end;
+
+
+	if vrm_rel_desc.switches.indexed then do;
+		call vrmu_delete_indexes (vrm_cursor.iocb_ptr, delete_key_list_ptr, element_id, code);
+		if code ^= 0 then call error (code);
+	     end;
+
+	call iox_$rewrite_record (vrm_cursor.iocb_ptr, tuple_ptr, tuple_length, code);
+	if code ^= 0 then call error (code);
+
+	if vrm_rel_desc.switches.indexed then do;
+		call vrmu_add_indexes (vrm_cursor.iocb_ptr, add_key_list_ptr, element_id, code);
+		if code ^= 0 then call error (code);
+	     end;
+
+exit_of_modify_one_tuple:
+
+	if vrm_cursor.switches.shared then call unlock;
+
+	if vrm_cursor.switches.meter_sw then
+	     vrm_meter.last_call_stats.number_tuples_modified =
+		vrm_meter.last_call_stats.number_tuples_modified + 1;
+
+     end modify_one_tuple;
+%page;
+error: proc (ecode);
+
+	dcl     ecode		 fixed bin (35);
+
+	if ecode = error_table_$no_record then O_code = dm_error_$no_tuple_id;
+	else O_code = ecode;
+
+	go to Exit;
+
+     end error;
+
+
+
+/* * * * * * * * * * * * * * * * * * *   tidy_up   * * * * * * * * * * *  */
+
+tidy_up: proc;
+
+	if file_locked then call iox_$control (iocb_ptr, "set_file_lock", addr (UNLOCK), code);
+
+	if vrm_cursor.switches.meter_sw then do;
+		call cpu_time_and_paging_ (pf_2, t2, pf_dummy);
+		vrm_meter.last_call_stats.last_time_of_stats = clock;
+
+		t3 = t2 - t1;
+		vrm_meter.last_call_stats.vcpu_time = divide (t3, 1000000, 63);
+		vrm_meter.last_call_stats.page_faults = pf_2 - pf_1;
+		vrm_meter.last_call_stats.number_times_used = 1;
+		vrm_meter.total_stats.last_time_of_stats = 0;
+		vrm_meter.total_stats = vrm_meter.total_stats + vrm_meter.last_call_stats;
+
+	     end;
+
+
+     end tidy_up;
+%page;
+/* * * * * * * * * * * * * *     lock   * * * * * * * * * * * * * * * *  */
+
+
+lock: proc;
+
+	call iox_$control (iocb_ptr, "set_file_lock", addr (LOCK), code);
+	if code ^= 0 then call error (code);
+
+	file_locked = "1"b;
+
+	if vrm_cursor.switches.meter_sw then
+	     vrm_meter.last_call_stats.number_times_locked =
+		vrm_meter.last_call_stats.number_times_locked + 1;
+
+
+     end lock;
+
+
+
+
+
+
+
+/* * * * * * * * * * * * * *     unlock   * * * * * * * * * * * * * * * *  */
+
+unlock: proc;
+
+	if file_locked then do;
+		call iox_$control (iocb_ptr, "set_file_lock", addr (UNLOCK), code);
+		if code ^= 0 then call error (code);
+	     end;
+
+	file_locked = "0"b;
+
+     end unlock;
+
+%page;
+%include dm_typed_vector_list;
+%page;
+%include vu_typed_vector;
+%page;
+%include vrm_cursor;
+%page;
+%include vrm_tuple;
+%page;
+%include vrm_open_info;
+%page;
+%include vrm_collection_info;
+%page;
+%include vrm_rel_desc;
+%page;
+%include vrm_change_bits;
+%page;
+%include vrm_key_list;
+%page;
+%include vrm_com;
+%page;
+%include dm_element_id_list;
+%page;
+%include mdbm_rs_info;
+%page;
+%include vrm_meter;
+%page;
+
+	dcl     1 tid		 aligned based (tid_ptr), /* MRDS tuple id (tid) */
+		2 non_std_desc	 bit (1) unal,	/* Non-standard descriptor bit */
+		2 temp		 bit (1) unal,	/* On if temp relation */
+		2 file_id		 bit (7) unal,	/* File id from mrds db_model file_id_list */
+		2 comp_num	 bit (10) unal,	/* Component number */
+		2 offset		 bit (17) unal;	/* Offset within component */
+
+	dcl     tid_ptr		 pointer;
+
+
+	dcl     1 vfd		 aligned based (vfd_ptr), /* Vfile desc */
+		2 pad_1		 bit (8) unal,
+		2 comp_number	 bit (10) unal,	/* Component number */
+		2 comp_offset	 bit (17) unal,	/* Offset with in component */
+		2 pade_2		 bit (1) unal;
+
+	dcl     vfd_ptr		 pointer;		/* Pointer to vfd structure */
+
+	dcl     1 block_head	 based,		/* block header of vfile */
+		2 is_preceding_block_free
+				 bit (1) unal,
+		2 is_this_block_free bit (1) unal,
+		2 block_size	 fixed (19) unal,
+		2 flags,
+		  3 lock_flag	 bit (1) unal,
+		  3 stationary	 bit (1) unal,
+		  3 indirect	 bit (1) unal,
+		  3 after_applies	 bit (1) unal,
+		  3 pad		 bit (6) unal,
+		  3 excess_words	 fixed (3) unal,	/* only used in indirect allocations */
+		2 prev_free_block	 fixed (18) aligned,
+		2 next_free_block	 fixed (18) aligned;
+%page;
+	dcl     add_key_list_ptr	 ptr;
+	dcl     attr_no		 fixed bin (17);
+	dcl     cleanup		 condition;
+	dcl     clock		 builtin;
+	dcl     code		 fixed bin (35);
+	dcl     cpu_time_and_paging_	 entry (fixed bin, fixed bin (71), fixed bin);
+	dcl     delete_key_list_ptr	 ptr;
+	dcl     divide		 builtin;
+	dcl     file_locked		 bit (1);
+	dcl     get_temp_segment_	 entry (char (*), ptr, fixed bin (35));
+	dcl     i			 fixed bin (35);
+	dcl     iox_$control	 entry (ptr, char (*), ptr, fixed bin (35));
+	dcl     iox_$rewrite_record	 entry (ptr, ptr, fixed bin (21), fixed bin (35));
+	dcl     KSQU		 fixed bin int static options (constant) init (10);
+	dcl     LOCK		 bit (2) aligned int static options (constant) init ("10"b);
+	dcl     pf_1		 fixed bin;
+	dcl     pf_2		 fixed bin;
+	dcl     pf_dummy		 fixed bin;
+	dcl     t1		 fixed bin (71);
+	dcl     t2		 fixed bin (71);
+	dcl     t3		 float bin (63);
+	dcl     temp_seg_ptr	 ptr;
+	dcl     tuple_templet	 char (rs_info.record_length) based;
+	dcl     UNLOCK		 bit (2) aligned int static options (constant) init ("00"b);
+	dcl     vrmu_add_indexes	 entry (ptr, ptr, bit (36) aligned, fixed bin (35));
+	dcl     vrmu_build_index_list	 entry (ptr, ptr, ptr, ptr, ptr, fixed bin (35));
+	dcl     vrmu_cv_vector_to_tuple entry (ptr, ptr, ptr, bit (1) aligned, fixed bin (21), fixed bin (35));
+	dcl     vrmu_delete_indexes	 entry (ptr, ptr, bit (36) aligned, fixed bin (35));
+	dcl     vfile_desc		 fixed bin (35) aligned;
+	dcl     z			 fixed bin;
+
+	dcl     (
+	        dm_error_$no_tuple_id,
+	        error_table_$unimplemented_version,
+	        error_table_$no_record,
+	        mdbm_error_$mod_key_attr,
+	        sys_info$max_seg_size
+	        )			 fixed bin (35) ext static;
+
+	dcl     (addrel, addr, currentsize, fixed, mod, null, rel, string) builtin;
+
+
+     end vrm_modify_tuples_by_id;
+

@@ -1,0 +1,534 @@
+/* ***********************************************************
+   *						 *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *						 *
+   *********************************************************** */
+
+/*  DESCRIPTION:
+
+	This is the program that does all crash recovery work.  It looks at
+     the configuration file for bootload indicators and has two main parts:
+     check to see if recovery is necessary or can be done at all, and the
+     actual rollback of uncompleted transactions.  This program should only
+     be called by dm_initializer_ from within the DM Daemon at initialization
+     time for a particular AIM level.
+
+	The first is responsible for making sure there is a previous set of
+     DM tables to possibly recover from.  Any of three things missing can make
+     recovery impossible: the previous per-bootload directory is missing, the
+     file manager's UID to pathname table is missing, or the before journal
+     manager's UID to pathname table is missing.  If we find a dm_system_data_
+     in the old directory with the normal shutdown indicator set properly,
+     recovery need not be done and we return.
+
+	The rollback after crash is the second part of recovery.  It opens
+     the before journals recorded in the old bootload BJM UID-pathname table,
+     finds the ends of these journals, and creates a list of transactions
+     that have not been committed or aborted.  These transactions are then
+     rolled back using the normal methods with some minor modifications of
+     the Daemon adoption/abandon scheme.  If any before journal or
+     synchronized file cannot be found, an error is registered in the Data
+     Management log.  Any errors found during recovery will be logged in the
+     above log using dm_misc_util_$log, but this program and its subordinates
+     will not print the error on the console.  If dm_recovery_ finds a fatal
+     error, or if non-fatal recovery errors are not allowed (expected to be 
+     the normal case), sub_err_ will be called at the end of all work to abort
+     further DMS initialization.  This keeps msgs. for the System administrator
+     from confusing the operator.
+
+/* DESCRIPTION CONTINUED NEXT PAGE */
+
+/* DESCRIPTION CONTINUED FROM PREVIOUS PAGE */
+/*
+
+	Note that two changes will have to be made to this recovery
+     procedure when some parts of DM are implemented that are not being done
+     now.  The first is before journal and after journal phasing.  The other
+     is multi-phase commits, which are only partially handled currently.
+*/
+
+/*  HISTORY:
+
+Written by Lee A. Newcomb, 11/01/82.
+Modified:
+01/13/83 by L. A. Newcomb: add call to file_manager_$end_of_crash_recovery.
+03/01/83 by L. A. Newcomb: to use dm_log_sv_codes include and fix up
+	  the program to reference correctly the modified bj_txt structure.
+03/27/83 by L. A. Newcomb: log how many journals were opened for
+	  crash recovery.  Should be a temp. mod.
+03/29/83 by L. A. Newcomb: correct a typo in a log msg., report when some BJ's
+	  could not be opened for recovery, and how many were opened.
+04/07/83 by L. A. Newcomb:  added call to bjm_$close_bj_after_recovery if an
+            error occurred recovering the txns in a journal so it cannot be
+            used.
+05/18/83 by Lindsey L. Spratt:  Changed to use version 3 of the TDT.
+06/07/83 by L. A. Newcomb:  fixed to handle all recovery tasks and use the
+	  configuration file for deciding if we do recovery, what to do with
+	  the old bootload dir, and whether or not to die on non-fatal
+	  recovery errors.
+06/13/83 by L. A. Newcomb:  fixed problem where old bootload directories from
+            the same Multics bootload would cause holding of the current
+            recovered dir.  to fail.
+08/14/83 by L. A. Newcomb:  fixed some calls to dm_log_ to be information type
+            instead of error type.
+10/07/83 by L. A. Newcomb:  to terminate old file_manager_ UID to pathname
+	  table reference before deleting old bootload directory.
+03/05/84 by L. A. Newcomb:  To use the include file dm_system_states (renamed
+            from dm_statuses) and the new names therein.
+05/29/84 by Lindsey L. Spratt:  Changed to use version 2 of dm_system_config,
+            added a version check via CHECK_VERSION.
+11/22/84 by Lee A. Newcomb:  Changed to use dm_misc_util_$get_aim_dir.
+12/07/84 by R. Michael Tague:  Changed dm_util_$* to dm_misc_util_$*.
+02/20/85 by Lee A. Newcomb:  Fixed to reset the validation level before
+            returning, and to not lose an error from tm_$recovery_after_crash
+            when deciding to increment n_bjs_completely_recovered.  Also
+            changed to init automatic vars.
+02/26/85 by Lee A. Newcomb:  Fixed to understand
+            dm_error_$too_many_bootload_dirs is a fatal error.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+03/18/85 by Steve Herbst: Fixed format of "ENTERING" log message.
+*/
+/* format:  style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+%page;
+dm_recovery_: proc ();
+
+/* START OF DECLARATIONS */
+
+/* Parameter */
+
+/* Automatic */
+dcl  (
+     aim_dir		        char (168) init (""),
+     bj_oid_p		        ptr init (null),	/* location of vector of bj_oid's */
+     bj_uid_p		        ptr init (null),	/* location of vector of bj_uid's */
+     check_mode		        bit (1) aligned init (""b), /* how extensivly examine BJ's? */
+     code			        fixed bin (35) init (0), /* normal error code */
+     do_not_force_enable	        bit (1) aligned init (""b), /* def: die no fatal errors */
+     idx			        fixed bin init (0),	/* loop index */
+     n_bjs_completely_recovered       fixed bin init (0),	/* how many BJ's were recovered with no errors */
+     n_bjs_opened_for_recovery        fixed bin init (0),	/* how many BJ's could be opened for crash recovery */
+     n_hold_dirs		        fixed bin init (0),	/* how many old bootload dirs exist */
+     no_recovery_needed	        bit (1) aligned init (""b), /* def: recover unless told otherwise */
+     old_bj_txt_p		        ptr init (null),
+     old_boot_dir		        char (168) init (""), /* last dm_dir.BOOTLOAD dir in DM_AIM_dir */
+     old_boot_dir_name	        char (32) init (""),	/* entryname of old_boot_dir for deleting */
+     old_dm_status		        char (4) aligned init (""), /* state of last bootload instance */
+     old_tm_tdt_p		        ptr init (null),
+     saved_dm_state		        char (4) aligned init (""),
+     saved_level		        fixed bin init (-1)	/* validation level at entry */
+     )			        automatic;
+
+/* Based */
+dcl  (						/* temp. vectors for recovery */
+     bj_oid		        based (bj_oid_p),
+     bj_uid		        based (bj_uid_p)
+     )			        bit (36) aligned dim (1:n_bjs_opened_for_recovery);
+
+/* Builtin */
+dcl
+     (char, null, ltrim,
+     rtrim, unspec)		        builtin;
+
+/* Condition */
+dcl  cleanup		        condition;
+
+/* Constant */
+dcl
+     MYNAME		        char (12) init ("dm_recovery_")
+			        internal static options (constant);
+						/* Entry */
+dcl  (
+     before_journal_manager_$close_bj entry (bit (36) aligned, fixed bin (35)),
+     before_journal_manager_$close_bj_after_recovery
+			        entry (bit (36) aligned, fixed bin (35)),
+     before_journal_manager_$find_txns_after_crash
+			        entry (ptr, ptr, bit (36) aligned, bit (1) aligned, fixed bin (35)),
+     before_journal_manager_$open_all_after_crash
+			        entry (char (*), ptr, ptr, fixed bin, fixed bin (35)),
+     cu_$level_get		        entry (fixed bin),
+     cu_$level_set		        entry (fixed bin),
+     delete_$path		        entry (char (*), char (*), bit (6), char (*), fixed bin (35)),
+     dm_find_configuration_	        entry () returns (ptr),
+     dm_misc_util_$log	        entry options (variable),
+     dm_misc_util_$get_aim_dir        entry (char (*)),
+     dm_misc_util_$dm_status	        entry (char (*), char (4) aligned, fixed bin (35)),
+     dm_misc_util_$find_old_boot_dir  entry (char (*), char (*), fixed bin (35)),
+     expand_pathname_	        entry (char (*), char (*), char (*), fixed bin (35)),
+     file_manager_$end_of_crash_recovery
+			        entry (fixed bin (35)),
+     file_manager_$find_old_uid_pn_table
+			        entry (char (*), fixed bin (35)),
+     get_ring_		        entry () returns (fixed bin (3)),
+     get_temp_segment_	        entry (char (*), ptr, fixed bin (35)),
+     hcs_$chname_file	        entry (char (*), char (*), char (*), char (*), fixed bin (35)),
+     hcs_$star_		        entry (char (*), char (*), fixed bin (2), ptr, fixed bin, ptr, ptr, fixed bin (35)),
+     release_temp_segment_	        entry (char (*), ptr, fixed bin (35)),
+     sub_err_		        entry () options (variable),
+     transaction_manager_$recover_after_crash
+			        entry (ptr, ptr, fixed bin (35))
+     )			        external;
+
+/* External */
+dcl  (
+     dm_error_$bj_not_all_opened_after_crash fixed bin (35),
+     dm_error_$partial_recovery       fixed bin (35),
+     dm_error_$too_many_bootload_dirs fixed bin (35),
+     dm_system_data_$current_dm_state char (4) aligned,
+     error_table_$nomatch	        fixed bin (35),
+     error_table_$unimplemented_version fixed bin (35)
+     )			        external static;
+
+/* Static */
+
+/* END OF DECLARATIONS */
+%page;
+SET_LEVEL_AND_CLEANUP_HANDLER:
+	do;
+
+	     call cu_$level_get (saved_level);
+
+	     on cleanup begin;
+		call CLEAN_UP ("0"b /* we are unwinding, don't call sub_err_ */);
+		call cu_$level_set (saved_level);
+	     end;
+
+	     call cu_$level_set (get_ring_ ());
+
+	end SET_LEVEL_AND_CLEANUP_HANDLER;
+
+FIND_CONFIG_FILE:
+	dm_system_config_ptr = dm_find_configuration_ ();
+
+	call CHECK_VERSION (dm_system_config.version, DM_CONFIG_VERSION_2, "dm_system_config");
+
+	call dm_misc_util_$log (LOG_SV, "ENTERING system crash recovery code.");
+%page;
+FIND_DIRS_AND_SET_INDICATORS:
+	do;
+
+	     call dm_misc_util_$get_aim_dir (aim_dir);
+
+	     saved_dm_state = dm_system_data_$current_dm_state; /* save state for reset if success */
+	     dm_system_data_$current_dm_state = DM_SYSTEM_STATE_RECOVERING;
+
+/* must we die on "non-fatal" recovery errors? */
+	     do_not_force_enable = (dm_system_config.curr_dm_enable = DM_DO_NOT_FORCE_ENABLE_NEW_BOOTLOAD);
+
+/* how extensive before journal examination? */
+	     check_mode = (dm_system_config.recovery_check_mode = DM_RECOVERY_CHECK_MODE_ON);
+
+	end FIND_DIRS_AND_SET_INDICATORS;
+
+FIND_OLD_BOOTLOAD_TO_RECOVER:
+	do;
+
+	     call dm_misc_util_$find_old_boot_dir (aim_dir, old_boot_dir, code);
+	     if code = dm_error_$too_many_bootload_dirs then /* fatal error */
+		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null, 0, "Per-AIM directory is ^a.", aim_dir);
+	     else if code ^= 0 then do;
+		call dm_misc_util_$log (LOG_SV, code, MYNAME,
+		     "No old bootload directory to recover in ^a.", aim_dir);
+						/* EXTRA CODE MUST BE ADDED HERE TO */
+						/* DETECT LOST BOOTLOADS IF RECOVERY ENABLED */
+		go to RESET_DM_STATE;
+	     end;
+	     else
+CHECK_IF_TO_IGNORE_RECOVERY:
+		if dm_system_config.recover = DM_DO_NOT_RECOVER_OLD_BOOTLOAD then do;
+		call dm_misc_util_$log (LOG_SV,
+		     "WARNING: recovery has been disabled by administrator; will not recover ^a.",
+		     rtrim (old_boot_dir));
+		no_recovery_needed = "1"b;
+		go to RECOVERY_CLEANUP_CHORES;	/* we still must do this part */
+	     end;
+	     else call dm_misc_util_$log (LOG_SV, "^5xDirectory to recover:^2x^a.", rtrim (old_boot_dir));
+
+	     call dm_misc_util_$dm_status (old_boot_dir, old_dm_status, code);
+	     if code = 0 then			/* have a good dm_system_data_ left */
+		if old_dm_status = DM_SYSTEM_STATE_NORMAL_SHUTDOWN then do; /* nothing to recover */
+		     call dm_misc_util_$log (LOG_SV, "No recovery required, no errors in previous DMS shutdown.");
+		     no_recovery_needed = "1"b;
+		     go to RECOVERY_CLEANUP_CHORES;
+		end;
+
+	end FIND_OLD_BOOTLOAD_TO_RECOVER;		/* ok, we need to do recovery */
+%page;
+GET_FM_UID_PATHNAME_TABLE:
+
+	call file_manager_$find_old_uid_pn_table (old_boot_dir, code);
+	if code ^= 0 then do;
+	     call dm_misc_util_$log (LOG_SV, code, MYNAME, "No old file manager pathname-UID table.");
+	     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+		"No old file manager path-UID table to use for recovery in ^a.", old_boot_dir);
+	end;
+
+GET_TEMP_STORAGE:
+	do;
+
+	     call get_temp_segment_ (MYNAME, bj_oid_p, code);
+	     if code ^= 0 then
+		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+		     "Unable to get temp. storage for BJ OID's.");
+
+	     call get_temp_segment_ (MYNAME, bj_uid_p, code);
+	     if code ^= 0 then
+		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+		     "Unable to get temp. storage for BJ UID's.");
+
+	     call get_temp_segment_ (MYNAME, old_bj_txt_p, code);
+	     if code ^= 0 then
+		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+		     "Unable to get temp. storage for txn list building.");
+
+	     call get_temp_segment_ (MYNAME, old_tm_tdt_p, code);
+	     if code ^= 0 then
+		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+		     "Unable to get temp. storage for txn list building.");
+
+
+	end GET_TEMP_STORAGE;
+%page;
+FIND_JOURNALS_TO_RECOVER:
+	do;
+
+/* Now find the before journals to be used in recovery. */
+/*     We initialize the cell n_bjs_completely_recovered which will be used */
+/*     to detect partial or complete recovery.  Every time we recovery using */
+/*     a journal with no errors, we add one to this cell.  If a code of one */
+/*     is returned from the call to open the BJ's, we set the cell to -1 so */
+/*     we will always see partial recovery. */
+
+	     call before_journal_manager_$open_all_after_crash (old_boot_dir,
+		bj_oid_p, bj_uid_p, n_bjs_opened_for_recovery, code);
+
+	     if code = dm_error_$bj_not_all_opened_after_crash then do; /* some BJ's could not be opened */
+		n_bjs_completely_recovered = -1;	/* make sure we report partial recovery */
+		call dm_misc_util_$log (LOG_SV, code, MYNAME);
+	     end;
+	     else if code ^= 0 then			/* FATAL -> could not open any BJ's */
+		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0, /* consider it a fatal recovery error */
+		     "Unable to open before journals open at crash time.");
+
+	     call dm_misc_util_$log (LOG_SV, "Number of journals opened for crash recovery = ^d.", n_bjs_opened_for_recovery);
+
+	end FIND_JOURNALS_TO_RECOVER;
+%page;
+/***** IF CONTROL GETS HERE, WE HAVE TO DO CRASH RECOVERY *****/
+
+RECOVER_EACH_JOURNAL_LOOP:
+	do idx = 1 to n_bjs_opened_for_recovery;
+
+/* step:  create a temporary transaction list of the old txns not finished */
+/*     at crash time, initially empty.  This currently consists of two */
+/*     temporary segments corresponding to the transaction and before */
+/*     journal managers' transaction tables.  These tables must be */
+/*     logically empty before processing each before journal. */
+
+	     old_tm_tdt_p -> tm_tdt.entry_count = 0;
+	     unspec (old_tm_tdt_p -> tm_tdt) = ""b;
+	     old_tm_tdt_p -> tm_tdt.version = TM_TDT_VERSION_3;
+	     old_bj_txt_p -> bj_txt.version = BJ_TXT_VERSION_1;
+	     old_bj_txt_p -> bj_txt.n_entries_used,
+		old_bj_txt_p -> bj_txt.max_n_entries = 0;
+	     old_bj_txt_p -> bj_txt.pad_entry_to_32_words = ""b;
+
+/* step:  find unfinished transactions in the BJ and add them to the */
+/*     temporary transaction table(s) for processing later */
+
+	     call before_journal_manager_$find_txns_after_crash (
+		old_tm_tdt_p, old_bj_txt_p, bj_oid (idx), check_mode, code);
+	     if code ^= 0 then do;
+		call dm_misc_util_$log (LOG_SV, code, MYNAME,
+		     "Unable to list unfinished txns. in BJ, OID = ^o.", bj_oid (idx));
+		go to SKIP_BEFORE_JOURNAL;
+	     end;
+	     old_bj_txt_p -> bj_txt.entry.bj_uid = bj_uid (idx); /* must patch in for rollback */
+
+/* step:  pass the temp. tables to transaction_manager_ to finish any */
+/*     processing needed on the txns found. */
+
+	     call transaction_manager_$recover_after_crash (
+		old_tm_tdt_p, old_bj_txt_p, code);	/* code checked in next step */
+
+/* step:  we may now close the journal.  This will be done normally if no */
+/*     errors occurred in recovering the txns in the journal.  Otherwise, */
+/*     we note the journal had unrecoverable txns for later observation. */
+
+SKIP_BEFORE_JOURNAL:
+	     if code = 0 then do;
+		call before_journal_manager_$close_bj (bj_oid (idx), code);
+						/* no errors at all, record for partial vs. */
+						/* complete recovery
+decision */
+		if code = 0 then
+		     n_bjs_completely_recovered = n_bjs_completely_recovered + 1;
+	     end;
+	     else call before_journal_manager_$close_bj_after_recovery (bj_oid (idx), code);
+	     if code ^= 0 then			/* oh, well... */
+		call dm_misc_util_$log (LOG_SV, code, MYNAME, "Unable to close BJ, OID ^o.", bj_oid (idx));
+
+	end RECOVER_EACH_JOURNAL_LOOP;
+%page;
+RECOVERY_CLEANUP_CHORES:				/* we always come here except when we die */
+
+REPORT_JOURNALS_NOT_RECOVERED:
+	if ^no_recovery_needed then do;		/* did try recovery */
+	     if n_bjs_completely_recovered ^= n_bjs_opened_for_recovery then
+		if do_not_force_enable then		/* must die here */
+		     call sub_err_ (dm_error_$partial_recovery, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			"Trying to recover ^a.", old_boot_dir);
+		else call dm_misc_util_$log (LOG_SV, dm_error_$partial_recovery, MYNAME,
+			"Trying to recover ^a.", old_boot_dir);
+	end;
+
+FILE_MANAGER_CLEANUP_CHORE:
+	if ^no_recovery_needed then do;		/* file_mamanger_ knows some things */
+	     call file_manager_$end_of_crash_recovery (code);
+	     if code ^= 0 then
+		call dm_misc_util_$log (LOG_SV, code, MYNAME,
+		     "Unable to terminate file_manager_'s ref. to old bootload tables.");
+	end;
+%page;
+OLD_BOOTLOAD_DIR_DISPOSITION:
+	do;
+
+	     call expand_pathname_ (old_boot_dir, (aim_dir), old_boot_dir_name, code);
+	     if code ^= 0 then			/* fatal? */
+		if do_not_force_enable then		/*  yes */
+		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			"Could not expand old bootload dir pathname ^a.", old_boot_dir);
+		else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+			"Could not expand old bootload dir pathname ^a.", old_boot_dir);
+
+	     if dm_system_config.hold = DM_HOLD_OLD_BOOTLOAD_DIRECTORY then do;
+						/* do any .hold.*'s already exist? */
+		call hcs_$star_ (aim_dir, rtrim (old_boot_dir_name) || ".hold.*", star_BRANCHES_ONLY,
+		     null (), n_hold_dirs, (null ()), (null ()), code);
+		if code ^= 0 & code ^= error_table_$nomatch then
+		     if do_not_force_enable then
+			call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			     "Cannot find out the current # of .hold.* direcotries in ^a.", aim_dir);
+		     else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+			     "Cannot find out the current # of .hold.* directories in ^a.", aim_dir);
+
+		else do;				/* get hold tag and rename */
+		     call hcs_$chname_file (aim_dir, old_boot_dir_name, old_boot_dir_name,
+			rtrim (old_boot_dir_name) || ".hold." || ltrim (rtrim (char (n_hold_dirs + 1))), code);
+		     if code ^= 0 then		/* see if we can allow this */
+			if do_not_force_enable then
+			     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+				"Cannot rename old bootload directory ^a.", old_boot_dir);
+			else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+				"Cannot rename old bootload directory ^a.", old_boot_dir);
+		end;
+	     end;
+	     else do;				/* must delete */
+		call delete_$path (aim_dir, old_boot_dir_name, "101000"b, MYNAME, code);
+		if code ^= 0 then			/* fatal? */
+		     if do_not_force_enable then	/*  yes */
+			call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			     "Could not delete old bootload direcotry ^a.", old_boot_dir);
+		     else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+			     "Could not delete old bootload direcotry ^a.", old_boot_dir);
+	     end;
+
+	     if no_recovery_needed then
+		go to RESET_DM_STATE;
+
+	end OLD_BOOTLOAD_DIR_DISPOSITION;
+%page;
+NORMAL_TERMINATION_CLEANUP:
+
+	call CLEAN_UP ("1"b /* report clean_up errors */);
+	call cu_$level_set (saved_level);
+
+RESET_DM_STATE:
+	dm_system_data_$current_dm_state = saved_dm_state;
+
+	call dm_misc_util_$log (LOG_SV, "FINISHED recovery^[ of ^a^].",
+	     (old_boot_dir ^= ""), old_boot_dir);
+
+	return;
+%page;
+CLEAN_UP:
+     proc (report_error_sw);
+
+/* This procedure releases the temporary segments acquired for recovery.   */
+/* If report_error_sw is on, it means that the call is after a successful  */
+/* recovery (or at least one where non-fatal errors are allowed).  Any     */
+/* error in this program when the parameter switch is on is considered a   */
+/* fatal recovery error. */
+
+dcl
+     report_error_sw	        bit (1) aligned
+			        parameter;
+
+dcl
+     cleanup_code		        fixed bin (35)
+			        automatic;
+
+	if bj_oid_p ^= null () then do;
+	     call release_temp_segment_ (MYNAME, bj_oid_p, cleanup_code);
+	     if cleanup_code ^= 0 then
+		if report_error_sw then
+		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			"Unable to release temp. storage for BJ OID's.");
+	end;
+
+	if bj_uid_p ^= null () then do;
+	     call release_temp_segment_ (MYNAME, bj_uid_p, cleanup_code);
+	     if cleanup_code ^= 0 then
+		if report_error_sw then
+		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			"Unable to release temp. storage for BJ UID's.");
+	end;
+
+	if old_tm_tdt_p ^= null () then do;
+	     call release_temp_segment_ (MYNAME, old_tm_tdt_p, cleanup_code);
+	     if cleanup_code ^= 0 then
+		if report_error_sw then
+		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			"Unable to release temp. txn. lists.");
+	end;
+
+	if old_bj_txt_p ^= null () then do;
+	     call release_temp_segment_ (MYNAME, old_bj_txt_p, cleanup_code);
+	     if cleanup_code ^= 0 then
+		if report_error_sw then
+		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+			"Unable to release temp. txn. lists.");
+	end;
+
+     end CLEAN_UP;
+%page;
+CHECK_VERSION:
+     proc (cv_p_received_version, cv_p_expected_version, cv_p_structure_name);
+
+dcl  cv_p_received_version	        char (8) aligned;
+dcl  cv_p_expected_version	        char (8) aligned;
+dcl  cv_p_structure_name	        char (*);
+
+	if cv_p_received_version ^= cv_p_expected_version
+	     then call
+		sub_err_ (error_table_$unimplemented_version, MYNAME, ACTION_CANT_RESTART, null, 0,
+		"^/Expected version ^d of the ^a structure.
+Received version ^d, instead.", cv_p_expected_version, cv_p_structure_name, cv_p_received_version);
+
+     end CHECK_VERSION;
+%page;
+%include dm_bj_txt;
+%page;
+%include dm_tm_tdt;
+%page;
+%include dm_system_config;
+%page;
+%include dm_system_states;
+%page;
+%include dm_log_sv_codes;
+%page;
+%include star_structures;
+%page;
+%include sub_err_flags;
+
+
+     end dm_recovery_;

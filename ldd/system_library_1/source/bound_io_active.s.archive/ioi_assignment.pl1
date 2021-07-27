@@ -1,0 +1,453 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+
+ioi_assignment:
+     proc;
+
+/* Module which handles devices assignments and unassignments for IOI */
+/* Rewritten February 1983 by Chris Jones. */
+/* Modified January 1984 by Chris Jones to add (add delete)_device entries. */
+/* Modified May 1984 by Paul Farley to check for IPC flag. */
+/* Modified Jan 1985 by Paul Farley to change IPC to FIPS. */
+/* Modified Sept 1985 by Paul Farley to add "controller" checking. */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+     audit(85-11-26,CLJones), install(86-03-21,MR12.0-1033):
+     Support FIPS.
+  2) change(86-05-16,Kissel), approve(86-07-30,MCR7461), audit(86-07-31,Coren),
+     install(86-08-19,MR12.0-1120):
+     Recompiled because of change in ioi_data.incl.pl1 to the constant
+     IOI_DEFAULT_MAX_BOUND.
+  3) change(86-06-03,Farley), approve(86-07-18,MCR7439),
+     audit(86-08-18,Fawcett), install(86-10-20,MR12.0-1189):
+     Changed to execute in the BCE environment.
+                                                   END HISTORY COMMENTS */
+
+dcl	p_dtx		   fixed bin parameter;	/* device table index (O) */
+dcl	p_name		   char (*) parameter;	/* device name (I) */
+dcl	p_priv		   bit (1) aligned parameter; /* privileged assign flag (I) */
+dcl	p_eventid		   fixed bin (71) parameter;	/* IPC event ID for wakeups (I) */
+dcl	p_code		   fixed bin (35) parameter;	/* error code (O) */
+
+dcl	code		   fixed bin (35);		/* local error code */
+dcl	controller	   bit (1) aligned;		/* set if device = controller */
+dcl	device		   bit (6) aligned;		/* physical device address */
+dcl	dtx		   fixed bin;		/* device table index */
+dcl	eventid		   fixed bin (71);		/* IPC event ID */
+dcl	locked_for_reconfig	   bit (1) aligned;		/* set if we hold the reconfig lock */
+dcl	must_be_deleted	   bit (1) aligned;		/* set if the device must be in the deleted state */
+dcl	name		   char (32) var;		/* device name */
+dcl	no_path		   bit (1) aligned;		/* set if we haven't found a path to the device */
+dcl	priv		   bit (1) aligned;		/* "1"b if privileged user */
+dcl	statusp		   ptr;			/* pointer to where io_manager stuffs status */
+dcl	subsys_name	   char (4) aligned;	/* subsystem name */
+
+dcl	cleanup		   cond;
+
+dcl	error_table_$invalid_device
+			   fixed bin (35) ext;
+dcl	error_table_$io_configured
+			   fixed bin (35) ext static;
+dcl	error_table_$io_no_path
+			   fixed bin (35) ext static;
+dcl	error_table_$io_not_configured
+			   fixed bin (35) ext static;
+
+dcl	pds$process_id	   bit (36) aligned external;
+dcl	pds$validation_level   fixed bin (3) external;
+
+dcl	sys_info$service_system
+			   bit (1) aligned external static;
+
+dcl	ioi_device$assign	   entry (ptr, bit (6) aligned, bit (1) aligned, fixed bin, fixed bin (35));
+dcl	ioi_device$get_dtep	   entry (fixed bin, ptr, fixed bin (35));
+dcl	ioi_device$get_dtep_force
+			   entry (fixed bin, ptr, fixed bin (35));
+dcl	ioi_device$unassign	   entry (ptr);
+dcl	ioi_device$unlock	   entry (ptr);
+dcl	ioi_masked$flush_status
+			   entry (ptr);
+dcl	ioi_masked$interrupt   entry (fixed bin (35), fixed bin (3), bit (36) aligned);
+dcl	ioi_masked$reset_device
+			   entry (ptr);
+dcl	ioi_page_table$put	   entry (fixed bin, fixed bin (35));
+dcl	ioi_usurp_channels$assign
+			   entry (ptr, fixed bin (35));
+dcl	ioi_usurp_channels$unassign
+			   entry (ptr, fixed bin (35));
+dcl	ioi_wire$unwire	   entry (ptr);
+dcl	ioi_workspace$create   entry (ptr, fixed bin (35));
+dcl	ioi_workspace$destroy  entry (ptr, fixed bin (35));
+dcl	ioi_workspace$release_aste
+			   entry (ptr);
+
+dcl	(addr, after, before, bin, bit, index, null, ptr, rel, rtrim)
+			   builtin;
+
+assign_deleted:
+     entry (p_dtx, p_name, p_eventid, p_priv, p_code);
+
+	must_be_deleted = "1"b;
+	goto ASSIGN_COMMON;
+
+assign:
+     entry (p_dtx, p_name, p_eventid, p_priv, p_code);
+
+	must_be_deleted = "0"b;
+ASSIGN_COMMON:
+	name = rtrim (p_name);			/* Copy the device name. */
+	priv = p_priv;				/* Copy privileged assign switch. */
+	eventid = p_eventid;			/* Grab the event ID. */
+
+	idp = addr (ioi_data$);			/* Get data base pointer. */
+	p_code = 0;				/* Clear error code. */
+	subsys_name = before (name, "_");
+
+	call find_gte (subsys_name);
+	if gtep = null () then do;
+	     p_code = error_table_$invalid_device;
+	     return;
+	end;
+
+	controller = "0"b;				/* start by saying its not */
+	if index (name, "_") = 0 then			/* no device given */
+	     if gte.fips then do;
+		device = "00"b3;			/* devices start at zero */
+		controller = "1"b;			/* and this is the controller */
+	     end;
+	     else device = "01"b3;			/* otherwise start at one */
+	else device = bit (bin (after (name, "_"), 6, 0));
+	if device = "00"b3 & ^gte.fips then
+	     controller = "1"b;			/* old style controller */
+
+	dtep = null ();
+	on cleanup call cleanup_assign;		/* Establish cleanup handler to undo whatever. */
+
+	call ioi_device$assign (gtep, device, controller, dtx, code);
+	if code ^= 0 then do;
+	     p_code = code;
+	     return;
+	end;
+	gte.n_devices = gte.n_devices + 1;
+	call ioi_device$get_dtep (dtx, dtep, code);	/* lock it to us too */
+	if code ^= 0 then do;			/* except if there's an error */
+	     call cleanup_assign;
+	     p_code = code;
+	     return;
+	end;
+
+	if dte.deleted & ^must_be_deleted then do;
+	     call cleanup_assign;
+	     p_code = error_table_$io_not_configured;
+	     return;
+	end;
+	if ^dte.deleted & must_be_deleted then do;
+	     call cleanup_assign;
+	     p_code = error_table_$io_configured;
+	     return;
+	end;
+
+	if gte.disk_data_subsystem_idx ^= 0 then do;	/* If channels to be taken from page control ... */
+	     call ioi_usurp_channels$assign (gtep, code); /* ...get channels for our use. */
+	     if code ^= 0 then do;
+		call cleanup_assign;
+		p_code = code;
+		return;
+	     end;
+	end;
+	else if ^gte.mplex then do;			/* channels aren't assigned yet */
+	     ctep = ptr (gtep, gte.ctep);		/* there's only one channel */
+	     if ^cte.ioi_use then do;
+		call io_manager$assign (cte.chx, cte.chanid, ioi_masked$interrupt, bin (rel (ctep)), statusp, code);
+		if code = 0 then do;
+		     cte.ioi_use = "1"b;
+		     cte.statusp = statusp;
+		end;
+		else do;
+		     call cleanup_assign;
+		     p_code = code;
+		     return;
+		end;
+	     end;
+	end;
+
+/**** Fill in the dte ****/
+	dte.cur_ctep = ""b;				/* no channel in use */
+	dte.channel_required = "";			/* no channel required */
+	dte.ev_chn = eventid;			/* use caller supplied event channel */
+	dte.max_bound = IOI_DEFAULT_MAX_BOUND;		/* use defaults */
+	dte.max_timeout = IOI_DEFAULT_MAX_TIMEOUT;
+	dte.timeout = IOI_DEFAULT_TIMEOUT;
+	dte.unwire_time = 0;
+	dte.bound = 0;
+/****^	dte.process_id...				...has already been set */
+	dte.priv = priv;				/* use caller supplied value */
+	dte.connected = "0"b;			/* no channel ready to run this device */
+	dte.active = "0"b;				/* no I/O to be done yet */
+	dte.workspace_wired = "0"b;			/* workspace is not wired yet */
+	dte.special_interrupt = "0"b;			/* no special interrupt received */
+	dte.log_status_cnt = "0"b;			/* status information not valid yet */
+	dte.reading_detailed_status = "0"b;
+	dte.detailed_status_valid = "0"b;
+
+/**** Build the workspace ****/
+	dte.ring = pds$validation_level;
+	dte.ptx = 0;				/* no page table yet */
+	dte.status_offset = 0;			/* clear status queue information */
+	dte.status_entries = 0;
+	dte.status_entry_idx = 0;
+	call ioi_workspace$create (dtep, code);
+	if code ^= 0 then do;
+	     call cleanup_assign;
+	     p_code = code;
+	     return;
+	end;
+
+	call unlock;
+	p_dtx = dtx;				/* return the device table index */
+	return;
+
+unassign:
+     entry (p_dtx, p_code);
+
+	dtx = p_dtx;
+	p_code = 0;
+	call ioi_device$get_dtep_force (dtx, dtep, code);
+	if code ^= 0 then do;
+	     p_code = code;
+	     return;
+	end;
+
+	idp = addr (ioi_data$);
+	gtep = ptr (idp, dte.gtep);
+	if dte.active then do;			/* if device has unfinished business */
+	     call ioi_masked$reset_device (dtep);	/* stop it */
+	     do while (dte.active);			/* it will stop eventually */
+	     end;
+	end;
+
+	if dte.ptx ^= 0 then do;
+	     call ioi_page_table$put (dte.ptx, code);
+	     dte.ptx = 0;
+	     if code ^= 0 then do;
+		call unlock;
+		p_code = code;
+		return;
+	     end;
+	end;
+
+/**** Destroy the workspace if the process which owns this device is doing the call.  Otherwise, simply unwire it.
+      In this case the process is about to go away, and either its process directory is going to be destroyed,
+      which will take the workspace with it, or it will be saved in a dead pdir, in which case it may be
+      interesting to whoever owned it. ****/
+
+	if dte.process_id = pds$process_id then
+	     call ioi_workspace$destroy (dtep, code);	/* get rid of the workspace */
+	else do;
+	     call ioi_wire$unwire (dtep);		/* unwire it */
+	     call ioi_workspace$release_aste (dtep);	/* and let go of its aste */
+	end;
+	if code ^= 0 then do;
+	     call unlock;
+	     p_code = code;
+	     return;
+	end;
+
+	dte.ev_chn = 0;				/* stop notifications */
+	dte.channel_required = "";
+	call ioi_masked$flush_status (dtep);
+	call channel_unassign;
+	call ioi_device$unassign (dtep);
+	call unlock;
+	p_code = 0;
+	return;
+
+add_device:
+     entry (p_name, p_code);
+
+	dtx = 0;
+	locked_for_reconfig = "0"b;
+	on cleanup call cleanup_reconfigure;
+
+	call assign_deleted (dtx, p_name, 0, "0"b, code);
+	if code ^= 0 then do;
+	     p_code = code;
+	     return;
+	end;
+
+	call ioi_device$get_dtep (dtx, dtep, code);
+	if code ^= 0 then do;
+	     call cleanup_reconfigure;
+	     p_code = code;
+	     return;
+	end;
+
+	call lock_for_reconfig_proc;
+	no_path = "1"b;
+	gtep = ptr (dtep, dte.gtep);
+	do ctep = ptr (gtep, gte.ctep) repeat ptr (ctep, cte.next_ctep) while (rel (ctep) ^= ""b & no_path);
+	     no_path = cte.deleted | cte.deleting;
+	end;
+	if no_path then do;
+	     call cleanup_reconfigure;
+	     p_code = error_table_$io_no_path;
+	     return;
+	end;
+
+	dte.deleted = "0"b;
+	io_config_data_ptr = addr (io_config_data$);
+	io_config_device_table_ptr = ptr (io_config_data_ptr, io_config_data.device_table_offset);
+	device_table.device_entry (dte.device_table_idx).configured = "1"b;
+	call cleanup_reconfigure;
+	p_code = 0;
+	return;
+
+delete_device:
+     entry (p_name, p_code);
+
+	dtx = 0;
+	locked_for_reconfig = "0"b;
+	on cleanup call cleanup_reconfigure;
+
+	call assign (dtx, p_name, 0, "0"b, code);
+	if code ^= 0 then do;
+	     p_code = code;
+	     return;
+	end;
+
+	call ioi_device$get_dtep (dtx, dtep, code);
+	if code ^= 0 then do;
+	     call cleanup_reconfigure;
+	     p_code = code;
+	     return;
+	end;
+
+	if dte.deleted then do;
+	     call cleanup_reconfigure;
+	     p_code = error_table_$io_not_configured;
+	     return;
+	end;
+
+	dte.deleted = "1"b;
+	io_config_data_ptr = addr (io_config_data$);
+	io_config_device_table_ptr = ptr (io_config_data_ptr, io_config_data.device_table_offset);
+	device_table.device_entry (dte.device_table_idx).configured = "0"b;
+	call cleanup_reconfigure;
+	p_code = 0;
+	return;
+
+lock_for_reconfig:
+     entry;
+
+	call lock_for_reconfig_proc;
+	return;
+
+unlock_for_reconfig:
+     entry;
+
+	call unlock_for_reconfig_proc;
+	return;
+
+cleanup_reconfigure:
+     proc;
+
+	if locked_for_reconfig then
+	     call unlock_for_reconfig_proc;
+	if dtx ^= 0 then do;
+	     call ioi_device$unlock (dtep);
+	     call unassign (dtx, (0));
+	end;
+
+     end cleanup_reconfigure;
+
+lock_for_reconfig_proc:
+     proc;
+
+dcl	lock$lock_fast	   entry (ptr);
+
+	idp = addr (ioi_data$);
+	if sys_info$service_system then
+	     call lock$lock_fast (addr (ioi_data.reconfig_lock));
+	locked_for_reconfig = "1"b;
+
+     end lock_for_reconfig_proc;
+
+unlock_for_reconfig_proc:
+     proc;
+
+dcl	lock$unlock_fast	   entry (ptr);
+
+	idp = addr (ioi_data$);
+	if sys_info$service_system then
+	     call lock$unlock_fast (addr (ioi_data.reconfig_lock));
+	locked_for_reconfig = "0"b;
+
+     end unlock_for_reconfig_proc;
+
+find_gte:
+     proc (name);
+
+dcl	name		   char (4) aligned parameter;
+
+dcl	gtx		   fixed bin;
+
+
+	do gtx = 1 to ioi_data.ngt;			/* Search for channel name. */
+	     gtep = addr (ioi_data.gt (gtx));		/* Get pointer to group table entry. */
+	     if gte.name = subsys_name then		/* if this is the one */
+		return;
+	end;
+	gtep = null ();
+
+     end find_gte;
+
+cleanup_assign:
+     proc;
+
+	if dtep ^= null () then do;			/* if we've gotten the device */
+	     call unlock;
+	     call channel_unassign;
+	     call ioi_device$unassign (dtep);
+	end;
+
+     end cleanup_assign;
+
+channel_unassign:
+     proc;
+
+	gte.n_devices = gte.n_devices - 1;
+	if gte.disk_data_subsystem_idx ^= 0 then
+	     call ioi_usurp_channels$unassign (gtep, (0));
+	else if ^gte.mplex then do;
+	     ctep = ptr (gtep, gte.ctep);
+	     if cte.ioi_use then do;
+		call io_manager$unassign (cte.chx, code);
+		if code = 0 then
+		     cte.ioi_use = "0"b;
+	     end;
+	end;
+
+     end channel_unassign;
+
+unlock:
+     proc;
+
+	call ioi_device$unlock (dtep);
+
+     end unlock;
+
+%include ioi_data;
+%page;
+%include io_config_data;
+%page;
+%include io_manager_dcls;
+
+     end ioi_assignment;

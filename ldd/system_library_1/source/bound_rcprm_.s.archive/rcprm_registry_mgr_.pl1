@@ -1,0 +1,915 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+rcprm_registry_mgr_:
+     proc;
+	return;
+
+/* This module implements registry management functions of creation and
+   replacement of registry header, for RCP resource management.
+   Written 05/10/78 by C. D. Tavares */
+/* Modified 11/21/79 by CDT to fix bug in comparing headers during update. */
+/* Modified 12/10/79 by CDT to take advantage of new facility to sleep in ring
+   1 */
+/* Modified 10/03/80 by CDT to fix bug where copy_registry always tried
+   to lock rcp.tcf in source dir even if there wasn't one, to check whether the
+   source and target registries of the copy were the same file, to improve
+   error messages reflected back to ring 4, and to change journal dir's ring
+   brackets to 1,7. */
+/* Modified 04/83 by B. Braun to cleanup iocbs left laying about. (TR phx11736) */
+/* Modified 12/84 by Keith Loepere for version 2 create_branch_info. */
+/* Modified 02/12/85 by Maria Pozzo copy_registry: to create a null
+   component(s) in the new registry when a component(s) is missing in
+   the original.  Returns a warning message to the user. */
+/* Modified 02/14/85 by Chris Jones for RCP auditing and to clean up better. */
+
+dcl	p_registry_dir	   char (*) parameter;
+dcl	p_registry_entry	   char (*) parameter;
+dcl	p_rtdep		   ptr;
+dcl	p_code		   fixed bin (35) parameter;
+
+/* entries */
+
+dcl	cu_$level_get	   entry (fixed bin);
+dcl	cu_$level_set	   entry (fixed bin);
+dcl	get_group_id_	   entry () returns (char (32));
+dcl	get_process_authorization_
+			   entry () returns (bit (72) aligned);
+dcl	get_ring_		   entry () returns (fixed bin (3));
+dcl	hcs_$append_branchx	   entry (char (*), char (*), fixed bin (5), (3) fixed bin (3), char (*), fixed bin (1),
+			   fixed bin (1), fixed bin (24), fixed bin (35));
+dcl	hcs_$create_branch_	   entry (char (*), char (*), ptr, fixed bin (35));
+dcl	hcs_$set_dir_ring_brackets
+			   entry (char (*), char (*), (2) fixed bin (3), fixed bin (35));
+dcl	hcs_$status_minf	   entry (char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24), fixed bin (35));
+dcl	pathname_		   entry (char (*), char (*)) returns (char (168));
+dcl	rcprm_registry_util_$create_transaction_control_file
+			   entry (char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry_create
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry_old
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry_no_journalize
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_transaction_control_file
+			   entry (ptr, char (*), fixed bin (35));
+dcl	rcprm_registry_util_$release_registry
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$release_transaction_control_file
+			   entry (ptr, fixed bin (35));
+dcl	suffixed_name_$make	   entry (char (*), char (*), char (32), fixed bin (35));
+
+/* automatic */
+
+dcl	1 cbi		   like create_branch_info aligned;
+dcl	code		   fixed bin (35);
+dcl	cur_level		   fixed bin;
+dcl	dir_rbs		   (2) fixed bin (3);
+dcl	error_msg		   char (256);
+dcl	i		   fixed bin;
+dcl	ME		   char (64);
+dcl	operation		   bit (36) aligned;
+dcl	prev_level	   fixed bin initial (-1);
+dcl	record_len	   fixed bin (21);
+dcl	registry_dir	   char (168);
+dcl	registry_name	   char (32);
+dcl	(switch_ptr, tcf_switch_ptr)
+			   pointer initial (null);
+
+/* internal static and constants */
+
+dcl	(
+	Create		   initial (0),
+	Locate		   initial (1)
+	)		   fixed bin static options (constant);
+
+dcl	ALL_USERS		   char (5) static options (constant) init ("*.*.*");
+dcl	JOURNALS_DIR_ENTRYNAME char (8) static options (constant) init ("journals");
+dcl	REGISTRY_SUFFIX	   char (4) static options (constant) init ("rcpr");
+dcl	REGISTRY_OLD_SUFFIX	   char (3) static options (constant) init ("old");
+dcl	RING_7_BRACKETS	   (3) fixed bin (3) static options (constant) init (7, 7, 7);
+
+/* external static */
+
+dcl	access_operations_$rcp_copy_registry
+			   bit (36) aligned ext static;
+dcl	access_operations_$rcp_delete_registry
+			   bit (36) aligned ext static;
+dcl	access_operations_$rcp_update_registry_header
+			   bit (36) aligned ext static;
+
+dcl	(
+	error_table_$namedup,
+	error_table_$improper_data_format,
+	error_table_$no_record,
+	error_table_$noentry,
+	error_table_$rcp_missing_registry_component
+	)		   external fixed bin (35) static;
+
+dcl	sys_info$access_class_ceiling
+			   bit (72) aligned ext static;
+
+/* builtins, etc. */
+
+dcl	(addr, char, currentsize, length, ltrim, null, unspec)
+			   builtin;
+
+dcl	cleanup		   condition;
+
+create_registry:
+     entry (p_registry_dir, p_rtdep, p_code);
+
+	registry_dir = p_registry_dir;
+	rtdep = p_rtdep;
+	call cu_$level_get (prev_level);
+
+	on cleanup call clean_up;
+
+	cur_level = get_ring_ ();
+	call cu_$level_set (cur_level);
+
+	operation = ""b;				/* no special operation */
+	ME = "rcprm_registry_mgr_$create_registry";
+
+	call suffixed_name_$make ((rtde.name), REGISTRY_SUFFIX, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+
+/* First, check to see that we are really creating a previously nonexistant registry. */
+
+	call hcs_$status_minf (registry_dir, registry_name, 0 /* no chase */, 0, 0, code);
+	call revise_error (error_table_$noentry, error_table_$namedup);
+						/* accept noentry as OK, reject 0 as namedup */
+	if code ^= 0 then
+	     goto error_return;
+
+/* Before creating the registry, try creating the transaction control file in
+   case there isn't one yet. */
+
+	call rcprm_registry_util_$create_transaction_control_file (registry_dir, code);
+	call revise_error (error_table_$namedup, 0);
+	if code ^= 0 then
+	     goto error_return;
+
+/* See if we should create a new journal dir. */
+
+	call hcs_$append_branchx (registry_dir, JOURNALS_DIR_ENTRYNAME, SMA_ACCESS_BIN, RING_7_BRACKETS, ALL_USERS,
+	     1 /* dir */, 0, 0, code);
+	if code = error_table_$namedup then
+	     code = 0;
+	else if code ^= 0 then
+	     goto error_return;
+	else do;
+	     dir_rbs (1) = cur_level;
+	     dir_rbs (2) = 7;
+	     call hcs_$set_dir_ring_brackets (registry_dir, JOURNALS_DIR_ENTRYNAME, dir_rbs, code);
+	     if code ^= 0 then
+		goto error_return;
+	end;
+
+
+/* Now we create an SSF to serve as the registry.  Although the registry will
+   immediately become an MSF (a record file), we want to set certain attributes
+   of it, like multiclass AIM attributes, so that the file will perform
+   properly.  Then we just rely on msf_manager_ and make_msf_ to correctly
+   propagate these attributes when it becomes an MSF (and when new components
+   are dynamically added. */
+
+	call fillin_cbi;
+	call hcs_$create_branch_ (registry_dir, registry_name, addr (cbi), code);
+	if code ^= 0 then
+	     goto error_return;
+
+/* Now, prepare we to transmogrify yon beeste into an MSF. */
+
+	call rcprm_registry_util_$grab_registry_create (switch_ptr, registry_dir, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call write_header (Create);
+
+/* Now add the necessary keys to the registry. */
+
+	call add_key (REGISTRY_SYSTEM_KEY, "system");
+	call add_key (REGISTRY_FREE_KEY, "free");
+
+good_return:
+	call clean_up;
+	call audit_success;
+	p_code = 0;
+	return;
+
+error_return:
+	call clean_up;
+	call audit_failure;
+	p_code = code;
+	return;
+
+write_header:
+     proc (action);
+
+dcl	action		   fixed bin parameter;
+
+dcl	1 auto_header	   aligned automatic,
+	  2 rtde_size	   fixed bin (18),
+	  2 rtde_template	   (currentsize (rtde)) bit (36) aligned,
+	  2 other		   like registry_header.other aligned;
+
+	unspec (auto_header.rtde_template) = unspec (rtde);
+	unspec (auto_header.other) = ""b;
+	auto_header.rtde_size = currentsize (rtde);
+
+	call iox_$seek_key (switch_ptr, (REGISTRY_HEADER_KEY), 0, code);
+	if action = Create then
+	     call revise_error (error_table_$no_record, error_table_$namedup);
+	if code ^= 0 then
+	     goto error_return;
+
+	if action = Create then
+	     call iox_$write_record (switch_ptr, addr (auto_header), currentsize (auto_header) * 4, code);
+	else call iox_$rewrite_record (switch_ptr, addr (auto_header), currentsize (auto_header) * 4, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	return;
+
+compare_header:
+     entry;
+
+	unspec (auto_header) = ""b;
+
+	call iox_$seek_key (switch_ptr, (REGISTRY_HEADER_KEY), record_len, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	if record_len > currentsize (auto_header) * 4 then
+	     goto not_format;
+
+	call iox_$read_record (switch_ptr, addr (auto_header), record_len, 0, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	if unspec (auto_header.rtde_template) ^= unspec (rtde) then
+	     goto not_format;
+
+     end write_header;
+
+not_format:
+	code = error_table_$improper_data_format;
+	goto error_return;
+
+revise_error:
+     proc (ok_code, zero_becomes_code);
+
+dcl	(ok_code, zero_becomes_code)
+			   fixed bin (35) parameter;
+
+	if code = ok_code then
+	     code = 0;
+	else if code = 0 then
+	     code = zero_becomes_code;
+
+     end revise_error;
+
+add_key:
+     proc (key, string_arg);
+
+dcl	key		   char (*) varying parameter;
+dcl	string_arg	   char (*) parameter;
+
+	call iox_$seek_key (switch_ptr, rtrim (key), 0, code);
+	call revise_error (error_table_$no_record, error_table_$namedup);
+	if code ^= 0 then
+	     goto error_return;
+
+	call iox_$write_record (switch_ptr, addr (string_arg), length (string_arg), code);
+	if code ^= 0 then
+	     goto error_return;
+
+     end add_key;
+
+update_registry_header:
+     entry (p_registry_dir, p_rtdep, p_code);
+
+/* This entry updates the header record in the registry with a new RTDE. */
+
+dcl	mylocked		   bit (1) aligned;
+
+	mylocked = ""b;
+	goto update_header_common;
+
+update_registry_header_mylock:
+     entry (p_registry_dir, p_rtdep, p_code);
+
+	mylocked = "1"b;
+
+update_header_common:
+	registry_dir = p_registry_dir;
+	rtdep = p_rtdep;
+	call cu_$level_get (prev_level);
+
+
+	on cleanup call clean_up;
+
+	operation = access_operations_$rcp_update_registry_header;
+	ME = "rcprm_registry_mgr_$update_registry_header";
+
+	call suffixed_name_$make ((rtde.name), REGISTRY_SUFFIX, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+	call cu_$level_set (get_ring_ ());
+
+	if ^mylocked then do;
+	     call rcprm_registry_util_$grab_transaction_control_file (tcf_switch_ptr, registry_dir, code);
+	     if code ^= 0 then
+		goto error_return;
+	end;
+
+	call rcprm_registry_util_$grab_registry_no_journalize (switch_ptr, registry_dir, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call iox_$seek_key (switch_ptr, (REGISTRY_HEADER_KEY), record_len, code);
+	if code ^= 0 then
+	     goto not_format;
+
+	begin;
+
+/* Read the current header and make sure that the position of all currently
+   known attributes is preserved.  Later on we might write a procedure to
+   reformat all records to free up attribute positions, but for now it is
+   an error of the worst kind. */
+
+dcl	record_buffer	   char (record_len) aligned;
+dcl	rbp		   ptr;
+dcl	rtde_copyp	   ptr;
+
+	     rbp = addr (record_buffer);
+
+	     call iox_$read_record (switch_ptr, rbp, record_len, 0, code);
+	     if code ^= 0 then
+		goto error_return;
+
+	     rtde_copyp = addr (rbp -> registry_header.rtde_copy);
+
+	     if rtde_copyp -> rtde.n_defined_attributes > rtdep -> rtde.n_defined_attributes then
+		goto not_format;
+
+	     do i = 1 to rtde_copyp -> rtde.n_defined_attributes;
+		if rtde_copyp -> rtde.attribute_names (i) ^= rtdep -> rtde.attribute_names (i) then
+		     goto not_format;
+	     end;
+	end;
+
+	call write_header (Locate);
+
+	goto good_return;
+
+validate_registry:
+     entry (p_registry_dir, p_rtdep, p_code);
+
+/* This entry checks to make sure that the RTDE in the RTDT agrees with the
+   RTDE in the registry.  If they are different (could happen in the case of a
+   partial reload or other calamity) RCP would otherwise be mighty confused. */
+
+	registry_dir = p_registry_dir;
+	rtdep = p_rtdep;
+	call cu_$level_get (prev_level);
+	operation = ""b;
+	ME = "rcprm_registry_mgr_$validate_registry";
+
+	call suffixed_name_$make ((rtde.name), REGISTRY_SUFFIX, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+	on cleanup call clean_up;
+
+	call rcprm_registry_util_$grab_registry (switch_ptr, registry_dir, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call compare_header;
+
+	call rcprm_registry_util_$release_registry (switch_ptr, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	goto good_return;
+
+delete_registry:
+     entry (p_registry_dir, p_registry_entry, p_code);
+
+/* automatic */
+
+dcl	cur_ring		   fixed bin;
+
+/* entries */
+
+dcl	hcs_$get_dir_ring_brackets
+			   entry (char (*), char (*), (2) fixed bin (3), fixed bin (35));
+dcl	admin_gate_$syserr	   entry () options (variable);
+dcl	delete_$path	   entry (char (*), char (*), bit (36) aligned, char (*), fixed bin (35));
+
+/* external static */
+
+dcl	error_table_$not_seg_type
+			   ext fixed bin (35);
+
+	registry_dir = p_registry_dir;
+	call cu_$level_get (prev_level);
+
+	on cleanup call clean_up;
+
+	cur_ring = get_ring_ ();
+	call cu_$level_set (cur_ring);
+
+	operation = access_operations_$rcp_delete_registry;
+	ME = "rcprm_registry_mgr_$delete_registry";
+
+	call suffixed_name_$make (p_registry_entry, REGISTRY_OLD_SUFFIX, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call hcs_$get_dir_ring_brackets (registry_dir, registry_name, dir_rbs, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	if (dir_rbs (1) ^= cur_ring) | (dir_rbs (2) ^= cur_ring) then do;
+	     code = error_table_$not_seg_type;
+	     goto error_return;
+	end;
+
+	call rcprm_registry_util_$grab_registry_old (switch_ptr, registry_dir, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call iox_$seek_key (switch_ptr, (REGISTRY_HEADER_KEY), 0, code);
+	if code ^= 0 then				/* this may not be a registry, or it */
+	     call admin_gate_$syserr (BEEP,		/* may just be a screwed-up registry */
+		"rcprm_registry_mgr_$delete_registry:  Deleting (possibly bogus) registry ^a for ^a.",
+		pathname_ (registry_dir, registry_name), get_group_id_ ());
+						/* so be a suspicious bugger */
+
+	call rcprm_registry_util_$release_registry (switch_ptr, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call delete_$path (registry_dir, registry_name, "101100"b /* force, brief, dir or seg, no chase */,
+	     "rcprm_registry_mgr_", code);
+	if code ^= 0 then
+	     goto error_return;
+
+	goto good_return;
+
+remove_registry:
+     entry (p_registry_dir, p_registry_entry, p_code);
+
+dcl	hcs_$chname_file	   entry (char (*), char (*), char (*), char (*), fixed bin (35));
+dcl	suffixed_name_$new_suffix
+			   entry (char (*), char (*), char (*), char (32), fixed bin (35));
+
+dcl	new_name		   char (32);
+
+	registry_dir = p_registry_dir;
+	call cu_$level_get (prev_level);
+
+	on cleanup call clean_up;
+
+	cur_ring = get_ring_ ();
+	call cu_$level_set (cur_ring);
+
+	operation = ""b;
+	ME = "rcprm_registry_mgr_$remove_registry";
+
+	call suffixed_name_$make (p_registry_entry, REGISTRY_SUFFIX, registry_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call suffixed_name_$new_suffix (registry_name, REGISTRY_SUFFIX, REGISTRY_OLD_SUFFIX, new_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	call hcs_$chname_file (registry_dir, registry_name, registry_name, new_name, code);
+	if code ^= 0 then
+	     goto error_return;
+
+	goto good_return;
+
+copy_registry:
+     entry (p_registry_dir, p_registry_names, p_target_dir, p_target_names, p_error_msg, p_reset_journal_sw, p_code);
+
+/* This entry copies any number of registries from one directory to another.
+   It also allows the caller to delete the old journal and make a fresh one
+   after all the registries have been successfully copied.  */
+
+dcl	p_registry_names	   dimension (*) char (*) parameter;
+dcl	p_target_names	   dimension (*) char (*) parameter;
+dcl	p_target_dir	   char (*) parameter;
+dcl	p_error_msg	   char (*) parameter;
+dcl	p_reset_journal_sw	   bit (1) parameter;
+
+dcl	target_dir	   char (168);
+dcl	target_name	   char (32);
+dcl	(registry_path, target_path)
+			   char (168);
+dcl	regno		   fixed bin;
+dcl	(from_msf_fcbp, to_msf_fcbp)
+			   pointer initial (null);
+dcl	increment		   fixed bin;
+dcl	save_uid		   bit (36);
+dcl	bc		   fixed bin (24);
+dcl	(newsegp, comp1p, to_ptr, from_ptr)
+			   pointer;
+dcl	copy_message	   char (168);
+dcl	missing_component	   fixed bin;
+dcl	bit_count		   fixed bin (24);
+
+dcl	1 auto_requestor_info  like requestor_info aligned;
+dcl	1 auto_resource_info   like resource_info aligned;
+dcl	1 auto_status	   like status_branch automatic aligned;
+
+dcl	based_seg		   bit (bc) aligned based;
+
+dcl	(dim, lbound, hbound, rtrim)
+			   builtin;
+
+dcl	(
+	error_table_$bad_arg,
+	error_table_$no_s_permission,
+	error_table_$sameseg
+	)		   ext fixed bin (35) static;
+
+dcl	msf_manager_$open	   entry (char (*), char (*), ptr, fixed bin (35));
+dcl	msf_manager_$get_ptr   entry (pointer, fixed bin, bit (1) aligned, pointer, fixed bin (24), fixed bin (35));
+dcl	msf_manager_$close	   entry (pointer);
+dcl	hcs_$set_bc_seg	   entry (ptr, fixed bin (24), fixed bin (35));
+dcl	hcs_$status_long	   entry (char (*), char (*), fixed bin (1), ptr, ptr, fixed bin (35));
+dcl	rcp_audit		   entry (char (*), bit (36) aligned, ptr, ptr, char (*), bit (3), bit (3),
+			   (2) fixed bin (3), bit (1), bit (1), fixed bin (35));
+dcl	rcprm_journalize_$make_fresh_journal
+			   ext entry (char (*), fixed bin (35));
+
+	registry_dir = p_registry_dir;
+	target_dir = p_target_dir;
+	if dim (p_registry_names, 1) ^= dim (p_target_names, 1)
+	     | lbound (p_registry_names, 1) ^= lbound (p_target_names, 1) then do;
+	     error_msg = "Dimensions of arrays do not match";
+	     code = error_table_$bad_arg;
+	     return;
+	end;
+
+	call cu_$level_get (prev_level);
+	on cleanup call clean_up;
+
+	cur_level = get_ring_ ();
+	call cu_$level_set (cur_level);
+
+	operation = access_operations_$rcp_copy_registry;
+	ME = "rcprm_registry_mgr_$copy_registry";
+
+/* lock the transaction file so no one can update registries while we are
+   trying to copy them.  Note that if
+   there is no transaction file, we won't require one (user can be copying
+   registries from any dir, not just system dir-- in fact, user may be copying
+   registries back INTO the system dir).  If there is no transaction file in
+   the system dir, we will try the target dir just in case the user IS copying
+   registries back into the system dir (although he SHOULDN'T be doing this
+   except in special session!!) */
+
+	error_msg = "rcp.tcf in " || registry_dir;
+	call rcprm_registry_util_$grab_transaction_control_file (tcf_switch_ptr, registry_dir, code);
+	if code ^= 0 then do;			/* locate failed, try target dir? */
+	     error_msg = "rcp.tcf in " || target_dir;
+	     call rcprm_registry_util_$grab_transaction_control_file (tcf_switch_ptr, target_dir, code);
+	     if code ^= 0 then do;
+		tcf_switch_ptr = null ();
+		error_msg = "No rcp.tcf. ";
+	     end;
+	end;					/* if neither exists, so what. */
+
+	do regno = lbound (p_registry_names, 1) to hbound (p_registry_names, 1);
+
+	     registry_name = p_registry_names (regno);
+	     call suffixed_name_$make (registry_name, REGISTRY_SUFFIX, registry_name, code);
+	     if code ^= 0 then
+		call return_error_msg (pathname_ (registry_dir, registry_name));
+
+	     target_name = p_target_names (regno);
+	     call suffixed_name_$make (target_name, REGISTRY_SUFFIX, target_name, code);
+	     if code ^= 0 then
+		call return_error_msg (pathname_ (target_dir, target_name));
+
+	     registry_path = pathname_ (registry_dir, registry_name);
+	     target_path = pathname_ (target_dir, target_name);
+
+	     call hcs_$status_long (registry_dir, registry_name, 1,
+						/* chase */
+		addr (auto_status), null, code);
+	     if code = error_table_$no_s_permission then
+		code = 0;
+	     else if code ^= 0 then
+		call return_error_msg (registry_path);
+
+	     save_uid = auto_status.uid;
+	     auto_status.uid = ""b;			/* in case next call fails */
+
+	     call hcs_$status_long (target_dir, target_name, 1,
+						/* chase */
+		addr (auto_status), null, code);
+	     if code = error_table_$no_s_permission then
+		code = 0;
+	     else if code = error_table_$noentry then
+		code = 0;
+	     else if code ^= 0 then
+		call return_error_msg (target_path);
+
+	     if auto_status.uid = save_uid then do;
+		code = error_table_$sameseg;
+		call return_error_msg (registry_path);
+	     end;
+
+	     call delete_$path (target_dir, target_name, "101111"b, "rcprm_registry_mgr_", code);
+						/* delete everything and don't ask questions */
+	     if code = error_table_$noentry then
+		code = 0;				/* ok, wasn't there */
+	     if code ^= 0 then
+		call return_error_msg (target_path);
+
+	     call fillin_cbi;
+
+	     call hcs_$create_branch_ (target_dir, target_name, addr (cbi), code);
+	     if code ^= 0 then
+		call return_error_msg (target_path);
+
+/* Now we have a properly AIM'ed, ACL'ed and ring'ed registry.  Now use
+   msf_manager_ to do the drudge work. */
+
+	     call msf_manager_$open (registry_dir, registry_name, from_msf_fcbp, code);
+	     if code ^= 0 then
+		call return_error_msg (registry_path);
+
+	     call msf_manager_$open (target_dir, target_name, to_msf_fcbp, code);
+	     if code ^= 0 then
+		call return_error_msg (target_path);
+
+	     call msf_manager_$get_ptr (to_msf_fcbp, 0, "1"b, newsegp, 0, code);
+	     if code ^= 0 then
+		call return_error_msg (target_path);
+	     call msf_manager_$get_ptr (to_msf_fcbp, 1, "1"b, comp1p, 0, code);
+						/* this is to make it an MSF right away */
+						/* Don't ask me why, but copy_seg_ does it this way */
+	     if code ^= 0 then
+		call return_error_msg (target_path);
+
+	     call hcs_$status_minf (registry_dir, registry_name, 1, 2, bit_count, code);
+	     if code ^= 0 then
+		call return_error_msg (registry_path);
+	     copy_message = "Missing Component(s) ";
+	     missing_component = -1;			/* Since component 0 is valid */
+	     do increment = 0 to (bit_count - 1);
+		call msf_manager_$get_ptr (from_msf_fcbp, increment, "0"b, from_ptr, bc, code);
+		if code = error_table_$noentry then do;
+		     copy_message = rtrim (copy_message) || " " || ltrim (char (increment));
+		     missing_component = increment;
+		     code = 0;
+		end;
+		if code = 0 then do;
+		     if increment = 0 then
+			to_ptr = newsegp;
+		     else if increment = 1 then
+			to_ptr = comp1p;
+		     else call msf_manager_$get_ptr (to_msf_fcbp, increment, "1"b, to_ptr, 0, code);
+		     if code ^= 0 then
+			call return_error_msg (target_path);
+
+		     to_ptr -> based_seg = from_ptr -> based_seg;
+
+		     call hcs_$set_bc_seg (to_ptr, bc, code);
+		     if code ^= 0 then
+			call return_error_msg (target_path);
+		end;
+	     end;
+
+	     call msf_manager_$close (from_msf_fcbp);
+	     from_msf_fcbp = null;
+
+	     call msf_manager_$close (to_msf_fcbp);
+	     to_msf_fcbp = null;
+	end;
+
+/* Great.  We got this far with no errors.  Reset the journal if we've been asked. */
+
+	if p_reset_journal_sw then do;
+	     call rcprm_journalize_$make_fresh_journal (registry_dir, code);
+	     if code ^= 0 then
+		call return_error_msg ("Resetting journal in " || pathname_ (registry_dir, JOURNALS_DIR_ENTRYNAME));
+	end;
+	if missing_component >= 0 then do;
+	     copy_message = rtrim (copy_message) || " - null component(s) created in new registry.";
+	     error_msg = error_msg || copy_message;
+	     code = error_table_$rcp_missing_registry_component;
+	     call return_error_msg (error_msg);
+	end;
+
+	goto good_return;
+
+/* Routine to fill in create_branch_info */
+
+fillin_cbi:
+     proc;
+
+	unspec (cbi) = ""b;
+	cbi.version = create_branch_version_2;
+	cbi.priv_upgrade_sw = (cur_level = 1);		/* want this to be a multiclass seg */
+	cbi.parent_ac_sw = ^cbi.priv_upgrade_sw;
+	cbi.mode = RW_ACCESS;
+	cbi.rings (*) = cur_level;
+	cbi.userid = ALL_USERS;
+	cbi.access_class = sys_info$access_class_ceiling;
+
+     end fillin_cbi;
+
+audit:
+     entry (a_ME, a_operation, a_prev_level, a_reg_dir, a_reg_name, a_success, a_code);
+
+dcl	a_ME		   char (*);
+dcl	a_operation	   bit (36) aligned;
+dcl	a_prev_level	   fixed bin;
+dcl	a_reg_dir		   char (*);
+dcl	a_reg_name	   char (*);
+dcl	a_success		   bit (1);
+dcl	a_code		   fixed bin (35);
+
+
+	ME = a_ME;
+	operation = a_operation;
+	prev_level = a_prev_level;
+	registry_dir = a_reg_dir;
+	registry_name = a_reg_name;
+	code = a_code;
+	if a_success then
+	     call audit_success ();
+	else call audit_failure ();
+
+	return;
+%page;
+audit_success:
+     proc;
+
+dcl	raw_mode		   bit (3);
+dcl	rbs		   (2) fixed bin (3);
+	raw_mode = N_ACCESS;
+	rbs = 0;
+	rbs (1) = -1;
+
+	if operation = ""b then
+	     return;				/* no auditable event */
+
+	call setup_audit (raw_mode);
+	call rcp_audit (ME, operation, requestor_info_ptr, resource_info_ptr, "", RW_ACCESS, raw_mode, rbs, "1"b, "0"b,
+	     (0));
+
+     end audit_success;
+
+audit_failure:
+     proc;
+
+dcl	raw_mode		   bit (3);
+dcl	rbs		   (2) fixed bin (3);
+	raw_mode = N_ACCESS;
+	rbs = 0;
+	rbs (1) = -1;
+
+	if operation = ""b then
+	     return;
+
+	call setup_audit (raw_mode);
+	call rcp_audit (ME, operation, requestor_info_ptr, resource_info_ptr, "", N_ACCESS, raw_mode, rbs, "1"b, "0"b,
+	     code);
+
+     end audit_failure;
+
+setup_audit:
+     proc (a_raw_mode);
+
+dcl	a_raw_mode	   bit (3);
+dcl	temp_mode		   bit (36) aligned;
+dcl	local_code	   fixed bin (35);
+
+dcl	hcs_$get_user_raw_mode entry (char (*), char (*), char (*), bit (36) aligned, fixed bin (35));
+dcl	pathname_		   entry (char (*), char (*)) returns (char (168));
+	local_code = 0;
+
+/* Set up the requestor information */
+
+	requestor_info_ptr = addr (auto_requestor_info);
+	requestor_info.user_id = get_group_id_ ();
+	requestor_info.current_authorization = get_process_authorization_ ();
+	requestor_info.validation_level = prev_level;
+
+/* Set up the resource information. */
+
+	resource_info_ptr = addr (auto_resource_info);
+	resource_info.registry_dir = registry_dir;
+	resource_info.registry_switch_ptr = null ();
+	resource_info.registry_record_ptr = null ();
+	resource_info.resource_type = registry_name;
+	resource_info.resource_name = "";
+
+/* Set up the operation. */
+
+	addr (addr (operation) -> encoded_access_op.detailed_operation) -> detailed_operation.priv_gate_call = "1"b;
+
+/* Since we don't call the kernel, set up the raw mode for auditing */
+/* purposes only. */
+
+	call hcs_$get_user_raw_mode ((pathname_ (rtrim (registry_dir), registry_name)), "", (requestor_info.user_id),
+	     temp_mode, local_code);
+	if local_code ^= 0 then
+	     a_raw_mode = ""b;
+	else a_raw_mode = substr (temp_mode, 1, 3);
+
+     end setup_audit;
+
+return_error_msg:
+     proc (message);
+
+dcl	message		   char (*);
+
+	p_error_msg = message;
+	goto error_return;
+
+     end return_error_msg;
+
+clean_up:
+     proc;
+
+	if from_msf_fcbp ^= null then
+	     call msf_manager_$close (from_msf_fcbp);
+
+	if to_msf_fcbp ^= null then
+	     call msf_manager_$close (to_msf_fcbp);
+
+	if switch_ptr ^= null then
+	     call rcprm_registry_util_$release_registry (switch_ptr, (0));
+
+	if tcf_switch_ptr ^= null then
+	     call rcprm_registry_util_$release_transaction_control_file (tcf_switch_ptr, (0));
+
+	call cu_$level_set (prev_level);
+
+     end clean_up;
+
+%include access_mode_values;
+%page;
+%include rcp_registry;
+%page;
+%include rcprm_registry_keys;
+%page;
+%include iox_dcls;
+%page;
+%include iox_modes;
+%page;
+%include create_branch_info;
+%page;
+%include rcp_requestor_info;
+%include rcp_resource_info;
+%page;
+%include access_audit_encoded_op;
+%include rcp_ops;
+%page;
+%include status_structures;
+%page;
+%include syserr_constants;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rcprm_registry_mgr_$delete_registry: Deleting (possibly bogus) registry PATH for USERID.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The segment at PATH does not seem to be an RCP registry.  It may
+   simply be a damaged registry, or a user may be attempting to use
+   delete_registry to delete a non-registry object.
+
+   A:	$contact_sa
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end rcprm_registry_mgr_;

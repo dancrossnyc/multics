@@ -1,0 +1,782 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style2,indcomtxt */
+
+pc_check_tables_:
+     procedure (Info_pointer, Code);
+
+/**** This procedure is invoked at fault recovery/ESD time to place the
+      SST in a consistent state, assuming consistent interruption of  page control.
+
+      It is also called from the user ring to report on the state
+      of a file system. In this case, it changes nothing.
+
+      This procedure's function is to reconstruct SST based on critical
+      sequences in all of ALM pc and pc.pl1. Every line
+      of this procedure that changes SST is critical by same standard, and must
+      follow same rules.
+
+      This procedure assumes the following conventions, which ALM page control
+      must continue to follow:
+
+      *	A ptw may be moved to full incore state. A cme with ptwp nonzero is wholly
+      *	valid.
+
+      *	Any out of service page can be taken non-out of service- if it was a write,
+      *	phm may be turned on. If it was a read, it may be taken out of core.
+
+
+      *	The disk dim has been trained to throw away all requests at
+      *	recovery time to validate these assumptions.
+
+
+      An attempt is made to repair "impossible" damage, i.e., that which could
+      not have occured as a result of clean interruption of a properly functioning
+      page control. Rather than report each such lossage, about which nothing
+      consistent can be done, segments so affected are marked as
+      damaged, and pages so involved made null where possible.
+
+      We even attempt to repair "garbage" in the SST (see reasonable_devaddp s/r),
+      although in this case and the previous one, segment damage will surely result.
+
+      No attempt is made to handle move_page_table in this version.
+
+      A creation of Bernard Greenberg, May 1977.
+      Modified, minimally, 03/06/81, W. Olin Sibert, for ADP conversion
+      Modified, minutely,  06/21/82, E. N. Kittlitz, to move core map and not so minutely (auditor's orders) zap page-multilevel.
+      Modified, 831220, E. N. Kittlitz, for pc$segmove support.
+      Modified, 84-01-05, BIM, to finish above and use debug_check for stats.
+      Modified, 84-01-05, BIM, to abstract as subroutine callable from user
+      ring. */
+
+
+	declare Info_pointer	 pointer;
+	declare Code		 fixed bin (35);
+
+	dcl     cmap		 ptr;		/* Core map array ppr */
+	dcl     ptp		 pointer;
+	dcl     (new_nused, new_nwired)
+				 fixed bin;	/* Counters for re-computation */
+	dcl     (curused, csl, nincore)
+				 fixed bin (9);	/* Ast remputation stats */
+	dcl     (cbno, ptsi, pts, astx, pno)
+				 fixed bin;	/* Walking indices */
+	declare reported_aste	 bit (1) aligned;
+
+	declare 1 stats		 aligned,
+		2 bad_cme_devadds	 fixed bin,
+		2 bad_cme_add_types	 fixed bin,
+		2 bad_ptw_devadds	 fixed bin,
+		2 cme_ptw_devadd_diffs
+				 fixed bin,
+		2 bad_cme_ptwps	 fixed bin,
+		2 ptws_os_2nd_pass	 fixed bin,
+		2 bad_ptw_addrs	 fixed bin,
+		2 valid_not_core	 fixed bin;
+
+	dcl     (offs, offdif, bno)	 fixed bin (18);	/* used in validation */
+	dcl     (addr, addrel, bit, divide, fixed, null, ptr, rel, size, string, substr, unspec)
+				 builtin;
+
+	dcl     page$cam		 entry;		/* used in damaging */
+	dcl     fcmep		 ptr;		/* thread heads */
+	dcl     lcmep		 ptr;		/* thread tails */
+	dcl     astagp		 ptr;		/* AST group (pool) ptr for walk */
+	dcl     astesize		 fixed bin;	/* Size of whole ASTE in that pool */
+	dcl     astagps		 (0:3) ptr;	/* ast pool ptrs */
+	dcl     (astlowers, astuppers, astesizes)
+				 (0:3) fixed bin (18);
+
+/* Structures */
+
+	dcl     1 ptwdevadd,			/* Devadd  from PTW */
+		2 add		 fixed bin (18) unsigned unal,
+						/* Record number (REALLY UNSIGNED!) */
+		2 add_type	 like badd_type unal;
+						/* add type */
+
+	dcl     1 cmedevadd,			/* Devadd from CME */
+		2 cmeadd		 fixed bin (18) unsigned unal,
+		2 cmeaddtype	 like badd_type unal;
+
+	dcl     1 fdevadd		 aligned,		/* for general work */
+		2 add		 fixed bin (18) unsigned unal,
+		2 add_type	 bit (4) unal;
+	dcl     1 based_comp_devadd	 like ptwdevadd aligned based;
+						/* ditto */
+
+	declare error_table_$unimplemented_version
+				 fixed bin (35) ext static;
+
+
+
+	dcl     1 ex_aste		 aligned based (astep),
+						/* large aste */
+		2 aste_proper	 like aste,
+		2 aste_ptw	 (0:pts - 1) like ptw aligned;
+
+	dcl     1 astage		 (0:fixed (sst.no_aste (ptsi), 18) - 1) like ex_aste based (astagp) aligned;
+						/* array group elements */
+
+/* Set up some pointers. */
+
+	check_tables_info_ptr = Info_pointer;
+	Code = 0;
+	if check_tables_info.version ^= PC_CHECK_TABLES_INFO_VERSION_1
+	then do;
+		Code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	sstp = check_tables_info.sst_ptr;
+	cmap = setwordno (check_tables_info.core_map_ptr, wordno (sst.cmp));
+	pvtp = check_tables_info.pvt_ptr;
+	pvt_arrayp = addr (pvt.array);
+
+	stats = 0;				/* aggregately */
+
+	astagp = setwordno (sstp, wordno (sst.astap));
+	do ptsi = 0 to 3;
+	     pts = sst.pts (ptsi);
+	     astagps (ptsi) = astagp;
+	     astesizes (ptsi) = size (ex_aste);
+	     astlowers (ptsi) = wordno (astagp);
+	     astagp = addwordno (astagp, size (astage));
+	     astuppers (ptsi) = wordno (astagp);
+	end;
+
+	call CHECK_SEGMOVE;
+	call CHECK_EVICT_PAGE;
+
+/**** First, loop through the core map. In any conflict, the core map
+      is right. */
+
+	if check_tables_info.recover_errors
+	then sst.usedp, sst.wusedp = "000000"b3;	/* Clear thread heads */
+
+	new_nused = 0;				/* Init new used count */
+
+	do cbno = sst.first_core_block to sst.last_core_block;
+	     cmep = addr (cmap -> cma (cbno));		/* Address each block */
+
+	     if cme.fp & "400000"b3
+	     then do;
+		     if check_tables_info.recover_errors
+		     then cme.fp, cme.bp = "777777"b3;	/* Any negative goes deconf */
+		end;
+	     else if (cme.fp | cme.bp | cme.ptwp) = "000000"b3
+	     then go to free_cme;			/* unpaged space */
+
+	     else if cme.ptwp = "000000"b3
+	     then ;				/* Was really free to start with. */
+
+	     else do;
+		     unspec (cmedevadd) = cme.devadd;
+		     if ^reasonable_devaddp (cme.devadd)
+		     then do;
+			     if check_tables_info.flags.report_errors
+			     then do;
+				     call check_tables_info.report ("Bad devadd in CME.");
+				     call check_tables_info.display_cme (cmep);
+				end;
+			     stats.bad_cme_devadds = stats.bad_cme_devadds + 1;
+			     go to clear_cme;
+			end;
+		     if cmeaddtype.core
+		     then do;
+			     if check_tables_info.report_errors
+			     then do;
+				     call check_tables_info.report ("Core devadd in CME.");
+				     call check_tables_info.display_cme (cmep);
+				end;
+			     stats.bad_cme_add_types = stats.bad_cme_add_types + 1;
+			     go to clear_cme;
+			end;
+		     if (string (cmeaddtype) = "0000"b)
+		     then do;
+			     if check_tables_info.report_errors
+			     then do;
+				     call check_tables_info.report ("Null add_type in CME.");
+				     call check_tables_info.display_cme (cmep);
+				end;
+			     go to clear_cme;
+			end;
+		     ptp = ptr (sstp, cme.ptwp);	/* address ptw */
+		     if ^reasonable_ptwpp (ptp, astep)
+		     then do;
+			     if check_tables_info.report_errors
+			     then do;
+				     call check_tables_info.report ("Bad ptwp ^o in CME.", cme.ptwp);
+				     call check_tables_info.display_cme (cmep);
+				end;
+			     stats.bad_cme_ptwps = stats.bad_cme_ptwps + 1;
+			     go to clear_cme;
+			end;
+		     else do;			/* ptw is legit */
+			     fdevadd.add = cbno * 16; /* set up coreadd */
+			     fdevadd.add_type = add_type.core;
+			     if ^reasonable_devaddp (mptw.devadd)
+			     then do;
+				     if check_tables_info.report_errors
+				     then do;
+					     call check_tables_info.report ("Bad devadd in PTW.");
+					     call check_tables_info.display_ptw (ptp);
+					end;
+				     stats.bad_ptw_devadds = stats.bad_ptw_devadds + 1;
+				     if check_tables_info.recover_errors
+				     then mptw.devadd = unspec (fdevadd);
+						/* bust segment */
+				     go to clear_cme;
+				end;
+
+			     if check_tables_info.recover_errors
+			     then cme.astep = rel (astep);
+
+			     if ptw.os & check_tables_info.recover_errors
+			     then do;		/* out of service, may have to free cme */
+				     if cme.notify_requested
+				     then call pnotify (ptp);
+				     if cme.io
+				     then ptw.phm1 = "1"b;
+						/* was write */
+				     else do;	/* was a read -- evict. */
+					     cme.fp = "066666"b3;
+						/* Cause core to be counted used */
+					     ptw.valid = "0"b;
+					     call page$cam;
+					     mptw.devadd = unspec (cmedevadd);
+					     cme.ptwp = "000000"b3;
+						/* Will cause freeing */
+					end;
+				     ptw.os = "0"b; /* This should turn off all legit o/s */
+				end;
+			     if mptw.devadd ^= unspec (fdevadd) & mptw.devadd ^= unspec (cmedevadd)
+			     then do;
+				     if check_tables_info.report_errors
+				     then do;
+					     call check_tables_info
+						.report ("PTW devadd inconsistent with CME.");
+					     call check_tables_info.display_ptw (ptp);
+					end;
+				     stats.cme_ptw_devadd_diffs = stats.cme_ptw_devadd_diffs + 1;
+				     if check_tables_info.recover_errors
+				     then do;
+					     aste.damaged = "1"b;
+					     ptw.valid = "0"b;
+					     call page$cam;
+					     mptw.devadd = page_problem_null_addr;
+					end;
+				end;		/* gonna get the asteps later */
+			end;
+		end;
+
+	     if cme.ptwp = "000000"b3
+	     then do;				/* Free it */
+		     if cme.fp ^= "777777"b3
+		     then
+clear_cme:
+			if check_tables_info.recover_errors
+			then cme.fp = "066666"b3;
+free_cme:
+		     if check_tables_info.recover_errors
+		     then do;
+			     cme.astep, cme.ptwp = "000000"b3;
+			     cme.notify_requested = "0"b;
+			end;
+		end;
+
+	     if check_tables_info.recover_errors
+	     then do;
+
+		     if ((cme.fp | cme.ptwp | cme.bp) ^= "000000"b3) & (cme.fp ^= "777777"b3)
+		     then do;
+			     new_nused = new_nused + 1;
+						/* count it */
+			     if sst.usedp = "0"b
+			     then do;
+				     sst.usedp, sst.wusedp = rel (cmep);
+				     fcmep, lcmep = cmep;
+				end;
+			     cme.fp = rel (fcmep);
+			     cme.bp = rel (lcmep);
+			     lcmep -> cme.fp = rel (cmep);
+			     fcmep -> cme.bp = rel (cmep);
+						/* continue thread */
+			     lcmep = cmep;
+			end;
+		end;
+
+	     sst.nused = new_nused;
+	end;
+
+	/*** Now loop through the AST. There should be no OS ptw's,
+	     except those in beginning of readin or end of io window.
+	     Any inconsistency still left is simply wrong. Damage segments. */
+
+	do ptsi = 0 to 3;
+	     astagp = astagps (ptsi);
+	     pts = sst.pts (ptsi);
+	     astesize = size (ex_aste);		/* get real size */
+	     do astx = 0 to fixed (sst.no_aste (ptsi), 18) - 1;
+		astep = addr (astage (astx));		/* address aste */
+
+		curused, nincore, csl = 0;		/* init stats */
+		reported_aste = "0"b;
+		do pno = 0 to pts - 1;		/* scan page table */
+		     ptp = addr (ex_aste.aste_ptw (pno));
+		     if ^reasonable_devaddp (mptw.devadd)
+		     then do;
+			     if check_tables_info.report_errors
+			     then do;
+				     call check_tables_info
+					.report ("Bad PTW devadd for aste at ^o, ptw ^d", rel (astep), pno);
+				     if ^reported_aste
+				     then do;
+					     call check_tables_info.display_aste (astep);
+					     reported_aste = "1"b;
+					end;
+				     call check_tables_info.display_ptw (ptp);
+				end;
+			     stats.bad_ptw_devadds = stats.bad_ptw_devadds + 1;
+			     go to ptwdamage;
+			end;
+
+		     unspec (ptwdevadd) = mptw.devadd;	/* get stuff out */
+
+		     if string (ptwdevadd.add_type) = "0000"b
+		     then ;			/* true null */
+		     else if ptwdevadd.disk
+		     then do;
+			     if ^substr (ptw.add, 1, 1)
+			     then do;		/* not nulled */
+				     csl = pno + 1;
+				     curused = curused + 1;
+						/* count rec used */
+				end;
+			end;
+		     else if ptwdevadd.core
+		     then do;
+			     cmep = addr (cmap -> cma (divide (fixed (ptw.add, 18), 16, 17, 0)));
+			     if reasonable_cmepp (cmep)
+			     then do;
+				     if cme.ptwp = rel (ptp)
+				     then do;	/* all good here */
+					     if ptw.os & check_tables_info.recover_errors
+					     then do;
+						/* This is a complete lie-- not window, as coreadd here.
+						   cme pass should have turned these all off. */
+
+						     stats.ptws_os_2nd_pass = stats.ptws_os_2nd_pass + 1;
+						     ptw.os = "0"b;
+						     go to ptwdamage;
+						end;
+					     nincore = nincore + 1;
+					     csl = pno + 1;
+					     curused = curused + 1;
+					end;
+				     else do;
+					     if check_tables_info.report_errors
+					     then do;
+						     call check_tables_info
+							.report ("CME ptwp ^= ptw address.");
+						     call check_tables_info.display_ptw (ptp);
+						     call check_tables_info.display_cme (cmep);
+						end;
+					     stats.bad_cme_ptwps = stats.bad_cme_ptwps + 1;
+					     go to ptwdamage;
+					end;
+				end;
+			     else do;
+				     if check_tables_info.report_errors
+				     then do;
+					     call check_tables_info.report ("Bad cmep in PTW.");
+					     call check_tables_info.display_ptw (ptp);
+					end;
+				     stats.bad_ptw_addrs = stats.bad_ptw_addrs + 1;
+				     go to ptwdamage;
+				end;
+			end;
+		     else do;
+			     if check_tables_info.report_errors
+			     then do;
+				     call check_tables_info.report ("PTW devadd not core, disk, or null.");
+				     call check_tables_info.display_ptw (ptp);
+				end;
+
+			     stats.bad_ptw_addrs = stats.bad_ptw_addrs + 1;
+ptwdamage:
+			     if check_tables_info.recover_errors
+			     then do;
+				     ptw.valid = "0"b;
+				     aste.damaged = "1"b;
+				     call page$cam;
+				     mptw.devadd = page_problem_null_addr;
+				     unspec (ptwdevadd) = page_problem_null_addr;
+				end;
+			end;
+		     if check_tables_info.recover_errors
+		     then ptw.os = "0"b;
+		     if ptwdevadd.core
+		     then do;
+			     if check_tables_info.recover_errors
+			     then ptw.valid = "1"b;	/* Assume NO FAULTED INCORES IN THIS VERSION OF SYS */
+			end;
+		     else do;			/* next check should never happen */
+			     if ptw.valid
+			     then do;
+				     if check_tables_info.report_errors
+				     then do;
+					     call check_tables_info.report ("Core PTW not valid.");
+					     call check_tables_info.display_ptw (ptp);
+					end;
+				     stats.valid_not_core = stats.valid_not_core + 1;
+				     if check_tables_info.recover_errors
+				     then do;
+					     ptw.valid = "0"b;
+					     call page$cam;
+					end;
+				end;
+			     if check_tables_info.recover_errors
+			     then ptw.phm, ptw.phm1 = "0"b;
+						/* these bother pc */
+			end;
+		     if ptw.wired
+		     then new_nwired = new_nwired + 1;
+
+		     if check_tables_info.recover_errors
+		     then ptw.df_no = "01"b;		/* I hate illegal segfault msgs -- Level 68 only */
+		end;				/* page table loop */
+
+/* CAREFUL THESE ALL DECLARED FIXED 9 */
+
+		if check_tables_info.report_errors
+		then do;
+			if aste.csl ^= bit (csl, 9) | aste.records ^= bit (curused, 9) | aste.np ^= bit (nincore, 9)
+			then do;
+				call check_tables_info.display_aste (astep);
+				call check_tables_info.report ("Bad counter for ASTE.");
+				if aste.csl ^= bit (csl, 9)
+				then call check_tables_info
+					.report (" csl = ^d, should be ^d", bin (aste.csl), csl);
+				if aste.records ^= bit (curused, 9)
+				then call check_tables_info
+					.report (" records = ^d, should be ^d", bin (aste.records), curused);
+
+				if aste.np ^= bit (nincore, 9)
+				then call check_tables_info
+					.report (" np = ^d, should be ^d", bin (aste.np), nincore);
+
+			     end;
+		     end;
+		if check_tables_info.recover_errors
+		then do;
+			aste.csl = bit (csl, 9);
+			aste.records = bit (curused, 9);
+			aste.np = bit (nincore, 9);
+		     end;
+	     end;					/* end ast group */
+	end;					/* end ast pool */
+
+	if check_tables_info.recover_errors
+	then sst.wired = new_nwired;
+
+	sst.wtct = 0;				/* we  stopped 'em all. */
+	if check_tables_info.report_error_counts
+	then if unspec (stats) ^= ""b
+	     then do;
+		     call check_tables_info.report ("Statistics:");
+		     call stat_print ("Bad cme.devadd", stats.bad_cme_devadds);
+		     call stat_print ("Bad cme add_type", stats.bad_cme_add_types);
+		     call stat_print ("Bad ptw devadd", stats.bad_ptw_devadds);
+		     call stat_print ("ptw/cme devadd mismatch", stats.cme_ptw_devadd_diffs);
+		     call stat_print ("Bad cme ptwp", stats.bad_cme_ptwps);
+		     call stat_print ("ptw os on second pass", stats.ptws_os_2nd_pass);
+		     call stat_print ("Bad ptw address", stats.bad_ptw_addrs);
+		     call stat_print ("Valid ptw not in memory", stats.valid_not_core);
+		end;
+
+/* Subroutines */
+
+stat_print:
+     procedure (what, how_many);
+
+	declare what		 char (*);
+	declare how_many		 fixed bin;
+
+	if how_many > 0
+	then call check_tables_info.report ("^5x^5d^12t^a", how_many, what);
+	return;
+     end stat_print;
+
+
+CHECK_SEGMOVE:
+     procedure;
+
+	declare old_astep		 pointer;
+	declare old_ptp		 pointer;
+	declare new_astep		 pointer;
+	declare new_ptp		 pointer;
+	declare px		 fixed bin;
+
+	if sst.segmove_lock.pid = ""b
+	then return;
+
+	astep = setwordno (sstp, wordno (sst.segmove_astep));
+	old_astep = setwordno (sstp, wordno (sst.segmove_old_addr_astep));
+	new_astep = setwordno (sstp, wordno (sst.segmove_new_addr_astep));
+
+	if check_tables_info.flags.report_state
+	then do;
+		call check_tables_info.report ("Segmove in progress, PID: ^w.", sst.segmove_lock.pid);
+		if sst.segmove_astep = null ()
+		then call check_tables_info.report (" move astep is NULL.");
+		else call check_tables_info
+			.
+			report (" move astep:  ^p, size = ^d.", check_tables_info.display_ptr ((sst.segmove_astep)),
+			sst.pts (bin (astep -> aste.ptsi)));
+
+		if sst.segmove_old_addr_astep = null ()
+		then call check_tables_info.report (" old addr astep is NULL.");
+		else call check_tables_info
+			.
+			report (" old addr astep:  ^p, size = ^d.",
+			check_tables_info.display_ptr ((sst.segmove_old_addr_astep)),
+			sst.pts (bin (old_astep -> aste.ptsi)));
+
+		if sst.segmove_new_addr_astep = null ()
+		then call check_tables_info.report (" new addr astep is NULL.");
+		else call check_tables_info
+			.
+			report (" new addr astep:  ^p, size = ^d.",
+			check_tables_info.display_ptr ((sst.segmove_new_addr_astep)),
+			sst.pts (bin (new_astep -> aste.ptsi)));
+
+		if astep ^= null ()
+		then call check_tables_info
+			.
+			report (" Old PV ^a (Vtocx ^d).", check_tables_info.display_pvname (sst.segmove_pvtx),
+			sst.segmove_vtocx);
+
+	     end;
+/**** to make code clearer, first we do display loop, then real work */
+/**** old_astep need not be displayed unless move_astep ^= null indicating
+      that some ptws have possibly been changed. */
+						/* leave out extensive display, you can poke w/azm */
+	if ^check_tables_info.recover_errors
+	then return;				/* done */
+
+	if old_astep ^= null ()
+	then old_ptp = addwordno (old_astep, sst.astsize);
+	if new_astep ^= null ()
+	then new_ptp = addwordno (new_astep, sst.astsize);
+	if astep ^= null ()
+	then ptp = addwordno (astep, sst.astsize);
+
+	begin;
+	     declare pt		      (1:sst.pts (bin (astep -> aste.ptsi))) bit (36) aligned based;
+	     if sst.segmove_astep ^= null ()
+	     then ptp -> pt = old_ptp -> pt;
+	     if sst.segmove_old_addr_astep ^= null ()
+	     then call NULL_PT (old_ptp, segmove_old_addr_null_addr);
+	     if sst.segmove_new_addr_astep ^= null ()
+	     then do;
+		     call NULL_PT (new_ptp, segmove_new_addr_null_addr);
+		     pvtep = addr (pvt_array (bin (new_astep -> aste.pvtx)));
+		     pvte.vol_trouble_count = pvte.vol_trouble_count + 1;
+		end;
+
+NULL_PT:
+     procedure (PTP, NullAddr);
+
+	declare PTP		 pointer;
+	declare NullAddr		 bit (22) aligned;
+	declare px		 fixed bin;
+	declare ptwp		 pointer;
+
+	do px = lbound (PTP -> pt, 1) to hbound (PTP -> pt, 1);
+	     unspec (ptwdevadd) = PTP -> pt (px);
+	     if string (ptwdevadd.add_type) ^= "0000"b
+	     then PTP -> pt (px) = NullAddr;
+	end;
+     end NULL_PT;
+	end;
+
+
+	aste.pvtx = sst.segmove_pvtx;
+	aste.vtocx = sst.segmove_vtocx;
+
+	sst.segmove_astep, sst.segmove_old_addr_astep, sst.segmove_new_addr_astep = null ();
+	sst.segmove_vtocx, sst.segmove_pvtx = 0;
+	return;
+
+     end CHECK_SEGMOVE;
+
+CHECK_EVICT_PAGE:
+     procedure;
+
+/**** If evict_page was moving a page, restore the sequestered modify bit. */
+
+	if sst.evict_ptp = "000000"b3
+	then return;
+
+	if check_tables_info.report_state
+	then do;
+		call check_tables_info.report ("Evict page in progess, ptw at ^o.", sst.evict_ptp);
+		call check_tables_info.display_ptw (pointer (sstp, sst.evict_ptp));
+	     end;
+
+	ptp = ptr (sstp, sst.evict_ptp);
+	if ^reasonable_ptwpp (ptp, astep)
+	then do;
+		if check_tables_info.report_errors
+		then call check_tables_info.report ("Invalid sst.evict_ptwp");
+		return;				/* no repair */
+	     end;
+	else do;
+		if ^check_tables_info.recover_errors
+		then return;
+		if sst.evict_phmbit ^= "000000"b3
+		then ptw.phm1 = "1"b;
+		sst.evict_phmbit = "000000"b3;
+		sst.evict_ptp = "000000"b3;
+	     end;
+	return;
+     end CHECK_EVICT_PAGE;
+
+pnotify:
+     proc (p);					/* Notify page control event */
+
+	dcl     p			 ptr;
+	dcl     pxss$notify		 entry (bit (36) aligned);
+
+	call pxss$notify ("000000"b3 || rel (p));
+
+     end;
+
+
+reasonable_cmepp:
+     proc (tcmep) returns (bit (1) aligned);		/* test reasonable cmep */
+
+	dcl     tcmep		 ptr;
+	dcl     offs		 fixed bin (18);
+
+	offs = fixed (rel (tcmep), 18);
+	offdif = offs - fixed (rel (cmap), 18);
+	if offdif < 0
+	then return ("0"b);
+	bno = offdif / size (cme);
+	if bno * size (cme) ^= offdif
+	then return ("0"b);
+	if bno < sst.first_core_block | bno > sst.last_core_block
+	then return ("0"b);
+	return ("1"b);
+
+     end;
+
+reasonable_ptwpp:
+     proc (tptp, rastep) returns (bit (1) aligned);
+
+	dcl     tptp		 ptr;
+	dcl     rastep		 ptr;
+
+	offs = fixed (rel (tptp), 18);
+	if offs < astlowers (0)
+	then return ("0"b);
+
+	do ptsi = 0 to 3;
+	     if offs < astuppers (ptsi)
+	     then do;
+		     offdif = offs - astlowers (ptsi);
+		     bno = offdif / astesizes (ptsi);
+		     if offdif - bno * astesizes (ptsi) < size (aste)
+		     then return ("0"b);
+		     rastep = ptr (sstp, bno * astesizes (ptsi) + astlowers (ptsi));
+		     return ("1"b);
+		end;
+	end;
+	return ("0"b);
+
+     end;
+
+reasonable_devaddp:
+     proc (arg_devadd) returns (bit (1) aligned);		/* tests non-garbage devadd */
+
+	dcl     arg_devadd		 bit (22) unaligned;
+	dcl     1 test_devadd,
+		2 add		 bit (18) unal,
+		2 add_type	 like badd_type unal;
+
+	dcl     LEGAL_ADD_TYPES	 bit (16) unal init ("1010100010000000"b) options (constant) static;
+
+	unspec (test_devadd) = arg_devadd;
+	if ^substr (LEGAL_ADD_TYPES, fixed (string (test_devadd.add_type), 4) + 1, 1)
+	then return ("0"b);
+	if test_devadd.add_type.core
+	then if substr (test_devadd.add, 15, 4)
+	     then return ("0"b);
+	return ("1"b);
+
+     end;
+
+
+/* format: off */
+%page; %include cmp;
+%page; %include sst;
+%page; %include add_type;
+%page; %include aste;
+%page; %include null_addresses;
+%page; %include "ptw.l68";
+/* format: on */
+
+	dcl     1 ptw		 aligned based (ptp) like l68_ptw;
+	dcl     1 ptw_flags		 unaligned like l68_ptw_flags based;
+	dcl     1 core_ptw		 aligned based (ptp) like l68_core_ptw;
+	dcl     1 special_ptw	 aligned based (ptp) like l68_special_ptw;
+	dcl     1 real_disk_ptw	 aligned based (ptp) like l68_real_disk_ptw;
+	dcl     1 null_disk_ptw	 aligned based (ptp) like l68_null_disk_ptw;
+
+/* Arrays and overlays for various purposes */
+
+	dcl     1 ptwa		 (0:255) based (ptp) aligned like ptw;
+						/* page table */
+
+	dcl     ptwa_bits		 (0:255) based (ptp) bit (36) aligned;
+						/* page table array as raw bits */
+
+	dcl     1 mptw		 based (ptp) aligned,
+						/* page table word while page is not in core */
+		2 devadd		 bit (22) unaligned,/* device address where page resides */
+		2 pad		 bit (14) unaligned;
+
+	dcl     1 mptwa		 (0:1) based (ptp) aligned,
+						/* page table while pages are not in core */
+		2 devadd		 bit (22) unaligned,/* device address where page resides */
+		2 pad		 bit (14) unaligned;
+
+	dcl     1 atptw		 based (ptp) aligned,
+						/* PL/I has problems on overlay-def based */
+		2 add		 bit (18) unal,
+		2 (core, disk, pd, reserved)
+				 bit (1) unal,	/* address types */
+		2 pad		 bit (14) unal;
+
+	dcl     1 atptwa		 (0:255) based (ptp) aligned like atptw;
+
+/* format: off */
+
+%include pvt;
+%include pvte;
+%include syserr_constants;
+%include pc_check_tables_info;
+
+     end pc_check_tables_;

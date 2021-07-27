@@ -1,0 +1,652 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION :
+
+     This procedure creates and initializes an entry in the bj_pst for
+   the BJ with the uid given as input. It assumes that the bj_pst is already 
+   locked by the caller, that is, no other process can allocate or free any
+   pste, or search the pst for a given uid. It also allocates the buffer
+   for this pste, stores the pathname of the journal in the pathname table
+   for use by rollback after crash, and checks in the process as a user
+   of this BJ.
+*/
+
+/*
+   CONVENTIONS FOR CURSORS IN CIRCULAR LIST
+
+   
+   The bj_pste structure contains various cursors that keep track of several
+   positions of interest in the journal. These cursors are expressed in
+   absolute CI numbers. They are representedby the following items:
+   
+   	- bj_pste.cl.origin_ci
+   	- bj_pste.last_ci_buffered
+   	- bj_pste.last_ci_put
+   	- bj_pste.last_ci_flushed
+   	- bj_pste.last_ci_on_disk
+   
+   After the bj_pste structure has been initialized, all these cursors MUST be
+   maintained according to the following conventions:
+   
+   
+   1. All cursors ALWAYS point to a CI of the circular list, ie, at any time,
+      the following relation is satisfied:
+
+   	bj_pste.cl.lowest_ci <= any cursor <= bj_pste.cl.highest_ci.
+
+      There is no such thing as a "null" value for a cursor, even at special
+      times such as when the journal is empty, or full, or has been
+      recycle, ect.
+
+   2. All cursors ALWAYS point to a CI of the used part of the journal. The
+      used part consists of the origin_ci followed by all the "next" CI's, up
+      to, and including, the last_ci_buffered. The function "distance (ci)"
+      has been implemented, and gives the distance if a CI to the origin.
+      The distance is defined as being the number steps forward needed to
+      reach the CI, starting from the origin_ci. At any instant, the
+      following relation must hold:
+
+   	0 <= distance (any_cursor) <= distance (bj_pste.last_ci_buffered)
+
+
+   3. The value of the origin_ci is ALWAYS safely recorded in the journal
+      header, in CI zero. It must be update in the journal header each time
+      its value changes.
+
+   
+   These conventions have been made in order to simplify programs that deal
+   with the circular list. These programs do not have to have special cases
+   to handle special situations where cursors could be "null". Also, the fact
+   that cursors are never null and must be in the used part of the journal
+   makes it possible to perform consistency checks at the lowest level of
+   programs. The last convention has been made to simplify the life of the
+   program that has to find the end of the journal after a system crash.
+*/
+
+/*
+   ENFORCING THESE CONVENTIONS:
+
+   
+   These conventions must be enforced by taking a special action whenever they
+   might be in violation; that is at start_up time and recycle time.
+   
+   At start_up time, no record has been written in the journal yet. Cursors 
+   pointing to the last_ci_put, last_ci_flushed and last_ci_on_disk are
+   undefined.  Their values could be set to a conventional "null" value, but
+   since we do not allow null values, we have to take a special action which
+   will result in giving these cursors a legitimate value. One could, for
+   example, define a start_up record type and write it in the journal at
+   start_up time, put it in the file, flush it and wait for I/O completion.
+   This would give our cursors legitimate values but it would require that a
+   new record type be known from all programs that check the record type.
+   Instead, we chose to write only the "end" of a imaginary record, whose
+   beginning would have been in the previous CI, but which would have been
+   overlapped by a recycle operation which moved the origin over it. So,
+
+   o AT START_UP time, we set all cursors to point to the first CI of the
+     circular list, and we write, in the first CI, an "element" which is the
+     continuation of an imaginary record whose beginning would have vanished
+     after a recycle. We flush the first CI, which is the origin, and wait for
+     I/O completion. Now all cursors point to the origin, in a legitimate
+     manner.  In addition, we write in the header in CI zero the value of
+     the origin.
+
+     This start_up protocol is used whenever a journal is "activated" after
+     having been "deactivated" in an orderly manner, ie, when it contains no
+     information that has to be rolled back. 
+
+   o AT RECYCLE time, if the new origin was not flushed yet, we flush it
+     and wait for I/O completion. In addition, the new origin is safely
+     recorded in the journal header, in CI zero.
+
+     At open after crash time, the origin is taken from the journal header.
+     This CI is the starting point to search for the end of the journal
+     (unless the header is updated more often, in which case, a more recent
+     info may be used).
+
+*/
+
+/* HISTORY:
+Written by Andre Bensoussan, 07/07/82.
+Modified:
+08/15/82 by M. Pandolf: to use file_manager_ to manipulate data
+	  management system files.
+11/23/82 by A. Bensoussan: to call dm_hsc_$allocate_journal.
+12/16/82 by A. Bensoussan: to find the last CI after a crash.
+12/20/82 by A. Bensoussan: to open after crash.
+01/26/83 by L. A. Newcomb: to call file_manager_$flush_consecutive_ci
+	  instead of page_file_manager_$...
+03/16/83 by L. A. Newcomb: to use dm_error_$bj_header_bad, not ..bad_header
+04/06/83 by A. Bensoussan: to add the entry point $for_recovery.
+05/13/83 by A. Bensoussan: to add the entry point $force.
+12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+06/11/84 by Lee Baldwin:  Renamed dm_error_$bj_header_bad to $bj_bad_header.
+12/03/84 by Lindsey L. Spratt:  Added the dm_ci_layout_types include file.
+12/03/84 by M. Sharpe:  to clean up dcls and format; to set/reset 
+	  validation level around the calls to file_manager_; to %include
+	  dm_ci.
+02/14/85 by Lee A. Newcomb:  Fixed:  to use new constant BJ_PSTE_VERSION_2,
+            turn formatting back on after short time of it being off, variable
+            naming for parameters and internal proc variables; removed all
+            reference to the obsolete undo functionality; changed entry_no to
+            be entry_name; removed unused dm_bj_static include.
+03/13/85 by Lee A. Newcomb:  Changed to fill in a valid value for
+            bj_pste.txn_storage_limit if it is zero in the BJ header.
+*/
+
+/* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+%page;
+bj_pste_create:
+   proc (p_bj_dir, p_bj_entry, p_bj_file_oid, p_bj_uid) returns (ptr);
+
+
+/* DECLARATIONS */
+
+/* Parameter */
+dcl  (
+     p_bj_dir			char (168),
+     p_bj_entry			char (32),
+     p_bj_file_oid			bit (36) aligned,
+     p_bj_uid			bit (36) aligned
+     )				parameter;
+
+/* Automatic */
+dcl  (
+     bj_ix			fixed bin init (0),
+     code				fixed bin (35) init (0),
+     current_ring			fixed bin (3) init (-1),
+     entry_name			char (32) init (""),
+     1 my_bj_header			aligned like bj_header,
+     n_txn			fixed bin init (0),
+     saved_level			fixed bin init (-1)
+     )				automatic;
+
+/* Based */
+/* Builtin */
+dcl  (addr, max, null, ptr, size, unspec)
+				builtin;
+
+/* Condition */
+dcl  cleanup			condition;
+
+/* Constant */
+dcl  (
+     BJ_PSTE_CREATE			char (32) init ("bj_pste_create"),
+     BJ_PSTE_CREATE_FORCE		char (32)
+				init ("bj_pste_create$force"),
+     BJ_PSTE_CREATE_FOR_RECOVERY	char (32)
+				init ("bj_pste_create$for_recovery"),
+     ME				char (14) init ("bj_pste_create")
+     )				internal static options (constant);
+
+/* Entry */
+dcl  (
+     bj_ci_zero$get_header		entry (bit (36) aligned, ptr,
+				fixed bin),
+     bj_ci_zero$put_header		entry (bit (36) aligned, ptr,
+				fixed bin),
+     bj_flush_pnt			entry (),
+     bj_max_txn_storage_limit		entry (ptr) returns (fixed bin (35)),
+     bj_pste_register$check_in	entry (ptr),
+     bj_report_err			entry (fixed bin (35), char (*)),
+     bj_storage_get_header$find_last_record
+				entry (bit (36) aligned, ptr, ptr)
+				returns (bit (36) aligned),
+     bj_storage_put_buffered_ci	entry (bit (36) aligned, ptr),
+     clock_			entry returns (fixed bin (71)),
+     cu_$level_get			entry (fixed bin),
+     cu_$level_set			entry (fixed bin),
+     dm_hcs_$allocate_journal		entry (bit (36) aligned, fixed bin,
+				fixed bin (35)),
+     file_manager_$flush_consecutive_ci entry (bit (36) aligned,
+				fixed bin (27), fixed bin (27),
+				fixed bin (35)),
+     file_manager_$get_ci_header	entry (bit (36) aligned,
+				fixed bin (27),
+				1 like ci_header aligned,
+				fixed bin (35)),
+     get_ring_			entry () returns (fixed bin (3))
+     )				external;
+
+/* External */
+dcl  (
+     (
+     dm_error_$bj_bad_header,
+     dm_error_$bj_logic_err,
+     dm_error_$bj_needed_for_recovery
+     )				fixed bin (35),
+     bjm_data_$bj_pst_ptr		pointer
+     )				external static;
+
+/* Static */
+
+/* END OF DECLARATIONS */
+%page;
+/* bj_pste_create:				repeat for reader	*/
+/*      proc (p_bj_dir, p_bj_entry, p_bj_file_oid, p_bj_uid)	*/
+/*      returns (ptr);					*/
+
+   entry_name = BJ_PSTE_CREATE;
+   goto COMMON;
+
+for_recovery:
+   entry (p_bj_dir, p_bj_entry, p_bj_file_oid, p_bj_uid) returns (ptr);
+
+   entry_name = BJ_PSTE_CREATE_FOR_RECOVERY;
+   goto COMMON;
+
+force:
+   entry (p_bj_dir, p_bj_entry, p_bj_file_oid, p_bj_uid) returns (ptr);
+
+   entry_name = BJ_PSTE_CREATE_FORCE;
+   goto COMMON;
+
+
+COMMON:						/* all entries have MUCH in common */
+INIT_INCLUDE_AUTOMATICS_AND_RING:
+   do;
+      bj_header_ptr = addr (my_bj_header);
+      bj_ix = 0;
+      bj_pn_table_ptr = null ();
+      bj_pst_ptr = bjm_data_$bj_pst_ptr;
+      bj_pste_ptr = null ();
+      current_ring = get_ring_ ();
+      call cu_$level_get (saved_level);
+   end INIT_INCLUDE_AUTOMATICS_AND_RING;
+
+
+   on cleanup call cu_$level_set (saved_level);
+
+
+/* Read the bj_header from CI zero and check it is consistent */
+
+   call bj_ci_zero$get_header (p_bj_file_oid, bj_header_ptr, size (bj_header));
+   call CHECK_HEADER ();
+
+
+/* Allocate an entry for this journal in the hardcore table used by	*/
+/* Page Control to keep the time stamps. Then use this index as the	*/
+/* index in the PST for the PSTE for this journal.		*/
+
+   call dm_hcs_$allocate_journal (p_bj_uid, bj_ix, code);
+   if code ^= 0 then
+      call ERROR_RETURN (code);
+
+   if bj_ix < 1 | bj_ix > bj_pst.max_n_entries | bj_pst.e (bj_ix).version ^= 0
+        then
+      call ERROR_RETURN (dm_error_$bj_logic_err);
+
+   bj_pste_ptr = addr (bj_pst.e (bj_ix));
+%page;
+/* Initialize the bj_pste entry, setting the version number last. */
+
+   unspec (bj_pste) = "0"b;
+
+   bj_pste.bj_ix = bj_ix;
+   bj_pste.bj_uid = p_bj_uid;
+   bj_pste.ci_size = bj_header.ci_size;
+   bj_pste.max_size = bj_header.max_size;
+   bj_pste.update_frequency = bj_header.update_frequency;
+   bj_pste.txn_storage_limit = bj_header.txn_storage_limit;
+   if bj_pste.txn_storage_limit = 0 then		/* old journal, fill limit in */
+      bj_pste.txn_storage_limit = bj_max_txn_storage_limit (bj_header_ptr);
+
+   bj_pste.active = "1"b;
+   bj_pste.n_processes = 0;				/* Incremented by bj_pste_register$check_in */
+
+   bj_pste.cl.lowest_ci = 1;
+   bj_pste.cl.highest_ci = bj_header.max_size - 1;
+   bj_pste.cl.number_ci = bj_header.max_size - 1;
+
+   bj_pste.buffer_offset = ALLOC_BUFFER (bj_ix);
+
+/* Initialize the BJ buffer.  This sets bj_uid in bj_ci.header1.	*/
+/* Must be done before calling WRITE_START_UP_RECORD.		*/
+
+   call INIT_BUFFER (ptr (bj_pst_ptr, bj_pste.buffer_offset));
+
+
+/* If the active switch in the BJ's header is off, a proper close	*/
+/* was done; otherwise, the journal was left open during a crash.	*/
+   if bj_header.active = "0"b then
+INIT_FOR_CLOSED_BJ:
+      do;
+      bj_pste.time_header_updated = clock_ ();
+      bj_pste.cl.origin_ci = bj_pste.cl.lowest_ci;
+      bj_pste.last_ci_on_disk = bj_pste.cl.lowest_ci;
+      bj_pste.last_ci_flushed = bj_pste.cl.lowest_ci;
+      bj_pste.last_ci_put = bj_pste.cl.lowest_ci;
+      bj_pste.last_ci_buffered = bj_pste.cl.lowest_ci;
+      bj_pste.last_rec_id = "0"b;
+      bj_pste.n_txn = 0;
+      call WRITE_START_UP_RECORD ();
+   end INIT_FOR_CLOSED_BJ;
+   else
+INIT_FOR_CRASHED_BJ:
+      do;
+      bj_pste.time_header_updated = bj_header.time_header_updated;
+      bj_pste.cl.origin_ci = bj_header.cl.origin_ci;	/* This item is refreshed at each recycle */
+      bj_pste.last_ci_on_disk = FIND_LAST_CI ();		/* Using time stamps */
+      bj_pste.last_ci_flushed = bj_pste.last_ci_on_disk;
+      bj_pste.last_ci_put = bj_pste.last_ci_on_disk;
+      bj_pste.last_ci_buffered = bj_pste.last_ci_on_disk;
+      bj_pste.last_rec_id = FIND_LAST_RECORD (n_txn);	/* Using BJ format */
+      bj_pste.n_txn = 0;				/* Since txt shows no txn yet */
+   end INIT_FOR_CRASHED_BJ;
+
+   bj_pste.stamp_for_last_ci_put, bj_pste.stamp_for_last_ci_on_disk =
+        clock_ ();
+%page;
+/* Update the number of entries in the bj_pst */
+
+   bj_pst.n_entries_used = bj_pst.n_entries_used + 1;
+   bj_pst.highest_ix_used = max (bj_ix, bj_pst.highest_ix_used);
+
+
+/* Store the pathname of the journal in the pathname table to be	*/
+/* available if the system crashes -  This table is implemented as a	*/
+/* parallel table to the bj_pst array. The pathname is stored  in	*/
+/* entry "bj_ix". The pathname is stored first, the bj_uid last. The	*/
+/* pathname and the bj_uid have been provided as input arguments to	*/
+/* bj_pste_create.						*/
+
+   bj_pn_table_ptr = ptr (bj_pst_ptr, bj_pst.pn_table_offset);
+
+   bj_pn_table (bj_ix).bj_uid = "0"b;
+   bj_pn_table (bj_ix).dir = p_bj_dir;
+   bj_pn_table (bj_ix).entry = p_bj_entry;
+   bj_pn_table (bj_ix).bj_uid = p_bj_uid;
+
+
+/* Page Control must be called now to flush those pages holding the	*/
+/* bj_pn_table, so that the table can be safe before one starts	*/
+/* using the journal.					*/
+
+   call bj_flush_pnt ();
+
+
+/* Check the process in as a user of the before journal being opened.	*/
+/* This consists of adding the process id to the list of processes	*/
+/* that have open this journal. This list is maintained in addition	*/
+/* to the count of processes that have open the journal. The list is	*/
+/* more reliable that the count because if a process dies it may not	*/
+/* have time to decrease the count. With the list, one can detect	*/
+/* that a process id in the list belongs to a process that no longer	*/
+/* exists, and remove it from the list. A journal cannot be		*/
+/* "deactivated", i.e., its pste cannot be removed until this list is	*/
+/* empty.							*/
+
+   call bj_pste_register$check_in (bj_pste_ptr);
+%page;
+/* Now, set the version number in the pste, indicating the bj_pste	*/
+/* is completely initialized.					*/
+
+   bj_pste.version = BJ_PSTE_VERSION_2;
+
+
+/* Finally update the bj_header in CI zero to show that the journal	*/
+/* is "active". But do it only if the journal was not found open	*/
+/* after a crash.						*/
+
+   if bj_header.active = "0"b then
+UPDATE_BJ_HEADER:
+      do;
+      call bj_ci_zero$put_header (p_bj_file_oid, bj_pste_ptr, size (bj_pste));
+      call cu_$level_set ((current_ring));
+      call file_manager_$flush_consecutive_ci (p_bj_file_oid, 0, 1, code);
+      call cu_$level_set (saved_level);
+
+      if code ^= 0 then
+         call ERROR_RETURN (code);
+   end UPDATE_BJ_HEADER;
+
+
+/* Return the bj_pste_ptr to the caller */
+
+   return (bj_pste_ptr);
+%page;
+ERROR_RETURN:
+   proc (er_p_code);
+
+dcl  er_p_code			fixed bin (35) parameter;
+
+   call bj_report_err (er_p_code, ME);			/* does not return */
+   end ERROR_RETURN;
+%skip (4);
+ALLOC_BUFFER:
+   proc (ab_p_bj_pste_index) returns (fixed bin (18) uns);
+
+dcl  ab_p_bj_pste_index		fixed bin parameter;
+
+/* Calculates and returns the offset of the buffer reserved for pste	*/
+/* number ab_p_bj_pste_index.					*/
+
+   return (bj_pst.buffer_table_offset + (ab_p_bj_pste_index - 1) * 1024);
+
+   end ALLOC_BUFFER;
+%skip (4);
+INIT_BUFFER:
+   proc (ib_p_bj_buffer_ptr);				/* Convention with bj_storage */
+
+dcl  ib_p_bj_buffer_ptr		ptr parameter;
+
+   bj_ci_ptr = ib_p_bj_buffer_ptr;
+
+   unspec (bj_ci.header1) = "0"b;
+   unspec (bj_ci.header2) = "0"b;
+
+   bj_ci.header1.stamp.bj_idx = bj_ix;
+   bj_ci.header1.id.uid = p_bj_uid;
+   bj_ci.header1.id.num = bj_pste.last_ci_buffered;
+
+   bj_ci.header2.layout_type = CI_LAYOUT_BJ;		/* Declared in dm_ci_header.incl.pl1 */
+
+   return;
+
+   end INIT_BUFFER;
+%page;
+CHECK_HEADER:
+   proc ();
+
+/* format: off */
+	if bj_header.version       ^= BJ_PSTE_VERSION_2
+	 | bj_header.bj_uid        ^= p_bj_uid
+	 | bj_header.ci_size       ^= 4096
+	 | bj_header.max_size      <= 0
+	 | bj_header.cl.lowest_ci  ^= 1
+	 | bj_header.cl.highest_ci ^= bj_header.max_size - 1
+	 | bj_header.cl.number_ci  ^= bj_header.max_size - 1
+	 | bj_header.cl.origin_ci  <  bj_header.cl.lowest_ci
+	 | bj_header.cl.origin_ci  >  bj_header.cl.highest_ci
+
+	then call ERROR_RETURN (dm_error_$bj_bad_header);
+/* format: on */
+
+   if bj_header.active = "1"b then do;
+      if entry_name = BJ_PSTE_CREATE then
+         call ERROR_RETURN (dm_error_$bj_needed_for_recovery);
+      if entry_name = BJ_PSTE_CREATE_FOR_RECOVERY then
+         ;
+      if entry_name = BJ_PSTE_CREATE_FORCE then
+         bj_header.active = "0"b;
+   end;
+
+   return;
+
+   end CHECK_HEADER;
+%page;
+FIND_LAST_CI:
+   proc returns (fixed bin (24) uns);
+
+dcl  (
+     flc_current			fixed bin (24) uns init (0),
+     flc_current_is_last		bit (1) aligned init (""b),
+     flc_last			fixed bin (24) uns init (0),
+     flc_next			fixed bin (24) uns init (0),
+     flc_time_current		fixed bin (71) init (0),
+     flc_time_next			fixed bin (71) init (0)
+     )				automatic;
+
+
+   flc_current = bj_pste.cl.origin_ci;
+   flc_time_current = TIME_STAMP (flc_current);
+   flc_current_is_last = "0"b;
+
+SEARCH_FROM_ORIGIN:
+   do while (^flc_current_is_last);
+
+      if flc_current < bj_pste.cl.highest_ci then
+         flc_next = flc_current + 1;
+      else flc_next = bj_pste.cl.lowest_ci;
+
+      flc_time_next = TIME_STAMP (flc_next);
+
+      if flc_time_next < flc_time_current then
+         flc_current_is_last = "1"b;
+      else do;
+         flc_current = flc_next;
+         flc_time_current = flc_time_next;
+      end;
+   end SEARCH_FROM_ORIGIN;
+
+   flc_last = flc_current;
+
+   return (flc_last);
+
+   end FIND_LAST_CI;
+%page;
+FIND_LAST_RECORD:
+   proc (flr_p_number_of_txn) returns (bit (36) aligned);
+
+/* Note: flr_p_number_of_txn is an output parameter even though this	*/
+/* is a function procedure;  it is the number of txn in progress at	*/
+/* the time the last record was written.			*/
+
+dcl  flr_p_number_of_txn		fixed bin parameter;
+
+dcl  (
+     1 flr_my_rec_hdr		like bj_rec_hdr aligned,
+     flr_last_rec_id		bit (36) aligned
+     )				automatic;
+
+   unspec (flr_my_rec_hdr) = "0"b;
+
+   flr_last_rec_id =
+        bj_storage_get_header$find_last_record (p_bj_file_oid, bj_pste_ptr,
+        addr (flr_my_rec_hdr));
+
+   if flr_last_rec_id ^= "0"b then
+      flr_p_number_of_txn = flr_my_rec_hdr.n_txn;
+   else flr_p_number_of_txn = 0;
+
+   return (flr_last_rec_id);
+
+   end FIND_LAST_RECORD;
+%skip (4);
+TIME_STAMP:
+   proc (ts_p_ci_no) returns (fixed bin (71));
+
+dcl  ts_p_ci_no			fixed bin (24) uns parameter;
+
+dcl  (
+     ts_my_ci			fixed bin (27),
+     ts_time_stamp			fixed bin (71),
+     1 ts_my_ci_header		like ci_header aligned
+     )				automatic;
+
+
+   ts_my_ci_header.stamp.version = CI_HEADER_STAMP_VERSION_1;
+   ts_my_ci = ts_p_ci_no;
+
+   call cu_$level_set ((current_ring));
+   call file_manager_$get_ci_header (p_bj_file_oid, ts_my_ci, ts_my_ci_header,
+        code);
+   call cu_$level_set (saved_level);
+
+   if code ^= 0 then
+      call ERROR_RETURN (code);
+
+   ts_time_stamp = ts_my_ci_header.stamp.time_modified;
+
+
+   return (ts_time_stamp);
+
+   end TIME_STAMP;
+%page;
+WRITE_START_UP_RECORD:
+   proc ();
+
+dcl  (
+     wsur_last_ci			fixed bin (24) uns init (0),
+     wsur_last_rec_id		bit (36) aligned init (""b),
+     wsur_nb_txn			fixed bin
+     )				automatic;
+
+dcl  1 wsur_str_rec_id		aligned automatic,
+       2 ci_no			fixed bin (24) uns unal,
+       2 sl_no			fixed bin (12) uns unal;
+
+
+   bj_ci.header1.id.num = bj_pste.cl.lowest_ci;
+
+   bj_ci.slot (1).length = 20;			/* Arbitrary number of bytes */
+   bj_ci.slot (1).offset =
+        bj_pste.ci_size - 4 * (size (ci_header) + size (ci_trailer)) - 20;
+
+   wsur_str_rec_id.ci_no = bj_pste.cl.highest_ci;
+   wsur_str_rec_id.sl_no = 1;
+
+   bj_ci.header2.first_rec_id = unspec (wsur_str_rec_id);
+   bj_ci.header2.last_is_contd = "0"b;
+   bj_ci.header2.first_is_contn = "1"b;
+   bj_ci.header2.n_slots = 1;
+
+   call bj_storage_put_buffered_ci (p_bj_file_oid, bj_pste_ptr);
+
+   call cu_$level_set ((current_ring));
+   call file_manager_$flush_consecutive_ci (p_bj_file_oid,
+        (bj_pste.cl.lowest_ci), 1, code);
+   call cu_$level_set (saved_level);
+
+   if code ^= 0 then
+      call ERROR_RETURN (code);
+
+
+/* Double check that FIND_LAST_CI and FIND_LAST_RECORD would find	*/
+/* no record in the journal.					*/
+
+   wsur_last_ci = FIND_LAST_CI ();
+   wsur_last_rec_id = FIND_LAST_RECORD (wsur_nb_txn);
+
+   if wsur_last_ci ^= bj_pste.last_ci_on_disk
+        | wsur_last_rec_id ^= bj_pste.last_rec_id
+        | wsur_nb_txn ^= bj_pste.n_txn then
+      call ERROR_RETURN (dm_error_$bj_logic_err);
+
+   return;
+   end WRITE_START_UP_RECORD;
+
+%page;
+%include dm_bj_pst;
+%page;
+%include dm_bj_pste;
+%page;
+%include dm_bj_header;
+%page;
+%include dm_bj_pn_table;
+%page;
+%include dm_bj_ci;
+%page;
+%include dm_ci_header;
+%page;
+%include dm_ci_layout_types;
+%page;
+%include dm_bj_records;
+
+
+   end bj_pste_create;

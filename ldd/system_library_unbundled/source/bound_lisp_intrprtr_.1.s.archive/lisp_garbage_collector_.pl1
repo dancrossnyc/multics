@@ -1,0 +1,957 @@
+/* **************************************************************
+   *                                                            *
+   * Copyright, (C) Massachusetts Institute of Technology, 1973 *
+   *                                                            *
+   ************************************************************** */
+lisp_garbage_collector_: proc;
+
+dcl curtop fixed bin(18),
+    total_allocation fixed bin(34),
+    old_allocation fixed bin(34),
+	lisp_gc_alm_$collect entry(bit(1)aligned) returns(ptr),
+    lisp_io_control_$gc_flush entry(ptr),
+    new_seg ptr,
+    curseg ptr,
+    segment_chain based ptr aligned,
+    lisp_static_vars_$gc_mark_bits bit(18) aligned external,
+    oldgcmark bit(18) aligned defined lisp_static_vars_$gc_mark_bits,
+    curgcmark bit(18) aligned,
+    chaser ptr,
+    ungclist_ptr ptr init(null()),
+    ungc_element fixed bin(71) aligned based,
+    1 ungclist_element based aligned like obarray_list_element,
+
+    obarray_list ptr init(null()),
+    obarray_list_end ptr init(null()),
+    obarray_ptr ptr,
+    last ptr,
+    tempp ptr,
+    copy_nil fixed bin(71),
+     gcmode fixed bin init(-1),	/* set to Obarray_array if in gctwa mode */
+    atptr ptr,
+    lisp_static_vars_$status_gctwa external fixed bin(71) aligned,
+    lisp_fault_handler_$nointerrupt entry,
+    1 obarray_list_element based aligned,
+      2 next ptr,
+      2 current ptr,
+    old_array_stcd_instruction bit(36) static init("001000000000001000011101111001000000"b),
+    1 Obarray based aligned,
+      2 bucket(0:510) aligned pointer,
+      2 char_atom(0:127) fixed bin(71),
+
+    1 copied_string based aligned,
+      2 pad5050 fixed bin,
+      2 new_address ptr unaligned,
+    reti fixed bin,
+    arg fixed bin(71) aligned,
+    1 arg_ovly based (addr(arg)) aligned,
+      2 pad bit(53) unal,
+      2 arg_points_at_odd_addr bit(1) unal,
+      2 rest bit(18) unal,
+    allocptr ptr,
+    workptr ptr,
+    lisp_static_vars_$garbage_collected_ptrs ext fixed bin(71),
+    lisp_static_vars_$number_gc_ptrs ext fixed bin(17) aligned,
+    bottom_ptr ptr,
+    size fixed bin,
+    stack ptr,
+    gc_mark fixed bin(71) static init(-1),
+    left fixed bin,
+    idx fixed bin,
+    copy_words (size) fixed bin(35) aligned based,
+    hcs_$truncate_seg entry(ptr, fixed bin, fixed bin(35)),
+   lisp_segment_manager_$get_lists entry(ptr),
+    lisp_segment_manager_$free_lists entry(ptr),
+    ioa_ entry options(variable),
+    ioa_$ioa_stream_nnl entry options(variable),
+    lisp_print_$type_string entry(char(*)),
+    virtual_cpu_time_ entry returns(fixed bin(52)),
+    start_time fixed bin(52),
+    saved_alloc_fault_word bit(36),
+    lisp_alloc_$get_fault_word entry(bit(36)),
+    lisp_alloc_$rehash_maknum entry,
+    lisp_default_handler_$deferred_quit entry,
+    fault_bits bit(36) aligned,
+    lisp_default_handler_$alloc_fault entry ( bit(36) aligned ),
+    (lisp_special_fns_$cons, lisp_special_fns_$list,
+    lisp_special_fns_$ncons, lisp_$apply, lisp_$eval) entry,
+    lisp_static_vars_$garbage_collect_inhibit bit(36) aligned external,
+    old_segs ptr,
+    meter_time float bin(63),
+    lisp_static_vars_$i_am_gcing bit(1) aligned external,
+    lisp_static_vars_$gcmax fixed bin(35) external,
+    lisp_static_vars_$space_names_atom external pointer,
+    lisp_static_vars_$gc_time external static fixed bin(71),
+    gc_time fixed bin(71),
+    Maximum_Reasonable_Size fixed bin(18) static init(65000),	/* no atom bigger than this */
+    com_err_ entry options(variable),
+    (addr,addrel,ptr,divide,null,mod,hbound,baseno,binary,bit,float,rel,lbound,string,fixed) builtin;
+
+dcl lisp_static_vars_$cleanup_list fixed bin(71) external,
+    lisp_static_vars_$cleanup_list_exists bit(1) aligned external,
+    lisp_static_vars_$gc_unwinder_kludge label external,
+    lisp_static_vars_$activate_gc_unwinder_kludge bit(1) aligned external;
+
+dcl 1 argo aligned based(addr(arg)->based_ptr),	/* overlay for bug messages */
+    2 (w1, w2, w3, w4, w5, w6) bit(36) aligned;
+
+
+%include lisp_free_storage;
+%include lisp_array_fmt;
+%include lisp_iochan;
+%include lisp_nums;
+%include lisp_ptr_fmt;
+%include lisp_stack_seg;
+%include lisp_string_fmt;
+%include lisp_bignum_fmt;
+%include lisp_stack_fmt;
+%include lisp_common_vars;
+%include lisp_atom_fmt;
+%include lisp_cons_fmt;
+%include lisp_control_chars;
+%include lisp_comp_subr_block;
+%include lisp_maknum_table;
+
+
+
+	go to join;		/* obsolete "FSUBR" entry point */
+
+gcsubr:	entry;
+	stack = stack_ptr;
+	stack_ptr = addr(stack->temp(2));
+	stack -> temp(1) = nil;
+join:	if lisp_static_vars_$garbage_collect_inhibit then return;
+
+	/* go into (nointerrupt t) mode */
+
+	lisp_static_vars_$i_am_gcing = "1"b;			/* for CTRL/? */
+	stack = stack_ptr;
+	stack_ptr = addr(stack -> temp(2));
+	stack -> temp(1) = t_atom;
+	call lisp_fault_handler_$nointerrupt;
+		/* now the top of the stack has the previous status of the nointerrupt flag */
+
+
+	/* Now safely clear the alloc fault word */
+
+	call lisp_alloc_$get_fault_word(saved_alloc_fault_word);	/* get fault word, make sure to zero it right. */
+
+	if saved_alloc_fault_word & quit_fault	/* do quit now */
+	then do;
+		saved_alloc_fault_word = saved_alloc_fault_word & ^quit_fault;
+		call lisp_default_handler_$deferred_quit;		/* but leave alarms for later */
+	     end;
+
+
+	start_time = virtual_cpu_time_();
+/*	curtop = 0;*/
+	call compute_total_allocation;
+	old_allocation = total_allocation;
+/*	total_allocation = 0;*/
+
+/*	curseg = null();*/
+	curgcmark = ^oldgcmark;
+	oldgcmark = curgcmark;
+/*	call new_segment_maker;*/
+
+	if lisp_static_vars_$status_gctwa ^= nil
+	then do;
+		gcmode = Obarray_array;	/* control switch for checking array types for obarrays */
+		if addr(lisp_static_vars_$status_gctwa) -> lisp_ptr_type = fixnum_type
+		then if addr(lisp_static_vars_$status_gctwa) -> fixedb = 1
+		     then addr(lisp_static_vars_$status_gctwa) -> fixedb = 0;	/* only gctwa this time */
+		     else if addr(lisp_static_vars_$status_gctwa) -> fixedb = 0
+			then gcmode = -1;			/* if switch is off, don't gctwa */
+			else addr(lisp_static_vars_$status_gctwa) -> fixedb = 8;
+	     end;
+
+
+
+
+	old_segs = lisp_gc_alm_$collect(gcmode=Obarray_array);		/* call whizzy new gcer */
+
+/*	copy_nil = nil;		*/
+/*	call lisp_segment_manager_$get_lists (stack);		/* use a new segment for gc stack */
+/* /*	workptr = stack_ptr;*/
+/*	bottom_ptr = ptr(unmkd_ptr,0)->stack_seg.marked_stack_bottom;
+/*	if baseno(bottom_ptr) ^= baseno(workptr)
+/*	then do;
+/*		call ioa_("Garbage collector: stack screwed up!!!! Entering debug.");
+/*		call debug;
+/*		dcl debug entry;
+/*	     end;
+/*
+/*	do while(workptr ^= bottom_ptr);
+/*	     workptr = addrel(workptr,-2);
+/*	     arg = workptr -> temp(1);
+/*	     reti = 3;
+/*	     go to collect;
+/*ret(3):	     workptr -> temp(1) = arg;
+/*	end;*/
+
+
+/*	idx = lisp_static_vars_$number_gc_ptrs;	/* get number of ext ptrs */
+/*	workptr = addr(lisp_static_vars_$garbage_collected_ptrs);*/
+/*	do while (idx > 0);			/* do until no more ptrs */
+/*	     idx = idx -1;
+/*	     reti = 5;*/
+/* /*	     arg = workptr -> temp(1);	/* use this as based ptr (lisp type) */
+/*	     go to collect;
+/*ret(5):	     workptr -> temp(1) = arg;
+/*	     workptr = addr(workptr->temp(2));	/* bump ptr address */
+/*	end;
+/*
+/*
+/* /* garbage collection of truly worthless atoms phase */
+/*
+/*	if gcmode < 0 then go to skip_gctwa;
+/*
+/*	/* first pass over obarrays in obarray_list is for the purpose of garbage collecting */
+/*	/* all of the worthy atoms which have not yet been seen. */
+/*	/* for example, if the user had setq'ed a to b but no program or other list */
+/*	/* structure referenced the atom b, we must make sure b is picked up  by this pass */
+/*	/* also, this handles difficulties with atoms whose values point into Obarray.buckets */
+/*
+/*	do chaser = obarray_list	/* pass to collect worthy atoms and their plists and values */
+/*		repeat(chaser -> obarray_list_element.next)
+/*		while(chaser ^= null());
+/*
+/*	     obarray_ptr = chaser -> obarray_list_element.current -> array_info.array_data_ptr;
+/*
+/*	     do idx = 0
+/*		  repeat(idx+1)
+/*		  while(idx <= 127);
+/*		arg = obarray_ptr -> Obarray.char_atom(idx);	/* these char_atoms are for single char atoms */
+/*		reti = 7;
+/*		go to collect;
+/*ret(7):		obarray_ptr -> Obarray.char_atom(idx) = arg;	/* put result back */
+/*	     end;
+/*
+/*	     do idx = 0
+/*		  repeat(idx+1)
+/*		  while(idx <= 510);			/* these are the hash buckets */
+/*
+/*		do tempp = obarray_ptr -> Obarray.bucket(idx)
+/*		        repeat (tempp -> cons_ptrs.cdr)
+/*		        while  (tempp -> cons.car ^= gc_mark);	/* don't go past point in list we have seen */
+/*
+/*		     arg = tempp -> cons.car;			/* atom is at car of list */
+/*		     reti = 8;
+/*					/* now check to see if atom was not seen , yet is worthy */
+/*		     if addr(arg) -> based_ptr -> atom.value ^= gc_mark
+/*		     then if addr(arg) -> based_ptr -> atom.value ^= 0 then go to collect;
+/*			else if addr(arg) -> based_ptr -> atom.plist ^= copy_nil then go to collect;
+/*
+/*		     go to no_check_car;
+/*ret(8):		     if tempp -> cons.car = gc_mark		/* in following atom's value or plist,
+/*							   came to this part of bucket list */
+/*		     then go to premature_end_of_bucket;
+/*no_check_car:	end;
+/*premature_end_of_bucket:
+/*	     end;
+/*	end;
+/*
+/*	/* second phase of gctwa operation -- must go through and make Obarray.bucket lists
+/*	   from old bucket lists, preserving the worthy atoms, all of which have now
+/*	   been collected */
+/*
+/*	do chaser = obarray_list
+/*		repeat (chaser -> obarray_list_element.next)
+/*		while  (chaser ^= null());
+/*	     obarray_ptr = chaser -> obarray_list_element.current -> array_info.array_data_ptr;
+/*
+/*	     do idx = 0
+/*		  repeat (idx + 1)
+/*		  while  (idx <= 510);
+/*		last = addr(obarray_ptr -> Obarray.bucket(idx));	/* last always point at place to splice next cons */
+/*
+/*		do tempp = obarray_ptr -> Obarray.bucket(idx)
+/*		        repeat (tempp -> cons_ptrs.cdr)
+/*		        while  (tempp -> cons.car ^= gc_mark);	/* stop at end of unseen bucket elements */
+/*
+/*		     atptr = tempp -> cons_ptrs.car;		/* get pointer to atom for worthiness check */
+/*		     if atptr -> cons.car = gc_mark	/* then it is worthy */
+/*		     then do;
+/*			     if curtop > 261116 then call new_segment_maker;
+/*			     allocptr = addrel(curseg, curtop);	/* allocate a cons */
+/*			     curtop = curtop + 4;
+/*			     allocptr -> cons.car = atptr -> cons.cdr;	/* the atom we are adding to bucket */
+/*			     last -> based_ptr = allocptr;	/* append to bucket list so far */
+/*			     last = addr(allocptr -> cons.cdr);	/* and remember where to append next */
+/*			end;
+/*		end;
+/*
+/*		last -> cons.car = tempp -> cons.cdr;	/* terminate the list with the new location of the end */
+/*	     end;
+/*	end;
+/*
+/*
+/*skip_gctwa:
+/*	/* now must scan over ungclist, and find all of those things which were not protected
+/*	   by the other list structure we have seen */
+/*
+/*	do chaser = ungclist_ptr
+/*		repeat (chaser -> ungclist_element.next)
+/*		while  (chaser ^= null());
+/*
+/*	     allocptr = chaser -> ungclist_element.current;	/* get pointer to ungc'ed array */
+/*	     call compute_array_size;
+/*	     allocptr = allocptr -> array_info.array_data_ptr;
+/*	     do left = size-2 by -2 to 0;
+/*		allocptr = addrel(allocptr,2);
+/*		if allocptr -> ungc_element = 0 then;
+/*		else if allocptr -> lisp_ptr_type & Numeric36 then;
+/*		     else if allocptr -> lisp_ptr_type & String36 then go to make_fake;
+/*			else if allocptr -> lisp_ptr_type & Subr36 then;
+/*			     else if allocptr -> based_ptr -> cons.car = gc_mark	/* if already seen atom, cons or
+/*									   bignum, then get new address */
+/*				then allocptr -> ungc_element = allocptr -> based_ptr -> cons.cdr;
+/*				else do;
+/*make_fake:				if curtop > 261116 then call new_segment_maker;
+/*					atptr = addrel(curseg, curtop);
+/*					curtop = curtop + 4;
+/*					/* replace current array element by cons of itself with itself */
+/*					atptr -> cons_ptrs.car = atptr;
+/*					atptr -> cons_ptrs.cdr = atptr;
+/*					allocptr -> based_ptr = atptr;
+/*				     end;
+/*
+/*	     end;
+/*	end;
+/*
+/*
+/*
+/*	/* now inform allocation routines of new segments */
+/*
+/*	curtop = divide(curtop + 3, 4, 17,0)*4;			/* make curtop 0 (mod 4) */
+/*	if curtop = 261120 then call new_segment_maker;		/* if at very end of seg, skip to new one */
+/*
+/*	total_allocation = total_allocation + curtop;	/* get current wordage */
+/*
+/*	old_segs = lisp_alloc_$cur_seg;		/* remember old seg for later flushing */
+/*
+/*	lisp_alloc_$cur_seg = curseg;			/* now set up all the necessary data */
+/*	lisp_alloc_$consptr = addr(curseg->alloc_segment.tally_word);
+/*	consptr_ovly.mod = "101011"b;				/* ad modifier */
+/*	curseg -> alloc_segment.tally_word.seg_offset = bit(binary(curtop,18,0),18);
+/*	curseg -> alloc_segment.tally_word.tally = bit(binary(divide(mod(-1020-curtop,16384),4,18,0),12,0),12);
+/*	curseg -> alloc_segment.tally_word.delta = 4;
+/*	lisp_alloc_$seg_blk_cntr = divide(curtop+1024,16384,35,0) - 16;*/
+
+	call compute_total_allocation;
+	call set_gc_blk_cntr;
+
+
+
+	/* now rehash the maknum table, after throwing away all old stuff not protected otherwise */
+	/* note - allocation performed below will not be accounted for in msgs, gcsize, etc. */
+
+/*	size = 0;				/* see if there is any point to it */
+/*
+/*	if lisp_static_vars_$maknum_mask = -1 then goto norehash;
+/*
+/*
+/*	do idx = lbound(maknum_table,1) to hbound(maknum_table,1);
+/*
+/*	     if string(maknum_table(idx).first)
+/*	     then do;
+/*
+/*		     if maknum_table(idx).first.type &(Subr|Numeric)
+/*		     then size = size + 1;
+/*		     else do;
+/*			     workptr = ptr(baseptr(maknum_table(idx).second.segno),maknum_table(idx).second.offset);
+/*			     if maknum_table(idx).first.type & String
+/*			     then if workptr -> string_length < 0
+/*				then maknum_table_ptrs(idx).second = workptr -> copied_string.new_address;
+/*				else string(maknum_table(idx).first) = ""b;
+/*			     else if workptr ->  cons.car = gc_mark
+/*				then maknum_table_ptrs(idx).second = workptr -> cons_ptrs.cdr;
+/*				else string(maknum_table(idx).first) = ""b;
+/*			     if string(maknum_table(idx).first)
+/*			     then size = size + 1;
+/*			end;
+/*		end;
+/*	end;
+/*
+/*
+/*
+/*	/* now rehash the table */
+/*
+/*	lisp_static_vars_$maknum_left = size;
+/*
+/*	lisp_static_vars_$garbage_collect_inhibit = "1"b;
+/*	call lisp_alloc_$rehash_maknum;
+/*	lisp_static_vars_$garbage_collect_inhibit = "0"b;
+/*norehash:*/
+
+	/* final post-flushage */
+
+	workptr = ptr(unmkd_ptr,0);	/* get ptr to base of stack */
+	workptr -> stack_seg.nil = nil;		/* copy back two quantities */
+	workptr -> stack_seg.true = t_atom;
+
+	workptr = ptr(stack_ptr, 0);		/* segment of marked stack */
+	reti = binary(rel(stack_ptr),17,0);		/* and current height */
+	call hcs_$truncate_seg(workptr, reti, (0));	/* make sure area above stack height is zero, as
+						   it might be pointing into garbage collected space
+						   which has just been moved! */
+/*	call lisp_segment_manager_$free_lists (stack);*/
+
+	do while(old_segs ^= null());		/* want to free all old segments */
+	     workptr = old_segs;
+	     old_segs = workptr -> alloc_segment.next_seg;
+	     call lisp_segment_manager_$free_lists(workptr);
+	     end;
+
+	/* Have to do a post-pass over all file objects because those which
+	   have not been seen are supposed to be automatically closed,
+	   since there is no longer any way to reference them.  In addition,
+	   we have to clear the gc_mark bits */
+
+	do allocptr = lisp_static_vars_$iochan_list
+	   repeat (allocptr -> iochan.thread)
+	   while  (allocptr ^= null);
+
+	     if allocptr -> iochan.gc_mark then allocptr -> iochan.gc_mark = "0"b;
+		else call lisp_io_control_$gc_flush(allocptr);
+	     end;
+
+	gc_time = virtual_cpu_time_()-start_time;
+	lisp_static_vars_$gc_time = lisp_static_vars_$gc_time + gc_time;
+	meter_time = float(gc_time,63)/1e3;
+	if addr(ctrlD)->based_ptr->atom.value ^= nil	/* want gc print */
+	then call ioa_("^/;gc done: ^.3f msec., ^d words compacted to ^d words.^/",
+			meter_time, old_allocation, total_allocation);
+
+
+
+	/* restore status of nointerrupt flag */
+
+	call lisp_fault_handler_$nointerrupt;
+	lisp_static_vars_$i_am_gcing = "0"b;
+	stack_ptr = addrel(stack_ptr, -2);
+
+	/* cleanup feature gets done here if released through a gc */
+
+	if lisp_static_vars_$activate_gc_unwinder_kludge then do;
+	   stack = stack_ptr;
+	   stack_ptr = addr(stack -> temp(3));
+	   lisp_static_vars_$activate_gc_unwinder_kludge = "0"b;
+	   do stack -> temp(1) = lisp_static_vars_$cleanup_list
+		repeat stack -> temp_ptr(1) -> cons.cdr
+		while (stack -> temp_type(1) = Cons);
+	      stack -> temp(2) = stack -> temp_ptr(1) -> cons.car;
+	      call lisp_$eval;
+	      end;
+	   lisp_static_vars_$cleanup_list_exists = "0"b;	/* do once-only */
+	   go to lisp_static_vars_$gc_unwinder_kludge;	/* resume unwindage */
+	   end;
+
+	fault_bits = saved_alloc_fault_word & fault_mask;	/* check for interrupts while in allocator */
+	if fault_bits ^= ""b then call lisp_default_handler_$alloc_fault(fault_bits);
+	saved_alloc_fault_word = saved_alloc_fault_word & ^fault_mask;
+
+	if addr (user_intr_array(20)) -> based_ptr -> atom.value ^= nil
+	then do;					/* call gc-daemon function */
+		stack = stack_ptr;
+		stack_ptr = addr(stack -> temp(5));
+		stack -> temp(1) = addr(user_intr_array(20)) -> based_ptr -> atom.value;
+		stack -> temp(2) = lisp_static_vars_$space_names_atom -> atom_ptrs.value -> cons.car;	/* list space */
+		addr(stack -> temp(3)) -> fixnum_fmt.type_info,
+		addr(stack -> temp(4)) -> fixnum_fmt.type_info = fixnum_type;
+		addr(stack -> temp(3)) -> fixedb = lisp_static_vars_$gcmax - old_allocation;
+		addr(stack -> temp(4)) -> fixedb = lisp_static_vars_$gcmax - total_allocation;
+		call lisp_special_fns_$cons;
+		call lisp_special_fns_$cons;
+		call lisp_special_fns_$ncons;			/* listify in case more than one space */
+		call lisp_special_fns_$ncons;			/* make another level of list for apply call */
+		call lisp_$apply;
+		stack_ptr = stack;
+	     end;
+
+	lisp_alloc_$alloc_fault_word = saved_alloc_fault_word;	/* restore fault word */
+	return;
+
+
+/* Pseudo-subroutine to collect a value, and return its new location */
+
+/*collect:	if arg = 0 then go to ret(reti);	/* go to return if zero (uninit stack or atom value) */
+/*	if addr(arg) -> lisp_ptr.itsmod ^= "100011"b then go to ret(reti);	/* not lisp value -- unsnapped link,
+/*									   perhaps, if o41 */
+/*	if addr(arg)->lisp_ptr_type & NotConsOrAtsym36 = "0"b then go to collect_atsym_or_cons;
+/* /*	if addr(arg) -> lisp_ptr_type & Numeric36 then go to ret(reti);	/* redundant, due to previous check since mod = 47 */
+/*	if arg_points_at_odd_addr			/* odd address, must fix this */
+/*	then do;
+/*		arg_points_at_odd_addr = "0"b;	/* force even address */
+/*		stack -> gcinfo.reti = reti;
+/*		reti = 6;						/* return to place where odd address fixed */
+/*		stack = addrel(stack,4);
+/*	     end;
+/*
+/*	if addr(arg)->lisp_ptr_type & File36 then go to collect_file;
+/*	if addr(arg)->lisp_ptr_type & Array36 then go to collect_array;
+/*	if addr(arg)->lisp_ptr_type & Subr36 then go to collect_subr;
+/*	if addr(arg)->lisp_ptr_type & String36 then go to collect_string;
+/*
+/*	/* check for big fixed point number */
+/*
+/*	if addr(arg) -> lisp_ptr_type & Bigfix36 then go to collect_bigfix;
+/*
+/*collect_atsym_or_cons:
+/*	if addr(arg)->based_ptr->cons.car = gc_mark	/* already got this atom or cons */
+/*	then do;
+/*		arg = addr(arg)->based_ptr->cons.cdr;	/* get its new location */
+/*		go to ret(reti);			/* and return */
+/*	     end;
+/*
+/*
+/*	/* now it is known that some space is to be allocated, and the car and cdr are to be collected */
+/*
+/*	if addr(arg)->lisp_ptr_type & Atsym36 then do;
+/*	   size = divide(addr(arg)->based_ptr->atom.pnamel+27,8,17,0)*2;
+/*	   if size > Maximum_Reasonable_Size then do;	/* that nasty bug is back */
+/*	      size = 4;				/* turn damn thing into a cons */
+/*	      addr(arg) -> lisp_ptr.type = Cons;	/* .. */
+/*	      if curtop + size > 261120		/* this lack of modularity */
+/*	      then call new_segment_maker;		/*  is for speed in the main path */
+/*	      allocptr = addrel(curseg, curtop);
+/*	      call com_err_(0, "lisp_garbage_collector_",  
+/*		"Bad atom ^w ^w ^w ^w ^w ^w at ^p -> ^p^/^-Possible bug in lisp.",
+/*		argo.w1, argo.w2, argo.w3, argo.w4, argo.w5, argo.w6,
+/*		addr(arg)->based_ptr, allocptr);
+/*	      go to bad_atom_scrunched;
+/*	      end;
+/*	   end;
+/*	else size = 4;
+/*
+/*	if curtop + size > 261120 then call new_segment_maker;	/* we need more room */
+/*	allocptr = addrel(curseg,curtop);		/* allocate space */
+/*bad_atom_scrunched:
+/*	curtop = curtop+size;			/* and indeed it is allocated */
+/*	allocptr -> copy_words = addr(arg)->based_ptr->copy_words;	/* copy whole structure */
+/*
+/*	addr(arg)->based_ptr->cons_ptrs.cdr = allocptr;	/* save where it was moved to */
+/*	addr(arg)->based_ptr->cons_types.cdr = addr(arg)->lisp_ptr.type;	/* and save type */
+/*	addr(arg)->based_ptr->cons.car = gc_mark;	/* remember we hit this object */
+/*
+/*	/* now build a stack block for this collection */
+/*
+/*	stack -> gcinfo.loc = allocptr;
+/*	stack -> gcinfo.reti = reti;
+/*	stack -> gcinfo.type = addr(arg)->lisp_ptr.type;
+/*
+/*
+/*	stack = addrel(stack,4);		/* bump stack ptr */
+/*	arg = allocptr -> cons.car;		/* get argument */
+/*	reti = 0;			/* cons first return */
+/*	go to collect;			/* call collector recursively */
+/*ret(0):	allocptr = addrel(stack,-4)->gcinfo.loc; /* get cons addr into automatic ptr */
+/*	allocptr->cons.car = arg;		/* set car to ne value */
+/*	arg = allocptr->cons.cdr;		/* get new argument */
+/*	reti = 1;				/* and call collector again */
+/*	go to collect;
+/*ret(1):	stack = addrel(stack,-4);		/* pop stack */
+/*	allocptr = stack -> gcinfo.loc;
+/*	allocptr -> cons.cdr = arg;
+/*	addr(arg)->based_ptr = allocptr;	/* generate return of correct type */
+/*	addr(arg)->lisp_ptr.type = stack -> gcinfo.type;
+/*	go to ret(stack->gcinfo.reti);	/* and return to caller */
+/*
+/*
+/*collect_string:
+/*	size = addr(arg) -> based_ptr -> string_length;
+/*	if size < 0
+/*	then addr(arg)->based_ptr = addr(arg) -> based_ptr ->  copied_string.new_address;
+/*		else do;
+/*		size = divide(size+11,8,17,0)*2;	/* even number of words to allocate */
+/*		if size > Maximum_Reasonable_Size then do;
+/*		   size = 4;			/* punt */
+/*		   if curtop + size > 261120 then call new_segment_maker;
+/*		   allocptr = addrel(curseg,curtop);
+/*		   call com_err_(0, "lisp_garbage_collector_",
+/*		     "Bad string ^w ^w ^w ^w at ^p -> ^p^/^-Possible bug in lisp.",
+/*		     argo.w1, argo.w2, argo.w3, argo.w4, addr(arg)->based_ptr, allocptr);
+/*		   end;
+/*		else do;
+/*		   if curtop + size > 261120 then call new_segment_maker;
+/*		   allocptr = addrel(curseg,curtop);
+/*		   end;
+/*		curtop = curtop + size;
+/*		allocptr -> copy_words = addr(arg)->based_ptr->copy_words;
+/*		addr(arg)->based_ptr -> string_length = -5050;	/* mark string */
+/*		addr(arg) -> based_ptr -> copied_string.new_address = allocptr;
+/*		addr(arg)->based_ptr=allocptr;
+/*	     end;
+/*	addr(arg)->lisp_ptr_type = addr(arg)->lisp_ptr_type|String36;	/* set type field */
+/*	go to ret(reti);			/* return */
+/*
+/*collect_bigfix:
+/*	if addr(arg)->based_ptr->cons.car = gc_mark	/* already got this bigfix */
+/*	then do;
+/*		arg = addr(arg)->based_ptr->cons.cdr;	/* get its new location */
+/*		go to ret(reti);			/* and return */
+/*	     end;
+/*	size = divide(addr(arg)->based_ptr->lisp_bignum.prec+2,2,18,0)*2;
+/*	if size > Maximum_Reasonable_Size then do;
+/*	   size = 4;			/* punt */
+/*	   if curtop+size > 261120 then call new_segment_maker;
+/*	   allocptr = addrel(curseg,curtop);
+/*	   call com_err_(0, "lisp_garbage_collector_",
+/*	     "Bad bignum ^w ^w ^w ^w at ^p -> ^p^/^-Possible bug in lisp.",
+/*	     argo.w1, argo.w2, argo.w3, argo.w4, addr(arg)->based_ptr, allocptr);
+/*	   end;
+/*	else do;
+/*	   if curtop+size > 261120 then call new_segment_maker;
+/*	   allocptr = addrel(curseg,curtop);
+/*	   end;
+/*	curtop = curtop+size;
+/*	allocptr->copy_words = addr(arg)->based_ptr->copy_words;
+/*	addr(arg)->based_ptr->cons.car = gc_mark;	/* mark this as copied */
+/*	addr(arg)->based_ptr->cons_ptrs.cdr = allocptr;
+/*	addr(addr(arg)->based_ptr->cons.cdr) -> lisp_ptr.type = Bigfix;
+/*	arg = addr(arg)->based_ptr->cons.cdr;
+/*	go to ret(reti);
+/*
+/*
+/*
+/*ret(6):						/* fix up odd address item, such as snapped link */
+/*	stack = addrel(stack, -4);
+/*	arg_points_at_odd_addr = "1"b;	/* make odd address */
+/*	go to ret(stack -> gcinfo.reti);		/* return */
+/*
+/*collect_subr:
+/*	if addr(arg) -> based_ptr -> subr_entries(1).rest_of_tsx0 = tsx0_ic then go to collect_compiled_subr;
+/*	go to ret(reti);		/* type 3 subrs no longer supported */
+/*
+/*collect_compiled_subr:
+/*	allocptr = addr(arg) -> based_ptr;
+/*	size = allocptr->subr_entries(1).head_offset-1;
+/*	allocptr = addrel(allocptr, size);
+/*	if allocptr -> subr_block_head.gcmark & curgcmark then go to ret(reti);
+/*	allocptr -> subr_block_head.gcmark = curgcmark;
+/*	left = allocptr->subr_block_head.gc_length;
+/*	size = size + 8;		/* move down 8 words relative to arg */
+/*	allocptr = addr(allocptr->subr_block_head.constants);
+/*	go to subr_join;
+/*
+/* /*
+/* * files are kept in static storage, but they do contain 2 garbage-collectbale
+/* * cells, the function and the namelist.
+/* */
+/*
+/*collect_file:
+/*	if addr(arg)->based_ptr -> iochan.gc_mark then go to ret(reti);	/* already been collected */
+/*	 else addr(arg)->based_ptr -> iochan.gc_mark = "1"b;		/* turn on already-been-seen bit */
+/*	left = 2;				/* now garbage-collect it as if it was an array */
+/*	size = 14;
+/*	allocptr = addr(addr(arg)->based_ptr -> iochan.function);	/* of just function and namelist */
+/*	go to subr_join;
+/*
+/*collect_array:
+/*
+/*	allocptr = addr(arg) -> based_ptr;		/* -> array_info block */
+/*
+/*	if allocptr -> array_info.call_array_operator = old_array_stcd_instruction
+/*	then call convert_old_array;		/* compatibility with old arrays */
+/*
+/*	if allocptr -> array_info.gc_mark&curgcmark then go to ret(reti);	/* we have seen it this time */
+/*	else allocptr -> array_info.gc_mark = curgcmark;	/* otherwise mark it as such */
+/*	if allocptr -> array_info.type = Dead_array then go to ret(reti);	/* nothing more to do */
+/*	if allocptr -> array_info.type = Un_gc_array then go to put_this_array_on_a_list;
+/*	if allocptr -> array_info.type = gcmode		/* Obarray and in gctwa mode */
+/*	then do;
+/*put_this_array_on_a_list:
+/*	     if curtop > 261116 then call new_segment_maker;
+/*	     atptr = addrel(curseg,curtop);	/* get space to add to list */
+/*	     curtop = curtop + 4;		/* allocate the space */
+/*	     if allocptr -> array_info.type = Obarray_array
+/*	     then do;
+/*			/* must append to _e_n_d of obarray list,
+/*			   since we may be running in gctwa phase
+/*			   already */
+/*		if obarray_list_end = null()		/* have no elements yet */
+/*		then obarray_list, obarray_list_end = atptr;
+/*		else do;
+/*		     obarray_list_end -> obarray_list_element.next = atptr;
+/*		     obarray_list_end = atptr;
+/*		     end;
+/*		obarray_list_end -> obarray_list_element.next = null();
+/*		obarray_list_end -> obarray_list_element.current = addr(arg) -> based_ptr;
+/*		end;
+/*	     else do;
+/*		atptr -> ungclist_element.next = ungclist_ptr;
+/*		atptr -> ungclist_element.current = addr(arg) -> based_ptr;
+/*		ungclist_ptr = atptr;
+/*		end;
+/*
+/*	     go to collect_number_array;	/* don't mark contents, but do copy into
+/*					   new lists seg */
+/*	     end;
+/*
+/*	else if allocptr -> array_info.type = Readtable_array then do;	/* readtables are strange */
+/*		left = 9;		/* number of markable double words */
+/*		size = 145;	/* total number of double words */
+/*		go to collect_readtable_join;
+/*		end;
+/*
+/*	else if allocptr -> array_info.type = Fixnum_array
+/*	     then if allocptr -> array_info.minus_2_times_ndims ^= 0 then go to collect_number_array;
+/*	          else go to ret(reti);		/* external array - don't attempt to collect data area */
+/*	else if allocptr -> array_info.type = Flonum_array then do;	/* number array */
+/*collect_number_array:
+/*		call compute_array_size;
+/*		if allocptr -> array_info.type >= Fixnum_array
+/*		then if allocptr -> array_info.type <= Flonum_array
+/*		then size = divide(size+1, 2, 18, 0);	/* convert to number of double words */
+/*		left = 0;		/* no markable words in this type of array */
+/*		go to collect_readtable_join;
+/*		end;
+/*	/* come here to collect an ordinary S-expression array */
+/*
+/*	call compute_array_size;
+/*	left = size;			/* all words are markable */
+/*collect_readtable_join:
+/*
+/*	/* left = number of double words to mark.
+/*	   size = number of double words total. */
+/*
+/*	/* the body of an array is in lists space so it has to be copied */
+/*
+/*	size = 2*(size + allocptr -> array_info.ndims);	/* allow for dope vector */
+/*	if curtop + size > 261120 then call new_segment_maker;
+/*	atptr = addrel(curseg, curtop);
+/*	curtop = curtop + size;
+/*	tempp = addrel(allocptr -> array_info.array_data_ptr,
+/*			allocptr -> array_info.minus_2_times_ndims);
+/*	atptr -> copy_words = tempp -> copy_words;	/* copy over the body of the array */
+/*	allocptr -> array_info.array_data_ptr = addrel(atptr, 2*allocptr -> array_info.ndims);
+/*
+/*	allocptr = allocptr -> array_info.array_data_ptr;	/* -> data to be marked */
+/*
+/*	/* now walk over the garbage-collectable portion of the array */
+/*
+/*subr_join:
+/*	if left = 0 then go to ret(reti);	/* no data at all */
+/*	stack -> array_save.argument = arg;		/* save argument */
+/*	stack -> array_save.reti = reti;
+/*	do while(left > 0);
+/*	     stack -> array_save.allocptr = allocptr;
+/*	     stack -> array_save.left = left;
+/*	     stack = addrel(stack,4);		/* size of array save */
+/*	     reti = 2;
+/*	     arg = allocptr -> cons.car;		/* get thing to gc */
+/*	     go to collect;
+/*ret(2):	     stack = addrel(stack,-4);
+/*	     allocptr = stack -> array_save.allocptr;
+/*	     allocptr -> cons.car = arg;
+/*	     allocptr = addr(allocptr->cons.cdr);
+/*	     left = stack -> array_save.left-1;
+/*	     end;
+/*
+/*	arg = stack -> array_save.argument;
+/*	go to ret(stack -> array_save.reti);
+/*
+/* /* declarations of structures used above */
+/*
+/*dcl 1 gcinfo based aligned,
+/*      2 loc ptr,
+/*      2 reti fixed bin,
+/*      2 type bit(9);
+/*
+/*dcl 1 subr_info based aligned,
+/*      2 nargs fixed bin(17) unal,
+/*      2 infop fixed bin(17) unal,
+/*      2 instructions(3) bit(36),
+/*      2 nwords fixed bin(17) unal,	/* this is the address of a tsblp instruction */
+/*      2 tsblp_inst bit(18) unal,
+/*      2 gcmark bit(18)aligned;
+/*
+/*dcl 1 array_save aligned based,
+/*      2 argument fixed bin(71),
+/*      2 reti fixed bin(17) unaligned,
+/*      2 left fixed bin(17) unaligned,
+/*      2 allocptr unaligned pointer;
+/*
+/* /* This routine converts an old array to a new array, for compatibility */
+/* /* allocptr -> old array, which is clobbered by array_info for new array (always shorter) */
+/*
+/*convert_old_array:  proc;
+/*
+/*dcl ndims fixed bin init(old_array.ndims),
+/*    (old_data_ptr, new_data_ptr) pointer,
+/*    size fixed bin(18),
+/*    bound_product fixed bin(18),
+/*    number_of_double_words fixed bin(18),
+/*    k fixed bin(18),
+/*    i fixed bin,
+/*    array_type fixed bin;
+/*
+/*dcl 1 old_array aligned based(allocptr),
+/*    2 ndims fixed bin(17) unaligned,
+/*    2 infop fixed bin(17) unaligned,
+/*    2 stcd_inst bit(36),
+/*    2 inst_pairs (ndims),
+/*      3 ldq_or_adq bit(36),
+/*      3 mpy_or_qls,
+/*        4 bound bit(18) unaligned,
+/*        4 rest_of_inst bit(18) unaligned,
+/*    2 tmi_error bit(36),
+/*    2 cmpq,
+/*      3 total_bound bit(18) unaligned,
+/*      3 rest_of_inst bit(18) unaligned,
+/*    2 more (6) bit(36),
+/*    2 gc_info,
+/*      3 (nw, gcm, at, pb) fixed bin(17) unaligned,
+/*    2 data (1000) fixed bin(71);
+/*
+/*dcl 1 dope_vector (ndims) aligned based(new_data_ptr),
+/*      2 bounds fixed bin(35),
+/*      2 multiplier fixed bin(35);
+/*
+/*	/* instructions to be put into a new array.  copied from lisp_array_fcns_ */
+/*
+/*dcl array_instructions(0:5, 0:3) bit(36) static init(	/* index by array_type, instx */
+/*		"001000000001001010010111011001010000"b,
+/*		"101000000000000000010011111001000110"b,
+/*		"010000000000000000111001000001000000"b,
+/*		""b,	/* S-expr, Un-gc:  ldaq lb|0,ql  tra bp|0 */
+/*
+/*		"001000000001001010010111011001010000"b,
+/*		"101000000000000000010011111001000110"b,
+/*		"010000000000000000111001000001000000"b,
+/*		""b,	/* S-expr, Un-gc:  ldaq lb|0,ql  tra bp|0 */
+/*
+/*		"001000000001001010010111011001010000"b,
+/*		"000100000000100111010011101000000111"b,
+/*		"101000000000000000010011110001000110"b,
+/*		"010000000000000000111001000001000000"b,	/* fixnum - lda 040047,dl  ldq lb|0,ql  tra bp|0 */
+/*
+/*		"001000000001001010010111011001010000"b,
+/*		"000010000000100111010011101000000111"b,
+/*		"101000000000000000010011110001000110"b,
+/*		"010000000000000000111001000001000000"b,	/* flonum - lda 020047,dl  ldq lb|0,ql  tra bp|0 */
+/*
+/*		"001000000001001100010111011001010000"b,
+/*		"000100000000100111010011101000000111"b,
+/*		"101000000000000000010011110001000110"b,
+/*		"010000000000000000111001000001000000"b,	/* readtable - lda 040047,dl  ldq lb|0,ql  tra bp|0 */
+/*
+/*		"001000000001001010010111011001010000"b,
+/*		"101000000000000000010011111001000110"b,
+/*		"010000000000000000111001000001000000"b,
+/*		""b);					/* obarray - ldaq lb|0,ql  tra bp|0 */
+/*
+/*
+/*	old_data_ptr = addr(old_array.data);
+/*	number_of_double_words = divide(fixed(old_array.total_bound, 18), 2, 18, 0);
+/*	size = 2*(ndims + number_of_double_words);		/* number of words required for data area */
+/*	if curtop + size > 261120 then call new_segment_maker;	/* allocate new data area */
+/*	new_data_ptr = addrel(curseg, curtop);
+/*	curtop = curtop + size;
+/*
+/*	size = size - 2*ndims;				/* subtract dope vector */
+/*	addrel(new_data_ptr, 2*ndims) -> copy_words =		/* move the data */
+/*	   old_data_ptr -> copy_words;
+/*
+/*	/* now fill in the dope vector */
+/*
+/*	bound_product = 1;
+/*	do i = 1 by 1 while (i < ndims);
+/*	   k = fixed(old_array.bound(i));			/* pick up old multiplier */
+/*	   dope_vector(i).multiplier, dope_vector(i+1).bounds = k;
+/*	   bound_product = bound_product * k;
+/*	   end;
+/*	dope_vector(ndims).multiplier = 2;
+/*	dope_vector(1).bounds = divide(number_of_double_words, bound_product, 18, 0);
+/*
+/*	/* compute type of old array and convert to new type codes */
+/*
+/*	array_type = old_array.gc_info.at;
+/*	if array_type = 2 then array_type = Obarray_array;
+/*	else if array_type = 3 then array_type = Un_gc_array;
+/*	else if array_type = 1 then array_type = Readtable_array;
+/*	else array_type = S_expr_array;
+/*
+/*	/* make an array info block, clobbering the old array */
+/*
+/*	allocptr -> array_info.ndims = ndims;
+/*	allocptr -> array_info.array_data_ptr = addrel(new_data_ptr, 2*ndims);
+/*	allocptr -> array_info.minus_2_times_ndims = -2*ndims;
+/*	allocptr -> array_info.gc_mark = ""b;
+/*	allocptr -> array_info.type = array_type;
+/*	allocptr -> array_info.call_array_operator = array_instructions(array_type, 0);
+/*	do i = 1 to 3;
+/*	   allocptr -> array_info.array_load_sequence(i) = array_instructions(array_type, i);
+/*	   end;
+/*
+/*end convert_old_array;
+/*
+/*new_segment_maker: proc;
+/*
+/*	total_allocation = total_allocation + curtop;
+/*	call lisp_segment_manager_$get_lists (new_seg);
+/*	new_seg -> alloc_segment.next_seg = curseg;
+/*	curseg = new_seg;
+/*	curtop = 4;
+/*
+/*end new_segment_maker;*/
+
+
+
+/* subroutine to set gc_blk_cntr according to the gcsize and gcmin parameters.
+   total_allocation must be set to the total number of words in lists space */
+
+set_gc_blk_cntr:  proc;
+
+dcl num_words_to_gc_at fixed bin(35),
+    lisp_static_vars_$gcsize fixed bin(35) external,
+    lisp_static_vars_$gcmin external,
+    lisp_static_vars_$gcmin_fraction bit(1) external,
+    lisp_static_vars_$gcmin_fixed fixed bin(35) based(addr(lisp_static_vars_$gcmin)),
+    lisp_static_vars_$gcmin_float float bin(27) based(addr(lisp_static_vars_$gcmin));
+
+	if lisp_static_vars_$gcmin_fraction
+	then num_words_to_gc_at = fixed(float(total_allocation) /
+				(1 - lisp_static_vars_$gcmin_float), 35);
+	else num_words_to_gc_at = total_allocation + lisp_static_vars_$gcmin_fixed;
+
+	if num_words_to_gc_at < lisp_static_vars_$gcsize
+	then num_words_to_gc_at = lisp_static_vars_$gcsize;
+
+	/* round up to next multiple of 16K */
+
+	lisp_alloc_$gc_blk_cntr = - divide(24 + divide(num_words_to_gc_at - total_allocation + 1023, 1024, 35, 0), 16, 35, 0);
+
+end set_gc_blk_cntr;
+
+
+/** entry to be called after the gc parameters have been changed **/
+
+set_gc_params:  entry;
+
+	/* compute the value of total_allocation, then call above subroutine */
+
+	call compute_total_allocation;
+	call set_gc_blk_cntr;
+	return;
+
+compute_total_allocation:  proc;
+
+	total_allocation = 0;
+	do curseg = lisp_alloc_$cur_seg
+		repeat (curseg -> alloc_segment.next_seg)
+		while (curseg ^= null);
+	   total_allocation = total_allocation + fixed(curseg -> alloc_segment.tally_word.seg_offset, 18);
+	   end;
+end compute_total_allocation;
+
+
+/*compute_array_size:  procedure;
+/*
+/*	size = 1;			/* compute size of array */
+/*	do left = -(allocptr -> array_info.ndims) by 1 while(left < 0);
+/*	    size = size * allocptr -> array_info.array_data_ptr -> array_data.dope_vector(left+1).bounds;
+/*	    end;
+/*end compute_array_size;*/
+
+end lisp_garbage_collector_;

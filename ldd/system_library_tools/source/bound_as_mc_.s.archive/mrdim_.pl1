@@ -1,0 +1,696 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-06-10,Parisek), approve(87-06-12,MCR7690),
+     audit(87-06-12,Martinson), install(87-09-10,MR12.1-1104):
+     Corrected a stringsize problem.
+  2) change(87-09-08,Parisek), approve(87-09-08,MECR0005),
+     audit(87-09-09,GDixon), install(87-09-10,MR12.1-1104):
+     Expand "quit_mask" field to 504 bits from 72 bits for supporting QUITs to
+     a larger array of daemons.
+  3) change(87-09-17,Parisek), approve(87-09-21,MECR0008),
+     audit(87-09-21,GDixon), install(87-09-21,MR12.1-1114):
+     Return with error if status code equals error_table_$unable_to_do_io from
+     calling mrd_util_.  This status code represents a condition error
+     signalled from mrd_util_. (phx20928)
+                                                   END HISTORY COMMENTS */
+
+mrdim_: proc;
+	return;					/* this is an undefined entry */
+
+/* MRDIM_ - message routing DIM.
+
+   This module replaces "ttydim_" for daemon processes which do not have stream terminals.
+   It sends messages to and gets messages from a message coordinator which is part of the
+   system control process group.
+   The initializer may operate several consoles and route messages to them as it pleases.
+
+   Coded by THVV from Feiertag's "ttydim_"
+   Modified by Dennis Capps
+   Attach entry modified for the access isolation mechanism on 10/16/74 - J. Whitmore
+   Modified by J. C. Whitmore, 10/78, to zero words on first attach instead of calling hcs_$truncate_seg (BUG writearound)
+   Modified by B. Margulies 11/81 for -login_channel.
+   */
+
+dcl (addr, index, length, null, size, string, substr, rtrim) builtin;
+
+dcl (tp, sp, vp, p) ptr,				/* temporary storage */
+    (state, n, nt, k, rw) fixed bin init (0),
+     code fixed bin (35),
+     em (4) fixed bin (71);
+
+dcl  sysdir char (168) int static init (">system_control_1"), /* The directory in which to find the tables */
+     RINGS (3) fixed bin (6) int static options (constant) init (4, 4, 4),
+     OWAIT fixed bin static options (constant) init (123),	/* err code from mrdi_util_ */
+     pigeon_hole char (32) init (""),
+     USERID char (32),
+     message char (132);
+
+dcl  ourmp ptr,					/* Pointer to mseg for this function */
+     mcmp ptr int static,				/* pointer to mseg for message coord'r */
+     messp ptr int static init (null);			/* Periferal info on read. */
+
+dcl
+     need_priv bit (1) int static init ("0"b),		/* switch for using privileges */
+     mask bit (36) aligned init ("0"b),			/* ips mask temporary */
+     created_seg bit (1) init ("0"b),
+     init bit (1) int static init ("0"b),
+     leave_locked bit (1) init ("0"b),
+     quit_mask bit (504)int static init ("0"b),
+     source_init bit (1) init ("0"b),
+     testing bit (1) int static init ("0"b),
+     wrote_sentinel bit (1) init ("0"b);
+
+dcl  lock_wait_time fixed bin init (300),
+     i fixed bin,
+     lcode fixed bin (35) init (0),
+     level fixed bin,
+     reset_priv fixed bin (35);
+
+dcl 1 based_mrt_index based (p),
+    2 dummy fixed bin (71),
+    2 mrt_source fixed bin (35),
+    2 mrt_stream fixed bin (35);
+
+declare 1 dump int static aligned like message_block;
+
+dcl 1 first_SDB int static aligned,			/* The first stream data block in the stream
+						   data list for this process. */
+    2 dim_name char (32),				/* the name of this DIM */
+    2 device_name_list ptr,				/* threaded list of device id's */
+    2 next_device ptr,				/* pointer to next entry in threaded list */
+    2 device_name_size fixed bin,			/* number of chars in device name */
+    2 device_name char (32),				/* device id */
+    2 pad1 fixed bin,
+    2 ipc_ep ptr,					/* to event list for block in read */
+    2 proto_ep ptr,					/* to event list for block in att & det */
+    2 nextp ptr init (null),				/* pointer to next stream block in chain */
+    2 ourmess ptr,					/* Pointer to mseg for this function */
+    2 hismess ptr,					/* Pointer to mseg for message coord'r */
+    2 source char (32),				/* symbolic name of I/O source  */
+    2 stream char (32),				/* symbolic name of I/O stream  */
+    2 source_index fixed bin,				/* in MRT  */
+    2 stream_index fixed bin,
+    2 flags,
+      3 valid bit (1) unal init ("0"b),			/* "1"b = entry-in-use, "0"b = not_in_use */
+      3 read bit (1) unal,				/* "1"b = stream attached for reading. */
+      3 write bit (1) unal,				/* "1"b = stream attached for writing. */
+      3 active bit (1) unal,				/* For compatibility with message_coordr_ */
+      3 more bit (1) unal,				/* "1"b = More text in this message than we've given */
+      3 unused bit (31)unal,
+    2 prev_trans,
+      3 first_block fixed bin,
+      3 end_block fixed bin,
+      3 current_block fixed bin,
+      3 offset fixed bin;
+
+dcl 1 SDB based (tp) aligned,				/* one entry in list of stream control blocks */
+    2 dim_name char (32),				/* the name of this DIM */
+    2 device_name_list ptr,				/* threaded list of device id's */
+    2 next_device ptr,				/* pointer to next entry in threaded list */
+    2 device_name_size fixed bin,			/* number of chars in device name */
+    2 device_name char (32),				/* device id */
+    2 pad1 fixed bin,
+    2 ipc_ep ptr,					/* to event list for block in read */
+    2 proto_ep ptr,					/* to event list for block in att & det */
+    2 nextp ptr,					/* pointer to next stream block in chain */
+    2 ourmess ptr,					/* Pointer to mseg for this function */
+    2 hismess ptr,					/* Pointer to mseg for message coord'r */
+    2 source char (32),				/* symbolic name of I/O source  */
+    2 stream char (32),				/* symbolic name of I/O stream  */
+    2 source_index fixed bin,				/* in MRT  */
+    2 stream_index fixed bin,
+    2 flags,
+      3 valid bit (1) unal,				/* "1"b = entry-in-use, "0"b = not_in_use */
+      3 read bit (1) unal,				/* "1"b = stream attached for reading. */
+      3 write bit (1) unal,				/* "1"b = stream attached for writing. */
+      3 active bit (1) unal,				/* For compatibility with message_coordr_ */
+      3 more bit (1) unal,				/* "1"b = More text in this message than we've given */
+      3 unused bit (31)unal,
+    2 prev_trans,
+      3 first_block fixed bin,
+      3 end_block fixed bin,
+      3 current_block fixed bin,
+      3 offset fixed bin;
+
+% include line_types;
+% include syscon_mseg;
+% include tty_types;
+
+dcl 1 st based (sp) aligned,				/* breakdown of I/O system status word */
+    2 code fixed bin (35),				/* error status code (0 = OK) */
+    2 comp bit (4) unaligned,				/* completion status, LI, LC, PI, PC */
+    2 eof bit (1) unaligned,				/* end-of-file */
+    2 pad1 bit (4) unaligned,
+    2 eod bit (1) unaligned,				/* end of physical data */
+    2 pad2 bit (4) unaligned,
+    2 abs bit (1) unaligned,
+    2 det bit (1) unaligned,				/* detach flag */
+    2 quit bit (1) unaligned,				/* quit flag */
+    2 abort bit (1) unaligned,			/* abort flag */
+    2 callx bit (18) unaligned;			/* rel pointer to last transaction */
+
+dcl  acc_mode fixed bin (35);				/* mode to satisfy the compiler */
+
+dcl 1 syscon_template aligned based,			/* overlay for xxx.message to truncate above system_low AIM */
+    2 lock_word fixed bin (35),
+    2 words (2047) fixed bin (35);			/* two pages worth of stuff to zero out */
+
+dcl 1 access based (addr (acc_mode)),
+    2 access_pad bit (32) unaligned,
+    2 R bit (1) unaligned,				/* the READ bit for the access mode */
+    2 E bit (1) unaligned,				/* the EXECUTE bit... */
+    2 W bit (1) unaligned,				/* the WRITE bit.... */
+    2 A bit (1) unaligned;				/* the APPEND bit (obsolete for segs)... */
+
+dcl
+     com_err_ ext entry options (variable),
+     continue_to_signal_ entry (fixed bin (35)),
+     cu_$cl ext entry,
+     cu_$level_get entry () returns (fixed bin),
+     get_process_id_ ext entry returns (bit (36) aligned),
+     ioa_$rs ext entry options (variable),
+     get_group_id_$tag_star ext entry () returns (char (32)),
+     ipc_$create_ev_chn ext entry (fixed bin (71), fixed bin (35)),
+     ipc_$block ext entry (ptr, ptr, fixed bin (35)),
+     ipc_$mask_ev_calls ext entry (fixed bin (35)),
+     ipc_$unmask_ev_calls ext entry (fixed bin (35)),
+     hcs_$append_branchx ext entry (char (*), char (*), fixed bin (5), (3) fixed bin (6),
+     char (*), fixed bin (1), fixed bin (1), fixed bin (24), fixed bin (35)),
+     hcs_$assign_linkage ext entry (fixed bin, ptr, fixed bin (35)),
+     hcs_$fs_get_mode entry (ptr, fixed bin (35), fixed bin (35)),
+     hcs_$initiate ext entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35)),
+     hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned),
+     mrd_util_$abort ext entry (ptr, fixed bin, fixed bin, fixed bin (35)),
+     mrd_util_$discard_remainder ext entry (ptr, fixed bin, fixed bin (35)),
+     mrd_util_$protocol ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, char (*), fixed bin (35)),
+     mrd_util_$read ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, char (*), ptr, fixed bin, fixed bin (35)),
+     mrd_util_$write ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+     mrd_util_$write_dont_flood ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+     mrd_util_$read_status ext entry (ptr, ptr, fixed bin (35)),
+     phcs_$ring_0_message ext entry (char (*)),
+     set_lock_$lock ext entry (bit (36) aligned, fixed bin, fixed bin (35)),
+     set_lock_$unlock ext entry (bit (36) aligned, fixed bin (35)),
+     system_privilege_$dir_priv_off entry (fixed bin (35)),
+     system_privilege_$dir_priv_on entry (fixed bin (35)),
+     system_privilege_$initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl  user_info_$terminal_data entry options (variable);
+
+dcl  error_table_$invalid_lock_reset ext fixed bin,
+     error_table_$ionmat ext fixed bin,			/* stream already attached */
+     error_table_$lock_wait_time_exceeded ext fixed bin,
+     error_table_$locked_by_this_process ext fixed bin,
+     error_table_$noentry ext fixed bin,
+     error_table_$moderr ext fixed bin (35),
+     error_table_$unable_to_do_io ext fixed bin (35),
+     error_table_$undefined_order_request ext fixed bin;
+
+dcl (any_other, linkage_error) condition;
+
+/*  */
+/* ===================================================== */
+
+mrd_attach: entry (attname, attype, attchan, mode, attstat, attptr); /* entry to attach stream */
+
+dcl  attname char (*),				/* stream name (e.g. user_i/o) */
+     attype char (*),				/* device type name ("mrd") */
+     attchan char (*),				/* stream channel name */
+     mode char (*),					/* attachment mode */
+     attstat bit (72) aligned,			/* I/O system status code (returned) */
+     attptr ptr;					/* device attachment pointer (returned) */
+
+dcl  mode_bits bit (36) init ("0"b);			/* For call to parse_mode */
+
+declare  attach_channel_name character (32);
+
+	attach_channel_name = attchan;
+	if attach_channel_name = "-login_channel"
+	then call user_info_$terminal_data ("", "", attach_channel_name);
+
+	attstat = "0"b;				/* clear status code */
+	sp = addr (attstat);			/* pick up pointer to status code argument */
+	if attptr ^= null then do;			/* this is a multiple attachment, no good */
+	     st.code = error_table_$ionmat;		/* return error code */
+	     return;				/* return */
+	end;
+
+	if ^init then do;				/* be sure we are initialized */
+
+	     USERID = get_group_id_$tag_star ();	/* get process name */
+	     level = cu_$level_get ();		/* get validation level of process */
+						/* see if process has access to coord message seg */
+	     pigeon_hole = "mc.message";		/* name of message seg */
+
+	     call hcs_$initiate (sysdir, pigeon_hole, "", 0, 1, mcmp, code); /* get the pointer */
+	     if mcmp = null then go to check_priv;	/* we should have had access, try for priv initiate. */
+						/* mc.message is assumed to be at the */
+						/* lowest access class in the system.  */
+
+	     call hcs_$fs_get_mode (mcmp, acc_mode, code); /* check real effective access */
+	     if code ^= 0 then go to atterr;		/* bad news */
+
+	     if ^(access.R & access.W) then do;		/*  are we restricted by access isolation? */
+						/* yes, see if priv initiate is possible */
+
+check_priv:	on linkage_error begin;		/* in case we don't have access to gate */
+		     code = error_table_$moderr;	/* tell caller  he has no access */
+		     go to atterr;			/* and return; */
+		end;
+
+		call system_privilege_$initiate (sysdir, pigeon_hole, "", 0, 1, mcmp, code);
+		if mcmp = null then go to atterr;	/* this should never happen */
+		revert linkage_error;		/* this must be off for the next part */
+		need_priv = "1"b;			/* if we needed priv here, we will need it later */
+	     end;
+	     init = "1"b;				/* Let's not go through this again */
+	     messp = addr (dump);			/* last item to initialize */
+
+	end;
+
+/* Search stream data list to see if this attachment is already made. */
+	tp = addr (first_SDB);			/* get pointer to first entry in stream list */
+	vp = null;				/* use vp to record first vacant entry (if any) */
+	do while (tp ^= null);			/* search entire stream list */
+	     p = tp;				/* keep track of last entry in p */
+	     if ^SDB.flags.valid then do;		/* is this entry an unused (^valid) entry? */
+		if vp = null then vp = tp;		/* record first vacant entry found in list */
+	     end;
+	     else if SDB.source = attach_channel_name then /* not vacant, is attach_channel_name-attname already attached? */
+		do;
+		if ^source_init then
+		     do;
+		     source_init = "1"b;
+		     ourmp = SDB.ourmess;		/* So we don't have to initiate > once */
+		end;
+		if SDB.stream = attname then
+		     do;
+		     attptr = tp;			/* if so, return attachment ptr to this entry */
+		     go to attrtn;			/* and return to caller */
+		end;
+	     end;
+	     tp = SDB.nextp;			/* get pointer to next entry (if any) in list */
+	end;
+	if vp = null then do;			/* if no vacant entry found in stream list, */
+	     i = size (SDB);
+	     call hcs_$assign_linkage (i, vp, code);	/* then we must allocate space for a new entry */
+	     string (vp -> SDB.flags) = "0"b;		/* initialize new stream list entry */
+	     vp -> SDB.nextp = null;			/* indicate new entry is last entry in list */
+	     p -> SDB.nextp = vp;			/* thread new entry into stream list */
+	end;
+	tp, attptr = vp;				/* set caller's attachment pointer */
+
+
+/* Fill in SDB */
+	SDB.dim_name = "mrd_";
+	SDB.device_name_list = addr (SDB.next_device);	/* Pointer to list of device names. */
+	SDB.next_device = null;			/* This is last entry in list of device names. */
+	i = index (attach_channel_name, " ");
+	if i = 0 then
+	     SDB.device_name_size = length (attach_channel_name);
+	else
+	SDB.device_name_size = i - 1;
+	SDB.device_name = attach_channel_name;
+	SDB.source = attach_channel_name;
+	SDB.stream = attname;
+	SDB.hismess = mcmp;
+
+
+	if ^source_init then
+	     do;
+						/* Initiate the message segment for this source */
+	     pigeon_hole = substr (attach_channel_name, 1, SDB.device_name_size) || ".message";
+	     if need_priv then
+		call system_privilege_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+	     else call hcs_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+	     if ourmp = null then
+		do;
+		if code = error_table_$noentry then	/* see if we can create the message seg */
+		     do;
+		     USERID = get_group_id_$tag_star ();
+		     if need_priv then do;		/* we can and need to use system priv */
+			reset_priv = 1;		/* if this is 0, we set the priv */
+			mask = "0"b;		/* old ips mask to be reset if not null */
+
+			on any_other begin;		/* be sure we cleanup if an error occurs */
+			     if reset_priv = 0 then
+				call system_privilege_$dir_priv_off (reset_priv);
+			     reset_priv = 0;
+			     if mask then
+				call hcs_$set_ips_mask (mask, ("0"b));
+			     mask = "0"b;
+			     call continue_to_signal_ ((0));
+			end;
+
+			call hcs_$set_ips_mask ((36)"0"b, mask); /* don't want to be interrupted */
+			call system_privilege_$dir_priv_on (reset_priv); /* get dir priv */
+
+			call hcs_$append_branchx (sysdir, pigeon_hole, 1011b, RINGS, USERID, 0, 0, 0, code);
+
+			if reset_priv = 0 then
+			     call system_privilege_$dir_priv_off (reset_priv);
+			reset_priv = 1;		/* don't reset it twice */
+			call hcs_$set_ips_mask (mask, ("0"b)); /* reset the old mask */
+			mask = "0"b;		/* clear it out */
+			revert any_other;
+		     end;
+		     else call hcs_$append_branchx (sysdir, pigeon_hole, 1011b, RINGS, USERID, 0, 0, 0, code);
+		     if code ^= 0 then go to atterr;
+		     if need_priv then
+			call system_privilege_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+		     else call hcs_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+		     if ourmp = null then goto atterr;
+		     created_seg = "1"b;		/* So we can mention it later */
+		end;
+		else goto atterr;
+	     end;
+
+/* Initialize our message segment */
+	     call ipc_$mask_ev_calls (code);
+lock_loop:
+	     call set_lock_$lock (ourmp -> syscon_mseg.mlock, lock_wait_time, code);
+	     if code ^= 0 then if code = error_table_$lock_wait_time_exceeded then
+		     do;
+		     if testing then
+			do;
+			call com_err_ (code, "mrdim_");
+			call cu_$cl;
+		     end;
+		     else call phcs_$ring_0_message ("Unable to lock daemon message segment");
+		     goto lock_loop;
+		end;
+		else if code = error_table_$locked_by_this_process then leave_locked = "1"b;
+		else if code ^= error_table_$invalid_lock_reset then goto atterr;
+
+	     ourmp -> syscon_template.words (*) = 0;	/* Zero all but the lock word */
+						/* to get around hcs_$truncate bug for sys priv initiate */
+
+	     ourmp -> syscon_mseg.current_process_id = get_process_id_ ();
+						/* Fill in event lists */
+	     ourmp -> syscon_mseg.ipc_el.n = 1;
+	     ourmp -> syscon_mseg.proto_el.n = 1;
+	     call ipc_$create_ev_chn (ourmp -> syscon_mseg.ipc_el.channel, code);
+	     if code ^= 0 then goto latterr;
+	     call ipc_$create_ev_chn (ourmp -> syscon_mseg.proto_el.channel, code);
+	     if code ^= 0 then go to latterr;
+	     ourmp -> syscon_mseg.flags.test_mode = testing;
+
+	     if ^leave_locked then call set_lock_$unlock (ourmp -> syscon_mseg.mlock, lcode);
+	     call ipc_$unmask_ev_calls (code);
+
+	end;
+
+	SDB.ipc_ep = addr (ourmp -> syscon_mseg.ipc_el);
+	SDB.proto_ep = addr (ourmp -> syscon_mseg.proto_el);
+	SDB.ourmess = ourmp;
+
+/* Now let's introduce ourself to the message coordinator.  */
+/* Construct a message. */
+	call ioa_$rs ("^a function attaching ^a stream.",
+	     message, i, attach_channel_name, attname);
+
+	p = addr (em);				/* Preparation for reciept of acknowledgement */
+
+/* Send introduction.  (This entry to mrd_util_ is really mrd_util_$write
+   except that it wakes up a different channel & puts messages in a different chain.)  */
+	call mrd_util_$protocol (tp, addr (message), 0, i, nt, "attach", code);
+	if code ^= 0 then goto atterr;
+
+/* Wait for acknowledgement. */
+	call ipc_$block (SDB.proto_ep, p, code);
+	SDB.source_index = based_mrt_index.mrt_source;
+						/* All future correspondence must */
+	SDB.stream_index = based_mrt_index.mrt_stream;	/* refer to these invoice numbers */
+	substr (quit_mask, SDB.source_index, 1) = "1"b;
+	ourmp -> syscon_mseg.no_of_streams = ourmp -> syscon_mseg.no_of_streams + 1;
+
+	if created_seg then
+	     do;
+	     call ioa_$rs ("Created ^a>^a.message", message, i, sysdir, attach_channel_name);
+	     call mrd_util_$write (tp, addr (message), 0, i, nt, state, code);
+	     if code = error_table_$unable_to_do_io then goto atterr;
+						/* Condition error */
+	end;
+
+	SDB.flags.valid = "1"b;			/* This SDB is being used. */
+	SDB.flags.more = "0"b;
+attrtn:
+	st.eof = "1"b;				/* indicate stream at "end of file" */
+	return;					/* and return to caller */
+
+latterr:	if ^leave_locked then call set_lock_$unlock (ourmp -> syscon_mseg.mlock, lcode);
+	call ipc_$unmask_ev_calls (lcode);
+
+atterr:	st.code = code;				/* here on error, return status code to caller */
+	st.det = "1"b;				/* indicate stream not attached */
+	return;
+
+/*  */
+/* ===================================================== */
+
+mrd_write: entry (SDBptr, wp, offset, ne, net, rwstat);	/* entry to write on stream */
+
+dcl  SDBptr ptr,					/* attachment pointer to entry in stream list */
+     wp ptr,					/* pointer to base of user's workspace */
+     offset fixed bin,				/* character offset from wp */
+     ne fixed bin,					/* number of elements (characters) to write (or read) */
+     net fixed bin,					/* number of elements actually written (or read) */
+     rwstat bit (72) aligned;				/* I/O system status code */
+
+	tp = SDBptr;				/* get pointer to entry for this stream */
+	rwstat = "0"b;				/* initialize status code to zero */
+	sp = addr (rwstat);				/* get pointer to status code argument */
+	if ne = 0 then go to wrtn;			/* skip to return if nothing to write */
+	nt = 0;					/* initialize elements-written to zero */
+	n = ne;					/* pick up number of elements to write */
+	k = offset;				/* pick up element offset from wp */
+wloop:	call mrd_util_$write_dont_flood (tp, wp, k, n, nt, state, code);
+	if code = OWAIT then do;
+	     call ipc_$block (SDB.ipc_ep, addr (em), code);
+	     go to wloop;
+	end;
+	else if code = error_table_$unable_to_do_io then goto wrerr;
+						/* Condition error */
+	if n ^= nt then				/* if elements-written < elements-requested, */
+	     do;
+	     k = k + nt;				/* adjust element offset by elements transferred */
+	     n = n - nt;				/* adjust element count to elements remaining */
+	     nt = 0;				/* reset  elements transferred to zero and */
+	     if n ^= 0 then go to wloop;		/* if elements remaining > 0, try again to write */
+	end;
+
+wrtn:	st.eof = "1"b;				/* indicate stream at "end-of-file" */
+	st.comp = "1110"b;				/* return I/O completion indicators */
+	net = ne;					/* indicate that all elements were transferred */
+	return;
+wrerr:    st.code = code;
+	return;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_read:	entry (SDBptr, wp, offset, ne, net, rwstat);	/* entry to read from stream */
+
+	tp = SDBptr;				/* get pointer to entry for this stream */
+	rwstat = "0"b;				/* initialize status code to zero */
+	sp = addr (rwstat);				/* get pointer to status code argument */
+	if ne = 0 then go to rdrtn;			/* skip to return if zero elements requested */
+	net = 0;					/* initialize elements transferred to zero */
+	p = addr (em);				/* get pointer to event message for call to block */
+rdloop:	call mrd_util_$read (tp, wp, offset, ne, net, "normal", messp, state, code);
+	if code = error_table_$unable_to_do_io then goto rdrtn;
+						/* Condition error */
+	if net = 0 then do;				/* if no elements read from console */
+	     if ^wrote_sentinel then			/* Send one reminder to operator */
+		do;
+		call ioa_$rs ("-->  ^a", message, i, SDB.source);
+		call mrd_util_$protocol (tp, addr (message), 0, i, nt, "sentinel", code);
+		if code = error_table_$unable_to_do_io then goto rdrtn;
+						/* Condition error */
+		wrote_sentinel = "1"b;
+	     end;
+	     call ipc_$block (SDB.ipc_ep, p, code);	/* call block to await signal from message coord'r */
+	     go to rdloop;				/* and try again to read from console */
+	end;
+
+rdrtn:	st.eof = "0"b;				/* not at end-of-file when in read-ahead mode */
+	st.comp = "1111"b;				/* return I/O completion indicators */
+	if state = 0 then st.eod = "1"b;
+	return;					/* and return control to caller */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_resetread: entry (SDBptr, stat2);			/* entry to reset read-ahead data */
+
+dcl  stat2 bit (72) aligned;				/* I/O system status code (returned) */
+
+	rw = 1;					/* set code to reset read-ahead only */
+	go to reset;				/* join with code for resetwrite */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_resetwrite: entry (SDBptr, stat2);			/* entry to reset write-behind buffers */
+
+	rw = 2;					/* set code to reset write-behind only */
+
+reset:	stat2 = "0"b;				/* initialize status code to zero */
+	sp = addr (stat2);				/* get pointer to status code argument */
+	go to rwabort;				/* join with code for abort */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_abort: entry (SDBptr, stat2, stat3);		/* entry to reset read, write and quit condition */
+
+dcl  stat3 bit (72) aligned;				/* I/O system status code (returned) */
+
+	rw = 3;					/* set code to reset everything */
+	stat3 = "0"b;				/* initialize status code to zero */
+	sp = addr (stat3);				/* get pointer to status code argument */
+
+rwabort:	tp = SDBptr;				/* get pointer to entry for this stream */
+	call mrd_util_$abort (tp, rw, state, st.code);
+	return;					/* and return */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_order: entry (SDBptr, request, argptr, stat4);	/* entry to handle stream orders */
+
+dcl  request char (*),				/* symbol stream request order code */
+     argptr ptr,					/* pointer to additional arguments (if any) */
+     stat4 bit (72) aligned;				/* I/O system status code (returned) */
+
+dcl 1 info_struc aligned based (argptr),
+    2 id char (4),
+    2 flags aligned,
+      3 bps_rate fixed binary (17) unaligned,
+      3 line_type fixed binary (17) unaligned,
+      3 pad bit (36) unaligned,
+    2 tw_type fixed bin;
+
+	string (stat4) = "0"b;
+	tp = SDBptr;
+
+	if request = "hangup" then return;
+	if request = "listen" then return;
+	if request = "line_length" then return;
+	if request = "quit_enable" then
+	     do;
+	     mcmp -> syscon_mseg.quit_bits = mcmp -> syscon_mseg.quit_bits | quit_mask;
+	     return;
+	end;
+	if request = "quit_disable" then
+	     do;
+	     mcmp -> syscon_mseg.quit_bits = mcmp -> syscon_mseg.quit_bits & ^quit_mask;
+	     return;
+	end;
+	if request = "start" then return;
+	if request = "printer_off" then return;
+	if request = "printer_on" then return;
+
+	if request = "info" then
+	     do;
+	     info_struc.id = rtrim(SDB.source);
+	     info_struc.bps_rate = 0;
+	     info_struc.line_type = LINE_MC;
+	     info_struc.pad = ""b;
+	     info_struc.tw_type = TYPE_UNKNOWN;
+	     return;
+	end;
+
+	if request = "discard_remainder" then
+	     do;
+	     call mrd_util_$discard_remainder (tp, state, code);
+	     return;
+	end;
+
+	if request = "read_status" then do;		/* request to look at read ahead */
+	     call mrd_util_$read_status (tp, argptr, code);
+	     return;
+	end;
+
+/* Any others are in error */
+	addr (stat4) -> st.code = error_table_$undefined_order_request;
+	return;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_getsize: entry (SDBptr, elsize, stat3);		/* entry to return current element size */
+
+dcl  elsize fixed bin;				/* current element size (returned) */
+
+	elsize = 9;				/* element size for consoles is always 9 */
+	return;					/* so return the constant 9 to the caller */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_changemode: entry (SDBptr, mode, omode, stat4);	/* entry to modify the stream mode */
+
+dcl  omode char (*);				/* returned mode prior to this call */
+
+dcl 1 modes aligned,				/* structure for order call */
+    2 len fixed bin,				/* length of mode string */
+    2 mode_string char (128);				/* mode string */
+
+	tp = SDBptr;				/* get pointer to SDB for this stream */
+	stat4 = ""b;				/* initialize status to OK */
+	sp = addr (stat4);				/* pick up pointer to status argument */
+	modes.mode_string = mode;			/* copy mode string */
+	omode = "";
+	return;
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mrd_detach: entry (SDBptr, ch2, disposal, stat4);		/* entry to detach a currently attached stream */
+
+dcl (ch2, disposal) char (*);				/* these arguments ignored in this implementation */
+
+	tp = SDBptr;				/* get pointer to entry for this stream */
+	stat4 = "0"b;				/* initialize status code to zero */
+	sp = addr (stat4);				/* get pointer to status code argument */
+	ourmp = SDB.ourmess;
+	st.det = "1"b;				/* set code to detach this ioname */
+	if ^SDB.valid then return;
+	SDB.valid = "0"b;				/* indicate stream list entry no longer in use */
+	ourmp -> syscon_mseg.no_of_streams = ourmp -> syscon_mseg.no_of_streams - 1;
+	if ourmp -> syscon_mseg.no_of_streams = 0 then
+	     substr (quit_mask, SDB.source_index, 1) = "0"b;
+
+/* Say goodbye to message coordinator */
+	p = addr (em);				/* Preparation for reciept of acknowledgement. */
+
+/* Construct a message */
+	call ioa_$rs ("^a function detaching ^a stream. ", message, i, SDB.source, SDB.stream);
+
+/* Send it */
+	call mrd_util_$protocol (tp, addr (message), 0, i, nt, "detach", code);
+
+/* Wait for acknowledgement */
+	call ipc_$block (SDB.proto_ep, p, code);
+
+	return;					/* and return */
+
+
+
+/* =================================================== */
+
+test_mrd:	entry (system_dir);
+
+dcl  system_dir char (*);
+
+	sysdir = system_dir;
+	init = "0"b;
+	need_priv = "0"b;				/* this will be determined later */
+	testing = "1"b;
+	return;
+
+     end mrdim_;

@@ -1,0 +1,751 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+log_write_:
+     procedure ();
+
+/* *	LOG_WRITE_
+   *
+   *	This is the user-ring program responsible for writing messages into a
+   *	family of log segments. It keeps track (in log_write_data) of the
+   *	current log, and switches log segments when it finds one full.
+   *
+   *	Modification history:
+   *	84-05-29, W. Olin Sibert: Initial coding
+   *	84-08-25, WOS: Added $open_for_migrate and related changes
+   *	84-10-16, WOS: Changed to rename segments with suffix of last message time
+   *	84-10-19, WOS: Changed to ignore segnamedup when renaming logs.
+   *	84-12-21, WOS: Changed to handle uninitialized logs better.
+   *	84-12-21, WOS: Changed data_class to 16 chars like it should be
+   *      84-12-23, WOS: Changed to create segments with suffixes when migrating
+   *	85-01-17, GMP: Changed to create segments with the proper access class
+   *	85-03-03, EJ Sharpe: Changed name of entry in log_list_history_ from single_dir to
+   *		single_dir_oldest_and_newest, added format
+   *	85-03-27, EJ Sharpe: get masked for sleeping and for swapping to new log segment,
+   *		open now fails if log is not in service
+*/
+
+declare  P_log_write_data_ptr pointer parameter;		/* Input: control information */
+
+declare  P_log_dname char (*) parameter;		/* Input: Log dname/ename when opening */
+declare  P_log_ename char (*) parameter;
+declare  P_create_sw bit (1) aligned parameter;		/* Input: Whether to create, at open, default log */
+
+declare  P_severity fixed bin parameter;		/* Input: Log message severity */
+declare  P_message char (*) parameter;			/* Input: Text message */
+declare  P_data_ptr pointer parameter;			/* Input: Binary data message location, size, class and type */
+declare  P_data_lth fixed bin parameter;		/* Input: Length of data message */
+declare  P_data_class char (16) varying parameter;	/* Input: Class of data message */
+declare  P_sequence fixed bin (35) parameter;		/* Input: Special sequence for $general */
+declare  P_message_lth fixed bin parameter;		/* Input: Length of text portion */
+declare  P_log_message_ptr pointer parameter;		/* Output: Location of written message */
+declare  P_code fixed bin (35) parameter;		/* Output: Status code */
+
+declare  code fixed bin (35);
+declare  open_for_migrate bit (1) aligned;
+declare  log_segment_damaged bit (1) aligned;
+declare  log_not_initialized bit (1) aligned;
+declare  service_bit bit (1) aligned;
+declare  system_area_ptr pointer;
+declare  system_area area based (system_area_ptr);
+declare  based_word bit (36) aligned based;
+declare  based_page (1024) bit (36) aligned based;
+
+/* Variables associated with mask manipulation.  Note that
+   initializations are assumed by cleanup handler. */
+dcl  ipc_mask_code fixed bin (35) init (-1);
+dcl  ipc_unmask_code fixed bin (35) init (-1);
+dcl  mask bit (36) aligned init (""b);
+
+declare  1 message_info aligned automatic,		/* Description of message being added */
+	 2 time fixed bin (71),			/* Set for: $message, $data */
+	 2 process_id bit (36) aligned,		/* Set for: $message, $data */
+	 2 severity fixed bin (35),			/* Set for: $message, $data */
+	 2 text_lth fixed bin,			/* Set for: $message, $data, $general */
+	 2 text_ptr pointer,			/* Set for: $message, $data */
+	 2 data_lth fixed bin,			/* Set for: $data, $general */
+	 2 data_ptr pointer,			/* Set for: $data */
+	 2 data_class char (16) varying,		/* Set for: $data, $general */
+	 2 sequence fixed bin (35);			/* Set for: $general */
+
+declare  message_text char (message_info.text_lth) unaligned based (message_info.text_ptr);
+declare  message_data dim (message_info.data_lth) bit (36) aligned based (message_info.data_ptr);
+
+declare  log_data_$default_log_size fixed bin (35) external static;
+
+declare  error_table_$log_out_of_service fixed bin (35) external static;
+declare  error_table_$log_segment_damaged fixed bin (35) external static;
+declare  error_table_$log_segment_full fixed bin (35) external static;
+declare  error_table_$log_segment_invalid fixed bin (35) external static;
+declare  error_table_$log_uninitialized fixed bin (35) external static;
+declare  error_table_$namedup fixed bin (35) external static;
+declare  error_table_$noentry fixed bin (35) external static;
+declare  error_table_$nomatch fixed bin (35) external static;
+declare  error_table_$no_w_permission fixed bin (35) external static;
+declare  error_table_$segnamedup fixed bin (35) external static;
+
+declare  cu_$level_get entry () returns (fixed bin (3));
+declare  get_process_access_class_ entry () returns (bit (72) aligned);
+declare  get_process_id_ entry () returns (bit (36) aligned);
+declare  get_system_free_area_ entry () returns (pointer);
+declare  hcs_$chname_seg entry (pointer, char (*), char (*), fixed bin (35));
+declare  hcs_$reset_ips_mask entry (bit (36) aligned, bit (36) aligned);
+declare  hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned);
+declare  hcs_$terminate_noname entry (pointer, fixed bin (35));
+declare  ipc_$mask_ev_calls entry (fixed bin (35));
+declare  ipc_$unmask_ev_calls entry (fixed bin (35));
+declare  log_create_$duplicate_segment entry (pointer, char (*), char (*), pointer, pointer, fixed bin (35));
+declare  log_create_$get_info entry (pointer, pointer, fixed bin (35));
+declare  log_create_$new_segment entry (pointer, pointer, fixed bin (35));
+declare  log_initialize_ entry (pointer, pointer, fixed bin (18), char (*), fixed bin (35));
+declare  log_initiate_ entry (char (*), char (*), fixed bin, pointer, fixed bin (35));
+declare  log_list_history_$single_dir_oldest_and_newest entry (char (*), char (*), char (*), char (*), fixed bin, fixed bin (35));
+declare  log_name_$name entry (char (*), fixed bin (71)) returns (char (32));
+declare  log_segment_$create_message entry (pointer, fixed bin, fixed bin, char (16) varying, pointer, fixed bin (35));
+declare  log_segment_$create_message_number entry
+	    (pointer, fixed bin, fixed bin, char (16) varying, fixed bin (35), pointer, fixed bin (35));
+declare  log_segment_$finish_message entry (pointer, pointer, fixed bin (35));
+declare  log_segment_$get_service_bit entry (ptr, bit (1) aligned, fixed bin (35));
+declare  log_segment_$place_in_service entry (pointer, fixed bin (35));
+declare  log_segment_$remove_from_service entry (pointer, fixed bin (35));
+declare  log_wakeup_$send_wakeups entry (pointer, pointer, fixed bin (35));
+declare  sub_err_ entry options (variable);
+declare  timer_manager_$sleep entry (fixed bin (71), bit (2));
+
+declare  seg_fault_error condition;
+
+declare  WHOAMI char (32) internal static options (constant) init ("log_write_");
+declare  MAX_TRIES fixed bin internal static options (constant) init (10);
+declare  RELATIVE_MICROSECONDS bit (2) internal static options (constant) init ("10"b);
+declare  ONE_SECOND fixed bin (71) internal static options (constant) init (1000000);
+declare  ONE_QUARTER_SECOND fixed bin (71) internal static options (constant) init (250000);
+
+declare  cleanup condition;
+
+declare  (addr, clock, length, null, substr, unspec) builtin;
+%page;
+
+MAIN_RETURN:
+	return;
+
+
+finished:
+     procedure (P_return_code);
+
+declare  P_return_code fixed bin (35) parameter;
+
+
+	call CLEANUP;
+	P_code = P_return_code;
+	goto MAIN_RETURN;
+     end finished;
+
+
+
+abort_open:
+     procedure (P_error_code);
+
+declare  P_error_code fixed bin (35) parameter;
+
+
+	call log_write_$close (log_write_data_ptr, (0));
+	call finished (P_error_code);
+
+     end abort_open;
+
+
+
+
+
+MASK:
+     procedure ();
+
+	call hcs_$set_ips_mask (""b, mask);		/* mask ips interrupts */
+	call ipc_$mask_ev_calls (ipc_mask_code);	/* mask ipc calls */
+
+     end MASK;
+
+
+UNMASK:
+     procedure ();
+
+	call ipc_$unmask_ev_calls (ipc_unmask_code);
+	ipc_mask_code = -1;
+	ipc_unmask_code = -1;
+	call hcs_$reset_ips_mask (mask, mask);
+
+     end UNMASK;
+
+
+
+CLEANUP: procedure;
+
+/* put masks back the way we found 'em and reset variables so we don't try it twice */
+
+	if ipc_mask_code ^= -1 & ipc_unmask_code = -1 then
+	     call ipc_$unmask_ev_calls (ipc_unmask_code);
+	ipc_mask_code = -1;
+	ipc_unmask_code = -1;
+
+	if substr(mask, 36, 1) = "1"b then
+	     call hcs_$reset_ips_mask (mask, mask);
+
+     end CLEANUP;
+%page;
+
+/* This entrypoint is called to put a text message into the log */
+
+log_write_$open:
+     entry (P_log_dname, P_log_ename, P_create_sw, P_log_write_data_ptr, P_code);
+
+	open_for_migrate = "0"b;
+	goto OPEN_COMMON;
+
+
+
+log_write_$open_for_migrate:
+     entry (P_log_dname, P_log_ename, P_create_sw, P_log_write_data_ptr, P_code);
+
+	open_for_migrate = "1"b;			/* P_log_ename, in this case, is the primary name of the */
+	goto OPEN_COMMON;				/* log, NOT the name of a specific segment */
+
+
+
+OPEN_COMMON:
+	P_log_write_data_ptr = null ();
+
+	system_area_ptr = get_system_free_area_ ();
+	allocate log_write_data in (system_area) set (log_write_data_ptr);
+	unspec (log_write_data) = ""b;
+
+	log_write_data.log_ptr = null ();
+	log_write_data.migrating = open_for_migrate;
+
+	on condition (cleanup) begin;
+	     call log_write_$close (log_write_data_ptr, (0));
+	end;
+
+/* For either open case, we take the dir name we received.	For the plain $open
+   case, that's true of the entry name as well.  However, for the $open_for_migrate
+   case, we have to find the newest in a series of already renamed logs, or, if
+   there aren't any, create one with a name based on the current time.  The log_name
+   itself is the entry name we were given, in either case. */
+
+	log_write_data.dname = P_log_dname;
+	log_write_data.log_name = P_log_ename;
+
+	if log_write_data.migrating then do;
+	     call log_list_history_$single_dir_oldest_and_newest /* See if we can find newest ename.YYYYMMDD.HHMMSS */
+		(P_log_dname, P_log_ename, (""), log_write_data.ename, (0), code);
+
+	     if (code = 0) then ;			/* OK: we found some oldies */
+
+	     else if (code = error_table_$nomatch) then	/* Also OK: Nothing there now, so we create the first */
+		log_write_data.ename = log_name_$name (P_log_ename, clock ()); /* Depending on P_create_sw, below */
+
+	     else call abort_open (code);		/* Otherwise, it's an error */
+	end;
+
+	else log_write_data.ename = P_log_ename;	/* Vanilla case, use what we got */
+%page;
+
+/* What follows is the code common for both types of open operations */
+
+	call log_initiate_ (log_write_data.dname, log_write_data.ename, 10, log_write_data.log_ptr, code);
+
+	log_not_initialized = (code = error_table_$log_uninitialized);
+
+/* If it exists, we consider using it. First, check to see whether it can be
+   written; if not, give up immediately. Next, if it wasn't initialized,
+   check to see whether it's a whole empty page, and initialize it only if
+   it is-- that avoids trashing a random segment that isn't actually a log.
+   Finally, if migrating, put it back in service and be gone. */
+
+	if (code = 0) | log_not_initialized then do;	/* The named segment exists. Use it. */
+GET_LOG_INFO:
+	     call log_create_$get_info (addr (log_write_data.segment_info), log_write_data.log_ptr, code);
+	     if (code ^= 0) then
+		call abort_open (code);
+
+	     if (log_write_data.effective_mode ^= RW_ACCESS) & (log_write_data.effective_mode ^= REW_ACCESS) then
+		call abort_open (error_table_$no_w_permission);
+
+	     if log_not_initialized then		/* Check whether anything is there */
+		if (unspec (log_write_data.log_ptr -> based_page) ^= ""b) then
+		     call abort_open (error_table_$log_segment_invalid);
+
+		else do;				/* It has nothing there, so initialize it */
+		     call log_initialize_ (null (), log_write_data.log_ptr,
+			(log_data_$default_log_size), log_write_data.dname, code);
+		     if (code ^= 0) then
+			call abort_open (code);
+		     else log_not_initialized = "0"b;
+		end;
+
+	     if log_write_data.migrating then		/* It's out of service now, so turn it back on */
+		call log_segment_$place_in_service (log_write_data.log_ptr, (0)); /* but ignore errors */
+	     else do;				/* Make sure we have a usable log since our caller apparently wants to write to it. */
+		call log_segment_$get_service_bit (log_write_data.log_ptr, service_bit, code);
+		if (code ^= 0) then			/* should always be possible */
+		     call abort_open (code);
+		if (service_bit ^= "1"b) then do;	/* need to wait for new log segment */
+		     call initiate_new_log_segment$$open;
+		     goto GET_LOG_INFO;		/* make sure the new one has proper access */
+		end;
+	     end;
+	end;
+
+/* If it didn't exist, and we were supposed to create it, take care of that */
+
+	else if P_create_sw & (code = error_table_$noentry) then do;
+	     log_write_data.rings (*) = cu_$level_get ();
+	     log_write_data.access_class = get_process_access_class_ ();
+	     log_write_data.max_length = log_data_$default_log_size;
+	     call log_create_$new_segment (addr (log_write_data.segment_info), log_write_data.log_ptr, code);
+	     if (code ^= 0) then
+		call abort_open (code);
+	end;
+
+	else call abort_open (code);
+
+	P_log_write_data_ptr = log_write_data_ptr;
+	call finished (0);
+%page;
+
+log_write_$close:
+     entry (P_log_write_data_ptr, P_code);
+
+	log_write_data_ptr = P_log_write_data_ptr;
+	if (log_write_data_ptr = null ()) then call finished (0);
+
+	P_log_write_data_ptr = null ();
+	system_area_ptr = get_system_free_area_ ();
+
+	if (log_write_data.acl_count ^= 0) & (log_write_data.acl_ptr ^= null ()) then
+	     free log_write_data.acl_ptr -> based_word in (system_area);
+
+	if (log_write_data.log_ptr ^= null ()) then do;
+
+/* If we are migrating, we take this segment out of service, and also give it
+   a name more befitting its station-- a suffix accurately representing the
+   newest message it contains.  This renaming, though, may result in name
+   duplications, which we have no way to handle, so we just ignore the
+   status code. */
+
+	     if log_write_data.migrating then do;
+		call log_segment_$remove_from_service (log_write_data.log_ptr, (0));
+		call rename_for_last_message (log_write_data.log_ptr, log_write_data.ename, (0));
+	     end;
+
+	     call hcs_$terminate_noname (log_write_data.log_ptr, (0));
+	     log_write_data.log_ptr = null ();
+	end;
+
+	free log_write_data in (system_area);
+
+	call finished (0);
+%page;
+
+log_write_$message:
+     entry (P_log_write_data_ptr, P_severity, P_message, P_log_message_ptr, P_code);
+
+	log_write_data_ptr = P_log_write_data_ptr;
+
+	unspec (message_info) = ""b;
+	message_info.time = clock ();
+	message_info.process_id = get_process_id_ ();
+	message_info.severity = P_severity;
+	message_info.text_ptr = addr (P_message);
+	message_info.text_lth = length (P_message);
+
+	call add_message ("1"b);
+
+	P_log_message_ptr = log_message_ptr;
+	call finished (0);
+%page;
+
+/* This entrypoint is called to put a message in the log including binary data */
+
+log_write_$data:
+     entry (P_log_write_data_ptr, P_severity,
+	P_message, P_data_ptr, P_data_lth, P_data_class, P_log_message_ptr, P_code);
+
+	log_write_data_ptr = P_log_write_data_ptr;
+
+	unspec (message_info) = ""b;
+	message_info.time = clock ();
+	message_info.process_id = get_process_id_ ();
+	message_info.severity = P_severity;
+	message_info.text_ptr = addr (P_message);
+	message_info.text_lth = length (P_message);
+	message_info.data_ptr = P_data_ptr;
+	message_info.data_lth = P_data_lth;
+	message_info.data_class = P_data_class;
+
+	call add_message ("1"b);
+
+	P_log_message_ptr = log_message_ptr;
+	call finished (0);
+%page;
+
+/* This entrypoint is called to put a message in the log with arbitrary
+   contents. The caller must fill it in after this returns, and then must
+   call log_segment_$finish itself to complete the job. The caller has
+   the option of setting a sequence number here, as well; if this number
+   is non-zero, add_message will call log_segment_$create_message_number.
+*/
+
+
+log_write_$general:
+     entry (P_log_write_data_ptr, P_sequence, P_message_lth, P_data_lth, P_data_class, P_log_message_ptr, P_code);
+
+	log_write_data_ptr = P_log_write_data_ptr;
+
+	unspec (message_info) = ""b;
+	message_info.sequence = P_sequence;
+	message_info.text_lth = P_message_lth;		/* Set only the length-determining information */
+	message_info.data_lth = P_data_lth;
+	message_info.data_class = P_data_class;
+
+	call add_message ("0"b);
+
+	P_log_message_ptr = log_message_ptr;
+	call finished (0);
+%page;
+
+add_message:
+     procedure (P_finish_message);
+
+declare  P_finish_message bit (1) aligned parameter;
+declare  fault_occurred bit (1) aligned;
+
+
+	fault_occurred = "0"b;
+	log_segment_damaged = "0"b;
+
+	on condition (seg_fault_error) begin;
+	     if fault_occurred then do;
+		code = error_table_$log_segment_damaged;
+		goto MAIN_RETURN;
+	     end;
+
+	     fault_occurred = "1"b;
+	     call create_new_log_segment ();
+	     goto TRY_TO_CREATE_MESSAGE;
+	end;
+
+
+TRY_TO_CREATE_MESSAGE:
+	do while (^create_message ());
+	end;
+
+	if ^P_finish_message then return;		/* Leave it to our caller to fill in and finish */
+
+	log_message.time = message_info.time;
+	log_message.severity = message_info.severity;
+	log_message.process_id = message_info.process_id;
+
+	log_message.text = message_text;
+	if (message_info.data_lth > 0) then do;
+	     log_message.data_class = message_info.data_class;
+	     log_message.data = message_data;
+	end;
+
+	call log_segment_$finish_message (log_write_data.log_ptr, log_message_ptr, code);
+	if (code ^= 0) then call finished (code);
+
+	if log_write_data.log_ptr -> log_segment.listeners_registered then /* This test repeated here for efficiency */
+	     call log_wakeup_$send_wakeups (log_write_data.log_ptr, log_message_ptr, (0));
+
+	revert condition (seg_fault_error);
+
+	return;
+     end add_message;
+%page;
+
+create_message:
+     procedure () returns (bit (1) aligned);
+
+	if (message_info.sequence > 0) then		/* Caller-supplied sequence number from log_write_$general */
+	     call log_segment_$create_message_number (log_write_data.log_ptr,
+		message_info.text_lth, message_info.data_lth, message_info.data_class, message_info.sequence,
+		log_message_ptr, code);
+
+	else call log_segment_$create_message (log_write_data.log_ptr,
+		message_info.text_lth, message_info.data_lth, message_info.data_class,
+		log_message_ptr, code);
+
+	if (code = 0) then return ("1"b);
+
+/* If our message won't fit, we have to swap log segments. This is done by taking the old
+   one out of service and creating a new one. However, it's quite possible that someone
+   else has also found the log full, and taken it out of service before we could, so we
+   have to pay close attention to what happens when we take it out of service. */
+
+	else if (code = error_table_$log_segment_full) then do;
+	     on cleanup call CLEANUP;
+	     call MASK;
+	     call log_segment_$remove_from_service (log_write_data.log_ptr, code);
+
+	     if (code = 0) then
+		call create_new_log_segment ();
+	     else call initiate_new_log_segment ();
+	     call UNMASK;
+	     return ("0"b);				/* Come around and try again */
+	end;
+
+	else if (code = error_table_$log_out_of_service) then do;
+	     call initiate_new_log_segment ();
+	     return ("0"b);
+	end;
+
+/* If it got munched for some reason, we give up on this one, and try to create a
+   new one. If we encounter this error more than once, though, we just give up--
+   that probably indicates some fairly serious internal logic error. For politeness,
+   we *try* to take the old segment out of service, though, really, its disposition
+   doesn't matter in the slightest at this point. */
+
+	else if (code = error_table_$log_segment_damaged) then do;
+	     if log_segment_damaged then
+		call finished (code);
+	     log_segment_damaged = "1"b;		/* Remember that this has been tried already */
+
+	     on cleanup call CLEANUP;
+	     call MASK;
+	     call log_segment_$remove_from_service (log_write_data.log_ptr, (0));
+	     call create_new_log_segment ();
+	     call UNMASK;
+	end;
+
+	else call finished (code);			/* Any other error is fatal */
+
+     end create_message;
+%page;
+
+initiate_new_log_segment:
+     procedure ();
+
+declare  old_log_ptr pointer;
+declare  new_log_ptr pointer;
+declare  retry_count fixed bin;
+declare  abort_proc entry (fixed bin (35)) variable;
+
+/* This call will try several times, returning only when new_log_ptr is different
+   from old_log_ptr.  When a log fills, it is renamed (in this case, by another
+   process, so it won't affect our segment number), and this procedure tries to
+   initiate with the old name, eventually (it hopes) getting the new segment of
+   that name. */
+
+	abort_proc = finished;
+	goto initiate_new_log_segment_join;
+
+initiate_new_log_segment$$open:
+     entry ();					/* entrypoint used when opeining a log for writing */
+
+	abort_proc = abort_open;
+
+initiate_new_log_segment_join:
+	old_log_ptr = log_write_data.log_ptr;
+
+	do retry_count = 1 to 10;
+	     call log_initiate_ (log_write_data.dname, log_write_data.ename, 1, new_log_ptr, code);
+
+	     if (code = 0) & (new_log_ptr ^= old_log_ptr) then do;
+		call hcs_$terminate_noname (old_log_ptr, (0));
+		log_write_data.log_ptr = new_log_ptr;
+		return;
+	     end;
+
+	     call sleep (ONE_QUARTER_SECOND);
+	end;
+
+/* If we run out of tries at this, then the process that set the log out-of-service
+   hasn't finished its job: no new log has been created, or, if it has been created,
+   it has not been initialized. Our caller loses. This shouldn't happen, of course,
+   since that whole task is handled by create_new_log_segment, below */
+
+	if (code = 0) then				/* Old log still exists (presumably, out of service) */
+	     call abort_proc (error_table_$log_out_of_service);
+	else call abort_proc (code);
+
+     end initiate_new_log_segment;
+%page;
+
+create_new_log_segment:
+     procedure ();
+
+/* This procedure renames the old log segment and creates a new one */
+
+declare  new_log_ptr pointer;
+declare  1 this_segment_info aligned like log_segment_info;
+declare  orig_log_ptr pointer;
+declare  rename_time fixed bin (71);
+
+
+	this_segment_info = log_write_data.segment_info;
+	orig_log_ptr = log_write_data.log_ptr;
+
+/* When a log segment fills, it gets a suffix that's guaranteed to be
+   as late or later (by adding ONE_SECOND) than the last message in the log.
+   Once it's full, we rename it to an appropriate name. */
+
+	call rename_for_last_message (orig_log_ptr, log_write_data.ename, rename_time);
+
+	if log_write_data.migrating then		/* These calls modify this_segment_info and leave */
+	     call create_migration_segment (rename_time); /* code set to indicate their success or failure */
+	else call create_initial_segment ();
+
+/* We terminate and give up on the old one, regardless-- WITHOUT modifying code */
+
+	call hcs_$terminate_noname (orig_log_ptr, (0));
+	log_write_data.log_ptr = null ();
+
+	if (code ^= 0) then
+	     call finished (code);
+
+	log_write_data.segment_info = this_segment_info;
+	log_write_data.log_ptr = new_log_ptr;
+
+	return;
+%page;
+
+create_initial_segment:
+	procedure ();
+
+	     call log_create_$duplicate_segment (addr (this_segment_info),
+		log_write_data.dname, log_write_data.log_name, orig_log_ptr, new_log_ptr, code);
+
+	     if (code = 0) then			/* All went well, we managed to duplicate the segment */
+		return;
+
+	     this_segment_info = log_write_data.segment_info; /* Since it may have been altered above */
+	     this_segment_info.ename = log_write_data.log_name;
+
+	     call log_create_$new_segment (addr (this_segment_info), new_log_ptr, code);
+
+	     return;				/* code is set to indicate success/failure */
+	end create_initial_segment;
+%page;
+
+create_migration_segment:
+	procedure (P_start_time);
+
+declare  P_start_time fixed bin (71) parameter;
+
+declare  tries fixed bin;
+declare  new_log_name char (32);
+declare  keep_trying bit (1) aligned;
+
+
+	     keep_trying = "1"b;
+	     do tries = 1 to MAX_TRIES while (keep_trying);
+		new_log_name = log_name_$name (log_write_data.log_name, (P_start_time + (tries * ONE_SECOND)));
+		call log_create_$duplicate_segment (addr (this_segment_info),
+		     log_write_data.dname, new_log_name, orig_log_ptr, new_log_ptr, code);
+
+		if (code = 0) then			/* If it's created, our job is done. */
+		     return;			/* Otherwise, as long as we keep getting name duplications, */
+		if (code ^= error_table_$namedup) then	/* Keep trying different names. Any other sort of error */
+		     keep_trying = "0"b;		/* is cause for giving up and going on to the new-segment */
+	     end;					/* case, the assumption being that duplication failed. */
+
+	     do tries = 1 to MAX_TRIES while (keep_trying);
+		this_segment_info = log_write_data.segment_info; /* Since it may have been altered above */
+		this_segment_info.ename = log_name_$name (log_write_data.log_name, (P_start_time + (tries * ONE_SECOND)));
+		call log_create_$new_segment (addr (this_segment_info), new_log_ptr, code);
+
+		if (code = 0) then			/* Error return logic is as above. */
+		     return;
+		if (code ^= error_table_$namedup) then
+		     keep_trying = "0"b;
+	     end;
+
+	     return;
+	end create_migration_segment;
+
+     end create_new_log_segment;
+%page;
+
+rename_for_last_message:
+     procedure (P_log_ptr, P_current_name, P_rename_time);
+
+declare  P_log_ptr pointer parameter;
+declare  P_current_name char (32) parameter;
+declare  P_rename_time fixed bin (71) parameter;
+
+declare  name_time fixed bin (71);
+declare  new_name char (32);
+declare  tries fixed bin;
+
+	name_time = P_log_ptr -> log_segment.last_time;
+
+/* The idea here is to keep trying later names until it can be set to
+   some name that is later than the last message in the segment. */
+
+	do tries = 1 to MAX_TRIES;			/* Don't try too many times.... */
+	     name_time = name_time + ONE_SECOND;	/* Add a delta so the suffix is guaranteed to be later */
+
+	     new_name = log_name_$name (log_write_data.log_name, name_time);
+
+	     call hcs_$chname_seg (P_log_ptr, P_current_name, new_name, code);
+
+	     if (code = error_table_$segnamedup) then	/* If it's already this, we're restarting after an */
+		code = 0;				/* error, and the code can be ignored. */
+
+	     if (code = 0) then do;			/* It worked */
+		P_current_name = new_name;		/* Set it back for our caller */
+		P_rename_time = name_time;		/* Say what time the old one has */
+		return;
+	     end;
+
+	     else if (code ^= error_table_$namedup) then	/* Nope, couldn't do it at all */
+		call finished (code);
+
+	     if ((name_time + ONE_SECOND) > clock ()) then/* Come around for another try, */
+		call sleep (ONE_SECOND);
+	end;					/* but don't let it get ahea of the clock */
+
+	call sub_err_ (0, WHOAMI, ACTION_CANT_RESTART, null (), "",
+	     "Tried (unsuccessfully) more than ^d times to rename log segment ^a (^p)",
+	     (tries - 1), P_current_name, P_log_ptr);
+
+     end rename_for_last_message;
+%page;
+
+sleep: procedure (interval);
+
+/* Internal procedure to pause for a specified interval.  It is
+   used when we need to wait for some other process to finish some
+   manipulation of the log segments. We perform our own mask
+   setting here if our caller is not already masked. */
+
+dcl  interval fixed bin (71) parameter;			/* sleep time in microseconds */
+
+	if substr(mask, 36, 1) = "0"b
+	then do;
+	     on cleanup call CLEANUP;
+	     call MASK;
+	     call timer_manager_$sleep (interval, RELATIVE_MICROSECONDS);
+	     call UNMASK;
+	end;
+	else call timer_manager_$sleep (interval, RELATIVE_MICROSECONDS);
+
+     end sleep;
+
+
+/* format: off */
+
+%page; %include log_message;
+%page; %include log_segment;
+%page; %include log_write_data;
+%page; %include sub_err_flags;
+%page; %include access_mode_values;
+
+	end log_write_;

@@ -1,0 +1,404 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* ARCHIVE_SORT - Archive Segment Sorting Program.
+   9/21/69 - Noel I. Morris
+   Recoded in PL/1 - 1/23/70
+   Checking for format errors, more rational treatment of other errors,
+   list-insertion code re-arranged, C Garman, 6 Mar 1972.
+   modified by E Stone Jan 1974 to call new version of update_handler_
+   Modified to call newer update_handler_ 03/29/79 by Steve Herbst
+   Modified to check for error_table_$no_move from hcs_$fs_move_seg 05/16/84 S. Herbst
+
+   */
+
+archive_sort: as: proc;
+
+dcl whoami char(16) aligned static init("archive_sort");
+
+	dcl  argptr ptr,				/* pointer to argument */
+	     arglen fixed bin (17),			/* character length of argument */
+	     argument char (arglen) based (argptr),	/* template for argument */
+	     argno fixed bin (17),			/* number of argument */
+	     (code, udh_code) fixed bin(35),		/* error code */
+	     dir char (168) aligned,			/* directory path name */
+	     arc_name char(40) aligned,		/* Used to build "xx.archive" */
+	     arc_temp_name char(32) aligned init("as_temp_.archive"),
+	     comment char(40) aligned,		/* Variable for errors during move */
+	     err_str char(8) aligned, 		/* For specifying type of format error */
+	     c0 char(0) aligned,			/* Null string */
+	     bitcnt fixed bin (24),			/* archive segment bit count */
+	     stop fixed bin (19),			/* length (in words) of archive segment */
+	     inptr ptr,				/* pointer to archive segment */
+	     outptr ptr static init(null),		/* pointer to temporary segment */
+	     clean fixed bin static init(0),		/* flag indicating state of temp seg */
+	     max_entries fixed bin static init(1000),	/* Size of arrays below */
+	    (p_array ptr,				/* array of archive sub-file pointers */
+	     n_array fixed bin(18)) (0:999),		/* array of archive sub-file lengths */
+	     nwords fixed bin(18),			/* word count of archive sub-file */
+	    (dirp, entryp) ptr,			/* Pointers to character strings */
+	    (p1, p2) ptr,				/* temporary sorting pointers */
+	     in_sort fixed bin,			/* Abandon sort if unnecessary */
+	     retry fixed bin,			/* Counter for re-try of move */
+	    (i, j) fixed bin;			/* sorting indices */
+
+dcl move_array(nwords) fixed bin(35) based; 		/* for PL/I based-array move */
+
+dcl expand_path_ ext entry (ptr, fixed bin, ptr, ptr, fixed bin(35)),
+    cu_$arg_ptr ext entry (fixed bin, ptr, fixed bin, fixed bin(35)),
+    cv_dec_check_ entry(char(*) aligned, fixed bin(35), fixed bin(18)),
+    hcs_$initiate_count entry(char(*) aligned, char(*) aligned, char(*) aligned,
+      fixed bin(24), fixed bin, ptr, fixed bin(35)),
+    hcs_$make_seg entry(char(*) aligned, char(*) aligned, char(*) aligned,
+      fixed bin, ptr, fixed bin(35)),
+    hcs_$set_bc_seg entry(ptr, fixed bin(24), fixed bin(35)),
+    hcs_$chname_seg entry(ptr, char(*) aligned, char(*) aligned, fixed bin(35)),
+    hcs_$fs_move_seg entry(ptr, ptr, fixed bin, fixed bin(35)),
+    hcs_$truncate_seg ext entry (ptr, fixed bin, fixed bin(35)),
+    hcs_$terminate_noname ext entry (ptr, fixed bin(35)),
+     update_handler_ entry (char(*) aligned, char(*) aligned, char(*) aligned, bit(36),bit(36),fixed bin(35)),
+     update_handler_$reprotect entry (char(*) aligned, char(*) aligned, bit(36),bit(36),fixed bin(35)),
+    (com_err_, ioa_$rsnnl) entry options(variable);
+
+dcl  cleanup condition;
+
+dcl (addr, addrel, bin, divide, fixed, index, null, rel, substr) builtin;
+
+dcl access_switches bit (36),				/* returned by update_handler_:
+					BIT saying whether access was forced
+					BIT saying there already was such an ACL term */
+     old_mode bit (36);				/* previous mode if any */
+
+dcl (error_table_$entlong,
+     error_table_$moderr,
+     error_table_$no_move,
+     error_table_$noarg,
+     error_table_$segknown) fixed bin (35) ext;
+
+dcl (archive_data_$ident,				/* Magic numbers to verify "archive-ness" */
+     archive_data_$fence) char(8) ext aligned;		/* .. */
+
+declare 1 arc_head based aligned,			/* archive header declaration */
+	2 ident1 char (8),
+	2 historical char(4),
+	2 name char (32),
+	2 dtm char(16),
+	2 mode char(4),
+	2 dtu char (20),
+	2 bitcnt char (8),
+	2 ident2 char (8);
+
+/* 
+   Create the temporary segment. */
+
+	if outptr = null
+	then do;
+
+	     call hcs_$make_seg (c0, arc_temp_name, c0, 1011b, outptr, code);
+	     if outptr = null
+	     then do;
+
+error_3:		call com_err_ (code, whoami, "^R^a^B (in process directory)", arc_temp_name);
+
+		return;
+
+		end;
+
+	     if code = error_table_$segknown			/* Did segment exist before? */
+	     then go to unclean;				/* Left dirty, truncate it */
+
+	     end;
+
+	else if clean ^= 0
+	     then do;
+
+unclean:		call hcs_$truncate_seg(outptr, 0, code);
+		if code ^= 0
+		then go to error_3;
+
+		end;
+
+	clean = 0;				/* Clear flag always */
+
+	on cleanup call trunc_temp;
+
+	dirp = addr(dir);
+	entryp = addr(arc_name);
+
+/* Pick up arguments to program. */
+
+	argno = 1;				/* Initialize argument number. */
+
+argument_loop:
+	call cu_$arg_ptr (argno, argptr, arglen, code);	/* Grab pointer to argument. */
+	if code ^= 0
+	then do;
+
+	     if code = error_table_$noarg
+	     then if argno ^= 1
+		then go to finish;
+
+	     call com_err_(code, whoami);
+
+	     go to finish;
+
+	     end;
+
+	if arglen = 0 then go to exit;		/* .. */
+
+/* Expand the path name. */
+
+	call expand_path_(argptr, arglen, dirp, entryp, code);
+	if code ^= 0 then do;			/* Expand the name. */
+error:	     call com_err_ (code, whoami, argument);
+	     go to exit;
+	end;
+
+	substr(arc_name, 33, 8) = (8)" ";		/* Set blanks after expanded name */
+
+	if index(arc_name, ".archive    ") = 0		/* Check for ".archive" provided */
+	then do;				/* Not provided, add it, check length */
+
+	     call ioa_$rsnnl("^a.archive", arc_name, nwords, arc_name);
+	     if nwords >= 33
+	     then do;
+
+		code = error_table_$entlong;
+		go to error;
+
+		end;
+
+	     end;
+
+/* Initiate and get the length of the archive file. */
+
+	call hcs_$initiate_count (dir, arc_name, c0, bitcnt, 1, inptr, code);
+	if inptr = null				/* Attempt to initiate the segment. */
+	then do;
+
+	     call com_err_(code, whoami, "^R^a>^a^B", dir, arc_name);
+	     go to exit;
+
+	     end;
+
+	stop = divide (bitcnt + 35, 36, 19, 0);		/* Compute word count of segment. */
+	if stop = 0
+	then do;
+
+	     call com_err_(0, whoami, "^R^a>^a^B is empty.", dir, arc_name);
+
+	     go to exit_1;
+
+	     end;
+
+
+
+/* 
+   Examine the archive file and perform sort. */
+
+	p1 = inptr;				/* Set archive pointer to beginning of segment. */
+	in_sort = 0;				/* Initialize flag for file-already-sorted */
+
+	do i = 0 by 1 while(fixed(rel(p1), 18) < stop);		/* Set loop */
+
+	if i = max_entries				/* Check for end of loop */
+	then do;
+
+	     call com_err_(0, whoami, "More than ^d components in ^R^a>^a^B, ^a",
+		(max_entries), dir, arc_name,
+		"Archive not sorted.");
+
+	     go to exit_1;				/* Terminate the input seg */
+
+	     end;
+
+	if p1 -> arc_head.ident1 ^= archive_data_$ident	/* Verify "archive-ness" of header */
+	then do;
+
+	     err_str = "head    ";
+
+fmt_err:	     call com_err_(0, whoami, "Archive format error (^aer) in component ^d: ^R^a>^a^B",
+		err_str, i + 1, dir, arc_name);
+
+	     go to exit_1;				/* Terminate the segment */
+
+	     end;
+
+	if p1 -> arc_head.ident2 ^= archive_data_$fence	/* Check trailer */
+	then do;
+
+	     err_str = "trail   ";
+
+	     go to fmt_err;
+
+	     end;
+
+	call cv_dec_check_(p1 -> arc_head.bitcnt, code, nwords);
+						/* Convert bit-count in header to binary value. */
+	if code ^= 0
+	then do;
+
+	     call com_err_(0, whoami,
+		"Non-numeric characters in bit-count for component ^R^a^B^/  ^R^a>^a^B, ^a",
+		p1 -> arc_head.name, dir, arc_name,
+		"Archive not sorted.");
+
+	     go to exit_1;
+
+	     end;
+
+/* Following inner loop compares name of this component
+   with names of previously encountered components
+   in order to find the proper slot for the component.
+   Items are entered into the list in order,
+   higher-sequence items being pushed up on the fly until
+   the appropriate spot is found.
+
+   Note that first time the loop code will not be executed, since
+   the first item is simultaneously
+   at the beginning and end of the list.
+
+   */
+
+	do j = i to 1 by -1;			/* Search list, from high to low. */
+	     p2 = p_array (j-1);			/* Get sub-file pointer. */
+
+/* Compare names.  Note that ">=" is used, not ">", so that identical
+   entries (which really shouldn't ever be encountered)
+   will not be interchanged; they will always remain in the same relative order. */
+
+	     if p1 -> arc_head.name >= p2 -> arc_head.name
+	     then go to end_loop;			/* Insert new info into array */
+
+	     p_array (j) = p2;			/* Current name less than current entry in list, */
+	     n_array (j) = n_array (j-1);		/* move this entry up one position */
+
+	end;
+
+/* If we fall out of loop, current info goes in position 0 of arrays */
+
+end_loop: /* Come here to enter info into proper slot */
+	if j = i					/* If new entry at end of list, ie already in sequence */
+	then in_sort = in_sort + 1;			/* Increment flag */
+
+	p_array (j) = p1;				/* Place sub-file pointer into correct slot. */
+
+	nwords = divide(nwords + 35, 36, 18, 0) + 25;	/* Compute number of words in sub-file. */
+	n_array (j) = nwords;			/* Set sub-file length array. */
+
+	p1 = addrel (p1, nwords);			/* Step to next sub-file. */
+
+	end;
+
+/* 
+   End of per-archive loop, list now in order for creation of sorted temporary */
+
+	if in_sort = i				/* If all array entries made at top */
+	then go to exit_1;				/* A sordid case, terminate, no message */
+
+	stop = bin(rel(p1), 18);				/* Re-calculate word-count */
+	bitcnt = stop * 36; 			/* and bit-count */
+
+/* Copy each of the archive sub-files in correct order into the temporary segment. */
+
+	clean = clean + 1;				/* Dirty, dirty, dirty! */
+
+	p1 = outptr;				/* Now set pointer into output segment. */
+	do j = 0 by 1 while(j ^= i);			/* Process all sub-files. */
+	     nwords = n_array (j);			/* Extract the word count. */
+	     p1 -> move_array = p_array(j) -> move_array; /* Copy the sub-file into temporary. */
+	     p1 = addrel (p1, nwords);		/* Step the output pointer. */
+	end;
+
+
+/* Move the temporary back into the archive file. */
+
+	retry = 0;				/* Clear counter */
+
+try_move:
+	call hcs_$fs_move_seg (outptr, inptr, 1b, code);	/* Move the temporary after truncating the original */
+	if code ^= 0
+	then do;
+
+	     if code = error_table_$moderr | code = error_table_$no_move  /* no write on target? */
+	     then if retry = 0			/* Have we been here before? */
+		then do;				/* OK, try to change mode */
+
+		     call update_handler_(dir, arc_name, whoami, access_switches, old_mode, udh_code);
+
+		     if udh_code = 0			/* Successful? */
+		     then do;
+
+			retry = retry + 1;		/* Update counter */
+			go to try_move;		/* See if it works this time */
+
+			end;
+
+		     else if udh_code = 1		/* He answered "no" */
+			then code = 0;		/* Suppress part of diagnostic */
+			else code = udh_code;	/* Something else, tell him */
+
+		     go to set_com; 		/* Print error message */
+
+		     end;
+
+		else /* ! */
+set_com:		     comment = "";
+
+	     else comment = " Original may have been truncated. ";
+
+	     call hcs_$set_bc_seg(outptr, bitcnt, udh_code);	/* Make temporary copiable */
+	     call hcs_$chname_seg(outptr, arc_temp_name, arc_name, udh_code);
+	     if udh_code = 0
+	     then arc_temp_name = arc_name;			/* Successful rename */
+
+	     outptr = null;				/* Re-call makeseg next time. */
+
+	     call com_err_(code, whoami, "^R^a>^a^B not updated. ^/ ^a ^a^a", dir, arc_name,
+		comment, "Sorted version temporarily preserved in [pd]>", arc_temp_name);
+
+	     go to finish;
+
+	     end;
+
+	clean = 0;				/* Successful fs_move call yields truncated seg */
+
+/* Reset the bit-count on the branch (really shouldn't have changed) */
+
+	call hcs_$set_bc_seg(inptr, bitcnt, code);
+
+	if code ^= 0
+	then call com_err_(code, whoami, "^R^a>^a^B", dir, arc_name);
+
+	if retry ^= 0
+	then call update_handler_$reprotect(dir, arc_name, access_switches, old_mode, code);
+
+exit_1:
+	call hcs_$terminate_noname (inptr, code);	/* Terminate null reference name. */
+	if code ^= 0 then
+	     call com_err_ (code, whoami, "^R^a>^a^B", dir, arc_name);
+
+/* Go back for more. */
+
+exit:
+	argno = argno + 1;				/* Increment the argument number. */
+	go to argument_loop;			/* Back for more. */
+
+trunc_temp: proc;				/* Cleanup procedure */
+
+	if clean ^= 0
+	then call hcs_$truncate_seg(outptr, 0, (0));	/* Ignore error code */
+
+	clean = 0;				/* Clear flag, indicates truncated seg */
+
+end trunc_temp;
+
+finish:
+end archive_sort;

@@ -1,0 +1,603 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+/* DESCRIPTION
+
+	A support routine for bjm_write, bjm_rollback, and
+     bjm_adopt_transaction.  This procedure contains the necessary logic to
+     finish the housekeeping after a record is successfully written in a
+     before journal.  If a record has not been successfully written (ie.,
+     it is pending), then the state is quiesed, assuming that it was never
+     even written.  Although this code seems better suited for residence in
+     bjm_write.pl1, its functions are required by the other two procedures
+     mentioned above.  Instead of duplicating code, the writer chose to
+     localize the funcitonal capability into a single compileable unit.
+     Nevertheless, the thought of fairly optimized code in bjm_write making
+     an external call to this routine turns this author's stomach.
+
+
+	NOTE	NOTE	NOTE	NOTE
+	ANY changes to this procedure's mechanisms should be carefully
+     examined to be sure they do not conflict with assumptions made in
+     bjm_write and bjm_find_txns_after_crash.  Though the latter does not
+     directly call this procedure, it "knows" various assumptions made by
+     bjm_write and this module and crash recovery could break if changes
+     are not propogated.
+*/
+
+/* HISTORY PRIOR TO INITIAL ISTALLATION:
+     
+     Written by M. Pandolf, 03/08/83.
+     Modified:
+     04/08/83 by M. Pandolf:  to use bj_txte.entry_state and
+                 to add update_records_info.
+     04/29/83 by M. Pandolf:  to add meters.
+     12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+     11/02/84 by Maggie Sharpe:  To use "call ERROR_RETURN (code)" method of error
+            handling; to clean up format and dcls; to remove 2 lines of
+            duplicated code from the FINISH_BEFORE_IMAGE procedure (code
+            already executed in COPY_REC_INFO) in callers); to set validation
+            level before calling file_manager and reset it after retruning
+            (includes setting up a cleanup handler in the routine
+            EXECUT_POSTCOMMIT_HANDLER).
+     12/14/84 by Matthew C. Pierret:  Changed contract with
+            file_manager_$postcommit_do slightly.  Now, if this process is the
+            same as the owner process, the opening id in the postcommit
+            handler is passed to file_mnager_$postcommit_do, otherwise a value
+            of ZERO is passed.  file_manager_ has decided that it wants the
+            opening id in the former case so that it can reset the opening
+            information.
+     03/04/85 by Lee A. Newcomb:  Fixed to flush FM_ROLLBACK_HANDLER records.
+     03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+
+     END HISTORY PRIOR TO INITIAL INSTALLATION */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-07,Pierret), approve(86-01-30,MCR7331),
+     audit(86-04-28,Newcomb), install(86-05-06,MR12.0-1054):
+     Changed to correctly set bj_rec_hdr.tid in WRITE_COMMITTED_MARK.
+  2) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+     audit(87-02-09,Dupuis), install(87-04-02,MR12.1-1020):
+     For TR phx20754, added the internal procedure FIND_NEW_INCR_ARRAY to be
+     used when the increment array in key_count_array has moved as detected by
+     fm_do_. This is the case if the control interval has been rearranged as is
+     the case in a compaction or split. Most of the contents of this new
+     procedure are taken from cm_get_bci_header$slot.
+                                                   END HISTORY COMMENTS */
+/* format: style4,^inddcls,indattr,ifthenstmt,ifthen,^indcomtxt,idind35 */
+%page;
+bj_txte_util$before_image:
+     procedure (p_txte_ptr);
+
+
+/* Parameter */
+
+dcl  p_txte_ptr			pointer parameter;	/* assume this value to be correct */
+
+/* Automatic */
+dcl  code				fixed bin (35);	/* system status code */
+dcl  fm_oid			bit (36) aligned;	/* per-process opening ID of DM file */
+dcl  n_rec_bytes			fixed bin;	/* length of a record in bytes, incl header */
+dcl  saved_level			fixed bin;	/* user's validation level */
+dcl  this_rec_id			bit (36) aligned;	/* ID of BJ record to be processed */
+dcl  time_stamp			fixed bin (71);	/* time BJ record written */
+
+
+/* Builtin */
+
+dcl  (addr, size)			builtin;
+
+/* Condition */
+
+dcl  cleanup			condition;
+
+/* Constant */
+
+dcl  ZERO				bit (36) aligned internal static options (constant)
+				init ((36)"0"b);
+dcl  ME				char (32) internal static options (constant)
+				init ("bj_txte_util");
+
+/* Entry */
+
+dcl  bj_storage_flush$up_to_rec_id	entry (ptr, bit (36) aligned);
+dcl  bj_storage_get			entry (bit (36) aligned, bit (36) aligned, ptr, fixed bin);
+dcl  bj_storage_append		entry (bit (36) aligned, ptr, fixed bin, fixed bin, fixed bin, bit (36) aligned,
+				fixed bin (71));
+dcl  bj_report_err			entry (fixed bin (35), char (*));
+dcl  bj_pste_lock$lock		entry (ptr, bit (36) aligned);
+dcl  bj_pste_lock$unlock		entry (ptr);
+dcl  cu_$level_get			entry (fixed bin);
+dcl  cu_$level_set			entry (fixed bin);
+dcl  dm_misc_util_$log		entry () options (variable);
+dcl  file_manager_$postcommit_do	entry (bit (36) aligned, bit (36) aligned, ptr, fixed bin, fixed bin (35));
+dcl  get_ring_			entry () returns (fixed bin (3));
+
+/* External Static */
+
+dcl  bjm_data_$bj_ppt_ptr		pointer external static;
+dcl  bjm_data_$bj_rollback_buffer_ptr	pointer external static;
+dcl  dm_error_$ci_not_allocated	fixed bin (35) ext static;
+dcl  dm_error_$misformatted_ci	fixed bin (35) ext static;
+dcl  dm_error_$not_own_transaction	fixed bin (35) ext static;
+dcl  dm_error_$incr_array_not_found     fixed bin (35) ext static;
+     
+
+%page;
+/* bj_txte_util$before_image:			repeat for reader	*/
+/*      procedure (p_txte_ptr);				*/
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_BEFORE_IMAGE ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$aborted_mark:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_ABORTED_MARK ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$simple_commit:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_COMMITTED_MARK ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$complex_commit:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	then do;
+
+	     call FINISH_BEGIN_COMMIT_MARK ();
+
+	     call EXECUTE_POSTCOMMIT_HANDLERS ();
+
+	     call WRITE_COMMITTED_MARK ();
+
+	     call FINISH_COMMITTED_MARK ();
+
+	end;
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$postcommit_mark:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_POSTCOMMIT_MARK ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$rolled_back_mark:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_ROLLED_BACK_MARK ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$fm_rollback_handler:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_FM_ROLLBACK_HANDLER ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$fm_postcommit_handler:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.pending_bj_rec_id ^= ZERO
+	     then call FINISH_FM_POSTCOMMIT_HANDLER ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+bj_txte_util$update_records_info:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.current_operation = ""
+	     then return;
+
+	if bj_txte.operator_info.process_id ^= bjm_data_$bj_ppt_ptr -> bj_ppt.process_id
+	     then call bj_report_err (dm_error_$not_own_transaction, ME);
+
+	call COPY_REC_INFO ();
+
+	return;
+
+bj_txte_util$synchronize_txte_pste:
+     entry (p_txte_ptr);
+
+	bj_txte_ptr = p_txte_ptr;
+
+	if bj_txte.append_state.current_operation = ""
+	     then return;
+
+	if bj_txte.operator_info.process_id ^= bjm_data_$bj_ppt_ptr -> bj_ppt.process_id
+	     then call bj_report_err (dm_error_$not_own_transaction, ME);
+
+	bj_ppte_ptr = bj_txte.operator_info.ppte_ptr;
+	bj_pste_ptr = bj_ppte.bj_pste_ptr;
+
+/*
+   at this point, locking the PSTE will synchronize it with its TXTE.  however,
+   we don't know if the pste_ptr points to the correct PSTE.  if we were to
+   check the PSTE, all we would know is that it did not belong to this TXTE.
+   in the mean time we have just synchronized it with its own TXTE.  if we were
+   really concerned with finding the correct PSTE, we would check each PSTE
+   for a meaningful append_state.txte_rec_id_relp, but is the overhead worth
+   it?
+*/
+
+	call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid); /* will blow up if pste and ppte UIDs don't match */
+	call bj_pste_lock$unlock (bj_pste_ptr);		/* so we were successful if we are here */
+
+/* complete any operation that was pending */
+
+	if bj_txte.append_state.pending_bj_rec_id = ZERO	/* write never completed */
+	then do;
+	     call MAKE_STATE_QUIESED ();
+	     return;
+	end;
+
+	if bj_txte.append_state.current_operation = BEGIN_COMMIT
+	then do;
+	     call FINISH_BEGIN_COMMIT_MARK ();
+	     call EXECUTE_POSTCOMMIT_HANDLERS ();
+	     call WRITE_COMMITTED_MARK ();
+	     call FINISH_COMMITTED_MARK ();
+	end;
+	else if bj_txte.append_state.current_operation = PERFORM_COMMIT
+	then do;
+	     call EXECUTE_POSTCOMMIT_HANDLERS ();
+	     call WRITE_COMMITTED_MARK ();
+	     call FINISH_COMMITTED_MARK ();
+	end;
+	else if bj_txte.append_state.current_operation = COMMITTED
+	     then call FINISH_COMMITTED_MARK ();
+	else if bj_txte.append_state.current_operation = ABORTED
+	     then call FINISH_ABORTED_MARK ();
+	else if bj_txte.append_state.current_operation = ROLLED_BACK
+	     then call FINISH_ROLLED_BACK_MARK ();
+	else if bj_txte.append_state.current_operation = BEFORE_IMAGE
+	     then call FINISH_BEFORE_IMAGE ();
+	else if bj_txte.append_state.current_operation = FM_ROLLBACK_HANDLER
+	     then call FINISH_FM_ROLLBACK_HANDLER ();
+	else if bj_txte.append_state.current_operation = FM_POSTCOMMIT_HANDLER
+	     then call FINISH_FM_POSTCOMMIT_HANDLER ();
+
+	call MAKE_STATE_QUIESED ();
+
+	return;
+
+
+%page;
+
+/* INTERNAL PROCEDURES */
+
+MAKE_STATE_QUIESED:
+     procedure ();
+
+	bj_txte.entry_state.last_completed_operation = bj_txte.append_state.current_operation;
+
+	bj_txte.append_state.current_operation = "";	/* officially quiesed */
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = 0;
+	bj_txte.append_state.pending_n_bytes_written = 0;
+
+	return;
+
+     end MAKE_STATE_QUIESED;
+
+COPY_REC_INFO:
+     procedure ();
+
+	bj_txte.records_info.last_bj_rec_id = bj_txte.append_state.pending_bj_rec_id;
+	bj_txte.records_info.n_rec_written = bj_txte.append_state.pending_n_rec_written;
+	bj_txte.records_info.n_bytes_written = bj_txte.append_state.pending_n_bytes_written;
+
+	if bj_txte.records_info.first_bj_rec_id = ZERO
+	then do;
+	     bj_txte.records_info.first_bj_rec_id = bj_txte.records_info.last_bj_rec_id;
+	     bj_txte.ppte_ptr -> bj_ppte.bj_pste_ptr -> bj_pste.meters.n_non_null_txn =
+		bj_txte.ppte_ptr -> bj_ppte.bj_pste_ptr -> bj_pste.meters.n_non_null_txn + 1;
+	end;
+
+	return;
+
+     end COPY_REC_INFO;
+
+FINISH_BEFORE_IMAGE:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	return;
+
+     end FINISH_BEFORE_IMAGE;
+
+FINISH_ABORTED_MARK:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	call bj_storage_flush$up_to_rec_id (bj_txte.ppte_ptr, bj_txte.append_state.pending_bj_rec_id);
+
+	bj_txte.entry_state.ok_to_write = "0"b;
+
+	return;
+
+     end FINISH_ABORTED_MARK;
+
+FINISH_COMMITTED_MARK:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	call bj_storage_flush$up_to_rec_id (bj_txte.ppte_ptr, bj_txte.append_state.pending_bj_rec_id);
+
+	bj_txte.entry_state.ok_to_write = "0"b;
+
+	return;
+
+     end FINISH_COMMITTED_MARK;
+
+FINISH_BEGIN_COMMIT_MARK:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	call bj_storage_flush$up_to_rec_id (bj_txte.ppte_ptr, bj_txte.append_state.pending_bj_rec_id);
+
+	return;
+
+     end FINISH_BEGIN_COMMIT_MARK;
+
+FINISH_POSTCOMMIT_MARK:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	call bj_storage_flush$up_to_rec_id (bj_txte.ppte_ptr, bj_txte.append_state.pending_bj_rec_id);
+
+	return;
+
+     end FINISH_POSTCOMMIT_MARK;
+
+FINISH_ROLLED_BACK_MARK:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	call bj_storage_flush$up_to_rec_id (bj_txte.ppte_ptr, bj_txte.append_state.pending_bj_rec_id);
+
+	bj_txte.curr_checkpoint_rec_id = ZERO;
+	bj_txte.last_fm_postcommit_handler_rec_id = ZERO;
+	bj_txte.records_info.first_bj_rec_id = bj_txte.records_info.last_bj_rec_id;
+
+	return;
+
+     end FINISH_ROLLED_BACK_MARK;
+
+FINISH_FM_ROLLBACK_HANDLER:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	call bj_storage_flush$up_to_rec_id (bj_txte.ppte_ptr, bj_txte.append_state.pending_bj_rec_id);
+
+	return;
+
+     end FINISH_FM_ROLLBACK_HANDLER;
+
+FINISH_FM_POSTCOMMIT_HANDLER:
+     procedure ();
+
+	call COPY_REC_INFO ();
+
+	bj_txte.last_fm_postcommit_handler_rec_id =
+	     bj_txte.append_state.pending_bj_rec_id;
+
+	return;
+
+     end FINISH_FM_POSTCOMMIT_HANDLER;
+
+WRITE_COMMITTED_MARK:
+     procedure ();
+
+dcl  1 my_bj_committed_record		like bj_committed_rec;
+
+	my_bj_committed_record.type = BJ_RECORD_TYPE.COMMITTED;
+	my_bj_committed_record.tid = bj_txte.tid;
+	my_bj_committed_record.process_id = bj_txte.owner_info.process_id;
+	my_bj_committed_record.prev_rec_id = bj_txte.last_bj_rec_id;
+	my_bj_committed_record.tx_rec_no = bj_txte.n_rec_written + 1;
+	n_rec_bytes = size (my_bj_committed_record) * 4;
+
+/* next section of code is to behave as bjm_write does:
+	call APPEND (addr (my_bj_committed_record), n_rec_bytes, -1, 0, FLUSH);
+*/
+
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+	bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + size (my_bj_committed_record) * 4;
+
+	bj_txte.append_state.current_operation = my_bj_committed_record.type;
+
+	call bj_storage_append (bj_txte.bj_oid, addr (my_bj_committed_record), size (my_bj_committed_record) * 4,
+	     -1, 0, bj_txte.append_state.pending_bj_rec_id, time_stamp);
+
+	return;
+
+     end WRITE_COMMITTED_MARK;
+
+EXECUTE_POSTCOMMIT_HANDLERS:
+     procedure ();
+
+/* change the append state of this transaction  to reflect this operation */
+
+	bj_txte.append_state.current_operation = BJ_RECORD_TYPE.PERFORM_COMMIT;
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = 0;
+	bj_txte.append_state.pending_n_bytes_written = 0;
+
+	bj_rec_hdr_ptr = bjm_data_$bj_rollback_buffer_ptr;
+
+	call cu_$level_get (saved_level);
+
+	on cleanup begin;
+	     call cu_$level_set (saved_level);
+	end;
+
+postcommit_loop:
+	do this_rec_id = bj_txte.last_fm_postcommit_handler_rec_id
+	     repeat (bj_fm_handler_rec.prev_fm_handler_rec_id)
+	     while (this_rec_id ^= ZERO);
+
+	     call bj_storage_get (bj_txte.bj_oid, this_rec_id, bj_rec_hdr_ptr, n_rec_bytes);
+
+	     if bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER
+		then call dm_misc_util_$log (LOG_SV, 0, ME, "non postcommit handler record found in postcommit list.");
+	     else do;
+
+		if bj_txte.owner_info.process_id ^= bjm_data_$bj_ppt_ptr -> bj_ppt.process_id
+		     then fm_oid = ZERO;
+		else fm_oid = bj_fm_handler_rec.fm_oid;
+		call cu_$level_set (get_ring_ ());
+		call file_manager_$postcommit_do (bj_fm_handler_rec.fm_uid, fm_oid,
+		     addr (bj_fm_handler_rec.info_bytes), bj_fm_handler_rec.info_len, code);
+		call cu_$level_set (saved_level);
+
+		if code = dm_error_$incr_array_not_found
+		then do;
+		     call dm_misc_util_$log (INFORM_SV, code, ME, "One attempt will be made to recover it.");
+		     call FIND_NEW_INCR_ARRAY;
+		     call cu_$level_set (get_ring_ ());
+		     call file_manager_$postcommit_do (bj_fm_handler_rec.fm_uid, fm_oid,
+			addr (bj_fm_handler_rec.info_bytes), bj_fm_handler_rec.info_len, code);
+		     call cu_$level_set (saved_level);
+		end;
+		if code = dm_error_$incr_array_not_found
+		then call dm_misc_util_$log (ERROR_SV, 0, ME, "Attempt to recover new key_count_array failed.");
+		else if code ^= 0
+		     then call dm_misc_util_$log (ERROR_SV, code, ME,
+		          "Error from calling file_manager_$postcommit_do.");
+	     end;
+
+	end postcommit_loop;
+
+     end EXECUTE_POSTCOMMIT_HANDLERS;
+
+FIND_NEW_INCR_ARRAY:
+     proc;
+
+ /* here we have concluded that the key_count_array is not where we left it 
+    at the time we wrote the post_commit handler (usually firstref in a txn).
+    we will try to find it with the fm_oid and the element_id stored in
+    bj_fm_handler_rec and increment_postcommit_info.
+*/
+
+dcl 1 local_bci_header aligned like bci_header;
+dcl 1 local_datum_slot aligned like datum_slot;
+dcl 1 local_ci_parts aligned,
+      2 number_of_parts fixed bin,
+      2 part (2) like ci_parts.part;
+     
+dcl BYTES_PER_WORD init(4) fixed bin(17) internal static options(constant);
+dcl file_manager_$get entry (bit(36) aligned, fixed bin(27), ptr, fixed bin(35));
+
+     postcommit_info_ptr = addr(bj_fm_handler_rec.info_bytes);
+     element_id_string= increment_postcommit_info.element_id;
+
+     local_ci_parts.number_of_parts = 1;
+     local_ci_parts.part (1).offset_in_bytes = 0;
+     local_ci_parts.part (1).length_in_bytes = size (local_bci_header) * BYTES_PER_WORD;
+     local_ci_parts.part (1).local_ptr = addr(local_bci_header);
+
+     if element_id.index > 0 then do;
+	local_ci_parts.number_of_parts = 2;
+	local_ci_parts.part (2).offset_in_bytes = (size (local_bci_header) + element_id.index - 1) * BYTES_PER_WORD;
+	local_ci_parts.part (2).length_in_bytes = BYTES_PER_WORD;
+	local_ci_parts.part (2).local_ptr = addr(local_datum_slot);
+     end;
+
+     call file_manager_$get (fm_oid, (element_id.control_interval_id), addr (local_ci_parts), code);
+     if code = 0
+	then if local_bci_header.layout_type ^= BASIC_CI_LAYOUT_1
+	     then if unspec (local_bci_header) = "0"b
+	          then code = dm_error_$ci_not_allocated;
+                    else code = dm_error_$misformatted_ci;
+
+     if code ^= 0 then
+	call dm_misc_util_$log(ERROR_SV, code, ME, 
+	"Attempting to recover new key_count_array after second try.");
+
+/* local_datum_slot.offset_in_bytes point to the beginning of the key_count
+   structure. The array actually starts at key_count_array.count(0) which is
+    KEY_COUNT_OFFSET_IN_CHARACTERS bytes in.
+*/
+
+     increment_postcommit_info.offset_in_bytes =
+	local_datum_slot.offset_in_bytes + KEY_COUNT_OFFSET_IN_CHARACTERS; 
+
+end FIND_NEW_INCR_ARRAY;
+
+/* Include Files */
+%page; %include dm_bj_pst;
+%page; %include dm_bj_pste;
+%page; %include dm_bj_ppt;
+%page; %include dm_bj_txt;
+%page; %include dm_bj_records;
+%page; %include dm_ci_parts;
+%page; %include dm_cm_basic_ci;
+%page; %include dm_element_id;
+%page; %include dm_fm_postcommit_info;
+%page; %include dm_key_count_array;
+%page; %include dm_log_sv_codes;
+
+
+     end bj_txte_util$before_image;

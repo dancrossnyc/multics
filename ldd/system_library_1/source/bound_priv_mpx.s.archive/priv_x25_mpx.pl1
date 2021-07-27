@@ -1,0 +1,364 @@
+/****^  *********************************************************
+        *                                                       *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989 *
+        *                                                       *
+        * Copyright, (C) Honeywell Bull Inc., 1987              *
+        *                                                       *
+        * Copyright (c) 1986 by Massachusetts Institute of      *
+        * Technology and Honeywell Information Systems, Inc.    *
+        *                                                       *
+        * Copyright (c) 1972 by Massachusetts Institute of      *
+        * Technology and Honeywell Information Systems, Inc.    *
+        *                                                       *
+        ********************************************************* */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-09-12,Beattie), approve(86-09-12,MCR7540),
+     audit(86-09-19,Brunelle), install(86-10-07,MR12.0-1176):
+     Ensure that LCT entries are freed when X.25 multiplexers crash or are
+     dumped (TR17714).
+  2) change(89-02-21,Parisek), approve(89-06-01,MCR8110),
+     audit(89-10-09,Farley), install(89-10-25,MR12.3-1100):
+     Add x25_packet_trace_(on off) orders for use in tracing PROTOCOL
+     packet I/O.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+priv_x25_mpx:
+     procedure;
+
+/* This procedure contains the privileged entry points to the
+   x25 multiplexer.  These entries are never referenced at interrupt
+   time and therefore need not be wired.
+
+   Coded December 1978 by J. Stern
+   Modified 7/31/79 by B.Westcott to support x25 instead.
+   Modified November 1979 by C. Hornig for installation.
+   Modified August 1981 by C. Hornig to add metering.
+   Modified May 1982 by D. W. Cousins for deletion of HOST level2 mpx.
+   Modified July 1983 by Robert Coren to implement administrative control of long_packet_size.
+   Modified August 1983 by Jeff Schiller to implement the "reverse charging" facility.
+   Modified October 1984 by R.J.C. Kissel to use the window size specified.
+   Modified October 1984 by R.J.C. Kissel to set the specified value for the breakall idle timer.
+*/
+
+/* Parameters */
+
+dcl  x25_code fixed bin (35);				/* error code */
+dcl  x25_devx fixed bin;				/* device (LCT) index */
+dcl  x25_infop ptr;					/* ptr to control order info structure */
+dcl  x25_miip ptr;					/* ptr to mux_init_info structure */
+dcl  x25_order char (*);				/* control order name */
+dcl  X25_data_ptr ptr;				/* ptr to x25_data (x25 multiplexer data base) */
+
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  devx fixed bin;
+dcl  order char (32);
+dcl  infop pointer;
+dcl  (lcx, scx) fixed bin;
+
+dcl  1 activate_order aligned,
+       2 dce_or_dte bit (1) unaligned,			/* ON = DCE */
+       2 lap_or_lapb bit (1) unaligned,			/* ON = lapb */
+       2 disc_first bit (1) unaligned,			/* ON = send disc upon physical connect */
+       2 trace_off bit (1) unaligned,			/* ON = turn off trace upon line crash */
+       2 pad bit (5) unaligned,			/* padding */
+       2 activation_order bit (9) unaligned,		/* "001"b3 */
+       2 frame_size uns fixed bin (18) unaligned,		/* max size of I-frame */
+       2 K uns fixed bin (9) unaligned,			/* max unack frame in frame level */
+       2 N2 uns fixed bin (9) unaligned,		/* number of retries */
+       2 T1 uns fixed bin (9) unaligned,		/* retry timer in tenths of seconds */
+       2 T3 uns fixed bin (9) unaligned;		/* init timer */
+
+/* Based */
+
+dcl  based_packet_size fixed bin based;
+
+
+/* Internal static */
+
+dcl  init_sw bit (1) aligned static init ("0"b);
+dcl  modulus8 fixed bin int static options (constant) init (8);
+
+/* External static */
+
+dcl  error_table_$action_not_performed fixed bin (35) ext;
+dcl  error_table_$dev_nt_assnd fixed bin (35) ext;
+dcl  error_table_$noalloc fixed bin (35) ext;
+dcl  error_table_$null_info_ptr fixed bin (35) ext;
+dcl  error_table_$undefined_order_request fixed bin (35) ext;
+dcl  error_table_$unimplemented_version fixed bin (35) ext;
+
+
+/* Conditions */
+
+dcl  cleanup condition;
+
+
+/* Builtins */
+
+dcl  (addr, after, before, currentsize, fixed, null, reverse, rtrim, size, string, unspec) builtin;
+
+
+/* Entries */
+
+dcl  x25_mpx$system_init entry;
+
+%page;
+/* Entry to allocate and initialize the  multiplexer data base for a given major channel */
+
+init_multiplexer:
+     entry (x25_devx, x25_miip, X25_data_ptr, x25_code);
+
+	devx = x25_devx;
+	miip = x25_miip;
+	X25_data_ptr = null ();
+
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+
+	x25_data_n_sc = mux_init_info.no_channels;
+	x25_data_ptr = null ();
+	on cleanup
+	     begin;
+	     if x25_data_ptr ^= null () then call tty_space_man$free_space (size (x25_data), x25_data_ptr);
+	end;
+
+	call tty_space_man$get_space (size (x25_data), x25_data_ptr);
+						/* allocate space for multiplexer data base */
+	if x25_data_ptr = null () then do;
+	     x25_code = error_table_$noalloc;
+	     return;
+	     end;
+
+	x25_data.name = reverse (after (reverse (mux_init_info.channels (1).name), "."));
+	x25_data.devx = devx;
+	x25_data.state = X25_HUNGUP;
+	x25_data.n_sc = x25_data_n_sc;
+	x25_data.n_lc = 0;
+	x25_data.lc_ptr = null ();
+	x25_data.write_head, x25_data.write_tail = null ();
+
+	do scx = 1 to x25_data.n_sc;
+	     xscep = addr (x25_data.sc (scx));
+	     xsce.name = mux_init_info.channels (scx).name;
+	     xsce.state = SC_HUNGUP;
+	     xsce.devx = mux_init_info.channels (scx).devx;
+	     xsce.lcx = 0;
+	     string (xsce.flags) = ""b;
+	     xsce.service = rtrim (reverse (before (reverse (mux_init_info.channels (scx).name), ".")), " 0123456789");
+	     xsce.write_head, xsce.write_tail = null ();
+	     xsce.trans_table_ptr = null ();
+
+	     lctep = addr (lct.lcte_array (xsce.devx));
+	     lcte.subchannel = scx;
+	end;
+
+	if ^init_sw then do;
+	     call x25_mpx$system_init;
+	     init_sw = "1"b;
+	     end;
+
+	X25_data_ptr = x25_data_ptr;
+	x25_code = 0;
+	return;
+
+/* * * * * * * * * * TERMINATE_MULTIPLEXER * * * * * * * * * */
+
+/* Entry to discard the multiplexer data base for a given major channel */
+
+terminate_multiplexer:
+     entry (X25_data_ptr, x25_code);
+
+	x25_data_ptr = X25_data_ptr;
+
+	if x25_data.lc_ptr ^= null () then do;
+	     call tty_space_man$free_space (size (x25_lces), x25_data.lc_ptr);
+	     x25_data.lc_ptr = null ();
+	     end;
+
+	call tty_space_man$free_space (currentsize (x25_data), x25_data_ptr);
+
+	X25_data_ptr = null ();
+	x25_code = 0;
+	return;
+
+/* * * * * * * * * START * * * * * * * * * */
+
+/* Entry to allow dialups on multiplexer subchannels */
+
+start:
+     entry (X25_data_ptr, x25_code);
+
+	x25_data_ptr = X25_data_ptr;
+	x25_data.flags.mpx_started = "1"b;
+	x25_code = 0;
+	return;
+
+/* * * * * * * * * * STOP * * * * * * * * * */
+
+/* Entry to forbid dialups on multiplexer subchannels */
+
+stop:
+     entry (X25_data_ptr, x25_code);
+
+	x25_data_ptr = X25_data_ptr;
+	x25_data.flags.mpx_started = "0"b;
+	x25_code = 0;
+	return;
+
+/* * * * * * * * * * SHUTDOWN * * * * * * * * * */
+
+/* Entry to shut down the multiplexer (equivalent to a crash) */
+/* instead of just hangup. It should be a disconnect order and
+   then a deactivate order for any state greater then listening
+*/
+
+shutdown:
+     entry (X25_data_ptr, x25_code);
+
+	x25_data_ptr = X25_data_ptr;
+	if x25_data.state > X25_HUNGUP then call channel_manager$control (x25_data.devx, "hangup", null (), code);
+	return;
+
+/* * * * * * * * * PRIV_CONTROL * * * * * * * * * * */
+
+/* Entry to perform privileged control orders */
+
+priv_control:
+     entry (X25_data_ptr, x25_order, x25_infop, x25_code);
+
+	x25_data_ptr = X25_data_ptr;
+	order = x25_order;
+	x25_code = 0;
+
+	if /* case */ order = "copy_meters" then do;
+	     call channel_manager$control (x25_data.devx, order, x25_infop, x25_code);
+	     end;
+
+	else if order = "get_meters" then do;
+	     call channel_manager$control (x25_data.devx, order, x25_infop, x25_code);
+	     end;
+
+	else if order = "x25_packet_trace_on" then x25_data.packet_trace_sw = "1"b;
+	else if order = "x25_packet_trace_off" then x25_data.packet_trace_sw = "0"b;
+	else x25_code = error_table_$undefined_order_request;
+
+	return;
+
+/* * * * * * * * * * HPRIV_CONTROL * * * * * * * * * */
+
+/* Entry to perform highly privileged control orders */
+
+hpriv_control:
+     entry (X25_data_ptr, x25_order, x25_infop, x25_code);
+
+	x25_data_ptr = X25_data_ptr;
+	order = x25_order;
+	code = 0;
+
+	if /* case */ order = "load_mpx" then do;	/* bootload the multiplexed device */
+	     ttybp = addr (tty_buf$);
+	     lctp = tty_buf.lct_ptr;
+	     x25_load_infop = x25_infop;		/* save load info */
+
+	     if x25_load_info.version ^= X25_LOAD_INFO_VERSION_1 then do;
+		x25_code = error_table_$unimplemented_version;
+		return;
+		end;
+
+	     if x25_data.state > X25_HUNGUP then do;	/* one at a time please */
+		x25_code = error_table_$action_not_performed;
+		return;
+		end;
+
+	     x25_data.n_lc = x25_load_info.n_lc;
+	     call tty_space_man$get_space (size (x25_lces), x25_data.lc_ptr);
+	     if x25_data.lc_ptr = null () then do;
+		x25_code = error_table_$noalloc;
+		return;
+		end;
+
+	     x25_data.load_proc_id = x25_load_info.pid;
+	     x25_data.load_ev_chan = x25_load_info.ev_chan;
+
+	     unspec (activate_order) = ""b;
+	     activate_order.dce_or_dte = x25_load_info.dce;
+	     activate_order.lap_or_lapb = x25_load_info.abm;
+	     activate_order.disc_first = x25_load_info.disc_first;
+	     activate_order.activation_order = "001"b3;
+	     activate_order.trace_off = x25_load_info.trace_off;
+	     activate_order.frame_size = x25_load_info.frame_size;
+	     activate_order.K = x25_load_info.k;
+	     activate_order.N2 = x25_load_info.n2;
+	     activate_order.T1 = fixed (10e0 * x25_load_info.t1, 9);
+	     activate_order.T3 = fixed (x25_load_info.t3, 9);
+
+	     call channel_manager$control (x25_data.devx, "line_control", addr (activate_order), code);
+	     if code ^= 0 then do;
+		x25_code = code;
+		return;
+		end;
+
+	     x25_data.net_type = x25_load_info.net_type;
+	     x25_data.my_address = x25_load_info.my_address;
+	     string (x25_data.flags) = ""b;
+	     x25_data.flags.bypass_restart = x25_load_info.bypass_restart;
+	     x25_data.flags.no_d = x25_load_info.no_d;
+	     x25_data.flags.out_calls_collect = x25_load_info.flags.out_calls_collect;
+	     x25_data.seq_mod = modulus8;
+	     x25_data.gfid = "01"b;
+	     x25_data.long_packet_size = x25_load_info.long_packet_size;
+	     x25_data.breakall_idle_timer = x25_load_info.breakall_idle_timer;
+
+	     do lcx = 1 to x25_data.n_lc;		/* init subchannel entries */
+		xlcep = addr (x25_lces.lc (lcx));
+		xlce.state = READY;
+		xlce.scx = 0;
+		xlce.max_packet_size = x25_load_info.max_packet_size;
+		xlce.max_window_size = x25_load_info.window_size;
+		xlce.window_size = x25_load_info.window_size;
+		string (xlce.flags) = ""b;
+	     end;
+
+	     do scx = 1 to x25_data.n_sc;
+		xscep = addr (x25_data.sc (scx));
+		lctep = addr (lct.lcte_array (xsce.devx));
+		lcte.physical_channel_devx = xsce.devx;
+	     end;
+
+	     call channel_manager$control (x25_data.devx, "listen", null (), code);
+	     if code ^= 0 then do;
+		x25_code = code;
+		return;
+		end;
+
+	     x25_data.state = X25_LISTENING;
+	     end;
+
+	else if order = "set_long_packet_threshold" then do;
+	     infop = x25_infop;
+	     if infop = null () then code = error_table_$null_info_ptr;
+	     else if x25_data.state = X25_HUNGUP then code = error_table_$dev_nt_assnd;
+	     else x25_data.long_packet_size = infop -> based_packet_size;
+	     end;
+
+	else code = error_table_$undefined_order_request;
+
+	x25_code = code;
+	return;
+%page;
+%include x25_data;
+%include x25_load_info;
+%include mux_init_info;
+%include lct;
+%include tty_buf;
+%include channel_manager_dcls;
+%include tty_space_man_dcls;
+     end priv_x25_mpx;

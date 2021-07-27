@@ -1,0 +1,378 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+     This program contains 2 entrypoints:
+
+     $up_to_rec_id flushes the journal up to the specified record.
+	It is called by bjm_flush_transaction to flush all records
+	appended to the journal by a transaction, as a step to get
+	ready to commit. It is also called by bj_storage_append, to
+	flush the logical record just appended to the journal, when
+	the type of the record requires a flush (ie committed mark,
+	aborted mark and rolled back mark).
+
+     $threshold flushes the journal up to the last ci put. It is called
+	by bj_storage_append when the number of unflushed before images,
+	and consequently the number of pages held in main memory, becomes
+	higher than a threshold.
+
+
+     Most of the code is common to the 2 procedures. The $threshold
+     entrypoint initializes the record id to be the first record of the
+     last CI put and then relies on the $up_to_rec_id entrypoint to do
+     the job. So, the remainder of the description applies to both procedures.
+
+
+     This procedure returns to the caller only after all required
+     disk I/O's are physically completed.
+
+     It updates the time stamp associated with the before journal
+     involved, for use by page control to honor the write ahead log protocol.
+
+	It also updated the number of "unsafe before images" in this
+     journal, that is, the number of before images that are not yet known
+     to be on disk.  This number is kept in bj_pste.n_bi_still_unsafe.  It
+     representes an upper bound of the current number of CI's that may be
+     held in main memory because of this journal.  Whenever a BI is
+     appended to a journal, the count of unsafe before images in this
+     journal is incremented by 1.  If the count becomes larger than a
+     threshold per journal, the append procedure calls the $threshold entry
+     point to flush the journal to release the pressure in main memory.
+
+
+     NOTE - To minimize the number of pages held in main memory, the journal
+     is always flushed up to the last ci put, unless the specified record
+     happens to be in the buffer, in which case the buffer is flushed too.
+
+     
+     The basic steps taken by this program are as follows:
+
+     1. If any part of the last record to be flushed is in the buffer,
+        put the buffer in the page file.
+
+     2. Flush the journal from the CI following the portion of the journal
+        known completely on disk, up to the last ci put in the page file.
+        The flushing is done by calling the page file manager, which in
+        turn, will call page control.
+
+        It is important to point out that the journal, ie the bj_pste, is
+        unlocked before calling the page file manager so that other processes
+        can use it during the physical I/O's. Upon return the journal is locked
+        again, and the rest of the program is ready to deal with any change
+        that may have happened while the journal was unlocked.
+     
+     3. Update the cursor to the last_ci_on_disk, carefully, making sure it can
+        only move forward in the circular journal.
+     
+     4. Update the time stamp used by page control for this journal, carefully,
+        making sure it can only move forward in time.
+
+     5. Update the number of still unsafe before images, carefully, making sure it can
+        only decrease.
+*/
+
+/* HISTORY:
+Written by A. Bensoussan, 10/29/82.
+Modified:
+02/23/83 by A. Bensoussan:  to lock/unlock using bj_pste_lock$lock/unlock.
+12/05/84 by M. Sharpe:  to correct format and dcls; to use ERROR_RETURN; to
+	  set/reset validation level around the calls to file_manager_.
+*/
+
+/* format: style2,ind3,^indcomtxt */
+%page;
+bj_storage_flush:
+   proc;
+      signal not_an_entrypoint;			/* Not an entry point */
+      return;
+
+/* START OF DECLARATIONS */
+
+/* Parameter */
+
+      dcl	    p_bj_ppte_ptr	       ptr;
+      dcl	    p_rec_id	       bit (36) aligned;
+
+/* Automatic */
+
+      dcl	    code		       fixed bin (35);
+      dcl	    pf_oid	       bit (36) aligned;
+      dcl	    rec_id	       bit (36) aligned;
+      dcl	    ci_no		       fixed bin (24) uns;
+      dcl	    first		       fixed bin (24) uns;
+      dcl	    last		       fixed bin (24) uns;
+      dcl	    my_last_ci_flushed     fixed bin (24) uns;
+      dcl	    my_stamp	       fixed bin (71);
+      dcl	    n_bi_being_saved_by_me fixed bin;
+      dcl	    n_bi_in_buffer	       fixed bin;
+      dcl	    entry_no	       fixed bin;
+      dcl	    current_ring	       fixed bin (3);
+      dcl	    saved_level	       fixed bin;
+
+
+/* Based */
+
+      dcl	    1 rec_id_str	       based,
+	      2 ci_no	       fixed bin (24) uns unaligned,
+	      2 slot_no	       fixed bin (12) uns unaligned;
+
+/* Builtin */
+
+      dcl	    (addr, ptr)	       builtin;
+
+/* Conditions */
+
+      dcl	    (cleanup, not_an_entrypoint)
+			       condition;
+
+/* Constant */
+
+      dcl	    ME		       char (16) internal static options (constant) init ("bj_storage_flush");
+
+/* Entry */
+
+      dcl	    bj_pste_lock$lock      entry (ptr, bit (36) aligned);
+      dcl	    bj_pste_lock$unlock    entry (ptr);
+
+      dcl	    file_manager_$flush_consecutive_ci
+			       entry (bit (36) aligned, fixed bin (24) uns, fixed bin (24) uns, fixed bin (35));
+
+      dcl	    bj_storage_put_buffered_ci
+			       entry (bit (36) aligned, ptr);
+      dcl	    bj_storage_util$next_used_ci
+			       entry (ptr, fixed bin (24) uns) returns (fixed bin (24) uns);
+      dcl	    dm_hcs_$set_journal_stamp
+			       entry (fixed bin, fixed bin (71), fixed bin (35));
+      dcl	    bj_report_err	       entry (fixed bin (35), char (*));
+      dcl	    get_ring_	       entry () returns (fixed bin (3));
+      dcl	    cu_$level_get	       entry (fixed bin);
+      dcl	    cu_$level_set	       entry (fixed bin);
+
+/* External */
+
+      dcl	    dm_error_$bj_bad_ci_no ext fixed bin (35);
+
+/* END OF DECLARATIONS */
+%page;
+up_to_rec_id:
+   entry (p_bj_ppte_ptr, p_rec_id);			/* ----- ENTRYPOINT 1 ----- */
+
+      entry_no = 1;
+      rec_id = p_rec_id;
+      goto COMMON;
+
+
+threshold:
+   entry (p_bj_ppte_ptr);				/* ----- ENTRYPOINT 2 ----- */
+
+      entry_no = 2;
+      rec_id = "0"b;
+      goto COMMON;
+
+COMMON:						/* Initialize some variables */
+      bj_ppte_ptr = p_bj_ppte_ptr;
+      bj_pste_ptr = bj_ppte.bj_pste_ptr;
+      pf_oid = bj_ppte.pf_oid;
+
+      current_ring = get_ring_ ();
+      call cu_$level_get (saved_level);
+      on cleanup call cu_$level_set (saved_level);
+
+/* Lock the bj_pste to be alone working on this journal */
+
+      call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+
+
+
+/* If the last record to be flushed has any portion in the
+   current buffer, put the buffer in the page file. 
+   Then decide to flush up to the last CI put. */
+
+
+      bj_ci_ptr = ptr (bj_pste_ptr, bj_pste.buffer_offset);
+
+
+      if entry_no = 2
+      then
+         do;
+	  addr (rec_id) -> rec_id_str.ci_no = bj_pste.last_ci_put;
+	  addr (rec_id) -> rec_id_str.slot_no = 1;
+
+/* In fact a better way would be to check if it is also
+		necessary to flush the buffer in order to get below the
+		threshold. Should be done some day.*/
+
+         end;
+
+
+
+      ci_no = addr (rec_id) -> rec_id_str.ci_no;
+
+      if ci_no < bj_pste.cl.lowest_ci | ci_no > bj_pste.cl.highest_ci
+      then call ERROR_RETURN (dm_error_$bj_bad_ci_no);
+
+%page;
+      if ci_no = bj_pste.last_ci_buffered | (bj_ci.header2.first_is_contn & bj_ci.header2.first_rec_id = rec_id)
+      then if bj_pste.last_ci_put ^= bj_pste.last_ci_buffered
+	 then call bj_storage_put_buffered_ci (pf_oid, bj_pste_ptr);
+
+
+      last = bj_pste.last_ci_put;
+
+
+
+
+/* Calculate the ci number of the first CI to be flushed.
+   If no flush is needed, go to the end to unlock. This case may happen
+   if another process has already started and completed the flush up to
+   the last ci we need to flush.
+
+   If a flush is needed, remember:
+      - the last ci I am going to flush
+      - the time stamp for the last ci I am going to flush
+      - the number of bi's my flush is going to make safe.
+*/
+
+      if bj_pste.last_ci_on_disk = bj_pste.last_ci_put
+      then goto Done;
+
+
+      if bj_pste.last_ci_put = bj_pste.last_ci_buffered
+      then n_bi_in_buffer = 0;
+      else n_bi_in_buffer = bj_ci.header2.n_bi;
+
+
+      first = bj_storage_util$next_used_ci (bj_pste_ptr, bj_pste.last_ci_on_disk);
+						/* Should not rollover*/
+
+      bj_pste.last_ci_flushed = last;
+
+      my_last_ci_flushed = bj_pste.last_ci_flushed;
+      my_stamp = bj_pste.stamp_for_last_ci_put;
+
+      n_bi_being_saved_by_me = bj_pste.n_bi_still_unsafe - bj_pste.n_bi_being_saved - n_bi_in_buffer;
+
+      bj_pste.n_bi_being_saved = bj_pste.n_bi_being_saved + n_bi_being_saved_by_me;
+%page;
+/* - Unlock the bj_pste.
+   - Call the page file manager to do the flush and wait for completion.
+   - Relock the bj_pste. 
+*/
+
+      call bj_pste_lock$unlock (bj_pste_ptr);
+
+      if first <= last
+      then
+         do;
+	  call cu_$level_set ((current_ring));
+	  call file_manager_$flush_consecutive_ci (pf_oid, first, last - first + 1, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+         end;
+
+      else
+         do;
+	  call cu_$level_set ((current_ring));
+	  call file_manager_$flush_consecutive_ci (pf_oid, first, bj_pste.cl.highest_ci - first + 1, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+	  call file_manager_$flush_consecutive_ci (pf_oid, bj_pste.cl.lowest_ci, last - bj_pste.cl.lowest_ci + 1, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+         end;
+
+      call cu_$level_set (saved_level);
+      call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+%page;
+/* Update the cursor bj_pste.last_ci_on_disk so that it points to the end of 
+   the journal's portion completely on disk, and update the time stamp used
+   by page control. These 2 items are cursors in nature and should only move
+   forward, one in the journal, the other in time. The updating should cause
+   these cursors to move forward, otherwise no updating should be done. 
+*/
+
+
+      if my_stamp > bj_pste.stamp_for_last_ci_on_disk
+      then
+         do;
+
+	  bj_pste.last_ci_on_disk = my_last_ci_flushed;
+	  bj_pste.stamp_for_last_ci_on_disk = my_stamp;
+
+	  call dm_hcs_$set_journal_stamp (bj_pste.bj_ix, my_stamp, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code);
+
+	  bj_pste.n_bi_still_unsafe = bj_pste.n_bi_still_unsafe - n_bi_being_saved_by_me;
+
+	  if bj_pste.last_ci_on_disk = bj_pste.last_ci_flushed
+	  then
+	     do;
+	        bj_pste.n_bi_being_saved = 0;
+
+	        if bj_pste.last_ci_on_disk = bj_pste.last_ci_put
+	        then
+		 do;
+		    if bj_pste.last_ci_put = bj_pste.last_ci_buffered
+		    then bj_pste.n_bi_still_unsafe = 0;
+		    else bj_pste.n_bi_still_unsafe = bj_ci.header2.n_bi;
+		 end;
+	     end;
+         end;
+
+
+
+
+
+
+
+Done:
+      call bj_pste_lock$unlock (bj_pste_ptr);
+
+
+      return;
+
+
+
+ERROR_RETURN:
+   proc (er_code);
+
+      dcl	    er_code	       fixed bin (35);
+
+      call cu_$level_set (saved_level);
+      call bj_report_err (er_code, ME);			/* does not return */
+   end ERROR_RETURN;
+
+
+
+%page;
+%include dm_bj_static;
+
+%page;
+%include dm_bj_ppt;
+
+%page;
+%include dm_bj_pst;
+
+%page;
+%include dm_bj_pste;
+
+%page;
+%include dm_bj_txt;
+
+%page;
+%include dm_bj_ci;
+
+%page;
+%include dm_ci_header;
+
+%page;
+%include dm_bj_global_error_info;
+
+   end bj_storage_flush;

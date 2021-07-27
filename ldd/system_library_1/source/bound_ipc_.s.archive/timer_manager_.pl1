@@ -1,0 +1,1039 @@
+/****^  **************************************************************
+        *                                                            *
+        * Copyright, (C) Massachusetts Institute of Technology, 1982 *
+        *                                                            *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982    *
+        *                                                            *
+        * Copyright (c) 1972 by Massachusetts Institute of           *
+        * Technology and Honeywell Information Systems, Inc.         *
+        *                                                            *
+        ************************************************************** */
+
+/* format: style4,insnl,delnl,ifthendo */
+
+timer_manager_:
+     proc;
+	return;
+
+/* This procedure provides to a user process the ability to schedule timers as
+   if there were an infinite number of hardware timers available, by keeping a
+   list of scheduled timers and intercepting all timer wakeups and interrupts.
+
+   Dedicated to Peter Bishop, who did the best he could with the tools he had.
+
+   LINES MARKED "DEBUG" and commented out should REMAIN commented out
+   in the production version.  They are only decommented for debugging.
+
+   Entirely rewritten 12/03/79 by C. D. Tavares.
+   Also added ability to sleep in inner ring and examine list of timers
+   scheduled to occur in the process. */
+
+/* Changed by E. Donner Jan 1981 to change calls to full_ipc_$ to ipc_$ for new ipc changes */
+/* Modified by Benson I. Margulies, September 1981, for condition wall an alarm_call calls. */
+/* Modified September 8, 1982 by Richard Lamson to add data pointer argument	     */
+/* Modified by BIM, November 1982 to take condition wall back out. */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-12,Kissel), approve(86-08-12,MCR7473),
+     audit(86-10-20,Fawcett), install(86-11-03,MR12.0-1206):
+     Changed to support control point management.  These changes were actually
+     done in February 1985 by G. Palter.
+  2) change(86-12-10,Fawcett), approve(86-12-17,MECR0003),
+     audit(86-12-15,GDixon), install(86-12-17,MR12.0-1250):
+     Changed to fix the problem in Initializer use of timer_manager_.
+     system_startup_ (Initializer ring 1 command level) calls
+     timer_manager_$sleep in ring 1, causing initial_ring (in timer_manager_'s
+     ring 1 internal static) to be set to 1 (since Initializer hasn't crossed
+     out into ring 4 yet).  After crossing to ring 4, when the Initializer
+     calls into ring_1 to a function that requires timer_manager_$sleep, ring 1
+     internal static still thinks initial_ring is 1, rather than 4.  It
+     therefore uses the login_ring sleep protocol rather than the inner ring
+     protocol, goes blocked in ring 1 and never awakens. The fix is to always
+     call the internal proc initialize. In this proc a check is made for
+     initial_ring = 1 and then if this is Initializer, then set the
+     initialized_mechanisum to Uninitialized (0) and reinit in this ring.
+  3) change(87-01-13,Fawcett), approve(87-01-13,MCR7601),
+     audit(87-01-13,GJohnson), install(87-01-13,MR12.0-1270):
+     This closes MECR0003.
+  4) change(87-01-13,Lippard), approve(86-11-24,MCR7577),
+     audit(87-01-14,Dickson), install(87-03-30,MR12.1-1018):
+     Change actually made 86-10-29, bogus date is to satisfy hcom.
+     Make timer_manager_$sleep unschedule timer in cleanup handler.
+                                                   END HISTORY COMMENTS */
+
+
+dcl  a_time fixed bin (71) parameter,			/* desired time of event */
+     a_flags bit (2) parameter,			/* 0=abs/1=rel; 0=usec/1=sec */
+     a_routine entry variable parameter,		/* routine to call when timer goes off */
+     a_channel fixed bin (71) parameter;		/* channel to wakeup over when timer goes off */
+
+dcl  area_ptr pointer parameter,			/* get_schedule entry: pointer to user area */
+     a_code fixed bin (35) parameter;
+
+dcl  a_mc_ptr pointer parameter,			/* interrupt entries: machine conditions ptr pointer */
+     a_condition_name char (*) parameter,		/* alrm or cput */
+     a_hc_mc_ptr pointer parameter,			/* hardcore machine conditions ptr */
+     io_ptr pointer,				/* we don't use this */
+     a_continue bit (1) aligned;			/* resignal condition if we turn it on */
+
+dcl  a_call_timer_info_ptr pointer parameter;		/* invoke_users_routine: data set by other control point */
+
+dcl  data_ptr pointer,
+     data_ptr_provided bit (1) aligned;
+
+dcl  call_timer_info_ptr pointer,
+     call_timer_info_condition_name_lth fixed binary (21);
+
+/* static */
+
+dcl  (
+     allow_all_mask bit (36) aligned initial ((36)"1"b),
+     alrm_cput_mask bit (36) aligned initial (""b),
+     alrm_cput_quit_mask bit (36) aligned initial (""b),
+     alrm_disabled_mask bit (36) aligned initial (""b),
+     my_group_id char (32) initial (""),     
+     initial_ring fixed bin initial (-2),
+     initialized_mechanism fixed bin initial (0),
+     my_processid bit (36) initial (""b),
+     start_alarm_list_ptr pointer initial (null),
+     start_cpu_list_ptr pointer initial (null),
+     free_bead_list_ptr pointer initial (null),
+     saved_channel_array (5) fixed binary (71) initial ((5) - 1),
+     saved_channel_count fixed binary initial (0),
+     sys_areap pointer initial (null),
+     this_ring fixed bin initial (-1)
+     ) static;
+
+/* external static */
+
+dcl  error_table_$invalid_channel fixed bin (35) external static,
+     error_table_$noalloc fixed bin (35) external static,
+     sys_info$max_seg_size fixed bin (35) ext static;
+
+/* constants */
+
+dcl  (
+     Alarm bit (1) aligned initial ("1"b),
+     CPU bit (1) aligned initial (""b),
+     Initializer char (23) initial ("Initializer.SysDaemon.z"),
+     Inhibit bit (1) aligned initial ("1"b),
+     No_inhibit bit (1) aligned initial (""b),
+     Call bit (1) aligned initial ("1"b),
+     Wakeup bit (1) aligned initial (""b),
+     Limited fixed bin initial (1),
+     Full fixed bin initial (2),
+     Uninitialized fixed bin initial (0),
+     Absolute_setting fixed bin initial (2),
+     Million fixed bin (35) initial (1f6),
+     Forever fixed bin (71) initial (1f70b),
+     All_IPS (1) char (32) aligned initial ("-all"),
+     IPS_names (3) char (32) aligned initial ("alrm", "cput", "quit")
+     ) static options (constant);
+
+/* entries */
+
+dcl  create_ips_mask_ entry (ptr, fixed bin, bit (36) aligned),
+     cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35)),
+     ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35)),
+     ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35)),
+     get_group_id_ entry () returns (char (32)),
+     get_initial_ring_ entry returns (fixed bin),
+     get_process_id_ entry returns (bit (36) aligned),
+     get_ring_ entry returns (fixed bin),
+     get_system_free_area_ entry returns (pointer),
+     hcs_$assign_channel entry (fixed bin (71), fixed bin (35)),
+     hcs_$reset_ips_mask entry (bit (36) aligned, bit (36) aligned),
+     hcs_$get_alarm_timer entry (fixed bin (71), fixed bin (71)),
+     hcs_$set_alarm_timer entry (fixed bin (71), fixed bin, fixed bin (71)),
+     hcs_$set_automatic_ips_mask entry (bit (36) aligned, bit (36) aligned),
+     hcs_$set_cpu_timer ext entry (fixed bin (71), fixed bin, fixed bin (71)),
+     hcs_$get_ips_mask ext entry (bit (36) aligned),
+     hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned),
+     hcs_$wakeup entry (bit (36), fixed bin (71), char (8) aligned, fixed bin (35)),
+     ipc_$block entry (pointer, pointer, fixed bin (35));
+
+/* based */
+
+dcl  1 bead aligned based,
+       2 next_ptr pointer,
+       2 info like schedule.timer;
+
+dcl  1 call_timer_info aligned based (call_timer_info_ptr),
+       2 routine entry (pointer, character (*), pointer, pointer) variable,
+       2 condition_name_lth fixed binary (21),
+       2 pad bit (36) aligned,
+       2 mc_ptr pointer,
+       2 hc_mc_ptr pointer,
+       2 data_ptr pointer,
+       2 condition_name
+	  character (call_timer_info_condition_name_lth refer (call_timer_info.condition_name_lth)) unaligned;
+
+dcl  sys_area area (sys_info$max_seg_size) based (sys_areap);
+
+/* builtins and conditions */
+
+dcl  (addr, bool, clock, hbound, length, null, stackbaseptr, substr, unspec, vclock) builtin;
+
+dcl  (area, cleanup) condition,
+     timer_manager_err condition;
+
+/* format: off */
+%page; %include timer_manager_schedule;
+%page; %include mc;
+%page; %include stack_header;
+%page; %include cpm_data_;
+%page; %include cpm_entries;
+/* format: on */
+%page;
+alarm_call:
+     entry (a_time, a_flags, a_routine);
+
+	call set_data_ptr (4, data_ptr, data_ptr_provided);
+	call schedule_timer (abs_time (a_time, a_flags, Alarm), Alarm, No_inhibit, Call, 0, a_routine, data_ptr,
+	     data_ptr_provided);
+	return;
+%skip (2);
+alarm_call_inhibit:
+     entry (a_time, a_flags, a_routine);
+
+	call set_data_ptr (4, data_ptr, data_ptr_provided);
+	call schedule_timer (abs_time (a_time, a_flags, Alarm), Alarm, Inhibit, Call, 0, a_routine, data_ptr,
+	     data_ptr_provided);
+	return;
+%skip (2);
+cpu_call:
+     entry (a_time, a_flags, a_routine);
+
+	call set_data_ptr (4, data_ptr, data_ptr_provided);
+	call schedule_timer (abs_time (a_time, a_flags, CPU), CPU, No_inhibit, Call, 0, a_routine, data_ptr,
+	     data_ptr_provided);
+	return;
+%skip (2);
+cpu_call_inhibit:
+     entry (a_time, a_flags, a_routine);
+
+	call set_data_ptr (4, data_ptr, data_ptr_provided);
+	call schedule_timer (abs_time (a_time, a_flags, CPU), CPU, Inhibit, Call, 0, a_routine, data_ptr,
+	     data_ptr_provided);
+	return;
+%skip (2);
+alarm_wakeup:
+     entry (a_time, a_flags, a_channel);
+
+	call schedule_timer (abs_time (a_time, a_flags, Alarm), Alarm, No_inhibit, Wakeup, a_channel,
+	     signal_timer_manager_err, null, "0"b);
+	return;
+%skip (2);
+cpu_wakeup:
+     entry (a_time, a_flags, a_channel);
+
+	call schedule_timer (abs_time (a_time, a_flags, CPU), CPU, No_inhibit, Wakeup, a_channel,
+	     signal_timer_manager_err, null, "0"b);
+	return;
+%skip (2);
+sleep:
+     entry (a_time, a_flags);
+
+	call sleep (abs_time (a_time, a_flags, Alarm), "0"b);
+	return;
+%skip (2);
+sleep_lss:
+     entry (a_time, a_flags);
+
+	call sleep (abs_time (a_time, a_flags, Alarm), "1"b);
+	return;
+%skip (2);
+reset_alarm_call:
+     entry (a_routine);
+
+	call set_data_ptr (2, data_ptr, data_ptr_provided);
+	call unschedule_timer (Alarm, Call, 0, a_routine, data_ptr, data_ptr_provided);
+	return;
+%skip (2);
+reset_alarm_wakeup:
+     entry (a_channel);
+
+	call unschedule_timer (Alarm, Wakeup, a_channel, signal_timer_manager_err, null, "0"b);
+	return;
+%skip (2);
+reset_cpu_call:
+     entry (a_routine);
+
+	call set_data_ptr (2, data_ptr, data_ptr_provided);
+	call unschedule_timer (CPU, Call, 0, a_routine, data_ptr, data_ptr_provided);
+	return;
+%skip (2);
+reset_cpu_wakeup:
+     entry (a_channel);
+
+	call unschedule_timer (CPU, Wakeup, a_channel, signal_timer_manager_err, null, "0"b);
+	return;
+%skip (2);
+get_schedule:
+     entry (area_ptr, schedule_ptr, a_code);
+
+	call get_schedule (area_ptr, schedule_ptr, a_code);
+	return;
+%skip (2);
+
+/* The following two entries are entries called by the system when timers go off */
+
+alarm_interrupt:
+     entry (a_mc_ptr, a_condition_name, a_hc_mc_ptr, io_ptr, a_continue);
+
+	call process_interrupt (Alarm, a_mc_ptr, a_condition_name, a_hc_mc_ptr, a_continue);
+	return;
+%skip (2);
+cpu_time_interrupt:
+     entry (a_mc_ptr, a_condition_name, a_hc_mc_ptr, io_ptr, a_continue);
+
+	call process_interrupt (CPU, a_mc_ptr, a_condition_name, a_hc_mc_ptr, a_continue);
+	return;
+%skip (10);
+invoke_users_routine:
+     entry (a_call_timer_info_ptr);
+
+	call_timer_info_ptr = a_call_timer_info_ptr;
+
+	on cleanup
+	     begin;
+	     if call_timer_info_ptr ^= null ()
+	     then free call_timer_info in (sys_area);
+	     call_timer_info_ptr = null ();
+	end;
+
+	call call_timer_info
+	     .
+	     routine (call_timer_info.mc_ptr, call_timer_info.condition_name, call_timer_info.hc_mc_ptr,
+	     call_timer_info.data_ptr);
+
+	free call_timer_info in (sys_area);
+	call_timer_info_ptr = null ();
+
+	return;
+%skip (10);
+set_data_ptr:
+     proc (arg_number, a_data_ptr, a_data_ptr_provided);
+
+	call cu_$arg_ptr (arg_number, p_ptr, p_len, x_code);
+	if x_code = 0 then do;
+	     a_data_ptr = p_ptr -> based_ptr;
+	     a_data_ptr_provided = "1"b;
+	end;
+	else do;
+	     a_data_ptr = null ();
+	     a_data_ptr_provided = "0"b;
+	end;
+	return;
+
+declare  arg_number fixed binary parameter;
+declare  a_data_ptr pointer parameter;
+declare  a_data_ptr_provided bit (1) aligned;
+
+declare  p_ptr pointer;
+declare  p_len fixed binary (21);
+declare  x_code fixed binary (35);
+declare  based_ptr pointer based;
+
+     end;
+%page;
+schedule_timer:
+     proc (time, type, inhibit, action, channel, routine, data_ptr, data_ptr_provided);
+
+dcl  (
+     time fixed bin (71),
+     type bit (1) aligned,
+     inhibit bit (1) aligned,
+     action bit (1) aligned,
+     channel fixed bin (71),
+     routine entry variable,
+     data_ptr_provided bit (1) aligned,
+     data_ptr pointer
+     ) parameter;
+
+dcl  bead_ptr pointer,
+     found bit (1) aligned,
+     next_bead_ptr pointer,
+     prev_bead_ptr pointer,
+     saved_mask bit (36) aligned,
+     start_list_ptr pointer;
+
+
+	call initialize (Full);
+
+/* Mask down so we won't be bothered by asynchronous processing or unexpected recursion */
+
+	saved_mask = "0"b;
+
+	on cleanup
+	     begin;
+	     if substr (saved_mask, 36, 1) = "1"b
+	     then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+	end;
+
+	call hcs_$set_ips_mask (alrm_cput_quit_mask, saved_mask);
+						/* disable alrm, cput, quit */
+
+
+/* Search down appropriate list and sort in alarm by time */
+
+	found = "0"b;
+	prev_bead_ptr = null;
+	if type = Alarm
+	then start_list_ptr = start_alarm_list_ptr;
+	else start_list_ptr = start_cpu_list_ptr;
+
+	do bead_ptr = start_list_ptr repeat (bead_ptr -> bead.next_ptr) while (bead_ptr ^= null & ^found);
+	     if time < bead_ptr -> bead.time
+	     then found = "1"b;
+	     else prev_bead_ptr = bead_ptr;
+	end;
+
+/* At this point, prev_bead_ptr points to the bead after which we want to sort in the new timer */
+	if free_bead_list_ptr = null ()
+	then allocate bead in (sys_area) set (bead_ptr);
+	else do;
+	     bead_ptr = free_bead_list_ptr;
+	     free_bead_list_ptr = bead_ptr -> bead.next_ptr;
+	end;
+/**** DEBUG  	     if debugging then call ioa_ ("Allocated bead at ^p.", bead_ptr); /* DEBUG */
+
+	bead_ptr -> bead.time = time;
+	bead_ptr -> bead.alarm = (type = Alarm);
+	bead_ptr -> bead.cpu = (type = CPU);
+	bead_ptr -> bead.inhibit = (inhibit = Inhibit);
+	bead_ptr -> bead.call = (action = Call);
+	bead_ptr -> bead.wakeup = (action = Wakeup);
+	bead_ptr -> bead.data_ptr_provided = data_ptr_provided;
+	bead_ptr -> bead.channel = channel;
+	bead_ptr -> bead.routine = routine;
+	bead_ptr -> bead.data_ptr = data_ptr;
+	bead_ptr -> bead.control_point_id = get_control_point_id_ ();
+
+	if prev_bead_ptr = null then do;		/* The new bead was placed at the head of the list */
+	     bead_ptr -> bead.next_ptr = start_list_ptr;
+	     start_list_ptr = bead_ptr;
+	     if type = Alarm
+	     then start_alarm_list_ptr = start_list_ptr;
+	     else start_cpu_list_ptr = start_list_ptr;
+
+/* Since the new bead is now the first scheduled to occur, we must (re)set the appropriate timer to the new time. */
+
+	     call set_next_timer;
+	end;
+
+	else do;
+	     bead_ptr -> bead.next_ptr = prev_bead_ptr -> bead.next_ptr;
+	     prev_bead_ptr -> bead.next_ptr = bead_ptr;
+	end;
+
+/**** DEBUG  	     if debugging_chain then call display_chain (start_list_ptr); /* DEBUG */
+	call hcs_$reset_ips_mask (saved_mask, saved_mask);
+	return;
+%skip (5);
+unschedule_timer:
+     entry (type, action, channel, routine, data_ptr, data_ptr_provided);
+
+dcl  removed_first bit (1) aligned;
+
+	call initialize (Full);
+
+/* Mask down so we won't be bothered by asynchronous processing or unexpected recursion */
+
+	saved_mask = "0"b;
+
+	on cleanup
+	     begin;
+	     if substr (saved_mask, 36, 1) = "1"b
+	     then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+	end;
+
+	call hcs_$set_ips_mask (alrm_cput_quit_mask, saved_mask);
+						/* disable alrm, cput, quit */
+
+
+/* Search down appropriate list and get rid of matching entries */
+
+	if type = Alarm
+	then start_list_ptr = start_alarm_list_ptr;
+	else start_list_ptr = start_cpu_list_ptr;
+
+	removed_first = ""b;
+	prev_bead_ptr = null;
+
+	do bead_ptr = start_list_ptr repeat (next_bead_ptr) while (bead_ptr ^= null);
+	     next_bead_ptr = bead_ptr -> bead.next_ptr;
+
+	     if action = Wakeup
+	     then if bead_ptr -> bead.channel = channel
+		then call remove_bead (bead_ptr, prev_bead_ptr);
+		else prev_bead_ptr = bead_ptr;
+	     else if bead_ptr -> bead.routine = routine
+	     then if data_ptr_provided
+		then if data_ptr = bead_ptr -> bead.data_ptr
+		     then call remove_bead (bead_ptr, prev_bead_ptr);
+		     else prev_bead_ptr = bead_ptr;
+		else call remove_bead (bead_ptr, prev_bead_ptr);
+	     else prev_bead_ptr = bead_ptr;
+	end;
+
+	if removed_first
+	then call set_next_timer;
+
+	call hcs_$reset_ips_mask (saved_mask, saved_mask);
+	return;
+%skip (2);
+process_interrupt:
+     entry (type, mc_ptr, condition_name, hc_mc_ptr, continue);
+
+dcl  (
+     mc_ptr pointer,
+     condition_name char (*),
+     hc_mc_ptr pointer,
+     continue bit (1) aligned
+     ) parameter;
+
+dcl  code fixed bin (35),
+     temp_mask bit (36) aligned,
+     wakeup_message char (8) aligned;
+
+dcl  1 auto_bead automatic,
+       2 next_ptr pointer,
+       2 info like schedule.timer;
+
+/**** DEBUG  	     if debugging then do;			/* DEBUG */
+/**** DEBUG  		call ioa_ ("Processing interrupt for ^a", condition_name); /* DEBUG */
+/**** DEBUG  		call hcs_$set_ips_mask ((36)"1"b, ""b); /* DEBUG */
+/**** DEBUG  	     end;					/* DEBUG */
+
+	if type = Alarm
+	then start_list_ptr = start_alarm_list_ptr;
+	else start_list_ptr = start_cpu_list_ptr;
+
+/* First, check if the timer that went off was expected.  Unexpected timers can
+   occur in three ways.  One, somebody may be fiddling around with the hardcore
+   timers (naughty).  Two, a timer may have gone off right while we were masked
+   and busy removing the very same timer from the list (via the reset entries).
+   Three, there is presently a minor problem in hardcore that causes CPU timers
+   to go off a bit too early (the timer is rung with respect to a CPU time that
+   includes page fault time, whereas the real virtual CPU time doesn't).  Since
+   we can't tell the difference in order to slap anyone's wrists, if we get any
+   unscheduled timers, we just grin and swallow them.  In addition, we re-force
+   the correct (expected) timer back into hardcore. */
+
+	if start_list_ptr = null then do;		/* didn't expect ANY such timer */
+	     call set_next_timer;			/* turn off HC timer */
+	     return;
+	end;
+
+	if type = Alarm
+	then if start_list_ptr -> bead.time > clock () then do;
+/**** DEBUG  		     if debugging then call ioa_ ("Unexpected alrm, rescheduling."); /* DEBUG */
+		call set_next_timer;
+		return;
+	     end;
+	     else ;
+	else if start_list_ptr -> bead.time > vclock () then do;
+/**** DEBUG  		if debugging then call ioa_ ("Unexpected cput, rescheduling."); /* DEBUG */
+	     call set_next_timer;
+	     return;
+	end;
+
+	unspec (auto_bead) = unspec (start_list_ptr -> bead);
+
+	call remove_bead (start_list_ptr, null);
+	call set_next_timer;
+
+	if auto_bead.call then do;
+/**** DEBUG  		if debugging then call ioa_ ("Processing the call."); /* DEBUG */
+	     if ^auto_bead.inhibit
+	     then call hcs_$set_ips_mask (allow_all_mask, "0"b);
+
+	     else on cleanup
+		     begin;			/* restore mask if fault and release while inhibited */
+		     if mc_ptr ^= null then do;
+			temp_mask = mc_ptr -> mc.ips_temp;
+			if substr (temp_mask, 36, 1)
+			then call hcs_$reset_ips_mask (temp_mask, "0"b);
+		     end;
+		end;
+
+	     if have_multiple_control_points ()		/* must always use cpm_ to insure I/O switches are OK */
+	     then call call_routine_in_other_control_point ();
+	     else call auto_bead.routine (mc_ptr, condition_name, hc_mc_ptr, auto_bead.data_ptr);
+	end;
+
+	else if auto_bead.wakeup then do;
+/**** DEBUG  		if debugging then call ioa_ ("Processing the wakeup."); /* DEBUG */
+	     if type = Alarm
+	     then wakeup_message = "alarm___";
+	     else wakeup_message = "cpu_time";
+	     call hcs_$wakeup (my_processid, auto_bead.channel, wakeup_message, code);
+	     if code ^= 0
+	     then if code ^= error_table_$invalid_channel
+		then call signal_timer_manager_err;	/* only acceptable error is user destroyed his channel */
+	end;
+
+	return;
+%skip (5);
+have_multiple_control_points:
+	procedure () returns (bit (1) aligned);
+
+	     if stackbaseptr () -> stack_header.cpm_enabled
+	     then return (cpm_data_$n_control_points > 1);
+	     else return ("0"b);
+
+	end have_multiple_control_points;
+%skip (5);
+call_routine_in_other_control_point:
+	procedure ();
+
+	     call_timer_info_condition_name_lth = length (condition_name);
+	     allocate call_timer_info in (sys_area) set (call_timer_info_ptr);
+
+	     call_timer_info.routine = auto_bead.routine;
+	     call_timer_info.mc_ptr = mc_ptr;
+	     call_timer_info.hc_mc_ptr = hc_mc_ptr;
+	     call_timer_info.data_ptr = auto_bead.data_ptr;
+	     call_timer_info.condition_name = condition_name;
+
+	     call cpm_$generate_call_preferred (auto_bead.control_point_id, invoke_users_routine, call_timer_info_ptr,
+		code);
+
+	     return;
+
+	end call_routine_in_other_control_point;
+%skip (5);
+remove_bead:
+	proc (a_bead_ptr, prev_bead_ptr);
+
+dcl  (a_bead_ptr, prev_bead_ptr) pointer parameter;
+
+dcl  bead_ptr pointer,
+     next_bead_ptr pointer;
+
+	     bead_ptr = a_bead_ptr;
+
+	     if prev_bead_ptr = null then do;
+
+		removed_first = "1"b;
+		start_list_ptr = bead_ptr -> bead.next_ptr;
+
+		if type = Alarm
+		then start_alarm_list_ptr = start_list_ptr;
+		else start_cpu_list_ptr = start_list_ptr;
+	     end;
+
+	     else prev_bead_ptr -> bead.next_ptr = bead_ptr -> bead.next_ptr;
+
+	     next_bead_ptr = bead_ptr -> bead.next_ptr;
+
+/**** DEBUG  		if debugging then			/* DEBUG */
+/**** DEBUG 		     call ioa_ ("Removed bead at ^p^[; was first bead^;^].", bead_ptr, removed_first); /* DEBUG */
+	     bead_ptr -> bead.next_ptr = free_bead_list_ptr;
+	     free_bead_list_ptr = bead_ptr;
+
+
+	     a_bead_ptr = next_bead_ptr;
+/**** DEBUG  		if debugging_chain then call display_chain (start_list_ptr); /* DEBUG */
+	     return;
+
+	end remove_bead;
+%skip (2);
+set_next_timer:
+	proc;
+
+	     if type = Alarm
+	     then if start_alarm_list_ptr ^= null then do;
+/**** DEBUG  			if debugging then do;	/* DEBUG */
+/**** DEBUG  			     call date_time_ (start_alarm_list_ptr -> bead.time, junk_string); /* DEBUG */
+/**** DEBUG  			     call ioa_ ("Setting HC alarm for ^a (^d) from ^p.", junk_string, /* DEBUG */
+/**** DEBUG  				start_alarm_list_ptr -> bead.time, start_alarm_list_ptr); /* DEBUG */
+/**** DEBUG  			end;			/* DEBUG */
+
+		     call hcs_$set_alarm_timer (start_alarm_list_ptr -> bead.time, Absolute_setting, 0);
+		end;
+		else do;
+/**** DEBUG  			if debugging then call ioa_ ("Turning HC alarm off."); /* DEBUG */
+		     call hcs_$set_alarm_timer (Forever, Absolute_setting, 0);
+						/* Hardcore interprets a number this big as "shut up" */
+		end;
+	     else if start_cpu_list_ptr ^= null then do;
+/**** DEBUG  		     if debugging then call ioa_ ("Setting HC CPU timer to ^6.3f from ^p.", /* DEBUG */
+/**** DEBUG 			start_cpu_list_ptr -> bead.time / 1e6, /* DEBUG */
+/**** DEBUG  			start_cpu_list_ptr);	/* DEBUG */
+		call hcs_$set_cpu_timer (start_cpu_list_ptr -> bead.time, Absolute_setting, 0);
+	     end;
+	     else do;
+/**** DEBUG  		     if debugging then call ioa_ ("Turning HC CPU timer off."); /* DEBUG */
+		call hcs_$set_cpu_timer (0, Absolute_setting, 0);
+						/* pxss, on the other hand, likes zeroes for that purpose */
+	     end;
+
+	     return;
+	end set_next_timer;
+%page;
+get_schedule:
+     entry (area_ptr, schedule_ptr, a_code);
+
+dcl  (
+     area_ptr pointer,
+     schedule_ptr pointer parameter,
+     a_code fixed bin (35)
+     ) parameter;
+
+dcl  timer_idx fixed bin;
+
+dcl  user_area area (sys_info$max_seg_size) based (area_ptr);
+
+	saved_mask = ""b;
+
+	on cleanup
+	     begin;
+	     if substr (saved_mask, 36, 1)
+	     then call hcs_$reset_ips_mask (saved_mask, saved_mask);
+	end;
+
+	schedule_ptr = null;
+
+	call hcs_$set_ips_mask (alrm_cput_mask, saved_mask);
+
+/* Count the outstanding scheduled timers */
+
+	N_Timers = 0;
+
+	do bead_ptr = start_alarm_list_ptr repeat (bead_ptr -> bead.next_ptr) while (bead_ptr ^= null),
+	     start_cpu_list_ptr repeat (bead_ptr -> bead.next_ptr) while (bead_ptr ^= null);
+	     N_Timers = N_Timers + 1;
+	end;
+
+	on area
+	     begin;
+	     a_code = error_table_$noalloc;
+	     goto return_hard;
+	end;
+
+	allocate schedule in (user_area) set (schedule_ptr);
+
+	revert area;
+
+	schedule_ptr -> schedule.version = timer_manager_schedule_version_3;
+
+	timer_idx = 0;
+	do bead_ptr = start_alarm_list_ptr repeat (bead_ptr -> bead.next_ptr) while (bead_ptr ^= null),
+	     start_cpu_list_ptr repeat (bead_ptr -> bead.next_ptr) while (bead_ptr ^= null);
+	     timer_idx = timer_idx + 1;
+	     call fill_slot (bead_ptr);
+	end;
+
+	a_code = 0;
+
+return_hard:
+	call hcs_$reset_ips_mask (saved_mask, saved_mask);
+
+	return;
+%skip (2);
+fill_slot:
+	proc (bead_ptr);
+
+dcl  bead_ptr pointer parameter;
+
+	     unspec (schedule_ptr -> schedule.timer (timer_idx)) = unspec (bead_ptr -> bead.info);
+	     return;
+	end fill_slot;
+     end schedule_timer;
+%page;
+sleep:
+     proc (time, lss);
+
+dcl  time fixed bin (71) parameter,
+     lss bit (1) aligned parameter;
+
+dcl  1 wait_list aligned,
+       2 number_of_channels fixed bin,
+       2 sleep_channel fixed bin (71);
+
+dcl  1 block_message aligned,
+       2 channel_id fixed bin (71),
+       2 message fixed bin (71),
+       2 sender_processid bit (36),
+       2 origin,
+         3 device bit (18) unaligned,
+         3 ring fixed bin (18) unaligned unsigned,
+       2 channel_index fixed bin;
+
+dcl  code fixed bin (35),
+     cur_mask bit (36) aligned,
+     old_channel fixed bin (71),
+     old_timer fixed bin (71);
+
+	call initialize (Limited);			/* if we need any more, someone else will do it */
+
+
+	wait_list.number_of_channels = 1;
+	sleep_channel = -1;
+
+	on cleanup
+	     begin;
+	     if sleep_channel ^= -1
+	     then do;
+		call ipc_$delete_ev_chn (sleep_channel, code);
+		call unschedule_timer (Alarm, Wakeup, sleep_channel, signal_timer_manager_err, null(), "0"b);
+		sleep_channel = -1;
+	     end;
+	end;
+
+/*	     call hcs_$assign_channel (sleep_channel, code); /* HC bug causes fast channels to fail right now. */
+/*	     if code ^= 0 then			/* maybe no fast channels left */
+	if saved_channel_count > 0 then do;
+	     saved_channel_count = saved_channel_count - 1;
+	     sleep_channel = saved_channel_array (saved_channel_count + 1);
+	end;
+	else do;
+	     call ipc_$create_ev_chn (sleep_channel, code);
+	     if code /* still */ ^= 0
+	     then call signal_timer_manager_err;
+	end;
+
+	call hcs_$get_ips_mask (cur_mask);
+
+/**** DEBUG  	     if debugging then do;			/* DEBUG */
+/**** DEBUG  		call date_time_ (time, junk_string);	/* DEBUG */
+/**** DEBUG  		call ioa_ ("Sleeping until ^a (^d).", junk_string, time); /* DEBUG */
+/**** DEBUG  	     end;					/* DEBUG */
+
+	if (lss | (this_ring ^= initial_ring) | (bool (cur_mask, alrm_disabled_mask, "1000"b) ^= ""b))
+	then begin;
+
+/* Here, we either want to or have to do the whole thing manually.  If this is
+   as LSS nap, we don't want any other interrupts to occur.  If alrms are
+   masked, they CAN'T occur-- and neither can our own.  If we are executing in
+   an inner ring (or other ring than initial ring) we can't take advantage of
+   the timer-queuing properties of schedule_timer anyway. */
+
+/**** DEBUG  		if debugging then call ioa_ ("Sleeping the hard way."); /* DEBUG */
+
+	     old_channel = -1;
+
+	     on cleanup
+		begin;
+		if old_channel ^= -1
+		then call hcs_$set_alarm_timer (old_timer, Absolute_setting, old_channel);
+	     end;
+
+	     call hcs_$get_alarm_timer (old_timer, old_channel);
+/**** DEBUG  		if debugging then call ioa_ ("Old timer was ^d on channel ^o.", old_timer, old_channel); /* DEBUG */
+
+	     call hcs_$set_alarm_timer (time, Absolute_setting, sleep_channel);
+/**** DEBUG  		if debugging then do;		/* DEBUG */
+/**** DEBUG  		     call hcs_$get_alarm_timer (junk_time, junk_channel); /* DEBUG */
+/**** DEBUG  		     call ioa_ ("HC verifies new timer as ^d on channel ^o.", junk_time, junk_channel); /* DEBUG */
+/**** DEBUG  		end;				/* DEBUG */
+
+	     call ipc_$block (addr (wait_list), addr (block_message), code);
+	     if code ^= 0
+	     then call signal_timer_manager_err;
+
+/**** DEBUG  		if debugging then call ioa_ ("Returned from block."); /* DEBUG */
+
+	     call hcs_$set_alarm_timer (old_timer, Absolute_setting, old_channel);
+	     old_channel = -1;
+	end;
+
+	else do;					/* normal case, use queuing mechanism */
+/**** DEBUG  		if debugging then call ioa_ ("Sleeping the easy way."); /* DEBUG */
+
+	     call schedule_timer (time, Alarm, No_inhibit, Wakeup, sleep_channel, signal_timer_manager_err, null (),
+		"0"b);
+
+	     call ipc_$block (addr (wait_list), addr (block_message), code);
+	     if code ^= 0
+	     then call signal_timer_manager_err;
+
+/**** DEBUG  		if debugging then call ioa_ ("Returned from block."); /* DEBUG */
+
+	end;
+
+	if saved_channel_count >= hbound (saved_channel_array, 1) then do;
+	     call ipc_$delete_ev_chn (sleep_channel, code);
+	     if code ^= 0
+	     then call signal_timer_manager_err;
+	     return;
+	end;
+	else do;
+	     saved_channel_array (saved_channel_count + 1) = sleep_channel;
+	     saved_channel_count = saved_channel_count + 1;
+	     return;
+	end;
+
+     end sleep;
+%page;
+abs_time:
+     proc (time, flags, type) returns (fixed bin (71));
+dcl  time fixed bin (71) parameter,
+     flags bit (2) parameter,
+     type bit (1) aligned parameter;
+
+dcl  abstime fixed bin (71);
+
+/* Compute the absolute time from the given time according to the flags the user indicated */
+
+	abstime = time;
+
+	if substr (flags, 2, 1)
+	then abstime = abstime * Million;		/* change seconds to microseconds */
+
+	if substr (flags, 1, 1)
+	then if type = CPU
+	     then abstime = abstime + vclock ();
+	     else abstime = abstime + clock ();
+
+	if abstime <= 0
+	then abstime = 1;				/* go off right away */
+
+	return (abstime);
+
+     end abs_time;
+%page;
+initialize:
+     proc (necessary_mechanism);
+
+dcl  necessary_mechanism fixed bin parameter;
+
+dcl  alrm_cput_auto_mask bit (36) aligned,
+     old_auto_ips_mask bit (36) aligned,
+     old_ips_mask bit (36) aligned;
+
+	if initial_ring = 1
+	then if my_group_id = Initializer
+	     then initialized_mechanism = Uninitialized;
+
+	goto step (initialized_mechanism);
+
+step (0):						/* initialize limited mechanism */
+/**** The limited mechanism suffices for timer_manager_$sleep in inner rings */
+	this_ring = get_ring_ ();
+	initial_ring = get_initial_ring_ ();
+          my_group_id = get_group_id_ ();
+	my_processid = get_process_id_ ();
+	sys_areap = get_system_free_area_ ();
+
+	call create_ips_mask_ (addr (IPS_names), 1, alrm_disabled_mask);
+	substr (alrm_disabled_mask, 36, 1) = "1"b;
+
+	call create_ips_mask_ (addr (IPS_names), 3, alrm_cput_quit_mask);
+	call create_ips_mask_ (addr (All_IPS), 1, allow_all_mask);
+	allow_all_mask = ^allow_all_mask;
+
+	initialized_mechanism = Limited;
+
+step (1):
+	if initialized_mechanism >= necessary_mechanism
+	then return;
+
+
+/**** The mechanism set up by this section will only work in the process'
+      initial ring.  This is because the list of timers is kept in per-ring
+      static, and therefore, any given ring can not know what timers are
+      outstanding in other rings.  Since there is only one REAL timer, this
+      would be terminally confusing.  Therefore, we limit ourselves to
+      operation in the user ring. */
+	if this_ring ^= initial_ring
+	then call signal_timer_manager_err;
+
+
+/* Now we want to diddle the automatic IPS mask.  Not precisely a mask, this is
+   really a set of indicators corresponding to IPS interrupts.  Whenever an IPS
+   interrupt indicated in the mask occurs, hardcore automatically masks ALL IPS
+   interrupts off before handling it.  It is the job of the handler to remember
+   to reset the IPS mask back to what it was.  The old mask can be found in the
+   machine conditions. */
+
+
+	call create_ips_mask_ (addr (IPS_names), 2, alrm_cput_mask);
+	alrm_cput_auto_mask = ^alrm_cput_mask;
+
+	old_auto_ips_mask, old_ips_mask = ""b;
+
+	on cleanup
+	     begin;
+	     if substr (old_auto_ips_mask, 36, 1)
+	     then call hcs_$set_automatic_ips_mask (old_auto_ips_mask, old_auto_ips_mask);
+
+	     if substr (old_ips_mask, 36, 1)
+	     then call hcs_$set_ips_mask (old_ips_mask, old_ips_mask);
+	end;
+
+	call hcs_$set_ips_mask (""b, old_ips_mask);	/* mask down while diddling auto mask */
+
+	call hcs_$set_automatic_ips_mask (""b, old_auto_ips_mask);
+						/* get current auto mask */
+
+	old_auto_ips_mask = alrm_cput_auto_mask | old_auto_ips_mask;
+						/* carry forward any indicators anyone else might have set */
+
+	call hcs_$set_automatic_ips_mask (old_auto_ips_mask, ""b);
+
+	old_auto_ips_mask = ""b;
+
+	call hcs_$reset_ips_mask (old_ips_mask, old_ips_mask);
+
+	initialized_mechanism = Full;
+step (2):
+	return;
+
+     end initialize;
+%skip (5);
+signal_timer_manager_err:
+     proc;
+
+	do while ("1"b);
+	     signal timer_manager_err;
+	end;
+     end signal_timer_manager_err;
+%page;
+/**** DEBUG  display_chain: proc (lp);			/* DEBUG */
+/**** DEBUG  dcl (lp, bp) pointer;			/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  dcl 1 auto_bead automatic,			/* DEBUG */
+/**** DEBUG      2 next_ptr pointer,			/* DEBUG */
+/**** DEBUG      2 info like schedule.timer;		/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  dcl  sysprint stream;			/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  	     put data (lp); put skip (2);		/* DEBUG */
+/**** DEBUG  	     do bp = lp repeat (bp -> bead.next_ptr) while (bp ^= null); /* DEBUG */
+/**** DEBUG  		put data (bp); put skip;		/* DEBUG */
+/**** DEBUG  		unspec (auto_bead) = unspec (bp -> bead); /* DEBUG */
+/**** DEBUG  		put data (auto_bead); put skip (2);	/* DEBUG */
+/**** DEBUG  	     end;					/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  	     return;				/* DEBUG */
+/**** DEBUG  	end display_chain;				/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  debug:	entry;				/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  dcl (debugging, debugging_chain) bit (1) aligned static initial (""b); /* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  dcl  ioa_ ext entry options (variable),		/* DEBUG */
+/**** DEBUG       junk_time fixed bin (71),			/* DEBUG */
+/**** DEBUG       junk_channel fixed bin (71),		/* DEBUG */
+/**** DEBUG       junk_string char (24),			/* DEBUG */
+/**** DEBUG       date_time_ ext entry (fixed bin (71), char (*)); /* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  	debugging = "1"b;				/* DEBUG */
+/**** DEBUG  	debugging_chain = ""b;			/* DEBUG */
+/**** DEBUG  	return;					/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  nodebug:	entry;				/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  	debugging, debugging_chain = ""b;		/* DEBUG */
+/**** DEBUG  	return;					/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  debug_chain: entry;				/* DEBUG */
+/**** DEBUG 						/* DEBUG */
+/**** DEBUG  	debugging, debugging_chain = "1"b;		/* DEBUG */
+/**** DEBUG  	return;					/* DEBUG */
+
+     end timer_manager_;

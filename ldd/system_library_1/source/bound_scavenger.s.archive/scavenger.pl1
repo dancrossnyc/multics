@@ -1,0 +1,579 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/* format: style3 */
+scavenger:
+     proc (Pvtx, Pvid, Scavenger_Optionsp, Sc_metersp, Code);
+
+/*  This is the driver program for the scavenger. It validates the PVTE
+    and sets up all data structures needed for scavenging. The scavenge
+    itself is done elsewhere.
+
+    scavenger$shutdown is called by normal shutdown to reset any
+    scavenge in progress. It must be called after traffic control
+    is shutdown to avoid races.
+
+    Written July 1982 by J. Bongiovanni
+    Modified October 1982 by J. Bongiovanni for fm_damaged and associated meters
+    Modified 83-12-13 BIM to call verify_lock on faults.
+    Modified 85-02-21, EJ Sharpe: use syserr_fault_msg.incl.pl1, correct logging of history registers.
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  2) change(86-06-02,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-18,Beattie), install(86-07-17,MR12.0-1097):
+     Add support for subvolumes.
+                                                   END HISTORY COMMENTS */
+
+/*  Parameter  */
+
+dcl	Pvtx		fixed bin;		/* PVTE index */
+dcl	Pvid		bit (36) aligned;		/* Physical Volume ID */
+dcl	Scavenger_Optionsp	ptr;			/* -> scavenger_options */
+dcl	Sc_metersp	ptr;			/* -> returned meters, or null */
+dcl	Code		fixed bin (35);		/* Error code */
+
+/*  Automatic  */
+
+dcl	begin_clock	fixed bin (71);
+dcl	begin_pf		fixed bin;
+dcl	begin_vcpu	fixed bin (71);
+dcl	code		fixed bin (35);
+dcl	end_pf		fixed bin;
+dcl	end_vcpu		fixed bin (71);
+dcl	i_am_wired	bit (1) aligned;
+dcl	1 local_sc_meters	aligned like sc_meters;
+dcl	1 local_scavenger_options
+			aligned like scavenger_options;
+dcl	p99		pic "99";
+dcl	old_mask		fixed bin (71);
+dcl	process_tablex	fixed bin;
+dcl	ptwp		ptr;
+dcl	scavenger_data_astep
+			ptr;
+dcl	started		bit (1) aligned;
+
+/*  Static  */
+
+dcl	N_OVFL		fixed bin int static options (constant) init (1023);
+						/* Limited by field size */
+
+/*  Based  */
+
+dcl	1 Sc_meters	aligned like sc_meters based (Sc_metersp);
+dcl	1 Scavenger_Options aligned like scavenger_options based (Scavenger_Optionsp);
+
+/*  External  */
+
+dcl	error_table_$pvid_not_found
+			fixed bin (35) external;
+dcl	error_table_$unexpected_condition
+			fixed bin (35) external;
+dcl	error_table_$scavenge_process_limit
+			fixed bin (35) external;
+dcl	error_table_$pv_no_scavenge
+			fixed bin (35) external;
+dcl	pds$process_group_id
+			char (32) aligned external;
+dcl	pds$processid	bit (36) aligned external;
+dcl	sst$astl		bit (36) aligned external;
+
+/*  Entry  */
+
+dcl	condition_	entry (char (*), entry);
+dcl	get_ptrs_$given_segno
+			entry (fixed bin) returns (ptr);
+dcl	lock$lock_ast	entry;
+dcl	lock$lock_fast	entry (ptr);
+dcl	lock$unlock_ast	entry;
+dcl	lock$unlock_fast	entry (ptr);
+dcl	pc_wired$wire_wait	entry (ptr, fixed bin, fixed bin);
+dcl	pc_wired$unwire	entry (ptr, fixed bin, fixed bin);
+dcl	pmut$lock_ptl	entry (fixed bin (71), ptr);
+dcl	pmut$unlock_ptl	entry (fixed bin (71), ptr);
+dcl	scavenge_volume	entry (ptr, ptr, ptr, ptr, fixed bin (35));
+dcl	syserr		entry options (variable);
+dcl	syserr$binary	entry options (variable);
+dcl	syserr$error_code	entry options (variable);
+dcl	usage_values	entry (fixed bin, fixed bin (71));
+dcl	verify_lock$condition_nolog
+			entry (character (*), pointer);
+dcl	wire_proc$wire_me	entry;
+dcl	wire_proc$unwire_me entry;
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	addrel		builtin;
+dcl	baseno		builtin;
+dcl	bin		builtin;
+dcl	clock		builtin;
+dcl	convert		builtin;
+dcl	divide		builtin;
+dcl	float		builtin;
+dcl	null		builtin;
+dcl	rel		builtin;
+dcl	size		builtin;
+dcl	unspec		builtin;
+%page;
+	started = "0"b;
+	i_am_wired = "0"b;
+
+	unspec (local_sc_meters) = ""b;
+	unspec (local_scavenger_options) = unspec (Scavenger_Options);
+
+	call SETUP_LOCK (Code);
+	if Code ^= 0
+	then return;
+
+	call SETUP_PROCESS_TABLE (process_tablex, code);
+	if code ^= 0
+	then goto CLEANUP_RETURN;
+
+	call SETUP_BLOCK (process_tablex);
+
+	pvte.scavenger_block_rel = rel (scavenger_blockp);
+	call lock$unlock_fast (addr (scavenger_data.lock));
+
+	call usage_values (begin_pf, begin_vcpu);
+	begin_clock = clock ();
+
+	call condition_ ("any_other", PRINT_ERROR);
+
+	call syserr (ANNOUNCE, "scavenger: Begin scavenge of ^a_^a^[^a^;^1s^] by ^a", pvte.devname,
+	     convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name, pds$process_group_id);
+	started = "1"b;
+	call wire_proc$wire_me;
+	i_am_wired = "1"b;
+	call scavenge_volume (pvtep, scavenger_blockp, addr (local_scavenger_options), addr (local_sc_meters), code);
+
+LOCK_CLEANUP_RETURN:
+	call lock$lock_fast (addr (scavenger_data.lock));
+
+CLEANUP_RETURN:
+	if i_am_wired
+	then call wire_proc$unwire_me;
+
+	if started & (code = 0)
+	then do;
+		call usage_values (end_pf, end_vcpu);
+		local_sc_meters.n_scavenge = 1;
+		local_sc_meters.pf = end_pf - begin_pf;
+		local_sc_meters.vcpu = end_vcpu - begin_vcpu;
+		local_sc_meters.clock_time = clock () - begin_clock;
+		if local_scavenger_options.print_meters
+		then call PRINT_METERS;
+		scavenger_data.meters = scavenger_data.meters + local_sc_meters;
+	     end;
+
+	call lock$lock_ast;				/* Protect against asynchronous SC/PC */
+	call pmut$lock_ptl (old_mask, ptwp);
+	pvte.scavenger_block_rel = ""b;
+	pvte.scav_check_address = "0"b;
+	pvte.deposit_to_volmap = "0"b;
+	call pmut$unlock_ptl (old_mask, ptwp);
+	call lock$unlock_ast;
+
+	if scavenger_blockp ^= null ()
+	then call RETURN_BLOCK (process_tablex);
+	if sc_process_tablep ^= null ()
+	then call RETURN_PROCESS_TABLE (process_tablex);
+
+	call lock$unlock_fast (addr (scavenger_data.lock));
+
+	if started
+	then do;
+		if code = 0
+		then call syserr (ANNOUNCE, "scavenger: Scavenge of ^a_^a^[^a^;^1s^] by ^a completed.", pvte.devname,
+			convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name, pds$process_group_id);
+		else call syserr$error_code (ANNOUNCE, code,
+			"scavenger: Scavenge of ^a_^a^[^a^;^1s^] by ^a completed with error.", pvte.devname,
+			convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name, pds$process_group_id);
+	     end;
+
+	if Sc_metersp ^= null ()
+	then unspec (Sc_meters) = unspec (local_sc_meters);
+
+	Code = code;
+	return;
+%page;
+/*  Entry to shutdown scavenges in progress  */
+
+shutdown:
+     entry;
+
+	scavenger_datap = addr (scavenger_data$);
+	sc_process_tablep = scavenger_data.process_table_ptr;
+
+	do process_tablex = 1 to sc_process_table.max_n_processes;
+	     if sc_process_table.process (process_tablex).processid ^= ""b
+						/* Live entry */
+	     then do;
+		     pvtep = sc_process_table.process (process_tablex).pvtep;
+		     pvte.deposit_to_volmap = "0"b;
+		     pvte.scav_check_address = "0"b;
+		     pvte.scavenger_block_rel = ""b;
+		     call syserr (ANNOUNCE, "scavenger: Scavenge of ^a_^a^[^a^] stopped.", pvte.devname,
+			convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name);
+		end;
+	end;
+
+	return;
+
+
+%page;
+/*  Internal Procedure to lock the scavenger data base and set up pointers */
+
+SETUP_LOCK:
+     proc (Code);
+
+dcl	Code		fixed bin (35);
+
+	scavenger_datap = addr (scavenger_data$);
+	sc_process_tablep = null ();
+	scavenger_blockp = null ();
+	pvt_arrayp = addr (pvt$array);
+	pvtep = addr (pvt_array (Pvtx));
+	scavenger_data_astep = get_ptrs_$given_segno (bin (baseno (scavenger_datap)));
+	Code = 0;
+
+	if pvte.pvid ^= Pvid
+	then do;
+		Code = error_table_$pvid_not_found;
+		return;
+	     end;
+	if ^pvte.used | ^pvte.storage_system | (pvte.scavenger_block_rel ^= ""b)
+	then do;
+		Code = error_table_$pv_no_scavenge;
+		return;
+	     end;
+
+	call lock$lock_fast (addr (scavenger_data.lock));
+
+     end SETUP_LOCK;
+%page;
+/*  Internal Procedure to get a process table entry and fill it in */
+
+SETUP_PROCESS_TABLE:
+     proc (Process_Index, Code);
+
+dcl	Process_Index	fixed bin;
+dcl	Code		fixed bin (35);
+
+dcl	n_header_pages	fixed bin;
+dcl	procx		fixed bin;
+
+	Process_Index = -1;
+	Code = 0;
+
+	sc_process_tablep = scavenger_data.process_table_ptr;
+	if sc_process_table.n_processes >= sc_process_table.max_n_processes
+	then do;
+RETURN_ERROR:
+		sc_process_tablep = null ();
+		Code = error_table_$scavenge_process_limit;
+		return;
+	     end;
+
+	do procx = 1 repeat procx + 1 while (procx <= sc_process_table.max_n_processes);
+	     if sc_process_table.process (procx).processid = ""b
+	     then goto FOUND_EMPTY;
+	end;
+	goto RETURN_ERROR;
+
+FOUND_EMPTY:
+	Process_Index = procx;
+	sc_process_table.process (procx).processid = pds$processid;
+	sc_process_table.process (procx).pvtep = pvtep;
+
+	sc_process_table.n_processes = sc_process_table.n_processes + 1;
+	if sc_process_table.n_processes = 1
+	then do;
+		n_header_pages = divide (size (scavenger_data) + 1023, 1024, 17);
+		call pc_wired$wire_wait (scavenger_data_astep, 0, n_header_pages);
+	     end;
+
+
+     end SETUP_PROCESS_TABLE;
+%page;
+/*  Internal Procedure to Allocate and Setup the Scavenge Block  */
+
+SETUP_BLOCK:
+     proc (Process_Index);
+
+dcl	Process_Index	fixed bin;
+
+dcl	first_page	fixed bin;
+dcl	n_pages		fixed bin;
+
+
+	scavenger_n_records = pvte.totrec;
+	scavenger_n_ovfl = N_OVFL;
+
+	first_page = sc_process_table.process (Process_Index).first_block_page;
+	n_pages = divide (size (scavenger_block) + 1023, 1024, 17);
+
+	scavenger_blockp = sc_process_table.process (process_tablex).blockp;
+
+	scavenger_block.n_records = scavenger_n_records;
+	scavenger_block.n_ovfl = scavenger_n_ovfl;
+	scavenger_block.ovfl_free_ix = 1;
+
+	unspec (scavenger_block.records) = ""b;
+	unspec (scavenger_block.overflow) = ""b;
+
+
+	call pc_wired$wire_wait (scavenger_data_astep, first_page, n_pages);
+
+	sc_process_table.process (Process_Index).n_block_pages = n_pages;
+
+     end SETUP_BLOCK;
+%page;
+/*  Internal Procedure to Revert a Scavenge Block  */
+
+RETURN_BLOCK:
+     proc (Process_Index);
+
+dcl	Process_Index	fixed bin;
+
+dcl	first_page	fixed bin;
+dcl	n_pages		fixed bin;
+
+
+	if sc_process_table.process (Process_Index).processid ^= pds$processid
+	then call syserr (CRASH, "scavenger: Invalid block reset");
+
+	first_page = sc_process_table.process (Process_Index).first_block_page;
+	n_pages = sc_process_table.process (Process_Index).n_block_pages;
+	call pc_wired$unwire (scavenger_data_astep, first_page, n_pages);
+
+
+
+     end RETURN_BLOCK;
+%page;
+/*  Internal Procedure to release a process table entry  */
+
+RETURN_PROCESS_TABLE:
+     proc (Process_Index);
+
+dcl	Process_Index	fixed bin;
+dcl	n_header_pages	fixed bin;
+
+	if sc_process_table.process (Process_Index).processid ^= pds$processid
+	then call syserr (CRASH, "scavenger: Process table entry not owned by this process.");
+
+	sc_process_table.process (Process_Index).processid = ""b;
+	sc_process_table.process (Process_Index).pvtep = null ();
+	sc_process_table.process (Process_Index).n_block_pages = 0;
+
+	sc_process_table.n_processes = sc_process_table.n_processes - 1;
+	if sc_process_table.n_processes = 0
+	then do;
+		n_header_pages = divide (size (scavenger_data) + 1023, 1024, 17);
+		call pc_wired$unwire (scavenger_data_astep, 0, n_header_pages);
+	     end;
+
+
+     end RETURN_PROCESS_TABLE;
+%page;
+/*  Internal Procedure to print an error message and cleanup. Called
+    when any conditon is signalled through this frame */
+
+PRINT_ERROR:
+     proc (Mcptr, Condition, Coptr, Infoptr, Continue) options (non_quick);
+
+dcl	Mcptr		ptr;
+dcl	Condition		char (*);
+dcl	Coptr		ptr;
+dcl	Infoptr		ptr;
+dcl	Continue		bit (1) aligned;
+
+dcl	1 auto_fault_msg	aligned like fault_msg;	/* Machine conds and hist regs for logging */
+dcl	ssptr		ptr;			/* pointer to signaller stack frame */
+
+
+	if Mcptr ^= null ()
+	then do;
+		ssptr = addrel (Mcptr, -8);		/* signaller_stack.pad is 8 words long! */
+
+/* Construct contiguous machine conditions and history registers */
+		unspec (auto_fault_msg.mach_cond) = unspec (ssptr -> signaller_stack.mach_cond);
+		auto_fault_msg.hist_reg = ssptr -> signaller_stack.history_registers;
+
+		call syserr$binary (scavenger_data.error_severity, Mcptr, SB_hw_fault, SBL_hw_fault,
+		     "scavenger: ^a condition signalled during scavenge of ^a_^a^[^a^;^1s^] by ^a", Condition,
+		     pvte.devname, convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name,
+		     pds$process_group_id);
+	     end;
+	else do;
+		call syserr (scavenger_data.error_severity,
+		     "scavenger: ^a condition signalled during scavenge of ^a_^a^[^a^;^1s^] by ^a", Condition,
+		     pvte.devname, convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name,
+		     pds$process_group_id);
+	     end;
+
+	if sst$astl = pds$processid
+	then call lock$unlock_ast;			/* Read-only, safe */
+	call verify_lock$condition_nolog (Condition, Mcptr);
+						/* Fix other locks */
+
+	code = error_table_$unexpected_condition;
+
+	goto LOCK_CLEANUP_RETURN;
+
+     end PRINT_ERROR;
+%page;
+/*  Internal Procedure to print metering data into the syserr log  */
+
+PRINT_METERS:
+     proc;
+
+dcl	clock_sec		float;
+dcl	vcpu_sec		float;
+
+	vcpu_sec = float (local_sc_meters.vcpu) / 1.0e6;
+	clock_sec = float (local_sc_meters.clock_time) / 1.0e6;
+
+	call syserr (LOG,
+	     "scavenger: Meters from scavenge of ^a_^a^[^a^;^1s^]. Clock=^6.1f vcpu=^6.1f pf=^d^/VTOCES: Total=^d Damaged=^d Per-Proc=^d Per-Boot=^d FMDamaged=^d Freed=^d^/Records: Total=^d Pot conflict=^d FMD Conflict = ^d Conflict=^d Lost=^d",
+	     pvte.devname, convert (p99, pvte.logical_area_number), pvte.is_sv, pvte.sv_name, clock_sec, vcpu_sec,
+	     local_sc_meters.pf, local_sc_meters.n_vtoces, local_sc_meters.n_vtoces_damaged,
+	     local_sc_meters.n_vtoces_per_proc, local_sc_meters.n_vtoces_per_boot, local_sc_meters.n_vtoces_fmd,
+	     local_sc_meters.n_vtoces_freed, local_sc_meters.n_records, local_sc_meters.n_conflicts,
+	     local_sc_meters.n_fmd_conflicts, local_sc_meters.n_real_conflicts, local_sc_meters.n_lost_records);
+
+     end PRINT_METERS;
+
+%page;
+%include pvte;
+%page;
+%include scavenger_data;
+%page;
+%include syserr_binary_def;
+%page;
+%include syserr_constants;
+%page;
+%include syserr_fault_msg;
+%page;
+%include mc;
+%page;
+%include signaller_stack;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+
+Message:
+scavenger: Begin scavenge of dskX_NN{s} by PERSON.PROJECT.TAG
+
+S:        $info
+
+T:        When a physical volume is being scavenged
+
+M:        This is an informational message at the beginning of a volume
+scavenge.
+
+A:        $ignore
+
+
+Message:
+scavenger: Scavenge of dskX_NN{s} by PERSON.PROJECT.TAG completed. 
+
+S:        $info
+
+T:        When a physical volume is being scavenged.
+
+M:        This is an informational message to indicate successful completion
+of a scavenge.
+
+A:        $ignore
+
+
+Message:
+scavenger: Scavenge of dskX_NN{s} by PERSON.PROJECT.TAG completed with error. ERRORMESSAGE.
+
+S:        $info
+
+T:	When a physical volume is being scavenged.
+
+M:        Scavenging could not be completed because of the error indicated.
+
+A:        $inform
+
+
+Message:
+scavenger: Invalid block reset.
+
+S:        $crash
+
+T:        When a physical volume is being scavenged.
+
+M:        A process attempted to clean up a scavenger block which was not
+assigned to it. This indicates a software malfunction.
+
+A:        $recover
+
+
+Message:
+scavenger: Process table entry not owned by this process.
+
+S:        $crash
+
+T:        When a physical volume is being scavenged.
+
+M:        The scavenger attempted to release a process table entry which did not
+belong to this process. This indicates a software malfunction.
+
+A:        $recover
+
+
+Message:
+scavenger: XXXXXX condition signalled during scavenge of dskX_NN{s} by PERSON.PROJECT.TAG
+
+S:        $info
+
+T:        When a physical volume is being scavenged.
+
+M:        An unexpected XXXXXX condition was signalled during a volume
+scavenge, causing abnormal termination of the scavenge.
+
+A:        $inform
+
+
+Message:
+scavenger: Meters from scavenge of dskX_NN{s}. METERINGDATA.
+
+S:        $log
+
+T:        When a physical volume is being scavenged.
+
+M:        Various peformance measurements of the scavenge are recorded if
+the appropriate scavenger control flag is set. 
+
+A:        $ignore
+
+Message:
+scavenger: Scavenge of dskX_NN{s} stopped.
+
+S:	$info
+
+T:	During system shutdown.
+
+M:	The system is being shutdown, and a scavenge of dskX_NN{s} is
+in progress. The scavenge is terminated and likely had no effect. 
+
+A:        Rerun the scavenge.
+
+
+END MESSAGE DOCUMENTATION */
+
+     end scavenger;

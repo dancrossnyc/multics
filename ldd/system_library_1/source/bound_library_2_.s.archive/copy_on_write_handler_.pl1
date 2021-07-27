@@ -1,0 +1,218 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,tree,ifthenstmt,indnoniterend */
+copy_on_write_handler_:
+     procedure (mcptr, cname, dummy1, dummy2) returns (bit (1) aligned);
+
+/* Modified 6/77 by M. Weaver to save lot entry */
+/* Modified 6/79 by C. Hornig to work in ring 0 */
+/* Modified May 1981 by C. Hornig to really work in any ring */
+/* Modified November 1984 by Keith Loepere to rename terminate to terminate_. */
+
+/* Parameters */
+
+dcl  cname char (*) parameter;
+dcl  (dummy1, dummy2) ptr parameter;
+dcl  mcptr ptr parameter;				/* pointer to machine conditions */
+
+/* Automatic */
+
+dcl  1 old_status like branch;			/* status of faulted segment */
+dcl  old_segno fixed bin (15);			/* segment number of faulted segment */
+dcl  old_ptr ptr;					/* pointer to faulted segment */
+dcl  old_dirname char (168);				/* directory containing faulted segment */
+dcl  old_ename char (32);				/* and its entry name */
+
+dcl  new_ptr ptr;					/* pointer to copy */
+dcl  new_dirname char (168);				/* directory containing copy */
+dcl  new_ename char (32);				/* entry name of copy */
+
+dcl  maxlength fixed bin (19);			/* max length of segment */
+dcl  size fixed bin (21);				/* size of segment in words */
+dcl  rb (3) fixed bin (6);				/* ring brackets of copy */
+dcl  group_id char (32);				/* group ID for ACL's */
+dcl  ref_names (10) char (32);			/* refnames so they can be put back */
+dcl  saved_lote bit (36) aligned;			/* LOT entry for the same reason */
+dcl  code fixed bin (35);
+dcl  i fixed bin;
+dcl  initiate_entry variable entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+						/* hcs_$initiate is saved here in case we have no linkage sectoion */
+dcl  (
+     val_ring,					/* validation ring at time of fault */
+     my_ring,					/* current ring of execution */
+     x_ring,					/* ring of execution at time of fault */
+     t_ring					/* validation ring of faulting reference */
+     ) fixed bin (3);
+dcl  saved_useable_lot bit (1) aligned;			/* whether LOT was good when fault happened */
+
+/* Entries callable in any ring */
+
+dcl  hcs_$level_get entry () returns (fixed bin (3));
+dcl  hcs_$level_set entry (fixed bin (3));
+dcl  hcs_$append_branchx
+	entry (char (*), char (*), fixed bin (5), (3) fixed bin (6), char (*), fixed bin (1), fixed bin (1),
+	fixed bin (24), fixed bin (35));
+dcl  hcs_$fs_get_path_name entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+dcl  hcs_$set_bc_seg entry (ptr, fixed bin (24), fixed bin (35));
+dcl  hcs_$fs_get_ref_name entry (ptr, fixed bin, char (*), fixed bin (35));
+dcl  hcs_$status_long entry (char (*), char (*), fixed bin (1), ptr, ptr, fixed bin (35));
+dcl  hcs_$get_max_length entry (char(*), char(*), fixed bin (19), fixed bin(35));
+dcl  hcs_$set_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl  hcs_$terminate_seg entry (ptr, fixed bin, fixed bin (35));
+dcl  hcs_$initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+
+/* User-ring entries */
+
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+dcl  get_group_id_ entry returns (char (32));
+dcl  get_pdir_ entry returns (char (168));
+dcl  get_ring_ entry returns (fixed bin (3));
+
+/* Hardcore entries */
+
+dcl  makeunknown_ entry (fixed bin (15), bit (2) aligned, bit (1) aligned, fixed bin (35));
+dcl  initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+
+dcl  pds$process_dir_name char (32) ext;
+dcl  pds$process_group_id char (32) ext;
+dcl  pds$useable_lot (0:7) ext bit unaligned;
+
+/* External static */
+
+dcl  error_table_$no_s_permission ext fixed bin (35);
+dcl  sys_info$page_size fixed bin ext static;
+
+/* Builtins */
+
+dcl  (addr, baseptr, baseno, binary, max, null, pointer, unspec) builtin;
+
+dcl  cleanup condition;
+
+/* Based */
+
+dcl  move char (size) based aligned;
+%page;
+	scup = addr (mcptr -> mc.scu);
+	old_segno = binary (scu.tpr.tsr, 15);		/* extract segment number */
+	x_ring = binary (scu.ppr.prr, 3);		/* ring that faulted */
+	val_ring = hcs_$level_get ();			/* save the validation level */
+	my_ring = get_ring_ ();			/* find ring we are in now */
+	if x_ring < my_ring then return ("1"b);		/* must have crawled out already */
+	t_ring = binary (scu.tpr.trr, 3);		/* validation ring of reference */
+	if my_ring = 0 then saved_useable_lot = pds$useable_lot (t_ring);
+						/* we have to restore this later */
+	on cleanup
+	     begin;				/* restore in case of accidents */
+		if my_ring = 0 then pds$useable_lot (t_ring) = saved_useable_lot;
+		call hcs_$level_set (val_ring);
+	     end;
+	call hcs_$level_set (t_ring);			/* set validation level */
+
+	old_ptr = baseptr (old_segno);
+	call hcs_$fs_get_path_name (old_ptr, old_dirname, (0), old_ename, code);
+						/* get path name of faulted sgement */
+	if code ^= 0 then goto error;
+	call hcs_$status_long (old_dirname, old_ename, 1, addr (old_status), null (), code);
+						/* get its copy switch */
+	if (code ^= 0) & (code ^= error_table_$no_s_permission) then goto error;
+	if old_status.copy_switch = "0"b then goto error; /* no copy switch set */
+	call hcs_$get_max_length (old_dirname, old_ename, maxlength, code);
+	if (code ^= 0) & (code ^= error_table_$no_s_permission) then goto error;
+	t_ring = max (t_ring, binary (old_status.ring_brackets (0), 3));
+						/* update t_ring from ring brackets */
+	if my_ring = 0 then saved_useable_lot = pds$useable_lot (t_ring);
+						/* must save it again */
+	call hcs_$level_set (t_ring);
+
+/* find ring whose lot entry is saved */
+
+	if /* case */ my_ring = 0 then do;
+	     pds$useable_lot (t_ring) = "0"b;		/* this allows faults on the LOT to work */
+	     new_dirname = pds$process_dir_name;
+	     group_id = pds$process_group_id;
+	     end;
+	else if t_ring ^= x_ring			/* someday we should be able to handle this case */
+	then goto error;
+	else do;
+	     sb = pointer (mcptr -> mc.prs (6), 0);	/* get ptr to our stack */
+	     new_dirname = get_pdir_ ();
+	     group_id = get_group_id_ ();
+	     end;
+
+/* Copy switch was ON, do the copy on write work */
+
+	new_ename = unique_chars_ ("0"b) || ".cp." || old_ename;
+	do i = 1 to 3;				/* compute new ring brackets */
+	     rb (i) = max (t_ring, binary (old_status.ring_brackets (i - 1), 3));
+	end;
+	call hcs_$append_branchx (new_dirname, new_ename, 01110b, rb, group_id, 0, 0, binary (old_status.bit_count, 24),
+	     code);				/* create the copy */
+	if code ^= 0 then goto error;
+	call hcs_$initiate (new_dirname, new_ename, "", 0, 0, new_ptr, code);
+						/* get a pointer to it */
+	if new_ptr = null () then goto error;
+	call hcs_$set_max_length_seg (new_ptr, maxlength, code);
+	if code ^= 0 then goto error;
+	size = binary (old_status.current_length, 12) * sys_info$page_size * 4;
+	new_ptr -> move = old_ptr -> move;		/* copy the segment */
+
+/* now swap the new segment for the old one */
+/* NOTE: we don't seem to do the right thing by known counts; this is hard to fix.
+   Don't do so well by refnames, either, if you have more than 10. */
+
+	if my_ring = 0 then do;
+	     call makeunknown_ (binary (baseno (new_ptr), 15), "01"b, (""b), code);
+	     if code ^= 0 then goto error;		/* make the new copy unknown */
+	     call makeunknown_ (old_segno, "11"b, (""b), code);
+						/* free up the segment number */
+	     if code ^= 0 then goto error;
+	     call initiate (new_dirname, new_ename, "", 1, 0, old_ptr, code);
+						/* make the copy known with the old segment number */
+	     pds$useable_lot (t_ring) = saved_useable_lot;/* restore useable_lot */
+	     if code ^= 0 then goto error;
+	     end;
+	else do;
+	     call hcs_$terminate_seg (new_ptr, 0, code);	/* terminate new copy */
+	     if code ^= 0 then goto error;
+	     do i = 1 to 10 while (code = 0);		/* save the refnames */
+		call hcs_$fs_get_ref_name (old_ptr, i, ref_names (i), code);
+	     end;
+	     saved_lote = unspec (stack_header.lot_ptr -> lot.lp (old_segno));
+						/* and the LOT entry */
+	     initiate_entry = hcs_$initiate;		/* must save since our linkage section is going away */
+	     call hcs_$terminate_seg (old_ptr, 1, code);	/* terminate old segment */
+	     if code ^= 0 then goto error;
+	     call initiate_entry (new_dirname, new_ename, "", 1, 0, old_ptr, code);
+						/* initiate new one in its place */
+	     if code ^= 0 then goto error;
+	     unspec (stack_header.lot_ptr -> lot.lp (old_segno)) = saved_lote;
+						/* restore LOT entry */
+	     do i = 1 to i - 1;			/* and ref names */
+		call hcs_$initiate (new_dirname, new_ename, ref_names (i), 0, 0, old_ptr, code);
+	     end;
+	     end;
+
+	call hcs_$level_set (val_ring);		/* restore saved validation level */
+	return ("0"b);
+
+error:						/* an error has occurred */
+	call hcs_$level_set (val_ring);		/* restore validation level */
+	if my_ring = 0 then pds$useable_lot (t_ring) = saved_useable_lot;
+	return ("1"b);
+%page;
+%include status_info;
+%include mc;
+%include lot;
+%include stack_header;
+
+     end copy_on_write_handler_;

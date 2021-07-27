@@ -1,0 +1,258 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+merge_volume_log: proc;
+
+/* This utility command merges two volume logs. Such a situation can occur if a volume log is deleted, then
+   a new one is created by the volume dumper, and subsequently the old one is recovered.  This command will update the
+   newer volume log with the data in the older volume log. The older volume log will not be modified. */
+
+/* Modified 83-11-04 by SGH (UNCA) to improve merge strategy -- phx16302. */
+
+dcl  arg char (argl) based (argp);
+dcl  argl fixed bin;
+dcl  argp ptr;
+dcl  old_lock bit (1);
+dcl  new_lock bit (1);
+dcl  temp_segs bit (1);
+dcl  update_lock bit (1);
+dcl  cycle_uid bit (36);
+dcl  tp (1) ptr;
+dcl  p (2) ptr;
+dcl  temp_bvlp ptr;
+dcl  update_bvlep ptr;
+dcl  new_bvlp ptr;
+dcl  copy_bvlp ptr;
+dcl  old_bvlep ptr;
+dcl  old_bvlp ptr;
+dcl  update_bvlp ptr;
+dcl  i fixed bin;
+dcl  j fixed bin;
+dcl  num char (12) ;
+dcl  relpn char (32);
+dcl  dn (3) char (168);
+dcl  en (3) char (32);
+dcl  code fixed bin (35);
+dcl  new_entry_count fixed bin;
+dcl  ignore fixed bin (35);
+dcl  myname char (32);
+
+dcl  cleanup condition;
+
+dcl  cu_$arg_count entry returns (fixed bin);
+dcl  hcs_$fs_get_path_name entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+dcl  adjust_bit_count_ entry (char (*), char (*), bit (1), fixed bin, fixed bin (35));
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  cv_oct_check_ entry (char (*), fixed bin (35)) returns (fixed bin);
+dcl  get_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl  release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl  com_err_ entry options (variable);
+dcl  suffixed_name_$make entry (char (*), char (*), char (*), fixed bin (35));
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  hcs_$initiate entry (char (*), char (*), char (*), fixed bin, fixed bin, ptr, fixed bin (35));
+dcl  set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+dcl  hcs_$terminate_noname entry (ptr, fixed bin (35));
+dcl  ioa_ entry options (variable);
+dcl  date_time_ entry (fixed bin (71), char (*));
+
+dcl  error_table_$invalid_lock_reset fixed bin (35) ext;
+dcl  unspec builtin;
+dcl  null builtin;
+dcl  addr builtin;
+
+%include backup_volume_log;
+%include backup_pvol_info;
+%include fs_vol_label;
+%include backup_volume_header;
+%include backup_static_variables;
+
+/* init local variables */
+	code = 0;
+	temp_segs = "0"b;
+	old_lock = "0"b;
+	new_lock = "0"b;
+	update_lock = "0"b;
+	new_entry_count = 0;
+	old_bvlp, update_bvlp, temp_bvlp, new_bvlp, tp (*) = null;
+	myname = "merge_volume_log";
+
+	on cleanup call finish_;
+						/* pickup pathnames and convert to pointers */
+	do i = 1, 2;
+	     call cu_$arg_ptr (i, argp, argl, code);
+	     if code ^= 0 then goto err;
+
+	     call suffixed_name_$make (arg, "volog", relpn, code);
+	     if code ^= 0 then goto err;
+
+	     call expand_pathname_ (relpn, dn (i), en (i), code);
+	     if code ^= 0 then goto err;
+
+	     call hcs_$initiate (dn (i), en (i), "", 0, 0, p (i), code);
+	     if p (i) = null then goto err;
+	end;
+						/* set local copies */
+	old_bvlp = p (1);
+	update_bvlp = p (2);
+
+	if old_bvlp = update_bvlp then do;
+	     call com_err_ (0, myname, "Same log specified as old and new");
+	     goto finish;
+	end;
+						/* create third seg if required */
+	if cu_$arg_count () > 2 then do;
+	     call cu_$arg_ptr (3, argp, argl, code);
+	     if code ^= 0 then goto err;
+	     call suffixed_name_$make (arg, "volog", relpn, code);
+	     if code ^= 0 then goto err;
+	     call expand_pathname_ (relpn, dn (3), en (3), code);
+	     if code ^= 0 then goto err;
+	     call hcs_$make_seg (dn (3), en (3), "", 1010b, new_bvlp, code);
+	     if new_bvlp = null then goto err;
+	end;
+						/* set up temp segs */
+	call get_temp_segments_ (myname, tp, code);
+	if code ^= 0 then goto err;
+	temp_segs = "1"b;
+	temp_bvlp = tp (1);
+						/* unlock logs if we abort */
+						/* lock both logs - set flags indicating they're locked */
+	call set_lock_$lock (old_bvlp -> backup_volume_log.lock, -1, code);
+	if code ^= 0 then do;
+	     if code = error_table_$invalid_lock_reset then code = 0;
+	     else goto err;
+	end;
+	old_lock = "1"b;
+	call set_lock_$lock (update_bvlp -> backup_volume_log.lock, -1, code);
+	if code ^= 0 then goto err;
+	update_lock = "1"b;
+
+/* Compare each entry in each log and order the new log enties by which entry, if used, has
+   an earlier starting time. */
+
+	i, j = 1;
+	do while (i <= old_bvlp -> backup_volume_log.next | j <= update_bvlp -> backup_volume_log.next);
+	     old_bvlep = addr (old_bvlp -> backup_volume_log.array (i));
+	     update_bvlep = addr (update_bvlp -> backup_volume_log.array (j));
+
+/* If both cycle uids valid ->  compare and take one with first open time. */
+
+	     if old_bvlep -> bvle.cycle_uid ^= "0"b & update_bvlep -> bvle.cycle_uid ^= "0"b then do;
+		if old_bvlep -> bvle.open_time < update_bvlep -> bvle.open_time then call log_entry (old_bvlep, i);
+		else if old_bvlep -> bvle.open_time > update_bvlep -> bvle.open_time then
+		     call log_entry (update_bvlep, j);
+
+/* If both open-times equal -> take only one if identical; otherwise, both */
+
+		else do;				/* equal open times */
+		     if unspec (old_bvlep -> bvle) = unspec (update_bvlep -> bvle) then do;
+			call log_entry (old_bvlep, i);
+			j = j + 1;
+		     end;
+		     else do;
+			call log_entry (old_bvlep, i);
+			call log_entry (update_bvlep, j);
+		     end;
+		end;
+	     end;
+
+/* If old cycle uid valid but update invalid -> take old, discard update. */
+
+	     else if old_bvlep -> bvle.cycle_uid ^= "0"b then do;
+		call log_entry (old_bvlep, i);
+		j = j + 1;
+	     end;
+
+/* If update cycle uid valid but old invalid -> take update, discard old. */
+
+	     else if update_bvlep -> bvle.cycle_uid ^= "0"b then do;
+		call log_entry (update_bvlep, j);
+		i = i + 1;
+	     end;
+
+/* If both cycle uids invalid -> discard both with warning. */
+
+	     else do;
+		call com_err_ (0, myname, "null entry in both logs");
+		i = i + 1;
+		j = j + 1;
+	     end;
+	end;
+						/* if new copy wanted copy old log */
+	if new_bvlp ^= null then do;
+	     new_bvlp -> backup_volume_log = old_bvlp -> backup_volume_log;
+	     if code ^= 0 then goto err;
+	     copy_bvlp = new_bvlp;
+	     new_lock = "1"b;
+	end;
+	else copy_bvlp = old_bvlp;
+						/* copy temp log entries into right place */
+	do i = 1 to new_entry_count;
+	     copy_bvlp -> backup_volume_log.array (i) = temp_bvlp -> backup_volume_log.array (i);
+	end;
+						/* Unlock all locked logs and set flags */
+	copy_bvlp -> backup_volume_log.next = new_entry_count;
+	call set_lock_$unlock (old_bvlp -> backup_volume_log.lock, code);
+	if code ^= 0 then goto err;
+	old_lock = "0"b;
+	call set_lock_$unlock (update_bvlp -> backup_volume_log.lock, code);
+	if code ^= 0 then goto err;
+	update_lock = "0"b;
+	if new_bvlp ^= null then call set_lock_$unlock (new_bvlp -> backup_volume_log.lock, code);
+	if code ^= 0 then goto err;
+	new_lock = "0"b;
+
+	call ioa_ ("volume logs ^a and ^a merged", en (1), en (2));
+
+/* Unlock  all locked logs and terminate all known logs. Also release temp segs */
+
+finish:
+	call finish_;
+	return;
+
+err:	call com_err_ (code, myname);
+	goto finish;
+
+log_entry: proc (vlep, index);
+
+/* This proc adds an entry to the new volume log */
+
+dcl  vlep ptr;
+dcl  index fixed bin;
+	     new_entry_count = new_entry_count + 1;
+	     index = index + 1;
+	     temp_bvlp -> backup_volume_log.array (new_entry_count) = vlep -> bvle;
+	end log_entry;
+
+
+finish_:	proc;
+	     if old_lock & old_bvlp ^= null then call set_lock_$unlock (old_bvlp -> backup_volume_log.lock, code);
+	     if new_lock & new_bvlp ^= null then call set_lock_$unlock (new_bvlp -> backup_volume_log.lock, code);
+	     if update_lock & update_bvlp ^= null then
+		call set_lock_$unlock (update_bvlp -> backup_volume_log.lock, code);
+	     if old_bvlp ^= null then call setbc_term (old_bvlp);
+	     if update_bvlp ^= null then call setbc_term (update_bvlp);
+	     if new_bvlp ^= null then call setbc_term (new_bvlp);
+	     if temp_segs then call release_temp_segments_ (myname, tp, ignore);
+	     return;
+	end finish_;
+setbc_term: proc (p);
+dcl  p ptr;
+dcl  dn char (168);
+dcl  en char (32);
+dcl  dnl fixed bin;
+	     call hcs_$fs_get_path_name (p, dn, dnl, en, (0));
+	     call adjust_bit_count_ (dn, en, "1"b, (0), (0));
+	     call hcs_$terminate_noname (p, (0));
+	     return;
+	end setbc_term;
+     end merge_volume_log;

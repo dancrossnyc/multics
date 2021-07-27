@@ -1,0 +1,562 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-06-08,Rauschelbach), approve(87-06-26,MCR7713),
+     audit(87-07-08,Farley), install(87-07-15,MR12.1-1041):
+     Changed to obey rcp privilege by using get_process_authorization_ instead
+     of get_authorization_.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+
+rcprm_list_resource_:
+     proc (p_resource_type, p_registry_dir, p_userid, p_user_area_ptr, p_n_resources, p_return_ptr, p_code);
+
+/* This procedure is charged with returning a list of resources owned by
+   various groups.  The selection is made by the userid argument.  It can
+   select from among:
+   1) a certain user.project (userid = user.project)
+   2) any user.project (privileged) (userid = user.project)
+   3) a certain project (project administrators only) (userid = *.project)
+   4) the system (userid = "system")
+   5) the free pool (userid = "free")
+   6) everything but the free pool (i.e. all acquisitions) (userid = "*.*")
+   7) all users (i.e. all registered resources of a given type) (userid = "**")
+*/
+
+/* Written 06/23/78 by C. D. Tavares */
+/* Modified 11/27/79 by CDT to fix bug where lists via *.Project were
+   bombing out on encountering interspersed name records for different users on
+   that project. */
+/* Modified 12/10/79 by CDT to take advantage of new facility to sleep in ring
+   1 */
+/* Modified 02/27/80 by CDT to remove non-quick blocks */
+/* Modified 06/18/81 by CDT to look for and reject * in the Project field,
+   not just treat it like a project name */
+/* Modified 09/81 by M.R. Jordan to fix a bug in listing resources awaiting manual clear. */
+/* Modified 04/83 by B. Braun to correct a typo error so 'free' and 'system' are once again accepted as arguments to
+   the list_resources -user control argument.  (TRs phx12946, phx13300). */
+/* Modified 04/83 by B. Braun to cleanup iocbs left laying about. (TR phx11736) */
+/* Modified 01/85 by Chris Jones to clean up the code, rationalize registry operations. */
+/* Modified 03/85 by Chris Jones to add auditing. */
+
+/* parameters */
+
+dcl	p_resource_type	   char (*) parameter;	/* (I) e.g. "tape_vol" */
+dcl	p_registry_dir	   char (*) parameter;	/* (I) directory registries are in */
+dcl	p_userid		   char (*) parameter;	/* (I) Personid.Project, or "system" or "free" or ** or *.* */
+dcl	p_user_area_ptr	   pointer parameter;	/* (I) area to allocate resource_list structure in */
+dcl	p_n_resources	   fixed bin (35) parameter;	/* (O) number of resources in resource_list */
+dcl	p_return_ptr	   pointer parameter;	/* (O) pointer to allocated structure */
+dcl	p_code		   fixed bin (35) parameter;	/* (O) standard status code */
+
+/* automatic */
+
+dcl	access_mode	   fixed bin (5);
+dcl	awaiting_clear	   bit (1) aligned initial ("0"b);
+dcl	code		   fixed bin (35);
+dcl	cur_level		   fixed bin;
+dcl	do_seek_head	   bit (1) initial ("0"b) aligned;
+dcl	done		   bit (1) aligned;
+dcl	find_by_resource_name  bit (1) aligned initial ("0"b);
+dcl	found		   bit (1) aligned;
+dcl	germane_descriptor	   fixed bin (35);
+dcl	i		   fixed bin (35);
+dcl	next_resource_list_ptr ptr;
+dcl	original_key	   char (256);
+dcl	pdt_name		   char (32);
+dcl	project		   char (32);
+dcl	prev_level	   fixed bin;
+dcl	last_known_key	   char (64) varying;
+dcl	last_ptr		   pointer;
+dcl	priv_sw		   bit (1) aligned;
+dcl	real_resource_record   bit (1) aligned;
+dcl	registry_dir	   char (64);
+dcl	resource_type	   char (32);
+dcl	return_ptr	   ptr;
+dcl	rew		   bit (3);
+dcl	rno		   fixed bin;
+dcl	sw_ptr		   pointer initial (null ());
+dcl	tcf_sw_ptr	   pointer initial (null ());
+dcl	user_area_ptr	   ptr init (null ());
+dcl	userid		   char (32);
+
+dcl	1 authorization	   aligned automatic like aim_template;
+dcl	1 record_status	   aligned automatic like rs_info;
+dcl	1 req_info	   aligned automatic like requestor_info;
+dcl	1 res_info	   aligned automatic like resource_info;
+dcl	1 get_key_info	   automatic,
+	  2 header	   like gk_header,
+	  2 key		   char (256) unaligned;
+
+dcl	1 circular_list	   aligned automatic,
+	  2 high_water_mark	   fixed bin,
+	  2 latest_entry	   fixed bin,
+	  2 entry		   (20) aligned,		/* 20 should be pretty efficient */
+	    3 descriptor	   fixed bin (35),
+	    3 rew		   bit (3) aligned;
+
+/* static */
+
+dcl	pdt_dirname	   char (168) initial (">system_control_1>pdt") static;
+
+dcl	Move_rel		   initial (0) fixed bin static options (constant);
+
+/* entries */
+
+dcl	access_audit_r1_$log_obj_path
+			   entry options (variable);
+dcl	cu_$level_get	   ext entry (fixed bin);
+dcl	cu_$level_set	   ext entry (fixed bin);
+dcl	get_authorization_	   entry () returns (bit (72) aligned);
+dcl	get_process_authorization_
+			   entry () returns (bit (72) aligned);
+dcl	get_group_id_	   entry () returns (char (32));
+dcl	get_group_id_$tag_star ext entry returns (char (32));
+dcl	get_ring_		   ext entry returns (fixed bin);
+dcl	hcs_$get_user_effmode  entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35));
+dcl	pathname_		   entry (char (*), char (*)) returns (char (168));
+dcl	rcp_compute_aim_mode   entry (ptr, ptr, bit (3), fixed bin (35));
+dcl	rcprm_registry_util_$free_key
+			   entry (ptr, char (*));
+dcl	rcprm_registry_util_$owner_key
+			   entry (char (*), ptr, char (*));
+dcl	rcprm_registry_util_$project_key
+			   entry (char (*), ptr, char (*));
+dcl	rcprm_registry_util_$skeleton_key
+			   entry (ptr, char (*));
+dcl	rcprm_registry_util_$skeleton_acquisition_key
+			   entry (ptr, char (*));
+dcl	rcprm_registry_util_$system_key
+			   entry (ptr, char (*));
+dcl	rcprm_registry_util_$grab_transaction_control_file
+			   entry (ptr, char (*), fixed bin (35));
+dcl	rcprm_registry_util_$release_transaction_control_file
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$release_registry
+			   entry (ptr, fixed bin (35));
+dcl	suffixed_name_$make	   entry (char (*), char (*), char (32), fixed bin (35));
+
+/* external variables */
+
+dcl	(
+	error_table_$insufficient_access,
+	error_table_$no_record,
+	error_table_$bad_name,
+	error_table_$end_of_info,
+	error_table_$smallarg
+	)		   ext fixed bin (35) static;
+dcl	access_operations_$rcp_list
+			   bit (36) aligned ext static;
+
+/* based variables */
+
+dcl	user_area		   area based (user_area_ptr);
+
+/* builtins and conditions */
+
+dcl	(area, cleanup)	   condition;
+
+dcl	(addr, after, before, hbound, null, rtrim, reverse, substr, unspec)
+			   builtin;
+
+	priv_sw = "0"b;
+	goto common;
+
+priv:
+     entry (p_resource_type, p_registry_dir, p_userid, p_user_area_ptr, p_n_resources, p_return_ptr, p_code);
+
+	priv_sw = "1"b;
+	goto common;
+
+awaiting_clear:
+     entry (p_resource_type, p_registry_dir, p_userid, p_user_area_ptr, p_n_resources, p_return_ptr, p_code);
+
+	priv_sw = "1"b;
+	awaiting_clear = "1"b;
+	goto common;
+
+common:
+/**** Copy relevant arguments ****/
+	resource_type = p_resource_type;
+	registry_dir = p_registry_dir;
+	userid = p_userid;
+	user_area_ptr = p_user_area_ptr;
+	return_ptr = null ();
+	call cu_$level_get (prev_level);
+	unspec (authorization) = get_process_authorization_ ();
+
+	if awaiting_clear then do;
+	     find_by_resource_name = "1"b;		/* no owner hijinks necessary */
+	     call rcprm_registry_util_$skeleton_key (addr (get_key_info.header), get_key_info.key);
+	end;
+
+	else if userid = "free" then
+	     call rcprm_registry_util_$free_key (addr (get_key_info.header), get_key_info.key);
+	else if userid = "system" then
+	     call rcprm_registry_util_$system_key (addr (get_key_info.header), get_key_info.key);
+	else if userid = "" | userid = get_group_id_$tag_star ()
+						/* asking for ourself */
+	     | userid = reverse (after (reverse (get_group_id_$tag_star ()), ".")) then do;
+	     call rcprm_registry_util_$owner_key (get_group_id_$tag_star (), addr (get_key_info.header),
+		get_key_info.key);
+	end;
+
+	else if userid = "*.*" then do;		/* requesting info on all acquired resources */
+	     if ^priv_sw then do;
+		code = error_table_$insufficient_access;
+		call error_return;
+	     end;
+	     call rcprm_registry_util_$skeleton_acquisition_key (addr (get_key_info.header), get_key_info.key);
+	end;
+
+	else if userid = "**" then do;		/* requesting info on all registered resources */
+	     if ^priv_sw then do;
+		code = error_table_$insufficient_access;
+		call error_return;
+	     end;
+
+	     find_by_resource_name = "1"b;
+	     call rcprm_registry_util_$skeleton_key (addr (get_key_info.header), get_key_info.key);
+	end;
+	else if substr (userid, 1, 2) = "*." then do;	/* requesting info on one project */
+	     call breakapart (userid, (""), project);
+
+	     pdt_name = rtrim (project) || ".pdt";	/* use PDT as an ACS */
+	     call hcs_$get_user_effmode (pdt_dirname, pdt_name, "", -1, access_mode, code);
+
+	     if code ^= 0 then
+		call error_return;
+	     if access_mode < R_ACCESS_BIN then do;	/* no read permission */
+		code = error_table_$insufficient_access;
+		call error_return;
+	     end;
+
+	     call rcprm_registry_util_$project_key (project, addr (get_key_info.header), get_key_info.key);
+	end;
+
+	else do;					/* request for particular user ^= caller */
+	     if ^priv_sw then do;
+		code = error_table_$insufficient_access;
+		call error_return;
+	     end;
+
+
+/* Make sure caller is not asking for "Person.*" */
+
+	     call breakapart (userid, (""), project);
+	     if project = "*" then do;
+		code = error_table_$bad_name;
+		call error_return;
+	     end;
+
+	     call rcprm_registry_util_$owner_key (userid, addr (get_key_info.header), get_key_info.key);
+	end;
+	original_key = substr (get_key_info.key, 1, get_key_info.head_size);
+
+/* Now we've figured out exactly what it is that the caller wants us to do
+   (and whether the caller can do it.)  So now we do it. */
+
+	on cleanup call clean_up ((0), "0"b);
+
+	cur_level = get_ring_ ();
+	call cu_$level_set (cur_level);
+
+	call rcprm_registry_util_$grab_transaction_control_file (tcf_sw_ptr, registry_dir, code);
+	if code ^= 0 then
+	     call error_return;
+
+	call rcprm_registry_util_$grab_registry (sw_ptr, registry_dir, resource_type, code);
+	if code ^= 0 then
+	     call error_return;
+
+	rno = 0;
+	last_known_key = "";
+
+	call iox_$control (sw_ptr, "get_key", addr (get_key_info), code);
+	if code ^= 0 then do;
+	     call clean_up (code, "1"b);
+	     if code ^= 0 then
+		call error_return;
+	     goto return_to_caller;
+	end;
+
+	done = "0"b;
+	get_key_info.input_key = "0"b;		/* just get the current key */
+	get_key_info.current = "1"b;			/* from now on */
+
+	unspec (record_status) = ""b;
+	record_status.version = rs_info_version_2;
+
+	on area
+	     begin;
+	     code = error_table_$smallarg;
+	     call error_return;
+	end;
+
+	circular_list.high_water_mark = -1;
+	circular_list.latest_entry = 0;
+	Max_entries = 100;				/* seems like a nice enough number */
+
+	allocate resource_list in (user_area) set (resource_list_ptr);
+	return_ptr = resource_list_ptr;		/* save it now for error_return */
+
+/* Now loop, finding all relevant resources. */
+
+	do while (^done);
+
+	     real_resource_record = "0"b;
+
+	     if substr (get_key_info.key, 1, get_key_info.head_size) ^= original_key then
+		done = "1"b;
+	     else if find_by_resource_name then
+		real_resource_record = "1"b;		/* no owner record hijinks necessary */
+	     else if get_key_info.key = last_known_key then
+		real_resource_record = "1"b;		/* first record of a given user key is username record, not a real resource record */
+	     else last_known_key = rtrim (get_key_info.key);
+
+	     if ^done & real_resource_record then do;
+		call iox_$control (sw_ptr, "record_status", addr (record_status), code);
+		if code = 0 then
+		     ;
+		else if code = error_table_$no_record then
+		     real_resource_record = "0"b;	/* is not, but has just been garbage-collected */
+						/* and should never bother us again! */
+		else call error_return;
+
+		if real_resource_record then do;
+		     record_ptr = record_status.record_ptr;
+
+/* see if we have enough access to report the existence of this resource.  This
+   computation takes into account ONLY the AIM range of the resource (since r
+   raw mode is not necessary to list the existence of a resource, but
+   read_allowed_ IS.) Once we know our access to any resource, theoretically we
+   know our access to any other resource possessing the same AIM descriptor.
+   So we make use of this fact (for efficiency) and look up the known
+   descriptors in a small internal table before passing the question off to the
+   external subroutine that acts as RCP's AIM security kernel.  (Note that all
+   descriptors found in this manner have gone through the kernel at least once
+   anyway.) */
+
+		     if authorization.privileges.rcp then
+			rew = "111"b;
+		     else do;
+
+			if registry_record.free then
+			     germane_descriptor = registry_record.potential_aim_range_desc;
+			else germane_descriptor = registry_record.aim_range_desc;
+
+			found = "0"b;
+
+			do i = circular_list.latest_entry to circular_list.high_water_mark while (^found),
+			     1 to circular_list.latest_entry - 1 while (^found);
+			     if circular_list.descriptor (i) = germane_descriptor then do;
+				rew = circular_list.rew (i);
+				found = "1"b;
+			     end;
+			end;
+
+/**** It wasn't found, so we ask rcp_compute_aim_mode to tell us what access this AIM
+      range confers on us. ****/
+			if ^found then do;
+			     res_info.registry_dir = registry_dir;
+			     res_info.registry_switch_ptr = sw_ptr;
+			     res_info.registry_record_ptr = record_ptr;
+			     res_info.resource_type = resource_type;
+			     res_info.resource_name = "";
+			     req_info.user_id = get_group_id_ ();
+			     req_info.current_authorization = get_authorization_ ();
+			     req_info.validation_level = prev_level;
+			     call rcp_compute_aim_mode (addr (req_info), addr (res_info), rew, code);
+			     if code ^= 0 then
+				call error_return;
+
+/* enter the information into the circular list */
+
+			     if circular_list.latest_entry = hbound (circular_list.descriptor, 1) then
+				i, circular_list.latest_entry = 1;
+			     else i, circular_list.latest_entry = circular_list.latest_entry + 1;
+
+			     if circular_list.latest_entry > circular_list.high_water_mark then
+				circular_list.high_water_mark = circular_list.latest_entry;
+
+			     circular_list.descriptor (i) = germane_descriptor;
+			     circular_list.rew (i) = rew;
+			end;
+		     end;
+
+		     if ^priv_sw & registry_record.awaiting_clear then
+			rew = "000"b;		/* don't report spectral resources */
+
+		     if awaiting_clear then		/* do we want only those awaiting clear? */
+			if registry_record.awaiting_clear = "0"b then
+						/* yes, and this one isn't */
+			     rew = "000"b;		/* ignore it-- make believe we can't read it */
+
+		     if substr (rew, 1, 1) = "1"b then do;
+						/* we can know this resource exists */
+			rno = rno + 1;		/* gound another one */
+
+			if resource_list.n_resources = resource_list.max_entries then do;
+			     last_ptr = resource_list_ptr;
+			     allocate resource_list in (user_area) set (resource_list_ptr);
+			     last_ptr -> resource_list.forward_ptr = resource_list_ptr;
+			end;
+
+			i, resource_list.n_resources = resource_list.n_resources + 1;
+			resource_list.resource_name (i) = registry_record.name.string;
+		     end;
+
+		end;
+
+	     end;
+	     if ^done then do;
+		call iox_$position (sw_ptr, Move_rel, 1, code);
+		if code = 0 then
+		     ;
+		else if code = error_table_$end_of_info then
+		     done = "1"b;
+		else call error_return;
+		if ^done then do;
+		     call iox_$control (sw_ptr, "get_key", addr (get_key_info), code);
+		     if code ^= 0 then
+			call error_return;
+		end;
+	     end;
+	end;
+	call audit (0);
+
+	call clean_up (code, "1"b);
+	if code ^= 0 then
+	     call error_return;
+
+return_to_caller:
+	p_n_resources = rno;			/* tell caller how many we found */
+	p_return_ptr = return_ptr;
+	p_code = code;
+	return;
+
+breakapart:
+     proc (userid, user_name, project);
+
+dcl	userid		   char (*) parameter;
+dcl	user_name		   char (*) parameter;
+dcl	project		   char (*) parameter;
+
+	user_name = before (userid, ".");
+	project = before (after (userid, "."), ".");
+
+     end breakapart;
+
+
+clean_up:
+     proc (code, error_matters);
+
+dcl	code		   fixed bin (35) parameter;
+dcl	error_matters	   bit (1) aligned parameter;
+
+	if sw_ptr ^= null () then do;
+	     call rcprm_registry_util_$release_registry (sw_ptr, code);
+	     call return_if_real_error;
+	end;
+
+	if tcf_sw_ptr ^= null () then do;
+	     call rcprm_registry_util_$release_transaction_control_file (tcf_sw_ptr, code);
+	     call return_if_real_error;
+	end;
+
+	call cu_$level_set (prev_level);
+
+cleanup_return:
+	return;
+
+return_if_real_error:
+	proc;
+
+	     if error_matters & code ^= 0 then
+		goto cleanup_return;
+
+	end return_if_real_error;
+
+     end clean_up;
+
+error_return:
+     proc;
+
+	call audit (code);
+	call clean_up ((0), "0"b);
+	do resource_list_ptr = return_ptr repeat next_resource_list_ptr while (resource_list_ptr ^= null ());
+	     next_resource_list_ptr = resource_list.forward_ptr;
+	     free resource_list;
+	end;
+	rno = 0;
+	return_ptr = null ();
+	goto return_to_caller;
+
+     end error_return;
+
+audit:
+     proc (code);
+
+dcl	code		   fixed bin (35) parameter;
+
+dcl	1 auto_event_flags	   like audit_event_flags aligned;
+dcl	registry_name	   char (32);
+
+	unspec (auto_event_flags) = ""b;
+	auto_event_flags.grant = (code = 0);
+	auto_event_flags.priv_op = priv_sw;
+	call suffixed_name_$make (resource_type, "rcpr", registry_name, (0));
+	call access_audit_r1_$log_obj_path ("rcprm_list_resource_", prev_level, unspec (auto_event_flags),
+	     access_operations_$rcp_list, pathname_ (registry_dir, registry_name), code, null (), 0);
+
+     end audit;
+
+test:
+     entry (newdirname);
+
+dcl	newdirname	   char (*) parameter;
+
+	if newdirname = "" then
+	     pdt_dirname = ">system_control_1>pdt";
+	else pdt_dirname = newdirname;
+	return;
+
+%include access_audit_eventflags;
+%page;
+%include resource_list;
+%page;
+%include rcp_registry;
+%page;
+%include rcp_requestor_info;
+%page;
+%include rcp_resource_info;
+%page;
+%include aim_template;
+%page;
+%include iox_dcls;
+%page;
+%include iox_modes;
+%page;
+%include access_mode_values;
+%page;
+%include rs_info;
+%page;
+%include ak_info;
+
+     end rcprm_list_resource_;

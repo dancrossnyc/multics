@@ -1,0 +1,568 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+punch_driver_: proc;
+
+	return;					/* this is not a legal entry */
+
+
+/* Standard punch device driver control module for the I/O daemon. */
+
+/* Originally coded in March 1975 by J. C. Whitmore */
+/* Modified November 1975 by M. A. Braida to print flip card header */
+/* Modified by J. C. Whitmore, 4/78, for new dprint_msg format and general upgrade */
+/* Modified by J. C. Whitmore, 7/78, to initialize for auto deferring of long requests */
+/* Modified by J. C. Whitmore, 3/79, to correct string size on two assignments */
+/* Modified by C. Marker, 02/23/85, to use version 5 message segments */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-05-10,Gilcrease), approve(87-08-17,MCR7686),
+     audit(88-02-01,Farley), install(88-02-02,MR12.2-1019):
+      Update for version 4 dprint_msg, and allow previous version.
+  2) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-20,Wallman), install(88-10-28,MR12.2-1199):
+     Upgrade for version 5 iod tables.
+  3) change(88-08-29,Farley), approve(88-08-19,MCR7911),
+     audit(88-10-20,Wallman), install(88-10-28,MR12.2-1199):
+     Updated for version 5 dprint_msg.
+  4) change(90-08-30,Vu), approve(90-08-30,MCR8196), audit(90-09-12,Zimmerman),
+     install(90-10-01,MR12.4-1034):
+     Correct generation of major_args_ptr when using offset into the I/O daemon
+     tables string area.
+                                                   END HISTORY COMMENTS */
+
+
+/*	AUTOMATIC VARIABLES */
+
+dcl  date_string char (24);
+dcl  ec fixed bin (35);
+dcl  i fixed bin;					/* general index variable */
+dcl  io_stat bit (72) aligned;			/* ios_ status code */
+dcl  major_args char (major_args_length) based (major_args_ptr);
+dcl  major_args_ptr ptr;				/* ptr to major_args string */
+dcl  major_args_length fixed bin;
+dcl  nelm fixed bin;
+dcl  nelt fixed bin;
+dcl  dest char (24);				/* temp for the destination */
+dcl  head char (64) aligned;				/* temp for the heading */
+dcl  banner_stream char (32) aligned;
+dcl  access_class char (36) aligned;			/* temp for the first access class token */
+dcl  p2 ptr;
+dcl  retry_sw bit (1);
+
+dcl  1 st aligned based (addr (io_stat)),		/* breakdown of status code */
+       2 code fixed bin (35),
+       2 flags bit (36);
+
+
+/*	EXTERNAL ENTRIES    */
+
+dcl  add_char_offset_ entry (ptr, fixed bin(21)) returns(ptr) reducible;
+dcl  clock_ entry () returns (fixed bin (71));
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  ioa_$rsnnl entry options (variable);
+dcl  iodd_listen_ entry (ptr);
+dcl  iodd_msg_ entry options (variable);
+dcl  iodd_parse_$args entry (char(*) var, char(*)) returns(char(256) var);
+dcl  ios_$attach entry (char (*) aligned, char (*) aligned, char (*) aligned, char (*) aligned, bit (72) aligned);
+dcl  ios_$changemode entry (char (*) aligned, char (*) aligned, char (*) aligned, bit (72) aligned);
+dcl  ios_$detach entry (char (*) aligned, char (*) aligned, char (*) aligned, bit (72) aligned);
+dcl  ios_$order entry (char (*) aligned, char (*) aligned, ptr, bit (72) aligned);
+dcl  ios_$getsize entry (char (*) aligned, fixed bin, bit (72) aligned);
+dcl  ios_$write entry (char (*) aligned, ptr, fixed bin, fixed bin, fixed bin, bit (72) aligned);
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  output_request_ entry (char (*) aligned, fixed bin, ptr, entry, fixed bin (35));
+dcl  output_request_$error_during_request entry (char (*));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2) aligned, fixed bin (71));
+dcl  timer_manager_$sleep entry (fixed bin (71), bit (2) aligned);
+dcl  write_control_form_ entry (char (*) aligned, char (*) aligned, ptr, fixed bin (35));
+dcl  write_sample_form_ entry (char (*) aligned, char (*) aligned, fixed bin (35));
+
+
+/*	INTERNAL STATIC   */
+
+dcl  card_header char (512) aligned int static;		/* buffer for flip card head/tail */
+dcl  xxbar char (22) aligned int static options (constant) init ((11)"
+-");						/* string of "NL-"'s for flip cards */
+dcl  ctl_msg_sent bit (1) int static init ("0"b);		/* flag set when msg sent ok */
+dcl  time fixed bin (71) int static init (1);
+dcl  alarm_channel fixed bin (71) int static;		/* channel used for time out checks */
+dcl  meter_sw bit (1) int static;			/* TRUE - if we are to keep metering data (future) */
+dcl  master fixed bin int static options (constant) init (1);
+dcl  both fixed bin int static options (constant) init (0);
+dcl  whoami char (24) int static options (constant) init ("punch_driver_");
+dcl  initial_bit_rate fixed bin int static options (constant) init (1000); /* starting value for the bit rate estimate */
+
+dcl  1 ctl_wait_list int static aligned,		/* ipc wait list for the form terminnal */
+       2 number fixed bin,
+       2 channel fixed bin (71);
+
+dcl  1 event_info int static aligned,			/* info returned from ipc_$block */
+       2 chan fixed bin (71),
+       2 message fixed bin (71),
+       2 sender bit (36),
+       2 origin fixed bin,
+       2 wait_list_index fixed bin;
+
+dcl  1 form_info aligned int static,			/* data from the form paging dim */
+       2 page_length fixed bin,			/* put in static to save stack space */
+       2 line_length fixed bin,
+       2 line_no fixed bin,
+       2 carriage_position fixed bin,
+       2 aligned bit (1) unal,			/* tells if the dim considers the forms alignedd */
+       2 pad bit (35) unal;
+
+dcl  1 sw (5) aligned int static,			/* format stream (switch) data structure */
+       2 name char (32) init ("Undefined", "viipunch_output", "mcc_output", "raw_output", "flipper_output"),
+       2 size fixed bin init (9, 1, 9, 960, 9),		/* element size for this format */
+       2 dim char (32) init ("syn", "viipunch_", "mcc_", "raw_", "flipper_");
+%page;
+
+/*	BUILTINS    */
+
+dcl  (addr, null, substr, before, after, length, rtrim) builtin;
+
+
+/*	CONDITIONS   */
+
+dcl  cleanup condition;
+
+
+/*	EXTERNAL STATIC -- ERROR TABLE ENTRIES     */
+
+dcl  error_table_$action_not_performed fixed bin (35) ext static;
+dcl  error_table_$fatal_error fixed bin (35) ext static;
+dcl  error_table_$ionmat fixed bin (35) ext static;
+%page;
+
+init: entry (arg_p);
+
+dcl  arg_p ptr;
+
+	stat_p = arg_p;				/* put the arg into static for easy reference */
+	driver_status_ptr = iodd_static.driver_ptr;	/* get current driver status ptr */
+	text_strings_ptr = iodd_static.text_strings_ptr;	/* get ptr to i/o daemon table text area */
+	retry_sw = "1"b;				/* retry attachments once on error */
+
+	if iodd_static.attach_type ^= ATTACH_TYPE_IOM then do;	/* this driver expects an IOM channel */
+	     ec = error_table_$fatal_error;
+	     call iodd_msg_ (2, master, ec, whoami, "This driver requires a punch attached through the IOM.");
+	     return;				/* quit now */
+	end;
+
+	if iodd_static.assigned_devices > 1 then do;	/* be sure all is correct */
+	     ec = error_table_$fatal_error;
+	     call iodd_msg_ (2, master, ec, whoami, "Multiple minor devices are not supported by the punch driver.");
+	     return;
+	end;
+
+/* locate the major args for the device in the iod_tables */
+	major_args_ptr = add_char_offset_ (addr (text_strings.chars), (iodd_static.major_args.first_char - 1));
+	major_args_length = iodd_static.major_args.total_chars;
+
+	iodd_static.device_dim = iodd_parse_$args ("dim=", major_args); /* see if a dim was specified */
+	if iodd_static.device_dim = "" then iodd_static.device_dim = "cpz"; /* no, use the default */
+	iodd_static.dev_out_stream = "punch_output_stream";
+	iodd_static.dev_io_stream = iodd_static.dev_out_stream; /* make them the same */
+	iodd_static.dev_in_stream = "Undefined_Daemon_Stream"; /* avoid uninitialized variables */
+
+attach:	call ios_$attach (iodd_static.dev_out_stream, iodd_static.device_dim, iodd_static.attach_name, "", io_stat);
+	if st.code ^= 0 then do;
+	     if st.code = error_table_$ionmat & retry_sw then do; /* can we try again */
+retry:		retry_sw = "0"b;			/* yes, but only once */
+		call detach_all;			/* clear the slate */
+		go to attach;
+	     end;
+	     call iodd_msg_ (2, master, st.code, whoami, "Fatal Error: Unable to attach channel ^a",
+		iodd_static.attach_name);
+	     return;
+	end;
+
+	on cleanup call detach_all;			/* for reinit, no_coord, logout, new_device, etc... */
+
+/*	set up the punch code formatting dims corresponding to the dprint_msg outer_module variable */
+
+	do i = 2 to 5;				/* attach the defined format streams */
+	     call ios_$attach (sw.name (i), sw.dim (i), iodd_static.dev_out_stream, "", io_stat);
+	     if st.code ^= 0 then do;
+		if st.code = error_table_$ionmat & retry_sw then go to retry; /* start_over */
+		call iodd_msg_ (2, master, st.code, whoami, "Fatal Error: Unable to attach ^a to ^a.",
+		     sw.name (i), iodd_static.dev_out_stream);
+		go to clean_out;
+	     end;
+	end;
+
+	do i = 2 to 4;				/* get the stream element sizes for 7punch, mcc and raw */
+	     call ios_$getsize (sw.name (i), sw.size (i), io_stat);
+	     if st.code ^= 0 then do;
+		call iodd_msg_ (2, master, st.code, whoami, "Fatal Error: Invalid getsize call for dim ^a.", sw.dim (i));
+		go to clean_out;
+	     end;
+	end;
+
+	driver_status.elem_size = 1;
+	driver_status.message_type = 2;		/* expected dprint message type */
+	driver_status.attached = "1"b;
+	driver_status.ready = "1"b;			/* issue an automatic "ready" command */
+	driver_status.form_wait_time = 5;		/* set this as a reasonable default */
+	driver_status.dev_out_stream = iodd_static.dev_out_stream; /* record this too */
+	driver_status.bit_rate_est = initial_bit_rate;
+	driver_status.defer_time_limit = 0;
+
+	if iodd_static.ctl_term.attached then do;
+	     ctl_wait_list.number = 1;
+	     ctl_wait_list.channel = iodd_static.ctl_ev_chan;
+	     alarm_channel = iodd_static.ctl_ev_chan;
+	     call ios_$changemode (iodd_static.ctl_output, "^hndlquit", "", io_stat); /* we reset read on quit */
+	end;
+	else do;
+	     ctl_wait_list.number = 0;		/* otherwise clear to avoid errors */
+	     ctl_wait_list.channel = 0;
+	     alarm_channel = 0;
+	end;
+
+	if driver_status.rqti_ptr ^= null then do;	/* see if there is any rqti data */
+	     p2 = driver_status.rqti_ptr;		/* copy the pointer for easy reference */
+	     if p2 -> rqti_header.header_version ^= rqti_header_version_1 then do;
+		call iodd_msg_ (2, both, error_table_$fatal_error, whoami,
+		     "RQTI header version ^d found (expected ^d).", p2 -> rqti_header.header_version,
+		     rqti_header_version_1);
+		go to clean_out;
+	     end;
+	     if ^(p2 -> rqti_header.type_code = 0 | p2 -> rqti_header.type_code = 2) then do;
+		ec = error_table_$fatal_error;	/* allow header only or punch RQTI - no others */
+		call iodd_msg_ (2, both, ec, whoami, "Incorrect RQTI segment format for punch.");
+		go to clean_out;
+	     end;
+	     iodd_static.slave_hold = ^(p2 -> rqti_header.auto_go); /* get the auto go value */
+	     iodd_static.wakeup_time = p2 -> rqti_header.driver_wait_time; /* and wait time */
+	     meter_sw = p2 -> rqti_header.meter;	/* meters needed? (for the future) */
+	end;
+	else do;					/* use default values, no rqti seg */
+	     iodd_static.slave_hold = "1"b;		/* ask for a go command */
+	     iodd_static.wakeup_time = 120;		/* should wait 2 min before asking for work */
+	     meter_sw = "0"b;			/* no metering  (future) */
+	end;
+
+	iodd_static.form_type = iodd_parse_$args ("form_type=", major_args); /* was form type given */
+	if iodd_static.form_type = "" then iodd_static.form_type = "std_ctl_msg"; /* no, use standard default */
+
+	call date_time_ (clock_ (), date_string);	/* get set for ready message */
+
+	call iodd_msg_ (1, both, 0, "", "^/^a driver ready at ^16a^/", driver_status.dev_name_label, date_string);
+
+	call iodd_listen_ (stat_p);			/* iodd_listen_ will never return */
+
+clean_out:					/* this label is for error recovery */
+
+	call detach_all;
+	return;
+%page;
+
+request: entry;
+
+/* This is the entry which is called by the iodd_listen_ procedure when a request
+   for this driver has been received from the coordinator.
+
+   The purpose of the code for this entry of the punch driver is to validate
+   that the request is one that we expect and can correctly interpret.  Then we
+   call output_request_ to do all the work of access checking etc.  The stream to
+   be used is based on the outer module specified in the request.  */
+
+	driver_status_ptr = iodd_static.driver_ptr;	/* make it general although it will always be the same */
+	p2 = addr (driver_status.descriptor);		/* find the request descriptor */
+	dmp = addr (driver_status.message);		/* get ptr to message */
+
+	if dprint_msg.header.hdr_version ^= queue_msg_hdr_version_1 then do; /* trouble */
+	     call iodd_msg_ (0, both, 0, "", "Invalid message header.  Cannot read request ^d.^d.",
+		p2 -> request_descriptor.seq_id, p2 -> request_descriptor.q);
+	     p2 -> request_descriptor.keep_in_queue = "1"b; /* save for conversion later */
+	     go to be_nice;
+	end;
+	if dprint_msg.header.message_type ^= driver_status.message_type then do;
+	     call iodd_msg_ (0, both, 0, "",		/* log the error */
+		"Incorrect message type for punch.^/Request ^d.^d for ^a (segment ^a) not processed.",
+		p2 -> request_descriptor.seq_id, p2 -> request_descriptor.q, 
+		p2 -> request_descriptor.mseg_message_info_copy.sender_id,
+		dprint_msg.header.ename);
+	     p2 -> request_descriptor.cancelled = "1"b;
+be_nice:	     p2 -> request_descriptor.dont_delete = "1"b; /* save the user's data */
+	     p2 -> request_descriptor.finished = "1"b;	/* mark it done */
+	     return;				/* it wasn't for us after all */
+	end;
+	if dprint_msg.version ^= dprint_msg_version_3 	/* Previous version */
+	& dprint_msg.version ^= dprint_msg_version_4	/* Previous version */
+	& dprint_msg.version ^= dprint_msg_version_5	/* Current version */
+	   then do;				/* other trouble? */
+	     call iodd_msg_ (0, both, 0, "",
+		"Wrong message version found.^/Request ^d.^d for ^a (segment ^a) not processed",
+		p2 -> request_descriptor.seq_id, p2 -> request_descriptor.q, 
+		p2 -> request_descriptor.mseg_message_info_copy.sender_id,
+		dprint_msg.header.ename);
+	     p2 -> request_descriptor.keep_in_queue = "1"b;
+	     go to be_nice;
+	end;
+	if dprint_msg.version < dprint_msg_version_4 then /* Disallow -line_nbrs before version 4 */
+	     dprint_msg.control.line_nbrs = "0"b;
+
+	i = dprint_msg.output_module;			/* get the user defined format */
+
+	if i < 2 | i > 4 then do;			/* be sure it is defined */
+	     call iodd_msg_ (0, both, 0, "",
+		"Undefined punch format in user request.^/Request ^d.^d for ^a (segment ^a) not processed",
+		p2 -> request_descriptor.seq_id, p2 -> request_descriptor.q, 
+		p2 -> request_descriptor.mseg_message_info_copy.sender_id,
+		dprint_msg.header.ename);
+	     p2 -> request_descriptor.cancelled = "1"b;
+	     go to be_nice;
+	end;
+
+	iodd_static.quit_during_request = "0"b;		/* start clean */
+	ctl_msg_sent = "0"b;			/* initialize to no msg yet */
+
+	call output_request_ (sw.name (i), sw.size (i), stat_p, print_banner, ec);
+	if ec ^= 0 then
+	     iodd_static.slave_hold = "1"b;		/* on errors go to command level */
+	return;
+%page;
+
+print_banner: entry (a_stream, type, data_ptr, code);
+
+dcl  a_stream char (*);				/* this would normally be the banner output stream */
+						/* but we can only use the flip card stream */
+dcl  type fixed bin;				/* type of banner to be written  */
+						/* 1 = heading banner            */
+						/* 2 = tail banner               */
+						/* 3 = error message             */
+dcl  data_ptr ptr;					/* pointer to output request data or  */
+						/* to char(256) varying string error msg */
+dcl  code fixed bin (35);				/* error code */
+
+	banner_stream = sw.name (5);			/* we must use the flipper stream */
+
+	if type = 1 then do;			/* heading banner for punch wanted */
+
+	     iodd_static.quit_during_request = "0"b;	/* reset for each request */
+
+	     if iodd_static.ctl_term.attached then do;	/* message to ctl term? */
+		call write_control_form_ (iodd_static.form_type, iodd_static.ctl_output, data_ptr, ec);
+		if ec ^= 0 then do;
+		     if code ^= error_table_$action_not_performed then do; /* this is normal */
+			call iodd_msg_ (2, master, ec, whoami, "Writing message on control terminal.");
+			iodd_static.slave_hold = "1"b;/* avoid automatic start */
+		     end;
+		     ctl_msg_sent = "0"b;		/* don't wait for bad message */
+		end;
+		else ctl_msg_sent = "1"b;		/* say all was well, so we can wait */
+		if ctl_wait_list.number = 1 & ctl_msg_sent then do; /* are we going to sync with the term? */
+		     call ipc_$drain_chn (ctl_wait_list.channel, ec);
+		     if ec ^= 0 then do;		/* avoid futher trouble, but not fatal */
+			ctl_wait_list.channel = 0;	/* stop trying */
+			ctl_wait_list.number = 0;
+			iodd_static.slave_hold = "1"b;
+			ctl_msg_sent = "0"b;	/* don't wait , no wakeup will come */
+			call iodd_msg_ (2, master, 0, whoami, "print_banner bad call to ipc_drain ^d", ec);
+		     end;
+		     else call timer_manager_$alarm_wakeup (driver_status.form_wait_time, "11"b, alarm_channel);
+		end;
+	     end;
+	     else ctl_msg_sent = "0"b;		/* don't wait */
+
+	     dmp = addr (iodd_static.driver_ptr -> driver_status.message); /* get pointer to meessage */
+	     ordatap = data_ptr;			/* set default ptr for output_request_data */
+
+/*	PRINT THE FLIP CARDS HERE */
+
+	     if dprint_msg.heading = "" then
+		head = before (ordata.requestor, ".");	/* default to the person */
+	     else head = dprint_msg.heading;
+
+	     if dprint_msg.destination = "" then
+		dest = before (after (ordata.requestor, "."), "."); /* default to project */
+	     else dest = dprint_msg.destination;
+
+	     access_class = before (ordata.access_class_string, ","); /* we want the first token, strip the rest */
+
+/*	Now, format the flip card header. */
+
+	     call ioa_$rsnnl ("^a^/^x^7a^x^2/^7d^2x^2/^3xCOPY^2x^2/^x^2d OF^2d^x^2/^x^8a^2/^x^8a^2/^x^7a^x^2/^x^7a^x^/",
+		card_header, nelm,
+		xxbar, "REQUEST", ordata.request_no, ordata.copy_no, ordata.copies,
+		substr (ordata.date_time_start_request, 1, 8),
+		substr (ordata.date_time_start_request, 11, 6), substr (dest, 1, 7),
+		substr (dest, 8, 7));
+
+	     call write_msg (card_header);		/* the first few cards */
+
+	     call write_msg (ordata.requestor);
+
+	     call write_msg (access_class);
+
+	     call write_msg (ordata.full_path);
+
+	     call write_msg (xxbar);			/* this closes out the header cards */
+
+	     call ios_$order (banner_stream, "reset", null, io_stat); /* clear card count */
+	end;
+
+	else if type = 2 then do;			/* a trailing banner is wanted */
+
+	     if iodd_static.test_entry then		/* be able to set a reasonable pace */
+		if time > 1 then call timer_manager_$sleep (time, "11"b); /* simulate device */
+
+/*	PUT IN A TAIL SEPARATOR HERE */
+
+	     call ioa_$rsnnl ("^3xEND OF^6xDECK^3x^a", card_header, nelm, xxbar);
+
+	     call write_msg (card_header);
+
+	     if iodd_static.quit_during_request then	/* output was lost */
+		ctl_msg_sent = "0"b;		/* cancel the flag */
+	     else if ctl_msg_sent then do;		/* avoid premature blocking */
+		ctl_msg_sent = "0"b;		/* ready for the next one */
+		call ipc_$block (addr (ctl_wait_list), addr (event_info), ec); /* wait for form to finish */
+	     end;
+	end;
+
+	else if type = 3 then do;			/* put out an error message */
+
+	     card_header = xxbar || "ERROR DURING REQUEST  " || xxbar; /* just a general message */
+
+	     call ios_$write (banner_stream, addr (card_header), 0, 66, nelt, io_stat);
+
+	     code = 0;				/* don't cause trouble */
+	end;
+
+	else code = error_table_$action_not_performed;	/* all other banner types are undefined */
+
+	return;
+
+flip_err: code = st.code;				/* report the error */
+	return;					/* and stop writing */
+%page;
+
+command: entry (source, state, arg_list_p, c_code);
+
+dcl  source fixed bin;				/* 1 = master console, 2 = slave */
+dcl  state fixed bin;				/* 0 = not quite ready to handle a request */
+						/* 1 = drivers are ready */
+						/* 2 = command entered after a quit */
+dcl  arg_list_p ptr;				/* ptr to structure returned by parse_command_ */
+dcl  c_code fixed bin (35);				/* error code: zero if command handled correctly */
+						/* error_table_ code for bad syntax or unknown command */
+dcl  1 arg_list aligned based (arg_list_p),		/* parse_command_ structure */
+       2 max_tokens fixed bin,			/* space allocated, do not change */
+       2 n_tokens fixed bin,				/* number of tokens from command line (including cmd) */
+       2 command char (64) var,			/* the first token is the command */
+       2 arg (n_tokens - 1) char (64) var;		/* the other tokens are args to the command */
+
+	if command = "help" then do;
+	     c_code = 0;
+	     call iodd_msg_ (1, source, 0, "", "^/** Commands for the punch driver **^/");
+	     call iodd_msg_ (1, source, 0, "", "sample_form");
+	     if test_entry then
+		call iodd_msg_ (1, source, 0, "", "time [<sleep_time>]");
+	end;
+	else if command = "ctl_term" then do;		/* this was passed on by iodd_command_processor_ */
+	     iodd_static.driver_ptr -> driver_status.form_wait_time = 5; /* to have us set the default form type */
+	     iodd_static.form_type = "std_ctl_msg";	/* this is our default */
+	end;
+	else if command = "time" then do;
+	     if iodd_static.test_entry then do;		/* refuse to recognize if not testing */
+		c_code = 0;			/* the command was good */
+		if n_tokens > 1 then do;
+		     time = cv_dec_check_ ((arg (1)), ec);
+		     if ec ^= 0 then time = 10;
+		end;
+		else time = 1;			/* return to the default..full speed */
+	     end;
+	end;
+	else if command = "sample_form" then do;
+	     c_code = 0;				/* we'll handle everything here */
+	     if iodd_static.ctl_term.attached then do;	/* be sure there is a place to write */
+		if iodd_static.forms then do;		/* are we simulating FF? */
+		     call ios_$order (iodd_static.ctl_output, "form_status", addr (form_info), io_stat);
+		     if st.code ^= 0 then do;		/* OOPS.... */
+			c_code = st.code;		/* pass it back */
+			iodd_static.master_hold = "1"b; /* this is a problem for master terminal */
+			call iodd_msg_ (1, both, st.code, whoami,
+			     "^/form_status order call.  Master terminal action required to continue.");
+			return;
+		     end;
+		     if ^form_info.aligned then
+			call ios_$order (iodd_static.ctl_output, "form_aligned", null, io_stat); /* this will work */
+		end;
+		call write_sample_form_ (iodd_static.form_type, iodd_static.ctl_output, c_code);
+	     end;
+	     else call iodd_msg_ (1, source, 0, "", "Control terminal is not attached.");
+	end;
+	return;					/* return any undefined commands without changing anything */
+%page;
+
+default_handler: entry (condition_info_ptr);
+
+dcl  condition char (32);				/* fixed string for the call */
+
+	condition = condition_info.condition_name;	/* this will indent funny */
+
+	if iodd_static.request_in_progress then		/* try to avoid mistakes */
+
+	     call output_request_$error_during_request (condition); /* take it away */
+
+	return;					/* output_request_ should not return, but.... */
+%page;
+
+detach_all: proc;
+
+/* cleanup proc to detach all possible streams we could have attached */
+
+	call ios_$detach (iodd_static.dev_out_stream, "", "", io_stat);
+	do i = 2 to 5;
+	     call ios_$detach (sw.name (i), "", "", io_stat);
+	end;
+	return;
+
+     end detach_all;
+
+
+
+write_msg: proc (string);
+
+dcl  string char (*) aligned;
+
+	nelm = length (rtrim (string));
+	if nelm > 0 then do;			/* write flip cards for non blank message */
+	     call ios_$write (banner_stream, addr (string), 0, nelm, nelt, io_stat);
+	     if st.code ^= 0 then go to flip_err;	/* trouble */
+	end;
+	return;
+
+     end write_msg;
+%page; %include condition_info;
+%page; %include dprint_msg;
+%page; %include driver_status;
+%page; %include iod_constants;
+%page; %include iod_tables_hdr;
+%page; %include iodd_static;
+%page; %include mseg_message_info;
+%page; %include output_request_data;
+%page; %include queue_msg_hdr;
+%page; %include request_descriptor;
+%page; %include rqti_header;
+
+     end punch_driver_;

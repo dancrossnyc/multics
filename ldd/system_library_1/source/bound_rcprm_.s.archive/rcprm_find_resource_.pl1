@@ -1,0 +1,1885 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+rcprm_find_resource_:
+     proc;
+	return;
+
+/* This procedure is charged with locating specific resources in RCP resource
+   management registries.
+
+   The register entrypoint makes a certain resource known to the system so that
+   it may be referred to by name.
+
+   The deregister entrypoint removes a certain resource from the registries so
+   that it may no longer be used by any process.
+
+   The acquire entrypoint finds a free resource that meets or exceeds given
+   criteria, and "acquires it to" the calling process such that this process
+   now owns/controls and is the "resource executive" for the resource.
+
+   The release entrypoint relinquishes a resource back to the free pool,
+   providing the requestor is the owner (not just a resource executive.)
+
+   The reserve entrypoint finds a resource that meets or exceeds the given
+   criteria, and belongs to the "system pool".  The resource is then
+   temporarily allocated for the use of the calling process.  This implements a
+   variant of a "scratch tape" facility.  Note that this entrypoint does NOT
+   perform the actual RCP reservation, but only locates a resource suitable for
+   such a reservation in the case where the requestor does not specify a
+   resource which already belongs to him.
+
+   The status entrypoint will find a resource given its name or UID, and return
+   all the information about it that a user needs to (or is allowed to) know.
+
+   The set entrypoint will find a resource given its name or UID, and replace
+   various properties of it (depending on your privilege and access).
+
+   The clear entrypoint is used to confirm to resource management that a volume
+   that has been released has had its contents destroyed (via degaussing or
+   whatever) and can return to the free pool to be acquired by someone else.
+   This is only necessary of the volume is to be locked on release, as noted
+   in the RTDT.
+
+   The reconstruct entrypoint does all of the above things. It is used solely
+   by rcprm_journalize_$reconstruct.  It includes the proper action code.
+   The main difference is that we don't try to grab the transaction control
+   file because we know it's mylocked.
+*/
+
+/* Written 05/09/78 by C. D. Tavares */
+/* Modified 11/21/79 by CDT to make privileged release use the real
+   owner's name, not that of the releaser. */
+/* Modified 12/10/79 by CDT to take advantage of new facility to sleep in ring
+   1 */
+/* Modified 02/27/80 by CDT to make scratch selection match on potential
+   attributes, not current attributes; and to disable setting of current
+   attributes in contexts where the desired_attribute field is used only as a
+   search criterion (i.e. in an acquisition by attributes instead of by name */
+/* Modified 06/17/81 by CDT to detect multiple requests for same resource
+   in same call, and to complain about attempt to change owner in set entry */
+/* Modified 04/83 by B. Braun to:
+   1. correct problem of RQO in the process_dir (phx11736, phx14452).
+   2. prevent damage to the registry during aquistion of resources by
+   locking the registry record upon modification (phx11638, phx13502).
+   3. decrement the ref_count on free key when deregistering a resource
+   (phx11636). */
+/* Modified 1/85 by Maria Pozzo and Chris Jones for B2 effort. */
+
+/****^  HISTORY COMMENTS:
+  1) change(87-06-08,Rauschelbach), approve(87-06-26,MCR7713),
+     audit(87-07-08,Farley), install(87-07-15,MR12.1-1041):
+     Fixes:
+     1) No longer returns awaiting-clear state for resources to which
+     the user does not have access.
+     2) The clear operation now functions.
+     3) A catch for when operation-type is not handled was added.
+     4) Error reporting now returns error_table_$action_not_performed for the
+     global error code.
+     5) Error code in the structure is now set when an error occurred on a
+     specific resource.
+  2) change(87-07-14,Rauschelbach), approve(87-08-07,MCR7748),
+     audit(87-11-11,Farley), install(87-11-30,MR12.2-1004):
+     Removed signal to vfile_error condition as it was erroneously left in from
+     debugging.
+                                                   END HISTORY COMMENTS */
+
+/* automatic */
+
+dcl	action		   fixed bin;
+dcl	audit_obj_ok	   bit (1);
+dcl	auto_registration	   bit (1) aligned initial (""b);
+dcl	base_rno		   fixed bin;
+dcl	base_given_uid	   bit (1);
+dcl	base_given_name	   bit (1);
+dcl	base_uid		   bit (36);
+dcl	base_name		   char (32);
+dcl	base_type		   char (32);
+dcl	bl		   fixed bin (21);
+dcl	bp		   pointer;
+dcl	callers_rdp	   ptr;
+dcl	clear_ok		   bit (1);
+dcl	code		   fixed bin (35);
+dcl	cur_level		   fixed bin;
+dcl	requestor_owner_id	   char (32) varying;
+dcl	current_rew	   bit (3);
+dcl	found		   bit (1) aligned;
+dcl	is_volume		   bit (1);
+dcl	lock_sw		   bit (1) aligned;
+dcl	old_key		   char (256) varying;
+dcl	operation		   bit (36) aligned;
+dcl	operation_ptr	   ptr;
+dcl	priv_sw		   bit (1) aligned initial ("0"b);
+dcl	prev_level	   fixed bin;
+dcl	proxy_authorization	   bit (72) aligned;
+dcl	proxy_call	   bit (1) aligned initial ("0"b);
+dcl	proxy_group_id	   char (32);
+dcl	read_key		   char (256) varying;
+dcl	rec_len		   fixed bin (21);
+dcl	reconstruct_operation  bit (1) aligned initial ("0"b);
+dcl	record_descrip	   fixed bin (35);
+dcl	registry_dir	   char (64);
+dcl	registry_open	   char (32);
+dcl	reserver_info_ptr	   ptr;
+dcl	resource_type	   char (32) defined (registry_open);
+dcl	rno		   fixed bin;
+dcl	seek_attr_flag	   bit (1) aligned;
+dcl	simple_code	   fixed bin (35);
+dcl	sstruc_ptr	   pointer;
+dcl	swno		   fixed bin;
+dcl	temp_acs_path	   char (168);
+dcl	temp_atts		   (2) bit (72) aligned based (addr (temp_relatts));
+dcl	temp_bounds	   (2) bit (72) aligned;
+dcl	temp_bounds_based	   (2) bit (72) aligned based;
+dcl	temp_key		   char (256) varying;
+dcl	temp_non_var_key	   char (256);
+dcl	temp_owner_name	   char (32);
+dcl	temp_relatts	   (4) bit (72) aligned;
+dcl	temp_mode		   bit (3);
+dcl	transaction_time	   fixed bin (71);
+dcl	tsw_ptr		   pointer;
+dcl	validity		   fixed bin;
+dcl	who_am_i		   char (32);
+
+dcl	1 en_access_op	   like encoded_access_op based (operation_ptr) aligned;
+dcl	1 record_status	   aligned automatic like rs_info;
+dcl	1 rs		   aligned automatic like rs_info;
+dcl	1 res_info	   aligned automatic like resource_info;
+dcl	1 req_info	   aligned automatic like requestor_info;
+
+dcl	1 add_key_info	   automatic,
+	  2 header	   like ak_header,
+	  2 key		   char (256);
+
+dcl	1 get_key_info	   automatic,
+	  2 header	   like gk_header,
+	  2 key		   char (256);
+
+/* static */
+
+dcl	my_owner_id	   char (32) varying static initial ("");
+dcl	my_group_id	   char (32) static initial ("");
+
+dcl	(
+	Absolute		   initial (0),
+	Relative		   initial (1)
+	)		   fixed bin static options (constant);
+
+dcl	(Move_rel, Equal)	   initial (0) fixed bin static options (constant);
+
+dcl	Lowest_Aim_Range	   (2) fixed bin (71) aligned static options (constant) initial ((2)0);
+
+dcl	sys_areap		   pointer static initial (null);
+
+/* entries */
+
+dcl	absolute_pathname_$add_suffix
+			   entry (char (*), char (*), char (*), fixed bin (35));
+dcl	admin_gate_$syserr	   ext entry options (variable);
+dcl	admin_gate_$syserr_error_code
+			   ext entry options (variable);
+dcl	cu_$level_get	   ext entry (fixed bin);
+dcl	cu_$level_set	   ext entry (fixed bin);
+dcl	cv_rcp_attributes_$make_rel
+			   ext entry (char (*), (2) bit (72) aligned, (4) bit (72) aligned, fixed bin (35));
+dcl	cv_rcp_attributes_$modify_rel
+			   ext entry ((2) bit (72) aligned, (4) bit (72) aligned, (2) bit (72) aligned);
+dcl	cv_rcp_attributes_$test_valid
+			   ext entry (char (*), (2) bit (72) aligned, fixed bin, fixed bin (35));
+dcl	rcprm_find_op	   ext
+			   entry (fixed bin, ptr, bit (1) aligned, bit (1) aligned, bit (36) aligned,
+			   bit (1) aligned, fixed bin (35));
+dcl	hcs_$get_authorization ext entry (bit (72) aligned, bit (72) aligned);
+dcl	get_process_authorization_
+			   ext entry returns (bit (72) aligned);
+dcl	get_group_id_	   ext entry returns (char (32));
+dcl	get_ring_		   ext entry returns (fixed bin);
+dcl	get_system_free_area_  ext entry returns (pointer);
+dcl	admin_gate_$make_uid   ext entry (bit (36) aligned);
+dcl	rcp_access_kernel_	   entry (bit (36) aligned, ptr, ptr, bit (3), fixed bin (35));
+dcl	rcp_audit		   entry (char (*), bit (36) aligned, ptr, ptr, char (*), bit (3), bit (3),
+			   (2) fixed bin (3), bit (1), fixed bin (35));
+dcl	rcp_compute_aim_mode$permissible_aim
+			   entry ((2) bit (72) aligned, (2) bit (72) aligned, fixed bin (35));
+dcl	resource_info_$get_type
+			   entry (char (*), bit (1), fixed bin (35));
+dcl	resource_info_$lock_on_release
+			   ext entry (char (*), bit (1) aligned, fixed bin (35));
+dcl	resource_info_$canonicalize_name
+			   entry (char (*) aligned, char (*) aligned, char (*) aligned, fixed bin (35));
+dcl	resource_info_$default_attributes
+			   ext entry (char (*) aligned, bit (72) aligned, fixed bin (35));
+dcl	resource_info_$set_arbitrary_attributes
+			   ext entry (char (*), bit (72) aligned, (2) bit (72) aligned, fixed bin (35));
+
+dcl	rcp_reserve_$approve_schedule
+			   ext entry (pointer, fixed bin, char (*), pointer, bit (18) unaligned, fixed bin (35));
+dcl	rcp_cancel_id_$remove_schedule
+			   ext entry (pointer, fixed bin, char (*), pointer, bit (18) unaligned, fixed bin (35));
+dcl	rcprm_journalize_	   ext entry (pointer, fixed bin, fixed bin (71), char (*));
+dcl	rcprm_registry_util_$grab_transaction_control_file
+			   entry (ptr, char (*), fixed bin (35));
+dcl	rcprm_registry_util_$grab_registry
+			   entry (ptr, char (*), char (*), fixed bin (35));
+dcl	rcprm_registry_util_$release_transaction_control_file
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$release_registry
+			   entry (ptr, fixed bin (35));
+dcl	rcprm_registry_util_$free_key
+			   entry (ptr, char (*));
+dcl	rcprm_registry_util_$system_key
+			   entry (ptr, char (*));
+dcl	rcprm_registry_util_$name_key
+			   entry (char (*), ptr, char (*));
+dcl	rcprm_registry_util_$owner_key
+			   entry (char (*), ptr, char (*));
+dcl	rcprm_registry_util_$uid_key
+			   entry (bit (36) aligned, ptr, char (*));
+
+/* external variables */
+
+dcl	(
+	error_table_$action_not_performed,
+	error_table_$resource_awaiting_clear,
+	error_table_$bad_resource_spec,
+	error_table_$duplicate_request,
+	error_table_$end_of_info,
+	error_table_$namedup,
+	error_table_$no_record,
+	error_table_$not_abs_path,
+	error_table_$not_privileged,
+	error_table_$not_seg_type,
+	error_table_$rcp_attr_not_permitted,
+	error_table_$rcp_bad_attributes,
+	error_table_$resource_bad_access,
+	error_table_$resource_free,
+	error_table_$resource_locked,
+	error_table_$resource_not_free,
+	error_table_$resource_unavailable,
+	error_table_$resource_unknown,
+	error_table_$unimplemented_version,
+	error_table_$unsupported_operation
+	)		   ext fixed bin (35) static;
+
+dcl	sys_info$max_seg_size  fixed bin (35) ext static;
+
+/* based variables */
+
+dcl	based_bits	   bit (bl * 9) aligned based (bp);
+dcl	based_charstring	   char (bl) aligned based (bp);
+dcl	sys_area		   based (sys_areap) area (sys_info$max_seg_size);
+
+dcl	potential_attributes_based
+			   bit (72) based;
+
+dcl	1 switch_struc	   aligned based (sstruc_ptr),
+	  2 maxno		   fixed bin,
+	  2 usedno	   fixed bin initial (0),
+	  2 xxx		   (resource_descriptions.n_items refer (switch_struc.maxno)) aligned,
+	    3 registry	   char (32),
+	    3 sw_ptr	   pointer;
+
+/* builtins and conditions */
+
+dcl	cleanup		   condition;
+
+dcl	(addr, clock, length, null, rtrim, size, string, substr, unspec)
+			   builtin;
+
+priv_acquire:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	priv_sw = "1"b;
+
+acquire:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+dcl	p_resource_desc_ptr	   ptr parameter;
+dcl	p_registry_dir	   char (*) parameter;
+dcl	p_code		   fixed bin (35) parameter;
+
+	action = Acquire;
+	who_am_i = "rcprm_find_resource_$acquire";
+	goto common_2;
+%skip (4);
+priv_release:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	priv_sw = "1"b;
+
+release:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	action = Release;
+	who_am_i = "rcprm_find_resource_$release";
+	goto common_2;
+%skip (4);
+clear:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	action = Clear;
+	priv_sw = "1"b;
+	who_am_i = "rcprm_find_resource_$clear";
+	goto common_2;
+%skip (4);
+priv_reserve:
+     entry (p_resource_desc_ptr, p_registry_dir, p_reserver_info_ptr, p_code);
+
+dcl	p_reserver_info_ptr	   pointer parameter;	/* reserver passes this, what it is is up to him */
+
+	priv_sw = "1"b;
+
+reserve:
+     entry (p_resource_desc_ptr, p_registry_dir, p_reserver_info_ptr, p_code);
+
+	action = Reserve;
+	who_am_i = "rcprm_find_resource_$reserve";
+	goto common_1;
+
+reserve_proxy:
+     entry (p_resource_desc_ptr, p_registry_dir, p_reserver_info_ptr, p_proxy_group_id, p_proxy_authorization, p_code);
+
+dcl	p_proxy_group_id	   char (*) parameter;
+dcl	p_proxy_authorization  bit (72) aligned parameter;
+
+	action = Reserve;
+	proxy_call = "1"b;
+	proxy_group_id = p_proxy_group_id;
+	proxy_authorization = p_proxy_authorization;
+	who_am_i = "rcprm_find_resource_$reserve";
+	goto common_1;
+%skip (4);
+priv_cancel:
+     entry (p_resource_desc_ptr, p_registry_dir, p_reserver_info_ptr, p_code);
+
+	priv_sw = "1"b;
+
+cancel:
+     entry (p_resource_desc_ptr, p_registry_dir, p_reserver_info_ptr, p_code);
+
+	action = Cancel;
+	who_am_i = "rcprm_find_resource_$cancel";
+	goto common_1;
+%skip (4);
+priv_status:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	priv_sw = "1"b;
+
+status:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	action = Status;
+	who_am_i = "rcprm_find_resource_$status";
+	goto common_2;
+%skip (4);
+priv_set:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	priv_sw = "1"b;
+
+set:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	action = Set;
+	who_am_i = "rcprm_find_resource_$status";
+	goto common_2;
+%skip (4);
+auto_register:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	auto_registration = "1"b;
+
+register:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	priv_sw = "1"b;
+	action = Register;
+	who_am_i = "rcprm_find_resource_$register";
+	goto common_2;
+%skip (4);
+deregister:
+     entry (p_resource_desc_ptr, p_registry_dir, p_code);
+
+	priv_sw = "1"b;
+	action = Deregister;
+	who_am_i = "rcprm_find_resource_$deregister";
+	goto common_2;
+%skip (4);
+reconstruct:
+     entry (p_resource_desc_ptr, p_registry_dir, p_action, p_tsw_ptr, p_code);
+
+dcl	p_action		   fixed bin parameter;
+dcl	p_tsw_ptr		   pointer parameter;
+
+	priv_sw = "1"b;
+	action = p_action;
+	reconstruct_operation = "1"b;
+	who_am_i = "rcprm_find_resource_$reconstruct";
+	goto common_2;
+
+common_1:
+	reserver_info_ptr = p_reserver_info_ptr;
+
+common_2:
+	audit_obj_ok = "0"b;			/* For auditing purposes, different audit calls depending on if we have retrieved the object (if it exists), etc. */
+	registry_dir = p_registry_dir;
+	operation = ""b;
+	operation_ptr = addr (operation);
+	ops_ptr = addr (en_access_op.detailed_operation);
+	seek_attr_flag = "0"b;
+	code = 0;
+
+	call cu_$level_get (prev_level);
+	tsw_ptr, ak_info_ptr, gk_info_ptr, sstruc_ptr, resource_desc_ptr = null;
+	registry_open = "";
+
+	unspec (record_status) = ""b;
+	record_status.version = rs_info_version_2;
+	record_status.record_ptr = null ();
+	record_ptr = null ();
+
+	if sys_areap = null then
+	     sys_areap = get_system_free_area_ ();
+	if my_owner_id = "" then do;
+	     my_group_id = get_group_id_ ();
+	     my_owner_id = rtrim (my_group_id);
+	     my_owner_id = substr (my_owner_id, 1, length (my_owner_id) - 2);
+	end;
+
+	if ^proxy_call then
+	     requestor_owner_id = my_owner_id;
+	else do;
+	     requestor_owner_id = proxy_group_id;
+	     requestor_owner_id = rtrim (requestor_owner_id);
+	     requestor_owner_id = substr (requestor_owner_id, 1, length (requestor_owner_id) - 2);
+	end;
+
+	on cleanup call clean_up (0, ""b);
+
+/* ------------------------- */
+
+clean_up:
+     proc (code, error_matters);
+
+dcl	code		   fixed bin (35) parameter;
+dcl	error_matters	   bit (1) aligned parameter;
+
+dcl	i		   fixed bin;
+dcl	saved_code	   fixed bin (35);
+
+	saved_code = 0;
+	if tsw_ptr ^= null then do;
+	     do i = 1 to switch_struc.usedno;
+		if sw_ptr (i) ^= null then do;
+		     if ^error_matters then do;	/* real abort, roll back */
+			call iox_$control (sw_ptr (i), "rollback", null, code);
+			call save_code_if_error;
+		     end;
+		     call rcprm_registry_util_$release_registry (sw_ptr (i), code);
+		     call save_code_if_error;
+		end;
+	     end;
+	     if ^reconstruct_operation then do;
+		call rcprm_registry_util_$release_transaction_control_file (tsw_ptr, code);
+		call save_code_if_error;
+	     end;
+	end;
+	if sstruc_ptr ^= null then do;
+	     free switch_struc;
+	     sstruc_ptr = null ();
+	end;
+	if resource_desc_ptr ^= null () then do;
+	     free resource_descriptions;
+	     resource_desc_ptr = null ();
+	end;
+
+	if error_matters then
+	     code = saved_code;
+
+	call cu_$level_set (prev_level);
+	return;
+
+save_code_if_error:
+	proc;
+
+	     if saved_code = 0 then
+		saved_code = code;
+
+	end save_code_if_error;
+
+     end clean_up;
+
+/* ------------------------- */
+
+	cur_level = get_ring_ ();
+	call cu_$level_set (cur_level);
+
+	call get_resource_descriptions;
+
+	if resource_descriptions.version_no ^= resource_desc_version_1 then
+	     call error_return (error_table_$unimplemented_version);
+
+/* Loop through the structure to make sure the caller didn't ask for the
+   operation to be done to the same resource more than once.  Yeah, somebody
+   did it, and it screwed up the record locking. */
+
+	do base_rno = 1 to resource_descriptions.n_items - 1;
+	     base_given_uid = resource_descriptions.item (base_rno).given.uid;
+	     base_given_name = resource_descriptions.item (base_rno).given.name;
+	     base_uid = resource_descriptions.item (base_rno).uid;
+	     base_name = resource_descriptions.item (base_rno).name;
+	     base_type = resource_descriptions.item (base_rno).type;
+
+	     do rno = base_rno + 1 to resource_descriptions.n_items;
+		if resource_descriptions.item (rno).type = base_type then do;
+
+		     if resource_descriptions.item (rno).given.name & base_given_name
+			& (resource_descriptions.item (rno).name = base_name) then
+			call error_return_in_struc (error_table_$duplicate_request);
+
+		     if resource_descriptions.item (rno).given.uid & base_given_uid
+			& (resource_descriptions.item (rno).uid = base_uid) then
+			call error_return_in_struc (error_table_$duplicate_request);
+		end;
+	     end;
+	end;
+
+/* So much for user damage.  Back to work. */
+
+	allocate switch_struc in (sys_area) set (sstruc_ptr);
+
+	transaction_time = clock ();
+
+/* First, seize the transaction control vfile exclusively.  This is a cheap
+   way to avoid deadlock, but if it proves overly contentious, we'll have to
+   implement shared transactions.  */
+
+	if reconstruct_operation then
+	     tsw_ptr = p_tsw_ptr;
+
+	else do;
+	     call rcprm_registry_util_$grab_transaction_control_file (tsw_ptr, registry_dir, code);
+	     if code ^= 0 then
+		call error_return (code);
+	end;
+
+/* Process the requests one by one. */
+
+	do rno = 1 to resource_descriptions.n_items;
+
+/*  Do some initial setup */
+
+	     call setup_request ();
+
+/* This block of code finds a resource by name or UID. */
+
+	     if ^seek_attr_flag then do;
+		call seek_specific ();
+		if code ^= 0 then
+		     goto MAIN_RETURN;
+	     end;
+
+/* This block of code finds a resource by potential attributes only */
+
+	     else do;
+		call seek_attr ();
+		if code ^= 0 then
+		     goto MAIN_RETURN;
+	     end;
+
+/* Now we have the (an) appropriate resource.  Process it. */
+
+	     record_descrip = record_status.descriptor;	/* luckily, this is always set */
+	     record_status.create_sw = ""b;
+	     temp_owner_name = rtrim (requestor_owner_id);/* start out on right foot */
+
+	     if action = Register then do;
+		call register ();
+		call acquire ();
+		call subset ();			/* Doesn't set AIM attributes. */
+		call status ();
+	     end;
+	     else if action = Acquire then do;
+		call acquire ();
+		call subset ();			/* Doesn't set AIM attributes. */
+		call status ();
+	     end;
+	     else if action = Set then do;
+		call set ();			/* Does set  AIM attributes */
+		call status ();
+	     end;
+	     else if action = Release then do;
+		call release (clear_ok);
+		if clear_ok then
+		     call clear ();
+	     end;
+	     else if action = Status then
+		call status ();
+	     else if action = Clear then
+		call clear ();
+	     else if action = Reserve then
+		call reserve ();
+	     else if action = Deregister then
+		call deregister ();
+	     else if action = Cancel then
+		call cancel ();
+	     else call error_return (error_table_$unsupported_operation);
+MAIN_RETURN:
+	     if code = 0 then
+		resource_descriptions.item (rno).status_code = code;
+	     else call error_return_in_struc (code);	/* that didn't hurt, now, did it? */
+	end;
+
+/* Auditing for registers is done here. */
+
+	if action = Register | action = Acquire then
+	     call audit ((0));
+	call process_end ();
+	p_code = 0;
+	return;
+
+error_return_in_struc:
+     proc (int_code);
+
+/* the real code is shoved in the structure and a vanilla code is returned */
+
+dcl	int_code		   fixed bin (35) parameter;
+dcl	bad_code		   fixed bin (35);
+
+	resource_descriptions.item (rno).status_code = int_code;
+	bad_code = error_table_$action_not_performed;
+	goto error_common;
+
+error_return:
+     entry (int_code);				/* the main difference is that int_code is preserved */
+
+	bad_code = int_code;
+
+error_common:
+	call audit (bad_code);
+	code = bad_code;
+	call put_resource_descriptions ();
+	call clean_up (0, ""b);
+	goto return_hard;
+     end error_return_in_struc;
+
+return_hard:
+	p_code = code;
+	return;
+
+current_auth:
+     proc returns ((2) bit (72) aligned);
+
+dcl	temp_bounds	   (2) bit (72) aligned;
+
+	temp_bounds (1) = get_process_authorization_ ();
+	string (addr (temp_bounds (1)) -> aim_template.privileges) = ""b;
+	temp_bounds (2) = temp_bounds (1);
+	return (temp_bounds);
+
+     end current_auth;
+
+chase:
+     proc (descriptor, bp, bl);
+
+dcl	(
+	descriptor	   fixed bin (35),
+	bp		   pointer,
+	bl		   fixed bin (21)
+	)		   parameter;
+
+	if descriptor = 0 then do;
+	     bp = addr (bp);			/* gotta point somewhere */
+	     bl = 0;
+	     return;
+	end;
+
+	unspec (rs) = ""b;
+	rs.version = rs_info_version_2;
+	rs.locate_sw = "1"b;
+	rs.descriptor = descriptor;
+
+	call iox_$control (sw_ptr (swno), "record_status", addr (rs), code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+	bl = rs.record_length;
+	bp = rs.record_ptr;
+
+	return;
+
+     end chase;
+
+swap_descriptor:
+     proc (descriptor, old_key, new_key, bp, bl);
+
+dcl	descriptor	   fixed bin (35) parameter;
+dcl	(old_key, new_key)	   char (*) varying parameter;
+dcl	bp		   pointer parameter;
+dcl	bl		   fixed bin (21) parameter;
+
+dcl	test_key		   char (256) varying;
+dcl	found		   bit (1) aligned;
+dcl	based_record	   char (bl) based;
+
+	unspec (rs) = ""b;
+	rs.version = rs_info_version_2;
+
+/* First find record to which old descriptor points and decrement its refcount. */
+
+	if descriptor ^= 0 then do;			/* make sure there is a record, first */
+
+	     rs.locate_sw = "1"b;
+	     rs.descriptor = descriptor;
+
+	     call iox_$control (sw_ptr (swno), "record_status", addr (rs), code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     if bl = rs.record_length then		/* check for replacement to same value */
+		if rs.record_ptr -> based_record = bp -> based_record then do;
+		     descriptor = rs.descriptor;	/* no need to replace X with X */
+		     return;
+		end;
+
+	     rs.dec_ref_count = "1"b;
+
+	     call iox_$control (sw_ptr (swno), "record_status", addr (rs), code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     if rs.ref_count = 1 then do;		/* only one reference left; got to be the major key */
+						/* means no record is using it, so garbage-collect it. */
+		unspec (get_key_info) = ""b;
+		get_key_info.input_key = "1"b;
+		get_key_info.input_desc = "1"b;
+		get_key_info.descrip = descriptor;
+		get_key_info.key_len = length (get_key_info.key);
+		get_key_info.head_size = length (get_key_info.key);
+		get_key_info.key = old_key;
+		get_key_info.rel_type = Equal;
+		get_key_info.version = gk_info_version_0;
+
+		call iox_$control (sw_ptr (swno), "get_key", addr (get_key_info), code);
+						/* locate the record, setting the current record position to it */
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+
+		call iox_$delete_record (sw_ptr (swno), code);
+						/* smash record */
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+	     end;
+	end;
+
+/* Now create the new record (or find one like it) and patch it back onto that key. */
+
+	if bl = 0 then do;				/* no new record, done */
+	     descriptor = 0;
+	     return;
+	end;
+
+	found = ""b;
+
+	call iox_$seek_key (sw_ptr (swno), (new_key), 0, code);
+
+	if code = 0 then do;			/* some exist, try to match them */
+
+	     unspec (rs) = ""b;
+	     rs.version = rs_info_version_2;
+
+	     test_key = new_key;
+
+	     do while (test_key = new_key & ^found);
+
+		call iox_$control (sw_ptr (swno), "record_status", addr (rs), code);
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+
+		if rs.record_length = bl then
+		     if rs.record_ptr -> based_record = bp -> based_record then
+			found = "1"b;
+
+		if ^found then do;
+		     call iox_$position (sw_ptr (swno), Move_rel, 1, code);
+		     call iox_$read_key (sw_ptr (swno), test_key, 0, code);
+		     if code = error_table_$end_of_info then
+			test_key = "";
+		     else if code ^= 0 then
+			call error_return_in_struc (code);
+		end;
+	     end;
+
+	     if ^found then
+		call iox_$seek_key (sw_ptr (swno), (new_key), 0, code);
+						/* fix key for insertion so next write works. */
+	end;
+	else if code ^= error_table_$no_record then
+	     call error_return_in_struc (code);
+
+	if ^found then do;
+	     call iox_$write_record (sw_ptr (swno), bp, bl, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+	end;
+
+	unspec (rs) = ""b;
+	rs.version = rs_info_version_2;
+	rs.inc_ref_count = "1"b;
+
+	call iox_$control (sw_ptr (swno), "record_status", addr (rs), code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+	descriptor = rs.descriptor;
+
+	return;
+
+     end swap_descriptor;
+
+insert_descriptor:
+     proc (descriptor, key, bp, bl);
+
+dcl	descriptor	   fixed bin (35) parameter;
+dcl	key		   char (*) varying parameter;
+dcl	bp		   ptr parameter;
+dcl	bl		   fixed bin (21) parameter;
+
+	call swap_descriptor (descriptor, key, key, bp, bl);
+
+     end insert_descriptor;
+
+swap_key:
+     proc (descriptor, old_key, new_key, initial_record);
+
+dcl	descriptor	   fixed bin (35) parameter;
+dcl	(old_key, new_key)	   char (256) varying;
+dcl	initial_record	   char (*) parameter;
+
+	unspec (add_key_info) = ""b;
+	add_key_info.input_key, add_key_info.input_desc = "1"b;
+	add_key_info.descrip = descriptor;
+
+	if old_key ^= "" then do;
+	     add_key_info.key_len = length (old_key);
+	     add_key_info.key = old_key;
+
+	     call iox_$control (sw_ptr (swno), "delete_key", addr (add_key_info), code);
+	     if code ^= 0 then
+		call error_return (code);
+	end;
+
+	call iox_$seek_key (sw_ptr (swno), (new_key), 0, code);
+	if code = error_table_$no_record then
+	     if initial_record ^= "" then do;
+
+		call iox_$write_record (sw_ptr (swno), addr (initial_record), length (initial_record), code);
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+	     end;
+	     else code = 0;				/* may as well be clean about it */
+	else if code ^= 0 /* from seek_key */ then
+	     call error_return_in_struc (code);
+
+	if new_key ^= "" then do;
+	     add_key_info.key_len = length (new_key);
+	     add_key_info.key = new_key;
+
+	     call iox_$control (sw_ptr (swno), "add_key", addr (add_key_info), code);
+	     if code ^= 0 then
+		call error_return (code);
+	end;
+
+	return;
+
+     end swap_key;
+
+make_owner_key:
+     proc (owner_name) returns (char (*) varying);
+
+dcl	owner_name	   char (*) parameter;
+
+dcl	key		   char (256);
+
+	if owner_name = "system" then
+	     return (REGISTRY_SYSTEM_KEY);
+	else if owner_name = "free" then
+	     return (REGISTRY_FREE_KEY);
+	else do;
+	     call rcprm_registry_util_$owner_key (owner_name, null (), key);
+	     return (rtrim (key));
+	end;
+
+     end make_owner_key;
+
+setup_request:
+     proc ();
+
+/*  This internal subroutine does some initial setup necessary */
+/*  to find the desired resource */
+
+	if ^reconstruct_operation then
+	     if resource_descriptions.item (rno).given.name then do;
+		call resource_info_$canonicalize_name (resource_descriptions.item (rno).type,
+		     (resource_descriptions.item (rno).name), resource_descriptions.item (rno).name, code);
+
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+	     end;
+
+/* Open the correct registry, if it is not already open. */
+
+	if registry_open = "" | registry_open ^= resource_descriptions.item (rno).type then do;
+						/* open a different registry */
+	     registry_open = resource_descriptions.item (rno).type;
+
+	     do swno = 1 to switch_struc.usedno while (switch_struc.registry (swno) ^= registry_open);
+	     end;
+
+	     if swno > switch_struc.usedno then do;
+		call rcprm_registry_util_$grab_registry (sw_ptr (swno), registry_dir, registry_open, code);
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+		switch_struc.usedno = swno;
+		switch_struc.registry (swno) = registry_open;
+
+		if (^reconstruct_operation) & (action ^= Status) then do;
+						/* set the last transaction time for this registry to now */
+		     call iox_$seek_key (sw_ptr (swno), (REGISTRY_HEADER_KEY), 0, code);
+		     if code = error_table_$no_record then
+			code = error_table_$not_seg_type;
+		     if code ^= 0 then
+			call error_return_in_struc (code);
+
+		     call iox_$control (sw_ptr (swno), "record_status", addr (record_status), code);
+						/* locate and lock the header for modification */
+		     if code ^= 0 then
+			call error_return (code);
+
+		     header_ptr = record_status.record_ptr;
+		     registry_header.last_transaction_time = transaction_time;
+						/* set this for edification of rcprm_journalize_ */
+		end;
+	     end;
+	end;
+
+	call rcprm_find_op (action, addr (resource_descriptions.item (rno)), reconstruct_operation, priv_sw, operation,
+	     seek_attr_flag, code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+     end setup_request;
+
+seek_specific:
+     proc ();
+
+
+	if resource_descriptions.item (rno).given.name then
+	     if resource_descriptions.item (rno).name = "scratch" then
+		call error_return_in_struc (error_table_$bad_resource_spec);
+						/* scratch is a "special" name and should never get here */
+
+	if action = Register then
+	     record_status.create_sw = "1"b;
+
+/* Create key to locate record by (in the case of register, to create it by) */
+
+	if resource_descriptions.item (rno).given.name then
+	     call rcprm_registry_util_$name_key ((resource_descriptions.item (rno).name), null (), temp_non_var_key);
+	else call rcprm_registry_util_$uid_key (resource_descriptions.item (rno).uid, null (), temp_non_var_key);
+
+	temp_key = rtrim (temp_non_var_key);
+	call iox_$seek_key (sw_ptr (swno), temp_key, rec_len, code);
+
+	if action = Register then
+	     if code ^= error_table_$no_record then
+		call error_return_in_struc (error_table_$namedup);
+	     else code = 0;				/* good register */
+	else if code ^= 0 then
+	     call error_return_in_struc (error_table_$resource_unknown);
+
+	if action = Register then do;			/* create a registry record instead of locating one */
+	     rr_strl = length (rtrim (resource_descriptions.item (rno).name));
+	     record_status.record_length, record_status.max_rec_len = size (null -> registry_record) * 4;
+	end;
+
+	if action ^= Status then
+	     record_status.lock_sw = "1"b;		/* must lock record to change it */
+	else record_status.lock_sw = ""b;
+
+	call iox_$control (sw_ptr (swno), "record_status", addr (record_status), code);
+						/* locate (or create) record */
+	if code ^= 0 then
+	     call error_return (code);
+	record_ptr = record_status.record_ptr;
+	audit_obj_ok = "1"b;			/* Now we can audit a specific object if we fail. */
+
+/* Make the simple checks first. */
+
+	call simple_checks ();
+
+/*  Ok, see if there is enough access to return this error info. */
+	if code ^= 0 then do;
+	     simple_code = code;
+	     call setup_kernel_call (proxy_call, addr (req_info), addr (res_info));
+	     call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), current_rew, code);
+	     if current_rew ^= N_ACCESS then		/* Has enough access to see code. */
+		call error_return_in_struc (simple_code);
+	     else call error_return (code);		/* No, let them see the incorrect access code. */
+	end;
+	else do;					/* Check user's access to resource, depending on what he wants to do with it */
+
+/* If we are reserving a device, the device name was */
+/* generated internally and we will not audit it until */
+/* we have access. */
+
+	     call resource_info_$get_type ((resource_type), is_volume, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+	     if action = Reserve & (^is_volume) then
+		detailed_operation.search = "1"b;
+	     call setup_kernel_call (proxy_call, addr (req_info), addr (res_info));
+	     call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), current_rew, code);
+	     if code ^= 0 then
+		call error_return_in_struc (error_table_$resource_bad_access);
+						/* Ok, we have access then if it is a Reserve of a device */
+						/* then audit it now. */
+
+	     if action = Reserve & (^is_volume) then do;
+		detailed_operation.search = "0"b;
+		call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), current_rew, code);
+	     end;
+	end;
+
+/* At this point, we know the user has enough access to find out about the device. */
+
+
+	if resource_descriptions.item (rno).given.name & resource_descriptions.item (rno).given.uid
+	     & resource_descriptions.item (rno).uid ^= registry_record.uid & ^reconstruct_operation then
+	     call error_return_in_struc (error_table_$bad_resource_spec);
+     end seek_specific;
+
+seek_attr:
+     proc ();
+
+/* Find out if the attributes of the resource matter to the user or not */
+
+	if ^resource_descriptions.item (rno).given.desired_attributes then do;
+	     temp_relatts (*) = ""b;
+	     call resource_info_$default_attributes (resource_descriptions.item (rno).type, temp_relatts (1), code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+	end;
+	else temp_relatts = resource_descriptions.item (rno).desired_attributes (*);
+
+/* Now decide what pool of resources we will choose a resource from. */
+
+	if action = Acquire then
+	     call rcprm_registry_util_$free_key (null (), temp_non_var_key);
+
+	else if action = Reserve then do;
+	     if resource_descriptions.item (rno).given.owner then do;
+		call rcprm_registry_util_$free_key (null (), temp_non_var_key);
+	     end;
+	     else call rcprm_registry_util_$system_key (null (), temp_non_var_key);
+	end;
+
+	temp_key = rtrim (temp_non_var_key);
+	call iox_$seek_key (sw_ptr (swno), temp_key, rec_len, code);
+	if code ^= 0 then do;
+	     if code = error_table_$no_record then
+		code = error_table_$resource_unavailable;
+	     call error_return_in_struc (code);
+	end;
+
+	unspec (record_status) = ""b;
+	record_status.version = rs_info_version_2;
+
+	found = ""b;
+
+/* Someday there will be an outer loop here which will implement the fancy "resource best-fit backup"
+   algorithm which will eliminate certain stupidities of the current algorithm which can cause an error
+   of the form "no appropriate resource available" for multiple requests just because it snarfed up a very
+   sophisticated resource for a preceding (simple) request, and now has only simple
+   resources left to satisfy a sophisticated request.  But that day is NOT today. */
+
+	do while (^found);
+
+	     audit_obj_ok = "0"b;			/* if we fail, we don't have an object to audit at this point so use different methods for auditing. */
+	     resource_descriptions.item (rno).name = "";
+
+	     call iox_$position (sw_ptr (swno), Move_rel, 1, code);
+						/* move forward one key */
+						/* this leads the loop since the first owner record */
+						/* is always the owner name, not a resource record */
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     call iox_$read_key (sw_ptr (swno), read_key, 0, code);
+	     if code = error_table_$end_of_info then
+		code = error_table_$resource_unavailable;
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     if read_key ^= temp_key then
+		call error_return_in_struc (error_table_$resource_unavailable);
+
+	     call iox_$control (sw_ptr (swno), "record_status", addr (record_status), code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     record_ptr = record_status.record_ptr;
+	     audit_obj_ok = "1"b;			/* Ok, we have an object to audit if we should fail now. */
+
+/* do the most inexpensive checks first */
+
+	     call simple_checks ();
+	     if code ^= 0 then
+		goto try_another_resource;
+
+	     call chase (registry_record.potential_attributes_desc, bp, bl);
+	     if (bp -> potential_attributes_based & unspec (temp_atts)) ^= unspec (temp_atts) then
+		goto try_another_resource;
+
+/*  Check the access */
+
+	     call setup_kernel_call (proxy_call, addr (req_info), addr (res_info));
+	     call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), current_rew, code);
+
+	     if code ^= 0 then
+		goto try_another_resource;
+
+	     if action = Reserve then do;
+		resource_descriptions.item (rno).name = registry_record.name.string;
+
+		call rcp_reserve_$approve_schedule (resource_desc_ptr, rno, registry_dir, reserver_info_ptr,
+		     registry_record.reserver_chain, code);
+		if code ^= 0 then
+		     goto try_another_resource;
+	     end;
+
+	     found = "1"b;				/* got one! */
+try_another_resource:
+	     code = 0;
+
+	end;
+
+/* Auditing for search by attribute operations is */
+/* performed at select time and only for successful */
+/* selections.  We call the kernel to do the auditing */
+/* since it has the information neeeded to do so. */
+
+	detailed_operation.search = "0"b;
+	temp_mode = ""b;
+	call rcp_access_kernel_ (operation, addr (req_info), addr (res_info), temp_mode, code);
+
+
+/* lock the registry record before updating */
+	record_status.lock_sw = "1"b;			/* record must be locked for modification	*/
+	record_status.locate_sw = "1"b;		/* previous chase altered current_position	*/
+	call iox_$control (sw_ptr (swno), "record_status", addr (record_status), code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+	record_status.locate_sw = "0"b;		/* clean up structure			*/
+
+     end seek_attr;
+
+register:
+     proc ();
+
+	registry_record.free = "1"b;
+
+	registry_record.name.n = length (rtrim (resource_descriptions.item (rno).name));
+	registry_record.name.string = resource_descriptions.item (rno).name;
+
+	if ^reconstruct_operation then do;		/* when reconstructing we want to use the old uid */
+	     call admin_gate_$make_uid (registry_record.uid);
+	     resource_descriptions.item (rno).uid = registry_record.uid;
+	end;
+	else registry_record.uid = resource_descriptions.item (rno).uid;
+
+	call rcprm_registry_util_$uid_key (resource_descriptions.item (rno).uid, null (), temp_non_var_key);
+	temp_key = rtrim (temp_non_var_key);
+
+	call swap_key (record_descrip, "", temp_key, ""); /* Add the key */
+
+	if resource_descriptions.item (rno).given.potential_aim_range then
+	     temp_bounds (*) = resource_descriptions.item (rno).potential_aim_range (*);
+	else temp_bounds = current_auth ();
+
+/* Here we check to see whether an RCP administrator at a higher level is
+   attempting to make a resource "appear" at a lower level.  But we disable
+   this check for auto registration; because the only alternative would be
+   to take the max of the given lower bound (from the defaults in the RTDT)
+   and the user's current authorization-- and this would result in really
+   haphazard registration of resources.  Generally, people who are worried
+   about AIM security won't be using auto_registration for other reasons. */
+
+	if ^auto_registration then do;
+	     call rcp_compute_aim_mode$permissible_aim (temp_bounds, temp_bounds, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+	end;
+
+	call insert_descriptor (registry_record.potential_aim_range_desc, REGISTRY_AIM_RANGE_KEY, addr (temp_bounds),
+	     size (temp_bounds) * 4);
+
+     end register;
+
+acquire:
+     proc ();
+	if resource_descriptions.item (rno).given.owner then
+	     temp_owner_name = resource_descriptions.item (rno).owner;
+	else if action = Register then
+	     temp_owner_name = "free";		/* free */
+
+	temp_key = make_owner_key (temp_owner_name);
+
+	if registry_record.owner_desc = 0 then
+	     old_key = "";
+	else do;
+	     call rcprm_registry_util_$free_key (null (), temp_non_var_key);
+	     old_key = rtrim (temp_non_var_key);
+	end;
+
+	registry_record.reserver_chain = ""b;
+	resource_descriptions.item (rno).rew = current_rew;
+
+	if (action ^= Register) | (resource_descriptions.item (rno).given.owner) then do;
+	     if resource_descriptions.item (rno).given.aim_range then
+		temp_bounds (*) = resource_descriptions.item (rno).aim_range (*);
+	     else temp_bounds (*) = current_auth ();
+
+	     call chase (registry_record.potential_aim_range_desc, bp, bl);
+	     if bl = 0 then
+		bp = addr (Lowest_Aim_Range);		/* none found, set to lowest */
+
+	     call rcp_compute_aim_mode$permissible_aim (bp -> temp_bounds_based, temp_bounds, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     call insert_descriptor (registry_record.aim_range_desc, REGISTRY_AIM_RANGE_KEY, addr (temp_bounds),
+		size (temp_bounds) * 4);
+	end;
+
+	call swap_key (record_descrip, old_key, temp_key, rtrim (temp_owner_name));
+	call swap_descriptor (registry_record.owner_desc, old_key, temp_key, addr (temp_owner_name),
+	     length (rtrim (temp_owner_name)));
+	registry_record.system = (temp_owner_name = "system");
+	registry_record.free = (temp_owner_name = "free");
+
+     end acquire;
+
+set:
+     proc ();
+	if resource_descriptions.item (rno).given.potential_aim_range then do;
+	     temp_bounds (*) = resource_descriptions.item (rno).potential_aim_range (*);
+	     if resource_descriptions.item (rno).given.aim_range then
+		bp = addr (temp_bounds);		/* don't sweat, a later check will validate this */
+	     else do;
+		call chase (registry_record.aim_range_desc, bp, bl);
+		if bl = 0 then
+		     bp = addr (Lowest_Aim_Range);	/* none found, set to lowest */
+	     end;
+
+						/* check the new potentials against the currents */
+
+	     call rcp_compute_aim_mode$permissible_aim (temp_bounds, bp -> temp_bounds_based, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     call insert_descriptor (registry_record.potential_aim_range_desc, REGISTRY_AIM_RANGE_KEY,
+		addr (temp_bounds), size (temp_bounds) * 4);
+	end;
+
+	if resource_descriptions.item (rno).given.aim_range then
+	     if registry_record.free then		/* free resources don't have set access classes */
+		call error_return_in_struc (error_table_$resource_free);
+	     else do;
+		temp_bounds (*) = resource_descriptions.item (rno).aim_range (*);
+
+		call chase (registry_record.potential_aim_range_desc, bp, bl);
+		if bl = 0 then
+		     bp = addr (Lowest_Aim_Range);	/* none found, set to lowest */
+						/* check the potentials against the new currents */
+
+		call rcp_compute_aim_mode$permissible_aim (bp -> temp_bounds_based, temp_bounds, code);
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+
+		call insert_descriptor (registry_record.aim_range_desc, REGISTRY_AIM_RANGE_KEY, addr (temp_bounds),
+		     size (temp_bounds) * 4);
+	     end;
+
+subset:
+     entry;
+	if (resource_descriptions.item (rno).given.potential_attributes | (action = Register)) then do;
+	     temp_atts (*) = ""b;
+	     if resource_descriptions.item (rno).given.potential_attributes then
+		temp_atts (1) = resource_descriptions.item (rno).potential_attributes;
+
+	     call cv_rcp_attributes_$test_valid (resource_type, temp_atts, validity, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     call insert_descriptor (registry_record.potential_attributes_desc, REGISTRY_ATTRIBUTES_KEY,
+		addr (temp_atts), size (temp_atts) * 2);/* chars per word, but we only want half of the array */
+
+	     registry_record.attributes (*) = registry_record.attributes (*) & temp_atts (1);
+	end;
+
+	if resource_descriptions.item (rno).given.location then
+	     call insert_descriptor (registry_record.location_desc, REGISTRY_LOCATION_KEY,
+		addr (resource_descriptions.item (rno).location),
+		length (rtrim (resource_descriptions.item (rno).location)));
+
+	if resource_descriptions.item (rno).given.charge_type then
+	     call insert_descriptor (registry_record.charge_type_desc, REGISTRY_CHARGE_TYPE_KEY,
+		addr (resource_descriptions.item (rno).charge_type),
+		length (rtrim (resource_descriptions.item (rno).charge_type)));
+
+	if resource_descriptions.item (rno).given.usage_lock then
+	     registry_record.usage_lock = resource_descriptions.item (rno).usage_lock;
+
+	if resource_descriptions.item (rno).given.release_lock then
+	     registry_record.release_lock = resource_descriptions.item (rno).release_lock;
+
+
+	if resource_descriptions.item (rno).given.acs_path then do;
+	     if registry_record.free then		/* free resource can't have an ACS */
+		call error_return_in_struc (error_table_$resource_free);
+	     temp_acs_path = resource_descriptions.item (rno).acs_path;
+	     if temp_acs_path = "" then
+		;				/* wants to have no ACS */
+	     else if substr (temp_acs_path, 1, 1) ^= ">" then
+		call error_return_in_struc (error_table_$not_abs_path);
+	     else do;
+		call absolute_pathname_$add_suffix (temp_acs_path, "acs", temp_acs_path, code);
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+	     end;
+
+	     call insert_descriptor (registry_record.acs_path_desc, REGISTRY_ACS_PATH_KEY, addr (temp_acs_path),
+		length (rtrim (temp_acs_path)));
+	end;
+
+	if resource_descriptions.item (rno).given.comment then
+	     call insert_descriptor (registry_record.comment_desc, REGISTRY_COMMENT_KEY,
+		addr (resource_descriptions.item (rno).comment),
+		length (rtrim (resource_descriptions.item (rno).comment)));
+
+	if resource_descriptions.item (rno).given.user_alloc then
+	     registry_record.user_alloc = resource_descriptions.item (rno).user_alloc;
+
+	if resource_descriptions.item (rno).given.desired_attributes & ^seek_attr_flag then do;
+
+	     temp_relatts = resource_descriptions.item (rno).desired_attributes (*);
+
+	     call cv_rcp_attributes_$test_valid (resource_type, temp_atts, validity, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+
+	     call chase (registry_record.potential_attributes_desc, bp, bl);
+	     if (bp -> potential_attributes_based | temp_atts (1)) ^= bp -> potential_attributes_based then
+		call error_return_in_struc (error_table_$rcp_attr_not_permitted);
+						/* some desired attribute is not a potential attribute */
+
+	     if validity = Absolute then
+		registry_record.attributes = temp_atts;
+
+	     else if validity = Relative then do;
+		call cv_rcp_attributes_$make_rel (resource_type, (temp_atts), temp_relatts, code);
+		if code ^= 0 then
+		     call error_return_in_struc (code);
+
+		call cv_rcp_attributes_$modify_rel ((registry_record.attributes), temp_relatts,
+		     registry_record.attributes);
+	     end;
+
+	     else call error_return_in_struc (error_table_$rcp_bad_attributes);
+	end;
+     end set;
+
+status:
+     proc ();
+
+	if ^resource_descriptions.item (rno).given.name then
+	     resource_descriptions.item (rno).name = registry_record.name.string;
+	if ^resource_descriptions.item (rno).given.uid then
+	     resource_descriptions.item (rno).uid = registry_record.uid;
+	resource_descriptions.item (rno).user_alloc = registry_record.flags.user_alloc;
+	resource_descriptions.item (rno).release_lock = registry_record.flags.release_lock;
+	resource_descriptions.item (rno).usage_lock = registry_record.flags.usage_lock;
+	resource_descriptions.item (rno).awaiting_clear = registry_record.flags.awaiting_clear;
+	resource_descriptions.item (rno).attributes (1) = registry_record.attributes (1);
+	resource_descriptions.item (rno).attributes (2) = registry_record.attributes (2);
+	resource_descriptions.item (rno).rew = current_rew;
+
+	call chase (registry_record.location_desc, bp, bl);
+	resource_descriptions.item (rno).location = based_charstring;
+
+	call chase (registry_record.comment_desc, bp, bl);
+	resource_descriptions.item (rno).comment = based_charstring;
+
+	call chase (registry_record.charge_type_desc, bp, bl);
+	resource_descriptions.item (rno).charge_type = based_charstring;
+
+	call chase (registry_record.owner_desc, bp, bl);
+	resource_descriptions.item (rno).owner = based_charstring;
+
+	call chase (registry_record.acs_path_desc, bp, bl);
+	resource_descriptions.item (rno).acs_path = based_charstring;
+
+	call chase (registry_record.potential_attributes_desc, bp, bl);
+	resource_descriptions.item (rno).potential_attributes = based_bits;
+
+	call chase (registry_record.potential_aim_range_desc, bp, bl);
+	addr (resource_descriptions.item (rno).potential_aim_range (1)) -> based_bits = based_bits;
+
+	if ^registry_record.free then
+	     call chase (registry_record.aim_range_desc, bp, bl);
+	addr (resource_descriptions.item (rno).aim_range (1)) -> based_bits = based_bits;
+						/* if free, use potential bounds as real bounds, doesn't matter */
+
+     end status;
+
+reserve:
+     proc ();
+
+	if seek_attr_flag then do;			/* only do this block if a specific resource was requested */
+						/* because we've already done this for "you choose one" requests */
+
+	     call rcp_reserve_$approve_schedule (resource_desc_ptr, rno, registry_dir, reserver_info_ptr,
+		registry_record.reserver_chain, code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+	end;
+
+/* If this is a system resource, we move this entry to the tail of the system pool with the following call.
+   This not only results in allowing us to rotate our stock, but also makes future calls to find available
+   resources faster by keeping the most-likely-to-be-available resources at the head of the line. */
+
+	if registry_record.system then
+	     call swap_key (record_descrip, (REGISTRY_SYSTEM_KEY), (REGISTRY_SYSTEM_KEY), "system");
+
+     end reserve;
+
+deregister:
+     proc ();
+
+
+/* Perform violent disassembly on this poor record, tearing out of its vitals all record descriptors
+   and freeing up (at least one usage of) the records they point to.  Note that although some of the
+   descriptors we attempt to free have no business being in a free record, we will second-guess them anyway,
+   in case some misguided RCP administrator has unfairly visited various invocations of set_resource upon
+   poor, innocent free resources.  In any case, the swap subroutines are sufficiently robust as to know
+   whether these descriptors really exist or not. */
+
+	call insert_descriptor (registry_record.potential_aim_range_desc, REGISTRY_AIM_RANGE_KEY, null, 0);
+	call insert_descriptor (registry_record.aim_range_desc, REGISTRY_AIM_RANGE_KEY, null, 0);
+	call insert_descriptor (registry_record.potential_attributes_desc, REGISTRY_ATTRIBUTES_KEY, null, 0);
+	call insert_descriptor (registry_record.acs_path_desc, REGISTRY_ACS_PATH_KEY, null, 0);
+	call insert_descriptor (registry_record.location_desc, REGISTRY_LOCATION_KEY, null, 0);
+	call insert_descriptor (registry_record.comment_desc, REGISTRY_COMMENT_KEY, null, 0);
+	call insert_descriptor (registry_record.charge_type_desc, REGISTRY_CHARGE_TYPE_KEY, null, 0);
+	call insert_descriptor (registry_record.owner_desc, REGISTRY_FREE_KEY, null, 0);
+
+	call swap_key (record_descrip, (REGISTRY_FREE_KEY), "", "");
+
+	call rcprm_registry_util_$uid_key (registry_record.uid, null (), temp_non_var_key);
+	temp_key = rtrim (temp_non_var_key);
+
+	call swap_key (record_descrip, temp_key, "", "");
+
+	call rcprm_registry_util_$name_key (registry_record.name.string, null (), temp_non_var_key);
+	temp_key = rtrim (temp_non_var_key);
+
+	call iox_$seek_key (sw_ptr (swno), temp_key, 0, code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+	call iox_$delete_record (sw_ptr (swno), code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+     end deregister;
+
+release:
+     proc (ok);
+
+dcl	ok		   bit (1);
+	ok = "1"b;
+
+	call resource_info_$lock_on_release (resource_type, lock_sw, code);
+	if lock_sw then do;
+	     registry_record.awaiting_clear = "1"b;
+	     registry_record.usage_lock = "1"b;
+	     resource_descriptions.item (rno).usage_lock = "1"b;
+	     resource_descriptions.item (rno).awaiting_clear = "1"b;
+	     ok = "0"b;
+	end;
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+     end release;
+
+clear:
+     proc ();
+
+/* We know the user has rew access, because this was called from Release,
+   which checks it, or he made a privileged call to get here. */
+
+	if priv_sw then do;				/* Clear or privileged Release */
+	     call chase (registry_record.owner_desc, bp, bl);
+	     temp_key = make_owner_key ((based_charstring));
+	end;
+
+	else temp_key = make_owner_key (temp_owner_name);
+
+	registry_record.usage_lock = ""b;
+	registry_record.awaiting_clear = ""b;
+
+	temp_owner_name = "free";
+	call swap_descriptor (registry_record.owner_desc, temp_key, REGISTRY_FREE_KEY, addr (temp_owner_name),
+	     length ("free"));
+
+	call swap_key (record_descrip, temp_key, (REGISTRY_FREE_KEY), "free");
+
+	call insert_descriptor (registry_record.comment_desc, REGISTRY_COMMENT_KEY, null, 0);
+	call insert_descriptor (registry_record.acs_path_desc, REGISTRY_ACS_PATH_KEY, null, 0);
+	call insert_descriptor (registry_record.aim_range_desc, REGISTRY_AIM_RANGE_KEY, null, 0);
+
+	registry_record.free = "1"b;
+	registry_record.system = ""b;
+
+/* "Degauss" the registry to prevent information passdown on a secure system;
+   also leaves the registry clean for the next guy in general. */
+
+	registry_record.flags.user_alloc = ""b;
+	registry_record.attributes (2) = ""b;		/* deprotect all attributes */
+
+	call chase (registry_record.potential_attributes_desc, bp, bl);
+	temp_atts (1) = based_bits;
+
+	call resource_info_$set_arbitrary_attributes (resource_type, temp_atts (1), registry_record.attributes, code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+     end clear;
+
+cancel:
+     proc ();
+
+	call rcp_cancel_id_$remove_schedule (resource_desc_ptr, rno, registry_dir, reserver_info_ptr,
+	     registry_record.reserver_chain, code);
+	if code ^= 0 then
+	     call error_return_in_struc (code);
+
+/* If this is a "scratch"  or "system" resource, "degauss" the registry record so that
+   no information may be passed to a lower authorization via this path. */
+
+	if registry_record.system then do;
+	     registry_record.flags.user_alloc = ""b;
+
+	     call chase (registry_record.potential_attributes_desc, bp, bl);
+	     temp_atts (1) = based_bits;
+
+	     call resource_info_$set_arbitrary_attributes (resource_type, temp_atts (1), registry_record.attributes,
+		code);
+	     if code ^= 0 then
+		call error_return_in_struc (code);
+	end;
+
+     end cancel;
+
+process_end:
+     proc ();
+
+	if (action ^= Status) then
+	     do swno = 1 to switch_struc.usedno;
+	     call iox_$control (sw_ptr (swno), "commit", null, code);
+	     if code ^= 0 then do;
+		if swno > 1 then
+		     call admin_gate_$syserr_error_code (BEEP, code,
+			"RCP: Registries may be in an inconsistent state.");
+		call error_return (code);
+	     end;
+	end;
+
+	if action = Release then
+	     do rno = 1 to resource_descriptions.n_items;
+	     if resource_descriptions.item (rno).awaiting_clear then
+		call admin_gate_$syserr (BEEP, "RCP: Schedule ^a ^a for manual clearing.",
+		     resource_descriptions.item (rno).type, resource_descriptions.item (rno).name);
+	end;
+
+	else if action = Clear then
+	     do rno = 1 to resource_descriptions.n_items;
+	     call admin_gate_$syserr (ANNOUNCE, "RCP: ^[Operator^s^;^a^] certified manual clearing of ^a ^a.",
+		(my_group_id = "Initializer.SysDaemon.z"), my_group_id, resource_descriptions.item (rno).type,
+		resource_descriptions.item (rno).name);
+	end;
+
+/* Journalize all successful operations that changed registry information */
+
+	if action ^= Status & action ^= Reserve & action ^= Cancel & ^reconstruct_operation then
+						/* certainly don't want to journalize those! */
+	     call rcprm_journalize_ (resource_desc_ptr, action, transaction_time, registry_dir);
+
+	call put_resource_descriptions;
+	call clean_up (code, "1"b);
+	if code ^= 0 then
+	     call error_return (code);
+
+     end process_end;
+
+/**** Routines to copy the resource descriptions from the caller's space, and back again.  get_* allocates the storage
+      in system_area.  These must (obviously) be called in the correct order. ****/
+
+get_resource_descriptions:
+     proc;
+
+dcl	based_bits	   (wordcount) bit (36) aligned based;
+dcl	wordcount		   fixed bin (19);
+
+	callers_rdp = p_resource_desc_ptr;		/* this is remembered for put... */
+	Resource_count = callers_rdp -> resource_descriptions.n_items;
+	allocate resource_descriptions in (sys_area) set (resource_desc_ptr);
+	wordcount = size (resource_descriptions);
+	resource_desc_ptr -> based_bits = callers_rdp -> based_bits;
+	resource_descriptions.n_items = Resource_count;	/* prevent caller "cleverness" */
+	return;
+
+put_resource_descriptions:
+     entry;
+
+	wordcount = size (resource_descriptions);
+	callers_rdp -> based_bits = resource_desc_ptr -> based_bits;
+	return;
+
+     end get_resource_descriptions;
+%page;
+setup_kernel_call:
+     proc (a_proxy_call, a_requestor_info_ptr, a_resource_info_ptr);
+
+dcl	a_proxy_call	   bit (1) aligned;
+dcl	a_requestor_info_ptr   ptr;
+dcl	a_resource_info_ptr	   ptr;
+
+	if a_proxy_call then do;
+	     a_requestor_info_ptr -> requestor_info.user_id = proxy_group_id;
+	     a_requestor_info_ptr -> requestor_info.current_authorization = proxy_authorization;
+	end;
+	else do;
+	     a_requestor_info_ptr -> requestor_info.user_id = get_group_id_ ();
+	     call hcs_$get_authorization (a_requestor_info_ptr -> requestor_info.current_authorization, (""b));
+						/*	     a_requestor_info_ptr -> requestor_info.current_authorization = get_authorization_ ();  */
+	end;
+	a_requestor_info_ptr -> requestor_info.validation_level = prev_level;
+	a_resource_info_ptr -> resource_info.registry_dir = registry_dir;
+	a_resource_info_ptr -> resource_info.registry_switch_ptr = sw_ptr (swno);
+	a_resource_info_ptr -> resource_info.registry_record_ptr = record_ptr;
+	a_resource_info_ptr -> resource_info.resource_type = resource_type;
+	if action = Register then
+	     a_resource_info_ptr -> resource_info.resource_name = resource_descriptions.item (rno).name;
+	else a_resource_info_ptr -> resource_info.resource_name = registry_record.name.string;
+	return;
+     end setup_kernel_call;
+%page;
+simple_checks:
+     proc ();
+
+	if registry_record.awaiting_clear & action ^= Clear & action ^= Status then
+	     code = error_table_$resource_awaiting_clear;
+
+	if ^registry_record.awaiting_clear & action = Clear then
+	     code = error_table_$resource_not_free;
+	if registry_record.usage_lock & ^registry_record.awaiting_clear & ^priv_sw then
+	     code = error_table_$resource_locked;
+	if ^registry_record.free & action = Acquire then
+	     code = error_table_$resource_not_free;
+	if action = Reserve then
+	     if registry_record.user_alloc then
+		code = error_table_$resource_locked;
+	if action = Release & (registry_record.release_lock & ^priv_sw) then
+	     code = error_table_$not_privileged;
+	if action = Release & registry_record.free then
+	     code = error_table_$resource_free;
+	if action = Deregister & ^registry_record.free then
+	     code = error_table_$resource_not_free;
+	return;
+     end simple_checks;
+%page;
+audit:
+     proc (a_code);
+
+dcl	a_code		   fixed bin (35);
+dcl	save_code		   fixed bin (35);
+dcl	based_charstring	   char (bl) aligned based (bp);
+dcl	bl		   fixed bin (21);
+dcl	bp		   ptr;
+dcl	current_owner	   char (32);
+dcl	path		   char (168);
+dcl	raw_mode		   bit (3);
+dcl	rcp_rbs		   (2) fixed bin (3);
+dcl	local_code	   fixed bin (35);
+dcl	1 auto_event_flags	   like audit_event_flags aligned;
+dcl	reg_name		   char (32);
+dcl	suffixed_name_$make	   entry (char (*), char (*), char (32), fixed bin (35));
+dcl	pathname_		   entry (char (*), char (*)) returns (char (168));
+dcl	access_audit_r1_$log_obj_path
+			   entry options (variable);	/*  Copy args and initialize local variables. */
+
+	save_code = a_code;
+	local_code = 0;
+	rcp_rbs = 0;
+	rcp_rbs (1) = -1;
+	raw_mode = ""b;
+
+/* If this is an audit of failure, most operations are audited in the kernel */
+/* with the exception of registers and acquires which are audited here.  */
+/* Operations which fail before an object is found, particularly in the */
+/* case of an error_table_$namedup, are audited here. */
+
+	if save_code ^= 0 then			/* It failed. */
+	     if action ^= Acquire & action ^= Register then
+						/* Audit these always. */
+		if audit_obj_ok then		/* We have an object - already audited. */
+		     return;
+
+/* If we don't have an object to audit, this is a failure.  Except in */
+/* the case of a Register or Acquire.  In the case of a Register we never */
+/* had an object to audit prior to this operation, so we audit the operation */
+/* on the registry. */
+
+	if ^audit_obj_ok | action = Register then do;
+	     call suffixed_name_$make ((resource_type), "rcpr", reg_name, local_code);
+	     path = pathname_ ((registry_dir), reg_name);
+	     unspec (detailed_operation) = "0"b;
+	     unspec (auto_event_flags) = ""b;
+	     auto_event_flags.grant = (save_code = 0);
+	     auto_event_flags.priv_op = priv_sw;
+	     call access_audit_r1_$log_obj_path ("rcprm_find_resource_", prev_level, unspec (auto_event_flags),
+		operation, path, save_code, null (), 0);
+	end;
+
+	else do;
+
+/* We have an object to audit. Get the object owner prior to */
+/* this operation. If it's an acquire operation the previous owner is */
+/* always "free". */
+
+	     if action = Acquire then
+		current_owner = "free";
+	     else do;
+		call chase (registry_record.owner_desc, bp, bl);
+		if bl = 0 then
+		     current_owner = "free";
+		else current_owner = based_charstring;
+	     end;
+
+/* This is a failure audit. */
+
+	     if save_code ^= 0 then do;
+		call setup_kernel_call (proxy_call, addr (req_info), addr (res_info));
+		call rcp_audit (who_am_i, operation, addr (req_info), addr (res_info), current_owner, ("000"b),
+		     raw_mode, rcp_rbs, ("1"b), (save_code));
+	     end;
+
+/* This is a success. */
+
+	     else call rcp_audit (who_am_i, operation, addr (req_info), addr (res_info), current_owner, (current_rew),
+		     raw_mode, rcp_rbs, ("1"b), (save_code));
+	end;
+	a_code = save_code;
+	return;
+     end audit;
+%page;
+%include access_mode_values;
+%page;
+%include access_audit_encoded_op;
+%page;
+%include access_audit_eventflags;
+%page;
+%include resource_control_desc;
+%page;
+%include rcp_ops;
+%page;
+%include rcp_registry;
+%page;
+%include rcp_requestor_info;
+%page;
+%include rcp_resource_info;
+%page;
+%include rcprm_action_codes;
+%page;
+%include iox_dcls;
+%page;
+%include iox_modes;
+%page;
+%include rs_info;
+%page;
+%include ak_info;
+%page;
+%include rcprm_registry_keys;
+%page;
+%include aim_template;
+%page;
+%include syserr_constants;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   RCP: Registries may be in an inconsistent state. ERROR_CODE
+
+   S: $beep
+
+   T: $run
+
+   M: An RCP Resource Management transaction was not properly committed to the
+   registries. $err
+
+   A: $contact
+
+
+   Message:
+   RCP: Schedule VOLUME for manual clearing.
+
+   S: $beep
+
+   T: $run
+
+   M: The data contained on VOLUME is to be destroyed by the operator via
+   degaussing or other site-mandated method.
+
+   A: The operator must erase the specified resource, and must acknowledge
+   when this has been done by issuing the clear_resource command or the
+   appropriate site-defined "x" Initializer request.
+
+
+   Message:
+   RCP: Operator certified manual clearing of VOLUME.
+   RCP: USERID certified manual clearing of VOLUME.
+
+   S: $info
+
+   T: In response to an operator or administrator command.
+
+   M: This message is printed for auditing purposes when site-madated
+   destruction of data is accomplished.
+
+   A: $ignore
+
+   END MESSAGE DOCUMENTATION */
+
+     end rcprm_find_resource_;

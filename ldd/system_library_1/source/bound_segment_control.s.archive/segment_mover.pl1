@@ -1,0 +1,772 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-03-28,Parisek), approve(88-05-27,MCR7907),
+     audit(88-06-02,Fawcett), install(88-09-27,MR12.2-1122):
+     Free the pvtx and pvid binding (done by get_pvtx$hold_pvtx to keep other
+     processes from allocating the potential target pv during VTOCE move) when
+     that target pv is found to be full, thus making it unusable for the VTOCE
+     move. (phx20920).
+  2) change(92-09-11,Zimmerman), approve(92-09-11,MCR8259), audit(92-09-22,Vu),
+     install(92-10-23,MR12.5-1040):
+     Change to include names of sub_volumes in error messages.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style2,indcomtxt */
+segment_mover:
+     proc (a_refaddr, a_astep, a_ep, a_segno, a_code);
+
+/**** This procedure is invoked from the segment fault handler when the latter finds
+      a flag (aste.pack_ovfl) on in an ASTE to which a process is trying to connect.
+      This flag is turned on when the page fault handler finds that no page of the
+      segment's Physical Volume of residence is availble for allocation.
+
+      Segment_mover tries to allocate a vtoce for the segment on some
+      other physical volume of the logical volume. The PVT is scanned once,
+      via a coroutine with create_vtoce$createv_for_segmove. The target
+      physical volume must have at least as many free records as the current requirement
+      of the segment, plus the one extra sought. If no allocation can be made, segment_mover
+      returns the logical volume full error code.
+
+      In the case of a demand segment move (hphcs_ call to move a segment),
+      optimization of physical volume selection is allowed for create_vtoce.
+      This optimization will place segments on devices with the most space,
+      over a sufficiently large number of segment creations.
+
+      segment_mover relies upon page_control detected out-of-physical-volume
+      conditions on the target physical volume. If the segment fault handler
+      notices a fault on the illegal low segment number, an error is signalled, which
+      is caught by a condition handler in this program, and interpreted appropriately.
+
+      The basic strategy is to move all pages into memory, wired,
+      and then change the record addresses. For synchronized segments,
+      it is neccessary to guarantee that no held pages exist, since
+      the disk records for held pages would have to be preserved and
+      their contents moved. Thus, for synchronized segments,
+      pc force writes the journal pages, and then can use the usual
+      strategy.
+
+      Designed and coded by Bernard Greenberg, 9-10/75
+
+      Last modified:
+
+      02/19/76 by Richard Bratt to change coroutine coordination with create_vtoce
+      05/76    by BSG for demounter, hphcs_ seg mover
+      06/76	by D. Vinograd to copy volume dump info to new aste and to set volume dump bit map for old vtoce.
+      12/1/78 by BSG for +-1 bugs in pc calls and special-case of 1 PV LV
+      10/03/79 by J. A. Bush to copy terminal quota attributes out of old vtoce, into new one
+      03/10/80 by Mike Grady to code around a compiler bug
+      04/08/80 by Mike Grady to fix a bug in releasing of held pvtx's.
+      03/20/81, W. Olin Sibert, to change for ADP PTW formats
+      03/22/81, WOS, to only complain about illegal deactivations in segment fault case (not hphcs_)
+      04/19/81, W. Olin Sibert, to stop maintaining aste.ic
+      02/28/82, J. Bongiovanni, to eliminate obsolete vtoce.infqcnt, rework pvte refs,
+      add demand_segmove entry and optimization of PV allocation
+      08/18/82, J. Bongiovanni, for new pc$list_deposited_add and
+      pc$deposit_list calling sequences
+      10/26/82, J. Bongiovanni, for fm_damaged and synchronized segments
+      831211, E. N. Kittlitz, for EHS moves, demand moves within a PV.
+      84-01-03 BIM to finish the above.
+      84-07-01 BIM to unthread one aste from get_aste before getting
+      the other. Otherwise, you can get the same aste twice.
+      1984-10-15 BIM to release pvtx's on failure.
+      1984-12-18 BIM: to zero special SDW for synch segment (it has no trailer,
+      so cannot be left around), and to sum$dirmod.
+      1985-04-01, BIM: only rethread the ASTE once on failure.
+*/
+
+	dcl     a_astep		 ptr;		/* for efficiency */
+	dcl     a_code		 fixed bin (35);	/* return error code */
+	dcl     a_ep		 ptr;
+	dcl     a_refaddr		 fixed bin (18);	/* referenced address, <0 if hphcs_ */
+	dcl     a_segno		 fixed bin;	/* arg segno of reference */
+
+	dcl     aste_uid		 bit (36) aligned;
+	dcl     aste_tqsw		 (0:1) bit (1) aligned;
+	dcl     cleanup_must_zero_sdw	 bit (1) aligned;
+	dcl     code		 fixed bin (35);	/* temp var for that */
+	dcl     corout_pvtx		 fixed bin;	/* control point for create_vtoce$createv_for_segmove */
+
+	dcl     demand_segmove	 bit (1);
+	dcl     depolist		 (0:255) bit (36) aligned;
+						/* deposit array */
+	dcl     dlp		 ptr;
+	dcl     move_astep		 ptr;		/* Target ASTE if ehs segmove */
+	dcl     held_pvtx		 bit (1);		/* flag, on if we held new pvtx */
+	dcl     ignore		 fixed bin (35);	/* what it says */
+	dcl     mod_status		 bit (1);		/* old seg fms status */
+	dcl     n_nulled_pages	 fixed bin;
+	dcl     new_pts		 fixed bin;
+	dcl     new_ptsi		 fixed bin;
+	dcl     new_pvid		 bit (36) aligned;
+	dcl     new_pvtx		 fixed bin;
+	dcl     new_vtocx		 fixed bin;
+	dcl     old_nqsw		 bit (1);		/* setting of no quota sw */
+	dcl     old_pts		 fixed bin;	/* old seg page table size */
+	dcl     old_ptsi		 fixed bin;	/* old seg page table size index */
+	dcl     old_pvid		 bit (36) aligned;
+	dcl     old_pvtx		 fixed bin;
+	dcl     old_vtocx		 fixed bin;
+	dcl     optimizing		 bit (1) aligned;
+	dcl     pageno_list		 (256) fixed bin;	/* Page number list */
+	dcl     pvid		 bit (36);	/* New pvid, to go in branch when ready */
+	dcl     pw1		 fixed bin;
+	dcl     pw2		 fixed bin;
+	dcl     qtype		 fixed bin;	/* seg/dir quota index */
+	dcl     recs_needed		 fixed bin;	/* Target vol must have this many */
+	dcl     ref_addr		 fixed bin (18);	/* address of fault */
+	dcl     refpage		 fixed bin;	/* page of fault */
+	dcl     same_pvtx		 bit (1);		/* flag, on new PVTX is same as old */
+	dcl     segno		 fixed bin;	/* temp for segno of reference */
+	dcl     size_needed		 fixed bin;	/* Size of new aste */
+	dcl     skip_pvtx		 fixed bin;	/* pvtx for cv to skip */
+	dcl     temp_ename		 char (32);
+	dcl     time1		 fixed bin (71);
+	dcl     time2		 fixed bin (71);
+	dcl     tsdw		 fixed bin (71) aligned;
+						/* Temp SDW stash */
+
+	dcl     1 aq_cell		 like quota_cell aligned;
+						/* auto copy of quota cell */
+	dcl     1 atq_info		 like tq_info aligned;
+						/* auto copy of tq_info */
+
+	dcl     MAGIC_NPAGES	 fixed bin static init (10);
+						/* if more than this many pages are nulled (found zero by PC), we will deposit them and retry the fault. */
+
+	dcl     create_vtoce$createv_for_segmove
+				 entry (ptr, bit (36), fixed bin, fixed bin (35), fixed bin, fixed bin, fixed bin,
+				 ptr, bit (1) aligned);
+	dcl     dbm_man$set_incr	 entry (fixed bin, fixed bin, fixed bin (35));
+	dcl     get_aste		 entry (fixed bin) returns (ptr);
+	dcl     get_ptrs_$given_astep	 entry (ptr) returns (fixed bin (71) aligned);
+	dcl     get_pvtx$hold_pvtx	 entry (bit (36) aligned, fixed bin, fixed bin (35));
+	dcl     get_pvtx$release_pvtx	 entry (bit (36) aligned, fixed bin);
+	dcl     lock$lock_ast	 ext entry;
+	dcl     lock$unlock_ast	 ext entry;
+	dcl     logical_volume_manager$lvtep
+				 entry (bit (36) aligned, ptr, fixed bin (35));
+	dcl     pc$deposit_list	 entry (fixed bin, fixed bin, ptr, fixed bin, ptr);
+	dcl     pc$list_deposited_add	 entry (ptr, fixed bin, fixed bin, fixed bin, ptr, ptr);
+	dcl     pc$segmove		 entry (ptr, ptr, ptr, fixed bin, fixed bin, fixed bin, ptr, ptr, fixed bin (35));
+	dcl     pds$process_group_id	 ext char (32) aligned;
+	dcl     pmut$swap_sdw	 entry (ptr, ptr);
+	dcl     put_aste		 entry (ptr);
+	dcl     setfaults		 entry (ptr, bit (1) aligned);
+	dcl     sum$dirmod		 entry (pointer);
+
+	dcl     syserr		 entry options (variable);
+	dcl     syserr$error_code	 entry options (variable);
+	dcl     (
+	        search_ast$hash_in,
+	        search_ast$hash_out
+	        )			 entry (pointer);
+	dcl     thread$cin		 entry (ptr, bit (18));
+	dcl     thread$out		 entry (ptr, bit (18));
+	dcl     usage_values	 entry (fixed bin (17), fixed bin (71));
+	dcl     vtoc_attributes$get_quota
+				 entry (bit (36) aligned, bit (36) aligned, fixed bin, ptr, fixed bin,
+				 fixed bin (35));
+	dcl     vtoc_man$await_vtoce	 entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+	dcl     vtoc_man$free_vtoce	 entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+
+	dcl     sys_info$page_size	 fixed bin external static;
+	dcl     error_table_$log_vol_full
+				 fixed bin (35) ext static;
+	dcl     error_table_$illegal_deactivation
+				 fixed bin (35) external;
+						/* Sent if illegal seg for move */
+
+	dcl     (addr, baseptr, divide, fixed, null, setwordno, unspec, wordno)
+				 builtin;
+
+%page;
+
+/**** Entry conditions:
+
+      DIRECTORY WRITE LOCKED
+      AST LOCKED
+
+*/
+
+	demand_segmove = "0"b;			/* Called from seg_fault */
+	ref_addr = a_refaddr;
+	goto COMMON;
+
+demand_segmove:
+     entry (a_astep, a_ep, a_segno, a_code);
+
+	demand_segmove = "1"b;			/* Called via hphcs_ */
+	ref_addr = -1;
+
+COMMON:
+	call usage_values (pw1, time1);		/* Meter */
+	code = 0;
+	segno = a_segno;
+	ep = a_ep;
+	astep = null ();				/* temporary use only */
+	move_astep = a_astep;			/* Current astep */
+
+	dlp = addr (depolist);			/* in general, use automatic table for deposits */
+	pvt_arrayp = addr (pvt$array);		/* for disk names and pvids */
+	sstp = addr (sst_seg$);
+
+	if move_astep -> aste.hc_sdw | move_astep -> aste.hc | move_astep -> aste.par_astep = "0"b
+	then do;
+		a_code = error_table_$illegal_deactivation;
+						/* Only complain for seg-fault invocation, not hphcs_ */
+		if ^demand_segmove
+		then /* theory is that these will go away next bootload, anyway */
+		     call syserr (LOG, "segment_mover: critical segment out of disk on ^a, segno/astep = ^o ^o",
+			diskname ((move_astep -> aste.pvtx)), segno, wordno (move_astep));
+		call lock$unlock_ast;
+		return;				/* leave pack_ovfl bit on */
+	     end;
+
+/**** Don't attempt non-demand segmoves on single PV case.
+      In the demand case, someone may have changed the sons_lvid to force a cross-LV move.
+      If we happen to take an oopv after this sons_lvid has changed but before a demand
+      move on the segment, we will move it within the old LV first. Oh well. */
+
+	call logical_volume_manager$lvtep ((pvt_array (move_astep -> aste.pvtx).lvid), lvtep, code);
+	if code = 0 & ^demand_segmove
+	then if move_astep -> aste.pvtx = lvte.pvtex & pvt_array (move_astep -> aste.pvtx).brother_pvtx = 0
+	     then do;
+		     call lock$unlock_ast;
+		     a_code = error_table_$log_vol_full;
+		     return;
+		end;
+
+	/*** For synchronized segs, we must prevent any new held pages.
+	     to do this, we must prevent any other process from modifying
+	     a page of this segment. To do that, we cut its trailer with setfaults.
+	     Once the trailer is cut, the segment is inaccessable until we release
+	     the directory lock. */
+
+
+	if move_astep -> aste.synchronized
+	then do;
+		call setfaults (move_astep, "0"b);	/* revoke all sdws */
+		tsdw = get_ptrs_$given_astep (move_astep);
+						/* but regenerate ours */
+		call pmut$swap_sdw (baseptr (segno), addr (tsdw));
+						/* back to normal */
+		cleanup_must_zero_sdw = "1"b;		/* an SDW without a trailer is not permissible */
+	     end;
+	else cleanup_must_zero_sdw = "0"b;
+
+	/*** Now we thread the segment out. Strictly speaking, only ^ehs
+	     segments need this. However, we can race with other processes
+	     on the ehs bit. It is simpler to always thread out.
+
+	     The segment is threaded out to prevent deactivation. Deactivation,
+	     while unlikely, would break the strategy. */
+
+	call thread$out (move_astep, sst.ausedp (fixed (move_astep -> aste.ptsi, 2)));
+	call search_ast$hash_out (move_astep);		/* we have to rethread on new vtocx */
+
+/* Get modified/not modified status of old segment, and needed pages. */
+
+	old_ptsi = fixed (move_astep -> aste.ptsi, 9);
+	old_pts = sst.pts (old_ptsi);
+	old_vtocx = move_astep -> aste.vtocx;
+	old_pvtx = move_astep -> aste.pvtx;
+	old_pvid = pvt_array (old_pvtx).pvid;
+
+	call get_pvtx$hold_pvtx (old_pvid, old_pvtx, code);
+	if code ^= 0
+	then call syserr (CRASH, "segment_mover: get_pvtx(^o) fails under ast lock", old_pvtx);
+	held_pvtx = "0"b;				/* Didn't grab second pvtx yet */
+
+	mod_status = move_astep -> aste.fms;
+
+	n_nulled_pages = 0;
+	if ^move_astep -> aste.ddnp & ^(move_astep -> aste.fm_damaged & (sst.checksum_filemap ^= 0))
+	then do;
+		call pc$list_deposited_add (move_astep, 0, old_pts - 1, n_nulled_pages, dlp, addr (pageno_list));
+						/* He means those nulled's */
+		if n_nulled_pages > 0 & ^demand_segmove
+		then do;
+			call vtoc_man$await_vtoce (old_pvid, old_pvtx, old_vtocx, code);
+						/* Wait out before deposit */
+			if code ^= 0
+			then go to retake_fault;
+			call pc$deposit_list (fixed (move_astep -> aste.pvtx, 17), n_nulled_pages, dlp, old_vtocx,
+			     addr (pageno_list));	/* Free the addresses */
+			if n_nulled_pages > MAGIC_NPAGES & ^demand_segmove
+			then do;			/* Avoid this hack for sweep_pv */
+retake_fault:
+				call thread$cin (move_astep, sst.ausedp (fixed (move_astep -> aste.ptsi, 2)));
+				call search_ast$hash_in (move_astep);
+				call cleanup_dseg_and_meter;
+				if move_astep -> aste.uid = aste_uid
+				then move_astep -> aste.pack_ovfl = "0"b;
+				call release_pvtxs; /* wallow in his own soup */
+				call lock$unlock_ast;
+				a_code = code;	/* success or failure, depending ... */
+				return;
+			     end;
+		     end;
+	     end;
+
+	recs_needed = n_nulled_pages + fixed (move_astep -> aste.records, 9);
+						/* Assume he will regen those pages */
+	refpage = divide (ref_addr, sys_info$page_size, 18, 0);
+	size_needed = old_pts;			/* Cannot be oob, seg_fault would have caught it */
+	aste_uid = move_astep -> aste.uid;		/* copy before AST unlock */
+	aste_tqsw (*) = move_astep -> aste.tqsw (*);	/* ... */
+	old_nqsw = move_astep -> aste.nqsw;		/* Get old nqsw */
+
+
+	move_astep -> aste.nqsw = "1"b;		/* no quota checking whilst we play */
+
+	new_ptsi, new_pts = -1;
+
+
+	call lock$unlock_ast;			/* *** AST UNLOCKED *** */
+
+	if aste_tqsw (0) | aste_tqsw (1)
+	then do;					/* any terminal quota? */
+		unspec (atq_info) = "0"b;		/* initialize structure */
+		tq_infop = addr (atq_info);		/* and set ptr */
+		qcp = addr (aq_cell);		/* set ptr for vtoc_attributes */
+		do qtype = 0 to 1;			/* check for both seg and dir quota */
+		     if aste_tqsw (qtype)
+		     then do;			/* if terminal quota of this type.. */
+			     call vtoc_attributes$get_quota (aste_uid, old_pvid, old_vtocx, qcp, qtype, code);
+			     if code ^= 0
+			     then /* we lose, log the error */
+				call syserr$error_code (LOG, code,
+				     "segment_mover: Moving ^[segment^;directory^] quota account from pvtx ^o, vtocx ^o^/",
+				     qtype + 1, old_pvtx, old_vtocx);
+			     else do;
+				     tq_info.trp (qtype) = quota_cell.trp;
+						/* copy pertinent info */
+				     tq_info.tup (qtype) = quota_cell.tup;
+				     tq_info.received (qtype) = quota_cell.received;
+				end;
+			end;
+		end;
+	     end;
+	else tq_infop = null;			/* no terminal quota */
+
+	temp_ename = addr (ep -> entry.primary_name) -> names.name;
+	corout_pvtx = 0;				/* Prime corutine */
+	optimizing = demand_segmove;			/* If hphcs_ call, attempt optimization */
+	if demand_segmove
+	then skip_pvtx = 0;				/* allow use of same pv if cv pleases */
+	else skip_pvtx = old_pvtx;			/* if oopv then skip this pv */
+
+next_pv:						/* RESTART POINT */
+/**** ASSERT:  aste is thread$out'ed
+      aste is search_ast$hash_out'ed
+*/
+	same_pvtx, held_pvtx = "0"b;
+	call create_vtoce$createv_for_segmove (ep, pvid, new_vtocx, code, corout_pvtx, skip_pvtx, recs_needed, tq_infop,
+	     optimizing);
+
+/**** + Debug
+      call syserr$error_code (ANNOUNCE, code, "sgm: pvid: ^w new_vtocx ^o corout_pvtx ^d skip_pvtx ^d recs_needed ^d ^[optimizing^].",
+      pvid, new_vtocx, corout_pvtx, skip_pvtx, recs_needed, optimizing);
+*/
+
+	if code ^= 0
+	then go to move_fails;
+	new_pvtx = corout_pvtx;			/* This is selected place */
+	if optimizing
+	then do;					/* in case this PV fails, punt further optimization */
+		optimizing = "0"b;			/* no more of this stuff */
+		corout_pvtx = 0;			/* start from the beginning again */
+	     end;
+	new_pvid = pvid;				/* alignment */
+	if new_pvtx = old_pvtx
+	then same_pvtx = "1"b;
+	else do;
+		call get_pvtx$hold_pvtx (new_pvid, new_pvtx, code);
+		if code = 0
+		then held_pvtx = "1"b;
+		else go to next_pv;
+	     end;
+
+
+	call MOVE_THE_SEGMENT;
+
+	sstp -> sst.good_sgms = sstp -> sst.good_sgms + 1;
+	if ^demand_segmove
+	then /* Only for seg_fault calls */
+	     call syserr (LOG, "segment_mover: Moved ^w(^a) from ^a to ^a for ^a", move_astep -> aste.uid, temp_ename,
+		diskname (old_pvtx), diskname (new_pvtx), pds$process_group_id);
+	move_astep = null ();
+	call release_pvtxs;
+	call cleanup_dseg_and_meter;
+	a_code = 0;				/* That was easy, wasn't it !? */
+	return;
+
+move_fails:					/* Code is set appropriately */
+	sstp -> sst.bad_sgms = sstp -> sst.bad_sgms + 1;	/* meter */
+	if ^demand_segmove
+	then call syserr$error_code (LOG, code, "segment_mover: Failed to seg move ^w(^a) from ^a for ^a",
+		move_astep -> aste.uid, temp_ename, diskname (old_pvtx), pds$process_group_id);
+	call lock$lock_ast;				/* AST LOCKED */
+	call thread$cin (move_astep, sst.ausedp (fixed (move_astep -> aste.ptsi, 2)));
+						/* put ASTE back the way we found it. */
+	move_astep -> aste.pack_ovfl = "0"b;
+	move_astep -> aste.nqsw = old_nqsw;
+	call search_ast$hash_in (move_astep);
+	call release_pvtxs;
+	call lock$unlock_ast;			/* AST UNLOCKED */
+	call cleanup_dseg_and_meter;
+	a_code = code;
+%page;
+
+
+MOVE_THE_SEGMENT:
+     procedure;
+	dcl     astes		 (2) pointer;
+	dcl     px		 fixed bin;
+
+	code = 0;
+	call lock$lock_ast;				/* *** AST LOCKED *** */
+
+	do px = 1, 2;				/* old and new */
+	     astep, astes (px) = get_aste (size_needed);
+	     if astes (px) = null ()
+	     then do;
+		     code = error_table_$log_vol_full;	/* lie */
+		     go to retake_fault;
+		end;
+
+	     call thread$out (astep, sst.ausedp (fixed (astep -> aste.ptsi, 2)));
+						/* Thread out on 1 BEFORE getting 2. */
+	end;
+	astep = null ();
+
+	call lock$unlock_ast;			/* seg is now protected from deactivation */
+
+	astes (1) -> aste.nqsw, astes (1) -> aste.gtms, astes (1) -> aste.gtus = "1"b;
+	astes (2) -> aste.nqsw, astes (2) -> aste.gtms, astes (2) -> aste.gtus = "1"b;
+	astes (2) -> aste.pvtx = new_pvtx;		/* for pc_check_tables_ */
+
+/**** depolist, n_nulled_pages, pageno_list describe the addresses from
+      the old vtoce. */
+
+	n_nulled_pages = 0;
+	depolist = ""b;
+	pageno_list = 0;
+	code = 0;
+
+	call pc$segmove (move_astep, astes (1), astes (2), new_pvtx, new_vtocx, n_nulled_pages, dlp, addr (pageno_list),
+	     code);
+
+/**** + Debug
+      call syserr$error_code (ANNOUNCE, code, "sgm: new_pvtx ^d new_vtocx ^o n_to_deposit ^d.", new_pvtx, new_vtocx, n_nulled_pages);
+*/
+
+	call lock$lock_ast;				/* pc returns unlocked. */
+	if code ^= 0
+	then do;
+		call put_aste (astes (1));
+		astes (1) = null;
+		call put_aste (astes (2));
+		astes (2) = null ();
+		call lock$unlock_ast;
+		if code = error_table_$log_vol_full	/* try another pv */
+		then do;
+			call release_pvtxs;		/* free ptvx/pvid binding */
+			go to next_pv;
+		     end;
+		else go to move_fails;		/* fatal error */
+	     end;
+
+	call thread$cin (move_astep, sst.ausedp (fixed (move_astep -> aste.ptsi, 2)));
+						/* Okay, it goes back into replacement. Since move_fails and next_pv both expect it out, we delay this call to here. */
+
+	move_astep -> aste.pack_ovfl = "0"b;		/* as good as it will ever be */
+	move_astep -> aste.nqsw = old_nqsw;
+	call search_ast$hash_in (move_astep);
+
+	do astep = astes (1), astes (2);
+	     call put_aste (astep);
+	end;
+
+	astep, astes (1), astes (2) = null;
+
+	call lock$unlock_ast;			/* *** AST UNLOCKED *** */
+	ep -> entry.pvid = pvid;			/* Make directory point right */
+	ep -> entry.vtocx = new_vtocx;		/* Both these must complete */
+	if ep -> entry.dirsw
+	then do;
+		dp = baseptr (segno);
+		dp -> dir.vtocx = new_vtocx;
+		dp -> dir.pvid = pvid;
+		call sum$dirmod (dp);
+	     end;
+	else call sum$dirmod (setwordno (ep, 0));	/* Since this walks up, the above call includes this call */
+	call release_old_vtoce;
+
+     end MOVE_THE_SEGMENT;
+%page;
+
+cleanup_dseg_and_meter:
+     procedure;
+
+	if cleanup_must_zero_sdw
+	then do;
+		tsdw = 0;
+		call pmut$swap_sdw (baseptr (segno), addr (tsdw));
+						/* remove our SDW for this */
+	     end;
+	call usage_values (pw2, time2);		/* meter */
+	sstp -> sst.sgm_time = sstp -> sst.sgm_time + time2 - time1;
+	sstp -> sst.sgm_pf = sstp -> sst.sgm_pf + pw2 - pw1;
+
+     end cleanup_dseg_and_meter;
+
+
+diskname:
+     proc (pvtx1) returns (char (9));
+	dcl     pic99		 pic "99";
+	dcl     pvtx1		 fixed bin;
+
+	pvtep = addr (pvt_array (pvtx1));
+	pic99 = pvte.logical_area_number;
+	if ^pvte.is_sv
+	then return (pvte.devname || "_" || pic99);
+	else return (pvte.devname || "_" || pic99 || pvte.sv_name);
+
+     end diskname;
+
+
+release_old_vtoce:
+     procedure;
+	call dbm_man$set_incr (old_pvtx, old_vtocx, ignore);
+	call vtoc_man$free_vtoce (old_pvid, old_pvtx, old_vtocx, code);
+	if code = 0
+	then call truncator (old_pvid, old_pvtx, old_vtocx);
+	else do;
+		call syserr$error_code (0, code, "segment_mover: freeing vtocx ^o on old pvtx ^o", old_vtocx,
+		     old_pvtx);
+		pvt_array (old_pvtx).vol_trouble_count = pvt_array (old_pvtx).vol_trouble_count + 1;
+	     end;
+
+     end release_old_vtoce;
+
+
+release_pvtxs:
+     proc;
+	call get_pvtx$release_pvtx (old_pvid, old_pvtx);
+	if held_pvtx
+	then call get_pvtx$release_pvtx (new_pvid, new_pvtx);
+
+     end release_pvtxs;
+
+
+/**** Procedure to release the records from the old vtoce. */
+
+truncator:
+     procedure (a_pvid, a_pvtx, a_vtocx);
+
+	dcl     (a_pvtx, a_vtocx)	 fixed bin;
+	dcl     a_pvid		 bit (36) aligned;
+
+	call vtoc_man$await_vtoce (a_pvid, a_pvtx, a_vtocx, code);
+						/* make sure the free "took". */
+	if code = 0
+	then call pc$deposit_list (a_pvtx, n_nulled_pages, dlp, a_vtocx, addr (pageno_list));
+	else do;
+		call syserr$error_code (0, code, "segment_mover: finishing truncation of pvtx ^o vtocx ^o.", a_pvtx,
+		     a_vtocx);
+		pvt_array (a_pvtx).vol_trouble_count = pvt_array (a_pvtx).vol_trouble_count + 1;
+	     end;
+
+     end truncator;
+
+
+
+/* format: off */
+%page; %include aste;
+%page; %include add_type;
+%page; %include dir_entry;
+%include dir_header;
+
+%include dir_name;
+%page; %include pvte;
+%page; %include lvt;
+%page; %include sst;
+%page; %include tq_info;
+%page; %include quota_cell;
+%page; %include syserr_constants;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   segment_mover: critical segment out of disk on DRIVENAME, segno/astep = sss/aaa
+
+   S: $info
+
+   T: $run
+
+   M: There are no more free pages on the physical volume where a critical
+   segment resides, and an extra page can not be found for that segment.
+   Such a critical segment may be a physical buffer segment for a
+   peripheral device attached via IOI.
+   The user process receives a seg_fault_error signal.
+
+   A: The logical volume containing the pack residing on DRIVENAME
+   may be too full, or may need rebalancing with the sweep_pv tool.
+   $notify_sa
+
+   Message:
+   segment_mover: get_pvtx (PPP) fails under ast lock
+
+   S: $crash
+
+   T: $run
+
+   M: The segment mover found that a physical volume appears to have been
+   demounted during the time that the segment mover has had the active segment
+   table locked. $err
+
+   A: $recover
+
+   Message:
+   segment_mover: unexpected segfault
+
+   S: $crash
+
+   T: $run
+
+   M: A segment fault occured during the cross-pack moving of a segment, but
+   this segment fault was not on the segment on which the segment mover was
+   expecting one. $err
+
+   A: $recover
+   There may be inconsistencies in the physical volumes involved. These can
+   be corrected by a physical volume salvage.
+
+   Message:
+   segment_mover: freeing vtocx VVV on new pvtx PPP. ERRORMESSAGE
+
+   S: $info
+
+   T: $run
+
+   M: The segment mover encountered an unexpected error in freeing
+   the VTOC entry of a segment being moved on a volume to which an abortive
+   attempt to move the segment was made.
+   This may be a physical device error.
+
+   A: $inform
+
+   Message:
+   segment_mover: threading error
+
+   S: $crash
+
+   T: $run
+
+   M: The segment mover encountered bad threads while rethreading the old or new AST entries
+   of  a segment involved in a cross-pack segment move.
+   $err
+
+   A: $recover
+
+   Message:
+   segment_mover: freeing vtocx VVV on old pvtx PPP ERRORMESSAGE
+
+   S: $info
+
+   T: $run
+
+   M: During a cross-pack segment move, the system encountered an unexpected
+   error in freeing the VTOC entry of the segment on the old pack
+   This may be a physical device error, or
+   may be indicative of a logic problem in the supervisor, or main memory or
+   CPU problems.
+
+   A: $inform
+
+   Message:
+   segment_mover: Moved UUUU(ENTRYNAME) from DRIVENAME1 to DRIVENAME2 for USERNAME
+
+   S: $log
+
+   T: $run
+
+   M: The system has successfully moved a segment from the pack
+   on DRIVENAME1 to the pack on DRIVENAME2, on a request for a new page on
+   behalf of the user whose process group ID is USERNAME. UUUU is the
+   unique ID of the segment, and ENTRYNAME its primary name.
+
+   A: If a large number of these messages occur, the logical volume containing
+   the packs specified by the drive names may be nearly full or
+   poorly balanced. If these messages persist, contact the system
+   administrator.
+
+   Message:
+   segment_mover: Failed to seg move UUU(ENTRYNAME) from DRIVENAME1 to DRIVENAME2 for USERNAME
+
+   S: $log
+
+   T: $run
+
+   M: The system could not perform a cross-pack segment move because no pack
+   in the logical volume had enough space to hold the segment. UUUU is the
+   unique ID of the segment, and ENTRYNAME its primary name.
+
+   A: If this message persists, the logical volume containing the packs
+   on the drives noted is near full. In this case, contact the system
+   administrator.
+
+   Message:
+   segment_mover: finishing truncation of pvtx PPP vtocx VVV
+
+   S: $info
+
+   T: $run
+
+   M: The segment mover encountered an unexpected error in truncating
+   either the old copy of a segment being moved cross-packs or in
+   a new copy which was aborted for lack of space. This may be a physical
+   device error, or may be indicative of a logic problem in the
+   supervisor, or may be symptomatic of main memory or CPU problems.
+
+   A: $inform
+
+   Message:
+   segment_mover: Moving QUOTA-TYPE quota account from pvtx PPP, vtocx VVV
+   ERRORMESSAGE
+
+   S: $log
+
+   T: $run
+
+   M: An error code was returned from the entry vtoc_attributes$get_quota when attempting to
+   get terminal quota information from the old vtoce before new vtoce is created. In this case
+   the terminal quota attributes for this QUOTA-TYPE  (either segment or directory) quota account
+   is lost.
+
+   A: If this occurs, the quota account for the segment that has been moved must be corrected
+   manually by the System Administrator or other qualified site personell.
+
+
+   END MESSAGE DOCUMENTATION */
+
+
+     end segment_mover;

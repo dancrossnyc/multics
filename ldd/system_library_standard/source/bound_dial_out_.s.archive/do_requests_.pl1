@@ -1,0 +1,425 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1991   *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+do_requests_:
+     procedure;
+
+/* Written April 1982 by C. Hornig */
+/* Modified 11 September 1982 by Richard Lamson to fix line_status problem in send and other requests. */
+/* Modified January 1983 by C. Hornig to reorganize functions */
+/* Modified March 1983 by K. Loepere so that send_file won't overflow FNP
+   input buffer with remote echo and so wait request can wait for a string
+   and so wait works in dial_out ecs */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(91-08-15,Schroth), approve(91-09-09,MCR8247),
+     audit(92-04-24,WAAnderson), install(92-04-24,MR12.5-1012):
+     Added -inhibit_error/-no_inhibit_error to wait request to inhibit active
+     function failure on timeouts.  If -inhibit_error is used with -timeout,
+     whatever was received prior the the timer runout will be returned as the
+     value of the active request.
+                                                   END HISTORY COMMENTS */
+
+
+
+dcl  (Sci_ptr, Do_ptr) ptr parameter;
+
+dcl  NL char (1) static options (constant) init ("
+");
+dcl  SP char (1) static options (constant) init (" ");
+
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  error_table_$bad_conversion fixed bin (35) ext static;
+dcl  error_table_$end_of_info fixed bin (35) ext static;
+dcl  error_table_$inconsistent fixed bin (35) ext static;
+dcl  error_table_$line_status_pending fixed bin (35) ext static;
+dcl  error_table_$long_record fixed bin (35) ext static;
+dcl  error_table_$noarg fixed bin (35) ext static;
+dcl  error_table_$short_record fixed bin (35) ext static;
+dcl  error_table_$wrong_no_of_args fixed bin (35) ext static;
+
+dcl  cu_$set_cl_intermediary entry (entry);
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  dial_out_modes_$set entry (ptr, char (*), fixed bin (35));
+dcl  dial_out_util_$interaction_loop entry (ptr, bit (1) aligned, bit (1) aligned);
+dcl  dial_out_util_$process_line_status entry (ptr);
+dcl  dial_out_util_$process_net_input entry (ptr, bit (1) aligned);
+dcl  dial_out_util_$reset_do_modes entry (ptr);
+dcl  dial_out_util_$send_chars entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl  dial_out_util_$send_nl entry (ptr, fixed bin (35));
+dcl  dial_out_util_$set_do_modes entry (ptr);
+dcl  ioa_ entry () options (variable);
+dcl  ioa_$rsnnl entry () options (variable);
+dcl  requote_string_ entry (char (*)) returns (char (*));
+dcl  ssu_$abort_line entry options (variable);
+dcl  ssu_$arg_count entry (ptr, fixed bin);
+dcl  ssu_$arg_ptr entry (ptr, fixed bin, ptr, fixed bin (21));
+dcl  ssu_$return_arg entry (ptr, fixed bin, bit (1) aligned, ptr, fixed bin (21));
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+
+dcl  abort_on_timeout bit (1) aligned;			/* timeout causes wait to abort */
+dcl  af_sw bit (1) aligned;				/* request called as active request */
+dcl  arg_num fixed bin;
+dcl  buff char (512);				/* reading from send file */
+dcl  code fixed bin (35);
+dcl  i fixed bin;
+dcl  iocbp ptr;
+dcl  nargs fixed bin;
+dcl  new_line bit (1) aligned;			/* on end of wait str */
+dcl  nin fixed bin (21);				/* chars read from send file */
+dcl  long_rec bit (1) aligned;			/* didn't read whole line from file */
+dcl  path_found bit (1) aligned;			/* found path arg in send_file request */
+dcl  silent bit (1) aligned;				/* discard foreign chars during transfer */
+
+dcl  arg char (al) based (ap);			/* standard argument stuff */
+dcl  al fixed bin (21);
+dcl  ap ptr;
+dcl  path char (path_len) based (path_ptr);		/* pathname for send_file request */
+dcl  path_len fixed bin (21);
+dcl  path_ptr ptr;
+dcl  str_to_match_area char (do_info.match_max_length) based (do_info.match_string_p);
+dcl  val varying char (val_len) based (val_ptr);		/* active request value */
+dcl  val_len fixed bin (21);
+dcl  val_ptr ptr;
+
+dcl  cleanup condition;
+
+dcl  (addr, codeptr, index, length, null, substr) builtin;
+%page;
+/* * * * * * * * * * QUIT * * * * * * * * * */
+
+quit_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+	do_info.abort_code = 0;
+	goto do_info.abort_label;
+
+/* * * * * * * * * * INTERRUPT * * * * * * * * * */
+
+interrupt_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+try_interrupt_request_again:
+	call iox_$control (do_info.ci.net_iocb, "interrupt", null (), code);
+	if code = error_table_$line_status_pending then do;
+	     call dial_out_util_$process_line_status (dop);
+	     go to try_interrupt_request_again;
+	     end;
+	if code ^= 0 then call ssu_$abort_line (Sci_ptr, code);
+	return;
+
+/* * * * * * * * * * MODES * * * * * * * * * */
+
+modes_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$return_arg (Sci_ptr, nargs, af_sw, val_ptr, val_len);
+
+	if af_sw then do;
+	     call ioa_$rsnnl ("^[^^^]raw,^[^^^]echo,^[^^^]send_lf,^[^^^]echo_lf,^[^^^]quit,^[^^^]line", val, (0),
+		^do_info.flags.raw_sw, ^do_info.flags.echo_sw, ^do_info.flags.send_lf_sw, ^do_info.flags.lfecho_sw,
+		^do_info.flags.quit_sw, ^do_info.flags.no_breakall_sw);
+	     end;
+
+	if nargs < 1 then do;
+	     if ^af_sw
+	     then call ioa_ ("^[^^^]raw,^[^^^]echo,^[^^^]send_lf,^[^^^]echo_lf,^[^^^]quit,^[^^^]line",
+		     ^do_info.flags.raw_sw, ^do_info.flags.echo_sw, ^do_info.flags.send_lf_sw,
+		     ^do_info.flags.lfecho_sw, ^do_info.flags.quit_sw, ^do_info.flags.no_breakall_sw);
+	     return;
+	     end;
+
+	if nargs > 1 then call ssu_$abort_line (Sci_ptr, error_table_$wrong_no_of_args);
+
+	call ssu_$arg_ptr (Sci_ptr, 1, ap, al);
+
+	call dial_out_modes_$set (dop, arg, code);
+	if code ^= 0 then call ssu_$abort_line (Sci_ptr, code);
+
+	return;
+
+/* * * * * * * * * * ESCAPE * * * * * * * * * */
+
+escape_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$return_arg (Sci_ptr, nargs, af_sw, val_ptr, val_len);
+
+	if af_sw then do;
+	     val = requote_string_ ((do_info.esc_char));
+	     end;
+
+	if nargs < 1 & ^af_sw then do;
+	     call ioa_ ("^1a", do_info.esc_char);
+	     return;
+	     end;
+
+	if nargs > 1 then call ssu_$abort_line (Sci_ptr, error_table_$wrong_no_of_args);
+
+	call ssu_$arg_ptr (Sci_ptr, 1, ap, al);
+
+	if length (arg) = 1
+	then do_info.esc_char = arg;
+	else call ssu_$abort_line (Sci_ptr, error_table_$bad_arg, "^a", arg);
+	return;
+
+/* * * * * * * * * * SEND * * * * * * * * * */
+
+send_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$arg_count (Sci_ptr, nargs);
+	if nargs < 1 then return;
+	call ssu_$arg_ptr (Sci_ptr, 1, ap, al);
+	call dial_out_util_$send_chars (dop, ap, al, code);
+	if code ^= 0
+	then
+bad_write:
+	     call ssu_$abort_line (Sci_ptr, code, "Writing.");
+	do i = 2 to nargs;
+	     call dial_out_util_$send_chars (dop, addr (SP), 1, code);
+	     if code ^= 0 then goto bad_write;
+	     call ssu_$arg_ptr (Sci_ptr, i, ap, al);
+	     call dial_out_util_$send_chars (dop, ap, al, code);
+	     if code ^= 0 then goto bad_write;
+	end;
+	return;
+
+/* * * * * * * * * * SEND_FILE_REQUEST * * * * * * * * * */
+
+send_file_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+	silent = "1"b;
+
+	call ssu_$arg_count (Sci_ptr, nargs);
+	if nargs < 1 | nargs > 2 then call ssu_$abort_line (Sci_ptr, 0, "Usage: send_file path {-display_input}");
+	path_found = "0"b;
+	do i = 1 to nargs;
+	     call ssu_$arg_ptr (Sci_ptr, i, ap, al);
+	     if arg = "-display_input" | arg = "-dsin" then silent = "0"b;
+	     else if arg = "-no_display_input" | arg = "-ndsin" then silent = "1"b;
+	     else if index (arg, "-") = 1 then call ssu_$abort_line (Sci_ptr, error_table_$bad_arg, "^a", arg);
+	     else do;
+		if path_found then call ssu_$abort_line (Sci_ptr, 0, "More than one path specified. ^a", arg);
+		path_found = "1"b;
+		path_ptr = ap;
+		path_len = al;
+		end;
+	end;
+
+	iocbp = null ();
+	on cleanup
+	     begin;
+	     call reset_do_state;
+	     call clean_iocb (iocbp);
+	end;
+
+	call iox_$attach_name ("do.send_file." || unique_chars_ (""b), iocbp, "vfile_ " || path,
+	     codeptr (send_file_request), code);
+	if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Attaching vfile_ ^a", path);
+	call iox_$open (iocbp, Stream_input, "0"b, code);
+	if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Opening vfile_ ^a", path);
+
+	call set_do_state;				/* coming here reset do state, we need it
+						   back so process_net_input works */
+
+	do while ("1"b);
+	     call iox_$control (do_info.ci.net_iocb, "read_status", addr (do_info.net_rs), code);
+						/* get incoming (echo?) */
+	     if code ^= 0 then do_info.net_rs.data_available = "1"b;
+	     if do_info.net_rs.data_available then call dial_out_util_$process_net_input (dop, silent);
+
+	     long_rec = "0"b;
+	     call iox_$get_line (iocbp, addr (buff), length (buff), nin, code);
+	     if (code = error_table_$long_record) | (code = error_table_$short_record) then long_rec = "1"b;
+	     else if (nin = 0) & (code = error_table_$end_of_info) then goto done_send_file;
+	     else if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Reading from ^a", path);
+	     else nin = nin - 1;			/* trim NL */
+
+	     call dial_out_util_$send_chars (dop, addr (buff), nin, code);
+	     if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Writing.", path);
+	     if ^long_rec then do;
+		call dial_out_util_$send_nl (dop, code);
+		if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Writing NL.", path);
+		end;
+	end;
+
+done_send_file:
+	call reset_do_state;
+	call clean_iocb (iocbp);
+	return;
+
+/* * * * * * * * * * SWITCH_NAME_REQUEST * * * * * * * * */
+
+switch_name_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$return_arg (Sci_ptr, nargs, af_sw, val_ptr, val_len);
+	if nargs ^= 0 then call ssu_$abort_line (Sci_ptr, 0, "Usage: switch_name");
+
+	if af_sw
+	then val = do_info.ci.net_iocb -> iocb.name;
+	else call ioa_ ("^a", do_info.ci.net_iocb -> iocb.name);
+	return;
+
+/* * * * * * * * * * * FILE_OUTPUT_REQUEST * * * * * * * * * * */
+
+file_output_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$arg_count (Sci_ptr, nargs);
+	if nargs ^= 1 then call ssu_$abort_line (Sci_ptr, 0, "Usage: file_output path");
+	if do_info.fo_iocbp ^= null () then call ssu_$abort_line (Sci_ptr, 0, "file_output already in progress.");
+	call ssu_$arg_ptr (Sci_ptr, 1, ap, al);
+
+	on cleanup call clean_iocb (do_info.fo_iocbp);
+
+	call iox_$attach_name ("do.file_output." || unique_chars_ (""b), do_info.fo_iocbp,
+	     "vfile_ " || arg || " -extend", codeptr (file_output_request), code);
+	if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Attaching vfile_ ^a.", arg);
+	call iox_$open (do_info.fo_iocbp, Stream_output, "1"b, code);
+	if code ^= 0 then call ssu_$abort_line (Sci_ptr, code, "Opening vfile_ ^a.", arg);
+	return;
+
+/* * * * * * * * * * REVERT_OUTPUT_REQUEST * * * * * * * * * * */
+
+revert_output_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$arg_count (Sci_ptr, nargs);
+	if nargs ^= 0 then call ssu_$abort_line (Sci_ptr, 0, "Usage: revert_output");
+	if do_info.fo_iocbp = null () then call ssu_$abort_line (Sci_ptr, 0, "No file_output in progress.");
+	call clean_iocb (do_info.fo_iocbp);
+	return;
+
+/* * * * * * * * * * WAIT * * * * * * * * * * */
+
+wait_request:
+     entry (Sci_ptr, Do_ptr);
+
+	dop = Do_ptr;
+
+	call ssu_$return_arg (Sci_ptr, nargs, af_sw, val_ptr, val_len);
+
+	do_info.time_out = 0;
+	abort_on_timeout = "1"b;
+	new_line = "0"b;
+	do_info.match_length = 0;
+	do arg_num = 1 to nargs;
+	     call ssu_$arg_ptr (Sci_ptr, arg_num, ap, al);
+	     if arg = "-timeout" | arg = "-tm" then do;
+		if arg_num = nargs
+		then call ssu_$abort_line (Sci_ptr, error_table_$noarg, "Timeout value.");
+		else do;
+		     arg_num = arg_num + 1;
+		     call ssu_$arg_ptr (Sci_ptr, arg_num, ap, al);
+		     do_info.time_out = cv_dec_check_ (arg, code);
+		     if code ^= 0 | do_info.time_out < 1
+		     then call ssu_$abort_line (Sci_ptr, error_table_$bad_conversion, "^a", arg);
+		     end;
+		end;
+	     else if arg = "-no_timeout" | arg = "-ntm" then do_info.time_out = 0;
+	     else if arg = "-nl" then new_line = "1"b;
+	     else if arg = "-nnl" then new_line = "0"b;
+	     else if arg = "-no_inhibit_error" | arg = "-nihe" then abort_on_timeout = "1"b;
+	     else if arg = "-inhibit_error" | arg = "-ihe" then abort_on_timeout = "0"b;
+	     else if substr (arg, 1, 1) = "-" then call ssu_$abort_line (Sci_ptr, error_table_$bad_arg, "^a", arg);
+	     else do;
+		if length (arg) > do_info.match_max_length - 1
+						/* room for NL */
+		then call ssu_$abort_line (Sci_ptr, 0, "Wait string too long; max is ^d.",
+			do_info.match_max_length - 1);/* arg too long to print with error */
+		else do;
+		     substr (str_to_match_area, 1, length (arg)) = arg;
+		     do_info.match_length = length (arg);
+		     end;
+		end;
+	end;
+	if ^abort_on_timeout & do_info.time_out = 0
+	then call ssu_$abort_line (Sci_ptr, error_table_$inconsistent,
+		"The use of -inhibit_error requires that -timeout be used as well.");
+	if new_line then do;
+	     do_info.match_length = do_info.match_length + 1;
+	     substr (str_to_match_area, do_info.match_length, 1) = NL;
+	     end;
+
+	if af_sw then do;
+	     do_info.active_result_ptr = val_ptr;
+	     do_info.active_result_max_len = val_len;
+	     val = "";
+	     end;
+
+	on cleanup call reset_do_state;
+	call set_do_state;				/* get back do state so that interaction loop works
+						   (it was reset on its way into here */
+
+	call dial_out_util_$interaction_loop (dop, "1"b, af_sw);
+						/* do normal net stuff 'til condition met */
+	if do_info.abort_code ^= 0
+	then if ^af_sw | abort_on_timeout then call ssu_$abort_line (Sci_ptr, do_info.abort_code);
+
+	call reset_do_state;
+	return;
+%page;
+/* * * * * * * * * * CLEAN_IOCB * * * * * * * * * * * */
+
+clean_iocb:
+     procedure (Iocbp);
+dcl  code fixed bin (35);
+dcl  Iocbp ptr parameter;
+
+	if Iocbp ^= null () then do;
+	     call iox_$close (Iocbp, code);
+	     call iox_$detach_iocb (Iocbp, code);
+	     call iox_$destroy_iocb (Iocbp, code);
+	     Iocbp = null ();
+	     end;
+	return;
+     end clean_iocb;
+
+reset_do_state:
+     proc;
+
+	call dial_out_util_$reset_do_modes (dop);
+	call cu_$set_cl_intermediary (do_info.saved_cl_intermediary);
+	return;
+     end;
+
+set_do_state:
+     proc;
+
+	call dial_out_util_$set_do_modes (dop);
+	call cu_$set_cl_intermediary (do_info.my_cl_intermediary);
+	return;
+     end;
+%page;
+%include dial_out_invocation;
+%include iocb;
+%include iox_dcls;
+%include iox_modes;
+
+     end do_requests_;

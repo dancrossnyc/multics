@@ -1,0 +1,280 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+iodd_quit_handler_: proc;
+
+/* This is the standard quit handler for the I/O daemon driver process */
+/* Its primary function is to see who sent the quit by looking for input. */
+/* We assume that the first to give a response is the one who QUIT, and will */
+/* accept the next input line as a command to be passed to the I/O daemon */
+/* command processor.  If all is well, we will return to where the */
+/* Quit took place.  However, the command processor may signal a condition */
+/* and never return.   */
+
+/* Originally coded in Sept 1973 by Robert S. Coren */
+/* Rewritten in Feb 1975 by J. C. Whitmore for the access isolation */
+/*      mechanism and general restructuring of the driver process. */
+/* Modified Dec 1975 by J. C. Whitmore to pass quit/signal state to command processor and */
+/*    to avoid writing on the slave stream if detached. */
+/* Modified Aug 1977 by J. C. Whitmore to use the iodd_get_cmd_ subroutine for reading cmd lines */
+/* Modified Nov 1977 by J. C. Whitmore to use iodd_msg_ for operator messages */
+/* Modified Mar 1978 by J. C. Whitmore to use parameter to set auto start delay time */
+/* Modified Mar 1979 by J. C. Whitmore to give proc name in last error call */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-19,Wallman), install(88-10-28,MR12.2-1199):
+     Upgraded to version 5 iod tables.
+                                                   END HISTORY COMMENTS */
+
+
+/*	ENTRIES		*/
+
+	dcl     continue_to_signal_	 entry (fixed bin (35));
+	dcl     ioa_$rsnnl		 entry options (variable);
+	dcl     iodd_command_processor_ entry (fixed bin, fixed bin, char (*), fixed bin (35));
+	dcl     iodd_msg_		 entry options (variable);
+	dcl     iodd_get_cmd_	 entry (ptr, fixed bin, fixed bin, bit (36), char (*), fixed bin, fixed bin (35));
+	dcl     iox_$control	 entry (ptr, char (*), ptr, fixed bin (35));
+	dcl     timer_manager_$alarm_call entry (fixed bin (71), bit (2), entry);
+	dcl     timer_manager_$reset_alarm_call entry (entry);
+
+
+
+/*	AUTOMATIC		*/
+
+	dcl     code		 fixed bin (35);
+	dcl     terminal		 (2) ptr;
+	dcl     line		 char (132);	/* input from terminal */
+	dcl     message		 char (64);	/* what to say after a quit */
+	dcl     junk		 fixed bin;	/* length from ioa_$rsnnl */
+	dcl     nchars		 fixed bin;	/* number of chars read */
+	dcl     state		 fixed bin;	/* quit = 2, signal handler = 3  */
+
+	dcl     control		 bit (36);	/* control flags for the get cmd subr */
+
+	dcl     1 ctl		 based (addr (control)),
+		2 wait_for_input	 bit (1),
+		2 prompt_master	 bit (1),
+		2 prompt_slave	 bit (1),
+		2 pad		 bit (33);
+
+	dcl     iodd_stat_p		 ptr ext static;	/* where stat_p is stored */
+
+	dcl     none		 fixed bin int static options (constant) init (0);
+	dcl     master		 fixed bin int static options (constant) init (1); /* constant  indicating input from master device */
+	dcl     slave		 fixed bin int static options (constant) init (2); /* constant indicating input from slave */
+	dcl     both		 fixed bin int static options (constant) init (0); /* constant for output to both master & salve */
+	dcl     normal		 fixed bin int static options (constant) init (1);
+	dcl     error		 fixed bin int static options (constant) init (2);
+	dcl     id		 char (20) int static options (constant) init ("iodd_quit_handler_");
+	dcl     quit_cmd_level	 fixed bin int static options (constant) init (4);
+	dcl     signal_cmd_level	 fixed bin int static options (constant) init (5);
+	dcl     master_cmd		 bit (1);		/* true if master gave a cmd at this level */
+	dcl     slave_cmd		 bit (1);		/* true if the slave gave a cmd at this level */
+	dcl     last_cmd		 fixed bin;	/* who gave the last cmd line */
+	dcl     source		 fixed bin;	/* who gave the current command line */
+	dcl     slave_input_state	 bit (1);		/* last setting of the slave accept input switch */
+
+	dcl     1 form_data		 aligned,		/* data from ctl_dim_ for form alignment */
+		2 page_length	 fixed bin,	/* length of logical page */
+		2 line_length	 fixed bin,	/* number of chars before folding line */
+		2 line_no		 fixed bin,	/* current line on the page */
+		2 carriage_pos	 fixed bin,	/* position of next char on the line */
+		2 aligned		 bit (1) unal,	/* "1"b if we are simulating form feeds */
+		2 pad		 bit (35) unal;
+
+/*	CONDITIONS		*/
+
+	dcl     (cleanup, any_other, alrm) condition;
+
+
+/*	BUILTINS		*/
+
+	dcl     (addr, null, substr, rtrim) builtin;
+
+
+/*	BASED STRUCTURES AND INCLUDE FILES		*/
+
+
+%include iod_tables_hdr;
+%include iodd_static;
+%page;
+
+	stat_p = iodd_stat_p;			/* copy ptr to iodd_static */
+
+	control = "0"b;
+
+	ctl.prompt_master = "0"b;			/* get ready to ask for help */
+	ctl.prompt_slave = "1"b;
+	if iodd_static.request_in_progress then iodd_static.quit_during_request = "1"b;
+	if iodd_static.request_in_progress then
+	     if iodd_static.assigned_devices > 1 then
+		call ioa_$rsnnl ("* QUIT *  request in progress on device: ^a", message, junk,
+		     iodd_static.output_device);
+	     else call ioa_$rsnnl ("* QUIT *  request in progress", message, junk);
+	else message = "* QUIT *";
+
+	call iox_$control (iodd_static.master_in, "resetread", null, code); /* we want clean input */
+
+	if iodd_static.slave.active & iodd_static.slave.accept_input & iodd_static.allow_quits then do;
+		call iox_$control (iodd_static.slave_in, "resetread", null, code);
+		source = both;			/* send message to both master and slave */
+	     end;
+	else source = master;
+
+	call iodd_msg_ (normal, source, 0, "", message);
+
+	call timer_manager_$alarm_call (iodd_static.auto_start_delay, "11"b, auto_start);
+						/* set a timer to automatically restart */
+						/* if no command is given within 60 seconds */
+	on alrm call continue_to_signal_ (code);	/* let this go through */
+
+	on any_other begin;
+		last_cmd = master;			/* stop the auto start proc */
+		call timer_manager_$reset_alarm_call (auto_start); /* in case this frame goes away */
+		call continue_to_signal_ (code);
+	     end;
+	message = "quit";
+	state = quit_cmd_level;			/* tell the command processor it was a quit */
+	iodd_static.quit_signaled = "1"b;		/* set the flag for anyone who is watching */
+
+join:	slave_input_state = iodd_static.slave.accept_input; /* in case of a cleanup */
+	if ^iodd_static.slave.allow_quits then /* if no quits allowed, don't read the terminal */
+	     iodd_static.slave.accept_input = "0"b;
+
+	on cleanup begin;
+		call timer_manager_$reset_alarm_call (auto_start); /* now we know the frame is gone */
+		iodd_static.slave.accept_input = slave_input_state;
+		if iodd_static.slave.active & iodd_static.allow_quits then
+		     call iox_$control (iodd_static.slave_in, "quit_enable", null, (0));
+	     end;
+
+	master_cmd = "0"b;				/* no commands received yet */
+	slave_cmd = "0"b;
+	last_cmd = none;
+	terminal (master) = iodd_static.master_in;	/* copy the iocb ptrs for easy use */
+	terminal (slave) = iodd_static.slave_in;
+
+
+wait:	ctl.wait_for_input = "1"b;			/* say to wait for a command */
+
+read:	call iodd_get_cmd_ (addr (line), 128, nchars, control, rtrim (message), source, code);
+
+	if source = master then
+	     if iodd_static.slave.active then /* don't let the slave interrupt the master */
+		call iox_$control (iodd_static.slave_in, "quit_disable", null, (0));
+
+	if source = none then go to start;		/* last cmd was start, so let er roll */
+
+	if source = master then master_cmd = "1"b;	/* if master gave the cmd */
+	else slave_cmd = "1"b;			/* otherwise it was the slave */
+	last_cmd = source;				/* who gave the last cmd */
+	ctl.wait_for_input = "0"b;			/* gotsome input */
+
+	call iodd_command_processor_ (source, state, substr (line, 1, nchars), code);
+
+	if iodd_static.slave.allow_quits then do;	/* let slave get a chance */
+		iodd_static.slave.accept_input = (iodd_static.slave.accept_input | slave_input_state);
+		call iox_$control (iodd_static.slave_in, "quit_enable", null, (0));
+	     end;
+	else do;					/* not accepting input */
+		if iodd_static.slave.accept_input then slave_input_state = "1"b; /* in case set */
+		iodd_static.slave.accept_input = "0"b;	/* hold off for now */
+	     end;
+
+	if code = 2 then go to read;			/* let's roll...but first check for input */
+	if code = 0 | code = 1 then go to wait;		/* we want more input...no errors */
+	call iox_$control (terminal (source), "resetread", null, (0)); /* clear input after bad command */
+	go to wait;				/* and wait for correct input */
+
+start:
+	call timer_manager_$reset_alarm_call (auto_start);/* just in case.... */
+
+/*	We can continue from the point of interruption now, unless operator has forced a "hold" */
+
+	if iodd_static.forms then /* check alignment if simulating forms */
+	     if iodd_static.ctl_term.attached then do;	/* if the terminal is there */
+		     call iox_$control (iodd_static.slave_out, "form_status", addr (form_data), code);
+		     if code ^= 0 then do;		/* something was wrong */
+			     iodd_static.forms = "0"b;/* drop the forms */
+			     call iodd_msg_ (error, slave, code, id, "Control terminal form simulation terminated.");
+			     ctl.prompt_master = "1"b;/* force operator action */
+			     ctl.prompt_slave = "1"b; /* slave can answer */
+			     call iox_$control (iodd_static.master_in, "resetread", null, (0));
+			     call iox_$control (iodd_static.slave_in, "resetread", null, (0));
+			     go to wait;
+			end;
+		     if ^form_data.aligned then do;	/* dim says not aligned...so, */
+			     call iodd_msg_ (normal, slave, 0, "", "Control forms not aligned."); /* tell slave opr */
+			     iodd_static.slave_hold = "1"b;
+			     go to wait;
+			end;
+		end;
+	     else iodd_static.forms = "0"b;		/* not legal if no ctl term attached */
+
+	if last_cmd = slave then /* do we owe the master a courtesy message? */
+	     if master_cmd then
+		call iodd_msg_ (normal, master, 0, "", "^a driver continuing.", iodd_static.major_device);
+	     else ;
+
+	else if slave_cmd then /* do we owe the slave a courtesy message? */
+	     if iodd_static.slave.active then /* be sure it wasn't detached since last prompt */
+		call iodd_msg_ (normal, slave, 0, "", "^a driver continuing.", iodd_static.major_device);
+
+	iodd_static.slave.accept_input = slave_input_state;
+
+	call iox_$control (iodd_static.master_in, "start", null, (0)); /* be sure we don't lose a wakeup */
+
+	if iodd_static.slave.active then do;
+		call iox_$control (iodd_static.slave_in, "start", null, (0)); /* be sure we don't lose a wakeup */
+	     end;
+
+	return;					/* let'er roll */
+
+
+command_level: entry;
+
+/*  This entry is used by the signal handler in test mode to allow
+   most commands to be used after the process has been initialized. */
+
+          control = "0"b;
+	ctl.prompt_master = "1"b;			/* only tell the master of the problem */
+	ctl.prompt_slave = "0"b;
+	message = "iodd signal";			/* new cmd level name */
+	state = signal_cmd_level;			/* tell the command processor it was from an unclaimed signal */
+	iodd_static.master_hold = "1"b;		/* force a response from the master */
+	go to join;				/* now join the main procedure */
+
+init: entry (aptr);
+
+	dcl     aptr		 ptr;
+
+	stat_p = aptr;				/* init the pointer for iodd_static */
+	return;
+
+auto_start: proc;
+
+/* internal proc to automatically "start" after a quit if no commands are given in 60 seconds */
+
+	if iodd_static.re_init_in_progress then return;
+
+	if last_cmd = none then do;
+		call iodd_msg_ (normal, both, 0, "", "Automatic Start Given");
+		go to start;
+	     end;
+	else return;				/* wasn't that easy? */
+
+     end auto_start;
+
+     end iodd_quit_handler_;

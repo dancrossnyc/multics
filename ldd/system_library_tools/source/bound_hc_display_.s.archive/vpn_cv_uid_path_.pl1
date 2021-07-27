@@ -1,0 +1,374 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+vpn_cv_uid_path_:
+     procedure (P_uid_path_ptr, P_pathname, P_code);
+
+	entry_sw = "0"b;
+	goto COMMON;
+
+vpn_cv_uid_path_$ent:
+     entry (P_uid_path_ptr, P_pathname, P_entry_uid, P_code);
+
+	entry_sw = "1"b;
+	goto COMMON;
+
+
+/* vpn_cv_uid_path_   -- a labyrinth of heuristics and suspicion */
+/* converts uid pathname to some real one for vtoc_pathname */
+/* Bernard Greenberg   05/76 */
+/* Cleaned up 06/21/81, W. Olin Sibert */
+/* Modified 1984-08-15 BIM to correctly update parent dir name. */
+
+
+dcl  P_uid_path_ptr pointer parameter;
+dcl  P_pathname char (*) parameter;
+dcl  P_entry_uid bit (36) aligned parameter;
+dcl  P_code fixed bin (35) parameter;
+
+dcl  entry_sw bit (1) aligned;
+dcl  depth fixed bin;
+dcl  level fixed bin;
+dcl  start fixed bin;
+dcl  uid_path_ptr pointer;
+dcl  input_uid_path (0 : 15) bit (36) aligned based (uid_path_ptr);
+dcl  uid_path (0 : 16) bit (36) aligned;		/* One larger, to make room for entry UID */
+dcl  dirp (0 : 16) pointer unaligned;
+
+dcl  rzdp pointer;
+dcl  refetch_count fixed bin;
+dcl  lookup_failures fixed bin;
+dcl  dir_size fixed bin (18);
+dcl 1 local_dir aligned like dir automatic;
+dcl 1 local_area aligned like area automatic;
+dcl 1 local_entry aligned like entry automatic;
+
+dcl  pathname char (512) varying;
+dcl  parent_dname char (512);
+dcl  parent_ename char (32);
+dcl  code fixed bin (35);
+dcl  real_code fixed bin (35);
+dcl  stop bit (1) aligned;
+
+dcl  com_err_ entry options (variable);
+dcl  pathname_ entry (character (*), character (*)) returns(character (168));
+dcl  phcs_$initiate entry (char (*), char (*), char (*), fixed bin (2), fixed bin (1), pointer, fixed bin (35));
+dcl  phcs_$ring_0_peek entry (pointer, pointer, fixed bin (18));
+dcl  phcs_$terminate_noname entry (pointer, fixed bin (35));
+
+dcl  error_table_$action_not_performed fixed bin (35) external static;
+dcl  error_table_$bad_uidpath fixed bin (35) external static;
+dcl  error_table_$dirseg fixed bin (35) external static;
+dcl  error_table_$incorrect_access fixed bin (35) external static;
+dcl  error_table_$no_dir fixed bin (35) external static;
+dcl  error_table_$noentry fixed bin (35) external static;
+dcl  error_table_$notadir fixed bin (35) external static;
+dcl  error_table_$vtoce_connection_fail fixed bin (35) external static;
+
+dcl  WHOAMI char (32) internal static options (constant) init ("vpn_cv_uid_path_");
+
+dcl  seg_fault_error condition;
+
+dcl (addr, binary, hbound, lbound, null, pointer, rtrim, size, unspec) builtin;
+
+/*  */
+
+COMMON:	uid_path_ptr = P_uid_path_ptr;
+
+	if unspec (input_uid_path) = ""b then do;	/* The ROOT has a UID path of all zeros */
+	     if ^entry_sw then do;			/* Just return it */
+REALLY_IS_ROOT:	P_pathname = ">";
+		P_code = 0;
+		return;
+		end;
+
+	     if P_entry_uid = "777777777777"b3 then goto REALLY_IS_ROOT;
+	     end; 				/* Fall through if wrong */
+
+	if input_uid_path (0) ^= "777777777777"b3 then do; /* Must start with the ROOT */
+	     P_code = error_table_$bad_uidpath;
+	     P_pathname = "--INVALID-UID-PATH--";
+	     return;
+	     end;
+
+	do depth = hbound (input_uid_path, 1) to 0 by -1	/* Find out how deep the tree is */
+		while (input_uid_path (depth) = ""b);
+	     end;
+
+	unspec (uid_path) = ""b;
+	do level = 0 to depth;			/* copy from the input */
+	     uid_path (level) = input_uid_path (level);
+	     end;
+
+	if entry_sw then do;			/* And add entry UID if needed */
+	     depth = depth + 1;
+	     uid_path (depth) = P_entry_uid;
+	     end;
+
+	on condition (seg_fault_error) begin;
+	     pathname = pathname || "(-SEG-FAULT-ERROR-)>-????-";
+	     stop = "1"b;
+	     real_code = error_table_$vtoce_connection_fail;
+	     goto NEXT_LEVEL;
+	     end;
+
+	dp = addr (local_dir);			/* These are the local copies we work with */
+	ep = addr (local_entry);
+	areap = addr (local_area);
+	dirp (*) = null ();
+	lookup_failures = 0;
+	start = 1;				/* Start with first non-root directory */
+
+START_OVER:
+	pathname = "";
+	parent_dname = ">";
+	parent_ename = "";
+	real_code = 0;
+	stop = "0"b;
+
+	do level = start to depth;
+	     if stop then pathname = pathname || ">-????-"; /* Can't find out any more */
+
+	     else do;				/* Otherwise, try to look it up */
+		call phcs_$initiate (parent_dname, parent_ename, "", 0, 0, rzdp, code);
+		if rzdp = null () then call cant_get_parent ();
+
+		else do;
+		     dirp (level) = rzdp;
+		     refetch_count = 0;
+RESTART_THIS_DIRECTORY:  call lookup_in_parent ();
+		     end;
+		end;
+
+NEXT_LEVEL:
+	     end; 				/* of loop looking up UIDs */
+
+MAIN_RETURN:
+	call terminate_dirs ();
+
+	P_pathname = pathname;			/* Copy output parameters */
+	P_code = real_code;
+	return;
+
+/*  */
+
+cant_get_parent: proc ();
+
+/* This procedure is called when the parent directory cannot be initiated for lookup.
+   It sets flags, adjusts the pathname, and returns. This first check goes off when
+   the directory is renamed between when it was found last time (by lookup in its parent)
+   and when we went to look for it this time. If this happens, we just punt and start
+   the whole lookup over again.
+   */
+
+	if code = error_table_$no_dir | code = error_table_$noentry then do;
+	     if lookup_failures > 6 then do;
+		call com_err_ (0, WHOAMI, "Names changing too fast: ^a", pathname_ (parent_dname, parent_ename));
+		real_code = error_table_$action_not_performed;
+		goto MAIN_RETURN;
+		end;
+
+	     lookup_failures = lookup_failures + 1;
+	     call terminate_dirs ();
+	     goto START_OVER;
+	     end;
+
+	stop = "1"b;			/* Don't try actually looking any more */
+	real_code = code;			/* Remember the first error */
+
+	if code = error_table_$dirseg then do;
+	     real_code = error_table_$incorrect_access; /* Adjust the code */
+	     pathname = pathname || ">-NO-ACCESS-";
+	     end;
+
+	else if code = error_table_$vtoce_connection_fail then
+	     pathname = pathname || ">-CONNECTION-FAILURE-";
+
+	else pathname = pathname || ">-CANT-GET-";
+
+	return;
+	end cant_get_parent;
+
+/*  */
+
+lookup_in_parent: proc ();
+
+/* This procedure performs the lookup of the target UID in its parent directory. */
+
+dcl  dirsw bit (1) aligned;
+dcl  ename char (32);
+
+
+	dir_size = 262143;				/* Until we find out for real */
+
+	call copy_from_dir (""b, dp, size (dir));	/* Get the header */
+	if dir.uid ^= uid_path (level - 1) then 	/* Not there any more */
+	     call refetch_dir ();
+
+	if dir.arearp = ""b then			/* Protect against bogus values */
+	     call refetch_dir ();
+
+	call copy_from_dir ((dir.arearp), areap, size (area));
+	dir_size = area.lu; 			/* This is the last used word in the directory */
+
+	call uid_to_ename (uid_path (level), ename, dirsw, code);
+	if code ^= 0 then do;
+	     stop = "1"b;				/* Do this no more */
+	     pathname = pathname || ">-NOT-LISTED-";
+	     if level = depth then			/* Final component */
+		real_code = error_table_$noentry;
+	     else real_code = error_table_$no_dir;
+	     return;
+	     end;
+
+	if parent_dname ^= ">" then			/* Update the parent dname & ename */
+	     parent_dname = rtrim (parent_dname) || ">";
+	parent_dname = rtrim (parent_dname) || parent_ename;
+	parent_ename = ename;
+
+	pathname = pathname || ">";
+	pathname = pathname || rtrim (ename);
+
+	if (level < depth) & (^dirsw) then do;
+	     stop = "1"b;				/* Stop if next entry isn't a directory */
+	     pathname = pathname || "(-NOT-A-DIR-)";
+	     real_code = error_table_$notadir;
+	     end;
+
+	return;
+	end lookup_in_parent;
+
+/*  */
+
+uid_to_ename: proc (P_uid, P_ename, P_dirsw, P_code);
+
+dcl  P_uid bit (36) aligned parameter;
+dcl  P_ename char (32) parameter;
+dcl  P_dirsw bit (1) aligned parameter;
+dcl  P_code fixed bin (35) parameter;
+
+dcl  e_rel bit (18) aligned;
+dcl  branch_count fixed bin;
+dcl  entry_count fixed bin;
+
+
+	entry_count = 0;
+	branch_count = 0;
+
+	do e_rel = dp -> dir.entryfrp
+		repeat (entry.efrp)
+		while (e_rel ^= ""b);
+
+	     call copy_from_dir (e_rel, ep, size (entry));
+
+	     if entry.bs then branch_count = branch_count + 1;
+	     if entry.uid = P_uid then do;
+		P_ename = addr (entry.primary_name) -> names.name;
+		P_dirsw = entry.dirsw;
+		P_code = 0;
+		return;
+		end;
+
+	     entry_count = entry_count + 1;
+	     if entry_count > 3121 then call refetch_dir (); /* No good */
+	     end;
+
+	if branch_count < (dir.seg_count + dir.dir_count) then call refetch_dir ();
+
+	P_code = 1;				  /* Indicate failure */
+	return;
+
+	end uid_to_ename;
+
+/*  */
+
+copy_from_dir: proc (P_offset, P_ptr, P_size);
+
+/* Procedure to copy things from the directory, avoiding OOB faults, etc. */
+
+dcl  P_offset bit (18) aligned parameter;
+dcl  P_ptr pointer parameter;
+dcl  P_size fixed bin (18) parameter;
+
+
+	if binary (P_offset, 18) + P_size > dir_size then
+	     call refetch_dir ();
+
+	call phcs_$ring_0_peek (pointer (rzdp, P_offset), P_ptr, P_size);
+
+	return;
+	end copy_from_dir;
+
+
+
+
+refetch_dir: proc ();
+
+/* This procedure is called to restart processing of the current directory.
+   If it is called too many times, we will give up, instead. It performs the
+   restart by a non-local goto into the main loop.
+   */
+
+	refetch_count = refetch_count + 1;
+
+	if refetch_count > 6 then do;
+	     call com_err_ (0, WHOAMI, "Unable to get a consistent copy of ^a>^a",
+		parent_dname, parent_ename);
+	     real_code = error_table_$action_not_performed;
+	     goto MAIN_RETURN;
+	     end;
+
+	goto RESTART_THIS_DIRECTORY;
+
+	end refetch_dir;
+
+/*  */
+
+terminate_dirs: proc ();
+
+/* This procedure terminates all the directories we have initiated. This is localized, and done
+   all at once when the whole lookup is finished, to avoid the following scenario:
+
+   1) >dir1 is initiated.
+   2) The UID of dir2 is found in >dir1
+   3) >dir1 is terminated, and removed from the address space because
+      it has no (currently initiated) inferiors.
+   4) >dir1>dir2 is initiated: this requires initiating dir1 AGAIN,
+      as part of the initiation and lookup process.
+
+   By performing all the terminations at once, all the directories in the pathname get initiated
+   only once in the lookup. Unfortunately, we can't just leave them initiated and wait for the
+   KST garbage collector to terminate them, because phcs_$initiate is not the same as an ordinary
+   directory initiation.
+   */
+
+dcl  idx fixed bin;
+dcl  this_dirp pointer;
+
+
+/* Loop backwards, to avoid "Attempt to terminate with inferiors" error. */
+
+	do idx = hbound (dirp, 1) to lbound (dirp, 1) by -1;
+	     if dirp (idx) ^= null () then do;
+		this_dirp = dirp (idx);
+		dirp (idx) = null ();
+		call phcs_$terminate_noname (this_dirp, (0));
+		end;
+	     end;
+
+	return;
+	end terminate_dirs;
+
+%page; %include dir_header;
+%page; %include dir_name;
+%page; %include dir_entry;
+%page; %include dir_allocation_area;
+
+	end vpn_cv_uid_path_;

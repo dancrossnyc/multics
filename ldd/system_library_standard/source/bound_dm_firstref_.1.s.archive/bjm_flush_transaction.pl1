@@ -1,0 +1,298 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+     This procedure flushes all before journal records that have been
+produced by the transaction specified by the caller. This transaction
+is supposed to be in progress. It returns to the caller only after
+all records produced by the transaction are physically on disk.
+
+     It also updates the time stamp associated with the before journal
+involved, for use by page control to honor the write ahead log protocol.
+     
+     In fact, for ease of implementation with (I think) no additional
+overhead, the journal is flushed further than necessary. It is flushed
+up to the last CI put in the page file. If it is also necessary to
+flush records that happen to be in the buffer, the buffer is first
+put in the page file and then the page file is flushed up to the last
+CI put.
+     
+     The basic steps taken by this program are as follows:
+
+     1. Find the rec_id of the last record produced by this transaction.
+
+     2. call bj_storage_flush$up_to_rec_id.
+*/
+
+/* HISTORY:
+Written by Andre Bensoussan, 08/11/82.
+Modified:
+08/15/82 by M. Pandolf:  to use file_manager_ to manipluate data
+	  management system files.
+11/17/82 by A. Bensoussan:  to call bj_storage_flush.
+12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+10/16/84 by Maggie Sharpe:  corrected format; checked version of bj_txt
+	  and bj_ppte structures before they are used; revised error
+	  handling to "call ERROR_RETURN (code)" convention; cleaned up
+	  dcls.
+02/26/85 by Lee A. Newcomb:  Corrected dm_error_$bj_(ppte txt)_version_bad to
+            be *$bj_bad_(ppte tst)_version.
+03/19/85 by Steve Herbst: Fixed to initialize bjm_data_$bj_code.
+04/02/85 by Lee A. Newcomb:  Fixed to zero out bjm_data_$bj_code on entry;
+            removed the unused dm_bj_static.incl.pl1; did general fixing of
+            internal procedures to ease maintenance.
+*/
+/* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+%page;
+bjm_flush_transaction:
+   proc (p_txn_id, p_txn_ix, p_code);
+
+/* START OF DECLARATIONS */
+
+/* Parameter */
+dcl  (
+     p_txn_id			bit (36) aligned,
+     p_txn_ix			fixed bin (17),
+     p_code			fixed bin (35)
+     )				parameter;
+
+/* Automatic */
+dcl  (
+     bjm_clean_up_needed		bit (1) aligned init (^TRUE),
+     last_rec_id			bit (36) aligned init (NULL_ID)
+     )				automatic;
+
+/* Builtin */
+dcl  addr				builtin;
+
+/* Condition */
+dcl  cleanup			condition;
+
+/* Constant */
+dcl  (
+     CHECK_FOR_BJM_RECURSION		bit (1) aligned init ("1"b),
+     MYNAME			char (32)
+				init ("bjm_flush_transaction"),
+     NULL_ID			bit (36) aligned init (""b),
+     TRUE				bit (1) aligned init ("1"b)
+     )				internal static options (constant);
+
+/* Entry */
+dcl  (
+     bj_cleanup_tables$handler	entry (fixed bin (35)),
+     bj_storage_flush$up_to_rec_id	entry (ptr, bit (36) aligned)
+     )				external;
+
+/* External */
+dcl  (
+     dm_data_$bj_txt_ptr		ptr,
+     (
+     dm_error_$bj_bad_ppte_version,
+     dm_error_$bj_bad_tid,
+     dm_error_$bj_bad_txt_version,
+     dm_error_$bj_recursive_invoc
+     )				fixed bin (35)
+     )				external static;
+
+/* END OF DECLARATIONS */
+%page;
+COPY_AND_INIT_PARAMETERS:
+   do;
+      p_code = 0;					/* assume we will succeed */
+   end COPY_AND_INIT_PARAMETERS;
+
+SETUP_FOR_NON_STANDARD_EXIT:
+   do;
+
+      on cleanup call CLEAN_UP ();
+
+      call SET_BJM_DATA_ERROR_HANDLING_VALUES (NONLOCAL_ERROR_EXIT, MYNAME,
+	 CHECK_FOR_BJM_RECURSION);
+
+   end SETUP_FOR_NON_STANDARD_EXIT;
+
+
+GET_BJ_TXTE_PTR:
+   do;
+      bj_txt_ptr = dm_data_$bj_txt_ptr;
+      call CHECK_VERSION_NUMERIC (bj_txt.version, BJ_TXT_VERSION_1,
+	 dm_error_$bj_bad_txt_version);
+
+      bj_txte_ptr = addr (bj_txt.entry (p_txn_ix));
+
+      if bj_txte.tid ^= p_txn_id then
+         call ERROR_RETURN (dm_error_$bj_bad_tid);
+   end GET_BJ_TXTE_PTR;
+
+/*
+   The txte should have the process id for which the bj_ppte_ptr and bj_oid
+   are valid. If the process that owns the txn is still alive, the set
+   pid, ppte_ptr, bj_oid are the original values put it the txte. If the
+   process dies, the daemon will execute procedures that use the txte.
+   It would be convenient if these procedures used the same protocol when
+   taking info from the txte: If the pid is equal to the pid of the process
+   executing the procedure, then it is safe to use the ppte_ptr and the bj_oid.
+   Otherwise, the BJ has to be opened by its uid and the txte updated
+   as follows:
+	     - zero the pid
+	     - set the new ppte_ptr
+	     - set the new bj_oid
+	     - set the pid.
+*/
+
+GET_BJ_PPTE_PTR:
+   do;
+      bj_ppte_ptr = bj_txte.ppte_ptr;			/* WHAT SHOULD BE DONE FOR DAEMON ? */
+      call CHECK_VERSION_NUMERIC (bj_ppte.version, BJ_PPTE_VERSION_1,
+	 dm_error_$bj_bad_ppte_version);
+   end GET_BJ_PPTE_PTR;
+%page;
+DO_THE_FLUSH:
+   do;
+
+/* Get the rec_id of the last record produced by this transaction	*/
+/* from the bj_txte Then call the bj_storage_flush procedure to flush	*/
+/* the journal up to the last record produced by the transaction	*/
+
+      last_rec_id = bj_txte.last_bj_rec_id;
+
+      if last_rec_id ^= "0"b then
+         call bj_storage_flush$up_to_rec_id (bj_ppte_ptr, last_rec_id);
+   end DO_THE_FLUSH;
+
+   call RETURN ();
+
+/* end bjm_flush_transaction */
+%page;
+MAIN_RETURN:
+   return;
+%skip (4);
+NONLOCAL_ERROR_EXIT:
+   call ERROR_RETURN (bjm_data_$bj_code);
+%skip (4);
+CHECK_VERSION_NUMERIC:
+   proc (cvn_p_given_version, cvn_p_correct_version, cvn_p_error_to_use);
+
+/* The error code to use is passed as this is really a template proc	*/
+/* used in several modules to check structure versions.  It is hoped	*/
+/* newer versions of these structures will be changed to use	*/
+/* char (8) versions.					*/
+
+dcl  (
+     cvn_p_given_version		fixed bin,
+     cvn_p_correct_version		fixed bin,
+     cvn_p_error_to_use		fixed bin (35)
+     )				parameter;
+
+   if cvn_p_given_version ^= cvn_p_correct_version then
+      call ERROR_RETURN (cvn_p_error_to_use);
+
+   end CHECK_VERSION_NUMERIC;
+%skip (4);
+CLEAN_UP:
+   proc ();
+
+   if bjm_clean_up_needed then
+      call bj_cleanup_tables$handler (0);
+
+   call FINISH ();
+
+   return;
+
+   end CLEAN_UP;
+%skip (4);
+ERROR_RETURN:
+   proc (er_p_code);
+
+dcl  er_p_code			fixed bin (35) parameter;
+
+   call CLEAN_UP ();
+   p_code = er_p_code;
+   goto MAIN_RETURN;
+
+   end ERROR_RETURN;
+%skip (4);
+FINISH:
+   proc ();
+
+   call SET_BJM_DATA_ERROR_HANDLING_VALUES (bjm_data_$bj_default_error_label,
+        "", ^CHECK_FOR_BJM_RECURSION);
+
+   return;
+
+   end FINISH;
+%skip (4);
+RETURN:
+   proc ();
+
+   call FINISH ();
+   go to MAIN_RETURN;
+
+   end RETURN;
+%page;
+SET_BJM_DATA_ERROR_HANDLING_VALUES:
+   proc (sbdehv_p_error_exit, sbdehv_p_operation,
+        sbdehv_p_check_for_recursive_invocation);
+
+/* This internal procedure centralizes the setting of the BJM global	*/
+/* error values in bjm_data_.  It is called near the beginning of	*/
+/* this module, and in the FINISH internal procedure.  ONLY THE FIRST	*/
+/* OF THESE CALLS SHOULD ASK FOR DETECTION OF A RECURSIVE INVOCATION	*/
+/* OF THE BEFORE JOURNAL MANAGER, if the other calls did, we could	*/
+/* end up getting a recursive call ERROR_RETURN, CLEANUP, FINISH,	*/
+/* this proc, etc.						*/
+/*							*/
+/* Note: if sbdehv_p_check_for_recursive_invocation and		*/
+/* bjm_clean_up_needed are both false, we do not set any values.	*/
+/* This may happen if we call ERROR_RETURN before calling this	*/
+/* proc, if the partial argument validation fails.		*/
+
+dcl  (
+     sbdehv_p_error_exit		label variable,
+     sbdehv_p_operation		char (*),
+     sbdehv_p_check_for_recursive_invocation
+				bit (1) aligned
+     )				parameter;
+
+   if sbdehv_p_check_for_recursive_invocation = CHECK_FOR_BJM_RECURSION then
+      if bjm_data_$bj_operation ^= "" then
+         call ERROR_RETURN (dm_error_$bj_recursive_invoc);
+
+/* only set bjm_data_ values if we set them */
+   if bjm_clean_up_needed ^= TRUE
+        & sbdehv_p_check_for_recursive_invocation ^= CHECK_FOR_BJM_RECURSION
+        then
+      ;
+   else
+SET_BJM_DATA_ERROR_VALUES:
+      do;
+      bjm_clean_up_needed = TRUE;
+      bjm_data_$bj_operation = sbdehv_p_operation;
+      bjm_data_$bj_exit_err = sbdehv_p_error_exit;
+      bjm_data_$bj_code = 0;
+   end SET_BJM_DATA_ERROR_VALUES;
+
+   return;
+
+   end SET_BJM_DATA_ERROR_HANDLING_VALUES;
+%page;
+%include dm_bj_ppt;
+%page;
+%include dm_bj_pst;
+%page;
+%include dm_bj_pste;
+%page;
+%include dm_bj_txt;
+%page;
+%include dm_bj_ci;
+%page;
+%include dm_ci_header;
+%page;
+%include dm_bj_global_error_info;
+
+   end bjm_flush_transaction;

@@ -1,0 +1,203 @@
+/****^  ********************************************
+        *                                          *
+        * Copyright, (C) Honeywell Bull Inc., 1987 *
+        *                                          *
+        ******************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-03-31,Blair), approve(87-03-31,MCR7666),
+     audit(87-06-25,Fawcett), install(87-07-15,MR12.1-1040):
+     Install as part of bound_copy_disk_.  This program is the I/O driver.
+     The asynchronous i/o scheme has been eliminated becuase rdisk_ goes
+     blocked, so setting up event channels only leads to confusion.
+                                                   END HISTORY COMMENTS */
+
+copy_disk_copy_:
+     procedure (P_source_info_ptr, P_target_info_ptr, 
+	P_brief_sw, P_query_sw, P_trace_sw, P_retry_sw, P_cylinder, P_code);
+
+/* This procedure implements the double-buffered disk copying mechanism. It
+   loops through the entire disk, doing the largest I/O's it can, reading 
+   and writing from alternate buffers.  The boundaries are detected by having
+   the lengths for read and write only be greater than zero when there is
+   I/O to be done.  If an error occurs on a read in the middle of a buffer, 
+   the entire buffer is read and written a record at a time before control
+   returns to this module.
+   */
+
+dcl  P_source_info_ptr pointer parameter;
+dcl  P_target_info_ptr pointer parameter;
+dcl  P_brief_sw bit (1) aligned parameter;
+dcl  P_query_sw bit (1) aligned parameter;
+dcl  P_trace_sw bit (1) aligned parameter;
+dcl  P_retry_sw bit (1) aligned parameter;
+dcl  P_cylinder fixed bin parameter;
+dcl  P_code fixed bin (35) parameter;
+
+dcl 1 source aligned like copy_disk_info based (P_source_info_ptr);
+dcl 1 target aligned like copy_disk_info based (P_target_info_ptr);
+
+dcl  code fixed bin (35);
+dcl  cylinder_idx fixed bin;
+dcl  buffer_ptrs (2) pointer;
+dcl  read_channel fixed bin (71);
+dcl  start_clock_time fixed bin (71);
+dcl  last_event_time fixed bin (71);
+
+dcl (read_address, write_address) fixed bin (35);
+dcl (read_length, write_length) fixed bin;
+dcl (read_buf_ptr, write_buf_ptr) pointer;
+dcl  temp_ptr pointer;
+dcl  last_cylinder_announced fixed bin;
+dcl  first_time bit (1) aligned;
+
+dcl  copy_disk_io_$read entry (pointer, bit (1) aligned, bit (1) aligned,
+     pointer, fixed bin (35), fixed bin, bit (1) aligned, fixed bin (35));
+dcl  copy_disk_io_$write entry (pointer, bit (1) aligned, bit (1) aligned,
+     pointer, fixed bin (35), fixed bin, bit (1) aligned, fixed bin (35));
+dcl  copy_disk_io_$record_to_sector  entry (ptr, fixed bin (18)) returns (fixed bin (35));
+
+dcl  com_err_ entry options (variable);
+dcl  get_temp_segments_ entry (char (*), (*) pointer, fixed bin (35));
+dcl  ioa_ entry options (variable);
+dcl  ioa_$nnl entry options (variable);
+dcl  release_temp_segments_ entry (char (*), (*) pointer, fixed bin (35));
+
+dcl cleanup condition;
+
+dcl (addr, clock, divide, float, min, mod, null) builtin;
+
+/*  */
+
+	read_channel = 0;
+	buffer_ptrs (*) = null ();
+	on condition (cleanup) call clean_up ();
+
+	call get_temp_segments_ (WHOAMI, buffer_ptrs, code);
+	if (code ^= 0) then do;
+	     call com_err_ (code, WHOAMI, "Cannot get temp segments for I/O.");
+	     goto MAIN_RETURN;
+	     end;
+
+	read_address = source.low_bound;
+	write_address = read_address - source.sectors_per_io;
+	read_length = source.sectors_per_io;
+	write_length = 0;
+	read_buf_ptr = buffer_ptrs (1);
+	write_buf_ptr = buffer_ptrs (2);
+	last_cylinder_announced = 0;
+	first_time = "1"b;
+
+	start_clock_time = clock ();
+	last_event_time = start_clock_time;
+
+	cylinder_idx = 0;				/* for reporting */
+
+	do while (write_address <= source.high_bound );
+	     if (write_length > 0) then do;		/* all but last */
+
+		call read_write (addr (target), WRITE,
+		     write_buf_ptr, write_address, write_length);
+		end;
+		
+	     if (read_length > 0 & read_address <= source.high_bound) then    /* first, synchronous, read */
+		call read_write (addr (source), READ, 
+		     read_buf_ptr, read_address, read_length);
+
+	     cylinder_idx = divide (write_address, target.sectors_per_cylinder, 17, 0);
+	     if (mod (cylinder_idx, 100) = 0) | first_time then
+		if (cylinder_idx ^= last_cylinder_announced) then
+		     if ^P_brief_sw then do;
+			if write_address > copy_disk_io_$record_to_sector (addr (source), source.n_records) then; 
+
+			else call ioa_$nnl ("^/^d cylinder^[ ^;s ^]processed ...", cylinder_idx, first_time);
+			last_cylinder_announced = cylinder_idx;
+			first_time = "0"b;
+			end;
+	      
+/* After a retry, where the buffer was processed by reading and writing one record at a time,
+   the length of the read buffer is set to zero so that we can resynchronize the next read.
+   We'll do this by 1) set write_length to zero (like when we started)
+ 	          2) increment read_buffer past the portion we just finished reading
+	          3) figure out new read_length				          */
+	     if read_length = 0 then do;
+		write_length = 0;
+		read_address = read_address + source.sectors_per_io;
+		read_length = min (source.sectors_per_io, (1 + source.high_bound - read_address));
+		goto RESYNCHRONIZE;
+		end;
+	     temp_ptr = write_buf_ptr;		/* swap buffers */
+	     write_buf_ptr = read_buf_ptr;
+	     read_buf_ptr = temp_ptr;
+		
+	     write_address = read_address;
+	     read_address = read_address + source.sectors_per_io;
+
+	     write_length = read_length;
+	     read_length = min (source.sectors_per_io, (1 + source.high_bound - read_address));
+	     source.trace_count = source.trace_count + 1;
+RESYNCHRONIZE: 
+	     end;
+
+	code = 0;
+
+MAIN_RETURN:
+	call clean_up ();
+
+	P_cylinder = cylinder_idx;
+	P_code = code;
+	return;
+
+/*  */
+
+read_write:
+     procedure (P_info_ptr, P_operation, P_buffer_ptr, P_sector, P_n_sectors);
+
+dcl  P_info_ptr pointer parameter;
+dcl 1 P_info aligned like copy_disk_info based (P_info_ptr);
+dcl  P_operation fixed bin parameter;     
+dcl  P_buffer_ptr pointer parameter;
+dcl  P_sector fixed bin (35);
+dcl  P_n_sectors fixed bin;
+
+dcl  interval fixed bin (71);
+
+
+	if P_trace_sw then  
+            if mod(source.trace_count, source.trace_parm)= 0 then do; /* only show the trace every N I/Os */
+	     interval = clock () - last_event_time;
+	     last_event_time = last_event_time + interval;
+	     call ioa_ (
+		"^/^9.4f (^7.1f): ^[Read^x^;Write^] ^7a: ^4d sectors at sector ^8d",
+		(float (last_event_time - start_clock_time) / 1.0e6), 
+		(float (interval) / 1.0e3), P_operation,
+		P_info.device, P_n_sectors, P_sector);
+	     end;
+
+	if (P_operation = READ) then
+	     call copy_disk_io_$read (P_info_ptr, P_brief_sw, P_query_sw,
+	          P_buffer_ptr, P_sector, P_n_sectors, P_retry_sw, code);
+	else call copy_disk_io_$write (P_info_ptr, P_brief_sw, P_query_sw,
+	          P_buffer_ptr, P_sector, P_n_sectors, ("0"b), code);
+
+	if (code ^= 0) then goto MAIN_RETURN;		/* message already printed */
+
+	return;
+	end read_write;
+
+/*  */
+
+clean_up:
+     procedure ();
+
+
+	if (buffer_ptrs (1) ^= null ()) then 
+	     call release_temp_segments_ (WHOAMI, buffer_ptrs, (0));
+
+	return;
+	end clean_up;
+
+%page; %include copy_disk_info;
+
+	end copy_disk_copy_;

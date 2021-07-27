@@ -1,0 +1,428 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+deactivate_for_demount$shutdown: proc (Code);
+
+/*  deactivate_for_demount
+
+    Program to do a bottom-up tree-walk of the AST and deactivate segments
+    prior to volume demounting.
+
+    Entries:
+
+    lv       - deactivates all segments belonging to a specified logical
+	     volume, using segment control deactivation.
+
+    shutdown - deactivates all segments by hand and converts deciduous
+	     segments into hardcore segments, freeing VTOCEs in the
+	     process. This can be called only during system shutdown.
+	     Segment control will not function after this is called.
+
+    Written June 1982 by J. Bongiovanni
+    Modified September 1982, J. Bongiovanni, to for device inop in shutdown
+*/
+
+/*  Parameter  */
+
+	dcl     Code		 fixed bin (35) parameter; /* Return Code */
+	dcl     Lvid		 bit (36) aligned;	/* Logical Volume ID */
+
+/*  Automatic  */
+
+	dcl     1 aste_val		 (0:3) aligned,	/* Used to validate aste-ptrs */
+		2 begin_addr	 fixed bin (19),	/* Begin of ASTEs this page table size */
+		2 end_addr	 fixed bin (19),	/* End of ASTEs this page table size */
+		2 modulus		 fixed bin;	/* Size of ASTE + Page Table */
+	dcl     astep_stack		 (16) ptr;	/* Stack for tree-walk */
+	dcl     code		 fixed bin (35);	/* Error code */
+	dcl     lvid		 bit (36) aligned;	/* Logical volume ID */
+	dcl     p99		 pic "99";
+	dcl     shut		 bit (1) aligned;	/* ON => shutdown called */
+	dcl     sstp		 ptr;
+	dcl     stack_level		 fixed bin;	/* Current level in stack */
+
+/*  Static  */
+
+	dcl     VALID_MARKER	 bit (6) internal static options (constant) init ("02"b3);
+
+/*  External  */
+
+	dcl     error_table_$inconsistent_sst fixed bin (35) external;
+	dcl     error_table_$vtoc_io_err fixed bin (35) external;
+	dcl     pvt$esd_state	 fixed bin external;
+	dcl     pvt$n_entries	 fixed bin external;
+	dcl     sst$		 external;
+	dcl     sst$astap		 ptr external;
+	dcl     1 sst$level		 (0:3) aligned external,
+		2 ausedp		 bit (18) unal,
+		2 no_aste		 fixed bin (18) uns unal;
+	dcl     sst$pts		 (0:3) fixed bin external;
+	dcl     sst$root_astep	 ptr external;
+
+/*  Entry  */
+
+	dcl     deactivate		 entry (ptr, fixed bin (35));
+	dcl     lock$lock_ast	 entry;
+	dcl     lock$unlock_ast	 entry;
+	dcl     pc$cleanup		 entry (ptr);
+	dcl     syserr$error_code	 entry options (variable);
+	dcl     update_vtoce$deact	 entry (ptr, fixed bin (35));
+	dcl     vtoc_man$free_vtoce	 entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+
+/* Builtin */
+
+          dcl     addr                   builtin;
+	dcl     bin		 builtin;
+	dcl     convert		 builtin;
+	dcl     hbound		 builtin;
+	dcl     mod		 builtin;
+	dcl     ptr		 builtin;
+	dcl     rel		 builtin;
+	dcl     size		 builtin;
+
+/* Condition */
+
+	dcl     any_other		 condition;
+%page;
+	shut = "1"b;
+
+	if pvt$esd_state ^= 0
+	then on any_other goto BAD_SST;
+
+	goto COMMON;
+
+lv:
+     entry (Lvid, Code);
+
+	lvid = Lvid;
+	shut = "0"b;
+
+COMMON:
+
+	Code = 0;
+	pvt_arrayp = addr (pvt$array);
+
+	call lock$lock_ast;
+
+	call INIT_FOR_SST;
+
+	stack_level = 1;
+	astep_stack (1) = sst$root_astep;
+	call VALIDATE_ASTE (astep_stack (1));
+	call PUSH_CHILD (astep_stack (1));
+
+	do while (stack_level > 0);
+	     astep = astep_stack (stack_level);
+	     call POP_PUSH_BROTHER (astep);
+	     call CHECK_DEACTIVATE (astep);
+	end;
+
+UNLOCK_RETURN:
+
+	call lock$unlock_ast;
+
+	return;
+
+
+BAD_SST:
+	Code = error_table_$inconsistent_sst;
+	call lock$unlock_ast;
+	return;
+
+%page;
+/*  Internal Procedure to check whether this ASTE should be deactivated,
+    and to do it.
+*/
+
+CHECK_DEACTIVATE:
+     proc (Astep);
+
+	dcl     Astep		 ptr;
+
+	dcl     1 Aste		 aligned like aste based (Astep);
+
+	if Aste.uid = ""b then return;
+	pvtep = addr (pvt_array (Aste.pvtx));
+
+	if shut then do;				/* Called for shutdown */
+	          if pvte.device_inoperative then return;
+
+		Aste.fmchanged = Aste.fmchanged | Aste.fmchanged1;
+		Aste.ddnp = "0"b;
+		if Aste.hc_sdw			/* Deciduous segment */
+		then call REVERT_DECIDUOUS (Astep);	/* Change to hardcore segment */
+		else call DEACTIVATE_FOR_SHUTDOWN (Astep);
+	     end;
+	else do;					/* Called for Logical Volume */
+		if pvte.lvid = lvid then do;
+			Aste.fmchanged = Aste.fmchanged | Aste.fmchanged1;
+			Aste.ddnp = "0"b;
+			call deactivate (Astep, code);
+			if code ^= 0
+			then do;
+				Code = code;
+				goto UNLOCK_RETURN;
+			     end;
+		     end;
+	     end;
+
+
+     end CHECK_DEACTIVATE;
+%page;
+/* Internal Procedure to deactivate by hand for shutdown. The segment
+   is updated to disk (pages and VTOCE), but ASTE threads are left as-is.
+*/
+DEACTIVATE_FOR_SHUTDOWN:
+     proc (Astep);
+
+	dcl     Astep		 ptr;
+
+	dcl     1 Aste		 aligned like aste based (Astep);
+
+	if ^Aste.ehs then call pc$cleanup (Astep);
+
+	call update_vtoce$deact (Astep, code);
+	if code ^= 0
+	then if code ^= error_table_$vtoc_io_err
+	     then do;
+		     Code = code;
+		     goto UNLOCK_RETURN;
+		end;
+
+	Aste.uid = ""b;
+
+     end DEACTIVATE_FOR_SHUTDOWN;
+
+
+%page;
+/* Internal Procedure to advance to the brother of the supplied ASTE.
+   If the brother exists, descendants are pushed onto the stack, as
+   far as possible. If no brother exists, the stack is popped by one.
+
+   This procedure is the brains of the bottum-up-left-right tree-walk
+*/
+
+POP_PUSH_BROTHER:
+     proc (Astep);
+
+	dcl     Astep		 ptr;
+
+	dcl     bastep		 ptr;
+	dcl     castep		 ptr;
+	dcl     pastep		 ptr;
+
+	dcl     1 Aste		 aligned like aste based (Astep);
+	dcl     1 baste		 aligned like aste based (bastep);
+	dcl     1 caste		 aligned like aste based (castep);
+	dcl     1 paste		 aligned like aste based (pastep);
+
+
+	castep = Astep;
+	pastep = ptr (sstp, caste.par_astep);
+
+	if caste.infl = ""b
+	then stack_level = stack_level - 1;
+	else do;
+		bastep = ptr (sstp, caste.infl);
+		call VALIDATE_ASTE (bastep);
+		call VALIDATE_PARENT_CHILD (pastep, bastep);
+		astep_stack (stack_level) = bastep;
+		call PUSH_CHILD (bastep);
+	     end;
+
+     end POP_PUSH_BROTHER;
+%page;
+/*  Internal Procedure to push as many descendants of the supplied ASTE
+    as possible onto the stack. Only the first descendant is examined at each level.
+*/
+
+PUSH_CHILD:
+     proc (Astep);
+
+	dcl     Astep		 ptr;
+
+	dcl     castep		 ptr;
+	dcl     pastep		 ptr;
+
+
+	dcl     1 caste		 aligned like aste based (castep);
+	dcl     1 paste		 aligned like aste based (pastep);
+
+	pastep = Astep;
+
+	do while (paste.infp ^= ""b);
+	     castep = ptr (sstp, paste.infp);
+	     call VALIDATE_ASTE (castep);
+	     call VALIDATE_PARENT_CHILD (pastep, castep);
+	     stack_level = stack_level + 1;
+	     if stack_level > hbound (astep_stack, 1)
+	     then goto BAD_SST;
+	     astep_stack (stack_level) = castep;
+	     pastep = castep;
+	end;
+
+     end PUSH_CHILD;
+%page;
+/* Internal Procedure to convert a deciduous segment to a hardcore segment
+   and free its VTOCE.
+*/
+
+REVERT_DECIDUOUS:
+     proc (Astep);
+
+	dcl     Astep		 ptr;
+
+	dcl     last		 bit (18) aligned;
+	dcl     pastep		 ptr;
+	dcl     relp		 bit (18) aligned;
+	dcl     vtocx		 fixed bin;
+
+	dcl     1 Aste		 aligned like aste based (Astep);
+	dcl     1 paste		 aligned like aste based (pastep);
+
+/* Unthread the ASTE */
+
+	pastep = ptr (sstp, Aste.par_astep);
+	last = ""b;
+	relp = paste.infp;
+
+	do while (relp ^= rel (Astep));
+	     last = relp;
+	     relp = ptr (sstp, relp) -> aste.infl;
+	end;
+
+	if last = ""b
+	then paste.infp = Aste.infl;
+	else ptr (sstp, last) -> aste.infl = Aste.infl;
+
+/* Free the VTOCE */
+
+	if Aste.pvtx > 0 & Aste.vtocx >= 0 then do;
+		vtocx = Aste.vtocx;
+		Aste.vtocx = -1;
+		pvtep = addr (pvt_array (aste.pvtx));
+		call vtoc_man$free_vtoce ((pvte.pvid), (Aste.pvtx), vtocx, code);
+		if code ^= 0
+		then call syserr$error_code (LOG, "deactivate_for_demount: Error freeing vtocx ^o on ^a_^a for ^w",
+			vtocx, pvte.devname, convert (p99, pvte.logical_area_number));
+	     end;
+
+     end REVERT_DECIDUOUS;
+
+
+%page;
+/*  Internal Procedure to validate an ASTE */
+
+VALIDATE_ASTE:
+     proc (Astep);
+
+	dcl     Astep		 ptr;
+
+	dcl     aste_addr		 fixed bin (19);
+	dcl     pts		 fixed bin;
+
+	dcl     1 Aste		 aligned like aste based (Astep);
+
+	if Aste.marker ^= VALID_MARKER
+	then goto BAD_SST;
+
+	if Aste.uid = ""b & ^shut
+	then goto BAD_SST;
+
+	if bin (Aste.msl, 9) > 256
+	     | bin (Aste.csl, 9) > 256
+	     | bin (Aste.records, 9) > 256
+	then goto BAD_SST;
+
+	if Aste.pvtx <= 0
+	     | Aste.pvtx > pvt$n_entries
+	then goto BAD_SST;
+
+	pts = bin (Aste.ptsi, 2);
+	aste_addr = bin (rel (Astep));
+	if aste_addr < aste_val (pts).begin_addr
+	     | aste_addr >= aste_val (pts).end_addr
+	then goto BAD_SST;
+	if mod (aste_addr - aste_val (pts).begin_addr, aste_val (pts).modulus) ^= 0
+	then goto BAD_SST;
+
+     end VALIDATE_ASTE;
+
+%page;
+/*  Internal Procedure to validate that two ASTEs are related as
+    parent/child.
+*/
+
+VALIDATE_PARENT_CHILD:
+     proc (Pastep, Castep);
+
+	dcl     Pastep		 ptr;
+	dcl     Castep		 ptr;
+
+	dcl     1 Caste		 aligned like aste based (Castep);
+
+
+	if Caste.par_astep ^= rel (Pastep)
+	then goto BAD_SST;
+
+
+     end VALIDATE_PARENT_CHILD;
+
+%page;
+/*  Internal Procedure to initialize  */
+
+INIT_FOR_SST:
+     proc;
+
+	dcl     array_addr		 fixed bin (19);
+	dcl     pts		 fixed bin;
+
+	sstp = addr (sst$);
+
+	array_addr = bin (rel (sst$astap));
+	do pts = 0 to 3;
+	     aste_val (pts).begin_addr = array_addr;
+	     aste_val (pts).end_addr = array_addr + bin (sst$level (pts).no_aste) * (size (aste) + sst$pts (pts));
+	     aste_val (pts).modulus = size (aste) + sst$pts (pts);
+	     array_addr = aste_val (pts).end_addr;
+	end;
+
+     end INIT_FOR_SST;
+%page;
+%include aste;
+%page;
+%include pvte;
+%page;
+%include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+Message:
+deactivate_for_demount: Error freeing vtocx OOOO on dskX_NN for UID. ERRORMESSAGE.
+
+S:     $log
+
+T:     During system shutdown.
+
+M:     The VTOCE for a deciduous segment could not be freed for the
+reason indicated. The VTOCE will be freed by the next volume salvage
+or by delete_old_pdds.
+
+A:     $ignore
+
+END MESSAGE DOCUMENTATION */
+
+     end deactivate_for_demount$shutdown;

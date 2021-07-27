@@ -1,0 +1,1465 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+/* DESCRIPTION:
+
+          This module searches the index for a specified key.  It returns the
+     element_id of the found key (or the element_id for the correct location
+     for the missing key) and the leaf_ci_header of the control interval
+     containing the returned element_id.
+
+     All internal subroutines have uppercase names.  If an error is
+     encountered in an internal subroutine, ERROR_RETURN is called directly
+     with the appropriate error code.  Control is not returned to the caller
+     of the subroutine.  Instead, a non-local transfer is performed to the
+     MAIN_RETURN label, following which the main procedure returns to its
+     caller.  For this reason, there are no error code checks after subroutine
+     calls.
+
+     This subroutine accesses data in a collection exclusively via direct
+     access, i.e., first gets a pointer to a control interval (node) by
+     calling collection_manager_$get_control_interval_ptr then gets elements
+     (keys and ci_headers) by copying the contents of the elements into local
+     buffers. It is imperative that a new
+     pointer to the current node (current_node_ptr) is gotten whenever the
+     current node (current_node_id) changes.  For this reason, the value of
+     current_node_id should never be manually changed; the subroutine
+     GET_NEW_NODE is called to change the value of current_node_id and get a
+     new current_node_ptr.  Calls to get a new node should always look like
+     the following:
+     
+      call GET_NEW_NODE (<new node id>, current_node_id, current_node_ptr);
+     
+     Because im_basic_search is such a heavily used routine and must be as
+     performant as possible, it gets elements out of control intervals
+     directly without calling collection_manager_.  This trade-off of
+     modularity in favor of performance is absolutely necessary.  Actual
+     knowledge of the format of a control interval is limited to the two
+     internal subroutines GET_CI_HEADER and GET_NEW_KEY.  These two routines
+     copy data out of the control interval into local buffers to avoid
+     problems with proper alignment.
+
+     GET_CI_HEADER and GET_NEW_KEY maintain the values of certain variables
+     that must be kept in synch.  The caller must co-operate by always calling
+     these routines in one of the following ways:
+     
+      call GET_CI_HEADER (current_node_ptr,
+                          current_node_id,
+                          common_ci_header_ptr,
+                          leaf_ci_header_ptr,
+                          branch_ci_header_ptr,
+                          element_id_string);
+     
+      call GET_NEW_KEY (current_node_ptr,
+                        current_node_id,
+                        <index>,
+                        leaf_key_ptr     | branch_key_ptr,
+                        lk_string_length | (0),
+                        (0)              | bk_string_length,
+                        element_id_string);
+
+     Also for performance reasons, the subroutine COMPARE_VECTOR_TO_STRING is
+     included in dm_comp_vec_str_proc.incl.pl1.  This routine, which is shared
+     by several modules, is written as an internal subroutine to eliminate the
+     call overhead that would be necessary were it an external routine.  This
+     routine takes no arguments and relies on global variables declared and
+     set in the main procedure to simulate parameters, again to avoid the cost
+     of argument list preparation.  All such pseudo-parameters are automatic
+     variables prefixed with the string "cvs_p_".
+*/
+
+/* HISTORY:
+
+Written by Lindsey Spratt, 03/28/82.
+Modified:
+04/22/82 by Lindsey Spratt: Added capability to deal with branch keys which
+	  have fewer than the full set of fields.
+05/26/82 by Lindsey Spratt: Changed calculation of new current_idx when vector
+	  is greater than the key to add the mod(current_idx + high_idx, 2)
+	  instead of just adding "1".  The old technique gave a result one
+	  too great when (current_idx + high_idx) was a multiple of two.
+06/21/82 by Lindsey Spratt: Changed name from im_search_$location to
+	  im_basic_search.  Added p_want_* flags to calling sequence, to
+	  support the im_structural_search routine.  Added case statement to
+	  determine what value to return for the p_key_id, based on the
+	  vector_*key flags and the p_want_* flags.
+07/26/82 by Lindsey Spratt:  Added the duplicate-field-filtering feature and
+	  extended the search algorithm to allow for "degenerate" branch
+	  nodes, those with no keys.
+08/09/82 by Matthew Pierret:  Changed calling sequence of 
+            collection_manager_$get_element to not use offset and length.
+08/27/82 by Lindsey Spratt:  Added p_is_relative_search and
+	  p_position_stack_ptr to calling sequence.  Changed to use local
+	  variable "first_idx" instead of referencing key_range.first
+	  directly as part of implementing "relative" searches.  The
+	  position_stack is only modified/used by im_basic_search, it is
+	  held by im_basic_search's caller, though, to make it so that this
+	  module only needs to calculate the position_stack once in a series
+	  of searches.
+09/13/82 by Lindsey Spratt:  Added check of the parent thread.  Rebuilt the
+	  search algorithm for branch nodes.
+10/20/82 by Lindsey Spratt:  Changed the leaf_node key search to be the same
+	  algorithm as that used for branch nodes.  Corrected the algorithm
+	  for the case where the search vector is equal to more than one key
+	  (in either a branch or leaf node).  If a key is desired which is
+	  <= the vector, or > the vector, then the rightmost (highest) key =
+	  the vector must be located.  If a key is desired which is >=
+	  the vector, or < the vector, then the leftmost (lowest) key = the
+	  vector must be located.
+10/27/82 by Lindsey Spratt:  Moved get_new_key to top of LEAF_KEY_LOOP.
+11/03/82 by Lindsey Spratt:  Added code to catch the case where an exact match
+	  is being sought and when exiting from the leaf loop it
+	  is the key identified by the high_idx, not the current_idx (which
+	  equals low_idx). 
+11/04/82 by Lindsey Spratt:  Added the insertion entry point, to be called by
+	  im_put_key.
+11/15/82 by Matthew Pierret: Added code to catch the case where an exact match
+	  is being sought and when exiting from the leaf loop it is equal
+            to the vector and is the first key.
+11/19/82 by Matthew Pierret: Changed to use buffered control interval
+            technology. To reduce on calls to file_manager_ (by 
+            collection_manager_) and on copying of data, when a node is to be
+            searched the whole node is retrieved into a local buffer by calling
+            cm_$setup_buffered_ci. Elements are then retrieved from that buffer
+            using cm_$get_element_buffered.
+            Also made current_node_id, parent_node_id, less_branch_id unsigned.
+01/19/83 by Lindsey Spratt:  Fixed to correctly set the p_key_id when working
+	  with the first key of a CI.  It was testing current_idx, which may
+	  be one greater or less  than the last key tested, whose slot index
+	  is accurately recorded in element_id.index.  Added some logic to
+	  check for the "low" limit when doing relative searching and trying
+	  to set the p_key_id one less than the element_id.index value.
+01/25/83 by Lindsey Spratt:  Fixed to set the parent_idx correctly when the
+	  "found" key is the first key in the CI, it is equal to the vector
+	  (hence, first_inequal_field_id >
+	  simple_typed_vector.number_of_dimensions), and the caller wants
+	  keys  ">=" to the vector.  The correct value is =
+	  key_range.first, it was being set to key_range.first - 1.
+02/23/83 by Lindsey Spratt: Added a new entry, $reposition, to support
+	  automatic re-positioning of cursors when they are found to have
+	  become invalid.  Added support for the version 3 cursor, which
+	  includes the ability for the cursor to have any combination of the
+	  the three possible operations (current, next, previous) be defined
+	  and the remaining operations be invalid for a given cursor.
+	       Changed the calling sequences to use the index_opening_info
+	  structure.
+03/02/83 by Lindsey Spratt:  Fixed execution path for $reposition entry to not
+	  reference the simple_typed_vector.
+03/07/83 by Lindsey Spratt:  Fixed the position_stack initialization to get
+	  the stack in the right order when doing a top_down init.  Also,
+	  fixed position_stack init to consistently set the id_string.index
+	  value to be the first (or leftmost) valid key slot; it was being
+	  set to be one to the left of the the first valid key slot on some
+	  occasions.
+03/24/83 by Lindsey Spratt:  Changed im_compare* to data_mgmt_util_$compare*.
+	  Was changed to use field_table version 2.
+04/09/83 by Lindsey L. Spratt:  Changed the post-BRANCH_KEY_LOOP
+	  interpretation of the comparison of the "vector" and the key.  If
+	  they compared equal, but the vector is shorter than the key, then
+	  the comparison is reinterpreted to be "less-than".
+05/02/83 by Lindsey L. Spratt:  Fixed a bug in the setting of the first_idx
+            for a branch node when doing a relative search.
+07/12/83 by Matthew Pierret:  Changed to set up the current node when the 
+            position_stack does not need to be set up for a relative search.
+07/13/83 by Matthew Pierret:  Changed all internal subroutine names to be 
+            uppercase. Adopted the convention of prefixing variable names 
+            declared in subroutines with the initials of the subroutine.
+            Added an ERROR_RETURN subroutine which takes an error code, sets
+            p_code to the value of the error code, and non-locally goes to
+            the return statement in the main procedure. Changed all subroutines
+            to call ERROR_RETURN when encountering an error and removed passing
+            of error codes, allowing callers of subroutines to assume that if
+            control is returned, no errors were encountered.
+03/14/84 by Lindsey L. Spratt:  Fixed GET_*CI_HEADER programs to allow for
+            branch CI's with key_range.first = key_range.last = 0.
+03/23/84 by Matthew Pierret:  Changed to get a pointer to a control interval
+            (node) in a file instead of setting up a CI buffer. Converted all
+            file access to this direct access method, including those that
+            were previously buffered and those that were previously standard.
+            Changed all modifications of the value of current_node_id to be 
+            done by the subroutine GET_NEW_NODE, which sets current_node_id and
+            current_node_ptr synchronously. Removed SETUP_NODE_BUFFER,
+            GET_NEW_BUFFERED_KEY and GET_BUFFERED_CI_HEADER.
+04/09/84 by Matthew Pierret:  Changed to access control intervals directly
+            instead of calling collection_manager_$simple_get_buffered_element.
+            This means that the subroutines GET_CI_HEADER and GET_NEW_KEY now
+            have sufficient knowledge about the format of control intervals to
+            find where keys and headers are stored.  This drastic step is taken
+            because this module is in a critical path and its performance is
+            very important to performance of the index_manager_. Also changed
+            these two subroutines to be completely parameterized.
+04/20/84 by Matthew Pierret:  Changed calls to
+            data_format_util_$compare_vector_to_string to be calls to the
+            internal subroutine COMPARE_VECTOR_TO_STRING, which is contained
+            in the include file dm_comp_vec_str_proc.incl.pl1.  Changed the
+            names of variables which were passed to dfu_$cvts to the names
+            expected by COMPARE_VECTOR_TO_STRING as global variables
+            simulating parameters.
+05/04/84 by Matthew Pierret:  Changed to FIELD_TABLE_VERSION_3.
+05/10/84 by Matthew Pierret:  Changed to align local_key_buffer on an even
+            word boundary.  Changed references to data_mgmt_util_ to be to
+            data_format_util_.
+05/23/84 by Lindsey L. Spratt:  Fixed a reference to field_table.version in a
+            sub_err_ call to use the cvs_p_field_table_ptr as it was supposed
+            to.
+10/12/84 by Matthew Pieret:  Changed to use the new dm_cm_basic_ci and
+            dm_cm_basic_ci_const include files.
+10/28/84 by Lindsey L. Spratt:  Changed to use version 2 index_opening_info,
+            and version 4 index_header.  Added some internal procedures to
+            help clarify the top level algorithm.
+10/30/84 by Lindsey L. Spratt:  Introduced the only_want_key_equal_to_vector
+            and want_highest_equal_key flags, derived from the other want_*
+            flags.  Remodularized the ANALYZE_RESULTS internal proc.
+11/08/84 by Lindsey L. Spratt:  Added documentation to the internal
+            procedures.  Moved the local variable initialization into an
+            internal program.
+11/14/84 by Lindsey L. Spratt:  Change REPOSITION_CURSOR to use its rp_code
+            instead of the global code variable.  Added the failed_exact_match
+            flag.  Changed REPORT_PREVIOUS_KEY to set the p_key_id.index to 0
+            when there is no previous key.  Fixed INIT_POSITION_STACK to do a
+            RETURN when the "least key" is after the end of the index and
+            therefore no searching is possible.  Changed INIT_POSITION_STACK
+            to use its own ips_code instead of the global code variable.
+            Fixed the setting of only_want_key_equal_to_vector.
+01/10/85 by Lindsey L. Spratt:  Changed the position_stack inversion in the
+            INIT_TOP_DOWN block of INIT_POSITION_STACK to only loop through
+            half of the position_stack.  As it was, the stack was being
+            inverted twice.  Changed SKIP_DEGENERATE_NODE to use
+            current_depth=max(current_depth -1,1) rather than just
+            "=current_depth".
+	  Fixed parent_idx setting in FIND_NEXT_BRANCH.
+02/15/85 by Lindsey L. Spratt:  Changed test after BRANCH_KEY_LOOP in
+	  FIND_NEXT_BRANCH to be "cvs_p_vector_less_than_key |
+	  ^want_highest_equal_key" instead of "cvs_p_vector_less_than_key |
+	  cvs_p_first_inequal_field_id <= number_of_fields_in_vector |
+	  want_highest_equal_key".
+03/07/85 by R. Michael Tague:  Changed opening info version to version 3.
+04/19/85 by Lindsey L. Spratt:  Fixed two problems with relative searches.
+            INIT_POSITION was setting element_id.control_interval_id at one
+            point in INIT_TOP_DOWN where it should have been setting
+            element_id.index.  FIND_LEAF_NODE, at the end of the
+            BRANCH_NODE_LOOP, was incorrectly setting the first_idx when the
+            current_node_id = position_stack.id_string.control_interval_id.
+            The proc SET_RELATIVE_FIRST_IDX has been created for setting the
+            first_idx in this case, and SETUP_FIRST_NODE and FIND_LEAF_NODE
+            changed to use it.
+           Fixed REPORT_PREVIOUS_KEY to always check for the previous key
+            being before the logical beginning of the index, as defined by the
+            position_stack, when doing a relative search.
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(87-05-06,Dupuis), approve(87-05-29,MCR7695), audit(87-06-02,Blair),
+     install(87-07-17,MR12.1-1042):
+     Changed the buffer alignment so that branch_key.string would be on a
+     double-word boundary. The key string was being aligned on an odd-word
+     boundary and this was causing bad comparisons when dealing with fields
+     that needed to be aligned on double-word boundaries.
+  2) change(87-11-19,Dupuis), approve(87-12-11,MCR7812), audit(87-12-11,Blair),
+     install(88-01-12,MR12.2-1012):
+     Changed the CURRENT_KEY_SATISFIES_CONSTRAINTS internal proc to correct
+     phx20998. When the vector was less than the key, but the number of fields
+     matching was equal to the index_header.number_of_duplication_fields, the
+     subroutine was determining that they weren't equal. This wasn't true,
+     because the tuple ids were the only fields that were inequal.
+  3) change(88-06-24,Dupuis), approve(88-08-31,MCR7974), audit(88-09-01,Blair),
+     install(88-09-06,MR12.2-1099):
+     Changed the FIND_NEXT_BRANCH to correctly get the correct branch in all
+     cases. See phx21803 for complete details.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style2,ind3 */
+
+im_basic_search:
+   proc (p_index_opening_info_ptr, p_index_cursor_ptr, p_is_relative_search, p_position_stack_ptr,
+        p_want_key_equal_to_vector, p_want_keys_greater_than_vector, p_want_keys_less_than_vector, p_typed_vector_ptr,
+        p_key_id_string, p_leaf_ci_header_ptr, p_code);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+      dcl	    p_index_opening_info_ptr
+			       ptr parameter;
+      dcl	    p_index_cursor_ptr     ptr parameter;
+      dcl	    p_is_relative_search   bit (1) aligned parameter;
+      dcl	    p_position_stack_ptr   ptr parameter;
+      dcl	    (p_want_key_equal_to_vector, p_want_keys_less_than_vector, p_want_keys_greater_than_vector)
+			       bit (1) aligned parameter;
+      dcl	    p_typed_vector_ptr     ptr parameter;
+      dcl	    p_key_id_string	       bit (36) aligned parameter;
+      dcl	    p_leaf_ci_header_ptr   ptr parameter;
+      dcl	    p_maximum_duplication_field
+			       fixed bin parameter;
+      dcl	    p_key_string_ptr       ptr parameter;
+      dcl	    p_key_string_length    fixed bin (24) parameter;
+      dcl	    p_code	       fixed bin (35) parameter;
+
+/* Automatic */
+
+      dcl	    cvs_p_field_table_ptr  ptr;
+      dcl	    cvs_p_simple_typed_vector_ptr
+			       ptr;
+      dcl	    cvs_p_key_string_ptr   ptr;
+      dcl	    cvs_p_key_string_length
+			       fixed bin (35);
+      dcl	    cvs_p_last_field_idx   fixed bin (17);
+      dcl	    cvs_p_first_inequal_field_id
+			       fixed bin (17);
+      dcl	    cvs_p_vector_equal_to_key
+			       bit (1) aligned;
+      dcl	    cvs_p_vector_less_than_key
+			       bit (1) aligned;
+      dcl	    cvs_p_code	       fixed bin (35);
+
+      dcl	    (want_key_equal_to_vector, want_keys_greater_than_vector, want_keys_less_than_vector,
+	    only_want_key_equal_to_vector, want_highest_equal_key, is_relative_search, is_reposition, is_insertion,
+	    failed_exact_match)    bit (1) aligned init ("0"b);
+      dcl	    position_stack_ptr     ptr init (null);
+      dcl	    (high_duplication_field, low_duplication_field)
+			       fixed bin init (0);
+
+      dcl	    is_first_pass_through_loop
+			       bit (1) aligned;
+
+      dcl	    current_depth	       fixed bin init (0);
+      dcl	    first_idx	       fixed bin;
+      dcl	    equal_idx	       fixed bin init (0);
+      dcl	    low_idx	       fixed bin;
+      dcl	    high_idx	       fixed bin;
+      dcl	    current_idx	       fixed bin;
+      dcl	    parent_idx	       fixed bin init (-1);
+      dcl	    depth_idx	       fixed bin (17) init (0);
+
+      dcl	    number_of_fields_in_vector
+			       fixed bin (35) init (0);
+
+      dcl	    parent_node_id	       fixed bin (24) unsigned init (0);
+      dcl	    current_node_id	       fixed bin (24) unsigned;
+      dcl	    less_branch_id	       fixed bin (24) unsigned;
+
+      dcl	    key_id_ptr	       ptr;
+      dcl	    current_node_ptr       ptr;
+
+      dcl	    local_header_buffer    bit (max (LEAF_CI_HEADER_LENGTH_IN_BITS, BRANCH_CI_HEADER_LENGTH_IN_BITS)) aligned;
+      dcl	    local_key_buffer       (DOUBLE_WORDS_PER_PAGE) fixed bin (71);
+      dcl	    local_key_id_string    bit (36) aligned init ("0"b);
+      dcl	    temp_id_string	       bit (36) aligned init ("0"b);
+
+/* Based */
+
+      dcl	    1 position_stack       aligned based (position_stack_ptr),
+	      2 depth	       fixed bin (17),
+	      2 id_string	       (10) bit (36) aligned;
+
+      dcl	    1 p_key_id	       like element_id based (key_id_ptr);
+
+/* Builtin */
+
+      dcl	    (addcharno, addr, addrel, ceil, divide, length, max, null, string, unspec)
+			       builtin;
+
+/* Controlled */
+/* Constant */
+
+      dcl	    (
+	    ALL_FIELDS_ARE_PRESENT init (-1),
+	    BYTES_PER_WORD	       init (4),
+	    BITS_PER_BYTE	       init (9),
+	    DOUBLE_WORDS_PER_PAGE  init (512)
+	    )		       fixed bin (17) unal internal static options (constant);
+      dcl	    myname	       init ("im_basic_search") char (16) internal static options (constant);
+
+/* Entry */
+
+      dcl	    im_validate_cursor     entry (ptr, ptr, fixed bin (35));
+      dcl	    data_format_util_$compare_string_to_string
+			       entry (ptr, ptr, fixed bin (24), ptr, fixed bin (24), fixed bin unal, fixed bin,
+			       bit (1) aligned, bit (1) aligned, fixed bin (35));
+
+      dcl	    im_set_cursor$at_current
+			       entry (ptr, bit (36) aligned, ptr, fixed bin (24), fixed bin (35));
+      dcl	    im_set_cursor$no_current
+			       entry (ptr, bit (36) aligned, ptr, fixed bin (24), fixed bin (35));
+      dcl	    im_set_cursor$at_beginning
+			       entry (ptr, bit (36) aligned, ptr, fixed bin (24), fixed bin (35));
+      dcl	    im_set_cursor$at_end   entry (ptr, bit (36) aligned, ptr, fixed bin (24), fixed bin (35));
+
+      dcl	    sub_err_	       entry options (variable);
+
+/* External */
+
+      dcl	    (
+	    error_table_$unimplemented_version,
+	    vd_error_$wrong_type,
+	    dm_error_$key_not_found,
+	    dm_error_$bad_first_key_idx,
+	    dm_error_$bad_last_key_idx,
+	    dm_error_$bad_parent_thread,
+	    dm_error_$long_return_element,
+	    dm_error_$no_element,
+   	    dm_error_$programming_error
+	    )		       fixed bin (35) ext;
+
+/* END OF DECLARATIONS */
+
+      want_key_equal_to_vector = p_want_key_equal_to_vector;
+      want_keys_less_than_vector = p_want_keys_less_than_vector;
+      want_keys_greater_than_vector = p_want_keys_greater_than_vector;
+      is_relative_search = p_is_relative_search;
+      position_stack_ptr = p_position_stack_ptr;
+      cvs_p_simple_typed_vector_ptr = p_typed_vector_ptr;
+      if cvs_p_simple_typed_vector_ptr -> simple_typed_vector.type ^= SIMPLE_TYPED_VECTOR_TYPE
+      then call sub_err_ (vd_error_$wrong_type, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected a simple_typed_vector, type ^d, structure. Received type ^d.", SIMPLE_TYPED_VECTOR_TYPE,
+	      cvs_p_simple_typed_vector_ptr -> simple_typed_vector.type);
+
+      key_id_ptr = addr (p_key_id_string);
+      goto JOIN;
+
+insert:
+   entry (p_index_opening_info_ptr, p_index_cursor_ptr, p_typed_vector_ptr, p_key_id_string, p_maximum_duplication_field,
+        p_leaf_ci_header_ptr, p_code);
+      is_insertion = "1"b;
+      want_key_equal_to_vector = "1"b;
+      want_keys_less_than_vector = "0"b;
+      want_keys_greater_than_vector = "0"b;
+      is_relative_search = "0"b;
+      position_stack_ptr = null;
+      cvs_p_simple_typed_vector_ptr = p_typed_vector_ptr;
+      if cvs_p_simple_typed_vector_ptr -> simple_typed_vector.type ^= SIMPLE_TYPED_VECTOR_TYPE
+      then call sub_err_ (vd_error_$wrong_type, myname, "s", null, 0,
+	      "^/Expected a simple_typed_vector, type ^d, structure. Received type ^d.", SIMPLE_TYPED_VECTOR_TYPE,
+	      cvs_p_simple_typed_vector_ptr -> simple_typed_vector.type);
+
+      key_id_ptr = addr (p_key_id_string);
+      goto JOIN;
+
+reposition:
+   entry (p_index_opening_info_ptr, p_index_cursor_ptr, p_key_string_ptr, p_key_string_length, p_code);
+      index_opening_info_ptr = p_index_opening_info_ptr;
+
+      key_id_ptr = addr (local_key_id_string);
+      local_key_id_string = p_index_cursor_ptr -> index_cursor.key_id_string;
+
+      is_reposition = "1"b;
+      want_key_equal_to_vector = "1"b;
+      want_keys_less_than_vector = "0"b;
+      want_keys_greater_than_vector = "0"b;
+      is_relative_search = "0"b;
+      position_stack_ptr = null;
+      cvs_p_simple_typed_vector_ptr = null;
+      goto JOIN;
+%page;
+JOIN:
+      call INITIALIZE_LOCAL_VARIABLES ();
+
+      call SETUP_FIRST_NODE ();
+
+      if ^common_ci_header.is_leaf
+      then call FIND_LEAF_NODE ();
+
+      call FIND_LEAF_KEY ();
+
+      call ANALYZE_RESULTS ();
+
+      if is_reposition
+      then call REPOSITION_CURSOR ();
+      else if p_leaf_ci_header_ptr ^= null
+      then p_leaf_ci_header_ptr -> leaf_ci_header = leaf_ci_header;
+
+
+      if failed_exact_match | p_key_id.index = 0
+      then call ERROR_RETURN (dm_error_$key_not_found);
+      else call RETURN ();
+
+MAIN_RETURN:
+      return;
+
+RETURN:
+   proc ();
+      p_code = 0;
+      goto MAIN_RETURN;
+   end RETURN;
+
+
+ERROR_RETURN:
+   proc (er_code);
+
+      dcl	    er_code	       fixed bin (35);
+
+      p_code = er_code;
+      goto MAIN_RETURN;
+
+   end ERROR_RETURN;
+
+/* Internal procedure description:
+
+          This program decides how to report the results of the search
+     through the index.  The global variables which are its "output" are:
+     code, p_key_id, and p_maximum_duplication_field.
+*/
+
+ANALYZE_RESULTS:
+   proc ();
+
+      if CURRENT_KEY_SATISFIES_CONSTRAINTS ()
+      then p_key_id = element_id;
+      else if only_want_key_equal_to_vector
+      then call REPORT_FAILED_EXACT_MATCH ();
+      else if want_keys_greater_than_vector
+      then call REPORT_NEXT_KEY ();
+      else call REPORT_PREVIOUS_KEY ();
+   end ANALYZE_RESULTS;
+
+
+
+/* Internal procedure description:
+
+          This program verifies that the current node's recorded parent key is
+     the same key as the one from which the search just came.  If not, there
+     is a problem in the structure of the index.
+*/
+
+CHECK_PARENT_THREAD:
+   proc (cpt_parent_node_id, cpt_parent_idx, cpt_header_parent_id_string);
+
+      dcl	    cpt_parent_node_id     fixed bin (24) unsigned;
+      dcl	    cpt_parent_idx	       fixed bin;
+      dcl	    cpt_header_parent_id_string
+			       bit (36) aligned;
+
+
+      if addr (cpt_header_parent_id_string) -> element_id.control_interval_id ^= cpt_parent_node_id
+	 | addr (cpt_header_parent_id_string) -> element_id.index ^= cpt_parent_idx
+      then call sub_err_ (dm_error_$bad_parent_thread, myname, "h", null, 0,
+	      "^/The child node's recorded parent is node ^d, slot index ^d.
+The actual parent is node ^d, slot index ^d.", addr (cpt_header_parent_id_string) -> element_id.control_interval_id,
+	      addr (cpt_header_parent_id_string) -> element_id.index, cpt_parent_node_id, cpt_parent_idx);
+
+   end CHECK_PARENT_THREAD;
+
+
+
+CHECK_VERSION:
+   proc (p_received_version, p_expected_version, p_structure_name);
+      dcl	    p_received_version     char (8) aligned parameter;
+      dcl	    p_expected_version     char (8) aligned parameter;
+      dcl	    p_structure_name       char (*);
+
+      if p_received_version ^= p_expected_version
+      then call sub_err_ (error_table_$unimplemented_version, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected version ^a of the ^a structure.
+Received version ^a instead.", p_expected_version, p_structure_name, p_received_version);
+
+   end CHECK_VERSION;
+
+
+
+/* Internal procedure description:
+
+          This program determines if the key pointed at at the end of the
+     search is a key which satisfies the caller's search constraints.
+*/
+
+CURRENT_KEY_SATISFIES_CONSTRAINTS:
+   proc () returns (bit (1) aligned);
+
+      if is_insertion
+      then if cvs_p_first_inequal_field_id > index_header.number_of_duplication_fields
+	 | cvs_p_vector_equal_to_key
+	 then return (want_key_equal_to_vector);
+
+      if cvs_p_vector_less_than_key
+      then return (want_keys_greater_than_vector);
+      else if cvs_p_vector_equal_to_key | cvs_p_first_inequal_field_id > index_header.number_of_duplication_fields
+      then return (want_key_equal_to_vector);
+      else return (want_keys_less_than_vector);
+
+   end CURRENT_KEY_SATISFIES_CONSTRAINTS;
+%page;
+/* Internal procedure description:
+
+          This program determines if the desired leaf key
+     is present in the current leaf node (located by FIND_LEAF_NODE).
+*/
+
+FIND_LEAF_KEY:
+   proc ();
+      cvs_p_vector_equal_to_key = "0"b;
+
+      low_idx = first_idx - 1;
+      high_idx = leaf_ci_header.common.key_range.last + 1;
+      current_idx = divide (low_idx + high_idx, 2, 17, 0);
+
+      cvs_p_last_field_idx = ALL_FIELDS_ARE_PRESENT;
+      cvs_p_first_inequal_field_id = index_header.number_of_duplication_fields;
+
+LEAF_KEY_LOOP:
+      do while (cvs_p_first_inequal_field_id <= index_header.number_of_duplication_fields & current_idx ^= low_idx);
+
+         call GET_NEW_KEY (current_node_ptr, current_node_id, current_idx, cvs_p_key_string_ptr, cvs_p_key_string_length,
+	    (0), element_id_string);
+
+         if is_reposition
+         then call data_format_util_$compare_string_to_string (cvs_p_field_table_ptr, p_key_string_ptr,
+	         p_key_string_length, cvs_p_key_string_ptr, (cvs_p_key_string_length), (cvs_p_last_field_idx),
+	         cvs_p_first_inequal_field_id, cvs_p_vector_equal_to_key, cvs_p_vector_less_than_key, cvs_p_code);
+         else call COMPARE_VECTOR_TO_STRING ();
+
+         if cvs_p_code ^= 0
+         then call ERROR_RETURN (cvs_p_code);
+
+         if cvs_p_first_inequal_field_id <= index_header.number_of_duplication_fields
+         then
+	  do;
+	     if cvs_p_vector_less_than_key
+	     then
+	        do;
+		 high_duplication_field = cvs_p_first_inequal_field_id - 1;
+		 high_idx = current_idx;
+		 current_idx = divide (low_idx + current_idx, 2, 17, 0);
+	        end;
+	     else if cvs_p_first_inequal_field_id <= number_of_fields_in_vector
+						/* Vector is greater than key, in some field which was tested. */
+	     then
+	        do;
+		 low_duplication_field = cvs_p_first_inequal_field_id - 1;
+		 low_idx = current_idx;
+		 current_idx = divide (high_idx + current_idx, 2, 17, 0);
+	        end;
+	     else if want_highest_equal_key		/* For all tested fields, vector = key. */
+	     then
+	        do;				/* Find the highest key such that  the key <= vector. */
+		 low_idx = current_idx;
+		 current_idx = divide (high_idx + current_idx, 2, 17, 0);
+	        end;
+	     else
+	        do;				/* Find the lowest key such that the key >= vector. */
+		 equal_idx = current_idx;		/* Record that the current key exactly matches the vector. */
+		 high_idx = current_idx;
+		 current_idx = divide (low_idx + current_idx, 2, 17, 0);
+	        end;
+	  end;
+      end LEAF_KEY_LOOP;
+
+      if current_idx < first_idx			/* Vector is less than all of the keys in the leaf ci. */
+      then if current_idx + 1 = equal_idx & only_want_key_equal_to_vector
+	 then
+	    do;
+	       current_idx = equal_idx;
+	       cvs_p_vector_less_than_key = "0"b;
+	       cvs_p_vector_equal_to_key = "1"b;
+	       element_id.index = current_idx;
+	    end;
+	 else
+	    do;
+	       cvs_p_vector_less_than_key = "1"b;
+	       cvs_p_vector_equal_to_key = "0"b;
+	       current_idx = first_idx;
+	       element_id.index = current_idx;
+	    end;
+      else if ^(cvs_p_vector_less_than_key | cvs_p_vector_equal_to_key) & current_idx + 1 = equal_idx
+	 & only_want_key_equal_to_vector
+      then
+         do;
+	  current_idx = equal_idx;
+	  cvs_p_vector_less_than_key = "0"b;
+	  cvs_p_vector_equal_to_key = "1"b;
+	  element_id.index = current_idx;
+         end;
+   end FIND_LEAF_KEY;
+%page;
+/* Internal procedure description:
+
+          This program, given a branch node, finds the leaf node which should
+     contain the desired leaf key.
+*/
+
+FIND_LEAF_NODE:
+   proc ();
+BRANCH_NODE_LOOP:
+      do while (^common_ci_header.is_leaf);
+
+         if is_relative_search
+         then if addr (position_stack.id_string (current_depth)) -> element_id.control_interval_id = current_node_id
+	    then
+	       do;
+		current_idx = addr (position_stack.id_string (current_depth)) -> element_id.index;
+		if current_idx > 0
+		then
+		   do;
+		      call GET_NEW_KEY (current_node_ptr, current_node_id, current_idx, branch_key_ptr, (0),
+			 bk_string_length, element_id_string);
+		      less_branch_id = branch_key.branch_id;
+		   end;
+		else less_branch_id = branch_ci_header.low_branch_id;
+	       end;
+	    else less_branch_id = branch_ci_header.low_branch_id;
+         else less_branch_id = branch_ci_header.low_branch_id;
+						/* The low_idx identifies the highest "key" which is */
+						/* less than or equal to the vector.  To begin with, */
+						/* this is the non-existant key before the first key */
+						/* of the node. */
+         low_idx = first_idx - 1;			/* The high_idx identifies the lowest key which is */
+						/* greater than vector.  To begin with, this is the */
+						/* non-existant key after the last key of the node. */
+         high_idx = branch_ci_header.common.key_range.last + 1;
+
+         current_idx = divide (low_idx + high_idx, 2, 17, 0);
+
+         call FIND_NEXT_BRANCH ();
+
+         if is_relative_search
+         then current_depth = max (current_depth - 1, 1);
+
+
+         call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+	    branch_ci_header_ptr, element_id_string);
+
+         call CHECK_PARENT_THREAD (parent_node_id, parent_idx, common_ci_header.parent_id_string);
+
+         call SKIP_DEGENERATE_NODES ();
+
+         if is_relative_search
+         then if current_node_id = addr (position_stack.id_string (current_depth)) -> element_id.control_interval_id
+	    then call SET_RELATIVE_FIRST_IDX (position_stack_ptr, common_ci_header_ptr, first_idx);
+	    else first_idx = common_ci_header.key_range.first;
+         else first_idx = common_ci_header.key_range.first;
+
+      end BRANCH_NODE_LOOP;
+
+   end FIND_LEAF_NODE;
+%page;
+/* Internal procedure description:
+
+          This program, given a branch node, finds the next branch node
+     indicated by the keys in the given branch node.  Its search algorithm is
+     similar to that used for finding a leaf key in a leaf node
+     (FIND_LEAF_KEY).
+*/
+
+FIND_NEXT_BRANCH:
+   proc ();
+
+      is_first_pass_through_loop = "1"b;
+
+/* if the first_idx is after the end of the key_range, then skip to the next CI. */
+
+      if first_idx < high_idx
+      then
+BRANCH_KEY_LOOP:
+         do while (current_idx ^= low_idx | is_first_pass_through_loop);
+	  is_first_pass_through_loop = "0"b;
+
+	  call GET_NEW_KEY (current_node_ptr, current_node_id, current_idx, branch_key_ptr, (0), bk_string_length,
+	       element_id_string);
+
+	  if is_reposition
+	  then call data_format_util_$compare_string_to_string (cvs_p_field_table_ptr, p_key_string_ptr,
+		  p_key_string_length, addr (branch_key.string), length (branch_key.string),
+		  (branch_key.last_field_idx), cvs_p_first_inequal_field_id, cvs_p_vector_equal_to_key,
+		  cvs_p_vector_less_than_key, cvs_p_code);
+	  else
+	     do;
+	        cvs_p_key_string_ptr = addr (branch_key.string);
+	        cvs_p_key_string_length = length (branch_key.string);
+	        cvs_p_last_field_idx = branch_key.last_field_idx;
+
+	        call COMPARE_VECTOR_TO_STRING ();
+	     end;
+	  if cvs_p_code ^= 0
+	  then call ERROR_RETURN (cvs_p_code);
+
+	  if cvs_p_vector_less_than_key
+	  then
+	     do;
+	        high_idx = current_idx;
+	        current_idx = divide (low_idx + current_idx, 2, 17, 0);
+	     end;
+	  else if cvs_p_first_inequal_field_id <= number_of_fields_in_vector
+	  then
+	     do;
+	        low_idx = current_idx;
+	        less_branch_id = branch_key.branch_id;
+	        current_idx = divide (high_idx + current_idx, 2, 17, 0);
+	     end;
+	  else if want_highest_equal_key
+	  then
+	     do;
+	        low_idx = current_idx;
+	        less_branch_id = branch_key.branch_id;
+	        current_idx = divide (high_idx + current_idx, 2, 17, 0);
+	     end;
+	  else
+	     do;
+	        if ^(cvs_p_vector_equal_to_key & want_key_equal_to_vector)
+	        then call sub_err_ (dm_error_$programming_error, myname, ACTION_CANT_RESTART, null, 0,
+		   "The vector and the key should have been equal.");
+	        if want_key_equal_to_vector & want_keys_greater_than_vector
+	        then do;
+		   high_idx = current_idx;
+		   current_idx = divide (low_idx + current_idx, 2, 17, 0);
+	        end;
+	        else do;
+		   low_idx = current_idx;
+		   less_branch_id = branch_key.branch_id;
+	        end;
+	     end;
+
+         end BRANCH_KEY_LOOP;
+
+      if cvs_p_vector_less_than_key | ^want_highest_equal_key
+      then
+         do;
+	  parent_idx = current_idx;
+	  if parent_idx < common_ci_header.key_range.first
+	  then parent_idx = 0;
+	  parent_node_id = current_node_id;
+	  call GET_NEW_NODE (less_branch_id, current_node_id, current_node_ptr);
+         end;
+      else
+         do;
+
+/* current_idx is not used here to set parent_idx because it can be 1
+slot lower than the actual parent slot (if the case which caused the
+exit from the above loop was the ^want_highest_equal_key case).
+element_id.index is always the index of the last key actually inspected.
+*/
+	  parent_idx = element_id.index;
+	  if parent_idx < common_ci_header.key_range.first
+	  then parent_idx = common_ci_header.key_range.first;
+	  parent_node_id = current_node_id;
+	  call GET_NEW_NODE ((branch_key.branch_id), current_node_id, current_node_ptr);
+         end;
+   end FIND_NEXT_BRANCH;
+%page;
+/* Internal procedure description:
+
+          This routine gets a pointer to the control interval which is used as
+     node gnn_p_node_id.  It also sets gnn_p_current_node_id to this value and
+     returns the value of the pointer in gnn_p_current_node_ptr.  In this way
+     this routine is used as a double-assignment statement, setting the global
+     variables current_node_id and current_node_ptr in tandem. This is to help
+     keep the two in synch. 
+*/
+
+GET_NEW_NODE:
+   proc (gnn_p_node_id, gnn_p_current_node_id, gnn_p_current_node_ptr);
+
+      dcl	    gnn_p_node_id	       fixed bin (24) unsigned;
+      dcl	    gnn_p_current_node_id  fixed bin (24) unsigned;
+      dcl	    gnn_p_current_node_ptr ptr;
+
+      dcl	    gnn_code	       fixed bin (35);
+
+      gnn_p_current_node_id = gnn_p_node_id;
+
+      call collection_manager_$get_control_interval_ptr (index_cursor.file_opening_id, index_cursor.collection_id,
+	 gnn_p_current_node_id, gnn_p_current_node_ptr, gnn_code);
+      if gnn_code ^= 0
+      then call ERROR_RETURN (gnn_code);
+
+      return;
+
+   end GET_NEW_NODE;
+%page;
+/* Internal procedure description:
+
+          This routine copies the element at slot 1 in the control interval
+     pointed to by gch_p_node_ptr to the buffer pointed to by
+     gch_p_common_ci_header_ptr. Slot 1 is reserved for the index control
+     interval header. Of the two output parameters, gch_p_leaf_ci_header_ptr
+     and gch_p_branch_ci_header_ptr, one will be set to null and the other to
+     gch_p_common_ci_header_ptr depending on whether the node is a branch or
+     leaf node.
+*/
+
+GET_CI_HEADER:
+   proc (gch_p_node_ptr, gch_p_node_id, gch_p_common_ci_header_ptr, gch_p_leaf_ci_header_ptr, gch_p_branch_ci_header_ptr,
+        gch_p_header_id_string);
+
+      dcl	    (gch_p_node_ptr, gch_p_common_ci_header_ptr, gch_p_leaf_ci_header_ptr, gch_p_branch_ci_header_ptr)
+			       ptr;
+      dcl	    gch_p_node_id	       fixed bin (24) unsigned;
+      dcl	    gch_p_header_id_string bit (36) aligned;
+
+      dcl	    1 gch_p_header_id      aligned like element_id based (addr (gch_p_header_id_string));
+
+      dcl	    gch_header_length_in_bytes
+			       fixed bin (35);
+      dcl	    gch_header_string      char (gch_header_length_in_bytes) based;
+      dcl	    1 gch_slot	       aligned like datum_slot based (gch_slot_ptr);
+      dcl	    gch_slot_ptr	       ptr;
+
+      gch_p_header_id.control_interval_id = gch_p_node_id;
+      gch_p_header_id.index = 1;
+
+      gch_slot_ptr = addcharno (gch_p_node_ptr, DATUM_POSITION_TABLE_OFFSET_IN_BYTES);
+						/* First slot */
+
+      if gch_slot.offset_in_bytes = FREE_SLOT
+      then call sub_err_ (dm_error_$no_element, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected an index control interval header at the first slot of^/control interval ^d.", gch_p_node_id);
+      if gch_slot.length_in_bits > max (LEAF_CI_HEADER_LENGTH_IN_BITS, BRANCH_CI_HEADER_LENGTH_IN_BITS)
+      then call sub_err_ (dm_error_$long_return_element, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/An index control interval header should be no longer than ^d bits;^/the one in control interval ^d is ^d bits.",
+	      max (LEAF_CI_HEADER_LENGTH_IN_BITS, BRANCH_CI_HEADER_LENGTH_IN_BITS), gch_p_node_id,
+	      gch_slot.length_in_bits);
+
+      gch_header_length_in_bytes = ceil (divide (gch_slot.length_in_bits, BITS_PER_BYTE, 35, 18));
+
+      gch_p_common_ci_header_ptr -> gch_header_string =
+	 addcharno (gch_p_node_ptr, gch_slot.offset_in_bytes) -> gch_header_string;
+
+
+      if gch_p_common_ci_header_ptr -> common_ci_header.is_leaf
+      then
+         do;
+	  gch_p_leaf_ci_header_ptr = gch_p_common_ci_header_ptr;
+	  gch_p_branch_ci_header_ptr = null;
+
+	  if gch_p_leaf_ci_header_ptr -> leaf_ci_header.common.key_range.first < 0
+	  then call ERROR_RETURN (dm_error_$bad_first_key_idx);
+	  else if gch_p_leaf_ci_header_ptr -> leaf_ci_header.common.key_range.last
+	       < gch_p_leaf_ci_header_ptr -> leaf_ci_header.common.key_range.first
+	  then call ERROR_RETURN (dm_error_$bad_last_key_idx);
+         end;
+      else
+         do;
+	  gch_p_leaf_ci_header_ptr = null;
+	  gch_p_branch_ci_header_ptr = gch_p_common_ci_header_ptr;
+
+	  if gch_p_branch_ci_header_ptr -> branch_ci_header.common.key_range.last
+	       < gch_p_branch_ci_header_ptr -> branch_ci_header.common.key_range.first
+	  then call ERROR_RETURN (dm_error_$bad_last_key_idx);
+         end;
+
+      return;
+
+   end GET_CI_HEADER;
+%page;
+/* Internal procedure description:
+     
+          This routine gets a key out of a control interval.  The pointer to
+     the control interval (gnk_p_node_ptr) and the index of the key in the
+     slot table (gnk_p_index) are input. The gnk_p_key_ptr points to a local
+     buffer in which the key will be copied. The two output values are the
+     length of the leaf_key.string (gnk_p_lk_string_length) should the key be
+     a leaf key, and the length of branch_key.string (gnk_p_bk_string_length)
+     should the key be a branch key.  
+*/
+
+GET_NEW_KEY:
+   proc (gnk_p_node_ptr, gnk_p_node_id, gnk_p_index, gnk_p_key_ptr, gnk_p_lk_string_length, gnk_p_bk_string_length,
+        gnk_p_key_id_string);
+
+      dcl	    gnk_p_node_ptr	       ptr;
+      dcl	    gnk_p_node_id	       fixed bin (24) unsigned;
+      dcl	    gnk_p_index	       fixed bin;
+      dcl	    gnk_p_key_ptr	       ptr;
+      dcl	    gnk_p_lk_string_length fixed bin (35);
+      dcl	    gnk_p_bk_string_length fixed bin (35);
+      dcl	    gnk_p_key_id_string    bit (36) aligned;
+
+      dcl	    1 gnk_p_key_id	       aligned like element_id based (addr (gnk_p_key_id_string));
+
+      dcl	    gnk_key_length_in_bytes
+			       fixed bin (35);
+      dcl	    gnk_key_string	       char (gnk_key_length_in_bytes) based;
+      dcl	    1 gnk_slot	       aligned like datum_slot based (gnk_slot_ptr);
+      dcl	    gnk_slot_ptr	       ptr;
+
+      gnk_p_key_id.control_interval_id = gnk_p_node_id;
+      gnk_p_key_id.index = gnk_p_index;
+
+      gnk_slot_ptr =
+	 addcharno (gnk_p_node_ptr, DATUM_POSITION_TABLE_OFFSET_IN_BYTES + BYTES_PER_WORD * (gnk_p_index - 1));
+
+      if gnk_slot.offset_in_bytes = FREE_SLOT
+      then call ERROR_RETURN (dm_error_$no_element);
+      if gnk_slot.length_in_bits > CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES * BITS_PER_BYTE
+      then call ERROR_RETURN (dm_error_$long_return_element);
+
+      gnk_key_length_in_bytes = ceil (divide (gnk_slot.length_in_bits, BITS_PER_BYTE, 35, 18));
+
+      gnk_p_key_ptr -> gnk_key_string = addcharno (gnk_p_node_ptr, gnk_slot.offset_in_bytes) -> gnk_key_string;
+
+      gnk_p_lk_string_length = gnk_slot.length_in_bits;
+      gnk_p_bk_string_length = gnk_slot.length_in_bits - BRANCH_KEY_HEADER_LENGTH_IN_BITS;
+
+      return;
+   end GET_NEW_KEY;
+%page;
+/* Internal procedure description:
+
+          This program sets up the local variables, mostly by copying data
+     from the parameters.  Input structures are checked to ensure that they
+     are of the same version as the structures used by im_basic_search.
+*/
+
+INITIALIZE_LOCAL_VARIABLES:
+   proc ();
+
+      want_highest_equal_key =
+	 (want_keys_less_than_vector & want_key_equal_to_vector)
+	 | (want_keys_greater_than_vector & ^want_key_equal_to_vector);
+      only_want_key_equal_to_vector =
+	 want_key_equal_to_vector & ^(want_keys_less_than_vector | want_keys_greater_than_vector);
+
+      index_opening_info_ptr = p_index_opening_info_ptr;
+      call CHECK_VERSION (index_opening_info.version, INDEX_OPENING_INFO_VERSION_3, "index_opening_info");
+
+      index_header_ptr = index_opening_info.index_header_ptr;
+      call CHECK_VERSION (index_header.version, INDEX_HEADER_VERSION_4, "index_header");
+
+      index_cursor_ptr = p_index_cursor_ptr;
+      if index_cursor.type ^= INDEX_CURSOR_TYPE
+      then call sub_err_ (error_table_$unimplemented_version, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected an index type cursor, cursor type ^d.  Received type ^d instead.", INDEX_CURSOR_TYPE,
+	      index_cursor.type);
+
+      if index_cursor.version ^= INDEX_CURSOR_VERSION_3
+      then call sub_err_ (error_table_$unimplemented_version, myname, ACTION_CANT_RESTART, null, 0,
+	      "^/Expected version ^d of the index_cursor structure. Received version ^d.", INDEX_CURSOR_VERSION_3,
+	      index_cursor.version);
+
+      cvs_p_field_table_ptr = index_opening_info.field_table_ptr;
+
+      if cvs_p_simple_typed_vector_ptr = null
+      then
+         do;
+	  if cvs_p_field_table_ptr -> field_table.version ^= FIELD_TABLE_VERSION_3
+	  then call sub_err_ (error_table_$unimplemented_version, myname, ACTION_CANT_RESTART, null, 0,
+		  "^/Expected version ^a of the field_table structure.  Received version ^a.", FIELD_TABLE_VERSION_3,
+		  cvs_p_field_table_ptr -> field_table.version);
+	  number_of_fields_in_vector = cvs_p_field_table_ptr -> field_table.number_of_fields;
+         end;
+      else number_of_fields_in_vector = cvs_p_simple_typed_vector_ptr -> simple_typed_vector.number_of_dimensions;
+
+      cvs_p_key_string_ptr = addr (local_key_buffer);
+      branch_key_ptr = addrel (cvs_p_key_string_ptr, 1);
+      common_ci_header_ptr = addr (local_header_buffer);
+   end INITIALIZE_LOCAL_VARIABLES;
+%page;
+/* Internal procedure description:
+     
+          This program fills in the values in the position_stack structure.
+     Ths position_stack defines the effective low (left) end of the index,
+     below which (i.e. to the left of which) searches cannot go.  The position
+     stack is only used for relative searches.  It is initialized to point at
+     the key in the index_cursor and each of that key's ancestors (that key's
+     parent key, the parent key's parent key, up to the root parent key).
+
+
+          In the INIT_TOP_DOWN case, there is no known key position in a leaf
+     node stored in the index_cursor, so it is necessary to initialize the
+     position_stack by starting with the first (or last) branch in the root
+     node and working down the tree.  This finds the levels of the position
+     stack in reverse order from the way INIT_BOTTOM_UP finds them, so it's
+     necessary to reverse the elements of the position_stack.
+     
+          In the INIT_BOTTOM_UP case, there is a known key position in a leaf
+     which is the least key value, so the position_stack initialization is
+     done from the leaf node up to the root node.
+     
+*/
+
+
+INIT_POSITION_STACK:
+   proc ();
+      dcl	    ips_code	       fixed bin (35) init (0);
+
+      call im_validate_cursor (index_opening_info_ptr, index_cursor_ptr, ips_code);
+      if ips_code ^= 0
+      then call ERROR_RETURN (ips_code);
+
+      if index_cursor.flags.is_at_end_of_index | index_cursor.flags.is_at_beginning_of_index
+      then
+INIT_TOP_DOWN:
+         do;
+
+
+	  call GET_NEW_NODE ((index_header.root_id), current_node_id, current_node_ptr);
+	  call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+	       branch_ci_header_ptr, element_id_string);
+
+	  do while (^common_ci_header.is_leaf);
+
+	     position_stack.depth = position_stack.depth + 1;
+	     addr (position_stack.id_string (position_stack.depth)) -> element_id.control_interval_id = current_node_id;
+
+	     if index_cursor.flags.is_at_beginning_of_index
+	     then
+	        do;
+		 call GET_NEW_NODE ((branch_ci_header.low_branch_id), current_node_id, current_node_ptr);
+						/* Set current_node_id, current_node_ptr */
+		 addr (position_stack.id_string (position_stack.depth)) -> element_id.index = 0;
+	        end;
+	     else
+	        do;
+		 current_idx = branch_ci_header.common.key_range.last;
+		 addr (position_stack.id_string (position_stack.depth)) -> element_id.index = current_idx;
+		 if current_idx = 0
+		 then call GET_NEW_NODE ((branch_ci_header.low_branch_id), current_node_id, current_node_ptr);
+		 else
+		    do;
+		       call GET_NEW_KEY (current_node_ptr, current_node_id, current_idx, branch_key_ptr, (0),
+			  bk_string_length, element_id_string);
+		       call GET_NEW_NODE ((branch_key.branch_id), current_node_id, current_node_ptr);
+		    end;
+	        end;
+	  end;
+	  position_stack.depth = position_stack.depth + 1;
+	  addr (position_stack.id_string (position_stack.depth)) -> element_id.control_interval_id = current_node_id;
+	  if index_cursor.flags.is_at_beginning_of_index
+	  then addr (position_stack.id_string (position_stack.depth)) -> element_id.index =
+		  common_ci_header.key_range.first;
+	  else addr (position_stack.id_string (position_stack.depth)) -> element_id.index =
+		  common_ci_header.key_range.last;
+
+/*  The position_stack is "upside down" at this point and needs to be inverted,
+to get position_stack(1) to correspond to a position in a leaf node and 
+position_stack(position_stack.depth) to correspond to a position in the root. 
+*/
+
+	  do depth_idx = 1 to divide (position_stack.depth, 2, 35, 0);
+	     temp_id_string = position_stack.id_string (depth_idx);
+	     position_stack.id_string (depth_idx) = position_stack.id_string (position_stack.depth - depth_idx + 1);
+	     position_stack.id_string (position_stack.depth - depth_idx + 1) = temp_id_string;
+	  end;
+
+         end INIT_TOP_DOWN;
+      else
+INIT_BOTTOM_UP:
+         do;
+	  call GET_NEW_NODE ((addr (index_cursor.key_id_string) -> element_id.control_interval_id), current_node_id,
+	       current_node_ptr);
+	  call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+	       branch_ci_header_ptr, element_id_string);
+
+	  position_stack.depth = 1;
+
+	  current_idx = addr (index_cursor.key_id_string) -> element_id.index;
+	  if index_cursor.flags.current_key_exists
+	  then current_idx = current_idx + 1;
+
+	  if current_idx > common_ci_header.key_range.last
+	  then if common_ci_header.next_id > 0
+	       then
+		do;
+		   call GET_NEW_NODE ((common_ci_header.next_id), current_node_id, current_node_ptr);
+		   call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+		        branch_ci_header_ptr, element_id_string);
+		   current_idx = common_ci_header.key_range.first;
+		end;
+	       else
+		do;
+		   p_key_id_string = "0"b;
+		   call RETURN ();
+		end;
+
+	  addr (position_stack.id_string (1)) -> element_id.control_interval_id = current_node_id;
+	  addr (position_stack.id_string (1)) -> element_id.index = current_idx;
+
+	  do while (common_ci_header.parent_id_string ^= "0"b);
+	     position_stack.depth = position_stack.depth + 1;
+	     position_stack.id_string (position_stack.depth) = common_ci_header.parent_id_string;
+
+	     call GET_NEW_NODE ((addr (common_ci_header.parent_id_string) -> element_id.control_interval_id),
+		current_node_id, current_node_ptr);
+	     call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+		branch_ci_header_ptr, element_id_string);
+
+	  end;
+         end INIT_BOTTOM_UP;
+
+      current_depth = position_stack.depth;
+
+   end INIT_POSITION_STACK;
+%page;
+/* Internal procedure description:
+     
+          This program sets up the output parameters of im_basic_search to
+     report the failure of a search for an exact match of the input
+     typed_vector.  This is the expected result for the im_basic_search$insert
+     entry, and the p_key_id and p_maximum_duplication_field output parameters
+     provide important information to the caller.
+*/
+
+REPORT_FAILED_EXACT_MATCH:
+   proc ();
+      failed_exact_match = "1"b;
+
+      if is_insertion
+      then p_maximum_duplication_field = max (high_duplication_field, low_duplication_field);
+
+      if cvs_p_vector_less_than_key
+      then p_key_id = element_id;
+      else
+         do;
+	  p_key_id.control_interval_id = element_id.control_interval_id;
+	  p_key_id.index = current_idx + 1;
+         end;
+   end REPORT_FAILED_EXACT_MATCH;
+%page;
+/* Internal procedure description:
+     
+          This procedure makes p_key_id point at the next key after the one
+     pointed at by element_id (the current key).  This is the result of the
+     search, to be returned to the caller of im_basic_search.
+*/
+
+REPORT_NEXT_KEY:
+   proc ();
+      if element_id.index >= leaf_ci_header.common.key_range.last
+      then
+         do;
+	  p_key_id.control_interval_id = leaf_ci_header.common.next_id;
+	  if leaf_ci_header.common.next_id > 0
+	  then
+	     do;
+	        call GET_NEW_NODE ((leaf_ci_header.common.next_id), current_node_id, current_node_ptr);
+	        call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+		   branch_ci_header_ptr, element_id_string);
+	        p_key_id.index = leaf_ci_header.common.key_range.first;
+	     end;
+	  else p_key_id.index = 0;
+         end;
+      else
+         do;
+	  p_key_id.control_interval_id = element_id.control_interval_id;
+	  p_key_id.index = element_id.index + 1;
+         end;
+
+   end REPORT_NEXT_KEY;
+%page;
+/* Internal procedure description:
+     
+          This procedure makes p_key_id point at the key previous to the one
+     pointed at by element_id (the current key).  This is the result of the
+     search, to be returned to the caller of im_basic_search.
+*/
+
+REPORT_PREVIOUS_KEY:
+   proc ();
+      if is_relative_search
+      then
+         do;
+
+/* It's necessary to check that the "previous" key is not before the logical
+beginning of the index, as defined in position_stack.
+*/
+	  if element_id.control_interval_id
+	       = addr (position_stack.id_string (current_depth)) -> element_id.control_interval_id
+	       & element_id.index <= addr (position_stack.id_string (current_depth)) -> element_id.index
+	  then
+	     do;
+	        p_key_id.control_interval_id = 0;
+	        p_key_id.index = 0;
+	        return;
+	     end;
+         end;
+
+      if element_id.index <= leaf_ci_header.common.key_range.first
+      then
+         do;
+	  p_key_id.control_interval_id = leaf_ci_header.common.previous_id;
+
+	  if leaf_ci_header.common.previous_id > 0
+	  then
+	     do;
+	        call GET_NEW_NODE ((leaf_ci_header.common.previous_id), current_node_id, current_node_ptr);
+	        call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+		   branch_ci_header_ptr, element_id_string);
+	        p_key_id.index = leaf_ci_header.common.key_range.last;
+	     end;
+	  else p_key_id.index = 0;
+         end;
+      else
+         do;
+	  p_key_id.control_interval_id = element_id.control_interval_id;
+	  p_key_id.index = element_id.index - 1;
+         end;
+
+   end REPORT_PREVIOUS_KEY;
+%page;
+/* Internal procedure description:
+     
+          This program changes the index_cursor to point to the new position
+     which is the result of the entire search.
+*/
+
+REPOSITION_CURSOR:
+   proc ();
+      dcl	    rp_code	       fixed bin (35);
+
+      string (index_cursor.flags) = "0"b;
+
+      if ^failed_exact_match
+      then call im_set_cursor$at_current (index_cursor_ptr, unspec (p_key_id), index_cursor.current_key_string_ptr,
+	      (index_cursor.current_key_string_length), rp_code);
+      else if p_key_id.index > leaf_ci_header.common.key_range.last
+      then if leaf_ci_header.common.next_id ^= 0
+	 then
+	    do;
+	       call GET_NEW_NODE ((leaf_ci_header.common.next_id), current_node_id, current_node_ptr);
+	       call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+		  branch_ci_header_ptr, element_id_string);
+
+	       p_key_id.control_interval_id = current_node_id;
+	       p_key_id.index = leaf_ci_header.common.key_range.first;
+	       call im_set_cursor$no_current (index_cursor_ptr, unspec (p_key_id), index_cursor.current_key_string_ptr,
+		  (index_cursor.current_key_string_length), rp_code);
+	    end;
+	 else
+	    do;
+	       p_key_id.index = leaf_ci_header.common.key_range.last;
+	       call im_set_cursor$at_end (index_cursor_ptr, unspec (p_key_id), index_cursor.current_key_string_ptr,
+		  (index_cursor.current_key_string_length), rp_code);
+	    end;
+      else if p_key_id.index = leaf_ci_header.common.key_range.first & leaf_ci_header.previous_id = 0
+      then call im_set_cursor$at_beginning (index_cursor_ptr, unspec (p_key_id), index_cursor.current_key_string_ptr,
+	      (index_cursor.current_key_string_length), rp_code);
+      else call im_set_cursor$no_current (index_cursor_ptr, unspec (p_key_id), index_cursor.current_key_string_ptr,
+	      (index_cursor.current_key_string_length), rp_code);
+      if rp_code ^= 0
+      then call ERROR_RETURN (rp_code);
+   end REPOSITION_CURSOR;
+%page;
+SET_RELATIVE_FIRST_IDX:
+   proc (srfi_p_position_stack_ptr, srfi_p_common_ci_header_ptr, srfi_p_first_idx);
+      dcl	    srfi_p_position_stack_ptr
+			       ptr parm;
+      dcl	    srfi_p_common_ci_header_ptr
+			       ptr parm;
+      dcl	    srfi_p_first_idx       fixed bin parm;
+
+
+      srfi_p_first_idx = addr (srfi_p_position_stack_ptr -> position_stack.id_string (current_depth)) -> element_id.index;
+
+/* For branch nodes, the position_stack index indicates the least branch to be
+searched, and the first_idx should be set to one greater than this index.
+The first_idx is used to indicate the least branch key to be compared against.
+Depending on the result of this comparison, the branch greater or less than
+(the less_branch_id) this "first" branch key may be used.  The branch less
+than the "first" branch key then should be the least branch, that identified
+by the position_stack index.
+
+For leaf nodes, the position_stack index indicates the least key which is a
+valid result.  Keys less than this key logically don't exist in relative
+searches.
+*/
+
+      if ^common_ci_header.is_leaf
+      then srfi_p_first_idx = max (srfi_p_first_idx + 1, srfi_p_common_ci_header_ptr -> common_ci_header.key_range.first);
+
+   end SET_RELATIVE_FIRST_IDX;
+%page;
+/* Internal procedure description:
+
+          This procedure finds the first node to be searched and makes it the
+     current one.  The first node to search in the absolute search case is
+     simply the root node, the first_idx is the key_range.first key in the
+     root node.  In the relative search case, it is necessary to
+     use the position stack to determine where the effective lower limit of
+     the root node is (the value specified in first_idx).
+     
+*/
+
+SETUP_FIRST_NODE:
+   proc ();
+      if is_relative_search
+      then
+         do;
+	  if position_stack.depth = 0
+	  then call INIT_POSITION_STACK ();
+	  else
+	     do;
+	        current_depth = position_stack.depth;
+
+	        call GET_NEW_NODE ((addr (position_stack.id_string (current_depth)) -> element_id.control_interval_id),
+		   current_node_id, current_node_ptr);
+	        call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+		   branch_ci_header_ptr, element_id_string);
+
+	     end;
+
+	  call SET_RELATIVE_FIRST_IDX (position_stack_ptr, common_ci_header_ptr, first_idx);
+         end;
+      else
+         do;
+	  call GET_NEW_NODE ((index_header.root_id), current_node_id, current_node_ptr);
+	  call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+	       branch_ci_header_ptr, element_id_string);
+
+	  first_idx = common_ci_header.key_range.first;
+         end;
+      parent_node_id = current_node_id;
+
+   end SETUP_FIRST_NODE;
+%page;
+/* Internal procedure description:
+
+          This procedure ensures that the current node is either a
+     non-degenerate branch node, or a leaf node.  A degenerte branch node is
+     one which contains no keys and has only a "low_branch", identified by the
+     low_branch_id.  Degenerate branches are skipped by just following the
+     low_branch_id "pointer".  Degenerate branches can be identified by the
+     fact that the key_range.first value in their headers is equal to 0.
+*/
+
+SKIP_DEGENERATE_NODES:
+   proc ();
+
+      do while (^common_ci_header.is_leaf & common_ci_header.key_range.first = 0);
+         parent_node_id = current_node_id;
+         parent_idx = 0;
+
+         call GET_NEW_NODE ((branch_ci_header.low_branch_id), current_node_id, current_node_ptr);
+
+         if is_relative_search
+         then current_depth = max (current_depth - 1, 1);
+
+         call GET_CI_HEADER (current_node_ptr, current_node_id, common_ci_header_ptr, leaf_ci_header_ptr,
+	    branch_ci_header_ptr, element_id_string);
+
+         call CHECK_PARENT_THREAD (parent_node_id, parent_idx, common_ci_header.parent_id_string);
+      end;
+   end SKIP_DEGENERATE_NODES;
+%page;
+%include dm_comp_vec_str_proc;
+%page;
+%include dm_im_cursor;
+%page;
+%include dm_im_ci_header;
+%page;
+%include dm_im_key;
+%page;
+%include dm_element_id;
+%page;
+%include dm_ci_lengths;
+%page;
+%include dm_collmgr_entry_dcls;
+%page;
+%include vu_typed_vector;
+%page;
+%include dm_im_opening_info;
+%page;
+%include dm_im_header;
+%page;
+%include sub_err_flags;
+%page;
+%include dm_field_table;
+%page;
+%include dm_cm_basic_ci;
+%page;
+%include dm_cm_basic_ci_const;
+
+   end im_basic_search;

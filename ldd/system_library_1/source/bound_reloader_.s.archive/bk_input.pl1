@@ -1,0 +1,338 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+%;						/* Tape input procedure for backup system. */
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+bk_input:						/* Created February 1969, R C Daley. */
+     procedure;					/* Modified 7 February 1970, R H Campbell. */
+						/* Modified 10/25/65 by S. Herbst */
+						/* changed to use tape_mult_
+						   9/77 by Noel I. Morris */
+						/* Modified 11/9/77 by Steve Herbst */
+/* Changed to call command_query_ except for "20 unexplained errors" query 02/28/80 S. Herbst */
+/* Modified: 17 October 1980 by G. Palter to obey bk_ss_$preattached */
+/* Attach description changed from char(32) to char(168) to hold user comments 05/14/81 S. Herbst */
+
+dcl (tape_label, first_tape_label) char (64) init ("");
+dcl answer char (64) aligned varying;
+
+dcl (temp, skipped, error_count) fixed binary,
+     nelemt fixed bin (22),
+     code fixed bin (35),
+     attach_descrip char (168),
+     line character (132),
+     yes_sw bit (1),
+    (buffer, tp) pointer;
+
+dcl  iocbp1 ptr static init (null ()),
+    (held, mounted, remount_first_tape) bit (1) static initial ("0"b),
+     blanks char (4) static init ("");			/* To reset tape label */
+
+dcl  buf_size fixed bin;
+dcl  tape_dim_data_$tdcm_buf_size fixed bin external;
+
+dcl  searching_for_header static character (21) initial ("Searching for header.");
+
+dcl  end_of_reel_encountered static character (24) initial ("End of reel encountered.");
+
+dcl  end_of_readable_data static character (21) initial ("End of readable data.");
+
+dcl 1 header aligned static options (constant),		/* Backup logical record header */
+    2 zz1 char (32) init (" z z z z z z z z z z z z z z z z"),
+    2 english char (56) init ("This is the beginning of a backup logical record."),
+    2 zz2 char (32) init (" z z z z z z z z z z z z z z z z");
+
+dcl 1 theader aligned,
+    2 compare,
+      3 zz1 char (32),
+      3 english char (56),
+      3 zz2 char (32),
+    2 hdrcnt fixed bin,
+    2 segcnt fixed bin,
+    2 space (32: 255);
+
+dcl (addr, length, mod, null, rtrim, substr, unspec) builtin;
+
+dcl iox_$error_output ptr ext;
+dcl iox_$user_input ptr ext;
+
+dcl  backup_map_$fs_error_line entry (fixed bin (35), char (*), char (168), char (32)),
+    (backup_map_$tapes, backup_map_$on_line) entry (pointer, fixed binary),
+     command_query_$yes_no entry options (variable),
+    (ioa_$rsnnl, ioa_$nnl, ioa_) entry options (variable),
+     command_query_ entry options (variable),
+     iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35)),
+     iox_$open entry (ptr, fixed bin, bit (1), fixed bin (35)),
+     iox_$close entry (ptr, fixed bin (35)),
+     iox_$detach_iocb entry (ptr, fixed bin (35)),
+     iox_$get_chars entry (ptr, ptr, fixed bin (22), fixed bin (22), fixed bin (35)),
+     iox_$get_line entry (ptr, ptr, fixed bin (22), fixed bin, fixed bin (35)),
+     parse_tape_reel_name_ entry (char (*), char (*));
+
+dcl (error_table_$end_of_info, error_table_$improper_data_format,
+     error_table_$data_improperly_terminated, error_table_$dev_nt_assnd) ext fixed bin; /* File system code. */
+
+/*  */
+
+%include query_info;
+%page;
+%include iox_modes;
+%page;
+%include bk_ss_;
+%page;
+%include backup_control;
+
+/*  */
+
+input_init: entry (istat);				/* entry to initialize backup input procedure */
+
+dcl  istat fixed bin (35);				/* Error code (returned). */
+
+	buffer = addr (line);			/* Set up pointer to buffer for comments. */
+
+	if bk_ss_$preattached
+	then do;					/* caller has already setup I/O switch */
+	     mounted = "1"b;			/* say it's moutned */
+	     iocbp1 = bk_ss_$data_iocb;
+	     istat = 0;
+	end;
+	else if held then istat = 0;			/* -hold last time */
+	else do;
+	     if mounted then call unmount;		/* unmount any previous tapes */
+	     call mount (istat);			/* mount first reload tape(s) */
+	end;
+	return;
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+
+rd_tape:	entry (lblptr, lblcnt, segptr, segcnt, rstat);	/* to get next backup record from tape */
+
+
+dcl  lblptr pointer,				/* pointer to preamble area */
+     lblcnt fixed binary,				/* size of preamble (returned) */
+     segptr pointer,				/* pointer to segment area */
+     segcnt fixed binary,				/* length of segment if any (returned) */
+     rstat fixed bin (35);				/* status code (returned) */
+
+dcl  req fixed bin;
+dcl  header_only fixed bin int static init (1);
+dcl  segment_only fixed bin int static init (2);
+dcl  both fixed bin int static init (3);
+
+
+	if lblptr = null then req = segment_only;
+	else if segptr = null then req = header_only;
+	else req = both;
+
+	if ^mounted then do;			/* Abort if no tape mounted. */
+	     rstat = error_table_$dev_nt_assnd;
+	     return;
+
+	end;
+	buffer = addr (line);			/* Set up pointer to buffer for comments. */
+	skipped, error_count, rstat = 0;
+	if req = segment_only then go to READ_SEG;
+
+getnext:
+	if req = segment_only then do;		/*  must have not found rest of segment */
+	     rstat = 2;
+	     return;
+	end;
+
+	call iox_$get_chars (iocbp1, addr (theader), 128, nelemt, code);
+
+	if code ^= 0 then do;			/* Check for tape reading error */
+	     if code = error_table_$end_of_info then go to eor; /* check end of reel */
+	     go to tsterr;				/* check for further tsterrors */
+	end;
+
+	if unspec (theader.compare) ^= unspec (header) then do;
+	     if skipped = 0 then			/* Is this the first time? */
+		call backup_map_$on_line (addr (searching_for_header), length (searching_for_header));
+	     skipped = skipped + 1;			/* Count this physical record skipped. */
+	     call iox_$get_chars (iocbp1, addr (theader), 896, nelemt, code);
+	     if code = error_table_$end_of_info then go to eor; /* check end of reel */
+	     if code ^= 0 then go to tsterr;		/* check for read error spacing */
+	     go to getnext;				/* try again to read header */
+	end;
+
+	if skipped ^= 0 then do;			/* Did we have to skip any records? */
+	     call ioa_$rsnnl ("^d 256-word blocks skipped.", line, temp, skipped); /* Make up comment. */
+	     call backup_map_$on_line (buffer, temp);	/* Type the comment. */
+	     skipped = 0;				/* Clear the count. */
+
+	end;
+	lblcnt = theader.hdrcnt;			/* pick up preamble length in words */
+	segcnt = theader.segcnt;			/* pick up segment length in words */
+	temp = theader.hdrcnt + 32 + 255;		/* adjust to read preamble to end of physical record */
+	temp = temp - mod (temp, 256) - 32;		/* 32 words have already been read. */
+	call iox_$get_chars (iocbp1, lblptr, temp * 4, nelemt, code);
+
+	if code = error_table_$end_of_info then go to eor; /* check end of reel */
+	if code ^= 0 then go to tsterr;
+	if req = header_only then return;
+						/*  header has been read */
+
+
+READ_SEG:
+	if segcnt > 0 then do;
+	     temp = segcnt + 255;			/* adjust to read segment to end of physical record */
+	     temp = temp - mod (temp, 256);		/* .. */
+	     call iox_$get_chars (iocbp1, segptr, temp * 4, nelemt, code);
+	     if code = error_table_$end_of_info then go to eor; /* check end of reel */
+	     if code ^= 0 then go to tsterr;
+	end;
+	return;					/* exit to caller */
+
+eor:	call backup_map_$on_line (addr (end_of_reel_encountered), length (end_of_reel_encountered));
+	go to remount;				/* go to mount next tape if any */
+
+tsterr:	if code = error_table_$data_improperly_terminated then do;
+	     call backup_map_$on_line (addr (end_of_readable_data), length (end_of_readable_data));
+	     go to remount;				/* go to mount next reel if any */
+	end;
+
+err:	call backup_map_$fs_error_line (code, "bk_input", "primary_reload_tape", "");
+						/* We used to go to remount for code = */
+						/* et_$improper_data_format also, but now */
+						/* we fall thru and eventually query user. */
+						/* It was found that usually the rest */
+						/* of the tape was readable after all. */
+
+	error_count = error_count + 1;		/* bump error count */
+	if error_count > 20 then do;			/* more than 20 successive  unexplained errors */
+	     call backup_map_$fs_error_line (code, bk_ss_$myname, "More than 20 unexplained errors", "");
+	     call command_query_$yes_no (yes_sw, 0, bk_ss_$myname,
+		"20 unrecoverable I/O errors have occurred; the tape is probably unreadable.
+Do you want to try further?",
+		"More than 20 unexplained errors.
+Do you want to try for 20 more?");
+
+	     if ^yes_sw then go to remount;		/* try next tape */
+	     error_count = 0;			/* try 20 more times */
+	end;
+	go to getnext;				/* and try to find next record on this reel */
+
+
+remount:	if bk_ss_$sub_entry then do;			/* get next tape label from tape_entry */
+	     call bk_ss_$control_ptr -> backup_control.tape_entry (tape_label);
+	     if tape_label = "" then go to no_more;
+	     else go to next;
+	end;
+
+	unspec (query_info) = "0"b;
+	query_info.version = query_info_version_5;
+	query_info.yes_or_no_sw = "1"b;
+	query_info.question_iocbp, query_info.answer_iocbp = null;
+
+	call command_query_ (addr (query_info), answer, bk_ss_$myname,
+	     "Are there any more tapes to be reloaded?");
+	if answer = "no" then do;
+no_more:	     rstat = 1;				/* indicate normal termination */
+	     return;
+	end;
+next:	call unmount;				/* unmount current reel(s) */
+	error_count = 0;
+	call mount (rstat);				/* mount next reel(s) if any */
+	if rstat ^= 0 then return;			/* return if no more reels to load */
+	skipped = 0;				/* Reset count of records skipped. */
+	go to getnext;				/* otherwise, continue on new reel(s) */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+input_finish: entry;				/* to terminate reload (by program) */
+	buffer = addr (line);			/* Set up pointer to buffer for comments. */
+	if bk_ss_$preattached then;
+	else if mounted then
+	     if ^bk_ss_$holdsw then call unmount;	/* unmount any reel(s) still mounted */
+	     else if first_tape_label ^= tape_label then do; /* -hold with a multi-volume set */
+		call unmount;			/* dismount last tape */
+		remount_first_tape = "1"b;		/* and mount the first */
+		call mount (rstat);
+		held = "1"b;
+	     end;
+	     else do;
+		held = "1"b;			/* -hold: don't unmount */
+		call iox_$close (iocbp1, code);
+		call iox_$open (iocbp1, Stream_input, "0"b, code);
+	     end;					/* just rewind tape */
+	return;
+						/*  */
+mount:	procedure (mount_status);			/* internal procedure to mount first or next reel(s) */
+
+dcl  mount_status fixed bin (35);			/* Error code (returned). */
+
+	     if remount_first_tape then do;
+		remount_first_tape = "0"b;
+		tape_label = first_tape_label;
+	     end;
+	     else do;
+		if bk_ss_$sub_entry then do;		/* get tape label from tape_entry */
+		     if tape_label = "" then
+			call bk_ss_$control_ptr -> backup_control.tape_entry (tape_label);
+		end;
+		else do;
+		     unspec (query_info) = "0"b;
+		     query_info.version = query_info_version_5;
+		     query_info.suppress_name_sw = "1"b;
+		     query_info.question_iocbp, query_info.answer_iocbp = null;
+		     call command_query_ (addr (query_info), answer, bk_ss_$myname,
+			"Input tape label:");
+		     tape_label = answer;
+		end;
+		if first_tape_label = "" then first_tape_label = tape_label;
+	     end;
+
+	     buf_size = 2080;			/* default is small buffer */
+	     if ^bk_ss_$debugsw then if (bk_ss_$myname = "reload") | (bk_ss_$myname = "iload") then do;
+		     buf_size = 4160;		/* system reload so big buffer */
+		     tape_label = rtrim (tape_label) || ",sys";  /* we want to be a system process */
+		end;
+
+	     tape_dim_data_$tdcm_buf_size = buf_size;
+	     call parse_tape_reel_name_ (tape_label, attach_descrip);
+	     call iox_$attach_ioname ("bk_input_1", iocbp1, "tape_mult_ " || attach_descrip, code);
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "bk_input", "attach bk_input_1", "");
+		go to MOUNT_ERROR;
+	     end;
+	     call iox_$open (iocbp1, Stream_input, "0"b, code);
+	     tape_dim_data_$tdcm_buf_size = 2080;	/* reset */
+	     if code ^= 0 then
+		call backup_map_$fs_error_line (code, "bk_input", "open bk_input_1", "");
+	     else do;
+		call ioa_$rsnnl ("Tape label: ^a.", line, temp, tape_label);
+		call backup_map_$tapes (buffer, temp);
+	     end;
+MOUNT_ERROR:   mount_status = code;
+	     mounted = (code = 0);			/* set mounted switch */
+	end mount;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+unmount:	procedure;				/* internal procedure to unmount current reel(s) */
+	     held = "0"b;
+	     call iox_$close (iocbp1, code);
+	     if code ^= 0 then
+		call backup_map_$fs_error_line (code, "bk_input", "close bk_input_1", "");
+	     call iox_$detach_iocb (iocbp1, code);
+	     if code ^= 0 then
+		call backup_map_$fs_error_line (code, "bk_input", "detach bk_input_1", "");
+	     mounted = "0"b;
+	     call backup_map_$tapes (addr (blanks), 4);	/* Reset label info in map header */
+	end unmount;
+     end bk_input;

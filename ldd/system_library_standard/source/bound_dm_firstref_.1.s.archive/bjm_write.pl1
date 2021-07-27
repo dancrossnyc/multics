@@ -1,0 +1,1024 @@
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+	The bjm_write procedure has entrypoints for each type of before
+     journal write operation.  ANY CHANGES TO BJM_FIND_TXNS_AFTER_CRASH OR
+     BJ_TXTE_UTIL SHOULD BE EXAMINED TO BE SURE THEY AGREE WITH THE
+     MEHCANISMS IN THIS MODULE USED TO WRITE TO BEFORE JOURNALS.  Likewise,
+     any changes to this module may need to be reflected in the above two
+     modules.
+
+LIST OF ENTRYPOINTS:
+
+   aborted_mark     (tid, tix, code)
+   before_image     (fm_uid, fm_oid, ci_no, ci_parts_ptr, time_stamp, code)
+   begin_mark       (tid, tix, bj_oid, code)
+   committed_mark   (tid, tix, code)
+   rolled_back_mark (tid, tix, checkpoint_no, code)
+   fm_rollback_handler
+                    (fm_uid, fm_oid, buff_ptr, buff_byte_len, n_ci_held, time_stamp, code)
+   fm_postcommit_handler
+                    (fm_uid, fm_oid, buff_ptr, buff_byte_len, code)
+
+LIST OF PARAMETERS:
+
+   tid           INPUT   bit (36) aligned         current transaction ID
+   tix           INPUT   fixed bin                current transaction index
+   bj_oid        INPUT   bit (36) aligned         opening ID of a before journal or "0"b
+   checkpoint_no INPUT   fixed bin (35)           number of the checkpoint of previous rollback
+   fm_uid        INPUT   bit (36) aligned         unique ID of protected file being imaged
+   fm_oid        INPUT   bit (36) aligned         opening ID of protected file being imaged
+   ci_no         INPUT   fixed bin (24) unsigned  control interval number in file being imaged
+   ci_parts_ptr  INPUT   pointer                  pointer to ci_parts description structure
+   buff_ptr      INPUT   pointer                  pointer to handler info buffer
+   buff_len      INPUT   fixed bin (17)           length of fm handler image in bytes
+   n_ci_held     INPUT   fixed bin (27)           number of control intervals held
+   time_stamp    OUTPUT  fixed bin (71)           time at which image saved
+   code          OUTPUT  fixed bin (35)           system status code
+
+     This code was originally contained in five separate programs.
+*/
+
+/* HISTORY:
+Written by M. Pandolf, 03/08/83.
+Modified:
+03/28/83 by M. Pandolf:  to align record buffers.
+04/08/83 by M. Pandolf:  to use new validation protocol.
+04/20/83 by M. Pandolf:  to have abort and commit leave TID alone and
+	  to zero the ok_to_write flag.
+04/29/83 by M. Pandolf:  added meters.
+04/30/83 by L. A. Newcomb: fixed VALIDATE_TRANSACTION to goto the local error
+	  exit instead of the non-local one to preserve the status code.
+12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+06/07/84 by Lee Baldwin:  Fixed to call dm_error_$no_current_transaction
+            instead of $bj_no_txn, renamed dm_error_$bj_txt_version_bad to
+            $bj_bad_txt_version.
+10/29/84 by Matthew Pierret:  Changed fm_rollback_mark to fm_rollback_handler.
+            Changed WRITE_COMMITTED_MARK to have no effect on the number of 
+            transactions in the journal if writing a BEGIN_COMMIT mark instead
+            of a COMMIT mark.  The latter case continues to decrease the
+            number of transactions by one.  In the BEGIN_COMMIT case, the
+            number of transactions is decremented later in 
+            bj_txte_util$complex_commit, when it finally writes the
+            COMMIT mark.
+            Changed to set bj_fm_handler_rec.prev_fm_handler_rec_id to
+            ZERO in the WRITE_FM_ROLLBACK_HANDLER, to 
+            bj_txte.last_fm_postcommit_handler_rec_id in 
+            WRITE_FM_POSTCOMMIT_HANDLER.
+            Changed to make WRITE_FM_POSTCOMMIT_HANDLER and
+            WRITE_FM_ROLLBACK_HANDLER increase the number of transactions
+            in the journal by 1 if writing the first record for a transaction.
+03/04/85 by Lee A. Newcomb:  Fixed to not write more than one BEGIN_COMMIT
+            mark.
+03/19/85 by Steve Herbst: Fixed to initialize bjm_data_$bj_code.
+*/
+
+/* format: style4,indattr,ifthenstmt,ifthen,^indcomtxt,idind33 */
+%page;
+/*
+   ************************************************************************
+   **********           BEGIN bjm_write$begin_mark               **********
+   ************************************************************************
+*/
+bjm_write$begin_mark:
+     procedure (p_tid, p_tix, p_bj_oid, p_begin_code);
+
+/* copy parameters and identify self */
+
+	txn_id = p_tid;
+	txn_index = p_tix;
+
+	p_begin_code = 0;
+
+	my_name = BEGIN_ID;
+	return_code_ptr = addr (p_begin_code);
+
+/* before entering BJM environment, obtain a BJ OID */
+
+	if p_bj_oid ^= ZERO
+	     then bj_oid = p_bj_oid;
+	else do;
+	     call before_journal_manager_$get_default_bj (bj_oid, p_begin_code);
+	     if p_begin_code ^= 0
+		then goto bjm_return;
+	end;
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* fill in the transaction table entry */
+
+	call INITIALIZE_TRANSACTION ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_begin_txn =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_begin_txn + 1;
+	bj_ppte_ptr -> bj_ppte.bj_pste_ptr -> bj_pste.meters.n_txn_started =
+	     bj_ppte_ptr -> bj_ppte.bj_pste_ptr -> bj_pste.meters.n_txn_started + 1;
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/*
+   ************************************************************************
+   **********           BEGIN bjm_write$aborted_mark             **********
+   ************************************************************************
+*/
+bjm_write$aborted_mark:
+     entry (p_tid, p_tix, p_abort_code);
+
+/* copy parameters and identify self */
+
+	txn_id = p_tid;
+	txn_index = p_tix;
+
+	p_abort_code = 0;
+
+	my_name = ABORT_ID;
+	return_code_ptr = addr (p_abort_code);
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_abort =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_abort + 1;
+
+/* validate transaction index and ID */
+
+	call VALIDATE_TRANSACTION ();
+
+/* if no record has been written this transaction, then don't now */
+
+	if bj_txte.first_bj_rec_id = ZERO
+	then do;
+	     bj_txte.ok_to_write = NO;
+	     bj_txte.last_completed_operation = ABORTED;
+	     goto bjm_wrap_up;
+	end;
+
+/* make the before journal record and write it */
+
+	call WRITE_ABORTED_MARK ();
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/*
+   ************************************************************************
+   **********           BEGIN bjm_write$before_image             **********
+   ************************************************************************
+*/
+bjm_write$before_image:
+     entry (p_fm_uid, p_fm_oid, p_ci_no, p_ci_parts_ptr, p_bi_time_stamp, p_before_image_code);
+
+/* copy parameters and identify self */
+
+	fm_uid = p_fm_uid;
+	fm_oid = p_fm_oid;
+	ci_no = p_ci_no;
+	ci_parts_ptr = p_ci_parts_ptr;
+	txn_id = dm_data_$current_txn_id;
+	txn_index = dm_data_$current_txn_index;
+
+	p_before_image_code = 0;
+
+	my_name = BEFORE_IMAGE_ID;
+	return_code_ptr = addr (p_before_image_code);
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_before_image =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_before_image + 1;
+
+/* validate transaction index and ID */
+
+	call VALIDATE_TRANSACTION ();
+
+/* make the before journal record and write it */
+
+	call WRITE_BEFORE_IMAGE ();
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/*
+   ************************************************************************
+   **********           BEGIN bjm_write$committed_mark             ********
+   ************************************************************************
+*/
+bjm_write$committed_mark:
+     entry (p_tid, p_tix, p_commit_code);
+
+/* copy parameters and identify self */
+
+	txn_id = p_tid;
+	txn_index = p_tix;
+
+	p_commit_code = 0;
+
+	my_name = COMMIT_ID;
+	return_code_ptr = addr (p_commit_code);
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_commit =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_commit + 1;
+
+/* validate transaction index and ID */
+
+	call VALIDATE_TRANSACTION ();
+
+/* if no record has been written this transaction, then don't now */
+
+	if bj_txte.first_bj_rec_id = ZERO
+	then do;
+	     bj_txte.ok_to_write = NO;
+	     bj_txte.last_completed_operation = COMMITTED;
+	     goto bjm_wrap_up;
+	end;
+
+/* make the before journal record and write it */
+
+	call WRITE_COMMITTED_MARK ();
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/*
+   ************************************************************************
+   **********           BEGIN bjm_write$rolled_back_mark             ******
+   ************************************************************************
+*/
+bjm_write$rolled_back_mark:
+     entry (p_tid, p_tix, p_checkpoint_no, p_rolled_back_code);
+
+/* copy parameters and identify self */
+
+	txn_id = p_tid;
+	txn_index = p_tix;
+	checkpoint_no = p_checkpoint_no;
+
+	p_rolled_back_code = 0;
+
+	my_name = ROLLED_BACK_ID;
+	return_code_ptr = addr (p_rolled_back_code);
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_rb_mark =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_rb_mark + 1;
+
+/* validate transaction index and ID */
+
+	call VALIDATE_TRANSACTION ();
+
+/* if no record has been written this transaction, then don't now */
+
+	if bj_txte.first_bj_rec_id = ZERO
+	     then goto bjm_wrap_up;
+
+/* make the before journal record and write it */
+
+	call WRITE_ROLLED_BACK_MARK ();
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/*
+   ************************************************************************
+   **********        BEGIN bjm_write$fm_rollback_handler         **********
+   ************************************************************************
+*/
+bjm_write$fm_rollback_handler:
+     entry (p_fm_uid, p_fm_oid, p_buff_ptr, p_buff_len, p_n_ci_held, p_fr_time_stamp, p_fm_rollback_code);
+
+/* copy parameters and identify self */
+
+	fm_uid = p_fm_uid;
+	fm_oid = p_fm_oid;
+	buff_ptr = p_buff_ptr;
+	buff_len = p_buff_len;
+	n_ci_held = p_n_ci_held;
+	txn_id = dm_data_$current_txn_id;
+	txn_index = dm_data_$current_txn_index;
+
+	p_fm_rollback_code = 0;
+
+	my_name = FM_ROLLBACK_HANDLER_ID;
+	return_code_ptr = addr (p_fm_rollback_code);
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_fm_rbh =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_fm_rbh + 1;
+
+/* validate transaction index and ID */
+
+	call VALIDATE_TRANSACTION ();
+
+/* make then before journal record and write it */
+
+	call WRITE_FM_ROLLBACK_HANDLER ();
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/*
+   ************************************************************************
+   **********        BEGIN bjm_write$fm_postcommit_handler         ********
+   ************************************************************************
+*/
+bjm_write$fm_postcommit_handler:
+     entry (p_fm_uid, p_fm_oid, p_buff_ptr, p_buff_len, p_fm_postcommit_code);
+
+/* copy parameters and identify self */
+
+	fm_uid = p_fm_uid;
+	fm_oid = p_fm_oid;
+	buff_ptr = p_buff_ptr;
+	buff_len = p_buff_len;
+	txn_id = dm_data_$current_txn_id;
+	txn_index = dm_data_$current_txn_index;
+
+	p_fm_postcommit_code = 0;
+
+	my_name = FM_POSTCOMMIT_HANDLER_ID;
+	return_code_ptr = addr (p_fm_postcommit_code);
+
+/* invoke entry protocol common to all before_journal_manager_ */
+
+	on cleanup call EMERGENCY_CLEANUP ();
+
+	call ENTER_BJM ();
+
+/* meter */
+
+	bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_fm_pc_mark =
+	     bjm_data_$bj_pst_ptr -> bj_pst.meters.n_calls_fm_pc_mark + 1;
+
+/* validate transaction index and ID */
+
+	call VALIDATE_TRANSACTION ();
+
+/* make then before journal record and write it */
+
+	call WRITE_FM_POSTCOMMIT_HANDLER ();
+
+/* go to common wrap up point */
+
+	goto bjm_wrap_up;
+%page;
+/* standard bjm exit sequence, except to set return code */
+
+bjm_wrap_up:
+	bjm_data_$bj_exit_err =
+	     bjm_data_$bj_default_error_label;
+	bjm_data_$bj_operation = "";
+
+bjm_return:
+	return;
+
+bjm_nonlocal_error_exit:
+	code = bjm_data_$bj_code;
+
+bjm_local_error_exit:
+	return_code = code;
+	call EMERGENCY_CLEANUP;
+	goto bjm_return;
+
+%page;
+/* BEGIN INTERNAL SUPPORT PROCEDURES */
+
+ENTER_BJM:					/* procedure to execute standard */
+     procedure ();					/* bjm entry sequence */
+
+	if bjm_data_$bj_operation = ""
+	     then bjm_data_$bj_operation = my_name;
+	else do;
+	     return_code = dm_error_$bj_recursive_invoc;
+	     goto bjm_return;
+	end;
+
+	bjm_data_$bj_exit_err = bjm_nonlocal_error_exit;
+	bjm_data_$bj_code = 0;
+
+	return;
+
+     end ENTER_BJM;
+%page;
+VALIDATE_TRANSACTION:				/* procedure to insure that state of the */
+     procedure ();					/* TXTE is consistent */
+
+/* get to TXT */
+
+	bj_txt_ptr = dm_data_$bj_txt_ptr;
+
+	if bj_txt.version ^= BJ_TXT_VERSION_1
+	then do;
+	     code = dm_error_$bj_bad_txt_version;
+	     goto bjm_local_error_exit;
+	end;
+
+/* validate transaction identifiers */
+
+	if txn_index < 1 | txn_index > dm_system_data_$max_n_transactions | txn_id = ZERO
+	then do;
+	     code = dm_error_$no_current_transaction;
+	     goto bjm_local_error_exit;
+	end;
+
+/* get to TXTE */
+
+	bj_txte_ptr = addr (bj_txt.entry (txn_index));
+
+/* see if a write is pending */
+
+	if bj_txte.append_state.current_operation ^= ""
+	     then call bj_txte_util$synchronize_txte_pste (bj_txte_ptr);
+
+	if bj_txte.tid ^= txn_id
+	then do;
+	     if bj_txte.tid ^= ZERO
+		then code = dm_error_$bj_bad_tid;
+	     else code = dm_error_$no_current_transaction;
+	     goto bjm_local_error_exit;
+	end;
+
+/* have we been called by transaction_manager_ for the same operation twice? */
+
+	if bj_txte.entry_state.ok_to_write = NO
+	then do;
+	     if my_name = COMMIT_ID
+		then if bj_txte.last_completed_operation = COMMITTED
+		     then code = 0;
+		else code = dm_error_$bj_cant_commit;
+	     else if my_name = ABORT_ID
+		then if bj_txte.last_completed_operation = ABORTED
+		     then code = 0;
+		else code = dm_error_$bj_cant_abort;
+	     else code = dm_error_$no_current_transaction;
+
+	     goto bjm_local_error_exit;
+	end;
+
+/* after all is fine, find the PPTE */
+
+	bj_ppte_ptr = bj_txte.ppte_ptr;
+
+	return;
+
+     end VALIDATE_TRANSACTION;
+%page;
+INITIALIZE_TRANSACTION:				/* procedure to  fill txte for new transaction */
+     procedure ();
+
+	bj_txt_ptr = dm_data_$bj_txt_ptr;
+	bj_txte_ptr = addr (bj_txt.entry (txn_index));
+	bj_ppte_ptr = bj_oid_util$get_ptr (bj_oid);
+
+	bj_txte.tid = ZERO;
+	bj_txte.bj_uid = bj_ppte.bj_uid;
+
+	bj_txte.entry_state.ok_to_write = NO;
+
+	bj_txte.owner_info.process_id = bjm_data_$bj_ppt_ptr -> bj_ppt.process_id;
+
+	bj_txte.operator_info.process_id = bj_txte.owner_info.process_id;
+	bj_txte.operator_info.ppte_ptr = bj_ppte_ptr;
+	bj_txte.operator_info.bj_oid = bj_oid;		/* bj_oid must come from parameters */
+
+	unspec (bj_txte.records_info) = ""b;
+
+	bj_txte.append_state.current_operation = "";
+
+	bj_txte.tid = txn_id;
+	bj_txte.entry_state.last_completed_operation = BEGIN_MARK;
+	bj_txte.entry_state.ok_to_write = YES;
+
+	return;
+
+     end INITIALIZE_TRANSACTION;
+%page;
+WRITE_ABORTED_MARK:					/* procedure to format aborted mark and */
+     procedure ();					/* forward it for writing in the journal */
+
+dcl  1 my_bj_aborted_record	        aligned like bj_aborted_rec; /* local copy of aborted mark */
+
+	bj_rec_hdr_ptr = addr (my_bj_aborted_record);
+
+	bj_aborted_rec.type = BJ_RECORD_TYPE.ABORTED;
+	bj_aborted_rec.tid = txn_id;
+	bj_aborted_rec.process_id = bj_txte.owner_info.process_id;
+	bj_aborted_rec.prev_rec_id = bj_txte.last_bj_rec_id;
+	bj_aborted_rec.tx_rec_no = bj_txte.n_rec_written + 1;
+	n_rec_bytes = size (my_bj_aborted_record) * 4;
+
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+	bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + n_rec_bytes;
+
+	call APPEND (addr (my_bj_aborted_record), n_rec_bytes, -1, 0);
+	call bj_txte_util$aborted_mark (bj_txte_ptr);
+
+	return;
+
+     end WRITE_ABORTED_MARK;
+%page;
+WRITE_BEFORE_IMAGE:					/* procedure to format a before image and */
+     procedure ();					/* forward it for writing in the journal */
+
+dcl  default_bj_before_image_space    aligned char (1024);	/* space to build small before image */
+dcl  part_no		        fixed bin;		/* ci part number */
+dcl  part_len		        fixed bin;		/* length of one ci_part, used for based variable one_ci_part */
+dcl  one_ci_part		        char (part_len) based;/* image of the ci_part provided via parameters */
+
+/* if the before image is small enough, we will make it here; if not, grow a frame in which to put it */
+
+	bj_rec_hdr_ptr = addr (default_bj_before_image_space);
+	bj_before_image.n_parts = 1;			/* do this so next statement won't blow up */
+
+	n_rec_bytes = (bin (rel (addr (bj_before_image.part (1)))) -
+	     bin (rel (bj_rec_hdr_ptr))) * 4;		/* length of constant portion of before image record in bytes */
+
+	do part_no = 1 to ci_parts_ptr -> ci_parts.number_of_parts;
+	     n_rec_bytes = n_rec_bytes + 8 + ci_parts_ptr -> ci_parts.part (part_no).length_in_bytes;
+						/* 8 = length of part.offset and part.length */
+	end;
+
+/* determine effect of adding this image to journal upon n_txn in journal */
+
+	if bj_txte.last_bj_rec_id = ZERO
+	     then delta_txn = 1;
+	else delta_txn = 0;
+
+/* see if there is enough space in the internal buffer for the before image */
+
+	if n_rec_bytes > 1024
+	then do;					/* the bj_before_image_rec will be too big for default space */
+
+MAKE_LARGE_BEFORE_IMAGE:
+	     begin;				/* push a stack frame with enough room for before image */
+
+dcl  bj_before_image_space	        aligned char (n_rec_bytes);
+
+		bj_rec_hdr_ptr = addr (bj_before_image_space);
+
+		call FILL_BEFORE_IMAGE ();
+
+		bj_txte.append_state.pending_bj_rec_id = ZERO;
+		bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+		bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + n_rec_bytes;
+
+		call APPEND (bj_rec_hdr_ptr, n_rec_bytes, delta_txn, 1);
+		call bj_txte_util$before_image (bj_txte_ptr);
+
+	     end MAKE_LARGE_BEFORE_IMAGE;
+
+	end;
+
+	else do;
+
+	     call FILL_BEFORE_IMAGE ();
+
+	     bj_txte.append_state.pending_bj_rec_id = ZERO;
+	     bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+	     bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + n_rec_bytes;
+
+	     call APPEND (bj_rec_hdr_ptr, n_rec_bytes, delta_txn, 1);
+	     call bj_txte_util$before_image (bj_txte_ptr);
+
+	end;
+
+/* more meters - here because the quantities are easiest obtained at this point */
+
+	bj_pste_ptr = bj_ppte.bj_pste_ptr;
+	bj_pste.meters.n_bi_written = bj_pste.meters.n_bi_written + 1;
+	bj_pste.meters.n_bi_bytes_written = bj_pste.meters.n_bi_bytes_written + n_rec_bytes;
+
+	p_bi_time_stamp = time_stamp;
+
+	return;
+
+FILL_BEFORE_IMAGE:
+	procedure ();
+
+	     bj_before_image.header.type = BJ_RECORD_TYPE.BEFORE_IMAGE;
+	     bj_before_image.header.tid = txn_id;
+	     bj_before_image.header.process_id = bj_txte.owner_info.process_id;
+	     bj_before_image.header.prev_rec_id = bj_txte.last_bj_rec_id;
+	     bj_before_image.header.tx_rec_no = bj_txte.n_rec_written + 1;
+
+	     bj_before_image.fm_uid = fm_uid;
+	     bj_before_image.fm_oid = fm_oid;
+	     bj_before_image.ci_no = ci_no;
+	     bj_before_image.n_parts = ci_parts_ptr -> ci_parts.number_of_parts;
+
+	     bj_before_image.image_len = 0;		/* initialize running size of before image */
+
+	     do part_no = 1 to ci_parts_ptr -> ci_parts.number_of_parts;
+		bj_before_image.part (part_no).byte_offset = ci_parts_ptr -> ci_parts.part (part_no).offset_in_bytes;
+		part_len = ci_parts_ptr -> ci_parts.part (part_no).length_in_bytes;
+		bj_before_image.part (part_no).byte_length = part_len;
+		bj_before_image_len = bj_before_image.image_len + 1;
+						/* set this value for use in string copying later */
+		bj_before_image.image_len = bj_before_image.image_len + part_len;
+						/* set this value to indicate the actual running size */
+		substr (bj_before_image.image, bj_before_image_len, part_len) =
+		     ci_parts_ptr -> ci_parts.part (part_no).local_ptr -> one_ci_part;
+						/* make a copy of the ci_part.  notice that */
+						/* bj_before_image_len is not being used */
+						/* as the declarations imply */
+	     end;
+
+	     return;
+
+	end FILL_BEFORE_IMAGE;
+
+     end WRITE_BEFORE_IMAGE;
+%page;
+WRITE_COMMITTED_MARK:
+     procedure ();
+
+/* Procedure to format a committed mark and forward it for	*/
+/* writing in the before journal.  If we have written a	*/
+/* BEGIN_COMMIT mark, then we simply call		*/
+/* bj_txte_util$complex_commit and be done with it.	*/
+/* Otherwise we see if we need to write a BEGIN_COMMIT or	*/
+/* simply a COMMIT and then call bj_txte_util.		*/
+
+dcl  1 my_bj_committed_record	        aligned like bj_committed_rec;
+dcl  commit_mark_delta_txn	        fixed bin;		/* Effect on number of transactions in journal: */
+						/* -1 for COMMIT means reduces number by 1,     */
+						/* 0 for BEGIN_COMMIT means has no effect.      */
+
+	bj_rec_hdr_ptr = addr (my_bj_committed_record);
+
+	if bj_txte.last_completed_operation = BJ_RECORD_TYPE.BEGIN_COMMIT then
+	     call bj_txte_util$complex_commit (bj_txte_ptr);
+	else
+DO_COMPLETE_COMMIT_MARK_OPERATION: do;
+	     if bj_txte.last_fm_postcommit_handler_rec_id = ZERO
+	     then do;
+		bj_committed_rec.type = BJ_RECORD_TYPE.COMMITTED;
+		commit_mark_delta_txn = -1;
+	     end;
+	     else do;
+		bj_committed_rec.type = BJ_RECORD_TYPE.BEGIN_COMMIT;
+		commit_mark_delta_txn = 0;
+	     end;
+	     bj_committed_rec.tid = txn_id;
+	     bj_committed_rec.process_id = bj_txte.owner_info.process_id;
+	     bj_committed_rec.prev_rec_id = bj_txte.last_bj_rec_id;
+	     bj_committed_rec.tx_rec_no = bj_txte.n_rec_written + 1;
+	     n_rec_bytes = size (my_bj_committed_record) * 4;
+
+	     bj_txte.append_state.pending_bj_rec_id = ZERO;
+	     bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+	     bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + n_rec_bytes;
+
+	     call APPEND (addr (my_bj_committed_record), n_rec_bytes, commit_mark_delta_txn, 0);
+	     if bj_txte.last_fm_postcommit_handler_rec_id = ZERO
+		then call bj_txte_util$simple_commit (bj_txte_ptr);
+	     else call bj_txte_util$complex_commit (bj_txte_ptr);
+
+	end DO_COMPLETE_COMMIT_MARK_OPERATION;
+
+
+	return;
+
+     end WRITE_COMMITTED_MARK;
+%page;
+WRITE_ROLLED_BACK_MARK:				/* procedure to format rolled_back mark and */
+     procedure ();					/* forward it for writing in the journal */
+
+dcl  1 my_bj_rolled_back_record       aligned like bj_rolled_back_rec; /* local copy of rolled_back mark */
+
+	bj_rec_hdr_ptr = addr (my_bj_rolled_back_record);
+
+	bj_rolled_back_rec.type = BJ_RECORD_TYPE.ROLLED_BACK;
+	bj_rolled_back_rec.tid = txn_id;
+	bj_rolled_back_rec.process_id = bj_txte.owner_info.process_id;
+	bj_rolled_back_rec.prev_rec_id = bj_txte.curr_checkpoint_rec_id;
+	bj_rolled_back_rec.checkpoint_no = 0;
+	bj_rolled_back_rec.last_rolled_back_rec_id = bj_txte.last_bj_rec_id;
+	bj_rolled_back_rec.tx_rec_no = 1;		/* must calculate this when checkpoints are implemented */
+	n_rec_bytes = size (my_bj_rolled_back_record) * 4;
+
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = 1;
+	bj_txte.append_state.pending_n_bytes_written = n_rec_bytes;
+
+	call APPEND (addr (my_bj_rolled_back_record), n_rec_bytes, 0, 0);
+	call bj_txte_util$rolled_back_mark (bj_txte_ptr);
+
+	return;
+
+     end WRITE_ROLLED_BACK_MARK;
+%page;
+WRITE_FM_ROLLBACK_HANDLER:				/* procedure to format fm rollback handler mark and */
+     procedure ();					/* forward it for writing in the journal */
+
+dcl  handler_buffer		        aligned char (512);
+dcl  info_buffer		        char (buff_len) based (buff_ptr);
+dcl  fm_rollback_delta_n_txn	        fixed bin;
+
+	if bj_txte.last_bj_rec_id = ZERO
+	     then fm_rollback_delta_n_txn = 1;
+	else fm_rollback_delta_n_txn = 0;
+
+	bj_rec_hdr_ptr = addr (handler_buffer);
+
+	bj_fm_handler_rec.type = BJ_RECORD_TYPE.FM_ROLLBACK_HANDLER;
+	bj_fm_handler_rec.tid = txn_id;
+	bj_fm_handler_rec.process_id = bj_txte.owner_info.process_id;
+	bj_fm_handler_rec.prev_rec_id = bj_txte.last_bj_rec_id;
+	bj_fm_handler_rec.prev_rec_byte_size = 0;	/* not used */
+	bj_fm_handler_rec.tx_rec_no = bj_txte.n_rec_written + 1;
+
+	bj_fm_handler_rec.fm_uid = fm_uid;
+	bj_fm_handler_rec.fm_oid = fm_oid;
+	bj_fm_handler_rec.prev_fm_handler_rec_id = ZERO;
+	bj_fm_handler_rec.info_len = buff_len;
+
+	bj_fm_handler_rec.info_bytes = buff_ptr -> info_buffer;
+
+	n_rec_bytes = (size (bj_rec_hdr) * 4) +
+	     16 +					/* size of constant portion of bj_fm_handler */
+	     buff_len;
+
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+	bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + n_rec_bytes;
+
+	call APPEND (bj_rec_hdr_ptr, n_rec_bytes, fm_rollback_delta_n_txn, n_ci_held);
+	call bj_txte_util$fm_rollback_handler (bj_txte_ptr);
+
+	p_fr_time_stamp = time_stamp;
+
+	return;
+
+     end WRITE_FM_ROLLBACK_HANDLER;
+%page;
+WRITE_FM_POSTCOMMIT_HANDLER:				/* procedure to format fm postcommit handler mark and */
+     procedure ();					/* forward it for writing in the journal */
+
+dcl  handler_buffer		        aligned char (512);
+dcl  info_buffer		        char (buff_len) based (buff_ptr);
+dcl  fm_postcommit_delta_n_txn        fixed bin;
+
+	if bj_txte.last_bj_rec_id = ZERO
+	     then fm_postcommit_delta_n_txn = 1;
+	else fm_postcommit_delta_n_txn = 0;
+
+	bj_rec_hdr_ptr = addr (handler_buffer);
+
+	bj_fm_handler_rec.type = BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER;
+	bj_fm_handler_rec.tid = txn_id;
+	bj_fm_handler_rec.process_id = bj_txte.owner_info.process_id;
+	bj_fm_handler_rec.prev_rec_id = bj_txte.last_bj_rec_id;
+	bj_fm_handler_rec.prev_rec_byte_size = 0;	/* not used */
+	bj_fm_handler_rec.tx_rec_no = bj_txte.n_rec_written + 1;
+
+	bj_fm_handler_rec.fm_uid = fm_uid;
+	bj_fm_handler_rec.fm_oid = fm_oid;
+	bj_fm_handler_rec.prev_fm_handler_rec_id = bj_txte.records_info.last_fm_postcommit_handler_rec_id;
+	bj_fm_handler_rec.info_len = buff_len;
+
+	bj_fm_handler_rec.info_bytes = buff_ptr -> info_buffer;
+
+	n_rec_bytes = (size (bj_rec_hdr) * 4) +
+	     16 +					/* size of constant portion of bj_fm_handler */
+	     buff_len;
+
+/* bj_txte.append_state was verified quiesed previously: use it without checking */
+
+	bj_txte.append_state.pending_bj_rec_id = ZERO;
+	bj_txte.append_state.pending_n_rec_written = bj_txte.records_info.n_rec_written + 1;
+	bj_txte.append_state.pending_n_bytes_written = bj_txte.records_info.n_bytes_written + n_rec_bytes;
+
+	call APPEND (bj_rec_hdr_ptr, n_rec_bytes, fm_postcommit_delta_n_txn, 0);
+	call bj_txte_util$fm_postcommit_handler (bj_txte_ptr);
+
+	return;
+
+     end WRITE_FM_POSTCOMMIT_HANDLER;
+%page;
+APPEND:						/* procedure to write a record in the before journal */
+     procedure (p_rec_ptr, p_n_bytes, p_delta_txn, p_delta_image);
+
+dcl  p_rec_ptr		        pointer;		/* points to record to be written */
+dcl  p_n_bytes		        fixed bin;		/* size of record in bytes */
+dcl  p_delta_txn		        fixed bin;		/* effect this record has on number of txn in journal */
+dcl  p_delta_image		        fixed bin (27);	/* change in number of before images when record written */
+
+/* change append_state to WRITE_PENDING by setting current_operation */
+
+	bj_txte.append_state.current_operation = p_rec_ptr -> bj_rec_hdr.type;
+
+/* call upon external service routine to change append_state */
+
+	call bj_storage_append (bj_txte.bj_oid, p_rec_ptr, p_n_bytes,
+	     p_delta_txn, p_delta_image,
+	     bj_txte.append_state.pending_bj_rec_id, time_stamp);
+
+	return;
+
+     end APPEND;
+
+EMERGENCY_CLEANUP:					/* procedure to reset bjm static storage */
+     procedure ();
+
+dcl  cleanup_code		        fixed bin (35);	/* local status code */
+
+	call bj_cleanup_tables$handler (cleanup_code);
+
+	bjm_data_$bj_operation = "";
+	bjm_data_$bj_exit_err =
+	     bjm_data_$bj_default_error_label;
+
+	return;
+
+     end EMERGENCY_CLEANUP;
+
+%page;
+
+/* DECLARATIONS */
+
+/* Parameters - see description in program header comments */
+
+dcl  p_tid		        bit (36) aligned parameter;
+dcl  p_tix		        fixed bin parameter;
+dcl  p_bj_oid		        bit (36) aligned parameter;
+dcl  p_checkpoint_no	        fixed bin (35) parameter;
+dcl  p_fm_uid		        bit (36) aligned parameter;
+dcl  p_fm_oid		        bit (36) aligned parameter;
+dcl  p_ci_no		        fixed bin (24) unsigned parameter;
+dcl  p_ci_parts_ptr		        pointer parameter;
+dcl  p_buff_ptr		        pointer parameter;
+dcl  p_buff_len		        fixed bin parameter;
+dcl  p_n_ci_held		        fixed bin (27) parameter;
+dcl  p_bi_time_stamp	        fixed bin (71) parameter;
+dcl  p_fr_time_stamp	        fixed bin (71) parameter;
+dcl  p_abort_code		        fixed bin (35) parameter;
+dcl  p_before_image_code	        fixed bin (35) parameter;
+dcl  p_begin_code		        fixed bin (35) parameter;
+dcl  p_commit_code		        fixed bin (35) parameter;
+dcl  p_rolled_back_code	        fixed bin (35) parameter;
+dcl  p_fm_rollback_code	        fixed bin (35) parameter;
+dcl  p_fm_postcommit_code	        fixed bin (35) parameter;
+
+/* Automatic */
+
+dcl  txn_id		        bit (36) aligned;	/* copy of parameter */
+dcl  txn_index		        fixed bin;		/* copy of parameter */
+dcl  bj_oid		        bit (36) aligned;	/* copy of parameter */
+dcl  checkpoint_no		        fixed bin (35);	/* copy of parameter */
+dcl  fm_uid		        bit (36) aligned;	/* copy of parameter */
+dcl  fm_oid		        bit (36) aligned;	/* copy of parameter */
+dcl  ci_no		        fixed bin (24) unsigned; /* copy of parameter */
+dcl  buff_ptr		        pointer;		/* copy of parameter */
+dcl  buff_len		        fixed bin;		/* copy of parameter */
+dcl  n_ci_held		        fixed bin (27);	/* copy of parameter */
+dcl  time_stamp		        fixed bin (71);	/* copy of parameter */
+dcl  code			        fixed bin (35);	/* local status code */
+dcl  my_name		        char (32);		/* ID of operation */
+dcl  return_code_ptr	        pointer;		/* pointer to current return code, set at each entrypoint */
+dcl  n_rec_bytes		        fixed bin;		/* number of bytes in record, including header */
+dcl  delta_txn		        fixed bin;		/* change in number of transaction in journal */
+
+/* Static, External */
+
+dcl  dm_data_$current_txn_id	        bit (36) aligned external static;
+dcl  dm_data_$current_txn_index       fixed bin external static;
+dcl  dm_data_$bj_txt_ptr	        pointer external static;
+dcl  bjm_data_$bj_ppt_ptr	        pointer external static;
+dcl  bjm_data_$bj_pst_ptr	        pointer external static;
+dcl  dm_error_$no_current_transaction fixed bin (35) external static;
+dcl  dm_error_$bj_bad_txt_version     fixed bin (35) external static;
+dcl  dm_error_$bj_bad_tid	        fixed bin (35) external static;
+dcl  dm_error_$bj_recursive_invoc     fixed bin (35) external static;
+dcl  dm_error_$bj_cant_abort	        fixed bin (35) external static;
+dcl  dm_error_$bj_cant_commit	        fixed bin (35) external static;
+
+/* Based */
+
+dcl  return_code		        fixed bin (35) based (return_code_ptr); /* overlays parameter return codes */
+
+/* Constant */
+
+dcl  ABORT_ID		        char (32) internal static options (constant)
+			        init ("write_aborted_mark");
+dcl  BEFORE_IMAGE_ID	        char (32) internal static options (constant)
+			        init ("write_before_image");
+dcl  BEGIN_ID		        char (32) internal static options (constant)
+			        init ("write_begin_mark");
+dcl  COMMIT_ID		        char (32) internal static options (constant)
+			        init ("write_committed_mark");
+dcl  ROLLED_BACK_ID		        char (32) internal static options (constant)
+			        init ("write_rolled_back_mark");
+dcl  FM_ROLLBACK_HANDLER_ID	        char (32) internal static options (constant)
+			        init ("write_fm_rollback_handler");
+dcl  FM_POSTCOMMIT_HANDLER_ID	        char (32) internal static options (constant)
+			        init ("write_fm_postcommit_handler");
+dcl  ZERO			        bit (36) aligned internal static options (constant)
+			        init ((36)"0"b);
+dcl  YES			        bit (1) aligned internal static options (constant)
+			        init ("1"b);
+dcl  NO			        bit (1) aligned internal static options (constant)
+			        init ("0"b);
+
+/* Entry */
+
+dcl  before_journal_manager_$get_default_bj entry (bit (36) aligned, fixed bin (35));
+dcl  bj_storage_append	        entry (bit (36) aligned, ptr, fixed bin, fixed bin, fixed bin (27), bit (36) aligned, fixed bin (71));
+dcl  bj_cleanup_tables$handler        entry (fixed bin (35));
+dcl  bj_oid_util$get_ptr	        entry (bit (36) aligned) returns (ptr);
+dcl  bj_txte_util$synchronize_txte_pste entry (ptr);
+dcl  bj_txte_util$before_image        entry (ptr);
+dcl  bj_txte_util$aborted_mark        entry (ptr);
+dcl  bj_txte_util$simple_commit       entry (ptr);
+dcl  bj_txte_util$complex_commit      entry (ptr);
+dcl  bj_txte_util$rolled_back_mark    entry (ptr);
+dcl  bj_txte_util$fm_rollback_handler entry (ptr);
+dcl  bj_txte_util$fm_postcommit_handler entry (ptr);
+
+/* Builtin */
+
+dcl  addr			        builtin;
+dcl  bin			        builtin;
+dcl  rel			        builtin;
+dcl  size			        builtin;
+dcl  substr		        builtin;
+dcl  unspec		        builtin;
+
+/* Condition */
+
+dcl  cleanup		        condition;
+
+/* Include Files */
+
+%page;
+%include dm_bj_global_error_info;
+%page;
+%include dm_bj_ppt;
+%page;
+%include dm_bj_txt;
+%page;
+%include dm_bj_static;
+%page;
+%include dm_bj_records;
+%page;
+%include dm_ci_parts;
+%page;
+%include dm_bj_pst;
+%page;
+%include dm_bj_pste;
+%page;
+
+     end bjm_write$begin_mark;

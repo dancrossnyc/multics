@@ -1,0 +1,1359 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* Modified: 15 Feb 1978 by PCK to implement options(main) and the stop statement */
+/* Modified 790807 by PG to remove jump_three_way */
+
+optimizer: proc(root);
+
+dcl	root ptr;		/* points at root block node */
+dcl	(blk,stm,p,q) ptr;
+dcl	set_level fixed bin;
+dcl	(doing_loop,inhibit_walk,state_is_discarded) bit(1) aligned;
+dcl	statement_type bit(9) aligned;
+dcl	pl1_stat_$cur_statement ptr ext static;
+dcl	pl1_stat_$stop_id bit(27) ext static;
+dcl	(ioa_,ioa_$nnl) entry options(variable), debug entry();
+dcl	(s_list,p_list,free,freec,p_tail,freep,freep_tail,l_list) ptr int static;
+
+dcl	n fixed bin(15);
+
+dcl	1 primary		based aligned,
+	2 node_type	bit(9) unaligned,
+	2 reserved	bit(12) unaligned,
+	2 number		fixed binary(14) unaligned,
+	2 computation	ptr unaligned,
+	2 statement	ptr unaligned,
+	2 last		ptr unaligned,
+	2 next		ptr unaligned;
+
+dcl	1 secondary	based aligned,
+	2 node_type	bit(9) unaligned,
+	2 reserved	bit(12) unaligned,
+	2 number		fixed binary(14) unaligned,
+	2 operation	ptr unaligned,
+	2 primary		ptr unaligned,
+	2 last		ptr unaligned,
+	2 next		ptr unaligned;
+
+dcl	1 chain		based aligned,
+	2 node_type	bit(9) unaligned,
+	2 reserved	bit(12) unaligned,
+	2 number		fixed binary(14) unaligned,
+	2 value		ptr unaligned,
+	2 next		ptr unaligned initial(null);
+
+dcl	(null,string,substr) builtin;
+
+%include language_utility;
+%include block;
+%include statement;
+%include operator;
+%include symbol;
+%include boundary;
+%include label;
+%include list;
+%include reference;
+%include op_codes;
+%include statement_types;
+%include nodes;
+
+begin:
+	inhibit_walk = "0"b;
+	set_level = 0;
+	s_list,p_list,free,freec,p_tail,freep,freep_tail,l_list=null;
+	blk=root->block.son;
+scan:
+	do while(blk->block.son ^= null);
+	blk=blk->block.son;
+	end;
+statements:
+	doing_loop = "0"b;
+	do stm = blk->block.prologue, blk->block.main;
+	state_is_discarded = "0"b;
+	do stm = stm repeat stm->statement.next while(stm^=null);
+	pl1_stat_$cur_statement = stm;
+	if string(stm -> statement.source_id) = string(pl1_stat_$stop_id)
+	then do;
+		call ioa_$nnl("optimizer at ^p: ^a^/DB ",stm,decode_node_id(stm,"0"b));
+		call debug;
+	     end;
+	statement_type = stm->statement.statement_type;
+	if statement_type = entry_statement
+	     then do;
+		call clear;
+		state_is_discarded = "0"b;
+		end;
+	     else if statement_type ^= procedure_statement
+		then if statement_type ^= format_statement
+		then do;
+		     if stm->statement.labels ^= null
+		     then do;
+			call intersection(stm,1);	/* order of calls is crucial */
+			call intersection(stm,2);	/* leave proper info on prim's for cg 
+						   or create new state */
+			end;
+		     if ^ state_is_discarded
+			then call reduce(stm->statement.root,stm,"0"b,"0"b);
+		     if statement_type = return_statement | statement_type = stop_statement
+		     then state_is_discarded = "1"b;
+		     else if statement_type = begin_statement
+			then call erase;
+		     end;
+	end;
+	end;
+	call clear;
+
+/* process the list of loop operators */
+
+	p = l_list;
+	do while(p ^= null);
+	     doing_loop = "1"b;
+	     q = p -> chain.value;
+	     call reduce(q->operand(1),q,"0"b,"0"b);
+	     call clear;
+	     if p -> chain.next = null
+	     then do;
+		p -> chain.next = freec;
+		freec = l_list;
+		l_list = null;
+		go to next_block;
+		end;
+	     p = p -> chain.next;
+	     end;
+
+/* set blk to point to the next block node. */
+
+next_block:
+	if blk->block.brother ^= null
+		then blk=blk->block.brother;
+		else if blk->block.father ^= null
+			then do;
+				blk=blk->block.father;
+				go to statements;
+			     end;
+			else return;
+	go to scan;
+
+
+/* this routine walks down the tree matching all computations against the primary list,
+and entering all reducible computations into the primary list if they are not already
+there.  If an operator or reference node matches a computation in the primary list,
+the parent node is modified to refer to the node that is in the primary list, and the
+reference count of that node is increased by one.  The reference count, if any,
+in the matching node is decreased by one and ,if possible, the node is freed.
+All operators which could alter the value of a variable are recognized
+and any computation which depends on these variables is removed from the primary list.  */
+
+/* inhibit is an input parameter used to prevent commoning or entry onto the
+   primary list of any node contained in a loop subtree.
+
+   irreducible is an output parameter set when an operator node is found to be
+   irreducible.  An operator is irreducible if it:
+
+	1. is a call to an irreducible entry.
+	2. produces side effects or output that depends on something
+	   other than its formal input.
+	3. contains any of the above.
+
+irreducible_op is a local variable used to determine if a given node is an irreducible
+operator.  If it is irreducible it is not put on the primary list, but contained
+subexpression may be put on the list if they are not themselves irreducible.
+
+The top operaotor of an argument subexpression is never commoned
+or put on the primary list, but it is not considered irreducible in the
+sense that it does not make its containing operator irreducible.  This
+is because if the containing operator is a reducible function the
+programmer has declared that the function won't alter its argument.  If
+the containing operator is an irreducible function, we don't need to
+pass back this information.  Since at the level where
+we process the argument, we don't know wheither or not the containing
+function is reducible, we don't set the irreducible bit for the
+top operator of an argument.
+
+Before the code_generator phase, reference.inhibit = "1"b means that the reference
+is the base of a defined variable (used for its address not its value) and should
+not be commoned.  This prevents conversion of the reference to a temporary by the
+code generator, which would destroy the address.
+
+Note that a given invocation of reduce cannot return unless it is at the bottom of the tree
+or has just called erase or has been commoned.  This insures that all set contexts
+are scanned.  A commoned subtree cannot contain a set context because if it did, it
+would be irreducible and therefore not in the primary list.  */
+
+reduce: proc(pt,parent,irreducible,inhibit);
+
+dcl	pt ptr unaligned;
+dcl	(parent,p,q,p1,p2,p3,s1,tp) ptr;
+dcl	(i,j)fixed bin(15);
+dcl	opcode bit(9) aligned;
+dcl	(irreducible,sets_operand1,inhibit,signal_op,new_primary,
+	irreducible_op,jump_op,irreducible_entry,addr_op,
+	sets_reference,irreducible_sons,inhibit_sons,irreducible_2)
+	bit(1) aligned;
+
+
+begin:
+	p = pt;
+	if p=null then return;
+	if p->node.type = reference_node
+		then do;
+			p1 = p->reference.symbol;
+			if p1->node.type = symbol_node
+			     then do;
+
+				/* The aliasable bit of a reference node means that the storage
+				   identified by this reference is potentially accessable via
+				   another name, this is a potential alias.  The circumstances
+				   that cause the aliasable bit of the symbol node to be set are:
+
+					The variable is used as an argument to addr.
+					(note that put string(x), read into(x),  read or locate set(x)
+					all take addr of x.)
+					The variable is the base of a defined variable.
+					The variable is defined.
+					The variable is based.
+					The variable is external.
+					The variable is a parameter.
+					The variable is passed as an argument by_reference and is static or controlled.
+
+				The reference is aliasable (potentially aliased) if its symbol node
+				has the aliasable bit or if it is a reference to a nonlocal automatic
+				variable that is passed as an argument by_reference.  */
+
+				p->reference.aliasable = p1->symbol.aliasable|
+					(p1->symbol.auto&(blk^=p1->symbol.block_node)&p1->symbol.passed_as_arg);
+
+				/* this code is executed to exclude from optimization those simple references
+				   that are done by the code generator.  If they were included here,
+				   the size of the tree would be very large.  */
+
+				if p->reference.offset=null
+				     then if p->reference.qualifier=null
+					then if p->reference.length=null
+					     then if p1->symbol.temporary
+						then return;
+						else if p->reference.units=word_ | p->reference.units=0
+						     then if p -> reference.ref_count = 0
+							then if ^ (p1->symbol.packed & p1->symbol.member)
+							     then if p = p1 -> symbol.reference
+								then return;
+								else do;
+								     p2 = p1 -> symbol.reference;
+								     if compare_expression(p,p2)
+									then pt = p2;
+								     return;
+								     end;
+				end;
+
+/* search the primary list for a previously computed instance of this reference.  */
+
+			q = p_list;
+			if ^inhibit
+			then if ^ p->reference.inhibit
+			then do;
+			do while(q^=null);
+			p2 = q -> primary.computation;
+			if p = p2
+			   then return;
+			   else if compare_expression(p2,p)
+			     then do;
+
+/* replace this reference with the previously computed one.  */
+
+				pt = p2;
+				p2->reference.ref_count = p2->reference.ref_count+1;
+				call adjust_count(p);
+				return;
+				end;
+			q = q->primary.next;
+			end;
+			end;
+
+/* determine the reducibility of this reference while reducing its sons.  */
+
+			irreducible_op = "0"b;
+			if ^ inhibit_walk
+			then if ^p->reference.shared		/* shared references have no sons */
+			     then do;
+				call reduce_ref_sons(p,irreducible_op);
+				end;
+			irreducible = irreducible|irreducible_op;
+			if inhibit|irreducible_op|p->reference.inhibit then return;
+
+/* no temporaries can go on the primary list */
+
+			if p1 -> node.type = symbol_node
+			then if p1 -> symbol.temporary
+			     then return;
+
+/* only unshared references should go on the primary list */
+
+			if p -> reference.shared
+			then do;
+			     p = copy_expression((p));
+			     p -> reference.shared = "0"b;
+			     p -> reference.ref_count = 1;
+			     pt = p;
+			     end;
+
+/* put this reference on the primary list.  */
+
+			q = create_node(p_list,1);
+			q->primary.computation = p;
+			q->primary.statement = pl1_stat_$cur_statement;
+			call record_secondaries(p,1);
+			return;
+		     end;
+	if p->node.type = list_node
+		then do;
+			do i = 1 to p->list.number;
+			call reduce(p->list.element(i),p,irreducible,inhibit);
+			end;
+			return;
+		     end;
+	if p->node.type ^= operator_node then return;
+
+/* join operators should be handled like list nodes except that they are always irreducible */
+
+	opcode = p->operator.op_code;
+
+	if opcode = join
+		then do;
+			do i = 1 to p->operator.number;
+			call reduce(p->operator.operand(i),p,irreducible,inhibit);
+			end;
+			irreducible = "1"b;
+			return;
+		     end;
+
+/* classify this operator and determine if it is irreducible.  */
+
+	jump_op = opcode>=jump & opcode<=jump_if_ge;
+	signal_op = opcode=record_io|opcode=allot_ctl|opcode=signal_on|opcode=terminate_trans|opcode=stream_prep|
+		opcode=open_file|opcode=close_file|opcode=allot_based|(opcode>=get_list_trans & opcode<=put_data_trans)|
+		opcode=lock_fun|opcode=stacq_fun;
+	irreducible_op = signal_op|jump_op|p->operator.number=0|opcode=return_words|
+		(opcode>=return_bits & opcode<=allot_auto)|opcode=free_ctl|
+		(opcode>=empty_area & opcode<=vclock_fun)|(opcode>=loop & opcode<=nop);
+	sets_operand1 = ^(opcode=return_words|opcode=return_bits|opcode=return_string|opcode=std_entry|
+		jump_op|p->operator.number=0|(opcode>=loop & opcode<=nop));
+	addr_op = opcode = addr_fun | opcode = addr_fun_bits;
+
+	if addr_op
+	     then addr_op = p -> operand(2) -> node.type = reference_node;
+
+	irreducible = irreducible|irreducible_op;
+
+
+/* search the primary list for a previously computed instance of this operator.
+   If one is found, make the parent of this node point to it. */
+
+
+	q=p_list;
+	if ^(inhibit|irreducible_op|parent->node.type = list_node)
+	then do;
+	do while(q^=null);
+	p2 = q -> primary.computation;
+	if p = p2
+	     then return;
+	     else if compare_expression(p2,p)
+		then do;
+			p1 = p2->operand(1);
+			if p1->reference.shared
+				then do;
+					p1,p2->operand(1) = copy_expression((p1));
+					p1->reference.shared = "0"b;
+					p1->reference.ref_count = 1;
+				     end;
+			pt = p2;
+			p1->reference.ref_count = p1->reference.ref_count+1;
+			call adjust_count(p);
+			return;
+		     end;
+	q=q->primary.next;
+	end;
+	end;
+
+/* If the operator can produce a signal that is allowed to alter storage and return,
+   process it as if it was a call to an external entry.  */
+
+	if signal_op
+	     then do;
+		irreducible_sons = "0"b;
+
+		if opcode = get_data_trans
+		     then do;
+			if p->operand(1) = null
+			     then call erase;		/* this is get data;  */
+			     else do;
+				p = p->operand(1);		/* join operator */
+				do i = 1 to p->operator.number;
+				call set((p->operand(i)));
+				end;
+				end;
+			call external_call;
+			return;
+			end;
+
+		if opcode = get_edit_trans | opcode = get_list_trans
+		     then do;
+			call reduce(p->operand(1),p,irreducible_op,inhibit);
+			q = p->operand(2);
+			if ^ q -> reference.shared
+			     then call reduce_ref_sons(q,irreducible_sons);
+			call set(q);
+			call external_call;
+			call check_and_reduce_target(2 /* ,q,p,irreducible_sons */);
+			return;
+			end;
+
+		if opcode = allot_ctl
+		     then do;
+			call reduce(p -> operand(2),p,irreducible_op,inhibit);
+			call set((p->operand(1)));
+			call external_call;
+			call reduce(p->operand(1),p,irreducible_op,inhibit);
+			return;
+			end;
+
+		if opcode = allot_based
+		then do;
+		     q = p -> operand(1);
+
+		     /* set option evaluated first and only once */
+
+		     if ^ q -> reference.shared
+			then call reduce_ref_sons(q,irreducible_sons);
+
+		     /* operations after this point may be retried */
+
+		     call external_call;
+
+		     call reduce(p -> operand(2),p,irreducible_op,inhibit);
+
+		     if p -> operand(3) ^= null
+		     then do;
+			call reduce(p -> operand(3),p,irreducible_op,inhibit);
+			call set((p -> operand(3)));
+			end;
+
+		     call set(q);
+		     call external_call;
+		     call check_and_reduce_target(1 /* ,q,p,irreducible_sons */);
+		     return;
+		     end;
+
+		if opcode = lock_fun | opcode = stacq_fun
+		then do;
+		     do i = 2 to p->operator.number;
+			call reduce(p->operand(i),p,irreducible_op,inhibit);
+			end;
+
+		     q = p -> operand(1);
+		     if ^ q -> reference.shared
+			then call reduce_ref_sons(q,irreducible_sons);
+
+		     if opcode = stacq_fun
+			then call set((p -> operand(2)));
+			else call external_call;
+		     call set(q);
+
+		     call check_and_reduce_target(1 /* ,q,p,irreducible_sons */);
+		     return;
+		     end;
+
+		do i = 1 to p->operator.number;
+		call reduce(p->operand(i),p,irreducible_op,inhibit);
+		end;
+		call external_call;
+		return;
+		end;
+
+/* all operators processed after this point do not produce conditions of interest to the optimizer.  */
+
+	if opcode = free_based
+	then do;
+	     call reduce(p -> operand(2),p,irreducible_op,inhibit);
+	     call reduce_ref_sons((p -> operand(1)),irreducible_op);
+
+	     if p -> operand(3) ^= null
+	     then do;
+		call reduce(p -> operand(3),p,irreducible_op,inhibit);
+		call set((p -> operand(3)));
+		end;
+
+	     /* last block of code here is nonstandard and corresponds to runtime action */
+
+	     if p -> operand(1) -> reference.qualifier -> node.type = reference_node
+		then call set((p -> operand(1) -> reference.qualifier));
+
+	     return;
+	     end;
+
+	if opcode = fortran_read
+	     then do;
+		do i = 1 to 9;
+		call reduce(p->operand(i),p,irreducible_op,inhibit);
+		end;
+		p1 = p->operand(10);
+		if p1 ^= null		/* check for an I/O list */
+		     then do i = 1 to p1->list.number;
+			call set((p1->list.element(i)));
+			call reduce(p1->operand(i),p1,irreducible_op,inhibit);
+			end;
+		return;
+		end;
+
+/* reduce the second operand of all non-addr_op operators that have at least two operands. 
+  (we omit reduction of the second operand of addr_ops to avoid code optimizations
+   for short strings done by the code generator) */
+
+	if p->operator.number >= 2
+	then if ^ addr_op
+	     then do;
+		irreducible_2 = "0"b;
+		call reduce(p -> operand(2),p,irreducible_2,inhibit);
+		irreducible_op = irreducible_op | irreducible_2;
+		end;
+	     else do;
+		tp = p -> operand(2);
+		tp->reference.aliasable = tp->reference.symbol->symbol.aliasable;
+		if ^ tp -> reference.shared
+		     then call reduce_ref_sons(tp,irreducible_op);
+		end;
+
+	if opcode = std_call
+	then do;
+
+/* Calls to internal procedures and entry variables may set anything.  Calls to external
+   entries can set: arguments passed by reference, aliased variables, and variables declared in a flush_at_call block.
+   The flush_at_call bit indicates that this block contains an on-unit, or an
+   internal procedure whose name is assigned or passed as an argument.  Therefore,
+   any call out from this block could result in the invocation of the on-unit or
+   internal procedure and could set any variable known to this block.  */
+
+/* The operands of a std_call operator are processed somewhat differently than the
+   operands of other operators.  We want to reduce the arguments of the call before
+   flushing the primary list, but we do not want to actually reduce a reference
+   node being passed as an argument until after the primary list is cleared
+   (because of some code optimizations done by the code generator).  The solution
+   we adopt is to reduce any length, qualifier, or offset expression on
+   a reference before clearing primary list and to not reduce the reference at
+   all. */
+
+/* the top operator of an argument expression passed to an irreducible entry cannot
+be commoned because it is usable as a variable in the called procedure.  */
+
+	     p3 = p->operand(2);
+	     if p3->node.type = reference_node
+		then irreducible_entry = p3->reference.symbol->symbol.irreducible;
+		else irreducible_entry = "1"b;
+
+	     irreducible_op = irreducible_op|irreducible_entry;
+	     if irreducible_entry
+	     then do;
+		p3 = p -> operand(3);
+		if p3 ^= null
+		then do;
+		     q = p3 -> operand(2);
+
+		     do i = 1 to q -> list.number;
+			tp = q -> element(i);
+			if tp -> node.type ^= reference_node
+			then call reduce(q -> element(i),q,irreducible_op,inhibit);
+			else do;
+			     if ^ tp -> reference.shared
+				then call reduce_ref_sons(tp,irreducible_op);
+			     end;
+			end;
+		     end;
+
+		q = p -> operand(2);
+		if q -> node.type = operator_node then q = q -> operand(1);
+		q = q -> reference.symbol;
+
+		if q -> symbol.variable | q -> symbol.internal | q->symbol.temporary
+		then do;
+		     call erase;
+		     end;
+		else do;
+		     if p3 ^= null
+		     then do;
+			q = p3 -> operand(2);
+
+			do i = 1 to q -> list.number;
+			     tp = q->list.element(i);
+			     if tp->node.type = reference_node
+				then call set(tp);
+			     end;
+
+			end;
+		     call external_call;
+		     end;
+
+		end;
+
+	     else do;
+		p3 = p -> operand(3);
+		if p3 ^= null
+		     then call reduce(p3 -> operand(2),p3,irreducible_op,inhibit);
+		end;
+
+	     end;
+
+/* reduce operands 3 through n for all operators that have them, except std_call.  */
+
+	if opcode ^= std_call
+	     then do i = 3 to p->operator.number;
+	          call reduce(p->operand(i),p,irreducible_op,inhibit);
+	          end;
+
+
+
+/* If this operator is reducible and stores its output into operand1, put it on the primary list. */
+
+	inhibit_sons = inhibit;
+	sets_reference,
+	irreducible_sons,
+	new_primary = "0"b;
+	if sets_operand1
+	     then if p->operator.operand(1) ^= null
+		then if p->operator.operand(1)->node.type = reference_node
+		     then do;
+
+			/* we must reduce descendents of operand(1) before it is set */
+
+			sets_reference = "1"b;
+			q = p->operand(1);
+			if ^ q->reference.shared
+			then do;
+			     call reduce_ref_sons(q,irreducible_sons);
+			     inhibit_sons = inhibit_sons | irreducible_sons;
+			     irreducible_op = irreducible_op | irreducible_sons;
+			     end;
+
+			if ^(irreducible_op | inhibit | parent->node.type = list_node)
+			then do;
+				new_primary = "1"b;
+				p1=create_node(p_list,1);
+				p1->primary.computation = p;
+				p1->primary.statement = pl1_stat_$cur_statement;
+				call record_secondaries(p,2); /* record all but operand 1 as secondaries. */
+				if ^ q->reference.shared
+				     then call record_secondaries(q,0); /* record descendents of opnd1
+								   as secondaries */
+			     end;
+			end;
+
+/* If the operator places its output into a variable the variable must be processed
+   by the "set" routine to purge the primary list of any computation that depends on
+  the value of this variable.  NOTE:  we must set the reference's aliasable bit
+  here, because it may not yet have been reduced */
+
+	if sets_reference
+	     then do;
+		if q->reference.symbol->node.type = symbol_node
+		then if ^(q->reference.symbol->symbol.temporary
+			|q->reference.symbol->symbol.return_value)
+			then do;
+			     s1 = q -> reference.symbol;
+			     q -> reference.aliasable = s1 -> symbol.aliasable |
+				(s1->symbol.auto&(blk^=s1->symbol.block_node)&s1->symbol.passed_as_arg);
+
+			     call set(q);
+
+			     if ^ q->reference.shared
+			     then if ^ inhibit_sons
+				then inhibit_sons = inhibit_sons | sons_were_set(q);
+			     end;
+		end;
+
+
+
+/* if this operator was entered on the primary list, record operand 1 as a secondary.
+   This strange order is necessary to insure that i=i+1 is not retained as a primary,
+   but a=b+c is retained.  Futhermore, a=b+c;a=10; must flush the add operator.  */
+
+	if new_primary
+	     then if p_list ^= null
+		then if p_list->primary.computation = p
+			     then if ^p->operand(1)->reference.symbol->symbol.temporary
+				then call record_secondaries((p->operand(1)),-1);
+
+/* reduce operand one of all operators. */
+
+	inhibit_walk = sets_reference;
+	inhibit_sons = inhibit_sons|(opcode=loop|opcode=ftn_trans_loop);
+	if p->operator.number>0
+	     then if p->operator.operand(1) ^= null
+		then call reduce(p->operand(1),p,irreducible_op,inhibit_sons);
+
+	irreducible = irreducible|irreducible_op;
+	inhibit_walk = "0"b;
+
+/* If the operator is a loop operator which does not immediately contain another
+loop operator, and we are not processing the inside of a loop now, then put this
+operator on the loop chain.  */
+
+	if opcode = loop
+	then if ^ doing_loop
+	then if p -> operand(1) -> operator.op_code ^= loop
+	then do;
+		if freec = null
+		then do;
+		     freec = create_list(2);
+		     freec -> list.element(2) = null;
+		     end;
+		p1 = freec;
+		freec = p1 -> chain.next;
+		p1 -> chain.next = l_list;
+		l_list = p1;
+		p1 -> chain.value = p;
+	     end;
+
+/* if the operator is a transfer check to see if it goes to a statement futher down in
+this block.  If it does, then attach the current p_list to the statement by taking the intersection
+of the list already on the statement and the current p_list.  Each time a transfer is processed the
+reference count in the statement node is decreased by one.  When the optimizer encounters the
+labeled statement it will check to see if all references have been processed by checking
+for a reference count of one.  If all references have been processed it will continue its optimization
+using the intersection of its current p_list and the list attached to the statement.  If all
+references have not been processed it will erase its p_list.   If the operator is an
+unconditional transfer mark the state as discarded.   */
+
+	if jump_op
+	then do;
+		q=p->operand(1);
+		if q -> node.type = label_node
+		then do;
+		     if q -> label.block_node = blk
+			then call process_jump_target((q -> label.statement));
+		     end;
+		else if q -> node.type = reference_node
+		     then do;
+			s1 = q -> reference.symbol;
+			if s1 -> node.type = label_node
+			then if s1 -> label.block_node = blk
+			then if q -> reference.offset = null
+			     then call process_jump_target((s1->label.statement->element(q->reference.c_offset + 1)));
+			     else do;
+				q = s1 -> label.statement;
+				do j = 1 to q -> list.number;
+				     if q -> element(j) ^= null
+				          then call process_jump_target((q -> element(j)));
+				     end;
+				end;
+			end;
+
+		if opcode = jump
+		     then state_is_discarded = "1"b;
+
+		/* set bit for cg's use in optimizing if statements */
+
+		if irreducible_2
+		then if p -> operator.number = 2	/* jump_true | jump_false */
+		     then stm -> statement.irreducible = "1"b;
+	     end;
+	return;
+
+
+reduce_ref_sons:	proc(pt,irreducible_sons);
+
+dcl	(p,pt) ptr;
+dcl	irreducible_sons bit(1) aligned;
+
+	p = pt;
+	if p -> reference.length ^= null
+	     then call reduce(p -> reference.length,p,irreducible_sons,inhibit);
+	if p -> reference.qualifier ^= null
+	     then call reduce(p -> reference.qualifier,p,irreducible_sons,inhibit);
+	if p -> reference.offset ^= null
+	     then call reduce(p -> reference.offset,p,irreducible_sons,inhibit);
+
+	end; /* reduce_ref_sons */
+
+
+/* this routine searches the primary list for sons of operand(1) of an operator
+   to see if they were set when operand(1) was set.  if so, operand(1) should
+   not be put on the primary list */
+
+sons_were_set:	proc(pt) reducible returns(bit(1) aligned);
+
+dcl	(p,pt) ptr;
+
+	p = pt;
+
+	if ^ check((p->reference.qualifier))
+	then if ^ check((p->reference.offset))
+	     then if ^ check((p->reference.length))
+		then return("0"b);
+
+	return("1"b);
+
+check:	proc(pt) reducible returns(bit(1) aligned);
+
+dcl	(p,pt,q) ptr;
+
+	p = pt;
+
+	if p = null then go to ok;
+	if p -> node.type = reference_node
+	then if p -> reference.shared
+	     then go to ok;
+
+	do q = p_list repeat q -> primary.next while(q ^= null);
+	     if q -> primary.computation = p then go to ok;
+	     end;
+
+	return("1"b);
+ok:	return("0"b);
+
+	end; /* check */
+
+	end; /* sons_were_set */
+
+
+/* this routine, called for a signal_op, checks to see if a target can
+   be reduced after the operation has taken place */
+
+check_and_reduce_target:	proc(i /* ,q,p,irreducible_sons */);
+
+dcl	i fixed bin;
+
+	if ^ q -> reference.shared
+	then if ^ irreducible_sons
+	     then irreducible_sons = irreducible_sons | sons_were_set(q);
+
+	if ^ irreducible_sons
+	then do;
+	     inhibit_walk = "1"b;
+	     call reduce(p -> operand(i),p,irreducible_op,inhibit);
+	     inhibit_walk = "0"b;
+	     end;
+
+	end; /* check_and_reduce_target */
+
+
+/* this routine does the actual processing for targets of  jump_op's */
+
+process_jump_target: proc(pt);
+
+dcl	(pt,p1,p2,p4,q) ptr;
+
+	p1 = pt;
+
+	if p1->statement.ref_count_copy = 0
+	     then p1->statement.ref_count_copy=p1->statement.reference_count-1;
+	     else p1->statement.ref_count_copy=p1->statement.ref_count_copy-1;
+	if string(p1->statement.source_id) < string(pl1_stat_$cur_statement->statement.source_id)
+		then return;
+	if p1->statement.optimized
+		then call intersection(p1,2);
+		else do;
+			p1->statement.optimized="1"b;
+			q=p_list;
+			do while(q^=null);
+			p4=p1->statement.reference_list;
+			p2=create_node(p4,0);
+			p1->statement.reference_list=p4;
+			p2->primary.computation=q->primary.computation;
+			p2->primary.statement=q->primary.statement;
+			q=q->primary.next;
+			end;
+		     end;
+
+	end; /* process_jump_target */
+
+	end; /* reduce */
+			
+
+/* this routine walks down a tree recognizing references to variables
+and enters them in the secondary list if they are not already in the list.  */
+
+record_secondaries: proc(pt,start);
+
+dcl	(p,pt,q,p1,p2) ptr;
+dcl	(i,start) fixed bin(15);
+
+	/* start :
+		-1	record pt but not its descendents
+		0	record pt's descendent but not pt
+		1	record pt and its descendents
+		2	record operands 2-n of operator pt */
+
+begin:
+	p = pt;
+	if p=null then return;
+	if p->node.type = list_node
+		then do;
+			do i = 1 to p->list.number;
+			call record_secondaries((p->list.element(i)),1);
+			end;
+			return;
+		     end;
+	if p->node.type = operator_node
+		then do;
+			do i=start to p->operator.number;
+			call record_secondaries((p->operand(i)),1);
+			end;
+			return;
+		     end;
+
+	if p->node.type ^= reference_node then return;
+
+	p1 = p->reference.symbol;
+	if p1 ->node.type ^= symbol_node then return;
+
+	if start >= 0
+	then do;
+	     if p->reference.qualifier ^= null then call record_secondaries((p->reference.qualifier),1);
+	     if p->reference.offset ^= null then call record_secondaries((p->reference.offset),1);
+	     if p->reference.length ^= null then call record_secondaries((p->reference.length),1);
+	     end;
+
+	if start = 0 then return;
+
+	if p1 -> symbol.constant | p1 -> symbol.temporary then return;
+
+/* search the secondary list to see if the variable is in the list */
+
+	q=s_list;
+	do while(q^=null);
+	     p2 = q->secondary.operation;
+	     if p2 = p then goto chain_it;
+	     if p->reference.symbol = p2->reference.symbol
+	     then if compare_expression(p2,p)
+		then go to chain_it;
+	     q=q->secondary.next;
+	     end;
+
+/* make a new secondary entry for the variable		*/
+
+	q=create_node(s_list,2);
+	q->secondary.primary=null;
+	q->secondary.operation=p;
+
+
+/* add this primary to the list of primaries effected by this secondary */
+
+chain_it:
+	if freec = null
+		then do;
+			freec = create_list(2);
+			freec->list.element(2) = null;
+		     end;
+	p1=freec;
+	freec=p1->chain.next;
+	p1->chain.next=q->secondary.primary;
+	q->secondary.primary=p1;
+	p1->chain.value=p_list;
+	end record_secondaries;
+
+/* this routine removes entries from the secondary list and related
+primary list.						*/
+
+set: proc(pt);
+
+dcl	(p,pt,q,p1,q1,p2,s) ptr;
+dcl	c_offset fixed bin(24);
+dcl	p1_unal ptr unal auto;	/* used for better code in the comparisons */
+
+
+begin:
+	p = pt;
+	if p=null then return;
+	if p->node.type ^= reference_node then return;
+	p1_unal, p1 = p->reference.symbol;
+	if p1->node.type ^= symbol_node then return;
+	s = p1->symbol.son;
+	do while(s^=null);
+	set_level = set_level + 1;
+	call set((s->symbol.reference));
+	set_level = set_level - 1;
+	s = s->symbol.brother;
+	end;
+	if p->reference.aliasable
+		then do;
+			q = s_list;
+			do while(q^=null);
+			q1 = q->secondary.operation->reference.symbol;
+			if q->secondary.operation->reference.aliasable
+			     then if compare_alias(p1,q1)
+				then do;
+					call free_them;
+					q1 = q->secondary.next;
+					call release_node(q,s_list,2);
+					q = q1;
+					go to next;
+				     end;
+			q = q->secondary.next;
+next:
+			end;
+			return;
+		     end;
+
+/* If the set was done with a pseudovariable, set the argument of the pseudovariable */
+
+	if p1 -> symbol.defined
+	     then call set((p -> reference.qualifier));
+
+/* if this variable has been the argument of string, unspec, real, or imag, we
+   must remove all computations depending on this symbol because the offset and
+   c_offset may have been changed during processing.  Also, ancestors may have
+   been affected */
+
+	if p1 -> symbol.overlayed_by_builtin & (p1 -> symbol.member | p1 -> symbol.dimensioned)
+	then do;
+	     do while(p1 ^= null);
+		if ^ p1 -> symbol.overlayed_by_builtin | ^ (p1 -> symbol.member | p1 -> symbol.dimensioned)
+		     then return;
+		q = s_list;
+		do while(q ^= null);
+		     if q -> secondary.operation -> reference.symbol = p1	/* p1_unal not used because p1 changes */
+		     then do;
+			call free_them;
+			q1 = q -> secondary.next;
+			call release_node(q,s_list,2);
+			q = q1;
+			end;
+		     else q = q -> secondary.next;
+		     end;
+		if set_level > 0
+		     then return;
+		p1 = p1 -> symbol.father;
+		end;
+	     return;
+	     end;
+
+/* if this is an array element with variable offset or array reference or string, remove all computations	*/
+/* that are a function of any element of this array or string.		*/
+
+	if (p1->symbol.array ^= null & (p->reference.array_ref | p-> reference.offset ^= null)) | p1->symbol.bit | p1->symbol.char
+		then do;
+			q=s_list;
+			do while(q^=null);
+			if q->secondary.operation->reference.symbol=p1_unal
+				then do;
+					call free_them;
+					q1=q->secondary.next;
+					call release_node(q,s_list,2);
+					q=q1;
+				     end;
+				else q=q->secondary.next;
+			end;
+		return;
+	     end;
+
+/* if this is an array element with constant offset, remove all computations
+   that are a function of this element or any array reference or array
+   element with variable offset of this array. handle storage_block 
+  references in a similar manner */
+
+	if p1 -> symbol.array ^= null | p1 -> symbol.storage_block
+	then do;
+	     q = s_list;
+	     c_offset = p -> reference.c_offset;
+	     do while (q ^= null);
+		q1 = q -> secondary.operation;
+		if q1 -> reference.symbol = p1_unal
+		then if q1 -> reference.c_offset = c_offset | q1 -> reference.array_ref | q1 -> reference.offset ^= null
+		     then do;
+			call free_them;
+			q1 = q -> secondary.next;
+			call release_node(q,s_list,2);
+			q = q1;
+			go to next_a;
+			end;
+		q = q -> secondary.next;
+next_a:
+		end;
+	     return;
+	     end;
+
+/* this is not an array element or array reference or string.			*/
+
+	q=s_list;
+	do while(q^=null);
+	if q->secondary.operation->reference.symbol = p1_unal
+		then do;
+			call free_them;
+			call release_node(q,s_list,2);
+			return;
+		     end;
+	q=q->secondary.next;
+	end;
+	return;
+
+/* This entry frees all computations that depend on anything that can be set by a
+   call to an external procedure, otherthan the arguments passed by-reference.  */
+
+external_call: entry;
+
+declare free_flag bit(1);
+
+	q = s_list;
+	do while(q^=null);
+	q1 = q->secondary.operation;
+	p2 = q1->reference.symbol->symbol.block_node;
+	if p2 = null
+	     then free_flag = q1->reference.aliasable;
+	     else free_flag = q1->reference.aliasable|p2->block.flush_at_call;
+	if free_flag
+		then do;
+			call free_them;
+			q1 = q->secondary.next;
+			call release_node(q,s_list,2);
+			q = q1;
+		     end;
+		else q = q->secondary.next;
+	end;
+	return;
+
+/* subroutine to free all primary list entries that depend on the secondary
+   entry identified by the pointer q.  */
+
+free_them: proc;
+
+dcl	p1 ptr;
+
+begin:
+	p1 = q->secondary.primary;
+	do while(p1^=null);
+	call release_node((p1->chain.value),p_list,1);
+	if p1->chain.next=null
+		then do;
+			p1->chain.next = freec;
+			freec = q->secondary.primary;
+			return;
+		     end;
+	p1 = p1->chain.next;
+	end;
+
+	end free_them;
+
+%include compare_alias;
+	end set;
+
+/* these routines are utility programs to create and free nodes	*/
+/* i=0 for statement list primary nodes. i=1 for p_list primary nodes. i=2 for secondary nodes. */
+
+release_node: proc(pt,list_head,i);
+
+dcl	(p,pt,list_head) ptr;
+dcl	i fixed bin(15);
+
+begin:
+	p = pt;
+	if p->primary.computation = null
+		then return;		/* this is an attempt to release an already freed primary */
+	if p->primary.next ^=null
+		then p->primary.next->primary.last=p->primary.last;
+	if p->primary.last =null
+		then list_head=p->primary.next;
+		else p->primary.last->primary.next=p->primary.next;
+	if i=1
+		then do;				/* this is a primary node */
+			if freep = null then freep_tail = p;
+			p->primary.computation=null;	/* null indicates that it is free */
+			p->primary.next=freep;
+			freep=p;
+			if p=p_tail then p_tail=p->primary.last;
+		     end;
+		else do;
+			p->primary.next = free;
+			free=p;
+		     end;
+	p->primary.last=null;
+	end release_node;
+
+
+create_node: proc(list_head,i) returns(ptr);
+
+dcl	(list_head,p) ptr;
+dcl	i fixed bin(15);
+
+begin:
+	if free = null
+		then p = create_list(4);
+		else do;
+			p=free;
+			free=free->list.element(4);
+		     end;
+	p->list.element(3)=null;
+	p->list.element(4)=list_head;
+	if i=1 & list_head=null then p_tail=p;
+	if list_head ^= null then list_head->list.element(3)=p;
+	list_head=p;
+	return(p);
+	end create_node;
+
+
+/* erase everything from the primary and secondary lists.  */
+
+clear: proc;
+
+	call erase;
+	if p_tail ^= null
+		then do;
+			p_tail->list.element(4) = free;
+			free = p_list;
+			p_list,p_tail = null;
+		     end;
+	end clear;
+
+/* erase all primaries except those whose operands are constants. */
+
+erase: proc;
+
+dcl	(p,q) ptr;
+
+begin:
+	q=s_list;
+	do while(q^=null);
+	p=q->secondary.primary;
+	do while(p^=null);
+	if p->chain.value->primary.computation ^= null
+	     then call release_node((p->chain.value),p_list,1);
+	if p->chain.next = null
+		then do;
+			p->chain.next=freec;
+			freec=q->secondary.primary;
+			go to continue;
+		     end;
+	p=p->chain.next;
+	end;
+continue:
+	call release_node(q,s_list,2);
+	q=s_list;
+	end;
+
+/* put free primaries on the free list.  It is safe to do this because no
+more secondaries exist and therefore no references exist.			*/
+
+/* the primary list may still contain computations whose operands are constants */
+
+	if freep_tail ^= null
+		then do;
+			freep_tail->primary.next=free;
+			free=freep;
+			freep_tail,freep=null;
+		     end;
+	end erase;
+
+
+/* this routine gets the intersection of the p_list and the primary list
+attached to the statement node.  If i=2 the statement node list is replace by this intersection.
+If i=1 the primary list p_list is replaced by the intersection.  If the state has been
+discarded and i = 2, the primary list p_list is replaced by the union of p_list and the
+statement node list.  */
+
+intersection: proc(pstate,p_i);
+
+dcl	(pstate,state,p,q,t) ptr;
+dcl	(i,n,p_i) fixed bin(15);
+
+begin:
+	state = pstate;
+	i = p_i;
+
+	n = 0;
+	do q=state->statement.labels repeat q->list.element(1) while(q^=null);
+	     n = n + 1;
+	end;
+
+	if state -> statement.ref_count_copy = 0 then state -> statement.ref_count_copy =
+	 state -> statement.reference_count;
+
+	if i=1 & state->statement.ref_count_copy ^= n
+		then do;
+			call clear;
+			q=state->statement.reference_list;
+			do while(q^=null);
+			t = state -> statement.reference_list;
+			call release_node(q,t,0);
+			q, state->statement.reference_list = t;
+			end;
+			return;
+		     end;
+
+	if ^state->statement.optimized  /* label was never referenced */
+	then if i=1 | state->statement.ref_count_copy = n
+	     then return;
+
+	if i = 2 & state_is_discarded & p_list = null
+	then do;
+	     do p = state -> statement.reference_list repeat p -> primary.next while(p ^= null);
+		t = create_node(p_list,1);
+		t -> primary.computation = p -> primary.computation;
+		t -> primary.statement = p -> primary.statement;
+		call record_secondaries((t -> primary.computation),1);
+		end;
+	     state_is_discarded = "0"b;
+	     return;
+	     end;
+
+	if i=2 then p=state->statement.reference_list;
+		else p=p_list;
+	do while(p^=null);
+	if i=2 then q=p_list;
+		else q=state->statement.reference_list;
+	do while(q^=null);
+	if q->primary.computation = p->primary.computation
+		then do;
+			p=p->primary.next;
+			go to next;
+		     end;
+	q=q->primary.next;
+	end;
+
+/* this element is not common to both lists, remove it (or if i = 2 &
+   state_is_discarded, add it to p_list).  */
+
+	q=p->primary.next;
+	if i=2
+	then if state_is_discarded
+	     then do;
+		t = create_node(p_list,1);
+		t -> primary.computation = p -> primary.computation;
+		t -> primary.statement = p -> primary.statement;
+		call record_secondaries((t -> primary.computation),1);
+		end;
+	     else do;
+		t = state -> statement.reference_list;
+		call release_node(p,t,0);
+		state -> statement.reference_list = t;
+		end;
+	else call release_node(p,p_list,1);
+	p=q;
+next:
+	end;
+
+	if i = 2 then state_is_discarded = "0"b;
+
+
+	end intersection;
+
+
+dump_primary: entry;
+dcl	display_exp entry(ptr);
+	do q = p_list repeat q->primary.next while(q^=null);
+	call display_exp((q->primary.computation));
+	call ioa_("^/");
+	end;
+	return;
+
+dump_secondary: entry;
+	do q = s_list repeat q->secondary.next while(q^=null);
+	call display_exp((q->secondary.operation));
+	call ioa_("^/");
+	end;
+	return;
+     end /* optimizer */;

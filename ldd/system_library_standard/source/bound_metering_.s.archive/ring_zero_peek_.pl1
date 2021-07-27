@@ -1,0 +1,356 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+ring_zero_peek_: procedure (P_from_ptr, P_to_ptr, P_word_count, P_code);
+
+/* *	This routine attempts to get some specific data item from hardcore
+   *	by calling phcs_$ring_0_peek or metering_ring_zero_peek_ as appropriate.
+   *	There are three cases worth considering:
+   *	   1) The user hasn't got access to either gate.
+   *	   2) The user has access to metering_ring_zero_peek_ only.
+   *	   3) The user has access to both gates.
+   *	For a class 3 user, we should always call phcs_, since it is more efficient.
+   *
+   *	The convoluted flow of control which tries to insure that phcs_ is always
+   *	called, if possible, and that as few linkage faults as possible are taken
+   *	does actually work, I believe, though considerable study is required to
+   *	convince yourself of it.
+   *
+   *	ring_zero_peek_$by_name, ring_zero_peek_$by_definition:
+   *
+   *	There are additional entrypoints for peeking by segment name and definition.
+   *	These are present so programs which need to copy from named ring zero segments
+   *	or particular ring zero definitions can avoid the inconvenience of calling
+   *	ring0_get_ every time, maintaining static pointers, initializing them, etc.
+   *
+   *	Since it would be expensive to always call ring0_get_, ring_zero_peek_
+   *	maintains a hashed list of the segment names and definitions it has been called
+   *	to look up, and uses the pointers stored therein rather than using ring0_get_
+   *	every time.
+   *
+   *	This efficiency mechanism should make the additional cost of using ring_zero_peek_
+   *	to copy by name or definition quite negligible, and the interface provided is far
+   *	more convenient than the usual techniques. In those occasional programs where
+   *	efficiency and absolute minimum of page faults are very important, the static
+   *	pointer technique will be more efficient.
+   *
+   *	The hashed lookup table should always work, since it is effectively serving only
+   *	as a cache on a static database, that of ring zero segments and definitions.
+   *	Since this database is read off the system tape, and is never changed throughout
+   *	the duration of a bootload, the cache is guaranteed to always be valid, and needs
+   *	no flushing or clearing protocols.
+   *
+   *	First written on January 14, 1974 by R F Mabee.
+   *	Last modified on 01/17/74 at 15:05:27 by R F Mabee.
+   *	Last modified on 05/26/79 W. Olin Sibert, to call phcs_ if possible
+   *	Last modified on 12/24/79 W. Olin Sibert, to add $by_name and $by_definition entries.
+   *	Last modified on 12/25/79 W. Olin Sibert, to add max length entrypoints.
+   *	Last modified on 02/22/81 W. Olin Sibert, to clean up for installation.
+   */
+
+dcl (P_from_ptr pointer,
+     P_to_ptr pointer,
+     P_word_count fixed bin (19),
+     P_seg_name char (*),
+     P_seg_ptr pointer,
+     P_entrypoint_name char (*),
+     P_offset fixed bin (18),
+     P_max_length fixed bin (19),
+     P_code fixed bin (35)) parameter;
+
+dcl (tried_phcs, tried_mrzp) bit (1) aligned;
+dcl  system_area_ptr pointer;
+dcl  system_area area based (system_area_ptr);
+dcl  def_name char (72) varying;
+dcl  temp_def_name char (72);
+dcl  def_offset fixed bin (18);
+dcl  r0_ptr pointer;
+dcl  def_ptr pointer;
+dcl  copy_ptr pointer;
+dcl  last_name_entry_ptr pointer;
+dcl  hash_index fixed bin;
+dcl  temp_word bit (36) aligned;
+dcl  ring_zero_only bit (1) aligned;
+dcl 1 temp_sdw aligned like sdw automatic;
+
+dcl  phcs_ok bit (1) aligned internal static init ("1"b);
+dcl  hash_buckets (127) pointer unaligned internal static init ((127)(null ()));
+
+dcl  name_entry_ptr pointer;
+dcl  name_entry_lth fixed bin;
+dcl 1 name_entry aligned based (name_entry_ptr),
+    2 next pointer unaligned,
+    2 r0_ptr pointer unaligned,
+    2 name_lth fixed bin,
+    2 name char (name_entry_lth refer (name_entry.name_lth));
+
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  metering_ring_zero_peek_ entry (pointer, pointer, fixed binary (19), fixed bin (35));
+dcl  phcs_$ring_0_peek entry (pointer, pointer, fixed binary (19));
+dcl  ring0_get_$definition entry (pointer, char (*), char (*), fixed bin (18), fixed bin, fixed bin (35));
+dcl  ring0_get_$segptr entry (char (*), char (*), pointer, fixed bin (35));
+dcl  ring_zero_peek_ entry (pointer, pointer, fixed bin (19), fixed bin (35));
+dcl  ring_zero_peek_$by_name entry (char (*), fixed bin (18), pointer, fixed bin (19), fixed bin (35));
+
+dcl (error_table_$no_info,
+     error_table_$invalidsegno,
+     error_table_$bad_arg) fixed bin (35) external static;
+
+dcl (seg_fault_error, linkage_error) condition;
+
+dcl (addr, addrel, baseno, binary, dimension, length, mod, null, rank, rtrim, search, size, substr) builtin;
+
+/*  */
+
+/* *	ring_zero_peek_: procedure (P_from_ptr, P_to_ptr, P_word_count, P_code);
+   *
+   *	This entry is used to merely extract words from ring zero, specified
+   *	by a pointer into ring zero. */
+
+	copy_ptr = P_from_ptr;			/* generate the pointer to copy from */
+
+	goto PERFORM_RING_ZERO_PEEK;			/* and join common peeking code */
+
+/*  */
+
+ring_zero_peek_$by_name: entry (P_seg_name, P_offset, P_to_ptr, P_word_count, P_code);
+
+/* *	This entry is used to copy words from the named ring zero segment,
+   *	starting at P_offset. */
+
+	if search (P_seg_name, "<>") ^= 0 then do;	/* it's a pathname, reject it */
+	     P_code = error_table_$bad_arg;		/* best code I could find */
+	     return;
+	     end;
+
+	call lookup (P_seg_name);			/* sets name_entry_ptr, last_name_entry_ptr, hash_index */
+
+	if name_entry_ptr = null () then do;		/* not there already, we must find it */
+	     call ring0_get_$segptr ("", P_seg_name, r0_ptr, P_code); /* call to find it */
+	     if P_code ^= 0 then return;		/* Nope. */
+
+	     call insert (P_seg_name, r0_ptr);		/* insert it */
+	     end;
+
+	else r0_ptr = name_entry.r0_ptr;		/* otherwise, copy it from the found name_entry */
+
+	copy_ptr = addrel (r0_ptr, P_offset);		/* generate the pointer to copy from */
+
+	goto PERFORM_RING_ZERO_PEEK;			/* and join common peeking code */
+
+/*  */
+
+ring_zero_peek_$by_definition: entry (P_seg_name, P_entrypoint_name, P_offset, P_to_ptr, P_word_count, P_code);
+
+/* *	This entry is used to copy words from the definition P_seg_name$P_entrypoint_name,
+   *	in ring zero, possibly offset by P_offset. */
+
+	if search (P_seg_name, "<>") ^= 0 then do;	/* it's a pathname, reject it */
+	     P_code = error_table_$bad_arg;		/* best code I could find */
+	     return;
+	     end;
+
+	def_name = rtrim (P_seg_name);		/* construct lookup name */
+	def_name = def_name || "$";
+	def_name = def_name || rtrim (P_entrypoint_name);
+	temp_def_name = def_name;
+
+	call lookup (temp_def_name);			/* sets name_entry_ptr, last_name_entry_ptr, hash_index */
+
+	if name_entry_ptr = null () then do;		/* not there already, we must find it */
+	     r0_ptr = null ();			/* indicate that this should be an output argument */
+	     call ring0_get_$definition (r0_ptr, P_seg_name, P_entrypoint_name, def_offset, (0), P_code);
+	     if P_code ^= 0 then return;		/* Nope. */
+
+	     def_ptr = addrel (r0_ptr, def_offset);	/* generate a pointer to the actual definition */
+	     call insert (temp_def_name, def_ptr); 	/* insert it */
+	     end;
+
+	else def_ptr = name_entry.r0_ptr;		/* otherwise, copy it from the found name_entry */
+
+	copy_ptr = addrel (def_ptr, P_offset);		/* add optionl offset, and generate pointer */
+
+	goto PERFORM_RING_ZERO_PEEK;			/* join common peeking code */
+
+/*  */
+
+/* *	This block of code is responsible for actually performing the peek.
+   *	It implements the complex heuristics described above for moderating access.
+   *	It tries to copy P_word_count words from the location in ring zero identified
+   *	by copy_ptr out to the location identified by P_to_ptr, setting P_code to
+   *	indicate success or failure. It is accessed via a goto rather than being an
+   *	internal procedure for reasons of efficiency; it would have to be a nonquick
+   *	procedure, since it sets up condition handlers, and it seemed worth saving
+   *	the additional overhead at the expense of making the program logic somewhat
+   *	more complicated. */
+
+PERFORM_RING_ZERO_PEEK:
+	tried_phcs = "0"b;				/* indicates that we have already tried and failed */
+	tried_mrzp = "0"b;				/* indicates that m_r_z_p_ lost as well */
+
+	if ^phcs_ok then goto NO_PHCS;		/* don't bother with linkage fault if we know already */
+
+
+TRY_PHCS: tried_phcs = "1"b;				/* don't come back */
+
+	on linkage_error goto NO_PHCS;
+
+	call phcs_$ring_0_peek (copy_ptr, P_to_ptr, P_word_count);
+
+	phcs_ok = "1"b;				/* indicate this will work in the future */
+	P_code = 0;				/* assume success */
+	return;
+
+
+NO_PHCS:	if tried_mrzp then goto NO_MRZP;		/* only try this once */
+
+	tried_mrzp = "1"b;				/* don't come back here */
+	phcs_ok = "0"b;				/* can only get here if we lost trying phcs_ */
+
+	on linkage_error goto NO_MRZP;
+
+	call metering_ring_zero_peek_ (copy_ptr, P_to_ptr, P_word_count, P_code);
+	if P_code = 0 then return;			/* it worked */
+						/* otherwise, fall through and maybe try phcs_ */
+
+
+NO_MRZP:	if ^tried_phcs then goto TRY_PHCS;		/* we lost for m_r_z_p_, try phcs_ once */
+
+	P_code = error_table_$no_info;		/* Sorry, out of luck */
+	return;					/* end of code for peeking */
+
+/*  */
+
+ring_zero_peek_$get_max_length: entry (P_seg_name, P_max_length, P_code);
+
+/* *	These entries return the max length of a selected ring zero segment,
+   *	by the simple expedient of peeking at the SDW for the segment. */
+
+	ring_zero_only = "1"b;
+	goto PERFORM_GET_MAX_LTH;			/* Only genuine ring 0 segs from hardcore address space */
+
+
+ring_zero_peek_$get_max_length_ptr: entry (P_seg_ptr, P_max_length, P_code);
+
+	ring_zero_only = "0"b;
+	goto PERFORM_GET_MAX_LTH;			/* Max length from SDW for any segment */
+
+
+PERFORM_GET_MAX_LTH:
+	P_max_length = -1;				/* initialization */
+
+	if ring_zero_only then do;			/* get a pointer to the named segment */
+	     call ring0_get_$segptr ("", P_seg_name, r0_ptr, P_code);
+	     if P_code ^= 0 then return;		/* sorry, you lose */
+	     end;
+	else r0_ptr = P_seg_ptr;			/* otherwise, copy the input pointer */
+
+	call ring_zero_peek_$by_name ("dseg", (2 * binary (baseno (r0_ptr), 17)),
+	     addr (temp_sdw), size (temp_sdw), P_code);	/* copy the SDW from the users dseg */
+	if P_code ^= 0 then return;			/* sorry, outta luck */
+
+	if temp_sdw.df = "0"b then do;		/* not active */
+	     on condition (seg_fault_error)		/* protect against nasties */
+		goto INVALID_SEGMENT_NUMBER;
+
+	     call ring_zero_peek_ (r0_ptr, addr (temp_word), size (temp_word), P_code);
+	     if P_code ^= 0 then			/* try to segfault on it, to get a valid SDW */
+		return;				/* Couldn't. Tough luck, Chucko. */
+
+	     revert condition (seg_fault_error);
+
+	     call ring_zero_peek_$by_name ("dseg", (2 * binary (baseno (r0_ptr), 17)),
+		addr (temp_sdw), size (temp_sdw), P_code); /* try again to get the SDW */
+	     if P_code ^= 0 then
+		return;
+
+	     if temp_sdw.df = "0"b then		/* Still not active -- just punt */
+		goto INVALID_SEGMENT_NUMBER;
+	     end; 				/* at this point, we apparently have a valid SDW */
+
+	P_max_length = 16 + (16 * binary (temp_sdw.bound, 14));
+
+	P_code = 0;
+	return;
+
+
+INVALID_SEGMENT_NUMBER:				/* Couldn't access something */
+	P_code = error_table_$invalidsegno;
+	return;					/* all done with ring_zero_peek_$get_max_length  */
+
+/*  */
+
+lookup: proc (P_name);
+
+/* *	This procedure looks up P_name in the internal name hash table, and sets
+   *	hash_index, name_entry_ptr, and last_name_entry_ptr appropriately. It will
+   *	always set hash_index correctly. If P_name is found, name_entry_ptr points
+   *	to the name_entry block for it, and last_name_entry_ptr will be invalid.
+   *	If P_name is not found, name_entry_ptr will be null, and last_name_entry_ptr
+   *	will either point to the last name_entry block in the chain, or be null if
+   *	the chain is empty. */
+
+dcl  P_name char (*) parameter;
+
+dcl  hash_sum fixed bin;
+dcl  idx fixed bin;
+
+	hash_sum = 43;				/* This is just to start it somewhere other than zero */
+						/* The choice of 43 is completely arbitrary */
+	do idx = 1 to length (rtrim (P_name));
+	     hash_sum = hash_sum + rank (substr (P_name, idx, 1));
+	     end;
+
+	hash_index = 1 + mod (hash_sum, dimension (hash_buckets, 1));
+
+	last_name_entry_ptr = null ();
+	do name_entry_ptr = hash_buckets (hash_index)
+		repeat (name_entry_ptr -> name_entry.next)
+		while (name_entry_ptr ^= null ());
+
+	     last_name_entry_ptr = name_entry_ptr;
+
+	     if name_entry.name = P_name then return;	/* jackpot */
+	     end; 				/* of loop through name_entry blocks */
+
+	return;					/* all done. the pointers are set appropriately by the loop */
+	end lookup;
+
+/*  */
+
+insert: proc (P_name, P_ptr);
+
+/* *	This procedure adds another name_entry block to the appropriate chain for
+   *	the association of P_name and P_ptr. It assumes that hash_index and
+   *	last_name_entry_ptr have already been set properly (presumably by lookup). */
+
+dcl (P_name char (*),
+     P_ptr pointer) parameter;
+
+	system_area_ptr = get_system_free_area_ ();	/* allocate a new name_entry */
+	name_entry_lth = length (rtrim (P_name));
+
+	allocate name_entry in (system_area) set (name_entry_ptr);
+
+	name_entry.next = null ();			/* initialize values */
+	name_entry.r0_ptr = P_ptr;
+	name_entry.name_lth = name_entry_lth;
+	name_entry.name = P_name;
+
+	if last_name_entry_ptr ^= null () then		/* and string in -- after last one, if there was such; */
+	     last_name_entry_ptr -> name_entry.next = name_entry_ptr;
+	else hash_buckets (hash_index) = name_entry_ptr;
+
+	return;					/* all done */
+	end insert;
+
+%page;	%include sdw;
+
+	end ring_zero_peek_;			/* External procedure */

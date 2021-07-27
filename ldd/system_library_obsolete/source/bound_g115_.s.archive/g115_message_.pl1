@@ -1,0 +1,412 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+g115_message_: proc;
+
+/* this procedure handles the actual read and writing of the
+   data to the MDS2400 via hcs_$tty calls. */
+
+/* Coded 4/30/74 by Mike Grady */
+
+/* modified 06/10/75 by Bob Adsit to move line_control to MCS/355 */
+
+/* modified 04/10/77 by Bob Franklin to fix many bugs. Now multiple
+   blocks must be unpacked on input in g115_message, special control
+   records must be ignored, etc. Ignore Quit error on Writes.
+   */
+
+dcl  msg_ptr ptr,
+     msg_len fixed bin,
+     input_ptr ptr,
+     put_ptr ptr,
+     msg_ct fixed bin,
+     msg_ct1 fixed bin,
+     offset fixed bin,
+     out_try fixed bin,
+     last_char_was_rs bit (1),
+     parity bit (1),
+     i fixed bin,
+     state fixed bin,
+     error_type fixed bin,
+     fmt_index fixed bin,
+     temp_full_cc fixed bin,
+     code fixed bin (35);
+dcl  debug entry options (variable);
+dcl  quit_code fixed bin (35) int static init (3000005);	/* quit occurred */
+
+dcl 1 info aligned,
+    2 pad fixed bin (71),
+    2 output_pending bit (1);
+
+
+dcl  com_err_ entry options (variable);
+dcl  ioa_ entry options (variable);
+dcl  hcs_$tty_write entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+     hphcs_$tty_write_force entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+     hcs_$tty_read entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+     hcs_$tty_order entry (fixed bin, char (*), ptr, fixed bin, fixed bin (35)),
+     hcs_$tty_event entry (fixed bin, fixed bin (71), fixed bin, fixed bin (35)),
+     g115_util_$get_ptr entry returns (ptr),
+     g115_util_$block entry (fixed bin (35)),
+     ipc_$mask_ev_calls entry (fixed bin (35)),
+     ipc_$unmask_ev_calls entry (fixed bin (35)),
+     timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71)),
+     timer_manager_$reset_alarm_wakeup entry (fixed bin (71)),
+     error_table_$buffer_big ext fixed bin (35);
+
+dcl  str_ptr1 ptr;
+dcl  after_etx fixed bin;
+dcl  read_chars char (msg_len) based (input_ptr) unal,
+     string char (g115_hdr.total_left) based (str_ptr) unal,
+     str_ptr pointer,
+     char char (1),
+    (unspec, index) builtin;
+
+dcl 1 aux_ctl (0:7) aligned int static,
+    2 split bit (1) init ("1"b, "0"b, "1"b, "0"b, "1"b, "0"b, "1"b, "0"b),
+    2 compress bit (1) init ("1"b, "1"b, "1"b, "1"b, "0"b, "0"b, "0"b, "0"b);
+
+%include g115_data;
+%include g115_msg;
+%include g115_stat;
+
+write:	entry (msg_ptr, code);
+
+/* This procedure writes messages to the MDS2400 and will do retries
+   if hcs_$tty_write could not write any chars */
+
+	data_ptr = g115_util_$get_ptr ();		/* get data ptr for us */
+
+	code = 0;					/* set error code to 0 */
+	out_try = 0;				/* clear number of trys */
+
+	msg_ct1 = msg_ptr -> g115_hdr.text_char_count + 8; /* get actual length of message */
+
+	msg_ptr -> g115_msg.seq_code = "0"b;		/* set the xmt seq code in msg */
+
+	put_ptr = addr (msg_ptr -> g115_msg);		/* get addr for tty_write */
+
+	if g115_data.no_block then do;		/* force output for answering service */
+	     call hcs_$tty_event (g115_data.twx, g115_data.hcs_ev_chan, state, code); /* replace with our chan for block */
+	     call hcs_$tty_order (g115_data.twx, "write_status", addr (info), state, code);
+	     if code ^= 0 then return;
+	     do while (info.output_pending);		/* if told to wait */
+		call ipc_$mask_ev_calls (code);	/* stop as for a sec */
+		call timer_manager_$alarm_wakeup (3, "11"b, g115_data.wait_list.timeout_chan);
+		call g115_util_$block (code);		/* wait for device */
+		call ipc_$unmask_ev_calls ((0));	/* reset mask */
+		if code ^= 0 then return;
+		call timer_manager_$reset_alarm_wakeup (g115_data.wait_list.timeout_chan); /* made it */
+		call hcs_$tty_order (g115_data.twx, "write_status", addr (info), state, code);
+	     end;
+	     call hcs_$tty_event (g115_data.twx, g115_data.as_ev_chan, state, code); /* return as ev can to tty_dim */
+	     call hphcs_$tty_write_force (g115_data.twx, put_ptr, 0, msg_ct1, msg_ct, state, code);
+	     return;
+	end;
+
+	offset = 0;
+
+try_again:
+	call hcs_$tty_order (g115_data.twx, "write_status", addr (info), state, code);
+	if code ^= 0 then return;
+	do while (info.output_pending);
+block_it:
+	     call g115_util_$block (code);
+	     call hcs_$tty_order (g115_data.twx, "write_status", addr (info), state, code);
+	end;
+
+retry:
+	call hcs_$tty_write (g115_data.twx, put_ptr, offset, msg_ct1, msg_ct, state, code);
+	if code = quit_code then go to retry;		/* ignore quit error0its been reset */
+	if code ^= 0 then return;			/* really terrible error has occured */
+
+	if msg_ct1 = msg_ct then return;		/* all data was sent by ring 0 */
+	if msg_ct = 0 then go to block_it;		/* whoops - nothing written */
+
+	msg_ct1 = msg_ct1 - msg_ct;			/* try to send remainder */
+	offset = offset + msg_ct;
+	go to try_again;
+
+
+read:	entry (msg_ptr, msg_len, code);
+
+/* entry to read and check messages from the MDS2400 */
+
+	data_ptr = g115_util_$get_ptr ();		/* get data ptr */
+
+check_1:
+	code = 0;
+	parity = "0"b;
+	msg_ptr = addr (g115_data.input_buffer);	/* init the buffer ptr */
+	input_ptr = addr (msg_ptr -> g115_msg);
+	slot_ptr = msg_ptr;
+	if g115_hdr.last_rs ^= 0 then go to partial_card; /* whoops - a mess */
+	if g115_hdr.total_left ^= 0 then go to process_1; /* don't need to read, just unblock */
+
+rloop:
+	if g115_hdr.total_left > 459 then return;
+	call hcs_$tty_read (g115_data.twx,
+	     input_ptr,
+	     g115_hdr.total_left,
+	     460 - g115_hdr.total_left,
+	     msg_len,
+	     state,
+	     code);
+	if code ^= 0 then return;
+	if g115_hdr.last_rs ^= 0 then do;		/* must delete imbedded header */
+	     if msg_len = 0 then do;
+		if g115_hdr.total_left = 0 then do;	/* may want to go blocked */
+block:		     call g115_util_$block (code);
+		     if code ^= 0 then return;
+		     go to rloop;
+		end;
+		if after_etx = 0 then go to block;	/* partial line */
+	     end;
+	     after_etx = after_etx + msg_len - 7;	/* actual number to move */
+	     g115_hdr.total_left = g115_hdr.total_left + msg_len;
+	     str_ptr1 = addr (g115_msg.text (g115_hdr.soh_offset - g115_hdr.last_rs -9));
+	     str_ptr = addr (g115_msg.text (g115_hdr.soh_offset - g115_hdr.last_rs));
+	     substr (str_ptr1 -> string, 1, after_etx) =
+		substr (str_ptr -> string, 1, after_etx);
+	     last_char_was_rs = "1"b;
+	     g115_hdr.total_left = g115_hdr.total_left - 9; /* adjust for missing header */
+	     g115_hdr.text_offset = -6;
+	     unspec (char) = g115_stat.etx_char;
+	     str_ptr = addr (g115_msg.text (g115_hdr.text_offset));
+	     msg_len = index (substr (string, 1, g115_hdr.total_left), char);
+	     if msg_len = 0 then return;
+	     go to enter;
+	end;
+	g115_hdr.total_left = g115_hdr.total_left + msg_len;
+	g115_hdr.soh_offset = -6;
+	g115_hdr.text_offset = 0;
+
+	if msg_len = 0 then return;			/* no data yet, so done */
+
+process_1:
+	unspec (char) = g115_stat.etx_char;
+	str_ptr = addr (g115_msg.text (g115_hdr.soh_offset));
+	if g115_hdr.total_left < 9 then go to move_read;	/* need more characters */
+	msg_len = index (substr (string, 1, g115_hdr.total_left), char);
+	if msg_len = 0 then go to move_read;		/* can't find ETX, need more characters */
+
+enter:
+	call check_message_format (code);		/* check the message */
+
+	if code ^= 0 then do;			/* format check failed - throw away message */
+	     g115_hdr.total_left = 0;
+	     g115_hdr.last_rs = 0;
+	     call ioa_ ("g115_message_: code = ^d", error_type);
+	     return;
+	end;
+
+	if g115_hdr.msg_type = 1 then go to check_1;	/* skip service messages */
+	if g115_hdr.msg_type = 2 then do;		/* skip special control records temporarily */
+	     g115_hdr.full_cc = g115_hdr.full_cc - 80;	/* don't forget its been incr */
+	     go to check_1;
+	end;
+
+
+	g115_hdr.read_offset = g115_hdr.text_offset;
+	if g115_hdr.text_offset = -6 then
+	     g115_hdr.text_offset = g115_hdr.soh_offset + 7;
+	return;
+
+move_read:					/* move remainder to top then read */
+	substr (input_ptr -> string, 1, g115_hdr.total_left) =
+	     substr (str_ptr -> string, 1, g115_hdr.total_left);
+	go to rloop;
+
+partial_card:
+	after_etx = g115_hdr.total_left;		/* save it for later */
+	g115_hdr.total_left = g115_hdr.soh_offset - g115_hdr.last_rs +
+	     g115_hdr.total_left-1;			/* total chars to move down */
+	str_ptr = addr (g115_msg.text (g115_hdr.last_rs+1));
+	go to move_read;				/* now move it down */
+
+check_message_format: proc (code);
+
+/* This procedure checks the format of a g115 message and returns an index specifying the
+   type of message read.  It also sets the variables in the message slot referring
+   to that message. */
+
+dcl  code fixed bin (35);
+
+
+	     code = 0;
+
+	     error_type = 0;
+
+	     if g115_hdr.last_rs ^= 0 then do;		/* get back in sync */
+		g115_hdr.text_char_count = msg_len - 1;
+		g115_hdr.last_rs = 0;
+		g115_hdr.total_left = g115_hdr.total_left - msg_len - 1;
+		g115_hdr.soh_offset = msg_len - 5;
+		go to enter1;
+	     end;
+
+	     g115_hdr.aux_bit_count,
+		g115_hdr.null_ct,
+		g115_hdr.text_char_count = 0;
+	     g115_hdr.read_split,
+		g115_hdr.read_compression = "0"b;
+
+/* check SOH character */
+	     if g115_msg.text (g115_hdr.soh_offset) ^= g115_stat.soh_char then do;
+		error_type = 19;
+		go to CHECK_RETURN;
+	     end;
+
+/* check format code */
+
+	     fmt_index = bin (substr (g115_msg.text (g115_hdr.soh_offset+1), 5, 5), 17); /* compute format index */
+	     if fmt_index < 1 | fmt_index > 11		/* illegal value */
+	     then go to FMT_CODE_CHECK (1);
+
+	     go to FMT_CODE_CHECK (fmt_index);
+
+FMT_CODE_CHECK (2):					/* service message, no auxilliary fields */
+	     g115_hdr.msg_type = 1;
+	     g115_hdr.sub_type = 1;
+	     g115_hdr.total_left = g115_hdr.total_left - 9;
+	     g115_hdr.soh_offset = g115_hdr.soh_offset + 9; /* skip message */
+	     go to END_FMT_CODE_CHECK;
+
+FMT_CODE_CHECK (3):					/* service message, auxilliary field */
+
+	     g115_hdr.msg_type = 1;
+	     g115_hdr.sub_type = 2;
+	     g115_hdr.aux_bit_count = 9;
+	     if bit (substr (g115_msg.text (g115_hdr.text_offset - 4), 7, 3)) =
+	     g115_stat.select then do;
+		i = fixed (substr (g115_msg.text (g115_hdr.text_offset-2), 4, 6), 17);
+		g115_data.write_split = aux_ctl (i).split; /* set split option */
+		g115_data.write_compress = aux_ctl (i).compress; /* set compression option */
+	     end;
+	     g115_hdr.total_left = g115_hdr.total_left - 10;
+	     g115_hdr.soh_offset = g115_hdr.soh_offset + 10; /* skip message */
+	     msg_len = 0;
+	     go to END_FMT_CODE_CHECK;
+
+FMT_CODE_CHECK (4):					/* special control record; no split, no compression */
+
+	     g115_hdr.read_split,
+		g115_hdr.read_compression = "0"b;
+	     g115_hdr.msg_type = 2;
+	     g115_hdr.sub_type = 1;
+	     go to fcp7;
+
+FMT_CODE_CHECK (5):					/* special control record; no split, compression */
+
+	     g115_hdr.read_split = "0"b;
+	     g115_hdr.read_compression = "1"b;
+	     g115_hdr.msg_type = 2;
+	     g115_hdr.sub_type = 2;
+	     go to fcp7;
+
+FMT_CODE_CHECK (8):					/* information message; no split, no compression */
+
+	     g115_hdr.read_split,
+		g115_hdr.read_compression = "0"b;
+	     g115_hdr.msg_type = 3;
+	     g115_hdr.sub_type = 1;
+	     go to fcp7;
+
+FMT_CODE_CHECK (9):					/* information message; no split, compression */
+
+	     g115_hdr.read_split = "0"b;
+	     g115_hdr.read_compression = "1"b;
+	     g115_hdr.msg_type = 3;
+	     g115_hdr.sub_type = 2;
+	     go to fcp7;
+
+FMT_CODE_CHECK (10):				/* information message; split, no compression */
+
+	     g115_hdr.read_split = "1"b;
+	     g115_hdr.read_compression = "0"b;
+	     g115_hdr.msg_type = 3;
+	     g115_hdr.sub_type = 3;
+	     go to fcp7;
+
+FMT_CODE_CHECK (11):				/* information message; split, compression */
+
+	     g115_hdr.read_split, g115_hdr.read_compression = "1"b;
+	     g115_hdr.msg_type = 3;
+	     g115_hdr.sub_type = 4;
+fcp7:
+
+	     g115_hdr.text_offset = g115_hdr.soh_offset + 7;
+	     go to END_FMT_CODE_CHECK;
+
+FMT_CODE_CHECK (1):					/* error in fmt code */
+FMT_CODE_CHECK (6):
+FMT_CODE_CHECK (7):
+
+	     error_type = 6;
+	     go to CHECK_RETURN;
+
+END_FMT_CODE_CHECK:
+
+	     if fmt_index < 4 then return;
+	     g115_hdr.soh_offset = g115_hdr.soh_offset + msg_len + 1;
+	     g115_hdr.total_left = g115_hdr.total_left - msg_len - 1;
+	     g115_hdr.text_char_count = msg_len - 8;
+enter1:
+	     temp_full_cc = 0;
+
+/*   set text length */
+
+	     do;					/* service messages don't reach here */
+		if g115_hdr.text_char_count > 0	/* message contains text */
+		then if ^g115_hdr.read_split then do;	/* message is not split */
+			if g115_msg.text (g115_hdr.text_offset) ^= g115_stat.bin_mc_char
+			& g115_msg.text (g115_hdr.text_offset) ^= g115_stat.bcd_mc_char then do; /* first text char not media code */
+			     error_type = 17;
+			     go to CHECK_RETURN;
+			end;
+			if g115_msg.text (g115_hdr.text_char_count + g115_hdr.text_offset - 1) ^= g115_stat.rs_char then do;
+			     error_type = 18;	/* error, last text char not record separator */
+			     go to CHECK_RETURN;
+			end;
+			last_char_was_rs = "1"b;	/* had to be */
+		     end;
+
+		do i = 1 to g115_hdr.text_char_count;	/* compute real text char count */
+		     if g115_msg.text (i + g115_hdr.text_offset - 1) = g115_stat.bcd_mc_char |
+		     g115_msg.text (i + g115_hdr.text_offset - 1) = g115_stat.bin_mc_char then do;
+			if last_char_was_rs then	/* if was rs then dont count mc */
+			     last_char_was_rs = "0"b;
+		     end;
+		     else				/* char is not media code */
+		     if last_char_was_rs then do;	/* error, missing media code */
+			error_type = 19;
+			go to CHECK_RETURN;
+		     end;
+		     if g115_msg.text (i + g115_hdr.text_offset - 1) = g115_stat.rs_char then do; /* record separators don't count */
+			g115_hdr.last_rs = i;	/* save position of last rs */
+			temp_full_cc = temp_full_cc + 80;
+			last_char_was_rs = "1"b;	/* remember */
+		     end;
+		end;
+
+		if g115_hdr.last_rs = g115_hdr.text_char_count then
+		     g115_hdr.last_rs = 0;
+		if g115_hdr.last_rs ^= 0 then do;	/* check special case of prev last_rs */
+		     if g115_hdr.text_offset = -6 then
+			g115_hdr.last_rs = g115_hdr.last_rs - 7;
+		end;
+		g115_hdr.full_cc = temp_full_cc;	/* set value in message slot */
+	     end;
+
+CHECK_RETURN:  if error_type ^= 0 then code = 1;		/* some error in message */
+	     return;
+
+	end;
+
+     end;

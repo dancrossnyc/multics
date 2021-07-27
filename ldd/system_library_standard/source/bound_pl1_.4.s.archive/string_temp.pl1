@@ -1,0 +1,295 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* format: style3 */
+string_temp:
+     proc (pt, pt2, pt3) returns (ptr);
+
+/* Program to standardize the allocation of long string temps for string_op and cat_op */
+
+/*	Written:	by Richard A. Barnes for EIS compiler
+	Modified:	21 August 1978 by RAB to tighten restrictions in need_temp
+	Modified:	1 April 1979 by RAB to improve code generated for equal
+		expression lengths
+	Modified:	15 April 1979 by RAB to make the determination in need_temp
+		more precise by checking if generation overlaps are exact
+	Modified:	30 March 1980 by RAB for reference.aligned_for_store_ref.
+		See prepare_operand for details.
+*/
+
+dcl	pt		ptr,			/* operator node */
+	pt2		ptr,			/* reference node of source to be optionally moved into temp.
+			   the space for the source may be reused for the temp */
+	pt3		ptr;			/* reference node of other operand */
+
+dcl	(
+	op,
+	p1,
+	p		(2:3),
+	q
+	)		ptr;
+dcl	(dt, icat, k, size, type)
+			fixed bin;
+dcl	dont_move		bit (1) aligned;		/* ON if p(2) should NOT be moved into the new temp */
+
+dcl	cg_stat$eis_temp	ptr ext;
+dcl	cg_stat$for_test_called
+			bit (1) aligned ext;
+
+dcl	(
+	realloc_char_temp	(0:1) init (92, 200),
+	alloc_char_temp	init (89),
+	zero_mac		(0:1) init (308, 307),
+	move_chars	(0:1) init (98, 218)
+	)		fixed bin (15) int static;
+
+dcl	adjust_ref_count	entry (ptr, fixed bin);
+dcl	copy_temp		entry (ptr) returns (ptr);
+dcl	long_op$eis	entry (ptr, fixed bin, fixed bin (15));
+dcl	expmac		entry (fixed bin (15), ptr);
+dcl	get_reference	entry () returns (ptr);
+dcl	long_op$extend_stack
+			entry (ptr, fixed bin (15));
+dcl	share_expression	entry (ptr) returns (ptr);
+dcl	stack_temp$assign_temp
+			entry (ptr);
+dcl	state_man$update_ref
+			entry (ptr);
+dcl	base_man$update_base
+			entry (fixed bin, ptr, fixed bin);
+
+dcl	(fixed, min, mod, null)
+			builtin;
+
+%include operator;
+%include op_codes;
+%include reference;
+%include symbol;
+%include data_types;
+%include boundary;
+%include cgsystem;
+
+	op = pt;
+	p (3) = pt3;
+	p (2) = pt2;
+
+	p1 = op -> operand (1);
+	type = p1 -> reference.data_type;
+	dt = type - char_string;
+	icat = fixed (op -> operator.op_code = cat_string, 1);
+	dont_move = p (3) = null;
+
+/* If for_test_called, we don't need a temporary */
+
+	if cg_stat$for_test_called
+	then do;
+		cg_stat$eis_temp = p (2);
+		if ^p (2) -> reference.shared
+		then p (2) -> reference.ref_count = p (2) -> reference.ref_count + 1;
+		return (p1);
+	     end;
+
+/* If operand(1) is a nontemporary, we must either create a temporary to work in,
+   or use operand(1) as the output if it does not appear as an input operand
+   in such a way as to destroy its value before it is used. */
+
+	q = p1;
+
+	if ^p1 -> reference.temp_ref
+	then if need_temp ()
+	     then do;
+		     q = get_reference ();
+		     q -> reference.data_type = p1 -> reference.data_type;
+		     q -> reference.units = word_;
+		     q -> reference.aligned_ref, q -> reference.aligned_for_store_ref, q -> reference.temp_ref = "1"b;
+		     q -> reference.long_ref = p1 -> reference.long_ref;
+		     q -> reference.c_length = p1 -> reference.c_length;
+		     if p1 -> reference.length ^= null
+		     then q -> reference.length = share_expression ((p1 -> reference.length));
+		end;
+	     else if q -> reference.length ^= null
+	     then go to set_eis;
+
+/* If the temporary is short, make sure it is unshared and has its allocate bit
+   on so that storage may be associated with it */
+
+	if ^q -> reference.long_ref
+	then if ^q -> reference.allocate
+	     then do;
+		     q = copy_temp (q);
+		     if p1 -> reference.temp_ref
+		     then op -> operand (1) = q;
+		end;
+
+/* If the temporary has a constant length and is used more than once (or has allocate bit
+   on), then we will now give it a spot in the stack rather than making a stack
+   extension for it */
+
+	if q -> reference.length = null
+	then if q -> reference.allocate
+	     then do;
+		     if ^q -> reference.allocated
+		     then if q -> reference.temp_ref
+			then call stack_temp$assign_temp (q);
+		     if ^q -> reference.long_ref
+		     then if dt >= 0
+			then do;
+
+/* if operand(1) is an aligned ref, but its size does not fill out
+                                 the word(s), zero out (last) word                                */
+
+				q -> reference.value_in.storage = "1"b;
+				size = q -> reference.c_length * convert_size (type);
+				if mod (size, bits_per_word) ^= 0 & q -> reference.aligned_for_store_ref
+				then do;
+					q -> reference.ref_count = q -> reference.ref_count + 1;
+					call expmac ((zero_mac (fixed (size > bits_per_word, 1))), q);
+				     end;
+			     end;
+		     go to set_eis;
+		end;
+
+/* Aggregate temporaries have already been allocated, so it is wrong to
+   allocate them again. */
+
+	if q -> reference.aggregate
+	then go to set_eis;
+
+/* If we get here, we want to use a stack extension for the temporary, but we can still
+   check to see if we can reuse a previously made extension or if we can extend it.
+   This can be done if the relationship between the operand lengths is known
+   at compile time. */
+
+	if icat > 0
+	then if p (2) -> reference.value_in.string_aq
+	     then go to re_alloc;
+	     else ;
+	else if p (2) -> reference.value_in.string_aq
+	then if q -> reference.length ^= null
+	     then if dont_move
+		then go to reuse;
+		else if ^p (3) -> reference.varying_ref
+			& (^p (3) -> reference.long_ref
+			| (p (2) -> reference.length = p (3) -> reference.length & ^p (2) -> reference.varying_ref))
+		then go to reuse;
+		else ;
+
+	     else do;
+		     if q -> reference.c_length > p (2) -> reference.c_length
+		     then do;
+re_alloc:
+			     call long_op$extend_stack (q, realloc_char_temp (icat) + dt);
+			end;
+
+		     else do;
+reuse:
+			     call state_man$update_ref (q);
+			     if ^dont_move & p (2) -> reference.address_in.b (1)
+			     then call base_man$update_base (2, q, 1);
+			end;
+
+		     if ^dont_move
+		     then if ^p (2) -> reference.shared
+			then call adjust_ref_count (p (2), -1);
+		     cg_stat$eis_temp = q;
+		     return (q);
+		end;
+	else ;
+
+/* We must get a new stack extension */
+
+	call long_op$extend_stack (q, alloc_char_temp + dt);
+
+/* Update cg_stat$eis_temp and move in source operand */
+
+set_eis:
+	cg_stat$eis_temp = q;
+
+	if ^dont_move
+	then do;
+		if op -> operator.op_code = and_bits
+		then k = min (p (2) -> reference.c_length, p (3) -> reference.c_length);
+		else k = 0;
+		call long_op$eis (p (2), k, move_chars (icat) + dt);
+	     end;
+
+	return (q);
+
+
+need_temp:
+     proc returns (bit (1) aligned);
+
+/* need_temp is called when operand(1) is not a temporary to determine if
+   string_temp should replace operand(1) with a temporary in order to compile
+   the expression.  need_temp tries to determine whether the generations of
+   storage of operand(1) and the other operands overlap. */
+
+dcl	alias		bit (1) aligned;
+dcl	(i, n)		fixed bin;
+dcl	(may_overlap, overlap_must_be_same_generation)
+			bit (1) aligned;
+
+	if q -> reference.defined_ref
+	then return ("1"b);
+
+	alias = q -> reference.aliasable;
+	if dont_move
+	then n = 2;
+	else n = 3;
+
+	do i = 2 to n;
+	     call check_overlap (q, (p (i)), may_overlap, overlap_must_be_same_generation);
+
+	     if may_overlap
+	     then if ^overlap_must_be_same_generation | icat > 0 | i > 2
+		then return ("1"b);
+	end;
+
+	if ^dont_move
+	then if ^q -> reference.shared
+	     then q -> reference.ref_count = q -> reference.ref_count + 1;
+	return ("0"b);
+
+
+check_overlap:
+     proc (out, in, may_overlap, overlap_must_be_same_generation);
+
+/* check_overlap determines if two operands may overlap, and, if they may, if
+   the operands describe the same generation if they actually do
+   overlap. */
+
+dcl	out		ptr,			/* -> target reference node */
+	in		ptr,			/* -> input reference node */
+	may_overlap	bit (1) aligned,		/* ON if references may have overlapping storage (output) */
+	overlap_must_be_same_generation
+			bit (1) aligned;		/* ON -- if references overlap at all, they must
+				   describe the same generation of storage (output) */
+
+	may_overlap, overlap_must_be_same_generation = "0"b;
+
+	if out -> reference.symbol = in -> reference.symbol
+	then may_overlap = "1"b;
+	else if alias
+	then if in -> reference.aliasable
+	     then if out -> reference.symbol -> symbol.aligned = in -> reference.symbol -> symbol.aligned
+		then if out -> reference.symbol -> symbol.varying = in -> reference.symbol -> symbol.varying
+		     then may_overlap = "1"b;
+
+	if may_overlap
+	then if ^in -> reference.substr & ^out -> reference.substr
+		& (out -> reference.symbol -> symbol.aligned | out -> reference.symbol -> symbol.varying)
+	     then overlap_must_be_same_generation = "1"b;
+
+     end /* check_overlap */;
+
+
+     end /* need_temp */;
+
+     end;

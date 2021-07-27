@@ -1,0 +1,489 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(2017-01-19,Swenson), approve(2017-01-19,MCR10028),
+     audit(2017-01-20,GDixon), install(2017-01-20,MR12.6f-0015):
+     Remove spurious \015 character from source introduced when copied from
+     ACTC/MIT tape.
+                                                   END HISTORY COMMENTS */
+
+g115_protocol_$write: proc (a_adp, a_ddp, a_bufp, a_nelem, a_code);
+
+/* This procedure performs all the message blocking and formatting required by the G115
+   Remote Computer Interface protocol.  Input and output are in the form of records, where one
+   record may be a partial message, a full message or must be split across messages.
+
+   On output, records are packed into messages.  The message is sent when it becomes
+   full or when the format code of the message must be changed. Each record of a message begins with
+   a media code which defines the target device (e.g. printer, bcd punch, binary punch, teleprinter)
+
+   On input, only character data is allowed.  This may be for the teleprinter (operator commands) or for the
+   card_input facility, but we can't tell which one (a deficiency in the protocol).
+*/
+
+/* Adapted from the original program g115_io_ by J. C. Whitmore, 9/79 */
+
+dcl  a_adp ptr parameter;
+dcl  a_ddp ptr parameter;
+dcl  a_bufp ptr parameter;
+dcl  a_nelem fixed bin parameter;
+dcl  a_nelemt fixed bin parameter;
+dcl  a_code parameter;
+
+
+dcl  bufp ptr;
+dcl  nelem fixed bin;
+dcl  code fixed bin (35);
+
+dcl  binary_record bit (960) aligned;			/* one binary card image */
+dcl  level fixed bin;				/* automatic version of our invocation level */
+dcl  format_code bit (9);
+dcl  slew_char char (1);
+dcl  io_data char (646) var;				/* data part of an input or output record */
+dcl  io_record char (648) var;			/* the full record with media code and record separator */
+dcl  idx fixed bin;					/* index variable */
+dcl  CC_index fixed bin;				/* where the next compression char sits */
+dcl  temp_buffer char (648) var;
+dcl  test_char char (1);
+dcl  rep_count fixed bin;				/* number of repeated chars in compression sequence */
+dcl  bcd_count fixed bin;				/* number of 6-bit elements in data to be output */
+dcl  space_left fixed bin;				/* number of chars remaining in current message block */
+dcl  count_char char (1);				/* ASCII char representing BCD equiv compression count */
+
+dcl  mess_p ptr;					/* temporary pointer to partial input message */
+dcl  mess_len fixed bin;				/* length of partial input message */
+dcl  remaining_message char (mess_len) based (mess_p);	/* the partial input message */
+
+dcl  six_bit_number (bcd_count) fixed bin (6) unsigned unal based;
+
+dcl  data_string char (nelem) based;			/* input data for the write entry */
+						/* or output data for the read entry */
+dcl  data_bit_string bit (nelem) based;			/* for binary punch, record length is in bits */
+
+dcl  based_record char (record_len) based;
+dcl  record_len fixed bin;
+dcl  rec_p ptr;
+
+dcl  convert_string_$input entry (char (*) var, ptr, char (*) var, fixed bin (35));
+dcl  convert_string_$output entry (char (*) var, ptr, char (*) var, fixed bin (35));
+dcl  g115_io_$write entry (ptr, ptr, fixed bin (35));
+dcl  g115_io_$read entry (ptr, ptr, fixed bin (35));
+
+dcl (addr, null, length, substr, copy, index, divide, maxlength) builtin;
+
+dcl (error_table_$eof_record,
+     error_table_$too_many_buffers,
+     error_table_$no_operation,
+     error_table_$improper_data_format,
+     error_table_$long_record,
+     error_table_$data_loss) fixed bin (35) ext;
+
+
+dcl  legal_slew_chars char (19) int static options (constant) init (" 0123456789[#@:>?AB");
+						/* printer slew codes, in order: */
+						/* Top of Form - space */
+						/* slew 0 to 15 lines - 0...? */
+						/* VFU_1 - A,  VFU_2 - B  */
+
+dcl  bcd_equiv_string char (64) unal int static options (constant)
+     init ("0123456789[#@:>? ABCDEFGHI&.](<\^JKLMNOPQR-$*);'+/STUVWXYZ_,%=""!");
+
+dcl  bcd_equiv (0:63) char (1) unal defined (bcd_equiv_string); /* 6-bit index to get equiv ASCII char */
+
+dcl  bcd_equiv_overlay char (63) defined (bcd_equiv_string) pos (2); /* overlay of bcd_equiv_string starting at element 2 */
+
+dcl  cleanup condition;
+
+
+%include g115_device_data;
+
+%include g115_message;
+
+%include G115;
+
+%include g115_attach_data;
+
+%include remote_ttt_info;
+
+/* g115_protocol_$write:  proc (a_adp, a_ddp, a_bufp, a_nelem, a_code);  */
+
+/* This entry takes a record described by a_bufp -> output_string (a_nelem) and prepares it to be
+   sent to the remote computer.  The message defined by g115_device_data.outp (level) -> g115_message.g115_msg_block
+   is used to accumulate records until the 324 char message block is full (or almost).  Then it is sent to the
+   remote computer by calling g115_io_$write.
+
+   The current message block is kept in a consistent state at all times so it can be "runout" by the
+   subsystem at any time.  A cleanup handler is used to insure that any message being updated was not
+   left in an inconsistent state.
+
+   The attach data for the switch performing the write defines the media code (i.e. target device).
+   A single message block can contain records for several devices as long as the format code of
+   the entire message is constant for all records.
+
+   The format code for the teleprinter device is different than for printer and punch data.
+   Also, records for the teleprinter are sent immediately, one record per message block, and must not
+   be compressed or split across messages.
+
+   If the media code is printer, the last char of the input string must be the slew control character.
+
+   If the media code is binary punch, the input string is a record of 1 to 960 bits as defined by a_nelem.
+   The input string is taken 6-bits at a time and converted to
+   an ASCII character equivalent to the BCD representation of the 6-bits.
+*/
+
+	a_code, code = 0;
+	adp = a_adp;
+	device_data_p = a_ddp;
+	nelem = a_nelem;
+	bufp = a_bufp;
+
+	if g115_attach_data.media_code = G115.punch_bin_mc then do; /* length of binary input is different */
+	     if nelem > length (binary_record) then go to NO_ROOM; /* too many bits for one card */
+	end;
+	else if nelem > maxlength (io_data) then do;	/* internal buffer limit for character records */
+NO_ROOM:	     a_code = error_table_$long_record;
+	     return;
+	end;
+
+	if g115_device_data.level = hbound (g115_device_data.outp, 1) then do;
+	     a_code = error_table_$too_many_buffers;
+	     return;
+	end;
+
+	g115_device_data.level = g115_device_data.level + 1; /* set buffer level for this invocation */
+	level = g115_device_data.level;		/* save a copy in automatic storage */
+	msgp = g115_device_data.outp (level);		/* get the output buffer for this level */
+	if msgp = null then do;			/* if not allocated, do it (never free output buffers) */
+	     allocate g115_message in (buffer_area) set (g115_device_data.outp (level));
+	     msgp = g115_device_data.outp (level);	/* set ref ptr for structure */
+	     g115_message = g115_device_data.template_ptr -> g115_message; /* initialize it */
+	end;
+
+	on cleanup begin;
+
+/*	check out the status of the message defined by this invocation   */
+
+	     if g115_message.being_changed | g115_device_data.level > 1 then do;
+						/* flush inconsistent or higher level messages */
+		msgp -> g115_message.text_char_count = 0;
+		msgp -> g115_message.rec_count = 0;
+		msgp -> g115_message.fmt_code = "0"b;
+		msgp -> g115_message.being_changed = "0"b; /* OK now */
+	     end;
+
+	     g115_device_data.level = g115_device_data.level - 1; /* back to value when called */
+	end;
+
+/* define the format code for this record */
+
+	if g115_attach_data.device_type = teleprinter then format_code = g115_device_data.fmt_code.control;
+	else format_code = g115_device_data.fmt_code.data;
+
+	if g115_message.text_char_count > 0 then	/* if there are records waiting */
+	     if g115_message.fmt_code ^= format_code then do; /* and the format code is changing */
+		call send_message_block (code);	/* then send the partial block */
+		if code ^= 0 then go to WRITE_RETURN;
+	     end;
+
+	g115_message.fmt_code = format_code;		/* this may be redundant at times, but cheap ... */
+
+/* start special processing of text */
+
+	if g115_attach_data.device_type = printer then do; /* for the printer, check the slew char */
+	     slew_char = substr (bufp -> data_string, nelem, 1); /* slew code is the last char of input data */
+	     if index (legal_slew_chars, slew_char) = 0 then /* if slew code not defined ...  */
+		slew_char = "1";			/* default to single new line */
+	     nelem = nelem - 1;			/* process remaining text up to the slew char */
+	end;
+
+	if g115_attach_data.media_code = G115.punch_bin_mc then do; /* Binary Punch Output */
+	     binary_record = bufp -> data_bit_string;	/* align data and pad with zeros */
+	     bufp = addr (binary_record);		/* use our copy now */
+	     bcd_count = divide (nelem + 5, 6, 0);	/* number of 6-bit elements */
+
+
+	     io_data = "";				/* clear the conversion string */
+	     do idx = 1 to bcd_count;
+						/* get six bits as unsigned fixed bin index */
+		io_data = io_data || bcd_equiv (bufp -> six_bit_number (idx)); /* output ASCII - bcd equiv of index */
+	     end;
+	end;
+	else do;					/* Character Output */
+	     temp_buffer = bufp -> data_string;		/* put data into local buffer */
+	     if length (temp_buffer) > 0 then do;
+						/* do any escape and/or translation processing */
+		call convert_string_$output (temp_buffer, addr (g115_attach_data.ttt_info), io_data, code);
+		if code ^= 0 then go to WRITE_RETURN;
+	     end;
+	     else io_data = "";			/* no data, could be just a printer slew record */
+	end;
+
+/* are we supposed to compress multiple characters (NOT allowed for teleprinter output) */
+
+	if g115_device_data.write_compress & g115_attach_data.device_type ^= teleprinter then do;
+	     temp_buffer = io_data;			/* copy into temp buffer */
+	     io_data = "";				/* clear output and rebuild */
+	     idx = 1;
+	     do while (idx <= length (temp_buffer));	/* loop through the input string */
+		test_char = substr (temp_buffer, idx, 1); /* find next char */
+		rep_count = verify (substr (temp_buffer, idx), test_char) - 1; /* how many are there? */
+
+		if rep_count < 1 then		/* remainder of string is the same */
+		     rep_count = length (temp_buffer) - idx + 1; /* see how many */
+
+		if rep_count > 3 then do;		/* compress if more than three in a row */
+		     if rep_count > 64 then rep_count = 64; /* only compress 64 at a time */
+		     count_char = bcd_equiv (rep_count - 1); /* don't include first char in repitition count */
+		     io_data = io_data || test_char || G115.CC || count_char;
+		end;
+
+		else do;				/* put in a few (1 to 3) of the char */
+		     io_data = io_data || substr (temp_buffer, idx, rep_count);
+		end;
+
+		idx = idx + rep_count;		/* bump the index */
+	     end;
+	end;
+
+/* format the data into a legal G115 record: <media_code><data>[<slew>]<record_separator> */
+
+	if g115_attach_data.device_type = printer
+	then io_record = g115_attach_data.media_code || io_data || slew_char || G115.RS;
+	else io_record = g115_attach_data.media_code || io_data || G115.RS;
+	record_len = length (io_record);		/* set the length of the based record */
+
+	if g115_attach_data.device_type = teleprinter & record_len > G115.max_msg_len then go to NO_ROOM;
+						/* teleprinter records cannot be split */
+
+/* this is the critical part of the code, add the record to the current message */
+
+	space_left = G115.max_msg_len - g115_message.text_char_count;
+
+	if record_len > space_left then do;		/* won't fit completely (can't happen for the teleprinter) */
+	     if g115_device_data.write_split then do;	/* can we add part of it to current message block */
+		g115_message.being_changed = "1"b;	/* mark as inconsistent */
+		rec_p = addr (g115_message.etx);	/* get ptr to start of next record */
+		substr (rec_p -> based_record, 1, space_left) = substr (io_record, 1, space_left);
+		g115_message.text_char_count = g115_message.text_char_count + space_left;
+		g115_message.etx = G115.etx_char;	/* put back the closing ETX */
+		g115_message.being_changed = "0"b;	/* message is now back to normal */
+		io_record = substr (io_record, space_left + 1); /* save the part not sent */
+		record_len = length (io_record);	/* define new based record length */
+	     end;
+	     call send_message_block (code);		/* send off the current block and start a new one */
+	     if code ^= 0 then go to WRITE_RETURN;
+	end;
+
+	g115_message.being_changed = "1"b;		/* tell handler message is inconsistent */
+	rec_p = addr (g115_message.etx);		/* find start of next record */
+	rec_p -> based_record = io_record;		/* add in the record (or the last part of split) */
+	g115_message.text_char_count = g115_message.text_char_count + record_len;
+	g115_message.etx = G115.etx_char;
+	g115_message.being_changed = "0"b;		/* back to a legal message again */
+
+/* All is safe now, the message is again consistent and ready to transmit.
+   See if we should send it now or wait.  Protocol says that there can only be one record per message
+   for the teleprinter, so always send teleprinter output.  Otherwise wait til there is enough to keep
+   the line overhead down or til the caller wants a runout.
+
+   The exception to this rule is that if this invocation level is greater than 1, we should send the
+   message because we may not get back to this level again to fill up the block.
+*/
+
+	if g115_attach_data.device_type = teleprinter then call send_message_block (code);
+
+	else if level > 1 then call send_message_block (code);
+
+	else if g115_message.text_char_count > 300 then call send_message_block (code);
+						/* if close to full, why wait? */
+WRITE_RETURN:
+
+	a_code = code;				/* copy back the code */
+
+	g115_device_data.level = g115_device_data.level - 1; /* pop the invocation level */
+
+	revert cleanup;				/* be sure we don't do it twice */
+
+	return;
+
+
+
+
+send_message_block: proc (code);
+
+dcl  code fixed bin (35);
+
+	     code = 0;
+
+	     if ^g115_message.being_changed then do;	/* if not consistent, quietly flush it */
+		call g115_io_$write (device_data_p, msgp, code);
+		if code ^= 0 then return;
+	     end;
+
+	     g115_message.text_char_count = 0;		/* make this message block clean again */
+	     g115_message.being_changed = ""b;
+
+	     return;
+
+	end send_message_block;
+
+read:	entry (a_adp, a_ddp, a_bufp, a_nelem, a_nelemt, a_code);
+
+/* This entry is used to read one record of a message block from the remote computer.
+   Only character data is accepted, and we have no way of knowing if the data is for the reader device
+   or for the operator.
+
+   The caller wants the data to be put into the string a_bufp -> data_string (a_nelem).  The record may
+   be shorter than a_nelem, so we tell how many were in the record by setting a_nelemt.
+   If the record is greater than a_nelem, we return as many as possible, throw away the extra
+   and return error_table_$data_loss as a status code.
+
+*/
+
+	a_code, code, a_nelemt = 0;			/* init return stuff */
+	adp = a_adp;
+	device_data_p = a_ddp;
+	bufp = a_bufp;
+	nelem = a_nelem;
+
+	if nelem < 1 then do;			/* read zero length record? */
+	     a_code = error_table_$no_operation;
+	     return;
+	end;
+
+	msgp = g115_device_data.first_bp;		/* get pointer to first input buffer */
+	if g115_message.rec_count < 1 then do;		/* is this block finished? */
+	     call get_next_message (msgp, code);	/* find a new message to process */
+	     if code ^= 0 then go to READ_RETURN;
+	end;
+
+/* at this point msgp should point to a valid data block (unless this is the Answering Service) */
+
+	if msgp -> g115_message.rec_count < 1 then return; /* no data */
+
+/* The input message block consists of one or more records of the form:
+
+   <media_code><text_data><record_separator>
+
+   we want to give the caller the text_data part of the next unprocessed record	*/
+	test_char = g115_message.text (g115_message.last_char_read + 1); /* pickup the media code of next record */
+
+	if test_char ^= G115.bcd_input_mc then do;	/* force the issue, ignore binary input */
+	     g115_message.text_char_count = 0;
+	     g115_message.rec_count = 0;		/* for now, kill the whole record */
+	     code = error_table_$improper_data_format;
+	     go to READ_RETURN;
+	end;
+
+	mess_p = addr (g115_message.text (g115_message.last_char_read + 2)); /* pointer to <text_data> (after media code) */
+	mess_len = g115_message.text_char_count - g115_message.last_char_read - 1; /* length of remaining message */
+
+	g115_message.last_char_read = g115_message.last_char_read + 1; /* we have used up the media code */
+
+	io_data = "";				/* clear the buffer */
+	idx = index (remaining_message, G115.RS);	/* find record separator which ends record */
+	do while (idx = 0);				/* collect split records if any */
+	     if length (io_data) + mess_len > maxlength (io_data) then do; /* will it fit */
+LONG_RECORD:	a_code = error_table_$long_record;
+		return;
+	     end;
+	     io_data = io_data || remaining_message;	/* first part of record is all this remaining message */
+	     call get_next_message (msgp, code);	/* rest of record should be in next message */
+	     if code ^= 0 then goto READ_RETURN;
+	     mess_p = addr (g115_message.text (1));	/* define the new remaining message string */
+	     mess_len = g115_message.text_char_count;	/* continuation of record has no media code */
+	     idx = index (remaining_message, G115.RS);	/* look for the record separator */
+	     if length (io_data) + idx > maxlength (io_data) then go to LONG_RECORD;
+	end;
+	io_data = io_data || substr (remaining_message, 1, idx - 1); /* last of record text less separator (G115.RS) */
+
+	g115_message.last_char_read = g115_message.last_char_read + idx; /* record the last char that was used */
+	g115_message.rec_count = g115_message.rec_count - 1; /* decrement input count in message */
+
+/* The text_data can contain compressed data of the form:
+
+   <repeat_char><G115.CC><count_char>
+
+   Where:
+
+   *	repeat_char	is the actual character that appears 3 to 64 times in a row.
+   *	G115.CC		is the compression code - 037 octal.
+
+   *	count_char	is an ASCII char, the equivalent 6-bit BCD value of which is the fixed bin
+   *			representation of the number of times the repeat char is repeated AFTER the first occurance.
+   *			(i.e. count_char "[" represents the number 10, thus 11 repeat_chars should appear
+   *			in the output data after de-compression.)
+*/
+
+	temp_buffer = "";				/* get ready to rebuild the data in the temporary */
+	idx = 1;					/* start looking from the first char in the record */
+	CC_index = index (io_data, G115.CC);		/* look for a compression code (CC) */
+	do while (CC_index > 0);			/* loop de-compressing record */
+	     temp_buffer = temp_buffer || substr (io_data, idx, CC_index - 1); /* copy all up to compression code */
+	     test_char = substr (io_data, idx + CC_index - 2, 1); /* pick up repeated char (before CC) */
+	     idx = idx + CC_index + 1;		/* move index to next unprocessed char */
+	     count_char = substr (io_data, idx - 1, 1);	/* this represents number of repeates */
+	     rep_count = index (bcd_equiv_overlay, count_char); /* convert to fixed bin */
+	     temp_buffer = temp_buffer || copy (test_char, rep_count);
+	     CC_index = index (substr (io_data, idx), G115.CC); /* look for next compression code */
+	end;
+	temp_buffer = temp_buffer || substr (io_data, idx); /* copy remainder of input */
+
+/* do any escape and/or translation processing */
+
+	call convert_string_$input (temp_buffer, addr (g115_attach_data.ttt_info), io_data, code);
+	if code ^= 0 then go to READ_RETURN;
+
+	if io_data = "++EOF" | io_data = "++eof" then
+	     code = error_table_$eof_record;		/* set end-of-file code */
+
+	record_len = length (io_data);
+	if nelem < record_len then do;		/* not enough room to return all */
+	     code = error_table_$data_loss;		/* give warning */
+	     record_len = nelem;
+	end;
+	substr (bufp -> data_string, 1, record_len) = substr (io_data, 1, record_len); /* give data to caller */
+	a_nelemt = record_len;
+
+READ_RETURN:
+
+	a_code = code;
+
+	return;
+
+
+get_next_message: proc (msgp, code);
+
+dcl  msgp ptr;
+dcl  code fixed bin (35);
+
+	     code = 0;
+
+/*	see if there is a chain of messages already */
+
+follow_chain:  if msgp -> g115_message.next_bp = null then	/* must read a message from Ring 0 */
+		call g115_io_$read (device_data_p, msgp, code);
+
+	     else do;				/* chain of input blocks exist, go to the next one */
+		g115_device_data.first_bp = g115_message.next_bp;
+		free msgp -> g115_message in (buffer_area);
+		msgp = g115_device_data.first_bp;
+		if msgp -> g115_message.rec_count = 0 then go to follow_chain; /* if empty, try again */
+	     end;
+
+	     return;
+
+	end get_next_message;
+
+
+
+
+     end g115_protocol_$write;

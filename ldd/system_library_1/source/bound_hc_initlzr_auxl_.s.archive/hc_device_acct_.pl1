@@ -1,0 +1,257 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+hc_device_acct_: proc (a_event_ptr);
+
+/* * This procedure is an interface between RCP and the answering service.
+   * It is on the system tape and it runs in ring 4 in the initializer process.
+   * It receives wakeups sent by RCP from ring 1 in user processes, at the time
+   * of device assignments, attachments, and unassignments, and it calls the
+   * appropriate device_acct_ entry points to cause the users to be charged for
+   * their use of the I/O devices.
+   *
+   * The init entry point is called by hc_initlzr_auxl_init_, which is called by
+   * as_init_. That entry point creates an event call channel with the main entry
+   * point as its handler, and passes the channel id to RCP via a call to
+   * rcp_sys_$init_account_chan. The target of that gate, rcp_mount_timer_$account_init,
+   * stores the channel and process id's in rcp_data, where they will be available
+   * to all processes (in ring 1).
+   *
+   * Modification history:
+   * Initial coding July 1977 by T. Casey
+   * Modified October 1977 by T. Casey to pick up device user's process id which is
+   *	passed in the event message, rather than using the sender_procid of
+   *	the wakeup, which is the initializer process for a force unassign.
+   *
+*/
+
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  a_event_ptr ptr;
+dcl  a_code fixed bin (35);
+
+/* Internal Static */
+
+dcl  already_init bit (1) aligned int static init (""b);
+
+/* External Static */
+
+dcl  error_table_$action_not_performed ext static fixed bin (35);
+
+/* External Entries */
+
+dcl  as_$dump entry options (variable);
+dcl  as_$find_process entry (bit (36), fixed bin, ptr);
+dcl  condition_ entry (char (*), entry);
+dcl (device_acct_$off, device_acct_$on, device_acct_$setup) entry (fixed bin, char (*), ptr);
+dcl  get_process_id_ entry returns (bit (36));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+dcl (ioa_$rsnnl, sys_log_, sys_log_$error_log) entry options (variable);
+dcl  rcp_sys_$init_account_chan entry (fixed bin (71), fixed bin (35));
+dcl  system_info_$device_prices entry (fixed bin, ptr);
+
+/* Automatic */
+
+dcl  err_msg char (50);
+dcl  devname char (32);
+
+dcl  chn_id fixed bin (71);
+dcl  code fixed bin (35);
+dcl  devid fixed bin;
+dcl  l fixed bin;
+dcl  n_devtab_entries fixed bin;
+dcl  process_type fixed bin;
+
+dcl  utep ptr;
+
+/* Builtin */
+
+dcl (addr, null) builtin;
+
+/* Structures and based variables, and their pointers */
+
+dcl  event_ptr ptr;
+
+dcl 1 event_info based (event_ptr),
+    2 channel_id fixed bin (71),
+    2 msg like rcp_account_msg,
+    2 sender_procid bit (36),
+    2 origin,
+      3 dev_signal bit (18) unal,
+    2 ring fixed bin (17) unal,
+    2 data_ptr ptr;
+
+dcl  ev_msg (2) bit (36) based (addr (event_info.msg));
+
+dcl 1 devtab_copy (16) aligned,
+    2 device_id char (8),
+    2 device_price (0:7) float bin;
+
+/* Include Files */
+
+%include rcp_account_msg;
+
+%include rcp_resource_types;
+
+%include devid;
+
+
+/* PROCEDURE */
+
+
+/* Being an event-call handler, we must catch any conditions that could cause
+   the stack to be unwound, take an asdump, and return to ipc_. If the stack gets
+   unwound around ipc_, this event channel stays inhibited forever, since ipc_
+   has no cleanup handler.
+*/
+
+	call condition_ ("any_other", any_other_handler);
+
+/* This code is temporary and non-general. Rather than attempt a complete
+   mapping between the devices known to RCP and those known to device_acct_
+   (which is currently impossible), it merely enables charging for the use of
+   tapes and I/O disks (which are the only devices known to both subsystems).
+   Eventually, device_acct_ and the rest of accounting should use RCP device codes.
+*/
+
+	event_ptr = a_event_ptr;
+
+/* Validate the event message */
+
+	if event_info.ring ^= 1 then do;		/* it must be from ring 1 */
+	     err_msg = "not from ring 1";
+ev_msg_err:
+	     call sys_log_ (2, "hc_device_acct_: RCP accounting wakeup ^a. Sender: ^w; ring: ^d; message: ^w ^w",
+		err_msg, event_info.sender_procid, event_info.ring, ev_msg);
+						/* note that ev_msg, a 2-element array, uses the last 2 ^w's */
+	     return;
+	end;
+
+	if event_info.sender_procid ^= event_info.device_user_procid then /* if wakeup sender ^= device user */
+	     if event_info.sender_procid ^= get_process_id_ () then /* and sender not initializer either */
+		call sys_log_ (0, "hc_device_acct_: RCP accounting wakeup: sender process (^w) ^= device user process (^w)",
+		event_info.sender_procid, event_info.device_user_procid);
+
+/* Translate device type */
+
+	if event_info.devtype = TAPE_DRIVE_DTYPEX then	/* map RCP code for tape */
+	     devid = devtab_ix_tape;			/* into device_acct_ code for tape */
+	else if event_info.devtype = DISK_DRIVE_DTYPEX then /* map RCP code for disk */
+	     devid = devtab_ix_disk;			/* into device_acct_ code for disk */
+	else return;				/* this device is not one that we know how to charge for */
+
+/* Get pointer to user table entry */
+
+	utep = null;
+	call as_$find_process (event_info.device_user_procid, process_type, utep);
+	if utep = null then do;
+	     if event_info.action = RCP_ACCTMSG_unassign then return; /* must be a force_unassign for a destroyed process */
+	     call sys_log_ (0, "hc_device_acct_: Unable to find user table entry for process ^w",
+		event_info.device_user_procid);
+						/* don't bother the operator with this one,
+						   but log it for the system programmers */
+	     return;
+	end;
+
+/* Build device name. device_acct_ wants one, but we don't want to bother
+   looking at rcp_data in ring 1 to get the real one, so build a meaningful one
+   from the offset in rcp_data. */
+
+	devname = "";
+	call ioa_$rsnnl ("rcp_data_relp_^.3b", devname, l, event_info.rcp_data_relp);
+
+/* Now call the appropriate device_acct_ entry */
+
+	if event_info.action = RCP_ACCTMSG_assign then
+	     call device_acct_$on (devid, devname, utep);
+	else if event_info.action = RCP_ACCTMSG_unassign then
+	     call device_acct_$off (devid, devname, utep);
+	else if event_info.action = RCP_ACCTMSG_attach then
+	     call device_acct_$setup (devid, devname, utep);
+	else do;
+	     err_msg = "with invalid action code";
+	     goto ev_msg_err;
+	end;
+
+/* All done */
+
+return_to_ipc_:					/* come here via nonlocal goto from the any_other handler */
+	return;
+
+
+init:	entry (a_code);
+
+	a_code = 0;				/* until something goes wrong */
+	if already_init then return;			/* A.S. initialization is restartable */
+
+	call ipc_$create_ev_chn (chn_id, code);
+	if code ^= 0 then do;
+ev_chn_err:
+	     call sys_log_ (2, "hc_device_acct_: Error creating event channel for RCP device accounting (code ^d)", code);
+	     a_code = error_table_$action_not_performed;	/* ipc_ returns nonstandard codes (1 thru 5) */
+	     return;
+	end;
+
+	call ipc_$decl_ev_call_chn (chn_id, hc_device_acct_, null (), (0), code);
+	if code ^= 0 then goto ev_chn_err;
+
+	call rcp_sys_$init_account_chan (chn_id, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, "hc_device_acct_", "From rcp_sys_$init_account_chan");
+	     a_code = code;
+	     return;
+	end;
+
+	call system_info_$device_prices (n_devtab_entries, addr (devtab_copy));
+	do devtab_ix_tape = 1 to n_devtab_entries	/* look up tape in devtab */
+		while (devtab_copy (devtab_ix_tape).device_id ^= dev_id (dev_tape));
+	end;
+	if devtab_ix_tape = n_devtab_entries + 1 then	/* if not there, we won't charge for tape */
+	     devtab_ix_tape = 0;
+
+	do devtab_ix_disk = 1 to n_devtab_entries	/* look up disk in devtab */
+		while (devtab_copy (devtab_ix_disk).device_id ^= dev_id (dev_disk));
+	end;
+	if devtab_ix_disk = n_devtab_entries + 1 then	/* if not there, we won't charge for disk */
+	     devtab_ix_disk = 0;
+
+	already_init = "1"b;			/* if we got here with no errors, remember it not to init again */
+
+	return;
+
+
+
+any_other_handler: proc (mcp, cname, cop, inp, cont);
+
+dcl (mcp, cop, inp) ptr, cname char (*), cont bit (1);
+
+	     if cname = "quit" | cname = "cput" | cname = "alrm" | cname = "program_interrupt" then do;
+		cont = "1"b;			/* let someone else handle it */
+		return;				/* return to signal_ */
+	     end;
+
+	     call sys_log_ ("hc_device_acct_: signal ^a", cname);
+	     call as_$dump ("hc_device_acct_");
+	     code = 0;				/* someone we call (like device_acct_)
+						   might have event calls masked */
+	     do while (code = 0);			/* be sure to get completely unmasked */
+		call ipc_$unmask_ev_calls (code);	/* code = 4 means "you were not masked" */
+	     end;
+	     goto return_to_ipc_;			/* go get this event call channel uninhibited */
+
+	end any_other_handler;
+
+     end hc_device_acct_;

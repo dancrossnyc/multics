@@ -1,0 +1,216 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+free_oldest_request_: proc;
+
+/* Procedure to free oldest inactive request and associated descriptor.
+   *  Normally invoked in response to alarm call set when request was
+   *  completed, but also called by find_next_request_ if it didn't have space
+   *  to allocate a fresh message.
+   *
+   *  This procedure will also delete the file if the user so requested (first
+   * making sure he has "m" access on the directory containing it).
+*/
+
+/* Coded August 1973 by Robert S. Coren */
+/* Modified by J. Stern, 12/27/74 */
+/* Modified by J. Stern, 11/25/75 */
+/* Modified by J. C. Whitmore, 4/78, to use the new queue_msg_hdr format */
+/* Modified by C. Marker, 02/23/85, to use version 5 message segments */
+
+dcl  desc_off fixed bin (18);
+dcl  desc_p ptr;					/* pointer to a descriptor */
+
+dcl  code fixed bin (35);
+dcl  mask_code fixed bin (35);
+dcl  acc_mode fixed bin (5);				/* access in form returned by get_user_effmode */
+
+dcl  dirname char (168);
+dcl  ename char (32);
+dcl  ddir char (168);				/* directory portion of directory name */
+dcl  dent char (32);				/* entry portion of directory name */
+
+dcl  force_bit bit (1) aligned;
+dcl  mask_bit bit (1) aligned;
+dcl  clean_bit bit (1) aligned;
+
+dcl  mp ptr;
+dcl  message_len fixed bin (18);
+dcl  based_message bit (message_len) aligned based;
+
+dcl  access_class bit (72) aligned;
+
+dcl  cleanup condition;
+
+dcl  aim_check_$equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  clock_ entry returns (fixed bin (71));
+dcl  delete_$path entry (char(*), char(*), bit(6), char(*), fixed bin(35));
+dcl  expand_pathname_ entry (char(*), char(*), char(*), fixed bin(35));
+dcl  hcs_$get_access_class entry (char(*), char(*), bit(72) aligned,
+	fixed bin(35));
+dcl  hcs_$get_link_target entry (char(*), char(*), char(*), char(*),
+	fixed bin(35));
+dcl  hcs_$get_user_effmode  entry (char(*), char(*), char(*), fixed bin,
+	fixed bin(5), fixed bin(35));
+dcl  hcs_$status_ entry (char(*), char(*), fixed bin(1), ptr, ptr,
+	fixed bin(35));
+dcl  ipc_$mask_ev_calls entry (fixed bin (35));
+dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+dcl  unthread_descriptor_ entry (ptr);
+
+dcl (addr, fixed, null, ptr, rel, bit) builtin;
+
+dcl 1 branch aligned,
+    2 pad1 fixed bin,
+    2 dtm bit (36),					/* date-time modified */
+    2 pad2 (2) fixed bin;
+
+/**/
+
+/* get pointer to oldest request */
+
+	mask_code = -1;
+	on cleanup begin;
+	     if mask_code = 0 then call ipc_$unmask_ev_calls (code);
+	end;
+	call ipc_$mask_ev_calls (mask_code);
+	mask_bit = "1"b;
+	clean_bit, force_bit = "0"b;
+join:
+
+	desc_off = iodc_static.first_req_done;
+	if desc_off = 0 then go to out;		/* no requests threaded, don't bother */
+
+	desc_p, mseg_message_info_ptr = ptr (iodc_static.descr_seg_ptr, desc_off);
+
+/* if cleanup entry we want to free them all, but not delete uncompleted ones */
+
+	if clean_bit
+	then do;
+	     if ^desc_p -> request_descriptor.finished
+	     then desc_p -> request_descriptor.dont_delete = "1"b;
+	     mseg_message_info.ms_ptr = ptr (iodc_static.req_seg_ptr, rel (mseg_message_info.ms_ptr));
+						/* segment number was left by previous coordinator process */
+	     go to free_it;				/* skip other checks */
+	end;
+
+	do while (desc_p -> request_descriptor.saved);
+
+/* find one that's not saved */
+
+	     desc_off = desc_p -> request_descriptor.next_done;
+	     if desc_off = 0 then return;
+	     desc_p = ptr (iodc_static.descr_seg_ptr, desc_off);
+	end;
+
+/* make sure it's old enough */
+
+	if (clock_ () - desc_p -> request_descriptor.time_done) >= iodc_static.time_interval | force_bit
+	then do;
+free_it:
+
+	     call unthread_descriptor_ (desc_p);
+
+	     mp = desc_p -> mseg_message_info.ms_ptr;
+
+	     if mp -> queue_msg_hdr.delete_sw		/* user requested deletion */
+	     then if ^desc_p -> request_descriptor.dont_delete /* and it's okay */
+		then do;
+
+/* check access on directory containing actual segment */
+/* so if it's a link, chase it */
+
+		     call hcs_$get_link_target ((mp -> queue_msg_hdr.dirname), (mp -> queue_msg_hdr.ename), dirname, ename, code);
+		     if code ^= 0 then go to skip_it;	/* can't deal with this */
+
+
+/* make sure the file hasn't been modified since */
+/* the request was done */
+
+		     call hcs_$status_ (dirname, ename, 1, addr (branch), null, code);
+		     if code ^= 0 then go to skip_it;
+		     if fixed (branch.dtm || (16)"0"b, 52) > desc_p -> request_descriptor.time_done
+		     then go to skip_it;
+
+/* now check the directory */
+
+		     call expand_pathname_ (dirname, ddir, dent, code);
+		     if code ^= 0 then go to skip_it;	/* God help us */
+
+		     call hcs_$get_access_class (ddir, dent, access_class, code);
+		     if code ^= 0 then go to skip_it;
+		     if ^aim_check_$equal (desc_p -> mseg_message_info.sender_authorization, access_class)
+		     then go to skip_it;
+
+		     call hcs_$get_user_effmode (ddir, dent, desc_p -> mseg_message_info.sender_id,
+			desc_p -> mseg_message_info.sender_level, acc_mode, code);
+		     if code ^= 0 then go to skip_it;
+		     if (bit (acc_mode, 5) & "00010"b) ^= "0"b
+		     then call delete_$path (dirname, ename, "000100"b, "", code);
+		end;
+
+skip_it:
+						/* now actually free the descriptor and the request */
+
+	     message_len = desc_p -> mseg_message_info.ms_len;
+	     free mp -> based_message in (req_area);
+	     free desc_p -> request_descriptor in (descr_area);
+
+	end;
+
+out:	if mask_bit
+	then call ipc_$unmask_ev_calls (code);
+
+	return;
+
+force:	entry;
+
+/* called when a request must be freed to make space */
+
+	clean_bit, mask_bit = "0"b;
+	force_bit = "1"b;
+	go to join;
+
+
+
+/* ************************************ */
+
+
+
+/* ************************************ */
+
+cleanup:	entry;
+
+/* called at initialization time to delete segments from requests */
+/* performed in previous session */
+
+	clean_bit = "1"b;
+	mask_bit, force_bit = "0"b;
+	go to join;
+
+
+init:	entry (a_ptr);
+
+dcl  a_ptr ptr;
+
+	stat_p = a_ptr;
+	return;
+
+/**/
+
+%include iodc_static;
+%page;
+%include mseg_message_info;
+%page;
+%include queue_msg_hdr;
+%page;
+%include request_descriptor;
+
+     end free_oldest_request_;

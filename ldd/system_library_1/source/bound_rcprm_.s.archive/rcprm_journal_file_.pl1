@@ -1,0 +1,459 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+rcprm_journal_file_:
+rcprm_journal_file_attach:
+     proc (p_iocb_ptr, p_options_array, p_com_err_sw, p_code);
+
+/* This I/O module uses vfile_ to manage an indexed file.  All calls which
+   might result in a modification of the file are either journalized or
+   disallowed, depending on the call.  The journal is used for both committing
+   and rolling back the file.
+
+   This module is a special hack for RCP, so it can roll back changes to a
+   vfile_.
+
+   Written  by Lindsey Spratt  08/02/79
+   Modified 08/79 by C. D. Tavares to fix faults in commit/rollback if switch not open
+   Modified 04/83 by B. Braun to correct a problem of RQO in process_dir (phx11736 phx14452)
+   Modified 02/85 by Chris Jones to use privileges and to clean up better.
+*/
+/* Parameter */
+
+dcl	p_actual_len	   fixed bin (21);
+dcl	p_not_used	   bit (1) aligned;
+dcl	p_buffer_len	   fixed bin (21);
+dcl	p_buffer_ptr	   ptr;
+dcl	p_info_ptr	   ptr;
+dcl	p_key		   char (256) varying;
+dcl	p_len		   fixed bin (21);
+dcl	p_open_mode	   fixed bin;
+dcl	p_pos_type	   fixed bin;
+dcl	p_skip		   fixed bin (21);
+dcl	p_com_err_sw	   bit (1);
+dcl	p_order		   char (*);
+dcl	p_code		   fixed bin (35);
+dcl	p_options_array	   (*) char (*) varying;
+dcl	p_iocb_ptr	   ptr;
+
+/* Automatic */
+
+dcl	area_ptr		   ptr;
+dcl	attach_idx	   fixed bin;
+dcl	attach_description	   char (256) varying;
+dcl	cleanup_jcb_ptr	   ptr;
+dcl	display_temp_str	   char (4096) varying;
+dcl	1 my_area_info	   like area_info aligned;
+dcl	option_idx	   fixed bin;
+dcl	privileges_string	   bit (36) aligned;
+
+/* Based */
+
+dcl	area		   area (4096) based (area_ptr);
+
+/* Builtin */
+
+dcl	addr		   builtin;
+dcl	bin		   builtin;
+dcl	bit		   builtin;
+dcl	codeptr		   builtin;
+dcl	hbound		   builtin;
+dcl	length		   builtin;
+dcl	null		   builtin;
+dcl	substr		   builtin;
+
+dcl	cleanup		   condition;
+
+/* Constant */
+
+dcl	myname		   char (19) init ("rcprm_journal_file_") options (constant) internal static;
+
+/* Controlled */
+/* Entry */
+
+dcl	add_key		   entry (ptr, ptr, fixed bin (35));
+dcl	delete_key	   entry (ptr, ptr, fixed bin (35));
+dcl	record_status	   entry (ptr, ptr, fixed bin (35));
+dcl	rollback		   entry (ptr, fixed bin (35));
+dcl	write_record	   entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl	print_data	   entry (char (*) var, ptr, fixed bin (35));
+dcl	define_area_	   entry (ptr, fixed bin (35));
+dcl	release_area_	   entry (ptr);
+dcl	unique_chars_	   entry (bit (*)) returns (char (15));
+dcl	com_err_		   entry options (variable);
+dcl	commit		   entry (ptr, fixed bin (35));
+dcl	delete_record	   entry (ptr, fixed bin (35));
+dcl	get_system_free_area_  entry returns (ptr);
+dcl	rcprm_registry_util_$turn_off_privs
+			   entry (bit (36) aligned);
+dcl	rcprm_registry_util_$turn_on_privs
+			   entry (bit (36) aligned);
+
+/* External */
+
+dcl	error_table_$argerr	   fixed bin (35) ext;
+dcl	error_table_$no_operation
+			   fixed bin (35) ext;
+dcl	error_table_$locked_by_this_process
+			   fixed bin (35) ext;
+
+	if hbound (p_options_array, 1) < 1 then do;
+	     if p_com_err_sw then
+		call com_err_ (error_table_$argerr, myname, "no file name specified.");
+	     p_code = error_table_$argerr;
+	     return;
+	end;
+	attach_description = "vfile_";
+	do option_idx = 1 to hbound (p_options_array, 1);
+	     attach_description = attach_description || " " || p_options_array (option_idx);
+	end;
+
+	area_ptr = get_system_free_area_ ();
+
+	call init_for_clean_up;
+	on cleanup call clean_up;
+
+	alloc journal_control_block in (area) set (cleanup_jcb_ptr);
+	journal_control_block_ptr = cleanup_jcb_ptr;
+
+	call iox_$attach_name (unique_chars_ ("0"b) || ".jf", journal_control_block.vfile_iocb_ptr,
+	     (attach_description), codeptr (rcprm_journal_file_), p_code);
+	if p_code ^= 0 then do;
+	     if p_com_err_sw then
+		call com_err_ (p_code, myname, "can not attach ^a.", attach_description);
+	     call clean_up;
+	     return;
+	end;
+
+	my_area_info.version = 1;
+	my_area_info.extend = "1"b;
+	my_area_info.no_freeing = "1"b;
+	my_area_info.dont_free = "1"b;
+	my_area_info.owner = myname;
+	my_area_info.areap = null;
+	my_area_info.size = sys_info$max_seg_size;
+	call define_area_ (addr (my_area_info), p_code);
+	if p_code ^= 0 then do;
+	     if p_com_err_sw then
+		call com_err_ (p_code, myname, "Could not get area for journal.");
+	     call clean_up;
+	     return;
+	end;
+	journal_control_block.journal_area_ptr = my_area_info.areap;
+	cleanup_jcb_ptr = null ();
+	p_iocb_ptr -> iocb.attach_descrip_ptr = addr (journal_control_block.attach);
+	p_iocb_ptr -> iocb.attach_data_ptr = journal_control_block_ptr;
+	p_iocb_ptr -> iocb.actual_iocb_ptr = p_iocb_ptr;
+	p_iocb_ptr -> iocb.open_descrip_ptr = null;
+	p_iocb_ptr -> iocb.open_data_ptr = null;
+
+	journal_control_block.attach = myname;
+	do attach_idx = 1 to hbound (p_options_array, 1);
+	     journal_control_block.attach = journal_control_block.attach || " ";
+	     journal_control_block.attach = journal_control_block.attach || p_options_array (attach_idx);
+	end;
+
+	p_iocb_ptr -> iocb.get_line = iox_$err_no_operation;
+	p_iocb_ptr -> iocb.get_chars = iox_$err_no_operation;
+	p_iocb_ptr -> iocb.put_chars = iox_$err_no_operation;
+	p_iocb_ptr -> iocb.modes = iox_$err_no_operation;
+	p_iocb_ptr -> iocb.rewrite_record = iox_$err_no_operation;
+
+	p_iocb_ptr -> iocb.detach_iocb = rcprm_journal_file_detach_iocb;
+	p_iocb_ptr -> iocb.open = rcprm_journal_file_open;
+	p_iocb_ptr -> iocb.close = iox_$err_not_open;
+	p_iocb_ptr -> iocb.control = rcprm_journal_file_control;
+	p_iocb_ptr -> iocb.seek_key = rcprm_journal_file_seek_key;
+	p_iocb_ptr -> iocb.write_record = rcprm_journal_file_write_record;
+	p_iocb_ptr -> iocb.read_record = rcprm_journal_file_read_record;
+	p_iocb_ptr -> iocb.delete_record = rcprm_journal_file_delete_record;
+	p_iocb_ptr -> iocb.read_key = rcprm_journal_file_read_key;
+	p_iocb_ptr -> iocb.read_length = rcprm_journal_file_read_length;
+	p_iocb_ptr -> iocb.position = rcprm_journal_file_position;
+
+	journal_control_block.latest_entry_ptr = null;
+	p_code = 0;
+	return;
+
+rcprm_journal_file_control:
+     entry (p_iocb_ptr, p_order, p_info_ptr, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.open_data_ptr;
+	call init_for_clean_up;
+	on cleanup call clean_up;
+
+	call rcprm_registry_util_$turn_on_privs (privileges_string);
+	if p_order = "io_call" then do;
+	     io_call_infop = p_info_ptr;
+	     if io_call_info.order_name = "commit" | io_call_info.order_name = "rollback" then do;
+		p_code = error_table_$no_operation;
+		return;
+	     end;
+	     else if io_call_info.order_name = "record_status" | io_call_info.order_name = "rs" then do;
+		area_ptr = get_system_free_area_ ();
+
+		alloc rs_info in (area);
+		rs_info.version = rs_info_version_2;
+		if nargs ^= 0 then do;
+		     rs_info.lock_sw = bit (substr (io_call_info.args (1), 1, 1), 1);
+		     rs_info.unlock_sw = bit (substr (io_call_info.args (1), 2, 1), 1);
+		     rs_info.create_sw = bit (substr (io_call_info.args (1), 3, 1), 1);
+		     rs_info.locate_sw = bit (substr (io_call_info.args (1), 4, 1), 1);
+		     rs_info.inc_ref_count = bit (substr (io_call_info.args (1), 5, 1), 1);
+		     rs_info.dec_ref_count = bit (substr (io_call_info.args (1), 6, 1), 1);
+		     rs_info.locate_pos_sw = bit (substr (io_call_info.args (1), 7, 1), 1);
+		end;
+		if nargs = 2 then
+		     rs_info.descriptor = bin (io_call_info.args (2), 35);
+		call record_status (journal_control_block_ptr, rs_info_ptr, p_code);
+
+		put string (display_temp_str) data (rs_info);
+		alloc print_data_info in (area);
+		print_data_info.version = print_data_info_version_1;
+		print_data_info.indentation = 1;
+		print_data_info.value_column = 40;
+		print_data_info.output_switch = null;
+		print_data_info.octal = "0"b;
+		print_data_info.intervals = "";
+		call print_data (display_temp_str, print_data_info_ptr, p_code);
+	     end;
+	     else if io_call_info.order_name = "add_key" | io_call_info.order_name = "ak" then do;
+		area_ptr = get_system_free_area_ ();
+		ak_key_len = 256;
+		alloc ak_info in (area);
+		ak_info.input_key = bit (substr (io_call_info.args (1), 1, 1), 1);
+		ak_info.input_desc = bit (substr (io_call_info.args (1), 2, 1), 1);
+		if ak_info.input_key then do;
+		     ak_info.key_len = length (io_call_info.args (2));
+		     ak_info.key = io_call_info.args (2);
+		     if ak_info.input_desc then
+			ak_info.descrip = bin (io_call_info.args (3), 35);
+		end;
+		else if ak_info.input_desc then
+		     ak_info.descrip = bin (io_call_info.args (2), 35);
+		call add_key (journal_control_block_ptr, ak_info_ptr, p_code);
+		if ak_info_ptr ^= null then
+		     ak_info.key_len = ak_key_len;
+
+	     end;
+	     else if io_call_info.order_name = "delete_key" | io_call_info.order_name = "dk" then do;
+		if nargs = 0 then
+		     ak_info_ptr = null;
+		else do;
+		     area_ptr = get_system_free_area_ ();
+		     ak_key_len = 256;
+		     alloc ak_info in (area);
+		     ak_info.input_key = bit (substr (io_call_info.args (1), 1, 1), 1);
+		     ak_info.input_desc = bit (substr (io_call_info.args (1), 2, 1), 1);
+		     if ak_info.input_key then do;
+			ak_info.key_len = length (io_call_info.args (2));
+			ak_info.key = io_call_info.args (2);
+			if ak_info.input_desc then
+			     ak_info.descrip = bin (io_call_info.args (3), 35);
+		     end;
+		     else if ak_info.input_desc then
+			ak_info.descrip = bin (io_call_info.args (2), 35);
+		end;
+		call delete_key (journal_control_block_ptr, ak_info_ptr, p_code);
+		if ak_info_ptr ^= null then
+		     ak_info.key_len = ak_key_len;
+	     end;
+	     else call iox_$control (journal_control_block.vfile_iocb_ptr, "io_call", io_call_infop, p_code);
+	end;
+	else if p_order = "record_status" | p_order = "rs" then
+	     call record_status (journal_control_block_ptr, p_info_ptr, p_code);
+	else if p_order = "add_key" | p_order = "ak" then
+	     call add_key (journal_control_block_ptr, p_info_ptr, p_code);
+	else if p_order = "delete_key" | p_order = "dk" then
+	     call delete_key (journal_control_block_ptr, p_info_ptr, p_code);
+	else if p_order = "get_key" | p_order = "gk" then
+	     call iox_$control (journal_control_block.vfile_iocb_ptr, p_order, p_info_ptr, p_code);
+	else if p_order = "seek_head" | p_order = "sh" then
+	     call iox_$control (journal_control_block.vfile_iocb_ptr, p_order, p_info_ptr, p_code);
+	else if p_order = "rollback" then
+	     if p_iocb_ptr -> iocb.open_data_ptr ^= null	/* switch is open */
+		then
+		call rollback (journal_control_block_ptr, p_code);
+	     else p_code = 0;
+	else if p_order = "commit" then
+	     if p_iocb_ptr -> iocb.open_data_ptr ^= null	/* switch is open */
+		then
+		call commit (journal_control_block_ptr, p_code);
+	     else p_code = 0;
+	else p_code = error_table_$argerr;
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	call clean_up;
+	return;
+
+rcprm_journal_file_write_record:
+     entry (p_iocb_ptr, p_buffer_ptr, p_buffer_len, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call write_record (journal_control_block_ptr, p_buffer_ptr, p_buffer_len, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_delete_record:
+     entry (p_iocb_ptr, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call delete_record (journal_control_block_ptr, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_seek_key:
+     entry (p_iocb_ptr, p_key, p_len, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$seek_key (journal_control_block.vfile_iocb_ptr, p_key, p_len, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_read_record:
+     entry (p_iocb_ptr, p_buffer_ptr, p_buffer_len, p_actual_len, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$read_record (journal_control_block.vfile_iocb_ptr, p_buffer_ptr, p_buffer_len, p_actual_len, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_read_length:
+     entry (p_iocb_ptr, p_len, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$read_length (journal_control_block.vfile_iocb_ptr, p_len, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_read_key:
+     entry (p_iocb_ptr, p_key, p_len, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$read_key (journal_control_block.vfile_iocb_ptr, p_key, p_len, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_close:
+     entry (p_iocb_ptr, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$close (journal_control_block.vfile_iocb_ptr, p_code);
+	if p_code = 0 | p_code = error_table_$locked_by_this_process then do;
+	     p_iocb_ptr -> iocb.close = iox_$err_not_open;
+	     p_iocb_ptr -> iocb.detach_iocb = rcprm_journal_file_detach_iocb;
+	     p_iocb_ptr -> iocb.open_data_ptr = null;
+	     p_iocb_ptr -> iocb.open_descrip_ptr = null;
+	     p_code = 0;
+	end;
+	return;
+
+
+rcprm_journal_file_detach_iocb:
+     entry (p_iocb_ptr, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$detach_iocb (journal_control_block.vfile_iocb_ptr, p_code);
+	if p_code = 0 | p_code = error_table_$locked_by_this_process then do;
+	     call iox_$destroy_iocb (journal_control_block.vfile_iocb_ptr, (0));
+	     p_code = 0;
+	     call release_area_ (journal_control_block.journal_area_ptr);
+	     area_ptr = get_system_free_area_ ();
+	     free journal_control_block;
+	     p_iocb_ptr -> iocb.attach_data_ptr = null;
+	     p_iocb_ptr -> iocb.attach_descrip_ptr = null;
+	     p_iocb_ptr -> iocb.open = iox_$err_not_attached;
+	     p_iocb_ptr -> iocb.detach_iocb = iox_$err_not_attached;
+	end;
+	return;
+
+
+rcprm_journal_file_position:
+     entry (p_iocb_ptr, p_pos_type, p_skip, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$position (journal_control_block.vfile_iocb_ptr, p_pos_type, p_skip, p_code);
+	if p_code = error_table_$locked_by_this_process then
+	     p_code = 0;
+	return;
+
+
+rcprm_journal_file_open:
+     entry (p_iocb_ptr, p_open_mode, p_not_used, p_code);
+
+	journal_control_block_ptr = p_iocb_ptr -> iocb.attach_data_ptr;
+	call iox_$open (journal_control_block.vfile_iocb_ptr, p_open_mode, p_not_used, p_code);
+	if p_code = 0 | p_code = error_table_$locked_by_this_process then do;
+	     p_code = 0;
+	     p_iocb_ptr -> iocb.close = rcprm_journal_file_close;
+	     p_iocb_ptr -> iocb.detach_iocb = iox_$err_not_closed;
+	     p_iocb_ptr -> iocb.open_data_ptr = journal_control_block_ptr;
+	     journal_control_block.open_desc = iox_modes (p_open_mode);
+	     p_iocb_ptr -> iocb.open_descrip_ptr = addr (journal_control_block.open_desc);
+	end;
+	return;
+
+init_for_clean_up:
+     proc;
+
+	cleanup_jcb_ptr, rs_info_ptr, print_data_info_ptr, ak_info_ptr = null ();
+	privileges_string = ""b;
+
+     end init_for_clean_up;
+
+clean_up:
+     proc;
+
+	if cleanup_jcb_ptr ^= null () then
+	     free cleanup_jcb_ptr -> journal_control_block;
+	if rs_info_ptr ^= null () then
+	     free rs_info;
+	if print_data_info_ptr ^= null () then
+	     free print_data_info;
+	if ak_info_ptr ^= null () then
+	     free ak_info;
+	call rcprm_registry_util_$turn_off_privs (privileges_string);
+
+     end clean_up;
+
+%include journal_control_block;
+%page;
+%include iocb;
+%page;
+%include iox_dcls;
+%page;
+%include iox_modes;
+%page;
+%include io_call_info;
+%page;
+%include area_info;
+%page;
+%include rs_info;
+%page;
+%include ak_info;
+%page;
+%include print_data_info;
+
+     end rcprm_journal_file_;

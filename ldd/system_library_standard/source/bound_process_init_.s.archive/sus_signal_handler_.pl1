@@ -1,0 +1,416 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-17,Swenson), approve(86-07-31,MCR7443), audit(86-07-31,Wong),
+     install(86-08-21,MR12.0-1137):
+     Changed to allow the IPC wakeup which kicks the process into execution
+     after a suspension to come from any process.  This is required so that the
+     login server process can send the wakeup.  Since process suspension can be
+     arbitrarily spoofed and replaced anyway, this presents no security
+     problem.
+  2) change(87-10-09,GDixon), approve(88-08-15,MCR7969),
+     audit(88-08-04,Lippard), install(88-08-29,MR12.2-1093):
+      A) Changed to call the term_signal_handler_ entrypoint of logout,
+         rather than the logout entrypoint, when the no_save_on_disconnect
+         command has been issued by the user.  Use of this command should
+         cause terminal disconnections to be indistinguishable from the case
+         in which the process does not have the save_on_disconnect attribute.
+         In that case, dialup_ signals trm_ (instead of sus_) which invokes
+         the term_signal_handler_.
+                                                   END HISTORY COMMENTS */
+
+/* format: style2 */
+sus_signal_handler_:
+     procedure;
+
+/* Handler for ips signal "sus_". A process receiving this signal
+   must suspend itself until the initializer signals it that it may run again.
+   If it fails to respond within a site-settable real time interval, or
+   uses more than a site-settable amount of cpu time while it is suspended,
+   it will be destroyed.
+
+   Throughout this procedure, we ignore all nonzero return codes, because we
+have no way to report them.  If we're non-absentee, we most likely have no
+terminal to print output on, and an error message would either go into the
+bit bucket or cause a fatal I/O error in the process.  And whatever our
+process type, we have a limited quota of cpu time to use while suspended, and
+it would be unwise to waste it in calls to com_err_.
+
+   Written by T. Casey, February 1979.
+   Modified July 1979 by T. Casey for MR8.0 for suspension of interactive 
+     processes whose terminals have hung up.
+   Modified December 1980 by Benson I. Margulies to extend reconnection to 
+     other io modules.
+   Modified November 1981 by E. N. Kittlitz for terminal_reconnect.ec.
+   Modified December 1983 by Jon A. Rochlis to try the "reconnection" control
+     order on the -login_channel switch, and to put back the call to 
+     user_info_$outer_module, removing special casing for tty_ and netd_.
+
+   */
+
+/* DECLARATIONS */
+
+/* Internal static */
+
+	dcl     all_name		 (1) char (32) int static options (constant) init ("-all");
+						/* to turn on all ips's before signalling QUIT */
+	dcl     reconnect_ec_entry	 char (32) int static options (constant) init ("reconnect.ec");
+
+	dcl     trm_name		 (1) char (32) int static options (constant) init ("trm_");
+						/* to mask off everything but trm_ */
+	dcl     nosave_switch	 bit (1) aligned int static init (""b);
+
+	dcl     ec_reconnect_switch	 bit (1) aligned int static init (""b);
+
+%include condition_info;
+%include condition_info_header;
+%include quit_info;
+
+	dcl     1 quit_info_struc	 aligned like quit_info;
+
+	dcl     error_table_$unable_to_do_io
+				 ext static fixed bin (35);
+
+/* Automatic */
+
+	dcl     all_mask		 bit (36) aligned;
+	dcl     code		 fixed bin (35);
+	dcl     logout_channel	 fixed bin (71);
+	dcl     logout_pid		 bit (36);
+	dcl     old_mask		 bit (36) aligned;	/* to save old ips mask, to put back when we unsuspend */
+	dcl     process_type	 fixed bin (35);
+	dcl     reconnect_ec_dir	 char (168);
+	dcl     reconnect_command_line char (256);
+	dcl     trm_mask		 bit (36) aligned;
+
+%include event_wait_channel;
+%include event_wait_info;
+
+	dcl     1 auto_event_wait_info automatic aligned like event_wait_info;
+
+	dcl     ec_entry_type	 fixed bin (2);
+
+/* Ext Entries */
+
+	dcl     create_ips_mask_	 entry (ptr, fixed bin, bit (36) aligned);
+	dcl     cu_$cp		 entry (ptr, fixed bin (21), fixed bin (35));
+	dcl     default_error_handler_$wall_ignore_pi
+				 entry options (variable);
+	dcl     hcs_$reset_ips_mask	 entry (bit (36) aligned, bit (36) aligned);
+	dcl     hcs_$set_ips_mask	 entry (bit (36) aligned, bit (36) aligned);
+	dcl     hcs_$status_minf	 entry (char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24),
+				 fixed bin (35));
+	dcl     hcs_$wakeup		 entry (bit (36), fixed bin (71), fixed bin (71), fixed bin (35));
+	dcl     ioa_$ioa_switch	 entry options (variable);
+	dcl     ipc_$block		 entry (ptr, ptr, fixed bin (35));
+	dcl     ipc_$create_ev_chn	 entry (fixed bin (71), fixed bin (35));
+	dcl     ipc_$delete_ev_chn	 entry (fixed bin (71), fixed bin (35));
+	dcl     ipc_$mask_ev_calls	 entry (fixed bin (35));
+	dcl     ipc_$unmask_ev_calls	 entry (fixed bin (35));
+
+	dcl     signal_		 entry () options (variable);
+	dcl     term_signal_handler_	 entry options(variable);
+	dcl     terminate_process_	 entry (char (*), ptr);
+	dcl     user_info_		 entry (char (*), char (*), char (*));
+	dcl     user_info_$homedir	 entry (char (*));
+	dcl     user_info_$logout_data entry (fixed bin (71), bit (36));
+	dcl     user_info_$process_type
+				 entry (fixed bin (35));
+	dcl     user_info_$outer_module
+				 entry (char (*));
+
+/* arg list is shortened to last interesting datum */
+%page;
+%include iox_entries;
+%include iox_modes;
+%page;
+/* Conditions */
+
+	dcl     any_other		 condition;
+
+/* Builtins */
+
+	dcl     (addr, codeptr, index, length, null, rtrim, size, string)
+				 builtin;
+
+/* PROCEDURE */
+
+/* If user changed his mind about -save, we'll log out when we get the sus_ signal. */
+
+	if nosave_switch
+	then call term_signal_handler_();
+
+/* Get our attach description for reattachment */
+
+/* Mask off all ips signals except trm_ (this allows a suspended process that gets bumped to signal finish). */
+
+	call create_ips_mask_ (addr (trm_name), (1), trm_mask);
+						/* this makes a mask that disables only trm_ */
+	trm_mask = ^trm_mask;			/* turn it into a mask that enables only trm_ */
+	call hcs_$set_ips_mask (trm_mask, old_mask);
+
+/* Mask off ipc event call wakeups */
+
+	call ipc_$mask_ev_calls (code);
+
+/* Create an event channel to block on */
+
+	call ipc_$create_ev_chn (event_wait_channel.channel_id (1), code);
+
+/* Tell answering service the channel id so it can wake us when it's ok to run again */
+
+	call user_info_$logout_data (logout_channel, logout_pid);
+						/* get channel and process id over which to signal a.s. */
+	call hcs_$wakeup (logout_pid, logout_channel, event_wait_channel.channel_id (1), code);
+						/* wakeup message is channel id */
+
+/* Now, go blocked on that channel until the answering service says we may run again */
+
+	auto_event_wait_info.sender = ""b;		/* so we can tell who sends the wakeup */
+	call ipc_$block (addr (event_wait_channel), addr (auto_event_wait_info), code);
+
+/* We returned from being blocked. We may run again. */
+
+	call ipc_$delete_ev_chn (event_wait_channel.channel_id (1), code);
+						/* clean up our ECT */
+
+	on any_other call REAL_FAILURE (error_table_$unable_to_do_io, "Fault or error reconnecting terminal.");
+
+/* What we do next depends on what kind of process we are. */
+
+	call user_info_$process_type (process_type);	/* find out */
+
+/* If we are absentee, we just return, to resume running. */
+
+	if process_type = 2
+	then do;
+		call unmask_all;			/* unmask ips signals and ipc event call wakeups */
+		return;
+	     end;
+
+/* Interactive or daemon */
+
+/* Can't be daemon because the MR8.0 answering service never sends sus_ to
+daemons.  So must be interactive.*/
+
+/* Simulate the user hitting QUIT. */
+
+/* We have a difficult problem here.  We would like to set a QUIT signal to
+be pending, then unmask everything, and let the QUIT and any other signals or
+wakeups go off in whatever order the system wants them to.  But if we unmask
+ips signals first, we are very likely to get one before we can signal QUIT.
+Or, if we signal QUIT with a signal statement first, we will probably get to
+command level with ips signals and ipc event call wakeups masked off, which
+is not a good environment in which to leave the user.  Since ipc wakeups will
+not happen until we go blocked, it is safe to unmask them just before
+signalling QUIT.  And, since the ips signals most likely to occur are cput
+and alrm, it is probably ok to let them happen before we signal QUIT.  So, we
+unmask and then immediately signal QUIT, and hope for the best.  But first,
+take care of a few details.  */
+
+
+	call reattach_user_channel;			/* redo iox_ attachments */
+
+/* Turn on the new terminal's QUIT button, while we still have control */
+
+	call iox_$control (iox_$user_io, "quit_enable", null (), code);
+
+	call ioa_$ioa_switch (iox_$user_io, "Wait for QUIT.");
+						/* tell user not to get impatient */
+	quit_info_struc.length = size (quit_info_struc);	/* set up QUIT info structure */
+	quit_info_struc.version = 1;
+	quit_info_struc.action_flags = ""b;		/* no special action */
+	quit_info_struc.info_string = "";
+	quit_info_struc.status_code = 0;
+	string (quit_info_struc.switches) = ""b;	/* ips_quit, reset_write = "0"b */
+	quit_info_struc.switches.reconnection_quit = "1"b;/* but this is... */
+
+/* Finally, we'll unmask and signal QUIT.
+   In case the hangup happened while a nonstandard mask was in effect, we'll mask everything on
+   before going to command level. This might cause problems in some rare cases, but it would be
+   a lot worse to put a user at command level with all ips signals masked off. If he
+   released in those circumstances, the ips signals would never get masked on again. */
+
+	call create_ips_mask_ (addr (all_name), (1), all_mask);
+						/* get mask that disables all ips signals */
+	all_mask = ^all_mask;			/* turn it into one that enables all ips signals */
+	call unmask_all;				/* for ipc and crit bit */
+	call hcs_$set_ips_mask (all_mask, (""b));
+
+	if ec_reconnect_switch
+	then do;
+		call user_info_$homedir (reconnect_ec_dir);
+		call hcs_$status_minf (reconnect_ec_dir, reconnect_ec_entry, 1, ec_entry_type, (0), code);
+		if code ^= 0 | ec_entry_type ^= 1
+		then do;
+			call user_info_ ((""), reconnect_ec_dir, (""));
+			reconnect_ec_dir = ">udd>" || rtrim (reconnect_ec_dir);
+			call hcs_$status_minf (reconnect_ec_dir, reconnect_ec_entry, 1, ec_entry_type, (0), code);
+			if code ^= 0 | ec_entry_type ^= 1
+			then do;
+				reconnect_ec_dir = ">system_control_dir";
+				call hcs_$status_minf (reconnect_ec_dir, reconnect_ec_entry, 1, ec_entry_type,
+				     (0), code);
+				if code ^= 0 | ec_entry_type ^= 1
+				then go to no_reconnect_ec;
+			     end;
+		     end;
+		on any_other call default_error_handler_$wall_ignore_pi;
+		reconnect_command_line = "exec_com " || rtrim (reconnect_ec_dir) || ">" || reconnect_ec_entry;
+		call cu_$cp (addr (reconnect_command_line), length (reconnect_command_line), code);
+		if code ^= 0
+		then call ioa_$ioa_switch (iox_$user_io, "sus_signal_handler_: Unable to invoke ^a.",
+			reconnect_ec_entry);
+	     end;
+
+no_reconnect_ec:
+	revert any_other;
+	call signal_ ("quit", null (), addr (quit_info_struc), null ());
+
+/* If the QUIT handler returns, the user probably said start. So we'll return to the procedure
+   that was interrupted by the sus_ signal. */
+
+
+	call iox_$control (iox_$user_io, "start", null (), code);
+						/* in case it hung up while we were in the tty_ dim */
+
+	call hcs_$reset_ips_mask (old_mask, (""b));	/* put back mask that was in effect at time of hangup */
+
+	return;
+
+
+unmask_all:
+     proc;					/* to unmask ipc event calls and ips signals */
+
+	call ipc_$unmask_ev_calls (code);
+	call hcs_$reset_ips_mask (old_mask, (""b));	/* tell hardcore that we have stopped changing the mask */
+	return;
+
+     end unmask_all;
+
+
+/* The following two entry points allow a user who specified -save at login time (or who gets -save by default)
+   to change his mind, repeatedly. Note that a user who doesn't log in with -save can not change his mind. */
+
+no_save_on_disconnect:
+     entry;
+
+	nosave_switch = "1"b;
+	return;
+
+save_on_disconnect:
+     entry;
+
+	nosave_switch = ""b;
+	return;
+
+
+/* The following four entry points are used to control the execution
+   of an exec_com following reconnection.  The process may disable/enable
+   the execution of the exec_com, and may establish the any_other handler
+   which will be used when the exec_com is being interpreted. */
+
+
+reconnect_ec_disable:
+     entry;
+
+	ec_reconnect_switch = "0"b;
+	return;
+
+
+reconnect_ec_enable:
+     entry;
+
+	ec_reconnect_switch = "1"b;
+	return;
+
+
+/* Brains of this act. This procedure reconnects switches attached
+   with -login_channel */
+
+reattach_user_channel:
+     procedure;
+
+%include iocb;
+	declare 1 IOCB		 aligned based (iocbp) like iocb;
+	declare iocbp		 pointer;
+	declare 1 atd		 aligned based (IOCB.attach_descrip_ptr),
+		2 len		 fixed bin (21),
+		2 attach_description char (0 refer (atd.len));
+	declare outer_module	 char (32);
+	declare ix		 fixed bin;
+	declare code		 fixed bin (35);
+	declare new_atd		 char (64);
+
+
+/* all attachments must be -login_channel to be noticed by this code */
+
+	outer_module = "";
+	call user_info_$outer_module (outer_module);
+
+	new_atd = rtrim (outer_module) || " -login_channel";
+
+	code = 0;
+
+	do ix = 1 repeat (1 + ix);			/* checkout all switches */
+	     code = 0;
+	     call iox_$find_iocb_n (ix, iocbp, code);
+	     if code ^= 0
+	     then goto NO_MORE_SWITCHES;
+	     if iocbp = IOCB.actual_iocb_ptr
+	     then if IOCB.attach_descrip_ptr ^= null ()
+		then do;
+			if index (attach_description, "-login_channel") > 0
+			then do;
+				call iox_$control (iocbp, "reconnection", null (), code);
+						/* for touchier io modules, ala window_io_/tc_io_ */
+				if code = 0
+				then goto RECONNECTED;
+				call iox_$close (iocbp, code);
+				if code ^= 0
+				then call REAL_FAILURE (code, "Closing switch " || IOCB.name);
+				call iox_$detach_iocb (iocbp, code);
+				if code ^= 0
+				then call REAL_FAILURE (code, "Detaching switch " || IOCB.name);
+				call iox_$attach_ptr (iocbp, rtrim (new_atd), codeptr (sus_signal_handler_), code)
+				     ;
+				if code ^= 0
+				then call REAL_FAILURE (code,
+					"Reattaching switch " || IOCB.name || " " || rtrim (new_atd));
+				call iox_$open (iocbp, Stream_input_output, ""b, code);
+				if code ^= 0
+				then call REAL_FAILURE (code, "Opening switch " || IOCB.name);
+				go to RECONNECTED;
+			     end;
+		     end;
+	end;
+
+NO_MORE_SWITCHES:					/* we hope for the best */
+RECONNECTED:
+	return;
+     end reattach_user_channel;
+
+REAL_FAILURE:
+     procedure (code, reason) options (non_quick);
+
+	dcl     code		 fixed bin (35);
+	dcl     reason		 char (*);
+	dcl     1 terminate_info	 aligned,
+		2 version		 fixed bin,
+		2 fatal_code	 fixed bin (35);
+
+	terminate_info.version = 0;
+	terminate_info.fatal_code = code;
+	call terminate_process_ ("fatal_error", addr (terminate_info));
+     end REAL_FAILURE;
+
+     end sus_signal_handler_;

@@ -1,0 +1,675 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,^ifthendo */
+priv_channel_manager:
+     procedure;
+
+/*  This procedure accepts calls to perform privileged channel management
+   functions.  Each such call is directed through a transfer vector
+   to the appropriate module according to channel type and functional
+   type.  The specified channel is locked before forwarding the call
+   and unlocked upon return.
+*/
+
+/* Coded 7/31/78 by J. Stern */
+/* MCM tracing added by C. Hornig, January 1980 */
+/* Metering added by C. Hornig, April 1980 */
+/* allocation of unwired saved logical channel meters added by Robert Coren, December 1980 */
+/* Modified November 1984 by Robert Coren to use tty_area_manager entries */
+
+/* Parameters */
+
+dcl  pm_lct_size fixed bin;
+dcl  pm_devx fixed bin;
+dcl  pm_chan_type fixed bin;
+dcl  pm_info_ptr ptr;
+dcl  pm_mii_ptr ptr;
+dcl  pm_chan_name char (*);
+dcl  pm_control_type char (*);
+dcl  pm_code fixed bin (35);
+
+
+/* Automatic */
+
+dcl  i fixed bin;
+dcl  found bit (1);
+dcl  devx fixed bin;
+dcl  chan_type fixed bin;
+dcl  db_ptr ptr;
+dcl  locked bit (1) aligned;
+dcl  code fixed bin (35);
+dcl  chan_name char (32);
+dcl  time_in fixed bin (71);
+
+
+/* Conditions */
+
+dcl  cleanup condition;
+dcl  area condition;
+
+
+/* External static */
+
+dcl  pds$virtual_delta fixed bin (71) ext;
+
+dcl  error_table_$invalid_state fixed bin (35) ext;
+dcl  error_table_$no_operation fixed bin (35) ext;
+dcl  error_table_$invalid_mpx_type fixed bin (35) ext;
+dcl  error_table_$bad_index fixed bin (35) ext;
+dcl  error_table_$id_not_found fixed bin (35) ext;
+dcl  error_table_$notalloc fixed bin (35) ext;
+dcl  error_table_$smallarg fixed bin (35) ext;
+
+/* Builtins */
+
+dcl  (addr, clock, codeptr, index, null, unspec, hbound, size) builtin;
+
+
+/* Entries */
+
+dcl  create_hproc entry (char (*), bit (1) aligned, ptr, ptr, fixed bin (35));
+dcl  mcs_timer_daemon entry;
+dcl  tty_area_manager$allocate entry (fixed bin, ptr);
+dcl  tty_area_manager$free entry (fixed bin, ptr);
+dcl  tty_lock$lock_channel entry (fixed bin, fixed bin (35));
+dcl  tty_lock$unlock_channel entry (fixed bin);
+dcl  tty_lock$flush_queue entry (fixed bin);
+dcl  mcs_trace entry options (variable);
+%page;
+/* * * * * * * * * * LCT_INIT * * * * * * * * * */
+
+lct_init:
+     entry (pm_lct_size, pm_code);
+
+	lct_size = pm_lct_size;
+	ttybp = addr (tty_buf$);
+
+	if tty_buf.timer_process = ""b
+	then do;
+	     call create_hproc ("MCS_Timer_Daemon.SysDaemon.z", "0"b, aptep, codeptr (mcs_timer_daemon), pm_code);
+	     if pm_code ^= 0
+	     then return;
+
+	     unspec (tty_buf.timer_ev_chn) = "007777000001000000000001"b3;
+	     tty_buf.timer_process = apte.processid;
+	end;
+
+	if lct_size < 0
+	then do;
+	     pm_code = error_table_$smallarg;
+	     return;
+	end;
+
+	lctp = null;
+	call tty_space_man$get_perm_space (size (lct), lctp);
+	if lctp = null
+	then do;
+lct_notalloc:
+	     pm_code = error_table_$notalloc;
+	     return;
+	end;
+
+	lct.max_no_lctes = lct_size;
+	on area go to lct_notalloc;
+	call tty_area_manager$allocate (size (lcnt), lcntp);
+	revert area;
+	lcnt.names (*) = "";
+	lct.lcnt_ptr = lcntp;
+	tty_buf.lct_ptr = lctp;
+	pm_code = 0;
+
+	return;
+
+/* * * * * * * * * * INIT_CHANNEL * * * * * * * * * */
+
+init_channel:
+     entry (pm_devx, pm_info_ptr, pm_code);
+
+	call setup ();
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.init
+	     then call mcs_trace (devx, "init_channel: ^p", pm_info_ptr);
+
+	if lcte.initialized | ^lcte.entry_in_use
+	then go to invalid_state;
+
+	init_channel_ev = make_entry (INIT_CHANNEL, 0);
+	call init_channel_ev (devx, pm_info_ptr, db_ptr, code);
+	if code = 0
+	then do;
+	     lcte.channel_type = 0;
+	     lcte.data_base_ptr = db_ptr;
+	     lcte.initialized = "1"b;
+	end;
+
+	pm_code = code;
+	call meter;
+	return;
+
+/* * * * * * * * * TERMINATE_CHANNEL * * * * * * * * * */
+
+terminate_channel:
+     entry (pm_devx, pm_code);
+
+	call setup ();
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.init
+	     then call mcs_trace (devx, "terminate_channel");
+
+	if lcte.channel_type ^= 0
+	then go to invalid_state;
+
+	on cleanup call unlock_channel ();
+	call lock_channel ();
+	terminate_channel_ev = make_entry (TERMINATE_CHANNEL, 0);
+	call terminate_channel_ev ((lcte.data_base_ptr), code);
+	if code = 0
+	then do;
+	     lcte.data_base_ptr = null;
+	     lcte.initialized = "0"b;
+	     lcte.space_needed = "0"b;
+	     if ^lcte.special_lock
+	     then call tty_lock$flush_queue (devx);	/* unlocks the channel lock */
+	end;
+	else call unlock_channel ();
+
+	pm_code = code;
+	call meter;
+	return;
+
+/* * * * * * * * * INIT_MULTIPLEXER * * * * * * * * * */
+
+init_multiplexer:
+     entry (pm_devx, pm_chan_type, pm_mii_ptr, pm_code);
+
+	call setup ();
+	chan_type = pm_chan_type;
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.init
+	     then call mcs_trace (devx, "init_multiplexer: ^a (^p).", mpx_types (pm_chan_type), pm_mii_ptr);
+
+	if chan_type < 1 | chan_type > hbound (cmtv.chan_type_index, 1)
+	then do;
+bad_chan_type:
+	     pm_code = error_table_$invalid_mpx_type;
+	     return;
+	end;
+	if cmtv.chan_type_index (chan_type) < 1 | cmtv.chan_type_index (chan_type) > cmtv.no_channel_types
+	then go to bad_chan_type;
+
+	miip = pm_mii_ptr;
+	call find_subchan_lctes ();
+
+	init_multiplexer_ev = make_entry (INIT_MULTIPLEXER, chan_type);
+	call init_multiplexer_ev (devx, miip, db_ptr, code);
+	if code = 0
+	then do;
+	     call allocate_subchan_lctes ();
+	     if code = 0
+	     then do;
+		lcte.channel_type = chan_type;
+		lcte.data_base_ptr = db_ptr;
+		lcte.special_lock = mpx_special_lock (chan_type);
+		lcte.initialized = "1"b;
+	     end;
+	end;
+
+	pm_code = code;
+	call meter;
+	return;
+
+/* * * * * * * * * * * TERMINATE_MULTIPLEXER * * * * * * * * * */
+
+terminate_multiplexer:
+     entry (pm_devx, pm_code);
+
+	call setup ();
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.init
+	     then call mcs_trace (devx, "terminate_multiplexer");
+
+
+	if lcte.channel_type = 0
+	then go to invalid_state;
+
+	call check_subchan_lctes ();
+
+	on cleanup call unlock_channel ();
+	call lock_channel ();
+	terminate_multiplexer_ev = make_entry (TERMINATE_MULTIPLEXER, (lcte.channel_type));
+	call terminate_multiplexer_ev ((lcte.data_base_ptr), code);
+	if code = 0
+	then do;
+	     lcte.data_base_ptr = null;
+	     call free_subchan_lctes ();
+	     lcte.initialized = "0"b;
+	     lcte.space_needed = "0"b;
+	     if ^lcte.special_lock
+	     then call tty_lock$flush_queue (devx);	/* unlocks channel lock */
+	end;
+	else call unlock_channel ();
+
+	pm_code = code;
+	call meter;
+	return;
+
+/* * * * * * * * * * * START * * * * * * * * * * */
+
+start:
+     entry (pm_devx, pm_code);
+
+	call setup ();
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.start
+	     then call mcs_trace (devx, "start");
+
+	on cleanup call unlock_channel ();
+	call lock_channel ();
+	start_ev = make_entry (START, (lcte.channel_type));
+	call start_ev ((lcte.data_base_ptr), pm_code);
+	call unlock_channel ();
+	call meter;
+	return;
+
+/* * * * * * * * * * STOP * * * * * * * * * * */
+
+stop:
+     entry (pm_devx, pm_code);
+
+	call setup ();
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.start
+	     then call mcs_trace (devx, "stop");
+
+	on cleanup call unlock_channel ();
+	call lock_channel ();
+	stop_ev = make_entry (STOP, (lcte.channel_type));
+	call stop_ev ((lcte.data_base_ptr), pm_code);
+	call unlock_channel ();
+	call meter;
+	return;
+
+/* * * * * * * * * * * SHUTDOWN * * * * * * * * * */
+
+shutdown:
+     entry (pm_devx, pm_code);
+
+	call setup ();
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.shutdown
+	     then call mcs_trace (devx, "shutdown");
+
+	on cleanup call unlock_channel ();
+	call lock_channel ();
+	shutdown_ev = make_entry (SHUTDOWN, (lcte.channel_type));
+	call shutdown_ev ((lcte.data_base_ptr), pm_code);
+	call unlock_channel ();
+	call meter;
+	return;
+
+/* * * * * * * * * * GET_DEVX * * * * * * * * * * */
+
+get_devx:
+     entry (pm_chan_name, pm_devx, pm_code);
+
+	call setup_name ();
+
+	if code = 0
+	then do;
+	     pm_devx = devx;
+	     pm_code = 0;
+	     return;
+	end;
+	else if index (chan_name, ".") ^= 0		/* not a level-1 multiplexer */
+	then do;
+	     pm_code = code;
+	     return;
+	end;
+
+/* come here to create lct entry for level-1 multiplexer */
+
+	found = "0"b;
+	do i = 1 to lct.max_no_lctes while (^found);
+	     devx = i;
+	     lctep = addr (lct.lcte_array (devx));
+	     if ^lcte.entry_in_use
+	     then found = "1"b;
+	end;
+
+	if found					/* found a free lct entry */
+	then do;
+	     lcte.entry_in_use = "1"b;
+	     lcte.data_base_ptr = null;
+	     lcnt.names (devx) = chan_name;
+	     on area go to get_devx_notalloc;
+	     call tty_area_manager$allocate (size (saved_meters), lcte.saved_meters_ptr);
+	     pm_code = 0;
+	     pm_devx = devx;
+	end;
+	else do;
+get_devx_notalloc:
+	     pm_code = error_table_$notalloc;
+	end;
+
+	return;
+
+/* * * * * * * * * * * * PRIV_CONTROL * * * * * * * * * * */
+
+priv_control:
+     entry (pm_chan_name, pm_control_type, pm_info_ptr, pm_code);
+
+	call setup_name ();
+	if code ^= 0
+	then do;
+	     pm_code = code;
+	     return;
+	end;
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.control
+	     then call mcs_trace (devx, "priv_control: ^a (^p)", pm_control_type, pm_info_ptr);
+
+	call lock_channel ();
+	if lcnt.names (devx) ^= chan_name		/* name changed before channel was locked */
+	then pm_code = error_table_$id_not_found;
+	else do;
+	     priv_control_ev = make_entry (PRIV_CONTROL, (lcte.channel_type));
+	     call priv_control_ev ((lcte.data_base_ptr), pm_control_type, pm_info_ptr, pm_code);
+	end;
+	call unlock_channel ();
+	call meter;
+	return;
+
+/* * * * * * * * * * * * HPRIV_CONTROL * * * * * * * * * * */
+
+hpriv_control:
+     entry (pm_chan_name, pm_control_type, pm_info_ptr, pm_code);
+
+	call setup_name ();
+	if code ^= 0
+	then do;
+	     pm_code = code;
+	     return;
+	end;
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.control
+	     then call mcs_trace (devx, "hpriv_control: ^a (^p)", pm_control_type, pm_info_ptr);
+
+	call lock_channel ();
+	if lcnt.names (devx) ^= chan_name		/* name changed before channel was locked */
+	then pm_code = error_table_$id_not_found;
+	else do;
+	     hpriv_control_ev = make_entry (HPRIV_CONTROL, (lcte.channel_type));
+	     call hpriv_control_ev ((lcte.data_base_ptr), pm_control_type, pm_info_ptr, pm_code);
+	end;
+	call unlock_channel ();
+	call meter;
+	return;
+
+
+invalid_state:
+	code = error_table_$invalid_state;
+
+
+error_exit:
+	call unlock_channel ();
+	pm_code = code;
+	return;
+
+/* * * * * * * * * * SETUP * * * * * * * * * * */
+
+setup:
+     procedure;
+	time_in = clock () - pds$virtual_delta;
+	locked = "0"b;
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	if lctp = null
+	then go to no_devx;
+
+	devx = pm_devx;
+	if devx < 1 | devx > lct.max_no_lctes
+	then do;
+no_devx:
+	     code = error_table_$bad_index;
+	     go to error_exit;
+	end;
+
+	lctep = addr (lct.lcte_array (devx));
+
+	cmtvp = addr (cmtv$cmtv);
+     end setup;					/* setup */
+
+/* * * * * * * * * * * SETUP_NAME * * * * * * * * * * * * */
+
+setup_name:
+     procedure;
+	time_in = clock () - pds$virtual_delta;
+	code = 0;
+	locked = "0"b;
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	if lctp = null
+	then do;
+no_name:
+	     code = error_table_$id_not_found;
+	     go to error_exit;
+	end;
+	lcntp = lct.lcnt_ptr;
+
+	chan_name = pm_chan_name;
+	if chan_name = ""
+	then go to no_name;
+
+	do devx = 1 to lct.max_no_lctes while (lcnt.names (devx) ^= chan_name);
+	end;
+
+	if devx > lct.max_no_lctes
+	then do;
+	     code = error_table_$id_not_found;
+	     return;
+	end;
+	lctep = addr (lct.lcte_array (devx));
+
+	cmtvp = addr (cmtv$cmtv);
+
+     end setup_name;				/* setup_name */
+
+/* * * * * * * * * * METER * * * * * * * * * */
+
+meter:
+     procedure;
+	lcte.meters.control.calls = lcte.meters.control.calls + 1;
+	lcte.meters.control.call_time = lcte.meters.control.call_time + clock () - pds$virtual_delta - time_in;
+     end meter;
+
+/* * * * * * * * * * * MAKE_ENTRY * * * * * * * * * * */
+
+make_entry:
+     proc (entry_type, chan_type) returns (entry variable); /* kludges together an entry variable */
+
+dcl  entry_type fixed bin;
+dcl  chan_type fixed bin;
+
+dcl  code_ptr ptr;
+dcl  code_word fixed bin based (code_ptr);
+
+dcl  new_entry entry variable;
+dcl  1 entry_var aligned,
+       2 code_ptr ptr,
+       2 env_ptr ptr;
+
+
+	code_ptr = addr (cmtv.entries (entry_type, cmtv.chan_type_index (chan_type)));
+	if code_word = 0				/* undefined entry point */
+	then do;
+	     code = error_table_$no_operation;
+	     go to error_exit;
+	end;
+
+	entry_var.code_ptr = code_ptr;
+	entry_var.env_ptr = null;
+	unspec (new_entry) = unspec (entry_var);
+
+	return (new_entry);
+
+     end;						/* get_entry */
+
+/* * * * * * * * * * * LOCK_CHANNEL * * * * * * * * * * */
+
+lock_channel:
+     procedure;
+
+	if ^lcte.entry_in_use
+	then go to invalid_state;
+
+	if lcte.special_lock			/* not for us to lock */
+	then return;
+
+	call tty_lock$lock_channel (devx, code);
+	if code ^= 0
+	then go to error_exit;
+	locked = "1"b;
+
+     end lock_channel;				/* lock_channel */
+
+/* * * * * * * * * * * * UNLOCK_CHANNEL * * * * * * * * * * * */
+
+unlock_channel:
+     procedure;
+
+	if locked
+	then call tty_lock$unlock_channel (devx);
+	locked = "0"b;
+
+     end unlock_channel;				/* unlock_channel */
+
+/* * * * * * * * * * CHECK_SUBCHAN_LCTES * * * * * * * * * */
+
+check_subchan_lctes:
+     procedure;
+
+dcl  lctx fixed bin;
+dcl  p ptr;
+
+
+	do lctx = 1 to lct.max_no_lctes;
+	     p = addr (lct.lcte_array (lctx));
+	     if p -> lcte.major_channel_devx = devx
+	     then if p -> lcte.initialized
+		then go to invalid_state;
+	end;
+
+     end;						/* check_subchan_lctes */
+
+/* * * * * * * * * * * * * FREE_SUBCHAN_LCTES * * * * * * * * * * */
+
+free_subchan_lctes:
+     procedure;
+
+dcl  lctx fixed bin;
+dcl  p ptr;
+
+
+	lcntp = lct.lcnt_ptr;
+
+	do lctx = 1 to lct.max_no_lctes;
+	     p = addr (lct.lcte_array (lctx));
+	     if p -> lcte.major_channel_devx = devx
+	     then do;
+		lcnt.names (lctx) = "";
+		call tty_area_manager$free (size (saved_meters), p -> lcte.saved_meters_ptr);
+		unspec (p -> lcte.meters) = "0"b;	/* to avoid confusion later */
+		p -> lcte.major_channel_devx = 0;
+		p -> lcte.entry_in_use = "0"b;
+	     end;
+	end;
+
+     end;						/* free_subchan_lctes */
+
+/* * * * * * * * * * FIND_SUBCHAN_LCTES * * * * * * * * * * * */
+
+find_subchan_lctes:
+     procedure;					/* finds unused lct entries */
+
+dcl  (lctx, sbchx) fixed bin;
+dcl  p ptr;
+
+
+	sbchx = 0;
+	do lctx = 1 to lct.max_no_lctes while (sbchx < mux_init_info.no_channels);
+	     p = addr (lct.lcte_array (lctx));
+	     if ^p -> lcte.entry_in_use
+	     then do;
+		sbchx = sbchx + 1;
+		mux_init_info.channels (sbchx).devx = lctx;
+	     end;
+	end;
+
+	if sbchx < mux_init_info.no_channels
+	then do;
+	     code = error_table_$notalloc;
+	     go to error_exit;
+	end;
+
+     end;						/* find_subchan_lctes */
+
+/* * * * * * * * * * * * ALLOCATE_SUBCHAN_LCTES * * * * * * * * * * */
+
+allocate_subchan_lctes:
+     proc;					/* marks previously found lct entries "in use" */
+
+dcl  (lctx, sbchx) fixed bin;
+dcl  p ptr;
+
+
+	lcntp = lct.lcnt_ptr;
+
+	do sbchx = 1 to mux_init_info.no_channels;
+	     lctx = mux_init_info.channels (sbchx).devx;
+	     lcnt.names (lctx) = mux_init_info.channels (sbchx).name;
+	     p = addr (lct.lcte_array (lctx));
+	     p -> lcte.major_channel_devx = devx;
+	     if lcte.physical_channel_devx = 0		/* major channel is an FNP */
+	     then p -> lcte.physical_channel_devx = lctx; /* FNP subchan is its own physical channel */
+	     else p -> lcte.physical_channel_devx = lcte.physical_channel_devx;
+						/* same as major channel */
+	     p -> lcte.entry_in_use = "1"b;
+	     on area go to subchan_not_alloc;
+	     call tty_area_manager$allocate (size (saved_meters), p -> lcte.saved_meters_ptr);
+	end;
+
+	return;
+subchan_not_alloc:
+	code = error_table_$notalloc;
+	return;
+
+     end;						/* allocate_subchan_lctes */
+%page;
+%include lct;
+%include cmtv;
+%include mux_init_info;
+%include multiplexer_types;
+%include tty_space_man_dcls;
+%include tty_buf;
+%include apte;
+
+     end priv_channel_manager;			/* priv_channel_manager */

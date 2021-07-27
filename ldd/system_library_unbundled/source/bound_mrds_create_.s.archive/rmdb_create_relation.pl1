@@ -1,0 +1,797 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-11-17,Dupuis), approve(85-12-16,MCR7314),
+     audit(86-02-04,Brunelle), install(86-02-05,MR12.0-1013):
+     This entry is being made to cover the change made on 85-05-06 by Thanh
+     Nguyen. (see mrds #136)
+  2) change(85-12-18,Spitzer), approve(85-12-18,MCR7311),
+     audit(86-09-15,Gilcrease), install(86-10-16,MR12.0-1187):
+     Add code to use the database crossreference file. Update the
+     unreferenced_attribute list in db_model.
+  3) change(86-11-18,Blair), approve(86-11-18,PBF7311), audit(86-12-05,Dupuis),
+     install(86-12-09,MR12.0-1237):
+     Change to use mrds_data_$relation_blocking_factor when creating new
+     relations.
+                                                   END HISTORY COMMENTS */
+
+rmdb_create_relation: proc (I_rmdb_ctl_ptr, I_rmdb_create_rel_info_ptr, I_called_from_request_level, O_err_msg, O_err_code);
+
+/*                          BEGIN_DESCRIPTION
+
+   The purpose of  this procedure is to provide the internal interface for the
+   restructuring  create_relation.   It is expected that the validation of the
+   user as a DBA and the quiescing of the database has already been done prior
+   to calling this procedure.
+
+   If successful it  will create the relation data file, create the file_model
+   segment and link the new relation into the data_model.
+
+   The new  relation  name  and attribute  info is  provided  as  input in the
+   rmdb_create_rel_info structure.  The  relation  name can  not  exist in the
+   database.   Only attributes  that already  exist in the  data_model  can be
+   used in the relation definition.
+
+   Temporary  space is created and  cleaned  up in the  directory specified by
+   rmdb_create_rel_info.temp_directory_path.  This space is used to create the
+   keyed sequential file for attribute name that  exists in the db_model.
+
+   If an error occurs during the creation of the new relation all segments and
+   files created prior to the error will be deleted.
+
+                               END_DESCRIPTION
+
+   HISTORY:
+   82-03-23   Originally written by R. Lackey
+
+   82-06-25  Roger Lackey : added %include access_mode_values
+   and changed make_seg call to use RW_ACCESS_BIN
+
+   Also converted undo request to use -brief instead of -force
+
+   82-07-01  Roger Lackey : Modified the calls to mu_db_inconsistent to use
+   mdbm_util_$inconsistent_* for binding.
+
+   82-09-22 D. Woodka : Modified for DMS conversion to call relation_manager
+   create_relation, create_index, and close.
+
+   83-01-11 R. Harvey : Fixed create_index code so that one call is made per
+   index to be created.
+
+   83-02-04 Mike Kubicar : Added calls to transaction processing routines.
+
+   83-02-14 Davids: modified to use the new db_type_flags in the db_model
+   structure instead of the old numeric db_type.
+
+   83-02-22 Harvey: Changed calling sequence to $create_relation for attribute
+   names.
+
+   83-02-24 Davids: Modified to set the protected, no_concurrency and
+   no_rollback elements of the file_create_info structure from the
+   transactions_needed, concurrency_on, and rollback_on elements of the
+   db_model structure.
+
+   83-05-24 Davids: Added code to change the saved_res_verion so that the
+   saved resultant will not get incorrectly used in an opening.
+
+   84-08-22 Pierret: Changed file_create_info structure to use version
+   FILE_CREATE_INFO_VERSION_2 and to set the new 
+   file_create_info.ring_brackets (*) to 0, meaning use default value.
+*/
+
+/*           PARAMETERS            */
+
+	dcl     I_rmdb_create_rel_info_ptr ptr parameter; /* Pointer to the rmdb_create_rel_info structure */
+	dcl     I_rmdb_ctl_ptr	 ptr parameter;	/* Pointer to the rmdb_ctl_info structure */
+	dcl     I_called_from_request_level bit (1);	/* True if rmdb_create_rel was called from the request level,
+                                                               false if from rmdb_create_and_pop_rel */
+	dcl     O_err_msg		 char (*) parameter;/* Error message text */
+	dcl     O_err_code		 fixed bin (35) parameter; /* Error code */
+%page;
+/* rmdb_create_relation: proc (I_rmdb_ctl_ptr, I_rmdb_create_rel_info_ptr, I_called_from_request_level, O_err_msg, O_err_code); */
+
+/*      Init parameters          */
+
+	rmdb_create_rel_info_ptr = I_rmdb_create_rel_info_ptr;
+	rmdb_ctl_ptr = I_rmdb_ctl_ptr;
+	called_from_request_level = I_called_from_request_level;
+	O_err_msg = "";
+	O_err_code = 0;
+
+/*     Init   for cleanup                   */
+
+	temp_file_iocb_ptr = rmdb_ctl.crossref_file_info.iocb_ptr;
+	file_model_ptr, temp_seg_ptr = null;
+	must_delete_relation = "0"b;
+	db_path = rmdb_create_rel_info.db_path;
+	temp_dir_path = rmdb_create_rel_info.temp_directory_path;
+	dbm_ptr = rmdb_create_rel_info.db_model_ptr;
+
+	if db_model.db_type_flags.transactions_needed & called_from_request_level then do;
+		mstxn_transactions_needed = "1"b;
+		call transaction_manager_$get_current_txn_id (mstxn_txn_id,
+		     mstxn_code);
+		if mstxn_code = 0 then do;
+			mstxn_txn_id = "0"b;	/* So that we don't try to commit the transaction */
+			call error (error_table_$action_not_performed,
+			     "Relations may not be created while a transaction is " ||
+			     "in progress.  Commit or abort the transaction and try " ||
+			     "again.");
+		     end;
+	     end;
+	else mstxn_transactions_needed = "0"b;
+	mstxn_txn_id = "0"b;			/* transaction_manager_ doesn't guarantee 0 after previous call */
+
+	fm_ptr = null;
+	on cleanup call tidy_up;			/* Establish a cleanup handler */
+
+	if rmdb_create_rel_info.version ^= RMDB_CREATE_REL_INFO_VERSION_1 then
+	     call error (error_table_$unimplemented_version,
+		"For rmdb_create_rel_info.version");
+
+	if db_model.num_rels + 1 > mrds_data_$max_relations then /* Can only have so many */
+	     call error (mrds_error_$max_rels, rmdb_create_rel_info.relation_name);
+%page;
+/* Validate the relation name supplied */
+
+	rel_name = rtrim (rmdb_create_rel_info.relation_name);
+
+	first_char = substr (rel_name, 1, 1);		/* Get first char of rel_name */
+
+	if first_char = "_" then
+	     call error (mrds_error_$inv_rel_name_first_char, "^/" || rel_name ||
+		"^/Relation names cannot begin with an underscore.");
+
+	if first_char = "-" then
+	     call error (mrds_error_$inv_rel_name_first_char, "^/" || rel_name ||
+		"^/Relation names cannot begin with a hyphen.");
+
+	if verify (first_char, "0123456789") = 0 then
+	     call error (mrds_error_$inv_rel_name_first_char, "^/" || rel_name ||
+		"^/Relation names cannot begin with a numeric.");
+
+
+	s = verify (rel_name, mrds_data_$valid_rel_and_attr_name_chars);
+	if s ^= 0 then
+	     call error (mrds_error_$bad_rel_name, "^/" || rel_name ||
+		"^/First bad character is:  " || substr (rel_name, s, 1));
+
+	if rel_name = "db_model" then call error (mrds_error_$rst_reserved_name,
+		"^/" || rel_name ||
+		"^/The name ""db_model"" is a reserved name for MRDS and cannot be used as a relation name.");
+
+	call check_supplied_attr_list;		/* Internal procedure */
+
+/* See if a relation by this name already exists in db */
+
+	call initiate_file_ (db_path, rel_name || ".m", R_ACCESS, fm_ptr, (0), code);
+
+	if fm_ptr ^= null then do;
+	     call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, (0));
+	     call error (mrds_error_$dup_rel, "^/" || rel_name);
+	     end;
+%page;
+	must_delete_relation = "1"b;			/* In case of an error */
+
+/* Changed the version on the saved resultant so it doesn't get used
+   incorrectly and mark database as inconsistent and set undo string.
+   This is done at this point in the procedure because until now, nothing
+   has been added to the db that would need to be removed in case of an error.
+   */
+
+	rmdb_ctl_ptr -> rmdb_ctl.saved_res_version_ptr -> based_char8 = "RESTRUCT";
+	call mdbm_util_$inconsistent_set (dbm_ptr, "create_relation",
+	     "Creating relation " || rel_name, "delete_relation " || rtrim (rel_name) || " -brief");
+
+/* Create file_model segment */
+
+	call initiate_file_$create (db_path, rel_name || ".m", RW_ACCESS, file_model_ptr, ("0"b), (0), code);
+	if code ^= 0 then call error (code, pathname_ (db_path, (rel_name)));
+
+	call rmdb_init_file_model (dbm_ptr, file_model_ptr, err_msg, code); /* External proc
+						   That inits file_model structure and rel_info structure */
+	if code ^= 0 then call error (code, err_msg);
+
+	call build_db_attr_list;			/* Internal proc  creates a list of all unique attribute names */
+
+
+/* Find last file_info in db_model so we can link in the new file_info */
+
+	do fi_ptr = ptr (dbm_ptr, db_model.file_ptr)
+	     repeat ptr (dbm_ptr, file_info.fwd_ptr)
+	     while (rel (fi_ptr) ^= NULL_OFFSET);
+
+	     last_fi_ptr = fi_ptr;
+	end;
+
+	on area begin;				/* In case there is not enough room to allocate file_info */
+		O_err_msg = "Area in model is not large enough to add the relation "
+		     || rel_name || "^/Relation will not be added.";
+		O_err_code = error_table_$area_too_small;
+		call tidy_up;
+		goto exit;
+	     end;
+
+	allocate file_info in (dbm_area) set (fi_ptr);	/* New file_info */
+	file_model_ptr -> file_model.fi_ptr = rel(fi_ptr);/* Save the ptr in case we have to back out */
+
+	revert area;
+
+	file_info.file_name = rel_name;
+	file_info.file_id = "000000000000000000000000000000000001"b;
+	file_info.fwd_ptr = NULL_OFFSET;
+%page;
+/* Start of critical code that links new relation in to database
+   Errors that occur prior to this will cause the data_file and file_model to
+   be deleted and leave that database consistent. */
+
+	quit_intercept_flag = "0"b;
+
+	on quit quit_intercept_flag = "1"b;		/* hold off any QUITs til finished updating db_model */
+
+	call add_supplied_attrs;			/* Internal proc */
+
+ /* Add the relation name to the xref file. */
+
+	call mdbm_util_$xref_create_record (temp_file_iocb_ptr, RELATION_KEY_HEAD, rmdb_create_rel_info.relation_name, rel( fi_ptr), err_msg, code);
+	if code ^= 0
+	then call error (code, err_msg);
+
+ /* Link new file_info into list */
+	if db_model.file_ptr = NULL_OFFSET then
+	     db_model.file_ptr = rel (fi_ptr);
+	else last_fi_ptr -> file_info.fwd_ptr = rel (fi_ptr);
+
+	db_model.num_unblk_files = db_model.num_unblk_files + 1; /* Just added new file */
+	db_model.num_rels = db_model.num_rels + 1;	/* Just added new relation */
+
+
+/* Start a transaction */
+
+	on cleanup
+	     begin;
+		call tidy_up;
+		call mstxn_cleanup;
+	     end;
+	on any_other call mstxn_any_other;
+%include mrds_start_transaction;
+	if mstxn_code ^= 0
+	then call error (mstxn_code,
+		"Could not start a transaction, while creating relation " ||
+		rtrim (rel_name) || ".");
+
+/* Create and init relations data file */
+
+	call create_relation_data_file;		/* Internal proc */
+
+	must_delete_relation = "0"b;			/* So tidy_up won't delete it */
+
+/* Add the history entry to the db_model */
+
+	call rmdb_add_rmdb_history (dbm_ptr, RMDB_REL_TYPE, (rel_name),
+	     RMDB_ADD_REL_OP, "", long_err_msg, code);
+
+	revert quit;
+
+	if quit_intercept_flag then signal quit;	/* Now signal the quit that was intecepted */
+
+	if code ^= 0 then call error (code, long_err_msg);/* Error code from rmdb_add_rmdb_history */
+
+	call adjust_bit_count_ ((db_path), rel_name || ".m", "1"b, bcnt, code);
+	if code ^= 0 then call error (code, pathname_ (db_path, rel_name || ".m"));
+
+	call adjust_bit_count_ ((db_path), "db_model", "1"b, bcnt, code);
+	if code ^= 0 then call error (code, pathname_ (db_path, "db_model"));
+
+	call tidy_up;				/* Release temp file and undo openings and
+						   set database as consistent */
+
+exit:
+	mftxn_code = O_err_code;
+%include mrds_finish_transaction;
+	if mftxn_code ^= 0 then do;
+		O_err_code = mftxn_code;
+		O_err_msg = "Could not commit or abort the transaction, while "
+		     || "creating relation " || rtrim (rel_name) || ".";
+	     end;
+	return;
+%page;
+/* * * * * * * * * * * * *   check_supplied_attr_list    * * * * * * * * * * */
+
+check_supplied_attr_list: proc;
+
+/* Checks attribute names supplied for this relation against themselves
+   for duplication.  It also sees if there is a primary key attribute supplied,
+   and check for valid attribute names.
+*/
+
+	primary_key_found = "0"b;
+
+	do x = 1 to rmdb_create_rel_info.num_attrs;
+
+	     if rmdb_create_rel_info.attrs (x).primary_key then primary_key_found = "1"b;
+
+	     do j = x+1 to rmdb_create_rel_info.num_attrs;
+
+		if x ^= j & /* If not itself  */
+		     rmdb_create_rel_info.attrs (x).name = rmdb_create_rel_info.attrs (j).name then
+		     call error (mrds_error_$rst_name_duplicate, "^/" ||
+			rmdb_create_rel_info.attrs (x).name);
+	     end;
+
+	     attr_name = rtrim (rmdb_create_rel_info.attrs (x).name);
+	     first_char = substr (attr_name, 1, 1);	/* Get first char of attr_name */
+
+	     if first_char = "_" then
+		call error (mrds_error_$inv_attr_name_first_char,
+		     "^/" || attr_name ||
+		     "^/Attribute names cannot begin with an underscore.");
+
+	     if first_char = "-" then
+		call error (mrds_error_$inv_attr_name_first_char,
+		     "^/" || attr_name ||
+		     "^/Attribute names cannot begin with a hyphen.");
+
+	     if verify (first_char, "0123456789") = 0 then
+		call error (mrds_error_$inv_attr_name_first_char,
+		     "^/" || attr_name ||
+		     "^/Attribute names cannot begin with a numeric.");
+
+	     s = verify (attr_name, mrds_data_$valid_rel_and_attr_name_chars);
+	     if s ^= 0 then
+		call error (mrds_error_$bad_attr_name, "^/" ||
+		     attr_name ||
+		     "^/First bad character is:  " || substr (attr_name, s, 1));
+
+	end;
+
+	if ^primary_key_found then
+	     call error (mrds_error_$no_primary_key, rmdb_create_rel_info.relation_name);
+
+     end check_supplied_attr_list;
+%page;
+/*  * * * * * * * * * * *  build_db_attr_list  * * * * * * * * * * * * * *   */
+
+
+build_db_attr_list: proc;
+
+/* This internal subroutine calls the database crossreference package to create
+   the crossreference file if it does not already exist.  */
+
+	if temp_file_iocb_ptr ^= null
+	then return;
+
+	call mdbm_util_$xref_build (temp_dir_path, db_path, dbm_ptr, rmdb_ctl.crossref_file_info.name,
+	     rmdb_ctl.crossref_file_info.iocb_ptr, err_msg, code);
+	if code ^= 0 then call error (code, err_msg);
+
+	temp_file_iocb_ptr = rmdb_ctl.crossref_file_info.iocb_ptr;
+	return;
+
+     end build_db_attr_list;
+%page;
+/*  * * * * * * * * * *    add_supplied_attrs    * * * * * * * * * * *  */
+
+
+
+add_supplied_attrs: proc;
+
+/* This procedure checks to see if the supplied attributes are defined in the
+   database by looking each name up in the attribute list created by
+   build_db_attr_list. If the attribute is valid the appropiate attr_info is
+   added to the file_model.  After all the attributes are processed, we have
+   to adjust alignment for the varying attributes.*/
+
+dcl  WORD fixed bin internal static options (constant) init (36);
+dcl  amount_to_pad fixed bin;
+dcl  prev_ua_ptr ptr;
+dcl  this_ua_ptr ptr;
+
+	crossref_info_record_ptr = addr (record_buffer);
+	do i = 1 to rmdb_create_rel_info.num_attrs;	/* Check each attr name */
+
+/* Read the first 8 bytes (2 words) of the crossreferece record. This will
+   contain the domain_info offset and the count of relations this attribute
+   is used in. If the attribute is unreferenced, delete the attr_info in the
+   db_model for this one. */
+
+	     call mdbm_util_$xref_find_record (temp_file_iocb_ptr, ATTRIBUTE_KEY_HEAD,
+		rmdb_create_rel_info.attrs (i).name, crossref_info_record_ptr,
+		8, err_msg, code);
+	     if code ^= 0
+	     then if code = error_table_$long_record
+		then ;				/* ignore this error */
+	          else if code = error_table_$no_record
+		     then call error (mrds_error_$undef_attr,
+			          "^/" || rmdb_create_rel_info.attrs (i).name);
+		     else call error (code, err_msg);
+
+	     di_ptr = ptr (dbm_ptr, crossref_info_record.offset);
+
+/* Add the attr_info to the rel_info */
+	     call rmdb_build_attr_info (dbm_ptr, addr (rmdb_create_rel_info.attrs (i)),
+		file_model_ptr, di_ptr, err_msg, code);
+	     if code ^= 0 then call error (code, err_msg);
+
+/* Add this relation to the attribute crossreference list */
+	     call mdbm_util_$xref_reference (temp_file_iocb_ptr, ATTRIBUTE_KEY_HEAD,
+		rmdb_create_rel_info.attrs (i).name, rmdb_create_rel_info.relation_name,
+		null, 0, err_msg, code);
+	     if code ^= 0 then call error (code, err_msg);
+
+/* Mark that the domain is used, in case this is a generated attribute for a
+   domain. */
+	     domain_info.unreferenced = "0"b;
+
+/* if it was an unreferenced_attribute, delete it from the db_model */
+	     if crossref_info_record.count = 0
+	     then do;
+		prev_ua_ptr, this_ua_ptr = null;
+		do ua_ptr = ptr (dbm_ptr, db_model.unreferenced_attribute_ptr)
+		     repeat ptr (dbm_ptr, unreferenced_attribute.fwd_thread)
+		     while (rel (ua_ptr) ^= NULL_OFFSET & this_ua_ptr = null);
+
+		     if unreferenced_attribute.name = rmdb_create_rel_info.attrs (i).name
+		     then this_ua_ptr = ua_ptr;
+		     else prev_ua_ptr = ua_ptr;
+		     end;				/* do ua_ptr */
+
+/* When we get here, if this_ua_ptr is nonnull, it will point to a matching
+   unreferenced_attribute in the db_model and is the one that we are going to
+   free. prev_ua_ptr will point to the previous one on the list or be null. If
+   it is null, then we are freeing the first one in the list and must set the
+   head of the list in the db_model. Otherwise, we change the offset of the
+   previous unreferenced_attribute fwd_thread to point to the next one in the
+   list. This operation only unchains it from the linked list. */
+
+		if this_ua_ptr ^= null
+		then do;
+		     if prev_ua_ptr = null
+		     then db_model.unreferenced_attribute_ptr = this_ua_ptr -> unreferenced_attribute.fwd_thread;
+		     else prev_ua_ptr -> unreferenced_attribute.fwd_thread = this_ua_ptr -> unreferenced_attribute.fwd_thread;
+
+		     free this_ua_ptr -> unreferenced_attribute in (dbm_area);
+		     end;
+		end;
+	end;					/* do i */
+          
+/* Here is where we adjust alignment for varying length attributes. */
+          ri_ptr = ptr (file_model_ptr, file_model_ptr -> file_model.rel_ptr);
+          if rel_info.nvar_atts = 0 then;
+	else do;
+	     if mod (rel_info.var_offset-1, WORD) = 0 then
+		amount_to_pad = 0;
+	     else amount_to_pad = WORD - mod (rel_info.var_offset -1, WORD);
+
+	     rel_info.var_offset = rel_info.var_offset + amount_to_pad;
+	     rel_info.max_data_len = rel_info.max_data_len + amount_to_pad;
+	     end;
+
+     return;
+     end add_supplied_attrs;
+%page;
+/*  * * * * * * * * * * *   create_relation_data_file   * * * * * * * * *    */
+
+create_relation_data_file: proc;
+
+	file_model_name = rel_name || ".m";
+	call initiate_file_ (db_path, file_model_name, R_ACCESS, fm_ptr, (0), code);
+	if fm_ptr = null then call error (code, " The file model," || rtrim (file_model_name) || "could not be initiated.");
+
+	ri_ptr = ptr (fm_ptr, file_model.rel_ptr);	/* relation info ptr */
+
+/* set up working area */
+	caller_name = "rmdb_create_relation";
+	call mdbm_util_$get_temp_segment_path (temp_dir_path, caller_name, temp_seg_ptr, code);
+	if code ^= 0 then call error (code, "getting temp segment.");
+
+	work_area_ptr = temp_seg_ptr;
+	wa = empty ();
+
+/* initialize for calls to relation manager */
+
+	tva_number_of_vector_slots = 0;
+	tva_number_of_dimensions = rel_info.num_attr;
+	tva_maximum_dimension_name_length = 32;
+	allocate typed_vector_array in (wa);
+
+	il_number_of_ids = rel_info.num_attr;
+	allocate id_list in (wa);
+	id_list.number_of_ids = 0;
+	id_list.version = ID_LIST_VERSION_1;
+
+	typed_vector_array.version = TYPED_VECTOR_ARRAY_VERSION_2;
+
+	ai_ptr = ptr (fm_ptr, rel_info.attr_ptr);	/* get attribute info  */
+	do i = 1 to tva_number_of_dimensions;
+
+	     if attr_info.key_attr then do;		/* set up the primary key index */
+		     id_list.number_of_ids = id_list.number_of_ids + 1;
+		     id_list.id (id_list.number_of_ids) = attr_info.defn_order;
+		end;
+	     di_ptr = ptr (dbm_ptr, attr_info.domain_ptr);/* set up descriptor list for create relation */
+	     typed_vector_array.dimension_table (i).name = attr_info.name;
+	     typed_vector_array.dimension_table (i).descriptor_ptr = addr (domain_info.db_desc);
+	     ai_ptr = ptr (fm_ptr, attr_info.fwd_thread);
+
+	end;
+	allocate rel_creation_info in (wa);
+	allocate file_create_info in (wa);
+
+/* initialize values for create_relation */
+
+	rel_creation_info.version = REL_CREATION_INFO_VERSION_2;
+	rel_creation_info.esm_info_ptr = null;
+	rel_creation_info.cism_info_ptr = null;
+	rel_creation_info.file_create_info_ptr = file_create_info_ptr;
+	file_create_info.version = FILE_CREATE_INFO_VERSION_2;
+	file_create_info.ci_size_in_bytes = 4096;
+	file_create_info.blocking_factor = mrds_data_$relation_blocking_factor;
+	file_create_info.flags.protected = db_model.db_type_flags.transactions_needed;
+	file_create_info.flags.no_concurrency = ^db_model.db_type_flags.concurrency_on;
+	file_create_info.flags.no_rollback = ^db_model.db_type_flags.rollback_on;
+	file_create_info.flags.mbz_1 = "0"b;
+          file_create_info.ring_brackets (*) = 0;
+	file_create_info.mbz_2 = 0;
+          file_create_info.mbz_3 = "0"b;
+
+/* initialize values for create_index */
+	style = 1;
+	relation_index_flags_ptr = addr (flag_list);
+	relation_index_flags.relation_must_be_empty = "0"b;
+	relation_index_flags.index_is_clustering = "0"b;
+	relation_index_flags.index_is_unique = "1"b;	/* for primary key */
+
+	create_rel_name = rtrim (rel_name);
+
+
+	call rmdb_ctl.relmgr_entries.create_relation (db_path, create_rel_name,
+	     rel_creation_info_ptr, typed_vector_array_ptr,
+	     rel_opening_id, rel_info.id, code);
+
+	if code ^= 0 then call error (code, "While creating relation " || rel_name);
+
+
+/* create the primary index for the relation */
+
+	call rmdb_ctl.relmgr_entries.create_index (rel_opening_id,
+	     id_list_ptr, flag_list, style, rel_info.primary_key_index_id, code);
+
+	if code ^= 0 then
+	     call error (code, "while creating the primary index for" || rel_name);
+
+
+
+/* create the secondary indexes for the relation */
+
+	relation_index_flags.index_is_unique = "0"b;	/* index need not be unique for secondary index */
+
+	id_list.number_of_ids = 1;			/* secondary indices involve only one attribute */
+
+	ai_ptr = ptr (fm_ptr, rel_info.attr_ptr);
+	do i = 1 to rel_info.num_attr;
+	     if attr_info.index_attr
+	     then do;
+		     id_list.id (1) = attr_info.defn_order;
+		     call rmdb_ctl.relmgr_entries.create_index (rel_opening_id,
+			id_list_ptr, flag_list, style, attr_info.index_id, code);
+		     if code ^= 0 then
+			call error (code, " while creating secondary indices for " || rel_name);
+		end;
+
+	     ai_ptr = ptr (fm_ptr, attr_info.fwd_thread);
+
+	end;
+
+	call rmdb_ctl.relmgr_entries.close (rel_opening_id, code);
+	if code ^= 0 then
+	     call error (code, " while closing the relation " || rel_name);
+
+
+
+     end create_relation_data_file;
+%page;
+/*  * * * * * * * * * * * * * *      error     * * * * * * * * * * * * * *   */
+
+
+
+error: proc (err_code, err_message);			/* Error procedure for rmdb_create_relation.pl1 */
+
+	dcl     err_code		 fixed bin (35);
+	dcl     err_message		 char (*);
+
+
+	O_err_code = err_code;
+	O_err_msg = err_message;
+	call tidy_up;
+	goto exit;
+
+     end error;
+
+
+
+
+
+/* * * * * * * * * * * * * * * *   tidy_up  * * * * * * * * * * * * * * *  */
+
+tidy_up: proc;
+
+	if must_delete_relation then do;		/* Unlink relation from db_model
+						   and delete file_model and relation_data_file */
+
+
+		delete_rel_info.version = RMDB_DELETE_REL_INFO_VERSION_1;
+		delete_rel_info.absolute_db_path = db_path;
+		delete_rel_info.db_model_ptr = rmdb_create_rel_info.db_model_ptr;
+		delete_rel_info.relation_name = rel_name;
+		delete_rel_info.brief = "1"b;
+		delete_rel_info.mbz = "0"b;
+
+		call rmdb_delete_relation$cleanup (rmdb_ctl_ptr, addr (delete_rel_info), err_msg, code);
+		fm_ptr = null;
+		call mdbm_util_$xref_destroy (rmdb_ctl.crossref_file_info.iocb_ptr, rmdb_ctl.temp_dir_path,
+		     rmdb_ctl.crossref_file_info.name, (""), (0));
+		end;
+
+	if code = 0 then call mdbm_util_$inconsistent_reset (dbm_ptr); /* Make db consistent */
+
+	if temp_seg_ptr ^= null then call mdbm_util_$free_temp_segment (caller_name, temp_seg_ptr, (0));
+
+	if fm_ptr ^= null then call terminate_file_ (fm_ptr, 0, TERM_FILE_TERM, (0));
+
+     end tidy_up;
+%page;
+/***********
+*
+*   These routines are used by the transaction processing include files.
+*   Restore_significant_data is called to reinitialize variables in case
+*   of a rollback.  In this module, restore data must add a history section
+*   note that the relation created has been deleted.  This is just a
+*   stopgap measure until add history is smart enough to be able to delete
+*   history entries.  Should_rollback determines whether a transaction should
+*   be rolled back or aborted on error.  Currently, it is always aborted.
+*
+**********/
+
+
+restore_significant_data:
+     proc;
+
+	dcl     add_history_code	 fixed bin (35);
+	dcl     add_history_err_msg	 char (500);
+
+	call rmdb_add_rmdb_history (dbm_ptr, RMDB_REL_TYPE, (rel_name),
+	     RMDB_DEL_REL_OP, "", add_history_err_msg, add_history_code);
+	must_delete_relation = "1"b;
+     end restore_significant_data;
+
+
+
+should_rollback:
+     proc returns (bit (1));
+	return ("0"b);
+     end should_rollback;
+%page;
+	dcl     addr		 builtin;
+	dcl     adjust_bit_count_	 entry (char (168) aligned, char (32) aligned, bit (1) aligned, fixed bin (35), fixed bin (35));
+	dcl     any_other		 condition;
+	dcl     area		 condition;
+	dcl     attr_name		 char (32) varying;
+	dcl     based_char8		 char (8) based;
+	dcl     bcnt		 fixed bin (35);
+	dcl     called_from_request_level bit (1);
+	dcl     caller_name		 char (20);
+	dcl     cleanup		 condition;
+	dcl     create_rel_name	 char (32);
+	dcl     code		 fixed bin (35);
+	dcl     db_path		 char (168);
+	dcl     empty		 builtin;
+	dcl     error_table_$action_not_performed fixed bin (35) ext static;
+	dcl     error_table_$area_too_small fixed bin (35) ext static;
+	dcl     error_table_$long_record fixed bin(35) ext static;
+	dcl     error_table_$no_record fixed bin (35) ext static;
+	dcl     error_table_$unimplemented_version fixed bin (35) ext static;
+	dcl     err_msg		 char (256);
+	dcl     file_model_name	 char (32);
+	dcl     file_model_ptr	 ptr;
+	dcl     first_char		 char (1);
+	dcl     fixed		 builtin;
+	dcl     flag_list		 bit (36) aligned;
+	dcl     mdbm_util_$get_temp_segment_path entry (char (*), char (*), ptr, fixed bin (35));
+          dcl     mdbm_util_$xref_create_record entry (ptr, char (*), char (*), bit (18), char (*), fixed bin (35));
+	dcl     mdbm_util_$xref_destroy entry (ptr, char (*), char (*), char (*), fixed bin (35));
+	dcl     initiate_file_	 entry (char(*), char(*), bit(*), ptr, fixed bin(24), fixed bin(35));
+	dcl     initiate_file_$create	 entry (char(*), char(*), bit(*), ptr, bit(1) aligned, fixed bin(24), fixed bin(35));
+	dcl     i			 fixed bin;
+	dcl     j			 fixed bin;
+	dcl     last_fi_ptr		 ptr;
+	dcl     long_err_msg	 char (500);
+	dcl     mrds_data_$max_relations ext fixed bin (35);
+          dcl     mrds_data_$relation_blocking_factor fixed bin (17) external static;
+	dcl     mrds_data_$valid_rel_and_attr_name_chars char (128) varying ext;
+	dcl     mrds_error_$bad_attr_name fixed bin (35) ext static;
+	dcl     mrds_error_$bad_rel_name fixed bin (35) ext static;
+	dcl     mrds_error_$dup_rel	 fixed bin (35) ext static;
+	dcl     mrds_error_$inv_attr_name_first_char fixed bin (35) ext static;
+	dcl     mrds_error_$inv_rel_name_first_char fixed bin (35) ext static;
+	dcl     mrds_error_$max_rels	 fixed bin (35) ext static;
+	dcl     mrds_error_$no_primary_key fixed bin (35) ext static;
+	dcl     mrds_error_$rst_name_duplicate fixed bin (35) ext static;
+	dcl     mrds_error_$rst_reserved_name fixed bin (35) ext static;
+	dcl     mrds_error_$undef_attr fixed bin (35) ext static;
+	dcl     must_delete_relation	 bit (1);
+	dcl     mdbm_util_$free_temp_segment entry (char(*), ptr, fixed bin(35));
+	dcl     mdbm_util_$inconsistent_reset entry (ptr);
+	dcl     mdbm_util_$inconsistent_set entry (ptr, char (*), char (*), char (*));
+	dcl     mdbm_util_$xref_build	 entry (char(*), char(*), ptr, char(*), ptr, char(*), fixed bin(35));
+	dcl     mdbm_util_$xref_find_record entry (ptr, char(*), char(*), ptr, fixed bin(21), char(*), fixed bin(35));
+	dcl     mdbm_util_$xref_reference entry (ptr, char(*), char(*), char(*), ptr, fixed bin(21), char(*), fixed bin(35));
+          dcl     mod                    builtin;
+	dcl     null		 builtin;
+	dcl     NULL_OFFSET		 int static bit (18) unal init ((18)"1"b) options (constant);
+	dcl     pathname_		 entry (char(*), char(*)) returns(char(168));
+	dcl     primary_key_found	 bit (1);
+	dcl     ptr		 builtin;
+	dcl     quit		 condition;
+	dcl     quit_intercept_flag	 bit (1);
+	dcl     record_buffer	 (2) fixed bin (35);
+	dcl     rel		 builtin;
+	dcl     rel_opening_id	 bit (36) aligned;
+	dcl     rel_name		 char (32) varying;
+	dcl     rmdb_add_rmdb_history	 entry (ptr, fixed bin, char (32), fixed bin, char (32), char (500), fixed bin (35));
+	dcl     rmdb_build_attr_info	 entry (ptr, ptr, ptr, ptr, char (*), fixed bin (35));
+	dcl     rmdb_delete_relation$cleanup entry (ptr, ptr, char (*), fixed bin (35));
+	dcl     rmdb_init_file_model	 entry (ptr, ptr, char (*), fixed bin (35));
+	dcl     rtrim		 builtin;
+	dcl     s			 fixed bin;
+	dcl     style		 fixed bin (17);
+	dcl     substr		 builtin;
+	dcl     sys_info$max_seg_size	 fixed bin (35) ext static;
+	dcl     temp_dir_path	 char (168);
+	dcl     temp_file_iocb_ptr	 ptr;
+	dcl     temp_seg_ptr	 ptr;
+	dcl     terminate_file_	 entry (ptr, fixed bin(24), bit(*), fixed bin(35));
+	dcl     verify		 builtin;
+	dcl     wa		 area (sys_info$max_seg_size) based (work_area_ptr);
+	dcl     work_area_ptr	 ptr;
+	dcl     x			 fixed bin;
+
+	dcl     1 delete_rel_info	 aligned
+				 like rmdb_delete_rel_info;
+
+%page;
+%include access_mode_values;
+%page;
+%include dm_file_create_info;
+%page;
+%include dm_id_list;
+%page;
+%include dm_rel_creation_info;
+%page;
+%include dm_relation_index_flags;
+%page;
+%include mdbm_db_model;
+%page;
+%include mdbm_file_model;
+%page;
+%include mdbm_rs_info;
+%page;
+%include mrds_rmdb_ctl;
+%page;
+%include rmdb_create_rel_info;
+%page;
+%include rmdb_crossref_info;
+%page;
+%include rmdb_delete_rel_info;
+%page;
+%include rmdb_history_entry;
+%page;
+%include terminate_file;
+%page;
+%include vu_typed_vector_array;
+
+     end rmdb_create_relation;

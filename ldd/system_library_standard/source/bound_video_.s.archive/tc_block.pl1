@@ -1,0 +1,185 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-09-17,LJAdams), approve(86-11-11,MCR7485),
+     audit(86-12-16,Margolin), install(87-01-06,MR12.0-1255):
+     Correct stringrange problem - after function was completed it continued to
+     loop until stack was exhausted.
+                                                   END HISTORY COMMENTS */
+
+
+/* Benson I. Margulies, sometime in 1981 */
+/* format: style2,linecom,^indnoniterdo,indcomtxt,^inditerdo,dclind5,idind25 */
+
+/* Modified 24 May 1982 by William M. York to eliminate an optimization
+   for the first level of block which led to a loop sending and receiving
+   wakeups. */
+/* Modified 14 September 1982 by WMY to add the $internal entrypoint.  This
+   is intended for use by other parts of tc_ (e.g. check_echonego in tc_input)
+   which want to block with protocol, but have no window_ level request
+   structure to pass in. */
+/* Modified 20 September 1982 by WMY to remove the $internal entrypoint.  We
+   must ALWAYS block on the behalf of some particular window for the async
+   stuff to work right, so all callers will just have to be changed to pass
+   in a request_ptr. */
+/* Modified 7 February 1985 by Jon Rochlis to add RESTORE_MASK so we can
+   restore the user's ips mask before we block, instead of just unmasking
+   everything. */
+
+tc_block:
+     procedure (TC_data_ptr, Request_ptr, mask_type);
+
+	declare TC_data_ptr		   pointer;
+	declare Request_ptr		   pointer;
+
+/* ordinarily, we unmask for the block, but in the case of awaiting a mark
+   we want to allow only quit. This is to prevent other stuff from
+   happening when we are doing a critical sync, because if the async thing
+   should need to sync to a mark, we would lack one to give it.
+
+   This is really poor, a major limitation on async input.
+
+   (Now instead of unmasking, we usually restore the old mask ... JR 2/7/85)
+*/
+
+	declare mask_type		   bit (36) aligned;
+
+	declare UNMASK_ALL		   bit (36) aligned initial (""b) internal static options (constant);
+	declare UNMASK_QUIT_ONLY	   bit (36) aligned initial ("1"b) internal static options (constant);
+	declare UNMASK_NOTHING	   bit (36) aligned initial ("01"b) internal static options (constant);
+	declare RESTORE_MASK	   bit (36) aligned initial ("001"b) internal static options (constant);
+
+	declare 1 EWI		   aligned like event_wait_info automatic;
+	declare 1 event_wait	   aligned,
+		2 n_channels	   fixed bin,
+		2 pad		   bit (36) aligned,
+		2 channels	   (2) fixed bin (71);
+
+	declare ipc_$block		   entry (ptr, ptr, fixed bin (35));
+	declare ipc_$create_ev_chn	   entry (fixed bin (71), fixed bin (35));
+	declare tc_error		   entry (fixed bin (35), character (*));
+	declare (
+	        tc_mask$close,
+	        tc_mask$open_all,
+	        tc_mask$open_quit
+	        )			   external entry;
+
+	declare tc_mask$restore	   entry (bit (36) aligned);
+
+	declare hcs_$get_ips_mask	   entry (bit (36) aligned);
+
+	declare ips_mask		   bit (36) aligned;
+	declare saved_change_pclock	   fixed bin (35);
+	declare code		   fixed bin (35);
+	declare cleanup		   condition;
+	declare addr		   builtin;
+
+
+	tc_data_ptr = TC_data_ptr;
+	request_ptr = Request_ptr;
+
+	state.pending.count = tc_data.state.pending.count + 1;
+	state_have_sent_protocol (tc_data.state.pending.count) = "0"b;
+	state_async_same_window (tc_data.state.pending.count) = "0"b;
+
+	tc_data.state.pending.blocked_windows (tc_data.state.pending.count) = request_header.window_id;
+
+	event_wait.n_channels = 0;
+
+	event_wait.pad = ""b;
+	event_wait.channels (1) = tc_data.event;
+
+/* Set up a second event channel to block on in conjunction with
+   the actual input channel. A wakeup will be sent on this protocol
+   channel by later (recursive) invocations of tc_block when they
+   receive real input wakeups. */
+
+	event_wait.n_channels = 2;
+	if tc_data.state.pending.protocol_evs (tc_data.state.pending.count) = 0
+	then do;
+	     call ipc_$create_ev_chn (event_wait.channels (2), (0));
+	     tc_data.state.pending.protocol_evs (tc_data.state.pending.count) = event_wait.channels (2);
+	end;
+	else event_wait.channels (2) = tc_data.state.pending.protocol_evs (tc_data.state.pending.count);
+
+	ips_mask = request_header.saved_ips_mask;
+
+	on cleanup
+	     begin;
+		state.pending.count = state.pending.count - 1;
+		if mask_type = RESTORE_MASK
+		then call hcs_$get_ips_mask (request_header.saved_ips_mask);
+	     end;
+
+	saved_change_pclock = tc_data.change_pclock;
+
+	if mask_type = UNMASK_QUIT_ONLY		/* actually, this lets trm_ and sus_ and neti through, as well */
+	then call tc_mask$open_quit;
+	else if mask_type = UNMASK_ALL
+	then call tc_mask$open_all;
+	else if mask_type = UNMASK_NOTHING
+	then ;
+	else if mask_type = RESTORE_MASK
+	then call tc_mask$restore (ips_mask);
+
+	call ipc_$block (addr (event_wait), addr (EWI), code);
+
+	call tc_mask$close ();			/* superfluous if we didnt unmask */
+	revert cleanup;
+	tc_data.state.pending.count = tc_data.state.pending.count - 1;
+
+	if code ^= 0
+	then call tc_error (code, "Terminal Control could not block.");
+
+
+	if (tc_data.change_pclock ^= saved_change_pclock)
+	then do;
+	     request_header.async_interruption = "1"b;
+
+	     if state_async_same_window (tc_data.state.pending.count + 1)
+	     then request_header.this_window = "1"b;
+	end;
+
+start_if_we_have_to:
+	begin;
+
+	     declare hcs_$wakeup	        entry (bit (*), fixed bin (71), fixed bin (71), fixed bin (35));
+	     declare get_process_id_	        entry () returns (bit (36));
+
+/* This code checks to see if anyone is waiting on protocol
+   wakeups (i.e. this is a recursive call), and sends a wakeup
+   to the protocol channel one above us.  Only one wakeup will
+   be sent on each level. */
+
+	     if tc_data.state.pending.count > 0
+	     then if ^state_have_sent_protocol (tc_data.state.pending.count)
+		then do;				/* Somebody is blocked */
+		     call hcs_$wakeup (get_process_id_ (),
+			tc_data.state.pending.protocol_evs (tc_data.state.pending.count), 0, code);
+
+		     if code ^= 0
+		     then call tc_error (code, "wakeup failed");
+		     state_have_sent_protocol (tc_data.state.pending.count) = "1"b;
+						/* only send ONE wakeup */
+		end;
+	end start_if_we_have_to;
+
+
+%page;
+%include tc_data_;
+%include tc_operations_;
+%include event_wait_info;
+
+     end tc_block;

@@ -1,0 +1,884 @@
+/****^  **************************************************************
+        *                                                            *
+        * Copyright, (C) Honeywell Bull Inc., 1988                   *
+        *                                                            *
+        * Copyright, (C) Massachusetts Institute of Technology, 1983 *
+        *                                                            *
+        ************************************************************** */
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+
+lap_simplex:
+     procedure;
+
+/*
+   This procedure is the trivial multiplexer which is used to gain direct access to the
+   FNP LAP implementation for use by the ARPAnet HDH interface. It contains both the
+   wired and nonwired entrypoints, since it's so small.
+*/
+
+/*
+   Coded December 1978 by J. Stern
+   Modified 7/31/79 by B.Westcott to support lap instead.
+   Modified November 1979 by C. Hornig for installation.
+   Modified August 1981 by C. Hornig to add metering.
+   Modified May 1982 by D. W. Cousins for deletion of HOST level2 mpx.
+   Modified January 1983 by W. Olin Sibert to create lap_simplex (again!)
+   Modified 6/23/83 by Jis to wire itself down when first invoked
+   Modified Nov 1986 by T. Beecher to correctly adjust buffer.tally for
+   insertion of L2_HEADER_PAD, to handle "frame-size" error @ line-status
+   interrupt, and to remove local copies of error_table codes.
+   Note:  the lap_cmdr_status structure was copied from x25_mpx.pl1.
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(88-07-07,Beattie), approve(88-06-27,MCR7926),
+     audit(88-07-22,Brunelle), install(88-08-08,MR12.2-1082):
+     Prepared for installation.
+                                                   END HISTORY COMMENTS */
+
+/* * * * * * * * * * * INTERRUPT * * * * * * * * * * */
+
+lap_simplex$interrupt:
+     entry (P_lap_data_ptr, P_int_type, P_int_data);
+
+	lap_data_ptr = P_lap_data_ptr;
+	int_type = P_int_type;
+	int_data = P_int_data;
+
+	if (int_type < lbound (INTERRUPT, 1)) | (int_type > hbound (INTERRUPT, 1)) then do;
+BAD_INTERRUPT:
+	     call syserr (Log_message, "lap_simplex(^a): Unexpected interrupt ^d ^.3b received.", lap_data.name,
+		int_type, int_data);
+	     return;
+	     end;
+	else goto INTERRUPT (int_type);
+
+
+INTERRUPT (1):					/* DIALUP - major channel has dialed up */
+	if (lap_data.state ^= LAP_LISTENING) then goto BAD_INTERRUPT;
+	unspec (lap_data.dialup_info) = int_data;	/* Remember it, and send it on */
+	lap_data.sc_dialup_info = lap_data.dialup_info;	/* Construct new version */
+	lap_data.sc_dialup_info.buffer_pad = L2_HEADER_PAD;
+	lap_data.sc_dialup_info.line_type = LINE_ASCII;
+
+	call pxss$ring_0_wakeup (lap_data.load_process_id, lap_data.load_event_channel, MPX_UP, ignore_code);
+	lap_data.state = LAP_ACTIVE;			/* Tell the Initializer we're here */
+	return;
+
+
+INTERRUPT (2):					/* HANGUP - major channel has hung up */
+	call crash (int_type);
+	return;
+
+
+INTERRUPT (3):					/* CRASH - parent multiplexer has died */
+	call crash (int_type);
+	return;
+
+
+INTERRUPT (4):					/* SEND_OUTPUT - it's safe to write next output frame now */
+	lap_data.flags.send_output = "1"b;
+	call channel_manager$interrupt (lap_data.subchannel, SEND_OUTPUT, (""b));
+	return;
+
+
+INTERRUPT (5):					/* INPUT_AVAILABLE */
+	goto BAD_INTERRUPT;
+
+
+INTERRUPT (6):					/* ACCEPT INPUT - process an input frame */
+	unspec (rtx_info) = int_data;
+	blockp = pointer (lap_data_ptr, rtx_info.chain_head);
+	real_buffer_lth = buffer.tally - L2_HEADER_PAD;
+
+	if ((lap_data.state < LAP_ACTIVE) | (real_buffer_lth <= 0)) then do;
+	     call tty_space_man$free_chain (lap_data.devx, INPUT, blockp);
+	     goto BAD_INTERRUPT;			/* Packet either too small or arrived at a bad time */
+	     end;
+
+	call tty_space_man$switch_chain (lap_data.devx, lap_data.subchannel, INPUT, INPUT, blockp);
+						/* Be sure to switch BEFORE shrinking.... */
+	begin;					/* Shift the characters over to eliminate the LAP */
+dcl  old_string char (real_buffer_lth) automatic;		/* header bytes */
+dcl  new_string char (real_buffer_lth) defined (buffer.chars);
+	     old_string = substr (string (buffer.chars), L2_HEADER_PAD + 1, real_buffer_lth);
+	     new_string = old_string;
+	end;
+
+	buffer.tally = buffer.tally - L2_HEADER_PAD;
+	rtx_info.input_count = rtx_info.input_count - L2_HEADER_PAD;
+
+	blockp = pointer (blockp, rtx_info.chain_tail);	/* Set the sentinel bit in the last char (just like */
+	begin;					/* the one we get when writing) */
+dcl  last_char char (1) unaligned defined (buffer.chars (buffer.tally - 1));
+	     unspec (last_char) = unspec (last_char) | "400"b3;
+	end;
+
+	call channel_manager$interrupt (lap_data.subchannel, ACCEPT_INPUT, unspec (rtx_info));
+	return;					/* Otherwise, just send it on */
+
+
+INTERRUPT (7):					/* INPUT REJECTED - ignore */
+INTERRUPT (8):					/* QUIT - ignore */
+	return;
+
+
+INTERRUPT (9):					/* LINE_STATUS - LAP link has gone down */
+	unspec (lap_down_status) = int_data;
+
+	if lap_down_status.status_type = 1
+	then call syserr (Log_message,
+		"lap_simplex(^a): Failure, Link state: ^a, Current action: ^a, in ^a, Primary state: ^a, Secondary state: ^a",
+		lap_data.name, FRAME_STATE_ARRAY (lap_down_status.main_state),
+		FRAME_FUNCTION_CODE (lap_down_status.last_function_process),
+		FRAME_SUB_STATE_ARRAY (lap_down_status.which_state_process),
+		FRAME_SUB_STATE_ARRAY (lap_down_status.primary_sub_state),
+		FRAME_SUB_STATE_ARRAY (lap_down_status.secondary_sub_state));
+
+	else if lap_cmdr_status.cmdr_status = 3
+	then call syserr (Log_message,
+		"lap_simplex(^a): Link disconnected due to mis-matched frame sizes. CMDR/FRMR frame: ^( ^.4b^).",
+		lap_data.name, lap_cmdr_status.cmdr_bytes.byte (*));
+
+	else goto BAD_INTERRUPT;			/* We don't know this status. */
+
+	return;					/* FNP will send hangup itself. */
+
+
+INTERRUPT (10):					/* DIAL STATUS - ignore */
+INTERRUPT (11):					/* WRU TIMEOUT - ignore */
+	goto BAD_INTERRUPT;
+
+
+INTERRUPT (12):					/* SPACE AVAILABLE - some buffer space was freed that we need */
+	call channel_manager$interrupt (lap_data.subchannel, SEND_OUTPUT, ""b);
+	return;					/* If we didn't ask, ignore it */
+
+
+INTERRUPT (13):					/* ACKNOWLEDGE_ECHNEGO_INIT */
+INTERRUPT (14):					/* ACKNOWLEDGE_ECHNEGO_STOP */
+	return;					/* Ignore both of these */
+
+
+INTERRUPT (15):					/* TIMER */
+INTERRUPT (16):					/* USER_INTERRUPT */
+	goto BAD_INTERRUPT;
+
+
+INTERRUPT (17):					/* MASKED - treat like HANGUP but use different wakeup message */
+	call pxss$ring_0_wakeup (lap_data.load_process_id, lap_data.load_event_channel, MPX_MASKED, code);
+	call crash (MASKED);
+	lap_data.state = LAP_HUNGUP;
+	return;
+%page;
+/* * * * * * * * * * * WRITE * * * * * * * * * * */
+
+lap_simplex$write:
+     entry (P_lap_data_ptr, P_subchan_idx, P_chain_ptr, P_code);
+
+	call setup ();
+
+	code = 0;
+	chain_ptr = P_chain_ptr;
+	next_block = binary (rel (chain_ptr), 18);
+
+	do while ((next_block ^= 0) & lap_data.send_output);
+	     blockp = pointer (chain_ptr, next_block);
+
+/*
+   The following statement generates miserable code, in that it invokes the pessimal search operator.
+   Clearly, it could be optimized, and, indeed, it turns out that search (XXX, collate) is thusly
+   optimized, so it's probably not even that hard to fix.
+*/
+
+	     frame_end = search (substr (string (buffer.chars), 1, buffer.tally), substr (collate9 (), 257, 256));
+
+	     if frame_end = 0 then do;		/* Buffer contains the middle of a frame */
+		next_block = buffer.next;		/* Just add it on and try the next buffer */
+		call add_buffer_to_frame ();		/* in the chain */
+		end;
+
+	     else if frame_end = buffer.tally then do;	/* Buffer ends a frame. Add it on, try to write */
+		next_block = buffer.next;		/* it out, and go on to the next buffer */
+		lap_data.frame_ready = "1"b;
+		call add_buffer_to_frame ();
+		end;
+
+	     else do;				/* Frame ends in the middle of a buffer. */
+		call split_buffer ();
+		lap_data.frame_ready = "1"b;		/* Guaranteed to be ready after splitting */
+		call add_buffer_to_frame ();		/* This adds on only the old half */
+		end;
+
+	     if lap_data.frame_ready then call write_frame ();
+	end;
+
+WRITE_FINISHES:
+	if (next_block = 0)
+	then P_chain_ptr = null ();
+	else P_chain_ptr = pointer (chain_ptr, next_block);
+
+	if lap_data.send_output then call channel_manager$interrupt (lap_data.subchannel, SEND_OUTPUT, ""b);
+
+	P_code = code;
+	return;
+%page;
+/* * * * * * * * * * * ADD_BUFFER_TO_FRAME * * * * * * * * * * */
+
+add_buffer_to_frame:
+     procedure ();
+
+	if (buffer.tally + lap_data.frame_size) > lap_data.max_frame_size then do;
+	     call syserr (Log_message, "lap_simplex(^a): Attempt to write overlength frame.", lap_data.name);
+	     call crash (HANGUP);
+	     call free_pending_frame ();
+	     end;
+
+	lap_data.frame_size = lap_data.frame_size + buffer.tally;
+	buffer.next = 0;				/* Break the chain before adding on */
+	string (buffer.flags) = ""b;
+
+	if (lap_data.frame_start ^= null ())
+	then					/* Add it to the end if there's something there */
+	     lap_data.frame_end -> buffer.next = binary (rel (blockp), 18);
+	else lap_data.frame_start = blockp;		/* Otherwise, remember the first */
+
+	lap_data.frame_end = blockp;			/* And always remember the end */
+
+	return;
+     end add_buffer_to_frame;
+%page;
+/* * * * * * * * * * SPLIT_BUFFER * * * * * * * * * * */
+
+split_buffer:
+     procedure ();
+
+dcl  leftover_chars fixed bin;
+dcl  new_buf_size fixed bin;
+dcl  new_bufp pointer;
+
+/*
+   This procedure is invoked when a frame terminator is found in the middle of a buffer. It splits
+   the buffer in two, copies the extra characters into the new one, shrinks the old one, and
+   adjusts next_block so that the new one will be the next one considered.
+*/
+
+	leftover_chars = buffer.tally - frame_end;
+
+	new_buf_size = 16 * (1 + divide ((leftover_chars + 7), 64, 17, 0));
+	call tty_space_man$get_buffer (lap_data.subchannel, new_buf_size, OUTPUT, new_bufp);
+	if (new_bufp = null ()) then do;		/* If this fails, it means we return the buffer we split */
+	     call tty_space_man$needs_space (lap_data.devx);
+						/* to our caller, and let him ship it back to us some */
+	     lap_data.send_output = "0"b;		/* other time. It gets shipped back because, at this */
+	     goto WRITE_FINISHES;			/* point, next_block still indicates the buffer being */
+	     end;					/* considered for splitting. */
+
+	substr (string (new_bufp -> buffer.chars), 1, leftover_chars) =
+	     substr (string (buffer.chars), frame_end + 1, leftover_chars);
+	new_bufp -> buffer.next = buffer.next;
+	new_bufp -> buffer.tally = leftover_chars;
+	string (new_bufp -> buffer.flags) = ""b;
+
+	next_block = binary (rel (new_bufp), 18);	/* Now, the new buffer will be the one we look at next */
+
+	buffer.tally = buffer.tally - leftover_chars;	/* Shrink the old one, and return */
+
+	return;
+     end split_buffer;
+%page;
+/* * * * * * * * * * WRITE_FRAME * * * * * * * * * * */
+
+write_frame:
+     procedure ();
+
+dcl  bufp pointer;
+dcl  bufl fixed bin;
+
+
+	lap_data.frame_end -> buffer.break = "1"b;	/* Since this IS the end */
+
+	bufp = lap_data.frame_start;			/* Shift first buffer right to make room for the */
+	bufl = bufp -> buffer.tally;			/* LAP header */
+
+	begin;					/* copy the characters over, avoiding overlap */
+dcl  old_string char (bufl) automatic;
+dcl  new_string char (bufl) defined (bufp -> buffer.chars (L2_HEADER_PAD));
+	     old_string = substr (string (bufp -> buffer.chars), 1, bufl);
+	     new_string = old_string;
+	end;
+
+	bufp -> buffer.tally = bufp -> buffer.tally + L2_HEADER_PAD;
+						/* Update the tally to say that the  */
+						/* header is there */
+
+	call tty_space_man$switch_chain (lap_data.subchannel, lap_data.devx, OUTPUT, OUTPUT, lap_data.frame_start);
+
+	call channel_manager$write (lap_data.devx, lap_data.frame_start, code);
+	if (code ^= 0) then do;
+	     call syserr$error_code (Log_message, code, "lap_simplex(^a): Error from write of ^d chars.", lap_data.name,
+		lap_data.frame_size);
+	     call free_pending_frame ();
+	     call channel_manager$control (lap_data.devx, "hangup", null (), ignore_code);
+	     return;
+	     end;
+
+	if (lap_data.frame_start ^= null ()) & (lap_data.frame_start ^= bufp) then do;
+	     call syserr (Log_message, "lap_simplex(^a): Write failed to take whole frame, discarding rest.",
+		lap_data.name);
+	     call free_pending_frame ();
+	     return;
+	     end;
+
+	if (lap_data.frame_start = null ()) then do;
+	     lap_data.frame_end = null ();
+	     lap_data.frame_size = 0;
+	     lap_data.frame_ready = "0"b;
+	     lap_data.send_output = "1"b;		/* Try it over again */
+	     end;
+	else lap_data.send_output = "0"b;		/* Didn't take the frame, so wait */
+
+	return;
+     end write_frame;
+%page;
+/* * * * * * * * * * * CONTROL * * * * * * * * * * */
+
+lap_simplex$control:
+     entry (P_lap_data_ptr, P_subchan_idx, P_order, P_info_ptr, P_code);
+
+	call setup ();
+
+	order = P_order;
+	info_ptr = P_info_ptr;
+	code = 0;
+
+	if (order = "hangup") then do;
+	     if (lap_data.state = LAP_HUNGUP)
+	     then code = error_table_$invalid_state;
+	     else call channel_manager$control (lap_data.devx, "hangup", null (), code);
+	     end;
+
+	else if (order = "listen") then do;
+	     if (lap_data.state ^= LAP_ACTIVE)
+	     then code = error_table_$invalid_state;
+	     else do;
+		call channel_manager$interrupt (lap_data.subchannel, DIALUP, unspec (lap_data.sc_dialup_info));
+		call channel_manager$interrupt (lap_data.subchannel, SEND_OUTPUT, ""b);
+		end;
+	     end;
+
+	else if (order = "abort") then do;
+	     if (info_ptr = null ())
+	     then code = error_table_$null_info_ptr;
+	     else call free_pending_frame ();
+	     end;
+
+	else if (order = "write_status") then do;
+	     if (info_ptr = null ())
+	     then code = error_table_$null_info_ptr;
+	     else do;
+		if (lap_data.frame_size ^= 0)
+		then info_ptr -> tty_write_status_info.output_pending = "1"b;
+		else call channel_manager$control (lap_data.devx, "write_status", info_ptr, code);
+		end;
+	     end;
+
+	else if (order = "wru") then do;
+	     if (lap_data.state ^= LAP_ACTIVE)
+	     then code = error_table_$invalid_state;
+	     else call channel_manager$interrupt (lap_data.subchannel, WRU_TIMEOUT, ""b);
+	     end;
+
+	else code = error_table_$undefined_order_request;
+
+	P_code = code;
+	return;
+%page;
+/* * * * * * * * * * * CHECK_MODES * * * * * * * * * */
+
+lap_simplex$check_modes:
+     entry (P_lap_data_ptr, P_subchan_idx, P_mcl_info_ptr, P_code);
+
+	call do_modes ("0"b);
+	return;
+
+/* * * * * * * * * * SET_MODES * * * * * * * * * */
+
+lap_simplex$set_modes:
+     entry (P_lap_data_ptr, P_subchan_idx, P_mcl_info_ptr, P_code);
+
+	call do_modes ("1"b);
+	return;
+
+/* * * * * * * * * * * GET_MODES * * * * * * * * * * */
+
+lap_simplex$get_modes:
+     entry (P_lap_data_ptr, P_subchan_idx, P_modes, P_code);
+
+	call setup ();
+	P_code = 0;
+	P_modes = "";
+	return;
+%page;
+/* * * * * * * * * * * DO_MODES * * * * * * * * * * */
+
+do_modes:
+     procedure (P_set_sw);
+
+dcl  P_set_sw bit (1) aligned parameter;
+dcl  mode_error fixed bin (35);
+
+
+	call setup ();
+	mclp = P_mcl_info_ptr;
+
+	if mcl.version ^= mcl_version_2 then do;
+	     P_code = error_table_$unimplemented_version;
+	     return;
+	     end;
+
+	mode_error = 0;				/* The only modes we implement are rawo and rawi, and they */
+						/* must always be turned on */
+	do mode_idx = 1 to mcl.n_entries;
+	     mclep = addr (mcl.entries (mode_idx));
+	     if (mcle.mode_name = "rawo") | (mcle.mode_name = "rawi") then do;
+		if ^P_set_sw then mcle.mpx_mode = "1"b;
+		else if (mcle.mode_switch = "0"b) then do;
+						/* They can only be turned on */
+		     mode_error = error_table_$bad_mode;
+		     mcle.error = "1"b;
+		     end;
+		end;
+
+	     else if P_set_sw
+	     then if (mcle.mpx_mode & ^mcle.force) then do;
+		     mode_error = error_table_$bad_mode;
+		     mcle.error = "1"b;
+		     end;
+
+		else mcle.mpx_mode = "0"b;
+	end;
+
+	P_code = mode_error;
+	return;
+     end do_modes;
+%page;
+/* * * * * * * * * * SETUP_SUBCHAN * * * * * * * * * */
+
+setup:
+     procedure ();
+
+	lap_data_ptr = P_lap_data_ptr;
+	if (P_subchan_idx ^= 1) then do;
+	     call syserr (Write_with_alarm, "lap_simplex(^a): Invalid subchannel index ^d", lap_data.name, P_subchan_idx);
+	     P_code = error_table_$bad_arg;
+	     goto SETUP_RETURNS_FOR_ERROR;
+	     end;
+
+	return;
+     end setup;
+
+SETUP_RETURNS_FOR_ERROR:
+	return;					/* from lap_simplex */
+
+
+/* * * * * * * * * * CRASH * * * * * * * * * */
+
+crash:
+     procedure (P_type);
+
+dcl  P_type fixed bin parameter;
+
+
+	call free_pending_frame ();
+
+	call channel_manager$interrupt (lap_data.subchannel, P_type, ""b);
+
+	if (P_type ^= CRASH)
+	then					/* Unless he's already obviously aware, */
+	     call pxss$ring_0_wakeup (lap_data.load_process_id, lap_data.load_event_channel, MPX_DOWN, code);
+						/* we'd better let daddy know we've been bad */
+	lap_data.state = LAP_HUNGUP;
+
+	return;
+     end crash;
+
+/* * * * * * * * * * FREE_PENDING_FRAME * * * * * * * * * */
+
+free_pending_frame:
+     procedure ();
+
+	if (lap_data.frame_start = null ()) then return;
+
+	call tty_space_man$free_chain (lap_data.devx, OUTPUT, lap_data.frame_start);
+
+	lap_data.frame_start = null ();
+	lap_data.frame_end = null ();
+	lap_data.frame_size = 0;
+	lap_data.frame_ready = "0"b;
+
+	return;
+     end free_pending_frame;
+%page;
+/*
+   All the "unwired" entries are below; they share no important code with the operational
+   parts of the multiplexer, only declarations, and are here for packaging reasons only.
+*/
+
+/* * * * * * * * * * INIT_MULTIPLEXER * * * * * * * * * */
+
+/* Entry to allocate and initialize the multiplexer data base for a given major channel */
+
+lap_simplex$init_multiplexer:
+     entry (P_devx, P_miip, P_lap_data_ptr, P_code);
+
+	devx = P_devx;
+	miip = P_miip;
+	P_lap_data_ptr = null ();
+
+	if ^init_sw then do;
+	     call wire_proc$wire_me;			/* Chomp on the memories */
+	     init_sw = "1"b;
+	     end;
+
+	lap_data_ptr = null ();
+	on cleanup
+	     begin;
+	     if lap_data_ptr ^= null () then call tty_space_man$free_space (size (lap_data), lap_data_ptr);
+	end;
+
+	call tty_space_man$get_space (size (lap_data), lap_data_ptr);
+	if lap_data_ptr = null () then do;		/* allocate space for multiplexer data base */
+	     P_code = error_table_$noalloc;
+	     return;
+	     end;
+
+	lap_data.name = reverse (after (reverse (mux_init_info.channels (1).name), "."));
+	lap_data.devx = devx;
+	lap_data.subchannel = mux_init_info.channels (1).devx;
+	lap_data.state = LAP_HUNGUP;
+	lap_data.frame_start = null ();
+	lap_data.frame_end = null ();
+
+	lctp = tty_buf$lct_ptr;
+	lctep = addr (lct.lcte_array (lap_data.subchannel));
+	lcte.subchannel = 1;
+
+	P_lap_data_ptr = lap_data_ptr;
+	P_code = 0;
+	return;
+%page;
+/* * * * * * * * * * TERMINATE_MULTIPLEXER * * * * * * * * * */
+
+/* Entry to discard the multiplexer data base for a given major channel */
+
+lap_simplex$terminate_multiplexer:
+     entry (P_lap_data_ptr, P_code);
+
+	lap_data_ptr = P_lap_data_ptr;
+	call tty_space_man$free_space (currentsize (lap_data), lap_data_ptr);
+
+	P_lap_data_ptr = null ();
+	P_code = 0;
+	return;
+
+/* * * * * * * * * START * * * * * * * * * */
+
+/* Entry to allow dialups on multiplexer subchannels */
+
+lap_simplex$start:
+     entry (P_lap_data_ptr, P_code);
+
+	lap_data_ptr = P_lap_data_ptr;
+	lap_data.simplex_started = "1"b;
+	P_code = 0;
+	return;
+
+/* * * * * * * * * * STOP * * * * * * * * * */
+
+/* Entry to forbid dialups on multiplexer subchannels */
+
+lap_simplex$stop:
+     entry (P_lap_data_ptr, P_code);
+
+	lap_data_ptr = P_lap_data_ptr;
+	lap_data.simplex_started = "0"b;
+	P_code = 0;
+	return;
+
+/* * * * * * * * * * SHUTDOWN * * * * * * * * * */
+
+/*
+   Entry to shut down the multiplexer (equivalent to a crash)
+   instead of just hangup. It should be a disconnect order and
+   then a deactivate order for any state greater than listening
+*/
+
+lap_simplex$shutdown:
+     entry (P_lap_data_ptr, P_code);
+
+	lap_data_ptr = P_lap_data_ptr;
+	if (lap_data.state > LAP_HUNGUP) then call channel_manager$control (lap_data.devx, "hangup", null (), code);
+	return;
+
+/* * * * * * * * * PRIV_CONTROL * * * * * * * * * * */
+
+/* Entry to perform privileged control orders */
+
+lap_simplex$priv_control:
+     entry (P_lap_data_ptr, P_order, P_info_ptr, P_code);
+
+	lap_data_ptr = P_lap_data_ptr;
+	order = P_order;
+	P_code = 0;
+
+	if /* case */ order = "copy_meters" then do;
+	     call channel_manager$control (lap_data.devx, order, P_info_ptr, P_code);
+	     end;
+
+	else if order = "get_meters" then do;
+	     call channel_manager$control (lap_data.devx, order, P_info_ptr, P_code);
+	     end;
+
+	else P_code = error_table_$undefined_order_request;
+
+	return;
+
+/* * * * * * * * * * HPRIV_CONTROL * * * * * * * * * */
+
+/* Entry to perform highly privileged control orders */
+
+lap_simplex$hpriv_control:
+     entry (P_lap_data_ptr, P_order, P_info_ptr, P_code);
+
+	lap_data_ptr = P_lap_data_ptr;
+	order = P_order;
+	code = 0;
+
+	if /* case */ order = "load_mpx" then do;	/* bootload the multiplexed device */
+	     lap_load_info_ptr = P_info_ptr;		/* save load info */
+
+	     if lap_load_info.version ^= LAP_LOAD_INFO_VERSION_1 then do;
+		P_code = error_table_$unimplemented_version;
+		return;
+		end;
+
+	     if lap_data.state > LAP_HUNGUP then do;	/* one at a time please */
+		P_code = error_table_$action_not_performed;
+		return;
+		end;
+
+	     string (lap_data.flags) = ""b;
+	     lap_data.load_process_id = lap_load_info.process_id;
+	     lap_data.load_event_channel = lap_load_info.event_channel;
+	     lap_data.activate_order = lap_load_info.activate_order;
+
+	     lap_data.activate_order.pad = ""b;		/* Just in case */
+	     lap_data.activate_order.command = ACTIVATE_COMMAND;
+
+	     lap_data.max_frame_size = divide (lap_data.activate_order.frame_size + 7, 8, 17, 0);
+
+	     call channel_manager$control (lap_data.devx, "line_control", addr (lap_data.activate_order), code);
+	     if code ^= 0 then do;
+		P_code = code;
+		return;
+		end;
+
+	     call channel_manager$control (lap_data.devx, "listen", null (), code);
+	     if code ^= 0 then do;
+		P_code = code;
+		return;
+		end;
+
+	     lap_data.state = LAP_LISTENING;
+	     end;
+
+	else code = error_table_$undefined_order_request;
+
+	P_code = code;
+	return;
+%page;
+dcl  P_devx fixed bin parameter;			/* device (LCT) index */
+dcl  P_info_ptr pointer parameter;			/* ptr to control order info structure */
+dcl  P_miip pointer parameter;			/* ptr to mux_init_info structure */
+dcl  P_order char (*) parameter;			/* control order name */
+dcl  P_lap_data_ptr pointer parameter;			/* ptr to lap_data (lap multiplexer data base) */
+dcl  P_subchan_idx fixed bin parameter;			/* Subchannel index (should always be 1) */
+dcl  P_int_type fixed bin parameter;
+dcl  P_int_data bit (72) aligned parameter;
+dcl  P_chain_ptr pointer parameter;
+dcl  P_mcl_info_ptr pointer parameter;			/* Mode change list and modes */
+dcl  P_modes char (*) parameter;
+dcl  P_code fixed bin (35) parameter;			/* error code */
+
+dcl  code fixed bin (35);
+dcl  ignore_code fixed bin (35);
+dcl  devx fixed bin;
+dcl  info_ptr pointer;
+dcl  order char (32);
+dcl  int_type fixed bin;
+dcl  int_data bit (72) aligned;
+dcl  chain_ptr pointer;
+dcl  next_block fixed bin (18);
+dcl  frame_end fixed bin;
+dcl  real_buffer_lth fixed bin;
+dcl  mode_idx fixed bin;
+
+dcl  1 lap_down_status aligned like lap_line_status_info automatic;
+
+dcl  1 lap_cmdr_status aligned based (addr (int_data)),
+       2 cmdr_status uns fixed bin (18) unaligned,	/* constant 3 */
+       2 cmdr_bytes (3) unaligned,			/* I-frame at fault */
+         3 pad bit (1) unaligned,			/* N(s) & N(r) */
+         3 byte bit (8) unaligned,			/* flags w,x,y,z */
+       2 pad bit (27) unaligned;
+
+dcl  init_sw bit (1) aligned static init ("0"b);		/* Whether proc has been wired */
+
+dcl  pxss$ring_0_wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl  syserr entry options (variable);
+dcl  syserr$error_code entry options (variable);
+dcl  wire_proc$wire_me entry;
+
+dcl  error_table_$action_not_performed fixed bin (35) external static;
+dcl  error_table_$bad_arg fixed bin (35) external static;
+dcl  error_table_$bad_mode fixed bin (35) external static;
+dcl  error_table_$invalid_state fixed bin (35) external static;
+dcl  error_table_$noalloc fixed bin (35) external static;
+dcl  error_table_$null_info_ptr fixed bin (35) external static;
+dcl  error_table_$undefined_order_request fixed bin (35) external static;
+dcl  error_table_$unimplemented_version fixed bin (35) external static;
+
+dcl  tty_buf$lct_ptr pointer external static;
+
+dcl  MPX_UP fixed bin (71) static options (constant) init (1);
+dcl  MPX_DOWN fixed bin (71) static options (constant) init (2);
+dcl  MPX_MASKED fixed bin (71) static options (constant) init (3);
+
+dcl  cleanup condition;
+
+dcl  (addr, after, binary, collate9, currentsize, divide, hbound, lbound, pointer, null, rel, reverse, search, size,
+     string, substr, unspec) builtin;
+%page;
+%include lap_simplex_data;
+%page;
+%include lap_line_info;
+%page;
+%include mux_init_info;
+%page;
+%include lct;
+%page;
+%include channel_manager_dcls;
+%page;
+%include tty_space_man_dcls;
+%page;
+%include mcs_modes_change_list;
+%page;
+%include mode_string_info;
+%page;
+%include tty_buffer_block;
+%page;
+%include mcs_interrupt_info;
+%page;
+%include line_types;
+%page;
+%include tty_read_status_info;
+%page;
+%include syserr_codes;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   lap_simplex(CHN): Unexpected interrupt TYPE DATA received.
+
+   S: $log
+
+   T: $run
+
+   M: An unexpected MCM interrupt was processed.
+
+   A: $notify
+
+   Message:
+   lap_simplex(CHN): Failure, Link state: STATE, Current Action: FUNCTION, in ESTATE, Primary state: PSTATE, Secondary state: SSTATE.
+
+   S: $log
+
+   T: $run
+
+   M: Normal request to crash the line when the link has been disconnected by
+   the FNP.  STATE is the main state of the link. FUNCTION is the last
+   function the link processed. The ESTATE is the execution state of the
+   last function. PSTATE and SSTATE are the link up substate.
+
+   A: $notify
+
+   Message:
+   lap_simplex(CHN): Link disconnected due to mis-matched frame sizes. CMDR/FRMR frame: FRAME.
+
+   S: $log
+
+   T: $run
+
+   M: The FNP has received a command reject (LAPB) or frame reject (LAP) which
+   specified a reason of "wide frame" on channel CHN.  The actual level 2
+   command is FRAME.  This means the frame received by the other end was too
+   long.  Instead of looping continuously trying to send this frame, the link
+   will be disconnected.  The maximum frame size in the Multics TTF for this
+   link should be checked against the size expected by the other end of the
+   link, and corrected.
+
+   A: $notify
+
+   Message:
+   lap_simplex(CHN): Attempt to write overlength frame.
+
+   S: $log
+
+   T: $run
+
+   M: An attempt was made to add a buffer to a frame which didn't have room
+   for it.  The connection will be crashed.
+
+   A: $notify
+
+   Message:
+   x25_mpx(CHN): Error from write of XXX chars. ERROR
+
+   S: $log
+
+   T: $run
+
+   M: The ERROR occurred writing XXX characters to the LAP channel.
+   The LAP channel will be disconnected.
+
+   A: $notify
+
+   Message:
+   lap_simplex(CHN): Write failed to take whole frame, discarding rest.
+
+   S: $log
+
+   T: $run
+
+   M: A attempt to write a whole frame failed, only a part of it was taken.
+   An attempt will be made to continue.
+
+   A: $notify
+
+   Message:
+   lap_simplex(CHN): Invalid subchannel index XXX
+
+   S: $alarm
+
+   T: $run
+
+   M: Some call which attempted to write, process a control order or process
+   a modes operation specified a subchannel other than 1.
+
+   A: $notify
+
+   END MESSAGE DOCUMENTATION */
+
+     end lap_simplex;

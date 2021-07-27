@@ -1,0 +1,738 @@
+/****^  **************************************************************
+        *                                                            *
+        * Copyright, (C) Massachusetts Institute of Technology, 1983 *
+        *                                                            *
+        ************************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-07-29,Pattin), approve(86-07-29,MCR7354),
+     audit(86-08-07,Margolin), install(86-08-16,MR12.0-1128):
+     Fixed to set seen switches when expunging transactions.
+     Copy chairman message across.  Detect more bugs in seen maps.
+     Make sure all proceedings segments are initiated.
+  2) change(86-09-07,Pattin), approve(86-09-07,MCR7354),
+     audit(86-09-07,Margolin), install(86-09-09,MR12.0-1151):
+     Correct copy_back to use length of new attendee segment instead of length
+     of old attendee segment when copying from temp seg and truncating attendee
+     segment.
+                                                   END HISTORY COMMENTS */
+
+
+forum_salvager_:
+	proc (P_attendee_seg_ptr, P_transaction_seg_ptr);
+
+/* Version 2 forum -
+	Salvage a meeting and/or expunge deleted transactions and attendees
+	Jay Pattin 1/19/83
+
+	Added entry to copy a meeting 3/18/83 Jay Pattin */
+/* Modified 09/12/83 by Jeffrey I. Schiller. Bugfixes */
+/* Modified 11/20/83 by Jeffrey I. Schiller. Allow expunge and salvage
+   of a forum with multiple proceedings segments. Also fixes for large
+   transactions. Deletion of left over proceedings components after
+   expunge. */
+/* Modified 03/09/84 by Jeffrey I. Schiller. arrange for forum_$copy to
+   expunge deleted transactions and participants if the person doing
+   the copy is not the chairman. (Security problem). */
+/* Audit changes, J. Spencer Love 10/05/84 */
+	     
+declare	(P_attendees_deleted	fixed bin,
+	P_attendee_seg_ptr		ptr,
+	P_copy_options_ptr		ptr,
+	P_forum_idx		fixed bin,
+	P_status			fixed bin (35),
+	P_switches_word		bit (36) aligned,
+	P_transactions_deleted	fixed bin,
+	P_transaction_seg_ptr	ptr)
+				parameter;
+
+declare	attendee_count		fixed bin,
+	attendee_seg_damaged	bit (1) aligned,
+	created			bit (1) aligned,
+	deleted_attendees		fixed bin,
+	deleted_count		fixed bin,
+	deleted_transactions	fixed bin,
+	directory			char (168),
+	egress			label variable,
+	expunged_map		bit (transaction_seg.transaction_count) based (expunged_map_ptr),
+	expunged_map_ptr		ptr,
+	idx			fixed bin,
+	inner_ring		fixed bin (3),
+	last_attendee_ptr		ptr,
+	me			char (16) static options (constant) init ("forum_salvager_"),
+	name			char (32),
+	new_aseg_ptr		ptr,
+	new_dir			char (168),
+	new_name			char (32),
+	new_tseg_ptr		ptr,
+	salvage_entry		bit (1) aligned,
+	status			fixed bin (35),
+	system_area		area based (get_system_free_area_ ()),
+	temp_map			bit (temp_map_len) based (temp_map_ptr),
+	temp_map_len		fixed bin,
+	temp_map_ptr		ptr,
+	user_ring			fixed bin (3),
+	xacl			bit (36) aligned;
+
+declare	1 switches		aligned,
+	2 transactions		bit (1) unaligned,
+	2 users			bit (1) unaligned;
+
+declare	1 auto_area_info		aligned like area_info,
+	1 od			aligned like open_data,  /* for new copy */
+	1 sod			aligned like open_data,  /* for original when salvaging or copying */
+	1 new_aseg		aligned like attendee_seg based (new_aseg_ptr),
+	1 new_tseg		aligned like transaction_seg based (new_tseg_ptr);
+
+declare	USERID_CHARS		char (100) static options (constant)
+				init (" !""#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~");
+
+declare	(addr, addrel, divide, fixed, hbound, index, null, ptr, rel, reverse, size, string, substr, unspec,
+	verify)			builtin,
+	(any_other, cleanup)	condition;
+
+declare	(error_table_$incorrect_access,
+	error_table_$unsupported_operation,
+	forum_et_$chairman_only,
+	forum_et_$invalid_trans_idx,
+	forum_et_$trans_reaped,
+	forum_et_$unexpected_fault,
+	sys_info$max_seg_size)	fixed bin (35) external;
+
+declare	define_area_		entry (ptr, fixed bin (35)),
+	forum_logger_		entry options (variable),
+	forum_logger_$any_other	entry options (variable),
+	forum_open_mgr_$lookup_forum_idx
+				entry (fixed bin, ptr, bit (36) aligned, fixed bin (35)),
+	forum_seg_mgr_$initiate	entry (char (*), char (*), bit (1) aligned, ptr, ptr, bit (36) aligned, fixed bin (35)),
+	forum_seg_mgr_$initiate_seg	entry (ptr, fixed bin, fixed bin (35)),
+	forum_seg_mgr_$just_create	entry (char (*), char (*), ptr, ptr, fixed bin (35)),
+	forum_seg_mgr_$terminate	entry (ptr, ptr),
+	forum_seg_mgr_$terminate_all	entry (ptr),
+	forum_seg_mgr_$unlock	entry (ptr),
+	forum_space_mgr_$allocate_bit_map
+				entry (ptr, ptr, fixed bin, ptr, fixed bin (35)),
+	forum_space_mgr_$find_transaction
+				entry (ptr, fixed bin, ptr, fixed bin (35)),
+	forum_space_mgr_$get_attendee_slot
+				entry (ptr, char (*), ptr, fixed bin (35)),
+	forum_trans_mgr_$load_trans	entry (ptr, char (*), fixed bin, char (*), bit (1) aligned, fixed bin, fixed bin (35)),
+	get_lock_id_		entry returns (bit (36) aligned),
+	get_ring_			entry returns (fixed bin (3)),
+	get_system_free_area_	entry returns (ptr),
+	get_temp_segment_		entry (char (*), ptr, fixed bin (35)),
+	hcs_$delentry_file		entry (char (*), char (*), fixed bin (35)),
+	hcs_$delentry_seg 		entry (ptr, fixed bin(35)),
+	hcs_$del_dir_tree		entry (char (*), char (*), fixed bin (35)),
+	hcs_$fs_get_path_name	entry (ptr, char (*), fixed bin, char (*), fixed bin (35)),
+	hcs_$level_get		entry (fixed bin (3)),
+	hcs_$level_set		entry (fixed bin (3)),
+	hcs_$status_long		entry (char (*), char (*), fixed bin (1), ptr, ptr, fixed bin (35)),
+	hcs_$truncate_seg		entry (ptr, fixed bin (19), fixed bin (35)),
+	pathname_			entry (char (*), char (*)) returns (char (168)),
+	release_temp_segment_	entry (char (*), ptr, fixed bin (35)),
+	release_temp_segments_	entry (char (*), (*) ptr, fixed bin (35)),
+	sort_items_indirect_$char	entry (ptr, ptr, fixed bin (24));
+%page;
+%include forum_structures;
+%page;
+%include forum_open_data;
+%page;
+%include area_info;
+%page;
+%include status_structures;
+%page;
+%include copy_options;
+%page;
+%include copy_flags;
+%page;
+/* forum_salvager_:
+	proc (P_attendee_seg_ptr, P_transaction_seg_ptr); */
+
+	egress = PUNT;
+	salvage_entry = "1"b;
+	expunged_map_ptr, temp_map_ptr, new_aseg_ptr, new_tseg_ptr = null ();
+	od.proceedings_ptrs (*) = null ();
+	string (switches) = ""b;
+
+	attendee_seg_ptr = P_attendee_seg_ptr;
+	transaction_seg_ptr = P_transaction_seg_ptr;
+
+	call hcs_$level_get (user_ring);
+	call hcs_$fs_get_path_name (attendee_seg_ptr, directory, idx, "", (0));
+	sod.attendee_seg_ptr = attendee_seg_ptr;
+	sod.transaction_seg_ptr = transaction_seg_ptr;
+	sod.proceedings_ptrs (*) = null ();
+	sod.forum_name = directory;
+	open_data_ptr = addr (sod);
+
+	call forum_logger_ (0, me, "Salvaging ^a.", substr (directory, 1, idx));
+	goto COMMON;
+
+
+forum_salvager_$expunge:
+     entry (P_forum_idx, P_switches_word, P_attendees_deleted, P_transactions_deleted, P_status);
+
+	egress = PUNT;
+	salvage_entry = "0"b;
+	attendee_seg_ptr, transaction_seg_ptr = null ();
+	expunged_map_ptr, temp_map_ptr, new_aseg_ptr, new_tseg_ptr = null ();
+	od.proceedings_ptrs (*) = null ();
+	call hcs_$level_get (user_ring);
+	string (switches) = P_switches_word;
+
+	call forum_open_mgr_$lookup_forum_idx (P_forum_idx, open_data_ptr, xacl, status);
+	if status ^= 0 then call error (status);
+
+	attendee_ptr = open_data.attendee_ptr;
+	attendee_seg_ptr = open_data.attendee_seg_ptr;
+	transaction_seg_ptr = open_data.transaction_seg_ptr;
+	if xacl ^= RWC_XACL then call error (forum_et_$chairman_only);
+
+COMMON:
+	inner_ring = get_ring_ ();
+
+	on any_other call any_other_handler ();
+	on cleanup call clean_up_salvage ();
+
+	call hcs_$level_set (inner_ring);
+
+	call initialize_copy ();
+
+	call copy_all ();
+
+	new_tseg.deleted_count = deleted_count;
+	call copy_back ();
+	attendee_seg.salvaging = "0"b;
+
+	if ^salvage_entry then do;
+	     call forum_seg_mgr_$unlock (attendee_seg_ptr);
+
+	     P_attendees_deleted = deleted_attendees;
+	     P_transactions_deleted = deleted_transactions;
+	end;
+
+	call hcs_$level_set (user_ring);
+	P_status = 0;
+	return;
+
+PUNT:	P_status = status;
+	call release_temp_segments_ (me, od.proceedings_ptrs (*), (0));
+	call release_temp_segment_ (me, new_aseg_ptr, (0));
+	call release_temp_segment_ (me, new_tseg_ptr, (0));
+
+	if ^salvage_entry then
+	     call forum_seg_mgr_$unlock (attendee_seg_ptr);
+	call hcs_$level_set (user_ring);
+
+	return;
+
+
+clean_up_salvage:
+     procedure ();
+
+	if temp_map_ptr ^= null () then free temp_map;
+	if expunged_map_ptr ^= null () then free expunged_map;
+
+	call release_temp_segments_ (me, od.proceedings_ptrs (*), (0));
+	call release_temp_segment_ (me, new_aseg_ptr, (0));
+	call release_temp_segment_ (me, new_tseg_ptr, (0));
+	call hcs_$level_set (user_ring);
+
+	return;
+     end clean_up_salvage;
+%page;
+forum_seg_mgr_$copy:
+     entry (P_copy_options_ptr, P_status);
+
+	created = "0"b;
+	attendee_seg_ptr, transaction_seg_ptr = null ();
+	temp_map_ptr, expunged_map_ptr = null ();
+	copy_options_ptr = P_copy_options_ptr;
+	copy_options.target_err_switch = "0"b;
+	egress = COPY_PUNT;
+
+	inner_ring = get_ring_ ();
+	call hcs_$level_get (user_ring);
+
+	on any_other call any_other_handler ();
+	on cleanup call clean_up_copy ();
+
+	call hcs_$level_set (inner_ring);
+
+	directory = copy_options.source_dir;
+	name = copy_options.source_name;
+	new_dir = copy_options.target_dir;
+	new_name = copy_options.target_name;
+
+	call forum_seg_mgr_$initiate (directory, name, "1"b, attendee_seg_ptr, transaction_seg_ptr, xacl, status);
+	if status ^= 0 then call error (status);
+	if xacl = ""b then call error (error_table_$incorrect_access);
+
+	string (switches) = ""b;			/* Initially decide to copy everything. */
+
+	if xacl ^= RWC_XACL then do;			/* But if we are not a chairman, then only copy non-deleted stuff */
+	     switches.transactions = "1"b;
+	     switches.users = "1"b;
+	end;
+
+	if copy_options.update | copy_options.extend then
+	     call error (error_table_$unsupported_operation);
+
+	copy_options.target_err_switch = "1"b;
+	call forum_seg_mgr_$just_create (new_dir, new_name, new_aseg_ptr, new_tseg_ptr, status);
+	if status ^= 0 then call error (status);
+	created = "1"b;
+
+	unspec (sod) = ""b;
+	sod.attendee_seg_ptr = attendee_seg_ptr;
+	sod.transaction_seg_ptr = transaction_seg_ptr;
+	sod.proceedings_ptrs (*) = null ();
+	sod.forum_name = pathname_ (directory, name);
+	open_data_ptr = addr (sod);
+
+	unspec (od) = ""b;
+	od.attendee_seg_ptr = new_aseg_ptr;
+	od.transaction_seg_ptr = new_tseg_ptr;
+	od.proceedings_ptrs (*) = null ();
+	od.forum_name = pathname_ (new_dir, new_name);
+
+	new_aseg.flags = attendee_seg.flags;
+	new_aseg.flags.salvaging = "0"b;		/* just in case */
+	new_aseg.chairman_message = attendee_seg.chairman_message;
+	new_aseg.chairman = attendee_seg.chairman;	/* just create set it to this user */
+
+	call copy_all ();
+
+	call forum_seg_mgr_$terminate_all (open_data_ptr);
+	call forum_seg_mgr_$terminate_all (addr (od));
+	call hcs_$level_set (user_ring);
+	P_status = 0;
+	return;
+
+COPY_PUNT:
+	call clean_up_copy ();
+	P_status = status;
+	return;
+
+
+clean_up_copy:
+     procedure ();
+
+	if temp_map_ptr ^= null () then free temp_map;
+	if expunged_map_ptr ^= null () then free expunged_map;
+
+	if created then do;
+	     call hcs_$del_dir_tree (new_dir, new_name, (0));
+	     call hcs_$delentry_file (new_dir, new_name, (0));
+	end;
+	call forum_seg_mgr_$terminate (attendee_seg_ptr, transaction_seg_ptr);
+	call hcs_$level_set (user_ring);
+	return;
+     end clean_up_copy;
+%page;
+initialize_copy:
+     proc ();
+
+	call get_temp_segment_ (me, new_aseg_ptr, status);
+	if status ^= 0 then call error (status);
+
+	call get_temp_segment_ (me, new_tseg_ptr, status);
+	if status ^= 0 then call error (status);
+
+	od.forum_name = open_data.forum_name;
+	od.attendee_seg_ptr = new_aseg_ptr;
+	od.transaction_seg_ptr = new_tseg_ptr;
+
+	new_aseg.version = ATTENDEE_SEG_VERSION_1;
+	new_aseg.lock = get_lock_id_ ();
+	new_aseg.flags = attendee_seg.flags;
+	new_aseg.salvaging = "1"b;
+	new_aseg.chairman = attendee_seg.chairman;
+	new_aseg.chairman_message = attendee_seg.chairman_message;
+
+	unspec (auto_area_info) = ""b;
+	auto_area_info.version = area_info_version_1;
+	auto_area_info.system = "1"b;
+	auto_area_info.zero_on_free = "1"b;
+	auto_area_info.zero_on_alloc = "1"b;
+	auto_area_info.size = sys_info$max_seg_size - size (attendee_seg_header);
+	auto_area_info.areap = addr (new_aseg.attendee_area);
+	auto_area_info.owner = "forum";
+
+	call define_area_ (addr (auto_area_info), status);
+	if status ^= 0 then call error (status);
+
+	transaction_block_ptr = addr (new_tseg.first_free_word);
+	new_tseg.version = TRANS_SEG_VERSION_1;
+	new_tseg.first_block_offset, new_tseg.current_block_offset = rel (transaction_block_ptr);
+	new_tseg.last_trans_in_block = hbound (transaction_block.transactions, 1);
+	new_tseg.current_segno = 1;
+	new_tseg.free_space_offset = rel (addrel (transaction_block_ptr, size (transaction_block)));
+	transaction_block.first_trans_idx, transaction_block.last_trans_idx = 1;
+
+	return;
+     end initialize_copy;
+%page;
+copy_all:
+     proc ();
+
+	temp_map_len = transaction_seg.transaction_count;
+	allocate temp_map in (system_area);
+
+	allocate expunged_map in (system_area);
+	expunged_map = ""b;
+
+	call check_attendee_count ();
+	if attendee_seg_damaged then attendee_count = 5000;    /* should be enough */
+
+	call copy_transactions ();
+
+	call copy_attendees ();
+
+	free temp_map;
+
+	return;
+     end copy_all;
+%page;
+check_attendee_count:
+     proc ();
+
+	attendee_ptr = ptr (attendee_seg_ptr, attendee_seg.first_attendee_offset);
+	attendee_count, deleted_attendees = 0;
+	attendee_seg_damaged = "0"b;
+
+	do while (attendee_ptr ^= null ());
+	     if check_for_damage () then do;
+		attendee_seg_damaged = "1"b;
+		last_attendee_ptr -> attendee.next_offset = ""b;
+		return;
+	     end;
+	     attendee_count = attendee_count + 1;
+	     if switches.users & attendee.deleted then deleted_attendees = deleted_attendees + 1;
+	     last_attendee_ptr = attendee_ptr;
+	     if attendee.next_offset = ""b then attendee_ptr = null ();
+	     else attendee_ptr = ptr (attendee_seg_ptr, attendee.next_offset);
+	end;
+
+	if attendee_count ^= attendee_seg.attendee_count then attendee_seg_damaged = "1"b;
+
+	return;
+
+check_for_damage:
+     proc () returns (bit (1) aligned);
+
+	if attendee.version ^= ATTENDEE_VERSION_1 then return ("1"b);
+	if attendee.attendee_uid < 0 | attendee.attendee_uid > attendee_seg.attendee_count then return ("1"b);
+	if verify (attendee.person_id, USERID_CHARS) ^= 0 then return ("1"b);
+	if verify (attendee.project_id, USERID_CHARS) ^= 0 then return ("1"b);
+
+	return ("0"b);
+     end check_for_damage;
+
+     end check_attendee_count;
+%page;
+copy_attendees:
+     proc ();
+
+declare	1 v			aligned,
+	2 n			fixed bin,
+	2 vector			(attendee_count) ptr unaligned;
+
+declare	1 idxs			aligned,
+	2 n			fixed bin,
+	2 vector			(attendee_count) fixed bin (18);
+
+	idx = 0;
+	attendee_ptr = ptr (attendee_seg_ptr, attendee_seg.first_attendee_offset);
+	do while (attendee_ptr ^= null ());
+	     if ^switches.users | ^attendee.deleted then do;
+		idx = idx + 1;
+		v.vector (idx) = addr (attendee.person_id);
+		idxs.vector (idx) = idx;
+	     end;
+	     if attendee.next_offset = ""b then attendee_ptr = null ();
+	     else attendee_ptr = ptr (attendee_seg_ptr, attendee.next_offset);
+	end;
+
+     	if attendee_seg_damaged then call find_attendees ();
+
+	v.n, idxs.n = idx;
+	call sort_items_indirect_$char (addr (v), addr (idxs), 22);
+
+	call copy_the_attendees (1, idx);
+	return;
+
+find_attendees:
+	proc ();
+
+/* WALK THROUGH SEG LOOKING FOR ATTENDEE_VERSION_1 */
+	call forum_logger_ (0, me, "Attendee seg damaged ^a.", open_data.forum_name);
+/*	call error (forum_et_$unexpected_fault); */
+
+     end find_attendees;
+%page;
+copy_the_attendees:
+     proc (low, high);
+
+declare	(low, high, idx, jdx, middle)	fixed bin,
+	1 at			aligned like attendee based (new_attendee_ptr),
+	new_attendee_ptr		ptr;
+declare	kdx fixed bin;
+
+	middle = low + divide (high - low, 2, 17, 0);
+
+	attendee_ptr = addrel (v.vector (idxs.vector (middle)), -2);
+	call forum_space_mgr_$get_attendee_slot (new_aseg_ptr, (attendee.person_id), new_attendee_ptr, status);
+	if status ^= 0 then call error (status);
+
+	at.project_id = attendee.project_id;
+	at.participating = attendee.participating;
+	at.deleted = "0"b;
+	at.notify = attendee.notify;
+	at.acl_change_pending = attendee.acl_change_pending;
+	at.message_change_pending = attendee.message_change_pending;
+	at.last_time_attended = attendee.last_time_attended;
+	at.xacl = attendee.xacl;
+
+	bit_map_ptr = ptr (attendee_seg_ptr, attendee.bit_map_offset);
+
+	if bit_map.attendee_uid ^= attendee.attendee_uid then do;
+	     idx = new_tseg.transaction_count;
+	     jdx = 1;
+	     temp_map = ""b;
+	end;
+	else do;
+	     temp_map = bit_map.map | substr (expunged_map, attendee.bit_map_first_trans);
+	     
+	     idx = index (bit_map.map, "0"b);
+	     if idx = 0 then idx = bit_map.length;
+
+	     jdx = attendee.bit_map_first_trans;
+	     idx = idx + jdx - 1;
+	end;
+
+	call forum_space_mgr_$allocate_bit_map (addr (od), new_attendee_ptr, idx, bit_map_ptr, status);
+	if status ^= 0 then call error (status);
+
+	idx = at.bit_map_first_trans - jdx + 1;
+	if idx <= temp_map_len then
+	     bit_map.map = substr (temp_map, idx);
+
+	kdx = index (reverse (bit_map.map), "1"b);
+	if kdx = 0 then kdx = -1;
+	else kdx = bit_map.length - kdx;
+
+	kdx = kdx + at.bit_map_first_trans;
+	if kdx > transaction_seg.transaction_count then do;
+	     idx = transaction_seg.transaction_count - at.bit_map_first_trans + 1;
+	     if idx > 0 then substr (bit_map.map, idx) = ""b;
+	     else do;
+		at.bit_map_first_trans = transaction_seg.transaction_count + 1;
+		bit_map.map = ""b;
+	     end;
+	end;
+
+	if middle < high then call copy_the_attendees (middle + 1, high);
+	if middle > low then call copy_the_attendees (low, middle - 1);
+
+	return;
+     end copy_the_attendees;
+
+     end copy_attendees;
+%page;
+copy_transactions:
+     proc ();
+
+declare	block_offset		bit (18),
+          pref_offset		bit (18),
+          pref_ptr			ptr,
+	new_trans_ptr		ptr,
+	1 new_trans		like transaction based (new_trans_ptr),
+	pref			fixed bin,
+	subject			char (subject_len) based (subject_ptr),
+	subject_len		fixed bin,
+	subject_ptr		ptr,
+	trans_idx			fixed bin,
+	trans_ptr			ptr,
+	trans_len			fixed bin (21),
+	trans_text		char (trans_len) based (trans_ptr);
+
+	deleted_transactions, deleted_count = 0;
+	block_offset = ""b;
+
+	do trans_idx = 1 to transaction_seg.transaction_count;
+	     call forum_space_mgr_$find_transaction (transaction_seg_ptr, trans_idx, transaction_ptr, status);
+	     if status ^= 0 & status ^= forum_et_$trans_reaped then
+		if status = forum_et_$unexpected_fault then status = forum_et_$trans_reaped;	/* damaged */
+		else call error (status);
+
+	     if status = forum_et_$trans_reaped then call expunge ();
+	     else if switches.transactions & transaction.deleted then call expunge ();
+	     else do;
+		trans_len = transaction.text_length;
+		subject_len = transaction.subject_length;
+		if open_data.proceedings_ptrs (transaction.segno) = null () then do;
+		     call forum_seg_mgr_$initiate_seg (open_data_ptr, transaction.segno, status);
+		     if status ^= 0 then call error (status);
+		end;
+		trans_ptr = ptr (open_data.proceedings_ptrs (transaction.segno), transaction.text_offset);
+		subject_ptr = ptr (open_data.proceedings_ptrs (transaction.segno), transaction.subject_offset);
+
+		pref = 0;
+		pref_offset = transaction.pref_offset;
+		do while (pref_offset ^= ""b);
+		     pref_ptr = ptr (transaction_seg_ptr, pref_offset);
+		     if ^pref_ptr -> transaction.deleted then do;
+			pref = pref_ptr -> transaction.trans_idx;
+			goto have_pref;
+		     end;
+		     pref_offset = pref_ptr -> transaction.pref_offset;
+		end;
+
+have_pref:
+		call forum_trans_mgr_$load_trans (addr (od), trans_text, pref, subject, (transaction.unfilled),
+		     idx, status);
+		if status ^= 0 then call error (status);
+		if trans_idx ^= idx then call error (forum_et_$invalid_trans_idx);
+		     
+		new_trans_ptr = ptr (new_tseg_ptr, new_tseg.last_trans_offset);
+		new_trans.person_id = transaction.person_id;
+		new_trans.project_id = transaction.project_id;
+		new_trans.time = transaction.time;
+		new_trans.deleted = transaction.deleted;
+		new_trans.deleted_by_author = transaction.deleted_by_author;
+
+		if new_trans.deleted then deleted_count = deleted_count + 1;
+		if block_offset ^= new_tseg.current_block_offset then do;
+		     ptr (new_tseg_ptr, new_tseg.current_block_offset) -> transaction_block.time = new_trans.time;
+		     block_offset = new_tseg.current_block_offset;
+		end;
+	     end;
+	end;
+	return;
+
+expunge:	
+     proc ();
+
+	if status = 0 then deleted_transactions = deleted_transactions + 1;
+	deleted_count = deleted_count + 1;
+
+	transaction_block_ptr = ptr (new_tseg_ptr, new_tseg.current_block_offset);
+	if trans_idx > new_tseg.last_trans_in_block then call get_new_block ();
+	
+	idx = trans_idx - transaction_block.first_trans_idx + 1;
+	transaction_block.offset (idx) = EXPUNGED;
+	transaction_block.last_trans_idx = idx;
+	new_tseg.transaction_count = new_tseg.transaction_count + 1;
+
+	substr (expunged_map, trans_idx, 1) = "1"b;
+	return;
+     end expunge;
+
+get_new_block:
+     proc ();
+
+declare	old_block_offset		bit (18);
+
+	old_block_offset = rel (transaction_block_ptr);
+	new_tseg.current_block_offset,
+	     transaction_block.next_block_offset = new_tseg.free_space_offset;
+	transaction_block_ptr = ptr (new_tseg_ptr, new_tseg.free_space_offset);
+	new_tseg.free_space_offset = rel (addrel (transaction_block_ptr, size (transaction_block)));
+	new_tseg.last_trans_in_block = new_tseg.last_trans_in_block + hbound (transaction_block.transactions, 1);
+	transaction_block.first_trans_idx = trans_idx;
+	transaction_block.prev_block_offset = old_block_offset;
+
+	return;
+     end get_new_block;
+
+     end copy_transactions;
+%page;
+copy_back:
+     proc ();
+
+declare	1 sb			aligned like status_branch,
+	attendee_seg_len		fixed bin (21),
+	directory			char (168),
+	dir_len			fixed bin,
+	entry_name		char (32),
+	segment			char (seg_len) based,
+	seg_len			fixed bin (21);
+
+	call hcs_$fs_get_path_name (new_aseg_ptr, directory, dir_len, entry_name, status);
+	if status ^= 0 then call error (status);
+
+	call hcs_$status_long (directory, entry_name, 0, addr (sb), null (), status);
+	if status ^= 0 then call error (status);
+	attendee_seg_len = 4096 * sb.current_length;
+
+/* Make sure all of the proceedings segments in the old meeting have
+   been initiated.  If all of the transactions in one segment are being
+   expunged, the segment may not be initiated and we will fault on it
+   here */
+
+	do idx = 1 to transaction_seg.current_segno;
+	     if open_data.proceedings_ptrs (idx) = null () then do;
+		call forum_seg_mgr_$initiate_seg (open_data_ptr, idx, status);
+		if status ^= 0 then call error (status);
+	     end;
+	end;
+
+	do idx = 1 to new_tseg.current_segno;
+	     if idx ^= new_tseg.current_segno then seg_len = 4 * sys_info$max_seg_size;
+	     else seg_len = 4 * fixed (new_tseg.next_trans_offset, 19);
+	     open_data.proceedings_ptrs (idx) -> segment = od.proceedings_ptrs (idx) -> segment;
+	end;
+
+	do idx = new_tseg.current_segno + 1 to transaction_seg.current_segno;
+	     call hcs_$delentry_seg (open_data.proceedings_ptrs (idx),
+		(0));
+	     open_data.proceedings_ptrs (idx) = null ();
+	end;
+		
+	seg_len = attendee_seg_len;
+	attendee_seg_ptr -> segment = new_aseg_ptr -> segment;
+
+	seg_len = 4 * fixed (new_tseg.free_space_offset, 19);
+	transaction_seg_ptr -> segment = new_tseg_ptr -> segment;
+
+	call hcs_$truncate_seg (open_data.proceedings_ptrs (new_tseg.current_segno),
+	     fixed (new_tseg.next_trans_offset, 19), (0));
+	call hcs_$truncate_seg (attendee_seg_ptr, divide (attendee_seg_len, 4, 19, 0), (0));
+	call hcs_$truncate_seg (transaction_seg_ptr, fixed (new_tseg.free_space_offset, 19), (0));
+
+	do idx = 1 to new_tseg.current_segno;
+	     call release_temp_segment_ (me, od.proceedings_ptrs (idx), (0));
+	end;
+	call release_temp_segment_ (me, new_aseg_ptr, (0));
+	call release_temp_segment_ (me, new_tseg_ptr, (0));
+
+     end copy_back;
+%page;
+any_other_handler:
+     proc ();
+
+	on any_other system;
+	if open_data_ptr ^= null () then directory = open_data.forum_name;
+	else directory = "";
+
+	call forum_logger_$any_other (0, me, directory);
+	status = forum_et_$unexpected_fault;
+	goto egress;
+
+     end any_other_handler;
+
+
+error:
+     proc (P_status);
+     
+declare	P_status			fixed bin (35);
+
+	status = P_status;
+	goto egress;
+
+     end error;
+
+end forum_salvager_;

@@ -1,0 +1,1668 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-18,JSLove), approve(86-08-18,MCR7518),
+     audit(86-08-18,Parisek), install(86-10-02,MR12.0-1175):
+     Changed to call match_star_name_ instead of value_match_.  Value_match_
+     was deleted when the new match_star_name_ was installed.
+                                                   END HISTORY COMMENTS */
+
+
+value_: proc;
+
+/* Written 11/17/80 by Steve Herbst */
+/* Fixed to catch deleted default value seg 08/81/81 Steve Herbst */
+/* Fixed for $set to create default seg unless -pp specified 12/01/81 Steve Herbst */
+/* Fixed to truncate value seg after compaction 02/01/82 Steve Herbst */
+/* Fixed value_$list_data_names to return word lengths 03/20/82 Steve Herbst */
+/* Modified: 29 March 1982 by G. Palter to garbage collect after adding/replacing values, to not release write lock in the
+      middle of deleting a push-down list of nodes, and to free the temporary segment used for garbage collection if the
+      user releases during GCing */
+/* Fixed value_$list to free allocated things on cleanup 05/24/82 Steve Herbst */
+/* Fixed value_$list to work on nonshareable value seg like exec_com uses 06/08/83 Steve Herbst */
+/* Fixed $get_path to notice hcs_$fs_get_path_name error 02/07/84 Steve Herbst */
+/* Fixed $list to return pushed values latest to earliest 07/26/84 Steve Herbst */
+/* Optimize var-setting to reuse old node if same length and type 02/15/85 Steve Herbst */
+
+
+/* The value database */
+
+dcl 1 seg aligned based (seg_ptr),			/* value segment (shareable) */
+     2 header,
+      3 version fixed bin,
+      3 banner bit (36),				/* identifying decoration (= BANNER) */
+      3 ht_size fixed bin,				/* for later modifications */
+      3 region_size fixed bin,			/* explicit size or rest of seg */
+      3 remote_area_ptr ptr,				/* null=>use seg.node_region, alloc by addrel, salvage */
+      3 lock bit (36),				/* standard interprocess lock */
+      3 salvaging_sw bit (1),				/* ON while locked for salvage */
+      3 change_count fixed bin (35),			/* incremented by writer when data is changed */
+      3 next_free_offset bit (18),			/* for next node allocation in seg.node_region */
+      3 trash_count fixed bin,			/* number of nodes freed before salvage */
+      3 offset_ht (0:60) bit (18),			/* hash table of offsets into region */
+     2 node_region (seg_region_size refer (seg.region_size)) fixed bin;  /* to contain nodes */
+
+dcl 1 pp aligned based (pp_ptr),			/* perprocess value database */
+     2 version fixed bin,
+     2 banner bit (36),				/* = PP_BANNER to distinguish from shareable seg */
+     2 ht_size fixed bin,
+     2 remote_area_ptr ptr,				/* non-null: points  to an area for node allocation */
+     2 pad (2) fixed bin,
+     2 ptr_ht (0:60) ptr unaligned;			/* hash table of pointers */
+
+dcl 1 node_header aligned based,			/* to be used in node structure */
+     2 version fixed bin,
+     2 banner bit (36),				/* for recognizing a node when salvaging (=BANNER) */
+     2 next_offset bit (18),				/* forward offset, for seg (shared) */
+     2 next_ptr ptr unaligned,			/* forward ptr, for pp (perprocess) */
+     2 switches,
+      3 pp_sw bit (1) unaligned,			/* ON for perprocess values */
+      3 data_sw bit (1) unaligned,			/* ON only for values set by $set_data etc. */
+      3 push_sw bit (1) unaligned,			/* ON if $push'ed on top of another value */
+      3 pad bit (33) unaligned,
+     2 name_len fixed bin (21),			/* length of variable name */
+     2 value_len fixed bin (21);			/* length of value string */
+
+dcl 1 node aligned based (node_ptr),			/* a single name-value pair */
+     2 header like node_header,
+     2 name char (node_name_len refer (node.name_len)) varying,
+     2 value char (node_value_len refer (node.value_len)) varying;
+
+dcl 1 old_node_format aligned based,			/* vestige from before version number */
+     2 banner bit (36),				/* for recognizing a node when salvaging (=BANNER) */
+     2 next_offset bit (18),				/* forward offset, for seg (shared) */
+     2 next_ptr ptr unaligned,			/* forward ptr, for pp (perprocess) */
+     2 name_len fixed bin (21),			/* length of variable name */
+     2 value_len fixed bin (21),			/* length of value string */
+     2 name char (node_name_len refer (old_node_format.name_len)),
+     2 value char (node_value_len refer (old_node_format.value_len));
+
+
+/* Other structures */
+
+%include value_structures;
+
+dcl 1 name_info aligned,				/* pointer and length of variable name_info */
+     2 ptr ptr,
+     2 len fixed bin (21);
+
+dcl 1 value_info aligned,				/* pointer and length of value string */
+     2 ptr ptr,
+     2 len fixed bin (21),
+     2 seg_ptr ptr,					/* for unlocking */
+     2 change_count fixed bin;			/* for unlocking */
+
+dcl 1 new_value_info aligned like value_info;		/* value to be set */
+dcl 1 old_value_info aligned like value_info;		/* to test against existing value */
+
+dcl 1 alloc_info aligned,				/* for freeing char string copy of value arg */
+     2 ptr ptr,
+     2 len fixed bin (21),
+     2 area_ptr ptr;
+
+dcl 1 node_ptrs aligned,
+     2 this ptr,					/* pointer to current (found) node */
+     2 last ptr,					/* pointer to previous node */
+     2 segp ptr,					/* pointer to seg or pp header */
+     2 hash fixed bin;				/* hash table index */
+
+dcl 1 sort_array aligned based (sort_array_ptr),		/* for sorting var names for value_$list */
+     2 count fixed bin,
+     2 name_ptr (sort_array.count) ptr unaligned;
+
+dcl 1 sort_entry aligned based (sort_entry_ptr),
+   2 node_ptr ptr,
+   2 sort_field,
+    3 length fixed bin,				/* simulate a varying string */
+    3 name char (node.name_len) unaligned,
+    3 sequence pic"999999" unaligned,
+   2 next_entry ptr;
+
+/* Constants */
+
+dcl MAX_TRASH_COUNT fixed bin int static options (constant) init (512);
+
+dcl BANNER bit (36) int static options (constant) init ("707070707070"b3);
+dcl PP_BANNER bit (36) int static options (constant) init ("070707070707"b3);
+dcl HT_SIZE fixed int static options (constant) init (61);
+dcl value_version_1 fixed bin int static options (constant) init (1);
+dcl (PERMANENT init (0), PERPROCESS init (1)) fixed bin int static options (constant);
+dcl (PERMANENT_SW init ("01"b), PERPROCESS_SW init ("10"b)) bit (2) int static options (constant);
+
+dcl SUFFIX char (6) int static options (constant) init (".value");
+dcl SUFFIX_LEN fixed bin int static options (constant) init (6);
+
+dcl BIT_TYPE fixed bin int static options (constant) init (19);
+dcl CHAR_TYPE fixed bin int static options (constant) init (21);
+dcl FIXED_BIN_TYPE fixed bin int static options (constant) init (1);
+dcl PTR_TYPE fixed bin int static options (constant) init (13);
+dcl VARYING_CHAR_TYPE fixed bin int static options (constant) init (22);
+
+dcl WHITE char (2) int static options (constant) init (" 	");  /* SP HT */
+
+
+/* Static */
+
+dcl perprocess_seg_ptr ptr int static init (null);	/* pointer to pp seg in process_dir */
+
+dcl default_seg_ptr ptr int static init (null);		/* pointer to default value seg used by commands */
+
+
+/* Arguments */
+
+dcl (A_path, A_name) char (*);
+dcl A_switches bit (36) aligned;
+dcl A_create_sw bit (1);
+dcl (A_area_ptr, A_data_ptr, A_new_data_ptr, A_old_data_ptr, A_remote_area_ptr, A_seg_ptr, A_value_ptr) ptr;
+dcl (A_match_info_ptr, A_value_list_info_ptr) ptr;
+dcl A_seg_type fixed bin;
+dcl (A_data_size, A_new_data_size, A_old_data_size) fixed bin (18);
+dcl A_region_size fixed bin (19);
+dcl A_value_len fixed bin (21);
+dcl A_code fixed bin (35);
+
+
+/* Global arg info for options (variable) entries */
+
+dcl options_var_sw bit (1) aligned;
+dcl arg_list_ptr ptr;
+dcl (code_arg_index, old_value_arg_index) fixed bin;
+
+
+/* Based */
+
+dcl char8 char (8) based;
+dcl name_string char (name_info.len) based (name_info.ptr);
+dcl value_string char (value_info.len) based (value_info.ptr);
+dcl new_value_string char (new_value_info.len) based (new_value_info.ptr);
+dcl old_value_string char (old_value_info.len) based (old_value_info.ptr);
+dcl alloc_string char (alloc_info.len) based (alloc_info.ptr);
+
+dcl based_area area based;
+
+dcl bits bit (99 /* indefinite */) aligned based;		/* for copying data */
+
+dcl 1 seg_mode_bits unaligned based (addr (seg_mode)),
+   2 pad bit (32) unaligned,
+   2 (R_BIT, E_BIT, W_BIT, pad1) bit (1) unaligned;
+
+
+/* Automatic */
+
+dcl (dn, path) char (168);
+dcl en char (32);
+
+dcl number_picture picture"999999";
+
+dcl switches bit (36);
+dcl pp_sw_arg bit (1) defined (switches) position (1);
+dcl seg_sw_arg bit (1) defined (switches) position (2);
+
+dcl node_offset bit (18);
+dcl (alloc_entrypoint_sw, function_entrypoint_sw, pop_sw, push_sw, set_entrypoint_sw) bit (1) aligned init ("0"b);
+dcl (data_entrypoint_sw, found_one_sw, local_pp_sw, locked_sw, test_entrypoint_sw) bit (1) aligned;
+
+dcl (area_ptr, new_node_ptr, node_ptr, old_node_ptr, pp_ptr, seg_ptr) ptr;
+dcl (sort_array_ptr, sort_entries_ptr, sort_entry_ptr, where_ptr) ptr;
+
+dcl seg_mode fixed bin (5);
+dcl (begin_change_count, i, saved_sort_count, sequential_number, sort_field_offset) fixed bin;
+dcl (chars_index, node_name_len, node_value_len, saved_chars_len) fixed bin (21);
+dcl (code, seg_code) fixed bin (35);
+
+dcl error_table_$action_not_performed fixed bin (35) ext;
+dcl error_table_$bad_conversion fixed bin (35) ext;
+dcl error_table_$badcall fixed bin (35) ext;
+dcl error_table_$boundviol fixed bin (35) ext;
+dcl error_table_$invalid_lock_reset fixed bin (35) ext;
+dcl error_table_$locked_by_this_process fixed bin (35) ext;
+dcl error_table_$lower_ring fixed bin (35) ext;
+dcl error_table_$noalloc fixed bin (35) ext;
+dcl error_table_$noentry fixed bin (35) ext;
+dcl error_table_$nomatch fixed bin (35) ext;
+dcl error_table_$oldnamerr fixed bin (35) ext;
+dcl error_table_$no_r_permission fixed bin (35) ext;
+dcl error_table_$no_w_permission fixed bin (35) ext;
+dcl error_table_$not_seg_type fixed bin (35) ext;
+dcl error_table_$out_of_sequence fixed bin (35) ext;
+
+dcl sys_info$max_seg_size fixed bin (24) ext;
+
+dcl assign_ entry (ptr, fixed bin, fixed bin (21), ptr, fixed bin, fixed bin (21));
+dcl cu_$arg_list_ptr entry returns (ptr);
+dcl cu_$arg_ptr_rel entry (fixed bin, ptr, fixed bin, fixed bin (35), ptr);
+dcl decode_descriptor_ entry (ptr, fixed bin, fixed bin, bit (1) aligned, fixed bin, fixed bin, fixed bin);
+dcl expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl get_system_free_area_ entry returns (ptr);
+dcl get_temp_segment_ entry (char (*), ptr, fixed (35));
+dcl hcs_$fs_get_mode entry (ptr, fixed bin (5), fixed bin (35));
+dcl hcs_$fs_get_path_name entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+dcl hcs_$initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl hcs_$set_bc_seg entry (ptr, fixed bin (24), fixed bin (35));
+dcl hcs_$terminate_noname entry (ptr, fixed bin (35));
+dcl hcs_$truncate_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl match_star_name_ entry (char (*), char (*), fixed bin (35));
+dcl pathname_ entry (char (*), char (*)) returns (char (168));
+dcl release_temp_segment_ entry (char (*), ptr, fixed (35));
+dcl search_file_ entry (ptr, fixed bin (21), fixed bin (21), ptr, fixed bin (21), fixed bin (21),
+	fixed bin (21), fixed bin (21), fixed bin (35));
+dcl set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+dcl sort_items_$varying_char entry (ptr);
+dcl user_info_ entry options (variable);
+dcl user_info_$homedir entry (char (*));
+
+dcl (addr, addrel, baseno, bit, currentsize, divide, fixed) builtin;
+dcl (length, mod, null, pointer, rel, rtrim, substr, unspec, wordno) builtin;
+
+dcl (any_other, area, cleanup, conversion, no_write_permission, not_in_write_bracket, sub_error) condition;
+%page;
+defined: entry (A_seg_ptr, A_switches, A_name, A_code) returns (bit (1) aligned);
+
+	data_entrypoint_sw, options_var_sw = "0"b;
+
+	function_entrypoint_sw = "1"b;
+
+	call copy_args;
+
+	A_code = 0;
+
+	call get_ptrs (seg_ptr, pp_ptr);
+
+	if find (pp_ptr, seg_ptr, name_info, value_info, node_ptrs) then return ("1"b);
+
+	else return ("0"b);
+%page;
+delete: entry (A_seg_ptr, A_switches, A_name, A_code);
+
+	data_entrypoint_sw, options_var_sw = "0"b;
+	A_code = 0;
+
+	call copy_args;
+
+	call get_ptrs (seg_ptr, pp_ptr);
+
+	call lock_for_write (seg_ptr);
+
+	on cleanup call unlock_for_write (seg_ptr);
+
+	found_one_sw = "0"b;
+DELETE:
+	if find (pp_ptr, seg_ptr, name_info, value_info, node_ptrs) then do;
+
+	     found_one_sw = "1"b;
+	     push_sw = node_ptrs.this -> node.push_sw;
+
+	     call delete_node (node_ptrs);
+
+	     if push_sw then go to DELETE;		/* delete all pushed values and the original */
+	end;
+
+	else if ^found_one_sw then A_code = error_table_$oldnamerr;
+
+	call unlock_for_write (seg_ptr);
+
+	return;
+%page;
+delete_data: entry (A_seg_ptr, A_switches, A_name, A_code);
+
+	options_var_sw = "0"b;
+	data_entrypoint_sw = "1"b;
+	A_code = 0;
+
+	call copy_args;
+
+	call get_ptrs (seg_ptr, pp_ptr);
+
+	call lock_for_write (seg_ptr);
+
+	on cleanup call unlock_for_write (seg_ptr);
+
+	found_one_sw = "0"b;
+	go to DELETE;
+%page;
+get: entry options (variable);
+
+/* call value_$get (seg_ptr, switches, name, value_arg, code); */
+
+	options_var_sw = "1"b;
+	code_arg_index = 5;				/* global; used by return_code */
+	arg_list_ptr = cu_$arg_list_ptr ();
+
+	call get_options_var_args (arg_list_ptr);
+
+	data_entrypoint_sw = "0"b;
+
+GET:	call get_ptrs (seg_ptr, pp_ptr);
+
+	if find (pp_ptr, seg_ptr, name_info, value_info, node_ptrs) then do;
+
+FOUND1:	     call set_value_arg (arg_list_ptr, 4, value_info);  /* return the value */
+
+	     if value_info.seg_ptr ^= null then		/* unlock for read */
+		if value_info.seg_ptr -> seg.change_count ^= value_info.change_count then do;
+
+		     if find_in (value_info.seg_ptr, name_info, value_info, node_ptrs) then go to FOUND1;  /* retry */
+
+		     else go to NOT_FOUND1;
+		end;
+
+	     call return_code (0);			/* zero status code */
+	end;
+	else
+NOT_FOUND1:    call return_code (error_table_$oldnamerr);
+
+RETURN:
+	if function_entrypoint_sw then return ("0"b);		/* value_$defined */
+	else return;
+%page;
+get_alloc: entry (A_seg_ptr, A_switches, A_name, A_area_ptr, A_value_ptr, A_value_len, A_code);
+
+	alloc_entrypoint_sw = "1"b;
+	data_entrypoint_sw = "0"b;
+	go to GET_DATA;
+%page;
+get_data: entry (A_seg_ptr, A_switches, A_name, A_area_ptr, A_data_ptr, A_data_size, A_code);
+
+	data_entrypoint_sw = "1"b;
+GET_DATA:
+	options_var_sw = "0"b;
+
+	if A_area_ptr = null then call return_code (error_table_$noalloc);
+
+	call copy_args;
+
+	go to GET;
+%page;
+get_path: entry (A_path, A_code);
+
+	A_code = 0;
+
+	options_var_sw = "0"b;
+
+	if default_seg_ptr ^= null then
+	     call hcs_$fs_get_path_name (default_seg_ptr, dn, 0, en, A_code);
+
+	else call get_default_path (dn, en);
+
+	if A_code = 0 then A_path = pathname_ (dn, en);
+
+	call return_code (A_code);
+%page;
+init_seg: entry (A_seg_ptr, A_seg_type, A_remote_area_ptr, A_region_size, A_code);
+
+/* See if already initiated */
+
+	options_var_sw = "0"b;
+
+	if A_seg_ptr -> seg.banner = BANNER then
+	     if A_seg_type ^= PERMANENT then call return_code (error_table_$not_seg_type);
+	     else if A_remote_area_ptr ^= null then call return_code (error_table_$out_of_sequence);
+	     else call return_code (0);
+	else if A_seg_ptr -> pp.banner = PP_BANNER then
+	     if A_seg_type ^= PERPROCESS then call return_code (error_table_$not_seg_type);
+	     else if A_remote_area_ptr ^= null then call return_code (error_table_$out_of_sequence);
+	     else call return_code (0);
+
+	call init_seg (A_seg_ptr);
+
+	if A_seg_type = PERPROCESS then do;
+	     A_seg_ptr -> pp.banner = PP_BANNER;
+	     do i = 0 to A_seg_ptr -> pp.ht_size - 1;	/* fill hash table with null ptrs */
+		A_seg_ptr -> pp.ptr_ht (i) = null;
+	     end;
+	     if A_remote_area_ptr ^= null then
+		A_seg_ptr -> pp.remote_area_ptr = A_remote_area_ptr;
+	     else A_seg_ptr -> pp.remote_area_ptr = get_system_free_area_ ();
+	end;
+
+	else do;
+	     A_seg_ptr -> seg.banner = BANNER;		/* shareable seg */
+	     unspec (A_seg_ptr -> seg.offset_ht) = "0"b;
+	     if A_region_size > 0 then A_seg_ptr -> seg.region_size = A_region_size;
+	end;
+
+	call return_code (0);
+%page;
+list: entry (A_seg_ptr, A_switches, A_match_info_ptr, A_area_ptr, A_value_list_info_ptr, A_code);
+
+/* Using A_match_info_ptr->match_info to select, returns names/values for matching variables */
+
+	data_entrypoint_sw = "0"b;
+LIST:
+	options_var_sw = "0"b;
+
+	A_code = 0;
+	seg_ptr = A_seg_ptr;
+	switches = A_switches;
+	match_info_ptr = A_match_info_ptr;
+	area_ptr = A_area_ptr;
+	if area_ptr = null then area_ptr = get_system_free_area_ ();
+
+	call get_ptrs (seg_ptr, pp_ptr);
+
+	sort_entries_ptr, sort_array_ptr, value_list_info_ptr = null;
+
+	on cleanup call list_cleanup;
+
+	call get_temp_segment_ ("value_$list", sort_array_ptr, code);
+	call get_temp_segment_ ("value_$list", sort_entries_ptr, code);
+
+	sort_entry_ptr = sort_entries_ptr;
+	sort_field_offset = wordno (addr (sort_entry)) - wordno (addr (sort_entry.sort_field));
+	sort_array.count, alloc_chars_len, sequential_number = 0;
+
+	if pp_ptr ^= null then do;			/* search perprocess values */
+
+	     call list_pp (pp_ptr);
+	end;
+
+	if seg_ptr ^= null then
+
+	     if seg_ptr -> seg.banner = PP_BANNER then call list_pp (seg_ptr);
+						/* a private nonshareable value seg, as for exec_com */
+
+	     else do;				/* a real value seg */
+
+		saved_chars_len = alloc_chars_len;		/* in case we have to retry */
+		saved_sort_count = sort_array.count;
+SEARCH_SEG:
+		call lock_for_read (seg_ptr, begin_change_count);
+
+		do node_ptrs.hash = 0 to seg.ht_size - 1;
+		     if seg.offset_ht (node_ptrs.hash) ^= "0"b then do;
+
+			node_ptrs.this = pointer (seg_ptr, seg.offset_ht (node_ptrs.hash));
+			node_ptrs.last = null;
+
+			do while (node_ptrs.this ^= null);
+
+			     if node_ptrs.this -> old_node_format.banner = BANNER then do;  /* COMPATIBILITY */
+
+				old_node_ptr = node_ptrs.this;
+
+				node_ptrs.this = add_node (seg_ptr, node_ptrs.this -> old_node_format.name_len,
+				     node_ptrs.this -> old_node_format.value_len, node_ptrs);
+
+				call copy_old_format_node (old_node_ptr, node_ptrs.this);
+			     end;
+
+			     if node_ptrs.this -> node.data_sw = data_entrypoint_sw then
+
+				call match_one (node_ptrs.this);
+
+			     node_ptrs.last = node_ptrs.this;
+			     node_offset = node_ptrs.this -> node.next_offset;
+			     if node_offset = "0"b then node_ptrs.this = null;
+			     else node_ptrs.this = pointer (seg_ptr, node_offset);
+			end;
+		     end;
+		end;
+
+		if seg.change_count ^= begin_change_count then do;  /* changed while listing */
+		     alloc_chars_len = saved_chars_len;
+		     sort_array.count = saved_sort_count;
+		     go to SEARCH_SEG;	     	/* retry the seg */
+		end;
+	     end;
+
+	if sort_array.count = 0 then do;
+	     A_code = error_table_$nomatch;
+	     go to LIST_RETURN;
+	end;
+
+/* Sort the found var names alphabetically */
+
+	call sort_items_$varying_char (sort_array_ptr);
+
+	alloc_pair_count = sort_array.count;
+
+	allocate value_list_info in (area_ptr -> based_area) set (value_list_info_ptr);
+
+	value_list_info.version = value_list_info_version_1;
+	chars_index = 1;
+
+	do i = 1 to value_list_info.pair_count;
+
+	     sort_entry_ptr = addrel (sort_array.name_ptr (i), sort_field_offset);
+					/* sort_array.name(i) is addr of sort_entry.sort_field */
+	     node_ptr = sort_entry.node_ptr;
+
+	     if node_ptr -> node.pp_sw then value_list_info.type_switches (i) = PERPROCESS_SW;
+	     else value_list_info.type_switches (i) = PERMANENT_SW;
+	     value_list_info.name_index (i) = chars_index;
+	     value_list_info.name_len (i) = node_ptr -> node.name_len;
+	     substr (value_list_info.chars, chars_index, value_list_info.name_len (i)) = node_ptr -> node.name;
+	     chars_index = chars_index + value_list_info.name_len (i);
+
+	     if data_entrypoint_sw then do;		/* return word length only for data entry */
+		value_list_info.value_index (i) = 0;
+		value_list_info.value_len (i) = divide (node_ptr -> node.value_len + 3, 4, 21, 0);
+	     end;
+	     else do;				/* return char value otherwise */
+		value_list_info.value_index (i) = chars_index;
+		value_list_info.value_len (i) = node_ptr -> node.value_len;
+		substr (value_list_info.chars, chars_index, value_list_info.value_len (i)) = node_ptr -> node.value;
+		chars_index = chars_index + value_list_info.value_len (i);
+	     end;
+	end;
+
+	value_list_info.chars_len = chars_index - 1;
+
+	A_value_list_info_ptr = value_list_info_ptr;
+	A_code = 0;
+LIST_RETURN:
+	call release_temp_segment_ ("value_$list", sort_array_ptr, code);
+	call release_temp_segment_ ("value_$list", sort_entries_ptr, code);
+
+	return;
+
+
+
+list_cleanup: proc;
+
+	if sort_array_ptr ^= null then call release_temp_segment_ ("value_$list", sort_array_ptr, code);
+	if sort_entries_ptr ^= null then call release_temp_segment_ ("value_$list", sort_entries_ptr, code);
+	if value_list_info_ptr ^= null then free value_list_info in (area_ptr -> based_area);
+
+end list_cleanup;
+%page;
+list_data_names: entry (A_seg_ptr, A_switches, A_match_info_ptr, A_area_ptr, A_value_list_info_ptr, A_code);
+
+/* Same as value_$list, but works on data values (value_$set_data) and returns only names */
+
+	data_entrypoint_sw = "1"b;
+	go to LIST;
+%page;
+pop: entry options (variable);
+
+/* call value_$pop (seg_ptr, switches, name, old_value, code); */
+
+	pop_sw = "1"b;
+	old_value_arg_index = 4;
+	code_arg_index = 5;
+
+	go to VALUE_SET;
+%page;
+push: entry options (variable);
+
+/* call value_$push (seg_ptr, switches, name, new_value, old_value, code); */
+
+	push_sw = "1"b;
+	old_value_arg_index = 5;
+	code_arg_index = 6;
+
+	go to VALUE_SET;
+%page;
+set: entry options (variable);
+
+/* call value_$set (seg_ptr, switches, name, new_value, old_value, code); */
+
+	seg_code = 0;
+
+	old_value_arg_index = 5;
+	code_arg_index = 6;
+VALUE_SET:
+	options_var_sw = "1"b;
+	arg_list_ptr = cu_$arg_list_ptr ();
+
+	call get_options_var_args (arg_list_ptr);
+
+	data_entrypoint_sw, test_entrypoint_sw = "0"b;
+
+SET:	set_entrypoint_sw = "1"b;
+
+	call get_ptrs (seg_ptr, pp_ptr);
+
+/* Pick up value to be set, convert to allocated char string */
+
+	alloc_info.ptr = null;
+	alloc_info.area_ptr = get_system_free_area_ ();
+
+	locked_sw = "0"b;
+
+	on cleanup begin;
+	     if alloc_info.ptr ^= null then
+		free alloc_info.ptr -> alloc_string in (alloc_info.area_ptr -> based_area);
+	     if locked_sw then call unlock_for_write (seg_ptr);
+	end;
+
+	if data_entrypoint_sw then do;		/* value_$set_data */
+
+	     if A_new_data_ptr = null then do;		/* delete existing value */
+
+		call lock_for_write (seg_ptr);
+		locked_sw = "1"b;
+
+		if find (pp_ptr, seg_ptr, name_info, value_info, node_ptrs) then
+
+		     call delete_node (node_ptrs);
+
+		call unlock_for_write (seg_ptr);
+
+		call return_code (0);
+	     end;
+
+	     new_value_info.ptr = A_new_data_ptr;
+	     new_value_info.len = A_new_data_size * 4;
+	end;
+	else if ^pop_sw then
+	     call get_value_arg (arg_list_ptr, 4, new_value_info, alloc_info);  /* convert from caller's type */
+
+	call lock_for_write (seg_ptr);
+	locked_sw = "1"b;
+
+	if find (pp_ptr, seg_ptr, name_info, value_info, node_ptrs) then do;
+
+	     if test_entrypoint_sw then do;		/* compare old value to argument */
+
+		if value_info.len < old_value_info.len then
+TEST_FAIL:	     call return_code (error_table_$action_not_performed);
+		if old_value_info.len ^= 0 then
+		     if substr (value_string, 1, old_value_info.len) ^=
+			substr (old_value_string, 1, old_value_info.len) then go to TEST_FAIL;
+	     end;
+
+	     else call set_value_arg (arg_list_ptr, old_value_arg_index, value_info);  /* return old value */
+
+	     if pop_sw then do;			/* delete current node only */
+
+		call delete_node (node_ptrs);
+
+		go to SET_RETURN;
+	     end;
+
+	     where_ptr = node_ptrs.segp;
+
+	     if push_sw then go to ADD_NODE;		/* add before current node */
+
+	     if where_ptr ^= null then do;		/* optimization: reuse old node if possible */
+		local_pp_sw = (where_ptr -> seg.banner = PP_BANNER);
+		if node_ptrs.this -> node.value_len = new_value_info.len &  /* reuse old node if same length and */
+		     node_ptrs.this -> node.pp_sw = local_pp_sw &	 /* same class (perprocess vs value seg) and */
+		     node_ptrs.this -> node.data_sw = data_entrypoint_sw then do;  /* same type (data vs char) */
+			node_ptrs.this -> node.value = new_value_string;
+			go to SET_RETURN;
+		end;
+	     end;
+	end;
+
+	else do;					/* no old value */
+
+	     if pop_sw then call return_code (error_table_$oldnamerr);  /* no previous value */
+
+	     if test_entrypoint_sw then go to TEST_FAIL;	/* test fails if no old value */
+
+/* No old value: first choice is to set in value segment */
+
+	     if seg_ptr ^= null then where_ptr = seg_ptr;
+	     else if seg_sw_arg then call return_code (seg_code);  /* return code from get_ptrs */
+	     else where_ptr = pp_ptr;
+
+	     node_ptrs.this = null;			/* to be sure no old node for add_node */
+
+	     value_info.ptr = where_ptr;
+	     value_info.len = 0;
+
+	     call set_value_arg (arg_list_ptr, old_value_arg_index, value_info);  /* return zero-length string */
+	end;
+ADD_NODE:
+	new_node_ptr = add_node (where_ptr, name_info.len, new_value_info.len, node_ptrs);
+
+	new_node_ptr -> node.name = name_string;
+	new_node_ptr -> node.value = new_value_string;
+
+SET_RETURN:
+	if alloc_info.ptr ^= null then
+	     free alloc_info.ptr -> alloc_string in (alloc_info.area_ptr -> based_area);
+
+	if seg_ptr ^= null () then			/* check if we should GC a permanent value segment */
+	     if (4 * seg.trash_count > fixed (seg.next_free_offset, 18, 0)) | (seg.trash_count > MAX_TRASH_COUNT) then
+		call compact_trash (seg_ptr);
+
+	call unlock_for_write (seg_ptr);		/* IMPROVE LOCKING STRATEGY (pp?) */
+
+	call return_code (0);
+%page;
+set_data: entry (A_seg_ptr, A_switches, A_name, A_new_data_ptr, A_new_data_size,
+		A_area_ptr, A_data_ptr, A_data_size, A_code);
+
+	options_var_sw = "0"b;
+
+	call copy_args;
+
+	alloc_info.ptr = null;
+
+
+	data_entrypoint_sw = "1"b;
+	test_entrypoint_sw = "0"b;
+
+	go to SET;
+%page;
+set_path: entry (A_path, A_create_sw, A_code);
+
+	options_var_sw = "0"b;
+
+	if A_path = "" then do;
+	     call get_default_path (dn, en);
+	     if dn = ">" then path = ">" || en;
+	     else path = rtrim (dn) || ">" || en;
+	end;
+	else path = A_path;
+
+	call hcs_$initiate (add_suffix (path), "", "", 0, 0, seg_ptr, code);
+	if code = error_table_$noentry & A_create_sw then do;
+	     call expand_pathname_ (add_suffix (path), dn, en, code);
+	     if code ^= 0 then call return_code (code);
+	     call hcs_$make_seg (dn, en, "", 01010b /* rw */, seg_ptr, code);
+	     if seg_ptr = null then call return_code (code);
+
+	     call init_seg (seg_ptr);
+
+	     seg_ptr -> seg.banner = BANNER;
+	     unspec (seg_ptr -> seg.offset_ht) = "0"b;
+	end;
+
+	if seg_ptr = null then call return_code (code);
+
+	on cleanup call hcs_$terminate_noname (seg_ptr, code);
+
+	call hcs_$fs_get_mode (seg_ptr, seg_mode, code);
+	if code ^= 0 then call return_code (code);	/* no r: don't set */
+	if ^addr (seg_mode) -> R_BIT then call return_code (error_table_$no_r_permission);
+	if ^addr (seg_mode) -> W_BIT then code = error_table_$no_w_permission;  /* no w: set anyway but return code */
+
+	call set_seg (seg_ptr);
+
+	call return_code (code);
+%page;
+test_and_set: entry options (variable);
+
+/* call value_$test_and_set (seg_ptr, switches, name, new_value, old_value, code); */
+
+	options_var_sw = "1"b;
+	code_arg_index = 6;
+	arg_list_ptr = cu_$arg_list_ptr ();
+
+	call get_options_var_args (arg_list_ptr);
+
+	alloc_info.ptr = null;
+	alloc_info.area_ptr = get_system_free_area_ ();
+
+	call get_value_arg (arg_list_ptr, 5, old_value_info, alloc_info);
+
+	test_entrypoint_sw = "1"b;
+	data_entrypoint_sw = "0"b;
+
+	go to SET;
+%page;
+test_and_set_data: entry (A_seg_ptr, A_switches, A_name, A_new_data_ptr, A_new_data_size,
+			A_old_data_ptr, A_old_data_size, A_code);
+
+	options_var_sw = "0"b;
+
+	call copy_args;
+
+	old_value_info.ptr = A_old_data_ptr;
+	old_value_info.len = A_old_data_size * 4;
+	alloc_info.ptr = null;
+
+	data_entrypoint_sw, test_entrypoint_sw = "1"b;
+
+	go to SET;
+%page;
+add_node: proc (P_ptr, P_name_len, P_value_len, P_node_ptrs) returns (ptr);
+
+/* Adds a new node in place of P_node_ptrs.this -> node if any, returns ptr to new node */
+
+dcl P_ptr ptr;					/* INPUT: ptr to segment (seg or pp) */
+dcl (P_name_len, P_value_len) fixed bin (21);		/* INPUT: lengths for allocation */
+dcl 1 P_node_ptrs aligned like node_ptrs;		/* INPUT: old and previous old nodes for threading */
+
+dcl (area_ptr, new_node_ptr) ptr;
+dcl new_node_offset bit (18);
+dcl next_free_word fixed bin (18);
+
+	if P_ptr -> seg.banner = PP_BANNER then do;	/* perprocess-type header */
+
+	     area_ptr = P_ptr -> pp.remote_area_ptr;
+	     node_name_len = P_name_len;
+	     node_value_len = P_value_len;
+
+	     on area call return_code (error_table_$noalloc);
+
+	     allocate node in (area_ptr -> based_area) set (new_node_ptr);
+
+	     new_node_ptr -> node.version = value_version_1;
+	     new_node_ptr -> node.banner = BANNER;	/* for the hell of it, like in seg */
+	     unspec (new_node_ptr -> node.switches) = "0"b;
+	     new_node_ptr -> node.pp_sw = "1"b;
+	     if data_entrypoint_sw then new_node_ptr -> node.data_sw = "1"b;
+
+	     if P_ptr -> pp.ptr_ht (P_node_ptrs.hash) = P_node_ptrs.this then
+		P_ptr -> pp.ptr_ht (P_node_ptrs.hash) = null;
+
+	     if P_node_ptrs.this ^= null then		/* old node exists */
+		if push_sw then do;			/* inserting a new node before current one */
+		     new_node_ptr -> node.push_sw = "1"b;
+		     new_node_ptr -> node.next_ptr = P_node_ptrs.this;
+		end;
+		else new_node_ptr -> node.next_ptr = P_node_ptrs.this -> node.next_ptr;  /* else use its fwd thread */
+
+	     else new_node_ptr -> node.next_ptr = null;	/* else end of chain */
+
+	     if P_node_ptrs.last ^= null then		/* previous node in chain exists */
+		P_node_ptrs.last -> node.next_ptr = new_node_ptr;
+	     else P_ptr -> pp.ptr_ht (P_node_ptrs.hash) = new_node_ptr;  /* else thread off hash table */
+
+	     if P_node_ptrs.this ^= null then
+		if push_sw then do;
+		     new_node_ptr -> node.push_sw = "1"b;
+		     new_node_ptr -> node.next_ptr = P_node_ptrs.this;
+		end;
+		else free P_node_ptrs.this -> node in (area_ptr -> based_area);  /* else free old node */
+	end;
+
+	else do;					/* shareable seg */
+
+	     new_node_offset = P_ptr -> seg.next_free_offset;  /* use next block of node_region */
+	     new_node_ptr = pointer (P_ptr, new_node_offset);
+	     new_node_ptr -> node.version = value_version_1;
+	     new_node_ptr -> node.banner = BANNER;	/* so it's findable by salvage */
+	     unspec (new_node_ptr -> node.switches) = "0"b;
+	     if data_entrypoint_sw then new_node_ptr -> node.data_sw = "1"b;
+	     new_node_ptr -> node.name_len = P_name_len;
+	     new_node_ptr -> node.value_len = P_value_len;
+
+	     next_free_word = fixed (new_node_offset) + currentsize (new_node_ptr -> node);
+	     if next_free_word >= sys_info$max_seg_size then  /* past end of segment */
+		call return_code (error_table_$boundviol);
+	     P_ptr -> seg.next_free_offset = bit (next_free_word, 18);  /* skip enough room for node */
+
+	     if P_node_ptrs.this ^= null then		/* old node exists */
+		if push_sw then do;			/* inserting a node before current node */
+		     new_node_ptr -> node.push_sw = "1"b;
+		     new_node_ptr -> node.next_offset = rel (P_node_ptrs.this);
+		end;
+		else do;				/* replacing current node */
+		     if P_node_ptrs.this -> old_node_format.banner = BANNER then do;
+			new_node_ptr -> node.next_offset = P_node_ptrs.this -> old_node_format.next_offset;
+			P_ptr -> seg.trash_count = P_ptr -> seg.trash_count +
+			     currentsize (P_node_ptrs.this -> old_node_format);
+		     end;
+		     else do;
+			new_node_ptr -> node.next_offset = P_node_ptrs.this -> node.next_offset;  /* use its fwd thread */
+			P_ptr -> seg.trash_count = P_ptr -> seg.trash_count +  /* increment # of freed words */
+			     currentsize (P_node_ptrs.this -> node);  /* for later compacting of segment */
+		     end;
+		end;
+
+	     else new_node_ptr -> node.next_offset = "0"b;  /* else end of chain */
+
+	     if P_node_ptrs.last ^= null then		/* previous node in chain exists */
+		P_node_ptrs.last -> node.next_offset = new_node_offset;
+	     else P_ptr -> seg.offset_ht (P_node_ptrs.hash) = new_node_offset;  /* else thread off hash table */
+	end;
+
+	return (new_node_ptr);
+
+end add_node;
+%page;
+add_suffix: proc (P_en) returns (char (*));
+
+/* Appends .value suffix to an entryname if not already there */
+
+dcl P_en char (*);					/* INPUT: entryname */
+
+dcl entry_len fixed bin;
+
+	entry_len = length (rtrim (P_en));
+
+	if entry_len < SUFFIX_LEN + 1 then return (rtrim (P_en) || SUFFIX);
+	else if substr (P_en, entry_len - SUFFIX_LEN + 1, SUFFIX_LEN) ^= SUFFIX then
+	     return (rtrim (P_en) || SUFFIX);
+	else return (P_en);
+
+end add_suffix;
+%page;
+compact_trash: proc (P_ptr);
+
+dcl P_ptr ptr;
+dcl (last_node_ptr, old_node_ptr, temp_node_ptr, temp_ptr) ptr;
+dcl (next_node_offset, next_word_offset) bit (18);
+dcl next_free_word fixed (18) unaligned unsigned;
+dcl (i, saved_region_size) fixed;
+
+	if P_ptr -> seg.banner ^= BANNER then return;	/* not shareable value seg */
+
+	call get_temp_segment_ ("value_", temp_ptr, code);
+	if code ^= 0 then return;
+	call hcs_$truncate_seg (temp_ptr, 0, code);
+	if code ^= 0 then return;
+
+	on cleanup call release_temp_segment_ ("value_", temp_ptr, (0));
+
+	P_ptr -> seg.salvaging_sw = "1"b;
+
+	temp_ptr -> seg.header = P_ptr -> seg.header;
+	temp_ptr -> seg.trash_count = 0;
+	temp_ptr -> seg.next_free_offset = rel (addr (P_ptr -> seg.node_region));
+	next_word_offset = temp_ptr -> seg.next_free_offset;
+
+	do i = 0 to temp_ptr -> seg.ht_size - 1;	/* for each hash table bucket */
+	     if temp_ptr -> seg.offset_ht (i) ^= "0"b then do;  /* some nodes for this bucket */
+
+		temp_ptr -> seg.offset_ht (i) = next_word_offset;
+
+		temp_node_ptr = pointer (temp_ptr, next_word_offset);
+		last_node_ptr = null;
+
+		next_node_offset = "1"b;		/* dummy ^= 0 for first time through loop */
+
+		do old_node_ptr = pointer (P_ptr, P_ptr -> seg.offset_ht (i))
+		  repeat (pointer (P_ptr, next_node_offset))
+		  while (next_node_offset ^= "0"b);
+
+		     if old_node_ptr -> old_node_format.banner = BANNER then
+
+			call copy_old_format_node (old_node_ptr, temp_node_ptr);
+
+		     else do;
+			temp_node_ptr -> node.name_len = old_node_ptr -> node.name_len;
+			temp_node_ptr -> node.value_len = old_node_ptr -> node.value_len;
+			temp_node_ptr -> node = old_node_ptr -> node;
+		     end;
+
+		     if last_node_ptr ^= null then last_node_ptr -> node.next_offset = next_word_offset;
+
+		     next_free_word = fixed (next_word_offset) + currentsize (temp_node_ptr -> node);
+		     next_word_offset = bit (next_free_word, 18);
+		     last_node_ptr = temp_node_ptr;
+		     temp_node_ptr = pointer (temp_ptr, next_word_offset);
+
+		     next_node_offset = old_node_ptr -> node.next_offset;
+		end;
+
+		last_node_ptr -> node.next_offset = "0"b;  /* last node in chain */
+	     end;
+	end;
+
+	temp_ptr -> seg.next_free_offset = next_word_offset;
+
+/* Copy back to the original */
+
+	saved_region_size = temp_ptr -> seg.region_size;
+	temp_ptr -> seg.region_size, P_ptr -> seg.region_size = fixed (next_word_offset);
+	P_ptr -> seg = temp_ptr -> seg;
+	P_ptr -> seg.region_size = saved_region_size;
+
+	P_ptr -> seg.salvaging_sw = "0"b;
+
+	call hcs_$truncate_seg (P_ptr, fixed (next_word_offset, 19), 0);
+
+	call release_temp_segment_ ("value_", temp_ptr, (0));
+
+
+end compact_trash;
+%page;
+copy_args: proc;
+
+/* Copies input args for non - options(var) entrypoints */
+
+	A_code = 0;
+
+	seg_ptr = A_seg_ptr;
+	switches = A_switches;
+	name_info.ptr = addr (A_name);
+	name_info.len = length (rtrim (A_name));
+
+	if name_info.len = 0 then call signal_error;
+
+end copy_args;
+%page;
+copy_old_format_node: proc (P_old_ptr, P_new_ptr);
+
+/* Converts an old pre-version node to the current version */
+
+dcl (P_old_ptr, P_new_ptr) ptr;
+
+	P_new_ptr -> node.version = value_version_1;
+	P_new_ptr -> node.banner = P_old_ptr -> old_node_format.banner;
+	P_new_ptr -> node.next_offset = P_old_ptr -> old_node_format.next_offset;
+	P_new_ptr -> node.next_ptr = P_old_ptr -> old_node_format.next_ptr;
+	unspec (P_new_ptr -> node.switches) = "0"b;
+	P_new_ptr -> node.name_len = P_old_ptr -> old_node_format.name_len;
+	P_new_ptr -> node.value_len = P_old_ptr -> old_node_format.value_len;
+	P_new_ptr -> node.name = P_old_ptr -> old_node_format.name;
+	P_new_ptr -> node.value = P_old_ptr -> old_node_format.value;
+
+end copy_old_format_node;
+%page;
+delete_node: proc (P_node_ptrs);
+
+/* Deletes (unthreads and frees/marks free) the node pointed to by P_node_ptrs.this */
+
+dcl 1 P_node_ptrs aligned like node_ptrs;
+
+dcl pp_sw bit (1);
+dcl area_ptr ptr;
+
+	pp_sw = (P_node_ptrs.segp -> seg.banner = PP_BANNER);
+
+	if pp_sw then do;				/* perprocess: ptrs */
+
+	     if P_node_ptrs.last ^= null then		/* previous node in chain exists */
+		P_node_ptrs.last -> node.next_ptr = P_node_ptrs.this -> node.next_ptr;
+	     else P_node_ptrs.segp -> pp.ptr_ht (P_node_ptrs.hash) = P_node_ptrs.this -> node.next_ptr;
+
+	     area_ptr = P_node_ptrs.segp -> pp.remote_area_ptr;
+	     free P_node_ptrs.this -> node in (area_ptr -> based_area);
+	end;
+
+	else do;					/* permanent: offsets */
+
+	     if P_node_ptrs.last ^= null then		/* previous node in chain exists */
+		P_node_ptrs.last -> node.next_offset = P_node_ptrs.this -> node.next_offset;
+	     else P_node_ptrs.segp -> seg.offset_ht (P_node_ptrs.hash) = P_node_ptrs.this -> node.next_offset;
+
+	     P_node_ptrs.segp -> seg.trash_count = P_node_ptrs.segp -> seg.trash_count +
+		currentsize (P_node_ptrs.this -> node);	/* for later compaction of seg */
+
+	     if (4 * P_node_ptrs.segp -> seg.trash_count > fixed (P_node_ptrs.segp -> seg.next_free_offset, 18, 0)) |
+	        (P_node_ptrs.segp -> seg.trash_count > MAX_TRASH_COUNT) then
+		call compact_trash (P_node_ptrs.segp);
+	end;
+
+end delete_node;
+%page;
+find: proc (P_pp_ptr, P_seg_ptr, P_name_info, P_value_info, P_node_ptrs) returns (bit (1));
+
+/* Looks first in perprocess if appropriate, then in value segment. Returns "1"b if found */
+
+dcl (P_pp_ptr, P_seg_ptr) ptr;			/* INPUT: header pointers */
+dcl 1 P_name_info aligned like name_info;		/* INPUT: variable name */
+dcl 1 P_value_info aligned like value_info;		/* OUTPUT: value string */
+dcl 1 P_node_ptrs aligned like node_ptrs;		/* OUTPUT: ptrs to current (found) and previous nodes */
+
+	if P_pp_ptr ^= null then do;			/* looking in perprocess */
+
+	     if find_in (P_pp_ptr, P_name_info, P_value_info, P_node_ptrs) then return ("1"b);
+	end;
+
+	if P_seg_ptr ^= null then do;
+
+	     if find_in (P_seg_ptr, P_name_info, P_value_info, P_node_ptrs) then return ("1"b);
+	end;
+
+	return ("0"b);
+
+end find;
+%page;
+find_in: proc (P_ptr, P_name_info, P_value_info, P_node_ptrs) returns (bit (1));
+
+/* Looks for the name in a specified segment; returns true if FOUND */
+
+dcl P_ptr ptr;					/* INPUT: segment to look in */
+dcl 1 P_name_info aligned like name_info;		/* INPUT: variable name */
+dcl 1 P_value_info aligned like value_info;		/* OUTPUT: value string */
+dcl 1 P_node_ptrs aligned like node_ptrs;		/* OUTPUT: ptrs to current (found) and previous nodes */
+
+dcl name_str char (P_name_info.len) based (P_name_info.ptr);
+dcl hash_str char (8);
+dcl next_node_offset bit (18);
+dcl pp_sw bit (1);
+dcl (begin_change_count, hash_index, i) fixed bin;
+dcl (first_node_ptr, old_node_ptr) ptr;
+
+	pp_sw = (P_ptr -> seg.banner = PP_BANNER);
+
+FIND:	if ^pp_sw then call lock_for_read (P_ptr, begin_change_count);
+
+	i = length (rtrim (name_str, WHITE));
+	if i > 8 then hash_str = substr (name_str, i - 7, 8);
+	else hash_str = name_str;
+
+	hash_index = mod (fixed (unspec (rtrim (hash_str, WHITE))), P_ptr -> seg.ht_size);
+
+	P_node_ptrs.this, P_node_ptrs.last = null;	/* initialize to not found */
+	P_node_ptrs.segp = P_ptr;
+	P_node_ptrs.hash = hash_index;
+
+	if pp_sw then do;
+	     first_node_ptr = P_ptr -> pp.ptr_ht (hash_index);
+	     if baseno (first_node_ptr) = "0"b | first_node_ptr = null then return ("0"b);
+	end;
+	else if P_ptr -> seg.offset_ht (hash_index) = "0"b then return ("0"b);
+
+	if pp_sw then P_node_ptrs.this = P_ptr -> pp.ptr_ht (hash_index);
+	else P_node_ptrs.this = pointer (P_ptr, P_ptr -> seg.offset_ht (hash_index));
+
+	do while (P_node_ptrs.this ^= null);		/* search the list */
+
+		if P_node_ptrs.this -> old_node_format.banner = BANNER then do;  /* COMPATIBILITY */
+
+		     old_node_ptr = P_node_ptrs.this;
+
+		     P_node_ptrs.this = add_node (P_ptr, P_node_ptrs.this -> old_node_format.name_len,
+			P_node_ptrs.this -> old_node_format.value_len, P_node_ptrs);
+
+		     call copy_old_format_node (old_node_ptr, P_node_ptrs.this);
+		end;
+
+		if P_node_ptrs.this -> node.name = name_str &
+		  P_node_ptrs.this -> node.data_sw = data_entrypoint_sw then do;  /* FOUND */
+
+		     P_value_info.ptr = addrel (addr (P_node_ptrs.this -> node.value), 1);  /* var string's text */
+		     P_value_info.len = P_node_ptrs.this -> node.value_len;
+
+		     if ^pp_sw then do;		/* if a shared segment */
+						/* make sure another process has not changed seg meanwhile */
+			if P_ptr -> seg.change_count ^= begin_change_count then go to FIND; /* retry */
+
+			P_value_info.change_count = begin_change_count;  /* for later unlocking */
+			P_value_info.seg_ptr = P_ptr;
+		     end;
+		     else P_value_info.seg_ptr = null;
+
+		     return ("1"b);
+		end;
+
+		P_node_ptrs.last = P_node_ptrs.this;
+
+		if pp_sw then P_node_ptrs.this = P_node_ptrs.this -> node.next_ptr;
+		else do;
+		     next_node_offset = P_node_ptrs.this -> node.next_offset;
+		     if next_node_offset = "0"b then P_node_ptrs.this = null;
+		     else P_node_ptrs.this = pointer (P_ptr, next_node_offset);
+		end;
+	end;
+
+	return ("0"b);
+
+end find_in;
+%page;
+get_default_path: proc (A_dn, A_en);
+
+dcl (A_dn, A_en) char (*);
+dcl person_id char (22);
+
+	call user_info_$homedir (A_dn);
+
+	call user_info_ (person_id);
+	A_en = rtrim (person_id) || ".value";
+
+end get_default_path;
+%page;
+get_default_ptr: proc () returns (ptr);
+
+/* Returns a pointer to the current default value seg */
+
+dcl dn char (168);
+dcl en char (32);
+
+	if default_seg_ptr = null then do;
+
+INITIATE:	     call get_default_path (dn, en);
+
+	     call hcs_$initiate (dn, en, "", 0, 0, default_seg_ptr, code);
+	end;
+
+	else do;
+
+	     on any_other go to INITIATE;
+
+	     if default_seg_ptr -> seg.banner ^= BANNER & default_seg_ptr -> seg.banner ^= PP_BANNER then
+		go to INITIATE;
+
+	     revert any_other;
+	end;
+
+	return (default_seg_ptr);
+
+end get_default_ptr;
+%page;
+get_options_var_args: proc (P_arg_list_ptr);
+
+/* Reads the argument list and returns the values of selected arguments */
+
+dcl P_arg_list_ptr ptr;				/* INPUT: ptr to argument list */
+
+dcl arg char (arg_len) based (arg_ptr);
+dcl based_bit36 bit (36) based;
+dcl based_packed_ptr ptr unaligned based;
+dcl based_ptr ptr aligned based;
+dcl based_varying_string char (261120 /* max chars in a segment */) varying based;
+
+dcl (packed_sw, varying_sw) bit (1) aligned;
+dcl arg_ptr ptr;
+dcl (arg_len, arg_scale, arg_size, arg_type, ndims) fixed bin;
+
+/* Argument 1 */
+	call decode_descriptor_ (P_arg_list_ptr, 1, arg_type, packed_sw, ndims, arg_size, arg_scale);
+	if arg_type ^= PTR_TYPE | ndims > 1 then
+	     call signal_error;
+
+	call cu_$arg_ptr_rel (1, arg_ptr, arg_len, code, P_arg_list_ptr);
+	if packed_sw then seg_ptr = arg_ptr -> based_packed_ptr;
+	else seg_ptr = arg_ptr -> based_ptr;
+
+/* Argument 2 */
+	call decode_descriptor_ (P_arg_list_ptr, 2, arg_type, packed_sw, ndims, arg_size, arg_scale);
+	if arg_type ^= BIT_TYPE | ndims > 1 then
+	     call signal_error;
+
+	call cu_$arg_ptr_rel (2, arg_ptr, arg_len, code, P_arg_list_ptr);
+	unspec (switches) = "0"b;
+	substr (switches, 1, arg_size) = substr (arg_ptr -> based_bit36, 1, arg_size);
+
+/* Argument 3 */
+	call decode_descriptor_ (P_arg_list_ptr, 3, arg_type, packed_sw, ndims, arg_size, arg_scale);
+	if ndims > 1 then call signal_error;
+	else if arg_type = VARYING_CHAR_TYPE then varying_sw = "1"b;
+	else do;
+	     if arg_type ^= CHAR_TYPE then call signal_error;
+	     varying_sw = "0"b;
+	end;
+
+	call cu_$arg_ptr_rel (3, arg_ptr, arg_len, code, P_arg_list_ptr);
+	if varying_sw then do;
+	     name_info.ptr = arg_ptr;
+	     name_info.len = length (addrel (arg_ptr, -1) -> based_varying_string);
+	end;
+	else do;
+	     name_info.ptr = arg_ptr;
+	     name_info.len = length (rtrim (arg));
+	end;
+
+end get_options_var_args;
+%page;
+get_ptrs: proc (P_seg_ptr, P_pp_ptr);
+
+/* Depending on the value of switches:
+	gets ptr to the perprocess value segment or returns null.
+	validates seg_ptr or sets it to null (pointer to the value seg) */
+
+dcl P_seg_ptr ptr;					/* INPUT/OUTPUT: ptr to value segment */
+dcl P_pp_ptr ptr;					/* OUTPUT: ptr to perprocess value segment */
+
+dcl (pp_sw, seg_sw) bit (1);
+
+	if ^pp_sw_arg & ^seg_sw_arg then call return_code (error_table_$badcall);
+	else do;					/* explicitly specified which to use */
+	     pp_sw = pp_sw_arg;
+	     seg_sw = seg_sw_arg;
+	end;
+
+	if pp_sw then do;				/* using perprocess */
+	     if perprocess_seg_ptr = null then do;	/* first time for process */
+		call get_temp_segment_ ("value_", perprocess_seg_ptr, code);
+		if code ^= 0 then call return_code (code);
+
+		perprocess_seg_ptr -> pp.version = value_version_1;
+		perprocess_seg_ptr -> pp.banner = PP_BANNER;
+		perprocess_seg_ptr -> pp.ht_size = HT_SIZE;
+		do i = 0 to HT_SIZE-1;
+		     perprocess_seg_ptr -> ptr_ht (i) = null;
+		end;
+
+		perprocess_seg_ptr -> pp.remote_area_ptr = get_system_free_area_ ();
+	     end;
+	     P_pp_ptr = perprocess_seg_ptr;
+	end;
+	else P_pp_ptr = null;
+
+	if seg_sw then do;				/* using value segment */
+	     if P_seg_ptr = null then do;		/* default value seg */
+		P_seg_ptr = get_default_ptr ();
+		if P_seg_ptr = null then do;		/* no default value seg */
+		     seg_code = code;
+		     if pp_sw then return;	/* otherwise OK unless asking for permanent only */
+		     else call return_code (code);
+		end;
+	     end;
+
+	     if P_seg_ptr -> seg.banner ^= BANNER & P_seg_ptr -> seg.banner ^= PP_BANNER then
+		call return_code (error_table_$not_seg_type);
+	end;
+	else P_seg_ptr = null;
+
+end get_ptrs;
+%page;
+get_value_arg: proc (P_arg_list_ptr, P_arg_index, P_value_info, P_alloc_info);
+
+/* Converts caller's input value argument to ptr and length of allocated char string copy */
+
+dcl P_arg_list_ptr ptr;				/* INPUT: ptr to argument list */
+dcl P_arg_index fixed bin;				/* INPUT: which arg to get */
+dcl 1 P_value_info aligned like value_info;		/* OUTPUT: structure containing ptr and length */
+dcl 1 P_alloc_info aligned like alloc_info;		/* OUTPUT: where char string has been allocated */
+
+dcl alloc_string char (P_alloc_info.len) based (P_alloc_info.ptr);
+
+dcl based_varying_string char (261120 /* max chars in a segment */) varying based;
+
+dcl packed_sw bit (1) aligned;
+dcl arg_ptr ptr;
+dcl (arg_len, arg_scale, arg_size, arg_type, ndims) fixed bin;
+
+	call decode_descriptor_ (P_arg_list_ptr, P_arg_index, arg_type, packed_sw, ndims, arg_size, arg_scale);
+	if ndims > 1 then call signal_error;
+
+	call cu_$arg_ptr_rel (P_arg_index, arg_ptr, arg_len, code, P_arg_list_ptr);
+
+/* Compute length for allocating a char string copy */
+
+	if arg_type = CHAR_TYPE then P_alloc_info.len = arg_len;
+	else if arg_type = VARYING_CHAR_TYPE then do;
+	     arg_ptr = addrel (arg_ptr, -1);
+	     P_alloc_info.len = length (arg_ptr -> based_varying_string);
+	end;
+	else P_alloc_info.len = 64;			/* arbitrary: 16 words ought to be enough */
+
+	allocate alloc_string in (alloc_info.area_ptr -> based_area) set (P_alloc_info.ptr);
+
+	on conversion call return_code (error_table_$bad_conversion);
+
+	call assign_ (P_alloc_info.ptr, CHAR_TYPE * 2, P_alloc_info.len,  /* to target string */
+	     arg_ptr, arg_type * 2 + fixed (packed_sw, 1), (arg_size));  /* from caller's arg */
+
+	P_value_info.ptr = P_alloc_info.ptr;
+	P_value_info.len = length (alloc_string);
+
+end get_value_arg;
+%page;
+init_seg: proc (P_ptr);
+
+/* Initializes the segment pointed to by P_ptr as a value segment */
+
+dcl P_ptr ptr;					/* INPUT: ptr to value segment */
+
+	on not_in_write_bracket call return_code (error_table_$lower_ring);
+	on no_write_permission call return_code (error_table_$no_w_permission);
+
+	P_ptr -> seg.version = value_version_1;
+	P_ptr -> seg.ht_size = HT_SIZE;
+	P_ptr -> seg.remote_area_ptr = null;
+
+	P_ptr -> seg.next_free_offset = rel (addr (P_ptr -> seg.node_region));
+	P_ptr -> seg.region_size =
+	     sys_info$max_seg_size - fixed (P_ptr -> seg.next_free_offset);  /* rest of segment */
+
+end init_seg;
+%page;
+list_pp: proc (P_ptr);
+
+/* Does value_$list stuff for a nonshareable value seg, perprocess or otherwise (using ptrs rather than offsets) */
+
+dcl P_ptr ptr;
+
+	do node_ptrs.hash = 0 to P_ptr -> pp.ht_size - 1;
+
+	     do node_ptrs.this = P_ptr -> pp.ptr_ht (node_ptrs.hash)
+		repeat (node_ptrs.this -> node.next_ptr) while (node_ptrs.this ^= null);
+
+		     if node_ptrs.this -> node.data_sw = data_entrypoint_sw then
+
+			call match_one (node_ptrs.this);
+	     end;
+	end;
+
+end list_pp;
+%page;
+lock_for_read: proc (P_ptr, P_change_count);
+
+/* Locks a copy of the value seg's lock word, then returns seg.change_count */
+
+dcl P_ptr ptr;					/* INPUT: ptr to value seg */
+dcl P_change_count fixed bin;				/* OUTPUT: seg.change_count at lock time */
+
+dcl i fixed bin;
+
+	if P_ptr -> seg.salvaging_sw then do;		/* seg in use */
+
+	     do i = 1 to 10;			/* try 10 times to catch seg unlocked */
+
+		P_change_count = P_ptr -> seg.change_count;
+
+		call set_lock_$lock ((P_ptr -> seg.lock), 0, code);	/* see if seg is locked (look at copy) */
+		if code = 0
+		     | code = error_table_$invalid_lock_reset
+		     | code = error_table_$locked_by_this_process then return;
+	     end;
+
+	     call return_code (code);			/* give up */
+	end;
+
+	else P_change_count = P_ptr -> seg.change_count;	/* no need to lock except for salvage */
+
+end lock_for_read;
+%page;
+lock_for_write: proc (P_ptr);
+
+/* Locks the value seg's lock word and increments seg.change_count */
+
+dcl P_ptr ptr;					/* INPUT: ptr to value seg */
+
+	if P_ptr = null then return;
+	if P_ptr -> seg.banner = PP_BANNER then return;
+
+	on not_in_write_bracket call return_code (error_table_$lower_ring);
+	on no_write_permission call return_code (error_table_$no_w_permission);
+
+	call set_lock_$lock (P_ptr -> seg.lock, 1, code);
+	if code ^= 0
+	     & code ^= error_table_$invalid_lock_reset
+	     & code ^= error_table_$locked_by_this_process then
+		call return_code (code);
+
+	if P_ptr -> seg.change_count > 10000 then P_ptr -> seg.change_count = 1;
+	else P_ptr -> seg.change_count = P_ptr -> seg.change_count + 1;
+
+end lock_for_write;
+%page;
+match_one: proc (P_ptr);
+
+/* Adds P_ptr->node.name to the sort array if it matches what's in match_info.
+   Global vars used: alloc_chars_len, data_entrypoint_sw, match_info_ptr, sort_entry_ptr,
+	sequential_number, sort_array_ptr */
+
+dcl P_ptr ptr;
+dcl based_fb35 fixed bin (35) aligned based;
+dcl (excluded_sw, matched_sw) bit (1);
+dcl i fixed;
+dcl code fixed (35);
+
+	excluded_sw, matched_sw = "0"b;
+
+	do i = 1 to match_info.name_count;
+
+	     if match_info.name (i) = P_ptr -> node.name then go to MATCH;
+
+	     else if match_info.regexp_sw (i) then
+		call search_file_ (addrel (addr (match_info.name (i)), 1), 1, length (match_info.name (i)),
+		     addrel (addr (P_ptr -> node.name), 1), 1, P_ptr -> node.name_len,
+		     0, 0, code);
+
+	     else call match_star_name_ ((P_ptr -> node.name), (match_info.name (i)), code);
+
+	     if code = 0 then do;
+MATCH:		if match_info.exclude_sw (i) then excluded_sw = "1"b;
+		else matched_sw = "1"b;
+	     end;
+	end;
+
+	if excluded_sw | ^matched_sw then return;
+
+/* Append a sort_entry structure to the sort_entries temp seg, describing this node */
+
+	node_ptr = P_ptr;				/* for sort_entry.name's length */
+	sort_entry.node_ptr = P_ptr;
+	sort_entry.name = P_ptr -> node.name;
+	sort_entry.length = P_ptr -> node.name_len + length (sort_entry.sequence);
+						/* include sequential number to be included */
+
+/* Append a sequential number in char string form to the name, so that the order
+   of multiple (pushed) values with the same name will be preserved by the sort */
+
+	sequential_number = sequential_number + 1;
+	sort_entry.sequence = sequential_number;	/* picture assignment, converted to char */
+
+/* Add this entry to the sort_array passed to sort_items_$varying_char */
+
+	sort_array.count = sort_array.count + 1;
+	sort_array.name_ptr (sort_array.count) = addr (sort_entry.sort_field);
+
+/* Bump sort_entry_ptr for the next entry, past end of this entry */
+
+	sort_entry_ptr = addr (sort_entry.next_entry);
+
+/* Reserve room for the output name */
+
+	alloc_chars_len = alloc_chars_len + P_ptr -> node.name_len;
+	if ^data_entrypoint_sw then alloc_chars_len = alloc_chars_len + P_ptr -> node.value_len;
+
+end match_one;
+%page;
+return_code: proc (P_code);
+
+/* Sets the value of the code argument and returns from the outer procedure */
+/* options_var_sw and code_arg_index are global variables set by the entry points */
+
+dcl P_code fixed bin (35);				/* INPUT: status code value */
+
+dcl based_fb35 fixed bin (35) based;
+dcl packed_sw bit (1) aligned;
+dcl arg_ptr ptr;
+dcl (arg_len, arg_scale, arg_size, arg_type, ndims) fixed bin;
+
+	if ^options_var_sw then do;
+	     A_code = P_code;
+	     go to RETURN;
+	end;
+
+	call decode_descriptor_ (arg_list_ptr, code_arg_index, arg_type, packed_sw, ndims, arg_size, arg_scale);
+	if arg_type = FIXED_BIN_TYPE then do;
+	     call cu_$arg_ptr_rel (code_arg_index, arg_ptr, arg_len, 0, arg_list_ptr);
+	     arg_ptr -> based_fb35 = P_code;
+	end;
+
+	go to RETURN;
+
+end return_code;
+%page;
+set_seg: proc (P_ptr);
+
+/* Sets the default value seg to P_ptr, or to [hd]>[user name].value if P_ptr = null */
+
+dcl P_ptr ptr;					/* INPUT: ptr to value seg */
+
+	if P_ptr = null then do;
+	     default_seg_ptr = null;
+	     P_ptr = get_default_ptr ();
+	end;
+	else do;
+	     if P_ptr -> seg.banner ^= BANNER then call return_code (error_table_$not_seg_type);
+	     default_seg_ptr = P_ptr;
+	end;
+
+end set_seg;
+%page;
+set_value_arg: proc (P_arg_list_ptr, P_arg_index, P_value_info);
+
+/* Converts ptr and length of string to value_arg argument */
+
+dcl P_arg_list_ptr ptr;				/* INPUT: ptr to argument list */
+dcl P_arg_index fixed bin;				/* INPUT: which arg to set */
+dcl 1 P_value_info aligned like value_info;		/* INPUT: structure containing ptr and length */
+
+dcl value_string char (P_value_info.len) based (P_value_info.ptr);
+dcl alloc_value char (A_value_len) based (A_value_ptr);
+dcl alloc_data (A_data_size) fixed bin aligned based (A_data_ptr);  /* for allocation */
+
+dcl packed_sw bit (1) aligned;
+dcl arg_ptr ptr;
+dcl (arg_len, arg_scale, arg_size, arg_type, ndims) fixed bin;
+dcl bit_size fixed bin (24);
+
+	if alloc_entrypoint_sw then do;		/* value_$get_alloc */
+	     A_value_len = P_value_info.len;
+	     if A_area_ptr ^= null then do;		/* wants it returned */
+
+		on area call return_code (error_table_$noalloc);
+
+		allocate alloc_value in (A_area_ptr -> based_area) set (A_value_ptr);
+
+		substr (alloc_value, 1, A_value_len) = substr (value_string, 1, A_value_len);
+	     end;
+
+	     return;
+	end;
+
+	if data_entrypoint_sw then do;		/* value_$get_data, value_$set_data */
+	     A_data_size = divide (P_value_info.len + 3, 4, 17, 0);
+	     if A_area_ptr ^= null then do;		/* wants it returned */
+
+		on area call return_code (error_table_$noalloc);
+
+		allocate alloc_data in (A_area_ptr -> based_area) set (A_data_ptr);
+
+		bit_size = A_data_size * 36;
+		substr (A_data_ptr -> bits, 1, bit_size) = substr (P_value_info.ptr -> bits, 1, bit_size);
+	     end;
+
+	     return;
+	end;
+
+	call decode_descriptor_ (P_arg_list_ptr, P_arg_index, arg_type, packed_sw, ndims, arg_size, arg_scale);
+	if ndims > 1 then call signal_error;
+
+	if arg_type = VARYING_CHAR_TYPE & arg_size = 0 then return;  /* caller testing whether defined */
+
+	call cu_$arg_ptr_rel (P_arg_index, arg_ptr, arg_len, code, P_arg_list_ptr);
+
+	if arg_type = VARYING_CHAR_TYPE then arg_ptr = addrel (arg_ptr, -1);  /* point to length word */
+
+	on conversion call return_code (error_table_$bad_conversion);
+
+	call assign_ (arg_ptr, arg_type * 2, (arg_size),	/* to caller's argument */
+	     P_value_info.ptr, CHAR_TYPE * 2, P_value_info.len);  /* from value in node */
+
+end set_value_arg;
+%page;
+signal_error: proc;
+
+/* Signals nonrestartable sub_error (a better one someday?) because of bad args in value_ call */
+
+	do while ("1"b);
+	     signal sub_error;
+	end;
+
+end signal_error;
+%page;
+unlock_for_write: proc (P_ptr);
+
+/* Unlock the value segment */
+
+dcl P_ptr ptr;					/* INPUT: ptr to value seg */
+
+	if P_ptr = null then return;
+	if P_ptr -> seg.banner = PP_BANNER then return;
+
+	call set_lock_$unlock (P_ptr -> seg.lock, code);
+
+	call hcs_$set_bc_seg (P_ptr, fixed (P_ptr -> seg.next_free_offset, 18) * 36, code);
+
+end unlock_for_write;
+%page;
+end value_;

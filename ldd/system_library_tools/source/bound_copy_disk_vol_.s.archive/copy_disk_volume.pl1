@@ -1,0 +1,740 @@
+/****^  *********************************************************
+        *                                                       *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992 *
+        *                                                       *
+        * Copyright, (C) Honeywell Bull Inc., 1987              *
+        *                                                       *
+        ********************************************************* */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-03-27,Blair), approve(87-06-02,MCR7666),
+     audit(87-06-25,Fawcett), install(87-07-16,MR12.1-1040):
+     Rewrite portions of this program to implement SCP6308.  In first go-round,
+     copy_disk applies only to system storage disks of like kind.
+  2) change(87-07-08,Blair), approve(87-07-08,MCR7731),
+     audit(87-07-08,Fawcett), install(87-07-16,MR12.1-1040):
+     Change the copy_disk command to copy_disk_volume and and -pv_name CA.
+  3) change(92-10-02,Vu), approve(92-10-02,MCR8270),
+     audit(92-10-09,WAAnderson), install(92-10-23,MR12.5-1040):
+     copy_disk_volume fails with an invalid IOCB error and missing arguments in
+     the call to print out the error summary.
+                                                   END HISTORY COMMENTS */
+
+copy_disk_volume:
+     procedure () options (variable);
+
+/* Procedure to make physical disk copies under Multics. 
+   
+   Created 20 April 1983, W. Olin Sibert                                */
+
+
+
+
+dcl 1 source aligned like copy_disk_info automatic;
+dcl 1 target aligned like copy_disk_info automatic;
+
+dcl  ask_user bit (1) aligned;
+dcl  brief_sw bit (1) aligned;
+dcl  check_sw bit (1) aligned;
+dcl  et_sw bit (1) aligned;
+dcl  query_sw bit (1) aligned;
+dcl  trace_sw bit (1) aligned;
+dcl  use_alt_partition bit (1) aligned;
+     
+     
+dcl  copy_started bit (1) aligned;
+dcl  copy_finished bit (1) aligned;
+dcl  retry_sw bit (1) aligned;
+dcl  cylinder_idx fixed bin;
+dcl  et_number fixed bin;
+dcl  idx fixed bin;
+dcl  first_record fixed bin (18);
+dcl  last_record fixed bin (18);
+dcl  trace_every_n fixed bin;
+dcl  source_labelp pointer;
+dcl  target_labelp pointer;
+dcl  temp_seg_ptr (4) pointer;
+
+dcl  alt_mode char (32);
+dcl  yes_sw bit (1);
+dcl  source_pv_name char (32);
+dcl  target_pv_name char (32);
+dcl  code fixed bin (35);
+
+dcl  start_clock_time fixed bin (71);
+dcl  start_cpu_time fixed bin (71);
+
+dcl  error_table_$bad_arg fixed bin (35) external static;
+dcl  error_table_$badopt fixed bin (35) external static;
+dcl  error_table_$bad_conversion fixed bin (35) external static;
+dcl  error_table_$noarg fixed bin (35) external static;
+dcl  error_table_$too_many_args fixed bin (35) external static;
+
+dcl  check_gate_access_ entry (char(*), ptr, fixed bin(35));
+dcl  copy_disk_copy_ entry (pointer, pointer, bit (1) aligned,
+     bit (1) aligned, bit (1) aligned, bit (1) aligned, fixed bin, fixed bin (35));
+dcl  copy_disk_io_$read entry (pointer, bit (1) aligned, bit (1) aligned, ptr, fixed bin (18), fixed bin (18), bit (1) aligned, fixed bin (35));
+dcl  copy_disk_io_$record_to_sector entry (pointer, fixed bin (18)) returns (fixed (35));
+dcl  copy_disk_io_$sector_to_record entry (pointer, fixed bin (35)) returns (fixed (18));
+dcl  command_query_$yes_no entry() options(variable);
+dcl  com_err_ entry options (variable);
+dcl  cu_$arg_count entry (fixed bin, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, pointer, fixed bin (21), fixed bin (35));
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  get_temp_segments_ entry (char (*), (*) pointer, fixed bin (35));
+dcl  ioa_ entry options (variable);
+dcl  mdc_$read_disk_table entry (pointer, fixed bin (35));
+dcl  release_temp_segments_ entry (char (*), (*) pointer, fixed bin (35));
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+
+/* The following number is chosen to be the largest multiple of 512 words
+   (since msu050X series devices really prefer to do 512 word I/O, and 
+   working in 512 word chunks means that the MPC doesn't have to do any 
+   extra read/rewrite nonsense for our I/Os) that can still be performed
+   by rdisk_ in a single DCW list.  The maximum rdisk_ I/O is the maximum
+   ioi_ buffer size (44K in this case) minus a modicum (128 words) for 
+   the DCWs and other overhead that rdisk_ keeps in the ioi_ buffer. Thus,
+   for purposes of disk copying, we get to use 43.5K words per I/O, which
+   keeps the MPC busy for 148.5 milliseconds at a time. */
+
+dcl  MAX_IO_LENGTH fixed bin internal static options (constant) init (44544);
+dcl  GATE char (8) internal static options (constant) init ("rcp_sys_");
+dcl  CHARS_PER_WORD fixed bin internal static options (constant) init (4);
+
+dcl cleanup condition;
+
+dcl (addr, char, clock, codeptr, divide, float, index, lbound, length, mod,
+     null, rtrim, size, substr, unspec, vclock, verify) builtin;
+
+/*  */
+
+	unspec (source) = ""b;
+	source.iocb = null ();			/* Tested by cleanup handler */
+	source.device = "";
+	target = source;				/* Simplest way to initialize both */
+
+	temp_seg_ptr = null ();				/* for cleanup handler */
+
+	brief_sw, check_sw, et_sw, trace_sw, copy_started, copy_finished,
+	     retry_sw = "0"b;
+	query_sw, use_alt_partition, ask_user = "1"b;
+	first_record, last_record = -1;
+	et_number = 10;
+	trace_every_n = 1;
+	alt_mode = "alttrk,";
+	source_pv_name, target_pv_name = "";
+		
+	on condition (cleanup) 
+	     call clean_up ("0"b);			/* clean up, silently */
+
+	call get_temp_segments_ (WHOAMI, temp_seg_ptr, code); 
+	if (code ^= 0) then do;			
+	     call com_err_ (code, WHOAMI, "Getting temporary segments");
+	     goto MAIN_RETURN;
+	     end;
+	dtp = temp_seg_ptr (1);
+
+	call mdc_$read_disk_table (dtp, code);
+	if (code ^= 0) then do;
+	     call com_err_ (code, WHOAMI, "cannot copy disk_table_.");
+	     goto MAIN_RETURN;
+	     end;
+
+	call process_arguments ();
+
+	call check_gate_access_ (GATE, null, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, WHOAMI, "Use of this command requires access to ^a.", GATE);
+	     call clean_up ("0"b);
+	     return;	     
+	     end;
+	
+	call open (addr (source), alt_mode, source_pv_name, Sequential_input);
+
+	source.sectors_per_cylinder = sect_per_cyl (source.device_type);
+	source.sectors_per_record = sect_per_rec (source.device_type);
+ 	source.records_per_cylinder = rec_per_cyl (source.device_type);
+	source.words_per_sector = words_per_sect (source.device_type);
+	source.chars_per_sector = CHARS_PER_WORD * source.words_per_sector;
+	source.sectors_per_io = divide (MAX_IO_LENGTH, source.words_per_sector, 17, 0);
+
+/* after opening the source, we need to read the label before we open the 
+   target in case we have a 451 which uses alternate partitions.  If we had an
+   unrecoverable error reading the label, we need to abort.*/
+	source_labelp = temp_seg_ptr(2);
+	call copy_disk_io_$read (addr(source), brief_sw, query_sw, source_labelp, 0, (sect_per_rec (source.device_type)), retry_sw, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, WHOAMI, "Unrecoverable error reading label of disk ^a.", source.device);
+	     goto MAIN_RETURN;
+	     end;
+	
+	if source_labelp -> label.Multics ^= Multics_ID_String then do;
+	     call com_err_ ((0), WHOAMI, "Volume mounted on disk ^a is not a Multics System Storage Volume.", source.device);
+	     goto MAIN_RETURN;
+	     end;
+
+/* if we're using a 451 we need to check for alt partitions.  Default is to 
+   open with using them, but in case we're not, we'll close the disk without
+   detaching it and then re-open it with the new mode. */
+
+	if source.device_type = msu0451devt then do;
+	     use_alt_partition = "0"b;
+	     call check_for_alt_partition (use_alt_partition);
+	     if ^use_alt_partition then do;
+		alt_mode = "";
+		call iox_$close (source.iocb, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, WHOAMI, "Error in closing ^a.", source.device);
+		     goto MAIN_RETURN;
+		     end;
+		source.opened = "0"b;
+		call open (addr(source), alt_mode, source_pv_name, Sequential_input);
+		end;
+	     end;
+	
+	target.disk_parameters = source.disk_parameters;
+	call open (addr (target), alt_mode, target_pv_name, Sequential_update);
+	target_labelp = temp_seg_ptr (3);
+	call copy_disk_io_$read (addr(target), brief_sw, query_sw, target_labelp, 0, (sect_per_rec (target.device_type)), retry_sw, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, WHOAMI, "Unrecoverable error reading label of target disk ^a.", target.device);
+	     return;
+	     end;
+	
+
+	call ioa_ ("^/Source disk is ^a ^a on device ^a, type ^a.", source_labelp -> label.Multics, source_labelp -> label.pv_name, source.device, device_names (source.device_type));
+	call ioa_ ("Dismounted^-^a", cv_time (source_labelp -> label.time_unmounted));
+	if target_labelp -> label.Multics = Multics_ID_String then do;
+	     ask_user = "0"b;
+	     call ioa_ ("^/Target disk is ^a ^a on device ^a, type ^a.", target_labelp -> label.Multics, target_labelp -> label.pv_name, target.device, device_names (target.device_type));
+	     call ioa_ ("Dismounted^-^a", cv_time (target_labelp -> label.time_unmounted));
+	     call command_query_$yes_no (yes_sw, (0), WHOAMI, "Target volume is a Multics System Storage Volume. ^/Do you still wish to copy data to it? ", "^/Target volume mounted on ^a is a Multics System Storage Volume. ^/Copy disk will destroy all data on this volume!!! ^/Do you wish to continue?", target.device);
+	     if ^yes_sw then do;
+		call ioa_ ("^a: terminating...", WHOAMI);
+		call clean_up ("1"b);
+		return;
+		end;		
+	     end;
+	
+	source.target_info_ptr = addr(target);  /* we need this if we ever go through single record retry */
+/* tell the user what he's got and give him a chance to change his mind. */
+	if ask_user then do;
+	     call ioa_ ("^a: copying the source will destroy all data on the volume mounted on device ^a ! ", WHOAMI, target.device);
+	     call command_query_$yes_no (yes_sw, (0), WHOAMI, "Target volume is a Multics System Storage Volume. ^/Do you still wish to copy data to it? ", "Do you wish to continue?");
+	     if ^yes_sw then do;
+		call ioa_ ("^a: terminating...", WHOAMI);
+		call clean_up ("1"b);
+		return;
+		end;
+	     end;
+	
+		
+	if source_labelp -> label.vol_trouble_count > 0 
+	     then source.n_records = rec_per_sv (source.device_type);
+	else 
+	     call get_highest_record (source.n_records); /* calculate highest record in volmap */
+     
+	target.n_records = source.n_records;
+
+	call check_compatibility ();
+
+	start_clock_time = clock ();
+	start_cpu_time = vclock ();
+
+	if ^brief_sw then 
+	     call ioa_ ("^a: begin copy of ^a onto ^a, records ^d. to ^d.",
+	          WHOAMI, source.device, target.device,
+	          first_record, last_record);
+
+	if et_number > 0 then retry_sw = "1"b;
+	copy_started = "1"b;
+
+	call copy_disk_copy_ (addr (source), addr (target),
+	     brief_sw, query_sw, trace_sw, retry_sw, cylinder_idx, code);
+
+/* We still need to copy the partitions if there are any */
+	labelp = source_labelp;
+	if label.nparts > 0 then do idx = 1 to label.nparts;
+	     if label.parts(idx).part = "alt" then;
+	     else do;
+		source.n_records = label.parts(idx).nrec;
+		source.high_bound = source.n_records + label.parts(idx).frec;
+		source.low_bound = label.parts(idx).frec;
+		call copy_disk_copy_ (addr(source), addr (target),
+		     brief_sw, query_sw, retry_sw, trace_sw, cylinder_idx, code);
+		if ^brief_sw then 
+		     call ioa_ ("Partition ^a processed.", label.parts(idx).part);
+		end;
+	     end;                                         /* no more partitions */
+	
+	
+	if (code = 0) then do;
+	     copy_finished = "1"b;	/* actual code is ignored, since we have */
+						/* already printed any messages */
+	     if ^brief_sw then call ioa_ ("Done.");
+	     end;
+
+MAIN_RETURN:
+	if copy_started & (copy_finished | (^brief_sw)) then do;
+	     call ioa_ ("^a: ^[abnormal termination at cylinder ^d after^;copy took^s^] ^.2f seconds, ^.2f vcpu.^[  no errors.^]", 
+	          WHOAMI, (^copy_finished), cylinder_idx,
+		(float (clock () - start_clock_time) / 1.0e6), 
+		(float (vclock () - start_cpu_time) / 1.0e6),
+		((source.errors + target.errors) = 0));
+
+	     if ((source.errors + target.errors) > 0) then
+		call ioa_ ("^a: ^[no^s^;^d^] error^[s^] on source disk ^a, ^[no^s^;^d^] error^[s^] on target disk ^a.",
+		     WHOAMI, (source.errors = 0), source.errors,
+		     (source.errors ^= 1), source.device, (target.errors = 0),
+		     target.errors, (target.errors ^= 1), target.device);
+	     end;
+
+	call clean_up ("1"b);
+	return;
+	
+/*  */
+
+open:
+     procedure (p_info_ptr, p_rdisk_modes, p_pv_name, p_mode);
+
+dcl  p_info_ptr pointer parameter;
+dcl  p_rdisk_modes char (32) unaligned parm;
+dcl  p_pv_name char (32) parm;
+dcl  p_mode fixed bin parm;
+dcl 1 p_info aligned like copy_disk_info based (p_info_ptr);
+dcl  pv_name char (32);
+dcl  rdisk_modes char (32) unaligned;
+
+	rdisk_modes = p_rdisk_modes;
+
+          if ^p_info.attached then do;
+               if p_pv_name = "" then pv_name = "scratch";
+               else pv_name = p_pv_name;
+	     p_info.iocb_name = "copy_disk_vol." || unique_chars_ (""b);
+	     call iox_$find_iocb (p_info.iocb_name, p_info.iocb, (0));
+
+	     p_info.desc = "rdisk_ ";		/* i/o module */
+	     p_info.desc = p_info.desc || device_names (p_info.device_type); /* must be correct for rcprm */
+	     p_info.desc = p_info.desc || " " || rtrim (pv_name);
+	     p_info.desc = p_info.desc || " -system ";
+	     if p_info_ptr = addr(target) then
+	          p_info.desc = p_info.desc || "-write ";	/* for target only */
+	     p_info.desc = p_info.desc || "-device " || rtrim (p_info.device);
+
+	     call iox_$attach_name (p_info.iocb_name, p_info.iocb, (p_info.desc), codeptr (copy_disk_volume), code);
+	     if (code ^= 0) then do;
+		call com_err_ (code, WHOAMI, "attaching ^a", p_info.desc);
+		goto MAIN_RETURN;
+		end;
+
+	     p_info.attached = "1"b;
+	     end;
+	
+	p_info.mode = p_mode;
+	call iox_$open (p_info.iocb, p_info.mode, "0"b, code);
+	if (code ^= 0) then do;
+	     call com_err_ (code, WHOAMI, "opening ^a for ^a", 
+		p_info.desc, iox_modes (p_info.mode));
+	     goto MAIN_RETURN;
+	     end;
+
+	p_info.opened = "1"b;
+
+	if check_sw then 
+	     rdisk_modes = rtrim(rdisk_modes) || "^label,wrtcmp";
+	else rdisk_modes = rtrim(rdisk_modes) || "^label,^wrtcmp";
+
+	call iox_$modes (p_info.iocb, rdisk_modes, (""), code);
+	if (code ^= 0) then do;
+	     call com_err_ (code, WHOAMI,
+		"attempting to set modes for ^a to ^a", p_info.device, rdisk_modes);
+	     goto MAIN_RETURN;
+	     end;
+
+	call iox_$control (p_info.iocb, "getbounds", addr (p_info.bounds), code);
+	if (code ^= 0) then do;
+	     call com_err_ (code, WHOAMI, "attempting to get bounds for ^a", p_info.device);
+	     goto MAIN_RETURN;
+	     end;
+
+	return;
+	end open;
+
+/*  */
+
+check_compatibility:
+     procedure ();
+
+dcl  first_sector fixed bin (35);
+dcl  last_sector fixed bin (35);
+
+
+	if (first_record >= 0) then
+	     first_sector = copy_disk_io_$record_to_sector 
+		(addr (source), first_record);
+	else first_sector = source.low_bound;
+
+	if (last_record >= 0) then
+	     last_sector = copy_disk_io_$record_to_sector 
+		(addr (source), (last_record + 1)) - 1;
+	else last_sector = source.high_bound;
+
+	first_record =				/* reset them to the real values */
+	     copy_disk_io_$sector_to_record (addr (source), first_sector);
+	last_record = 
+	     copy_disk_io_$sector_to_record (addr (source), last_sector);
+
+	if (first_sector < source.low_bound) | (first_sector < target.low_bound) then do;
+	     call com_err_ (0, WHOAMI, 
+		"first record (^d) is beyond the low bound for ^[^a^s^;^s^a^].",
+		first_record, (first_sector < source.low_bound),
+		source.device, target.device);
+	     goto MAIN_RETURN;
+	     end;
+
+	if (last_sector > source.high_bound) | (last_sector > target.high_bound) then do;
+	     call com_err_ (0, WHOAMI, 
+		"last record (^d) is beyond the high bound for ^[^a^s^;^s^a^].",
+		last_record, (last_sector > source.high_bound),
+		source.device, target.device);
+	     goto MAIN_RETURN;
+	     end;
+
+	source.low_bound = first_sector;
+	source.high_bound = last_sector;
+
+	target.bounds = source.bounds;		/* make them the same now, for the copy */
+
+          if (source.device_type = target.device_type) then return;
+	else do;
+	     call com_err_ (0, WHOAMI, "source is ^a, target is ^a: media formats are not compatible.", source.device_type, target.device_type);
+	     goto MAIN_RETURN;
+	     end;
+	
+	end check_compatibility;
+
+/*  */
+
+check_for_alt_partition:
+     procedure (p_partitions_used);
+
+dcl p_partitions_used bit (1) aligned;
+
+	if source_labelp -> label.nparts > 0 
+	     then do idx = 1 to source_labelp -> label.nparts;
+		if source_labelp -> label.parts(idx).part = "alt"
+		     then p_partitions_used = "1"b;
+		end;
+	return;
+	end check_for_alt_partition;
+
+/*  */
+
+cv_time:
+     proc (date_time) returns (char (*));
+
+dcl date_time		         fixed bin (71);
+dcl date_time_string	         char (24);
+dcl (length, substr)	         builtin;
+dcl date_time_		         entry (fixed bin(71), char(*));
+dcl Null_date_time		         char (16) static options (constant) init ("01/01/01  0000.0");
+
+	if date_time = 0 then
+	     return ("");
+	else do;
+	     call date_time_ (date_time, date_time_string);
+	     if substr (date_time_string, 1, length (Null_date_time)) = Null_date_time then
+		return ("");
+	     else return (date_time_string);
+	end;
+     end cv_time;
+
+/*  */
+
+get_highest_record:
+     procedure (P_highest_record) ;
+     
+dcl P_highest_record fixed bin (18) parm;
+dcl bit_idx			fixed bin;
+dcl find_bit_$last_off entry (bit(*)) returns (fixed bin(24)) reducible;
+dcl last_record_bit		          fixed bin (24);
+dcl last_volmap_entry		fixed bin;
+dcl all_free_in_word_mask		bit (32) int static options (constant) init ("ffffffff"b4);
+dcl entries_per_word		fixed bin int static options (constant) init (32);
+
+	      vol_mapp = temp_seg_ptr(4);
+	      call copy_disk_io_$read (addr(source), brief_sw, query_sw, vol_mapp, (sect_per_rec (source.device_type)), divide (size(vol_map),words_per_sect(source.device_type),17,0), retry_sw, code);   /* read the vol_map */
+	      if code ^= 0 then do;
+		 call com_err_ (code, WHOAMI, "Unrecoverable error reading vol_map of disk ^a.", source.device);
+		 goto MAIN_RETURN;
+		 end;
+
+/* See if any of the bits in the last word of the vol_map are used.  Get the index into the last word.
+   If one of these bits is on, calculate the highest record to be the number of the words in the bit_map
+   times number of entries per word, plus the index on last bit on.  Otherwise, we have to work our way
+   from the back of the bit map till we find a word that is being used and thenperform the calculation.
+   Finally we have to add in the base_add to take care of the portion of the disk before the vol_map. */	 	 
+	 bit_idx = mod (vol_map.n_rec,  entries_per_word);
+	 if bit_idx = 0 then bit_idx = entries_per_word;
+	 bit_map_wordp = addr (vol_map.bit_map (vol_map.bit_map_n_words - 1));
+	 last_record_bit = find_bit_$last_off (substr (bit_map_word.bits, 1, bit_idx));
+	 if last_record_bit > 0 then do;
+	      last_volmap_entry = ((vol_map.bit_map_n_words * entries_per_word) + last_record_bit);
+	      goto set_last_volmap_record;
+	      end;
+	 do idx = vol_map.bit_map_n_words - 1 by -1 to lbound (vol_map.bit_map, 1);
+	      bit_map_wordp = addr (vol_map.bit_map (idx));
+	      if bit_map_word.bits ^= all_free_in_word_mask then goto found_last;
+	      end;
+	 P_highest_record = (vol_map.base_add);
+	 return;
+found_last:
+	 last_volmap_entry = (idx * entries_per_word) + find_bit_$last_off (bit_map_word.bits);
+set_last_volmap_record:
+	 P_highest_record = vol_map.base_add + last_volmap_entry;	
+	 return;
+	 end get_highest_record;
+/*  */
+
+process_arguments:
+     procedure ();
+
+dcl  arg_count fixed bin;
+dcl  arg_idx fixed bin;
+dcl  arg_ptr pointer;
+dcl  arg_lth fixed bin (21);
+dcl  arg char (arg_lth) based (arg_ptr);
+
+
+	call cu_$arg_count (arg_count, code);
+	if (code ^= 0) then do;
+	     call com_err_ (code, WHOAMI);
+	     goto MAIN_RETURN;
+	     end;
+
+	do arg_idx = 1 to arg_count;
+	     call cu_$arg_ptr (arg_idx, arg_ptr, arg_lth, (0));
+GOT_ONE:	     if (arg = "-brief") | (arg = "-bf") then brief_sw = "1"b;
+	     else if (arg = "-query") then query_sw = "1"b;
+	     else if (arg = "-no_query") then query_sw = "0"b;
+	     else if (arg = "-long") | (arg = "-lg") then brief_sw = "0"b;
+	     else if (arg = "-check") | (arg = "-ck") then check_sw = "1"b;
+	     else if (arg = "-no_check") | (arg = "-nck") then check_sw = "0"b;
+	     else if (arg = "-trace") then do;
+		trace_sw = "1"b;
+		arg_idx = arg_idx +1;
+		if arg_idx > arg_count then do;
+		     call com_err_ (error_table_$badopt, WHOAMI, "Missing parameter following ^a.", arg);
+		     goto MAIN_RETURN;
+		     end;
+		call cu_$arg_ptr (arg_idx, arg_ptr, arg_lth, (0));
+		if index (arg, "-") = 1 then goto GOT_ONE;
+		else do;
+		     trace_every_n = cv_dec_check_ (arg, code);
+		     if code ^= 0 then do;
+			call com_err_ (error_table_$bad_conversion, WHOAMI, "Value of trace parameter must be numeric.");
+			goto MAIN_RETURN;
+			end;
+		     if trace_every_n < 0 then do;
+			call com_err_ (error_table_$bad_arg, WHOAMI, "Value of trace parameter must be positive.");
+			goto MAIN_RETURN;
+			end;
+		     else source.trace_parm = trace_every_n;
+		     end;
+		end;
+	     else if (arg = "-error_threshold") then do;
+		et_sw = "1"b;
+		arg_idx = arg_idx +1;
+		if arg_idx > arg_count then do;
+		     call com_err_ (error_table_$badopt, WHOAMI, "Missing parameter following ^a.", arg);
+		     goto MAIN_RETURN;
+		     end;
+		call cu_$arg_ptr (arg_idx, arg_ptr, arg_lth, (0));
+		if index (arg, "-") = 1 then goto GOT_ONE;
+		else do;
+		     et_number = cv_dec_check_ (arg, code);
+		     if code ^= 0 then do;
+			call com_err_ (error_table_$bad_conversion, WHOAMI, "Value of error_threshold parameter must be numeric.");
+			goto MAIN_RETURN;
+			end;
+		     if et_number < 0 then do;
+			call com_err_ (error_table_$bad_arg, WHOAMI, "Value of trace parameter must be positive.");
+			goto MAIN_RETURN;
+			end;
+		     end;
+		end;
+	     else if (arg = "-no_trace") then trace_sw = "0"b;
+	     else if (arg = "-pv_name") | (arg = "-pv") then do;
+		     arg_idx = arg_idx + 1;
+		     if arg_idx > arg_count then do;
+			call com_err_ (error_table_$badopt, WHOAMI, "Missing parameter following ^a.", arg);
+			goto MAIN_RETURN;
+			end;
+		     call cu_$arg_ptr (arg_idx, arg_ptr, arg_lth, (0));
+		     if index (arg, "-") = 1 then goto GOT_ONE;
+		     else if source_pv_name = "" & source.device ^= ""
+			then source_pv_name = arg;
+		     else if source_pv_name ^= "" & target_pv_name = "" & target.device ^= "" 
+			then target_pv_name = arg;
+		     else do;
+			call com_err_ (error_table_$badopt, WHOAMI, "Invalid use of ^a.", arg);
+			goto MAIN_RETURN;
+			end;
+		     end;
+				
+
+	     else if (char (arg, 1) = "-") then do;  /* we were expecting a value and got another CA instead */
+		call com_err_ (error_table_$badopt, WHOAMI, "^a", arg);
+		goto MAIN_RETURN;
+		end;
+
+	     else if (source.device = "") then source.device = arg;
+	     else if (target.device = "") then target.device = arg;
+
+	     else do;
+		call com_err_ (error_table_$too_many_args, WHOAMI,
+		     "Too many disk names; maximum is 2. ^a", arg);
+		goto MAIN_RETURN;
+		end;
+	     end;					/* of argument loop */
+
+	if (target.device = "") then do;		/* Not specified */
+	     call com_err_ (error_table_$noarg, WHOAMI, 
+		"^/Usage:^-^a  FromDisk  ToDisk  {-bf}",
+		WHOAMI);
+	     goto MAIN_RETURN;
+	     end;
+
+	source.threshold = et_number;
+	call check_disk (source.device, "source", source.device_type);
+	call check_disk (target.device, "target", target.device_type);
+
+	if (source.device = target.device) then do;
+	     call com_err_ (0, WHOAMI, "Cannot copy ^a to itself.", source.device);
+	     goto MAIN_RETURN;
+	     end;
+
+	return;
+
+	end process_arguments;
+     
+/*  */
+
+check_disk:
+     procedure (P_name, P_type, P_device_type);
+
+dcl  P_name char (*) parameter;
+dcl  P_type char (*) parameter;
+dcl  P_device_type fixed bin parameter;
+
+dcl  disk_name char (8) varying;
+dcl  bad bit (1) aligned;
+dcl  devx fixed bin;
+dcl  problem char (70) varying;
+
+
+	disk_name = rtrim (P_name);
+	if (length (disk_name) < 7) then bad = "1"b;
+	else if (substr (disk_name, 1, 3) ^= "dsk") then bad = "1"b;
+	else if (substr (disk_name, 5, 1) ^= "_") then bad = "1"b;
+	else if (verify (substr (disk_name, 6, 2), "0123456789") ^= 0) then bad = "1"b;
+	else if (length (disk_name) > 7)
+	     then if (verify (substr (disk_name, 8, 1), valid_sv_string) ^= 0) then bad = "1"b;
+	     else bad = "0"b;
+	else bad = "0"b;
+
+	if bad then do;
+	     call com_err_ (0, WHOAMI, 
+		"Invalid name for ^a disk: ""^a"". Must be dskX_NNX.",
+		P_type, disk_name);
+	     goto MAIN_RETURN;
+	     end;
+
+	do devx = 1 to dt.n_entries;
+	     dtep = addr (dt.array (devx));
+	     if (dte.drive_name = disk_name) then goto FOUND_THE_DISK;
+	     end;
+
+	call com_err_ (0, WHOAMI, "Disk drive ^a not found in disk_table_.", disk_name);
+	goto MAIN_RETURN;
+
+FOUND_THE_DISK:
+	if dte.storage_system then 
+	     if dte.used then 
+	          problem = "is in use by the storage system";
+	     else problem = "has not been sdu'd for I/O usage";
+	else if dte.deleted then problem = "has been deleted with deldev";
+	else problem = "";
+
+	if (problem ^= "") then do;
+	     call com_err_ (0, WHOAMI, "Cannot access ^a: it ^a.",
+		disk_name, problem);
+	     goto MAIN_RETURN;
+	     end;
+
+	P_device_type = dte.device_type;
+
+	return;
+	end check_disk;
+
+/*  */
+
+clean_up:
+     procedure (P_report);
+
+dcl  P_report bit (1) aligned parameter;
+
+
+          call close (addr (source));
+	call close (addr (target));
+
+	if (temp_seg_ptr (1) ^= null ()) then
+	     call release_temp_segments_ (WHOAMI, temp_seg_ptr, (0));
+          temp_seg_ptr (1) = null;
+	
+	return;
+
+
+
+close:
+     procedure (P_info_ptr);
+
+dcl  P_info_ptr pointer parameter;
+dcl 1 P_info aligned like copy_disk_info based (P_info_ptr);
+
+
+	if P_info.opened then do;
+	     call iox_$close (P_info.iocb, code);
+	     if P_report & (code ^= 0) then 
+		call com_err_ (code, WHOAMI, 
+		     "Closing stream for ^a.", P_info.device);
+	     end;
+
+	if P_info.attached then do;
+	     call iox_$detach_iocb (P_info.iocb, code);
+	     if P_report & (code ^= 0) then 
+		call com_err_ (code, WHOAMI, 
+		     "Detaching stream for ^a.", P_info.device);
+	     end;
+
+	if (P_info.iocb ^= null ()) then
+	     call iox_$destroy_iocb (P_info.iocb, (0));
+
+	return;
+	end close;
+
+	end clean_up;
+
+%page; %include copy_disk_info;
+%page; %include fs_dev_types;
+%page; %include iox_dcls;
+%page; %include iox_modes;
+%page; %include disk_table;
+%page; %include query_info;
+%page; %include fs_vol_label;
+%page; %include vol_map;
+%page; %include vtoc_map;
+       
+
+	end copy_disk_volume;

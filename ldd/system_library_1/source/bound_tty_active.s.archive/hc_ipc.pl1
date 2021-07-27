@@ -1,0 +1,527 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style3 */
+hc_ipc:
+     procedure;
+
+/* Rewritten by E Donner Jan 1981 for new ipc */
+/* Modified 04/26/82 by S Krupp to print module name with all syserr msgs. */
+/* Modified 10/03/83 by Jeffrey I. Schiller to fix bug with messages for
+   bad rings. */
+/* Modified 1984-11-21 by E. Swenson for IPC event channel validation. */
+/* Modified 1985-01-25 by EJ Sharpe to use access_audit_ */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-09,Kissel), approve(86-08-12,MCR7479),
+     audit(86-10-20,Fawcett), install(86-11-03,MR12.0-1206):
+     Changed to allow wakeups on fast channels by other than the creating
+     process.  The changes to support async event channels are all handled in
+     pxss$wakeup.
+                                                   END HISTORY COMMENTS */
+
+
+/*  entries  */
+
+dcl	ipc_validate_$decode_event_channel_name
+			entry (fixed bin (18), fixed bin (35), fixed bin (71), bit (3) aligned, fixed bin (15),
+			fixed bin (3), bit (1) aligned, fixed bin (18), fixed bin (35));
+dcl	ipc_validate_$encode_event_channel_name
+			entry (fixed bin (18), fixed bin (35), bit (3) aligned, fixed bin (15), fixed bin (3),
+			bit (1) aligned, fixed bin (18), fixed bin (71));
+dcl	level$get		entry returns (fixed bin (3));
+dcl	access_audit_$log_general
+			entry options (variable);
+dcl	pxss$free_itt	entry (bit (18) aligned);
+dcl	pxss$wakeup	entry (bit (36) aligned, bit (72) aligned, fixed bin (71), fixed bin (35));
+dcl	syserr		entry options (variable);
+dcl	tc_util$get_ipc_operands
+			entry (fixed bin (18), fixed bin (35));
+dcl	tc_util$get_ipc_operands_priv
+			entry (bit (36) aligned, fixed bin (18), fixed bin (35), fixed bin (35));
+dcl	terminate_proc	entry (fixed bin (35));
+
+/* internal static */
+dcl	last_sender	bit (36) internal static init ("0"b);
+						/* on of the few uses of internal static in ring zero */
+
+/* Constants */
+
+dcl	ME		char (32) initial ("hc_ipc") internal static options (constant);
+dcl	OFF		bit (1) aligned internal static options (constant) init ("0"b);
+dcl	(ON, YES)		bit (1) aligned internal static options (constant) init ("1"b);
+dcl	QUITSTOP		char (8) internal static options (constant) init ("quitstop");
+
+/* external static */
+dcl	access_operations_$ipc_wakeup
+			bit (36) aligned ext;
+dcl	error_table_$ect_full
+			fixed bin (35) ext;
+dcl	error_table_$inconsistent_ect
+			fixed bin (35) ext;
+dcl	error_table_$invalid_channel
+			fixed bin (35) ext;
+dcl	error_table_$itt_overflow
+			fixed bin (35) ext;
+dcl	error_table_$process_stopped
+			fixed bin (35) ext;
+dcl	error_table_$process_unknown
+			fixed bin (35) ext;
+dcl	error_table_$special_channels_full
+			fixed bin (35) ext;
+dcl	error_table_$wakeup_denied
+			fixed bin (35) ext;
+dcl	error_table_$wrong_channel_ring
+			fixed bin (35) ext;
+
+dcl	pds$event_masks	(7) bit (36) aligned ext;
+dcl	pds$events_pending	bit (36) aligned ext;
+dcl	pds$itt_head	bit (18) aligned ext;
+dcl	pds$process_group_id
+			char (32) aligned ext;
+dcl	pds$process_id	bit (36) aligned ext;
+dcl	pds$ring_events	bit (36) aligned ext;	/* per ring indicator of messages copied from itt to ect */
+
+dcl	pds$special_channels
+			bit (36) aligned ext;
+dcl	pds$stacks	(0:7) ext ptr;
+dcl	tc_data$		fixed bin (17) ext;
+dcl	tc_data$max_channels
+			fixed bin (35) ext;
+
+
+/* builtins */
+
+dcl	addr		builtin;
+dcl	index		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	string		builtin;
+dcl	substr		builtin;
+dcl	unspec		builtin;
+
+/* conditions */
+
+dcl	area		condition;
+
+/* Automatic */
+
+dcl	channel_ring	fixed bin (3);
+dcl	code		fixed bin (35);
+dcl	ev_chn_flags	bit (3) aligned;
+dcl	ev_chn_index	fixed bin (15);
+dcl	ev_chn_ring	fixed bin (3);
+dcl	ev_chn_type	bit (1) aligned;
+dcl	ev_chn_unique_id	fixed bin (18);
+dcl	event_channel_name_fb71
+			fixed bin (71) automatic;
+dcl	event_channel_message
+			fixed bin (71);
+dcl	fast_channel_id	fixed bin (18);
+dcl	1 event_flags	aligned like audit_event_flags;
+						/* for access_audit_ */
+dcl	1 itt_dummy	like itt_entry aligned;	/* used to send self wakeup */
+dcl	itt_relp		bit (18) aligned;
+dcl	msg_ptr		ptr;			/* pointer to allocated itt msg entry in ECT */
+dcl	r_offset		fixed bin (18);		/* IPC validation operand */
+dcl	r_factor		fixed bin (35);		/* IPC validation operand */
+dcl	target_process	bit (36) aligned;
+dcl	same_process	bit (1) aligned;
+dcl	pxss_status	fixed bin (35);
+dcl	target_ring	fixed bin (3);		/* target ring of message */
+dcl	val_ring		fixed bin (3);
+
+/* based */
+
+dcl	ect_area		area (ect_header.ect_area_size) based (ect_header.ect_areap);
+%page;
+ipc_wakeup:
+     entry (a_target_process, a_event_channel, a_event_channel_message, a_code);
+
+/**** This entry (target of the gate hcs_$wakeup) performs IPC signalling.
+      Note that pxss$wakeup may also send an IPS "wkp_" signal if the event
+      channel flags indicate that it is that type of event channel.
+      It validates the supplied processid as well as the event channel
+      name before calling pxss to process the wakeup. */
+
+dcl	a_target_process	bit (36) aligned parameter;
+dcl	a_event_channel	fixed bin (71) parameter;
+dcl	a_event_channel_message
+			fixed bin (71) parameter;
+dcl	a_code		fixed bin (35) parameter;
+
+/* wakeup can be called from all rings (1-7) in order to send an IPC
+   signal to any currently-active process. It returns the following code:
+
+   code = 0	Signalling correctly accomplished
+   code = error_table_$process_stopped
+		Signalling correctly done & target process was found to be stopped
+   code = error_table_$invalid_channel
+	          The specified event channel name was bad.
+   code = error_table_$process_unknown
+		Target process not found (either process-id wrong or process deactivated)
+   code = error_table_$itt_overflow
+		ITT overflow resulted, signalling aborted
+   code = error_table_$wakeup_denied
+		The access authorization of the target process
+		is not greater than or equal to the access authorization
+		of the sender process, so signalling is aborted.
+*/
+
+	code = 0;					/* reset returned code to zero */
+	target_process = a_target_process;		/* copy args into stack */
+	event_channel_name_fb71 = a_event_channel;	/* copy parameters */
+	event_channel_message = a_event_channel_message;
+
+	val_ring = level$get ();			/* save validation level */
+
+	call tc_util$get_ipc_operands_priv (target_process, r_offset, r_factor, code);
+	if code ^= 0
+	then do;
+		call syserr (LOG, "^a: Denied wakeup by ^a in ring ^d.  Invalid process id ^w.", ME,
+		     pds$process_group_id, val_ring, target_process);
+		goto WAKEUP_RETURNS;
+	     end;
+
+	call ipc_validate_$decode_event_channel_name (r_offset, r_factor, event_channel_name_fb71, ev_chn_flags,
+	     ev_chn_index, ev_chn_ring, ev_chn_type, ev_chn_unique_id, code);
+	if code ^= 0
+	then do;
+		call syserr (LOG, "^a: Denied wakeup by ^a in ring ^d to process ^w.  Invalid event channel ^24.3b",
+		     ME, pds$process_group_id, val_ring, target_process, unspec (event_channel_name_fb71));
+		goto WAKEUP_RETURNS;
+	     end;
+
+/* is wakeup being sent to self */
+	same_process = (target_process = pds$process_id);
+
+/* Determine if channel is a fast channel and do not allow */
+/* sending wakeup to an inner ring */
+
+	if ev_chn_type = FAST_CHANNEL_TYPE		/* it's a fast channel */
+	then do;
+		if ev_chn_ring < val_ring
+		then do;
+			code = error_table_$invalid_channel;
+			call syserr (LOG,
+			     "^a: Denied wakeup by ^a in ring ^d to process ^w.  Fast channel (^24.3b) not allowed.",
+			     ME, pds$process_group_id, val_ring, target_process, unspec (event_channel_name_fb71));
+
+			go to WAKEUP_RETURNS;
+		     end;
+	     end;
+
+/* It's not a fast channel and sending self wakeup */
+/* Special case - avoid calling pxss and allocate entry in ECT directly */
+
+	else if (same_process = YES)
+	then do;
+		if ev_chn_ring = val_ring
+		then do;
+			unspec (itt_dummy) = "0"b;	/* set up replica of entry in ITT */
+						/* fill in values */
+			itt_dummy.sender, itt_dummy.target_id = target_process;
+			itt_dummy.ring = val_ring;
+			unspec (itt_dummy.channel_id) = unspec (event_channel_name_fb71);
+			itt_dummy.message = event_channel_message;
+
+			on area call ect_error_handler (error_table_$ect_full, target_ring);
+
+			call dispatch_message (addr (itt_dummy), target_ring);
+			if target_ring > 0
+			then go to WAKEUP_RETURNS;	/* it should be done */
+		     end;
+
+	     end;
+
+/* send wakeup to other process or send wakeup over fast channel */
+/* call wakeup which does checks for overflow of ITT */
+
+	code = 0;					/* Start clean. */
+
+	call pxss$wakeup (target_process, unspec (event_channel_name_fb71), event_channel_message, pxss_status);
+
+	if pxss_status = 0
+	then code = error_table_$process_unknown;	/* target process unknown */
+
+	else if pxss_status = 5
+	then code = error_table_$process_stopped;	/* target process is quit */
+
+	else if pxss_status = 100
+	then do;
+		string (event_flags) = ""b;
+		call access_audit_$log_general (ME, val_ring, string (event_flags), access_operations_$ipc_wakeup, "",
+		     0, null (), 0, "Target process (^w) authorization is lower", target_process);
+		code = error_table_$wakeup_denied;
+	     end;
+
+	else if pxss_status = 200
+	then do;					/* ITT overflow */
+		code = error_table_$itt_overflow;
+		if pds$process_id ^= last_sender
+		then do;				/* filter useless msgs */
+			last_sender = pds$process_id;
+			call syserr (0, "^a: ITT overflow caused by ^a", ME, pds$process_group_id);
+		     end;
+	     end;
+
+WAKEUP_RETURNS:
+	a_code = code;
+	return;
+
+/*	BLOCK = procedure to receive IPC Signals */
+
+full_block:
+     entry;
+
+	val_ring = level$get ();			/* get validation level */
+	on area call ect_error_handler (error_table_$ect_full, target_ring);
+
+	itte_ptr = addr (tc_data$);
+	do itt_relp = pds$itt_head repeat (itte_ptr -> itt_entry.next_itt_relp) while (itt_relp);
+						/* go through all ITT messages */
+	     itte_ptr = ptr (itte_ptr, itt_relp);
+	     call dispatch_message (itte_ptr, target_ring);
+
+	end;
+
+	call pxss$free_itt (pds$itt_head);		/* free all messages */
+
+	return;
+
+assign_channel:
+     entry (a_channel_name, a_code);
+
+dcl	a_channel_name	fixed bin (71);		/* name of channel assigned */
+
+	code = 0;
+
+	fast_channel_id = index (pds$special_channels, "0"b);
+						/* get index of new channel */
+	if (fast_channel_id > tc_data$max_channels) | (fast_channel_id = 0)
+	then do;					/* channels exhausted */
+		code = error_table_$special_channels_full;
+		a_channel_name = 0;
+		go to FAST_CHANNEL_RETURNS;
+	     end;
+	substr (pds$special_channels, fast_channel_id, 1) = ON;
+						/* channel is asigned */
+	val_ring = level$get ();
+	substr (pds$event_masks (val_ring), fast_channel_id, 1) = ON;
+						/* channel assigned to ring */
+	substr (pds$events_pending, fast_channel_id, 1) = OFF;
+						/* turn off any pending wakeups */
+
+/**** Retrieve the values of R-Offset and R-Factor from the APTE.  These
+      values are needed to encode the event channel name. */
+
+	call tc_util$get_ipc_operands (r_offset, r_factor);
+
+/* fill in channel name */
+
+	call ipc_validate_$encode_event_channel_name (r_offset, r_factor, NORMAL_CHANNEL_FLAGS, (fast_channel_id),
+	     val_ring, FAST_CHANNEL_TYPE, fast_channel_id, event_channel_name_fb71);
+
+	unspec (a_channel_name) = unspec (event_channel_name_fb71);
+	go to FAST_CHANNEL_RETURNS;
+
+delete_channel:
+     entry (a_channel_name, a_code);
+
+	unspec (event_channel_name_fb71) = unspec (a_channel_name);
+	code = 0;
+	val_ring = level$get ();
+
+/**** Retrieve the values of R-Offset and R-Factor from the APTE.  These
+      values are needed to decode the event channel name. */
+
+	call tc_util$get_ipc_operands (r_offset, r_factor);
+
+	call ipc_validate_$decode_event_channel_name (r_offset, r_factor, event_channel_name_fb71, ev_chn_flags,
+	     ev_chn_index, channel_ring, ev_chn_type, fast_channel_id, code);
+	if code ^= 0
+	then goto FAST_CHANNEL_RETURNS;
+
+	if fast_channel_id ^= ev_chn_index
+	then do;
+		code = error_table_$invalid_channel;
+		goto FAST_CHANNEL_RETURNS;
+	     end;
+
+	if val_ring > channel_ring
+	then do;					/* access violation */
+		code = error_table_$wrong_channel_ring;
+		go to FAST_CHANNEL_RETURNS;
+	     end;
+
+	if ev_chn_type ^= FAST_CHANNEL_TYPE
+	then do;
+		code = error_table_$invalid_channel;
+		goto FAST_CHANNEL_RETURNS;
+	     end;
+
+	if fast_channel_id > tc_data$max_channels | fast_channel_id <= 0
+	then do;
+		code = error_table_$invalid_channel;
+		go to FAST_CHANNEL_RETURNS;
+	     end;
+
+	if (substr (pds$event_masks (channel_ring), fast_channel_id, 1) = OFF)
+	then do;
+		code = error_table_$invalid_channel;
+		go to FAST_CHANNEL_RETURNS;
+	     end;
+
+/* deallocate channel in ring */
+	substr (pds$event_masks (channel_ring), fast_channel_id, 1) = OFF;
+	substr (pds$special_channels, fast_channel_id, 1) = OFF;
+						/* deallocate channel */
+FAST_CHANNEL_RETURNS:
+	a_code = code;
+	return;
+
+dispatch_message:
+     proc (a_itte_ptr, a_target_ring);
+
+dcl	a_itte_ptr	ptr parameter;
+dcl	a_target_ring	fixed bin (3) parameter;
+
+/* following is the unthreading of the event queue and the dispatching
+   of the event messages into their corresponding rings */
+
+	a_target_ring = 0;
+
+/* process is being destroyed */
+	if unspec (a_itte_ptr -> itt_entry.channel_id) = unspec (QUITSTOP)
+	then return;
+
+/* pick up ring from channel name and check its validity */
+	a_target_ring = addr (a_itte_ptr -> itt_entry.channel_id) -> event_channel_name.ring;
+	if a_target_ring = 0
+	then return;
+	sb = pds$stacks (a_target_ring);
+	if sb = null				/* sender could have put bad ring in name */
+	then return;
+
+/* pick up pointer to ect and ect area and check that all goes well */
+	ect_ptr = sb -> stack_header.ect_ptr;
+
+/* ect_ptr is null in rings that don't have an ECT (like inner rings that
+haven't called ipc_$create_ev_chn). DONT KILL PROCESS BECAUSE OF THIS, just
+ignore the event. Note that anyone can send an event message to an event
+channel that specifies any old ring... The old code here used to terminate
+the process on this condition thus allowing malicious users to trash 
+any process */
+
+	if ect_ptr = null
+	then return;
+
+	if ect_header.ect_areap = null
+	then call ect_error_handler (error_table_$inconsistent_ect, a_target_ring);
+
+	allocate itt_message in (ect_area) set (msg_ptr);
+	ect_header.count (ITT_MESSAGE) = ect_header.count (ITT_MESSAGE) + 1;
+	ect_header.count (TOTAL) = ect_header.count (TOTAL) + 1;
+	unspec (msg_ptr -> itt_message) = "0"b;
+	msg_ptr -> itt_message.type = ITT_MESSAGE;
+	call thread_itt_message (ect_ptr, msg_ptr);
+
+	msg_ptr -> itt_message.message_data = a_itte_ptr -> itt_entry, by name;
+
+	substr (pds$ring_events, a_target_ring, 1) = ON;	/* record that messages copied into this ring's ect */
+						/* may not be validation ring */
+
+     end dispatch_message;
+
+thread_itt_message:
+     proc (a_ect_ptr, a_msgp);
+
+dcl	a_ect_ptr		ptr parameter;
+dcl	a_msgp		ptr parameter;
+
+dcl	prev_ittp		ptr;
+
+	prev_ittp = a_ect_ptr -> ect_header.lastp (ITT_MESSAGE);
+	if prev_ittp = null
+	then a_ect_ptr -> ect_header.firstp (ITT_MESSAGE) = a_msgp;
+	else prev_ittp -> itt_message.next_itt_msgp = a_msgp;
+	a_ect_ptr -> ect_header.lastp (ITT_MESSAGE) = a_msgp;
+	a_msgp -> itt_message.next_itt_msgp = null;
+
+     end thread_itt_message;
+
+ect_error_handler:
+     proc (a_code, a_ring);
+
+dcl	a_code		fixed bin (35) parameter;
+dcl	a_ring		fixed bin (3) parameter;
+
+	call syserr (4, "^a: Unable to allocate in ring ^d ECT for ^a", ME, a_ring, pds$process_group_id);
+	call terminate_proc (a_code);
+
+     end ect_error_handler;
+
+/* format: off */
+%page; %include access_audit_eventflags;
+%page; %include ect_structures;
+%page; %include event_channel_name;
+%page; %include itt_entry;
+%page; %include stack_header;
+%page; %include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   hc_ipc: ITT overflow caused by NAME.PROJ
+
+   S:	$info
+
+   T:	$run
+
+   M:	When wakeups are sent from one process to another, or from a device
+   like a tape drive to a process, the wakeups are stored temporarily in the 
+   Interprocess Transmission Table (ITT). If wakeups are sent too fast,
+   or if the receiving process never calls block to read its wakeups,
+   the ITT may overflow. When the ITT is full, this message is printed
+   for each lost wakeup. The message identifies the sender of the wakeup,
+   who may be innocent of any error or wrongdoing.
+
+   If a critical system function cannot send a wakeup, the system may crash.
+
+   A:	If the ITT overflow is a transient condition, this message will stop
+   coming out after a few minutes. If so, system operation may return to normal.
+   If the message comes out repeatedly, the system will have to be crashed,
+   since user terminal operation, daemon operations, and the message
+   coordinator depend on wakeups.
+   $recover
+
+
+   Message:
+   hc_ipc: Unable to allocate in ring RINGNO ECT for  NAME.PROJ
+
+   S:     $log
+
+   T:     $run
+
+   M:     When a process recieves wakeups, they are copied from the
+   Interprocess Transmission Table to an Event Channel Table (ECT).
+   A process owns one ECT per ring.  If, for any reason, an entry
+   for a wakeup cannot be allocated in a process' ECT, that
+   process is terminated.
+
+   A:     If the process is a daemon process, it must be reinitialized.
+   If the process is the initializer process, the system will crash.
+
+   END MESSAGE DOCUMENTATION */
+/* format: on */
+
+     end hc_ipc;

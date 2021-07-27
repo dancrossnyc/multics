@@ -1,0 +1,1532 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Bull Inc., 1987                *
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+" *                                                         *
+" * Copyright (c) 1972 by Massachusetts Institute of        *
+" * Technology and Honeywell Information Systems, Inc.      *
+" *                                                         *
+" ***********************************************************
+
+" HISTORY COMMENTS:
+"  1) change(85-09-09,Fawcett), approve(85-09-09,MCR6979),
+"     audit(86-01-27,CLJones), install(86-03-21,MR12.0-1033):
+"     Add support for dev 0 FIPS.
+"  2) change(86-05-29,Fawcett), approve(86-05-29,MCR7383),
+"     audit(86-05-30,Coppola), install(86-07-17,MR12.0-1097):
+"     Add code for MSU3380 and MSU3390 support. This code supports the
+"     division of the devices into subvolumes. Also read 512 word sectors are
+"     supported by only doing 512_word seek command (30 oct). Multics will not
+"     support 64_seeks for these devices.
+"  3) change(86-09-10,Farley), approve(86-10-24,MCR7544),
+"     audit(86-10-27,Fawcett), install(86-10-28,MR12.0-1200):
+"     Added change to properly shift the TEST I/O command in the A-reg before
+"     storing in chantab.rssdcw.
+"                                                      END HISTORY COMMENTS
+
+	name	dctl
+
+" dctl - fast path for disk control, coded in ALM for obvious reasons
+"
+" Written sometime by someone (possibly Mullen)
+" Modified by Fawcett 1979 for shared stack frames
+" Modified back by Hornig December 1980
+" Modified March 1981 by J. Bongiovanni to add entry queue_length_given_pvtx
+" Modified July, 1981, WOS, to implement Mike Jordan's fix to the 501 sector number
+"  overflow problem (too many sectors to represent in 20 bits).
+" Modified February 1982 by C. Hornig for MR10 io_manager.
+" Modified March 1982 by J. Bongiovanni to remove queue_length_given_pvtx
+"         (moved to disk_control) and for new PVTE
+" Modified March 1982 by C. Hornig to unload disks.
+" Modified July 1982 by J. Bongiovanni for read_sectors, write_sectors
+" Modified April 1984 by T. Oke for system wide free_q.
+" Modified April 1984 by T. Oke for dynamic channel table and the use of
+"	dskdcl_chans_per_subsys to define channel idx/subsystem relation.
+" Modified May 1984 by T. Oke to add pvtx in queue entry for azm analysis
+"	of queue.
+" Modified May 1984 by T. Oke to install adaptive optimization, modifying
+"	the quentry structure.
+" Modified Nov 26,1984 by R. A. Fawcett to suppoer dev 0 (fips).
+" Modified February 1985 by Keith Loepere to re-install bootload_read/write
+"	which was broken by one of the above recently named.
+" Modified April 1985 by R. A. Fawcett to support real 512 work IO for 3380's.
+" Modified July 1985 by R. A. Fawcett to support sub-volumes on 3380/3390's
+" ============================================================================
+	
+	tempd	int_arg_list
+	tempd	meter_start_time,status_time,entry_time,test_time
+	tempd	ptp,mask		Used for pmut$wire_and_mask
+	tempd	arglist(3)
+	tempd	listp
+	tempd	ima(8)
+	temp	coreadd
+	temp	sect_off,record_offset
+	temp	devadd
+	temp	errcd
+	temp	real_device
+	temp	sect_sw		Uses upper bit (sign) to indicate sect
+	temp	bootload_sw	Ditto for bootload
+	temp	sx		Subsystem index in DL
+	temp	pvtx
+	temp	dev
+	temp	sector
+	temp	cylinder
+	temp	io_type		Io type stored in DL
+	temp	masked		Non-zero if call side running masked
+	temp	intrpt		Caller requested interrupt on complete
+	temp	temp1
+	temp	switches
+	temp	best_seek		Also is best_pos_comb
+	temp	comb_qp		DU has forward comb qp, DL has reverse
+	temp	best_neg_comb
+	temp	n_sectors,n_sectors_temp
+"
+	entry	disk_inter
+	entry	disk_read
+	entry	disk_write
+	entry	bootload_read
+	entry	bootload_write
+	entry	read_sectors
+	entry	write_sectors
+
+"	REGISTER USAGE:
+"	bb -> disk_seg base, disk_data
+"	bp -> disktab, per subsystem info
+"	ap -> chantabe
+"	lb -> pvte, DCW list, devtabe (when opt_info access needed)
+
+"	x0 = pdi
+"	x1 temp
+"	x2-> devtab
+"	x3-> quentry
+"	x4 temp
+"	x5 temp
+"	x6 call savex	(top level calls)
+"	x7 calls		(lower level)
+
+
+"     The ALM assembler must border on the least friendly assembler known
+"     to man.  So some techniques are in force through this program to aid
+"     in the detection of error conditions due to movement of structure
+"     contents.
+
+"     Specifically there is quite a bit of use of the construction:
+"
+"	equ	quentry.coreadd_shift,0
+"
+"     This construction will cause an error if the value of the shift is not
+"     zero, AS WE ARE PRESUMING IT TO BE.  Thus we can produce fast code, with
+"     extra supurflous instructions removed, but still detect if they would be
+"     necessary if things move.  Hopefully these little checks will do someone
+"     good in the future.
+
+	equ	MUST_BE_ZERO,0	Used for 0 check
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	CALL SIDE OF DISK DIM -- various entries
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+write_sectors:
+	push
+	ldx4	VTOC_WRITE,du
+	tra	go_sector
+
+read_sectors:
+	push
+	ldx4	VTOC_READ,du
+	tra	go_sector
+
+bootload_read:
+	push
+	ldx4	BOOTLOAD_READ,du
+	tra	go_sector
+
+bootload_write:
+	push
+	ldx4	BOOTLOAD_WRITE,du
+	tra	go_sector
+
+go_sector:
+	sxl4	io_type
+	lda	ap|10,*			pick up number of sectors
+	sta	n_sectors
+	ldq	ap|8,*			pick up sect_off arg
+	stq	sect_off
+	stz	intrpt			clear interrupt desired
+	ldq	bootload_mapping,du		" IO type still in x4
+	qls	0,x4
+	tpl	go_vtoc
+	stz	masked
+	tra	go_common
+
+"     wire stack frame for vtoc_man
+
+go_vtoc:
+	epplb	mask
+	sprilb	arglist+2
+	epplb	ptp
+	sprilb	arglist+4
+	ldaq	two_args_nd
+	staq	arglist
+	call	pmut$wire_and_mask(arglist)
+	lda	1,dl
+	sta	masked			in masked environment
+	tra	go_common
+
+
+disk_write:
+	push
+	ldx4	PAGE_WRITE,du
+	tra	go_page
+
+disk_read:
+	push
+	ldx4	PAGE_READ,du
+
+go_page:
+	sxl4	io_type
+	stz	n_sectors
+	stz	sect_off			sect_off = 0
+	stz	masked			not in masked environment
+	stz	intrpt
+	lda	ap|8,*			pick up priority arg
+	tze	no_intrpt			intrpt="0"b
+	lda	quentry.intrpt,du		intrpt=quentry.intrpt
+no_intrpt:
+	sta	intrpt
+
+go_common:				" Common command interface
+	lda	ap|4,*
+	als	12			MASK FOR COREADD
+	arl	12
+	sta	coreadd
+	lda	ap|6,*
+	arl	18
+	sta	devadd
+
+	rccl	sys_info$clock_,*		get entry time for stats
+	staq	entry_time	GET PVTE for device
+
+	epplb	pvt$array
+	ldq	ap|2,*			get pvtx
+	stq	pvtx			save for queue entry
+	mpy	pvte_size,dl
+	epplb	lb|-pvte_size,ql		HENCEFORTH lb -> PVTE
+	lda	lb|pvte.dim_info
+	arl	pvtdi.sx_shift
+	sta	sx
+	tsx7	setup
+
+	eax4	disktab.call_lock_meters	specify lock reason
+	tsx7	lock
+
+	ldq	lb|pvte.logical_area_number_word
+	qrl	pvte.logical_area_number_shift
+"""""	anq	pvte.logical_area_number_mask,dl  This mask bigger than next
+	anq	quentry.dev_mask,dl
+	stq	dev			device in sub-sys
+
+	ldx2	devtab_subs,ql		subscript devtab
+	ldq	bp|devtab.pdi_word,x2	devtab.pdi
+	equ	devtab.pdi_shift,0		PRESUMED 0
+"""""	qrs	devtab.pdi_shift
+	anq	devtab.pdi_mask,dl
+	eax0	0,ql			HENCEFORTH X0 = pdi
+	ldx2	devtab_subs,x0		subscript devtab
+	eax2	bp|0,x2			HENCEFORTH X2->devtab
+
+"     The following code is out, since we will try the abandoned device
+"     will get an error return, and it will be handled by disk_control
+"     error processing.  Thus disk_control eventually finds out.
+
+"""""	lda	bb|devtab.abandoned_word,x2
+"""""	cana	devtab.abandoned,du
+"""""	tnz	ABANDONED
+
+"     Allocate a quentry for this operation
+
+	aos	bp|disktab.alloc_wait_meters+disk_lock_meters.count
+	tsx7	get_free_q		HENCEFORTH X3->quentry
+	arg	got_fq			get_free_q success
+"Failed to find free quentry. Call RUN.
+	eax4	disktab.alloc_wait_meters	meter this time as alloc wait
+	tsx6	lock_meter_start
+retry_get_fq:
+	tsx7	get_free_q
+	arg	retry_got_fq
+	eppap	sx
+	spriap	arglist+2
+	ldaq	one_arg_nd
+	staq	arglist
+	call	disk_control$call_run(arglist)
+	tra	retry_get_fq
+
+
+retry_got_fq:
+	eax4	disktab.alloc_wait_meters	time metered as alloc wait
+	tsx6	lock_meter_stop	Compute cylinder and sector -- remember them in stack
+
+got_fq:	ldq	devadd
+	lda	lb|pvte.is_sv_word
+	cana	pvte.is_sv,du
+	tze	not_subvol    " pvte does not define sv "
+	div	lb|pvte.records_per_cyl
+	sta	record_offset
+	ldq	devadd
+	sblq	record_offset
+	mpy	lb|pvte.num_of_svs
+	adlq	lb|pvte.record_factor
+	adlq	record_offset
+not_subvol: 
+	lda	lb|pvte.device_type_word
+	arl	pvte.device_type_shift
+	ana	pvte.device_type_mask,dl
+	eax1	0,al
+	mpy	sec_per_rec,x1		" mpy by 16 for 64 word io and 2 for 512 word io
+	stq	sector
+
+	lda	lb|pvte.dim_info
+	ars	pvtdi.usable_sect_per_cyl_shift
+	ana	pvtdi.usable_sect_per_cyl_mask,dl
+	sta	temp1
+	div	temp1			into sector in Qreg
+	stq	cylinder
+
+	ldq	lb|pvte.dim_info
+	equ	pvtdi.unused_sect_per_cyl_shift,0	PRESUMED = 0
+""""""	qrs	pvtdi.unused_sect_per_cyl_shift
+	anq	pvtdi.unused_sect_per_cyl_mask,dl
+	mpy	cylinder
+	adq	sect_off
+	asq	sector
+
+"     Fill in quentry contents
+"     quentry.intrpt, used, type, coreadd
+" PRESUMES that type,intrpt,used and coreadd are in the same quentry word.
+
+	equ	quentry.type_word,1		All presumed in word 1
+	equ	quentry.intrpt_word,1
+	equ	quentry.used_word,1
+	equ	quentry.coreadd_word,1
+	equ	MUST_BE_ZERO,quentry.coreadd_shift
+
+	lda	io_type
+	als	quentry.type_shift		get io_type of operation
+	ora	intrpt			Set interrupt flag
+	ora	quentry.used,du		indicate entry is used
+	ora	coreadd			presume shift is 0
+	sta	bb|quentry.type_word,x3
+	
+
+"     quentry.pvtx, pdi, dev, cylinder
+" PRESUMES that pvtx,cylinder,dev and pdi are in the same quentry word.
+
+	equ	quentry.pvtx_word,2		Presumed in word 2
+	equ	quentry.pdi_word,2
+	equ	quentry.dev_word,2
+	equ	quentry.cylinder_word,2
+	equ	MUST_BE_ZERO,quentry.cylinder_shift
+
+	lda	pvtx
+	als	quentry.pvtx_shift
+	ora	cylinder			presume cylinder shift is 0
+	sta	bb|quentry.pvtx_word,x3
+	eaa	0,x0			pdi from X0
+	als	quentry.pdi_shift-18
+	orsa	bb|quentry.pdi_word,x3
+	lda	dev
+	als	quentry.dev_shift
+	orsa	bb|quentry.dev_word,x3
+
+
+"     quentry.n_sectors, sector
+" PRESUMES that n_sectors and sector are in the same quentry word.
+
+	equ	quentry.n_sectors_word,3	Presume in word 3
+	equ	quentry.sector_word,3
+	equ	MUST_BE_ZERO,quentry.sector_shift
+
+	lda	n_sectors
+	als	quentry.n_sectors_shift
+	ora	sector			include sector number
+	sta	bb|quentry.sector_word,x3
+
+"     Fill in queued time.
+
+	ldaq	entry_time
+	staq	bb|quentry.time,x3
+
+"
+"Provided the disk dim is functioning correctly on the interrupt side
+"then if there are already requests queued for this device
+"then there is no chance we can immediately issue a connect for this request.
+"Therefore we merely queue the request and return.
+"The same is true if the device is busy already.
+"On the other hand if the device is neither busy nor has a queue already
+"then if there is a free channel then we need not even add the quentry
+"to the queue, but instead issue the connect forthwith.
+
+"     X3 -> quentry, X0 = pdi, X2 -> devtab (pdi)
+
+	ldaq	bp|disktab.dev_busy
+	oraq	bp|disktab.dev_queued
+	lls	0,x0			X0 has PDI ..
+	tmi	call_side_queues		this PDI is busy or queued
+
+	ldx4	bp|disktab.channels		find dynamic table
+	eppap	bb|0,x4			AP -> (first)chantabe
+
+	lxl4	bp|disktab.nchan
+	tze	call_side_queues		no channels exist - queue it
+
+	ldaq	channel_criteria		bit and mask for testing
+call_chan_loop:
+	cmk	ap|chantab.in_use_word
+	tze	call_side_connects		channel available - use it
+	eppap	ap|chantab_size		try next channel
+	eax4	-1,x4			if there is another channel
+	tpnz	call_chan_loop
+
+"     Add to existing work queue for device and fast return
+
+call_side_queues:				" io_type (DL) must be good
+	tsx7	add_wq
+	tra	working
+
+"     Have channel and no queued requests for idle device - send it work
+
+call_side_connects:
+	tsx7	gotwork
+working:	tsx7	unlock		unlock and return
+	szn	masked		see if we are masked
+	tze	unwired
+
+"     We are wired and must clear wiring before return
+
+	epplb	mask
+	sprilb	arglist+2
+	epplb	ptp
+	sprilb	arglist+4
+	ldaq	two_args_nd
+	staq	arglist
+	call	pmut$unwire_unmask(arglist)
+
+unwired:	return
+
+
+"for ldaq/cmk above:A has bits desired, Q has 1bits to mask dont-care bits
+"we require a channel which is in-use, and not-active
+
+	even
+channel_criteria:
+	zero	0,chantab.in_use
+	zero	-1,-chantab.in_use-chantab.active-1
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	SETUP -- called with sx in Areg
+"		makes bb->disk_seg
+"		makes bp->devtab
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+setup:	eppbb	disk_seg$
+	als	1
+	eppbp	bb|disk_data.array-2,al*
+	tra	0,7		setup returns
+
+
+
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	LOCK -- locks bp->disktab (ie a subsystem)
+"		called with x4->metercells
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+lock:	aos	bp|disk_lock_meters.count,x4
+	lda	pds$processid
+	stac	bp|disktab.lock	lock subsystem lock
+	tze	0,x7		lock ret1
+
+	tsx6	lock_meter_start
+	lda	pds$processid
+lockloop:	stac	bp|disktab.lock
+	tze	lockgot
+	llr	72
+	llr	72
+	llr	72
+	llr	72
+	tra	lockloop
+
+lockgot:	tsx6	lock_meter_stop
+	tra	0,x7		lock ret2
+
+"
+"	LOCK_METER_START - called via X6, X4 must specify lock reason
+"
+
+lock_meter_start:
+	rccl	sys_info$clock_,*
+	staq	meter_start_time
+	aos	bp|disk_lock_meters.waits,x4
+	tra	0,x6
+
+"
+"	LOCK_METER_STOP -called via X6, X4 must specify lock reason
+"
+
+lock_meter_stop:
+	rccl	sys_info$clock_,*
+	sbaq	meter_start_time
+	adaq	bp|disk_lock_meters.wait_time,x4
+	staq	bp|disk_lock_meters.wait_time,x4
+	tra	0,x6
+
+"
+"	UNLOCK -- unlocks bp->disktab
+"
+
+unlock:	lda	pds$processid	DEBUG
+	cmpa	bp|disktab.lock	DEBUG
+	tze	*+2
+	oct	04		DEBUG Die Die Die
+	eaa	0
+	ansa	bp|disktab.lock
+	tra	0,x7		unlock ret
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	GET_FREE_Q -- called with bp->disktab
+"		sets x3->quentry
+"		note indirect return if sucessful, direct if fail!!
+"
+"		uses X4, X5, A
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	even
+
+lock_disk_data.wait:
+	llr	72			Read/Alter/Rewrite delay
+	llr	72
+	llr	72
+	llr	72
+lock_disk_data:
+	lda	pds$processid
+	stac	bb|disk_data.lock		lock disk_data
+	tze	0,x4			return to caller
+	tra	lock_disk_data.wait
+
+"     Unlock disk_data.  Ensures write notification.
+
+unlock_disk_data:
+	lda	pds$processid	DEBUG
+	cmpa	bb|disk_data.lock	DEBUG
+	tze	*+2
+	oct	04		DEBUG Die Die Dia
+	eaa	0
+	ansa	bb|disk_data.lock
+	tra	0,x4		unlock ret
+
+
+
+get_free_q:
+	tsx4	lock_disk_data
+	ldx3	bb|disk_data.free_q+qht.head
+	tze	gfq_bret			bad unlock and return
+
+	ldx4	bb|quentry.next,x3		make head point to next
+	stx4	bb|disk_data.free_q+qht.head	set head
+	tze	gfq_kill_tail		kill tail if no next
+	ldx5	0,du			make an 18-bit zero
+	sxl5	bb|quentry.prev,x4		kill new head's prev
+	tra	gfq_do_stats
+
+gfq_kill_tail:
+	sxl4	bb|disk_data.free_q+qht.tail	kill tail
+
+"     Compile statistics.
+
+gfq_do_stats:
+	lxl5	bb|disk_data.free_q+qht.depth
+	eaa	0,x5
+	ars	18
+	asa	bb|disk_data.free_q+qht.sum	accumulate depth sum
+	adx5	1,du			increment depth counter
+	sxl5	bb|disk_data.free_q+qht.depth
+	cmpx5	bb|disk_data.free_q+qht.max_depth
+	tmoz	gfq_no_max_depth		not maximum depth seen
+	stx5	bb|disk_data.free_q+qht.max_depth
+gfq_no_max_depth:
+	aos	bb|disk_data.free_q+qht.count
+
+"     unlock disk_data and return good
+
+	tsx4	unlock_disk_data
+	tra	0,x7*
+
+gfq_bret:	tsx4	unlock_disk_data		unlock disk_data
+	tra	1,x7			gfq failure ret
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	ADD_FREE_Q -- add X3->quentry to queue
+"
+"		Uses X4, X5
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	even
+
+add_free_q:
+	tsx4	lock_disk_data
+	lxl5	bb|disk_data.free_q+qht.tail	X5->oldtail
+	tze	afq_empty			was none!
+	stx3	bb|quentry.next,x5		make old_tail -> new_tail
+	tra	afq_any
+afq_empty:
+	stx3	bb|disk_data.free_q+qht.head	was empty, make new head
+
+"     make this entry's prev point to old tail
+
+afq_any:	sxl5	bb|quentry.prev,x3		set this prev to old tail
+	sxl3	bb|disk_data.free_q+qht.tail 	set tail ptr
+	eax5	0
+	stx5	bb|quentry.next,x3		make newtail's next->nil
+
+"     Account for returned element
+
+	lxl5	bb|disk_data.free_q+qht.depth	subtract for return
+	sbx5	1,du
+	sxl5	bb|disk_data.free_q+qht.depth
+
+	tsx4	unlock_disk_data		unlock disk_data
+	tra	0,x7			add_q ret
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	ADD_WQ -- add X3->quentry to queue
+"
+"     X2-> devtab (pdi), X0 = pdi
+"		Uses X1, X4, X5, EAQ and lb
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+add_wq:
+	lda	=o400000,du		set requests queued for dev
+	ldq	0,du
+	lrl	0,x0
+	orsa	bp|disktab.dev_queued
+	orsq	bp|disktab.dev_queued+1
+
+"     add to work queue
+
+	lxl5	bb|devtab.wq+qht.tail,x2 	X5->oldtail
+	tze	aq_empty			was none!
+	stx3	bb|quentry.next,x5		make old_tail -> new_tail
+	tra	aq_any
+aq_empty:
+	stx3	bb|devtab.wq+qht.head,x2	was empty, make new head
+
+aq_any:	sxl5	bb|quentry.prev,x3		set this prev to old tail
+	sxl3	bb|devtab.wq+qht.tail,x2	set tail ptr
+	eax5	0
+	stx5	bb|quentry.next,x3		make newtail's next->nil
+
+"     Compile statistics for queue loading.
+
+	lxl5	bb|devtab.wq+qht.depth,x2
+	eaa	0,x5
+	ars	18
+	asa	bb|devtab.wq+qht.sum,x2	accumulate depth sum
+	adx5	1,du			increment depth
+	sxl5	bb|devtab.wq+qht.depth,x2
+	cmpx5	bb|devtab.wq+qht.max_depth,x2
+	tmoz	gq_no_max_depth		not maximum depth seen
+	stx5	bb|devtab.wq+qht.max_depth,x2
+gq_no_max_depth:
+	aos	bb|devtab.wq+qht.count,x2
+
+"     compile system load stats.  Presumes io_type (DL) is good.
+
+	tsx4	lock_disk_data		ensure counter is ours
+	lxl1	io_type
+	ldx5	sys_info_subs,x1		x5 is sysp offset
+	ldx4	bb|sys_info.depth_map,x5	get mapped counter
+	fld	bb|0,x4			increment depth
+	fad	=1.0,du
+	fst	bb|0,x4
+
+"     Produce sys_info.fraction.   -(float (depth) - max_depth)/max_depth
+
+	fsb	bb|sys_info.max_depth,x5
+	fneg
+	tpl	gq_pos_fraction		fraction is positive
+	fld	=0.0,du			limit to 0.0
+gq_pos_fraction:
+	fdv	bb|sys_info.max_depth,x5
+	fst	bb|sys_info.fraction,x5
+	tsx4	unlock_disk_data		clear disk_data lock
+"     Produce multiplier.  -(float (depth) * slope) + intercept
+"     Final opt_info.multiplier is max (1.0, multiplier * sys_info.fraction)
+
+	lxl4	opt_info_subs,x1		x4 is optp offset in devtab
+	epplb	bb|0,x2			pointer to devtab
+	aos	lb|opt_info.depth,x4	increment device depth
+
+	lda	lb|opt_info.depth,x4
+	als	18			clear high stuff
+	lrs	72-18			float opt_info.depth
+	lde	=71b25,du
+	fno
+	fmp	lb|opt_info.slope,x4
+	fneg
+	fad	lb|opt_info.intercept,x4
+	fmp	bb|sys_info.fraction,x5	* fraction
+	fst	lb|opt_info.multiplier,x4
+	fcmp	=1.0,du			max (multiplier, 1.0)
+	tpl	0,x7			add_q return
+	fld	=1.0,du
+	fst	lb|opt_info.multiplier,x4	set to 1.0
+	tra	0,x7			add_q return
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	DEL_Q -- called with x3->quentry
+"
+"		Uses X1, X4, X5, EAQ, lb
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+del_q:	ldx4	bb|quentry.next,x3		get next pointer
+	lxl5	bb|quentry.prev,x3		is if head is previous
+	tnz	dq_mid
+	stx4	bb|devtab.wq+qht.head,x2	save new head
+	tra	dq_head_done
+dq_mid:	stx4	bb|quentry.next,x5		set previous's next
+dq_head_done:
+	cmpx4	0,du			test zero/non-zero
+	tnz	dq_not_tail
+	sxl5	bb|devtab.wq+qht.tail,x2	update tail
+	tra	dq_tail_done
+dq_not_tail:
+	sxl5	bb|quentry.prev,x4		update next's previous
+
+"     Compile queue loading statistics
+
+dq_tail_done:
+	lxl5	bb|devtab.wq+qht.depth,x2	decrement current depth
+	sbx5	1,du
+	sxl5	bb|devtab.wq+qht.depth,x2
+	tpnz	dq_with_queue
+	lda	=o400000,du		turn off device_queued bit
+	ldq	0,du
+	lrl	0,x0			X0 has PDI
+	eraq	all_ones			form mask
+	ansa	bp|disktab.dev_queued
+	ansq	bp|disktab.dev_queued+1
+
+"     compile system load stats.
+
+dq_with_queue:
+	lda	bb|quentry.type_word,x3	get type of IO
+	ars	quentry.type_shift
+	ana	quentry.type_mask,dl
+	eax1	0,al			save for opt_info subs
+
+	tsx4	lock_disk_data		lock for system update
+	ldx5	sys_info_subs,x1		x5 is sysp offset
+	ldx4	bb|sys_info.depth_map,x5	get mapped counter
+	fld	bb|0,x4			increment depth
+	fsb	=1.0,du
+	tpl	dq_pos_depth		Must stay positive
+	fld	=0.0,du
+dq_pos_depth:
+	fst	bb|0,x4
+
+"     Produce sys_info.fraction.  -(float (depth) - max_depth)/max_depth
+
+	fsb	bb|sys_info.max_depth,x5
+	fneg
+	tpl	dq_pos_fraction		fraction is positive
+	fld	=0.0,du			limit to 0.0
+dq_pos_fraction:
+	fdv	bb|sys_info.max_depth,x5
+	fst	bb|sys_info.fraction,x5
+	tsx4	unlock_disk_data	
+"     Produce multiplier.  -(float (depth) * slope) + intercept
+"     Final opt_info.multiplier is max (1.0, multiplier * sys_info.fraction)
+
+	lxl4	opt_info_subs,x1		x4 is optp offset in devtab
+	epplb	bb|0,x2			pointer to devtab
+	lxl1	lb|opt_info.depth,x4	decrement depth
+	sbx1	1,du
+	sxl1	lb|opt_info.depth,x4
+	eaa	0,x1			load into high A
+	lrs	72-18			float opt_info.depth
+	lde	=71b25,du
+	fno
+	fmp	lb|opt_info.slope,x4
+	fneg
+	fad	lb|opt_info.intercept,x4
+	fmp	bb|sys_info.fraction,x5	* sys_info.fraction
+	fst	lb|opt_info.multiplier,x4
+	fcmp	=1.0,du			max (multiplier, 1.0)
+	tpl	0,x6			add_wq return
+	fld	=1.0,du
+	fst	lb|opt_info.multiplier,x4	max to 1.0
+	tra	0,x6			add_wq_return
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	GETWORK -- find something to do.
+"		enter at gotwork if you already know what to do.
+"
+"		ap->chantabe
+"		bb->disk_seg
+"		bp->disktab
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+getwork:
+	lda	ap|chantab.in_use_word	 Return if channel not in use
+	cana	chantab.in_use,dl
+	tze	gw_ret
+
+	ldaq	bp|disktab.dev_queued 	See if any PDI with queue is not busy
+	cnaaq	bp|disktab.dev_busy 	Z = AQ & ^Y-pair
+	tze	gw_ret			Return if nothing to do
+
+"     Scan through all devices round-robin til one is found which is not
+"     busy, and has a queue.  We are looking at the primary device to
+"     determine not_busy and queued.
+
+	lxl5	bp|disktab.last_dev		get high drive number
+	stx5	temp1			in upper for cmpx
+	rccl	sys_info$clock_,*		get time for stagnate test
+	staq	test_time
+
+gw_dev.scan:
+	aos	bp|disktab.dev_index	device to examine
+	lxl4	bp|disktab.dev_index
+	cmpx4	temp1			see if over-run
+	tmoz	gw_dev.in_range
+	ldx4	bp|disktab.first_dev	reset index to first dev
+	sxl4	bp|disktab.dev_index
+
+gw_dev.in_range:
+	ldx4	devtab_subs,x4		subscript devtab (dev)
+	ldq	bp|devtab.pdi_word,x4	get PDI
+	equ	devtab.pdi_shift,0		PRESUMED 0
+"""""	qrs	devtab.pdi_shift
+	anq	devtab.pdi_mask,dl
+	eax0	0,ql			X0 is PDI
+	ldaq	bp|disktab.dev_busy		see if PDI is busy
+	lls	0,x0
+	tpl	gw_dev.not_busy		free for use
+gw_dev.check_done:
+	sbx5	1,du			count dev done
+	cmpx5	bp|disktab.first_dev	more to scan
+	tpl	gw_dev.scan
+	tra	gw_ret			done sub-system
+
+"     See if broken or without queue.
+
+gw_dev.not_busy:
+	ldx4	devtab_subs,x0		subscript devtab (pdi)
+	eax2	bp|0,x4			X2->DEVTABE
+	lxl4	bb|devtab.wq+qht.depth,x2	test depth of queue
+	tze	gw_dev.check_done		no work to do
+	ldq	bb|devtab.broken_word,x2	see if usable
+	anq	devtab.broken,du
+	tnz	gw_dev.check_done		skip this one
+
+	ldx3	bb|devtab.wq+qht.head,x2	get head of queue
+	cmpx4	1,dl
+	tze	gw_dev.this_request		take the only request
+	lda	bb|disk_data.stagnate_time	see if we are stagnating
+	lrs	36			full 71 bit time
+	adaq	bb|quentry.time,x3		plus queued time
+	sbaq	test_time			minus time now
+	tpl	gw_dev.seek		optimized nearest seek
+"
+"	COMB DEVICE FOR BEST REQUEST
+"		X0 = pdi
+"		X1 temp
+"		X2 -> devtabe
+"		X3 -> best_quentry
+"		X4 temp
+"		bb -> disk_seg
+"		bp -> disktab
+"		ap -> chantabe
+"
+
+gw_dev.comb:
+	aos	bb|devtab.comb,x2		count a comb done
+	lda	=o400000,du		best_neg_comb
+	sta	best_neg_comb
+	lda	=o377777,du		best_pos_comb
+	sta	best_seek	
+	stz	comb_qp			flag no best yet
+
+comb.scan:
+	ldq	bb|devtab.forward_word,x2	see if moving forward
+	lda	bb|quentry.cylinder_word,x3	get queued cylinder
+	ana	quentry.cylinder_mask
+	sba	bb|devtab.cylinder,x2
+	tze	gw_dev.this_request		take on-cylinder request
+	anq	devtab.forward,du		see if forward
+	tnz	comb.forward		yes - use queue-device
+	neg				" use device-queue
+comb.forward:
+	cmpa	0,dl			test direction
+	tmi	comb.move_reverse
+
+"     This move would be in the current direction.
+
+comb.move_forward:
+	cmpa	best_seek			see if shorter move
+	tpl	comb.skip			longer move
+	sta	best_seek
+	stx3	comb_qp			save forward best
+	tra	comb.skip
+
+"     This move would reverse our direction.
+
+comb.move_reverse:
+	cmpa	best_neg_comb		see if shorter move
+	tmi	comb.skip			longer move
+	sta	best_neg_comb
+	sxl3	comb_qp			save reverse best
+"	tra	comb.skip
+
+"     Continue scan of queue.
+
+comb.skip:
+	ldx3	bb|quentry.next,x3		get next element
+	tnz	comb.scan			continue scan
+
+	ldx3	comb_qp			see if forward was found
+	tnz	gw_dev.this_request		yes - do it
+	lxl3	comb_qp			take reverse which must be here
+	tra	gw_dev.this_request
+"
+"	FIND SHORTEST LOGICAL SEEK ON DEV
+"		X0 = pdi
+"		X1 = best_qp
+"		X2 -> devtabe
+"		X3 -> best_quentry
+"		X4 temp
+"		bb -> disk_seg
+"		bp -> disktab
+"		ap -> chantabe
+"		lb -> devtabe
+"
+
+gw_dev.seek:
+	fld	=1.0e30,du		high set best_seek
+	fst	best_seek
+	eax1	0,x3			best_qp
+	epplb	bb|0,x2			form devtabe pointer
+
+seek.scan:
+	lda	bb|quentry.type_word,x3	get type of request
+	ars	quentry.type_shift
+	ana	quentry.type_mask,dl
+	lxl5	opt_info_subs,al		subscript opt_info
+	lda	bb|quentry.cylinder_word,x3	find cylinder move
+	ana	quentry.cylinder_mask,dl
+	sba	lb|devtab.cylinder
+	tze	gw_dev.this_request		on-cylinder
+	tpl	seek.pos			take absolute
+	neg
+seek.pos:	lrs	36			float
+	lde	=71b25,du
+	fno
+	fmp	lb|opt_info.multiplier,x5	* multiplier
+	fcmp	best_seek			see if best seek
+	tpl	seek.worse		this one is worse
+	eax1	0,x3			save this entry as best
+	fst	best_seek			and the length
+
+seek.worse:
+	ldx3	bb|quentry.next,x3		check next entry
+	tnz	seek.scan
+
+"     The best seek is noted in X1, move to X3 and use it.
+
+	eax3	0,x1
+gw_dev.this_request:
+	tsx6	del_q			delete this request from Q
+"	tra	xfer_join
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	GOTWORK -- XFER JOIN  process a quentry
+"		X0 = pdi
+"		X2 -> devtabe (from pdi)
+"		X3 -> quentry
+"		X5 -> devtabe for actual device
+"		X7 is return address
+"		bb -> disk_seg
+"		bp -> disktab
+"		ap -> chantabe
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	equ	chantab.erct_shift,0	PRESUME=0
+
+gotwork:
+xfer_join:
+	lda	-chantab.erct_mask-1,dl	clear error count and qrp
+	ansa	ap|chantab.erct_word	zero qrp,erct leave command
+	stx3	ap|chantab.qrp		save quentry index for later
+
+	lda	bb|quentry.dev_word,x3
+	ars	quentry.dev_shift
+	ana	quentry.dev_mask,dl
+	sta	dev			save device number
+	als	idcw.device_shift		position dev in AU
+
+"     dev value in AU is used in gw_testing below.
+
+	equ	quentry.used_word,quentry.type_word
+	ldq	bb|quentry.used_word,x3
+	canq	quentry.used,du		DEBUG
+	tnz	*+2
+	oct	04			DEBUG Die Die Die
+	qrs	quentry.type_shift
+	anq	quentry.type_mask,dl
+	eax4	0,ql			io_type to x4
+	cmpq	TEST,dl			See if TEST io
+	tze	gw_testing
+
+	stca	ap|chantab.scdcw,20		use dev in AU
+	ora	=o740000,dl		(dcdcw) idcw.code=7 idcw.ext_ctl=1
+	sta	ap|chantab.dcdcw
+
+	lxl5	dev			get device
+	ldx5	devtab_subs,x5		subscript devtab
+	eax5	bp|0,x5			HENCE x5 -> real devtabe
+
+"     Determine if write IO by shifting the mask
+
+	lda	write_mapping,du
+	als	0,ql			io_type still QL
+	tpl	gw_read			if positive then read
+	lda	=o310000,du
+	tra	gw_rw_done
+gw_read:
+	lda	=o250000,du
+gw_rw_done:
+	stca	ap|chantab.dcdcw,40		I believe an orsa would do
+
+"dcdcwp->idcw.ext = quentry.coreadd
+	lda	bb|quentry.coreadd_word,x3
+	equ	MUST_BE_ZERO,quentry.coreadd_shift	PRESUMPTION
+	stca	ap|chantab.dcdcw,10
+
+"dddcwp->dcw.address = substr (quentry.coreadd,7)
+	als	18
+	stba	ap|chantab.dddcw,60
+
+	lda	bb|quentry.sector_word,x3	leave sector in A for gw_put_seldata
+	als	36-quentry.n_sectors_shift	mask for sectors
+	arl	36-quentry.n_sectors_shift
+	sta	ap|chantab.select_data
+
+" Check for 64 or 512 type seek use x1
+	ldx1	ap|chantab.scdcw
+          bool	seek_64_bit,040000	"34 = seek_64 (normal) 30 = seek_512 (ibm)
+	anx1	seek_64_bit,du
+	tnz	seek_64		" bit was on
+seek_512:
+" Check io type for file system standards
+	cmpx4	VTOC_WRITE,du
+	tpnz	not_stan
+	cmpx4	PAGE_WRITE,du
+	tmoz	page_512
+	ora	000100,du
+	stca	ap|chantab.select_data,20     " store sector limit
+	ldq	192,dl			" real vtoce size
+	stcq	ap|chantab.dddcw,03		" store tally
+	tra	seek_stats
+page_512:
+	ora	000200,du
+	stca	ap|chantab.select_data,20     " store sector limit
+	ldq	1024,dl
+	stcq	ap|chantab.dddcw,03		" store tally
+	tra	seek_stats
+not_stan: 
+	ldq	sector_mapping,du		io_type still in X4
+	qls	0,x4
+	tpl	not_sect_512		if positive then not sector
+
+" Formulate tally and select_data.limit 512
+
+	ldq	bb|quentry.n_sectors_word,x3
+	qrl	quentry.n_sectors_shift
+	stq	n_sectors
+	qls	chantab.limit_shift		align for sector limit
+	stq	n_sectors_temp
+	ada	n_sectors_temp		n_sectors + sector
+	ldq	n_sectors
+	qls	9			times 512
+	tra	sect_done_512
+not_sect_512:
+	ldq	1024,dl			page size is 1024 words
+	ada	=o000200,du		add in limit bit
+sect_done_512:
+	stcq	ap|chantab.dddcw,03		store tally
+put_seldata_512:
+	sta	ap|chantab.select_data
+	tra	seek_stats
+seek_64:	
+	ldq	sector_mapping,du		io_type still in X4
+	qls	0,x4
+	tpl	gw_not_sect		if positive then not sectorFormulate tally and select_data.limit
+
+	ldq	bb|quentry.n_sectors_word,x3
+	qrl	quentry.n_sectors_shift
+	stq	n_sectors
+	qls	chantab.limit_shift		align for sector limit
+	stq	n_sectors_temp
+	ada	n_sectors_temp		n_sectors + sector
+	ldq	n_sectors
+	qls	6			times 64
+	tra	gw_sect_done
+gw_not_sect:
+	ldq	1024,dl			page size is 1024 words
+	ada	=o002000,du		add in limit bit
+gw_sect_done:
+	stcq	ap|chantab.dddcw,03		store tally
+gw_put_seldata:
+	sta	ap|chantab.select_data
+
+"     Formulate seek statistics and seek direction.
+
+seek_stats: 
+	epplb	bb|0,x5			form devtab (dev) pointer
+	lxl4	opt_info_subs,x4		get opt_info subscript in devtab
+	lda	bb|quentry.cylinder_word,x3	get quentry.cylinder
+	ana	quentry.cylinder_mask,dl
+	sta	cylinder
+	sba	bb|devtab.cylinder,x2	subtract devtab.cylinder
+	tze	gw_seek_done		on-cylinder retain forward
+	tpl	gw_seek_fwd		seek from low to high
+gw_seek_back:				" seek from high to low
+	lcx1	devtab.forward+1,du		clear forward bit
+	ansx1	bb|devtab.forward_word,x2
+	neg				" take absolute cylinder move
+	tra	gw_seek_done
+	
+gw_seek_fwd:
+	ldq	devtab.forward,du
+	orsq	bb|devtab.forward_word,x2
+
+gw_seek_done:
+	asa	lb|opt_info.seek_sum_word,x4	sum seek lengths
+	aos	lb|opt_info.seek_count_word,x4	count seek done
+	lda	cylinder
+	sta	bb|devtab.cylinder,x2
+	epplb	ap|chantab.scdcw
+
+"     Perform the operation
+
+	tsx6	connect
+gw_ret:	tra	0,x7
+
+
+"TESTING HERE -- note dev for idcw in AU
+
+gw_testing:
+	stca	ap|chantab.rssdcw,20	use dev in AU
+	lda	bb|quentry.coreadd_word	get command from coreadd
+	ana	idcw.command_mask,dl	mask for command
+	als	30			shift to bits 0 - 5
+	stca	ap|chantab.rssdcw,40	in IDCW
+
+"     Statistics for TEST - io_type in X4
+
+	epplb	bb|0,x5			devtab (dev) pointer
+	lxl4	opt_info_subs,x4		convert type to subscript
+	cmpa	58,dl
+	tze	gw_testing.unload
+	aos	lb|opt_info.seek_count_word,x4	TEST
+	tra	gw_testing.connect
+gw_testing.unload:
+	aos	lb|opt_info.seek_sum_word,x4	UNLOAD
+
+gw_testing.connect:
+	epplb	ap|chantab.rssdcw
+	tsx6	connect
+	tra	gw_ret
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	CONNECT -- called via tsx6
+"
+"			X0 = pdi
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	even
+one_arg_nd:
+	zero	2,4
+	zero	0
+
+two_args_nd:
+	zero	4,4
+	zero	0
+
+nullptr:	its	-1,1
+
+" *********
+"
+" LB -> DCW list
+"
+connect:
+	sprilb	ima+io_manager_arg.listp
+	lda	ap|chantab.chx
+	sta	ima+io_manager_arg.chx
+	stz	ima+io_manager_arg.pcw
+	ldaq	nullptr
+	staq	ima+io_manager_arg.ptp
+
+	ldaq	one_arg_nd
+	staq	arglist
+	epplb	ima
+	sprilb	arglist+2
+	call	io_manager$connect_abs(arglist)
+
+	aos	ap|chantab.connects
+	lda	chantab.active,dl
+	orsa	ap|chantab.active_word
+	rccl	sys_info$clock_,*
+	staq	ap|chantab.connect_time
+	lda	=o400000,du
+	ldq	0,du
+	lrl	0,x0		leave PDI-th bit on
+	orsa	bp|disktab.dev_busy
+	orsq	bp|disktab.dev_busy+1
+	tra	0,x6		connect retns
+"
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	DISK_INTER  -- the interrupt side of the disk_dim
+"	This proc only processes the easy cases, those
+"	which do not involve errors or syserr messeage production.
+"	It is assumed that if this procedure did not exist, the
+"	pl1 version of the disk_dim could handle all cases
+"	properly.
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+evil_status_bits:
+	oct	002300000000
+
+	even
+simple_interrupt_criteria:
+	zero	0,chantab.active
+	zero	-1,-chantab.active-chantab.ioi_use-chantab.rsr-1
+
+	even
+all_ones:
+	vfd	36/-1
+	vfd	36/-1
+
+	even
+time_mod:	dec	1
+	dec	0
+
+disk_inter:
+	push			" get a stack frame
+	spriap	int_arg_list	" save arg list ptr
+	eppbb	disk_seg$		need bb in case of bailout
+
+	lxl5	ap|4,*		get interrupt level
+	cmpx5	3,du		only level = 3 (terminate) handled here
+	tnz	SLOW_INT
+
+" Each subsystem has a channel address space of dskdcl_chans_per_subsys.
+" If you divide the supplied channel idx by this you can arrive at the subsys
+" index.
+
+	lda	ap|2,*			get idx
+	lrs	dskdcl_chans_per_subsys_shift	sx = idx/#
+	tsx7	setup
+	qrl	36-dskdcl_chans_per_subsys_shift	put mod(idx,#) in the q
+	lxl4	chantab_subs,ql		subscript chantab
+	adx4	bp|disktab.channels		locate dynamic table
+	eppap	bb|0,x4			HENCEFORTH AP -> chantabe
+	eax4	disktab.int_lock_meters
+	tsx7	lock
+
+	lda	ap|chantab.statusp,*	get status
+
+	tze	NO_STATUS_TERM		someone else processed status (disk_control$run)
+
+"CHECK 1 AGAIN
+
+	tpl	UNLOCK_THEN_SLOW
+
+
+"CHECK 8 -- handle abnormal termination status
+	cana	bb|disk_data.status_mask
+	tnz	UNLOCK_THEN_SLOW
+
+"CHECK 9 -- Test for non-zero tally residue in DCW (DISCONTINUED)
+"CHECK 10 -- If controller performed EDAC or auto retry
+	cana	evil_status_bits
+	tnz	UNLOCK_THEN_SLOW
+
+	ldaq	simple_interrupt_criteria	pre-CHECKS 3&4&7
+	cmk	ap|chantab.active_word	test channel criteria
+	tnz	UNLOCK_THEN_SLOW
+
+"
+"CHECK 3 -- If status for ioi channel
+"CHECK 4 -- If channel not active scream bloody murder
+"CHECK 7 --If detailed status just read
+"
+	rccl	sys_info$clock_,*
+	staq	status_time
+
+"Now set needed registers pointing into disk_data seg
+	ldx3	ap|chantab.qrp		HENCEFORTH X3->quentry
+	lda	bb|quentry.pdi_word,x3
+	ars	quentry.pdi_shift		AL now has PDI
+	ana	quentry.pdi_mask,dl
+	eax0	0,al			HENCEFORTH X0 = PDI
+
+	ldx2	devtab_subs,x0		subscript devtab (pdi)
+	eax2	bp|0,x2			HENCEFORTH X2->devtabe
+"
+"CHECK 11 -- Was disk previously inoperative?
+	lda	bb|devtab.broken_word,x2
+	cana	devtab.broken+devtab.was_broken,du
+	tnz	UNLOCK_THEN_SLOW
+"
+" Must set sect_sw bootload_sw coreadd prior ercd before yielding quentry
+
+
+"CHECK 12 -- If was test then indicate test result
+
+	lda	bb|quentry.type_word,x3
+	ars	quentry.type_shift
+	ana	quentry.type_mask,dl
+	sta	io_type			io_type (DL) **
+	cmpa	TEST,dl
+	tze	UNLOCK_THEN_SLOW		Handle through pl1 DIM
+
+	ldq	sector_mapping,du		Determine if sector IO
+	qls	0,al			shift to sign bit
+	stq	sect_sw
+	ldq	bootload_mapping,du		" Determine if bce IO
+	qls	0,al
+	stq	bootload_sw
+	ldq	bb|quentry.coreadd_word,x3
+	qls	36-quentry.type_shift	isolate coreaddress
+	qrs	36-quentry.type_shift
+	stq	coreadd
+
+	stz	errcd
+
+"     WE MAY NEED TO SET LB->PVTE HERE ...
+
+"AT THIS POINT WE KNOW THAT NO ERROR OCCURED.
+"AT THIS POINT WE KNOW WE WILL NOT HAVE TO PRINT ANY MESSAGES.
+"AT THIS POINT WE MAY BEGIN TO MODIFY DISK_SEG TO REFLECT AN I/O COMPLETION.
+
+
+	lca	chantab.active+chantab.inop+1,dl
+	ansa	ap|chantab.active_word Indicate channel is no longer active|inop
+	lda	=o400000,du
+	ldq	0,du
+	lrl	0,x0			X0=PDI -- turn off PDI-th bit
+	eraq	all_ones
+	ansa	bp|disktab.dev_busy
+	ansq	bp|disktab.dev_busy+1
+
+	lcx4	devtab.inop+1,du
+	ansx4	bb|devtab.inop_word,x2	Clear the devtab.inop flag
+"Meter this i/o completion
+
+
+	lxl4	io_type			io_type in DL
+	lxl4	opt_info_subs,x4		subscript opt_info
+	epplb	bb|0,x2			devtab pointer (pdi)
+	rccl	sys_info$clock_,*
+	sbaq	ap|chantab.connect_time
+	adaq	lb|opt_info.channel_wait,x4	sum channel wait
+	staq	lb|opt_info.channel_wait,x4
+	rccl	sys_info$clock_,*
+	sbaq	bb|quentry.time,x3
+	adaq	lb|opt_info.queue_wait,x4	sum queue wait
+	staq	lb|opt_info.queue_wait,x4
+	lcx4	quentry.used+1,du		mask out used bit
+	ansx4	bb|quentry.used_word,x3
+
+	tsx7	add_free_q
+
+	tsx7	getwork
+
+	tsx7	unlock
+
+
+"	Post this io completion.
+
+	epplb	coreadd
+	sprilb	arglist+2
+	epplb	errcd
+	sprilb	arglist+4
+	ldaq	two_args_nd
+	staq	arglist
+
+	szn	sect_sw		Select posting means
+	tmi	sector_post
+	eppap	arglist
+	short_call page$done
+	return
+
+sector_post:
+	lda	bb|0,3
+	szn	bootload_sw
+	tmi	bootload_post
+	eppap	arglist
+	short_call vtoc_interrupt$vtoc_interrupt
+	return
+
+bootload_post:
+	eppap	arglist
+	short_call bootload_disk_post$bootload_disk_post
+	return
+
+
+"	SLOW INT -- UNLOCK_THEN_SLOW -- bail out of hard case
+
+UNLOCK_THEN_SLOW:
+	tsx7	unlock
+
+SLOW_INT:	aos	bb|disk_data.bail_outs	count a bail-out to PL1
+	eppap	int_arg_list,*		get back arg list ptr
+	short_call disk_control$disk_inter
+	return
+
+NO_STATUS_TERM:
+	aos	ap|chantab.no_status_terminate;
+	tsx7	unlock
+	return
+		
+"Constants for subscript calculations
+
+"     Subscript for sys and opt info.  Sys_info is DU, Opt_info is DL.
+"     sys_info is segment offset of sys_info (i), opt_info is devtab
+"     offset of opt_info (i).
+sec_per_rec: 
+	zero	0,0	" not used
+	zero	0,0	" not used      
+	zero	0,16	" 500
+	zero	0,16	" 451
+	zero	0,16	" 400
+	zero	0,16	" 190
+	zero	0,16	" 181
+	zero	0,16	" 501
+	zero	0,2	" 3380
+	zero	0,2	" 3390
+sys_info_subs:				" (0:MAX_IO_TYPE)
+opt_info_subs:
+	zero disk_data.sys_info+sys_info_size*0,devtab.opt_info+opt_info_size*0
+	zero disk_data.sys_info+sys_info_size*1,devtab.opt_info+opt_info_size*1
+	zero disk_data.sys_info+sys_info_size*2,devtab.opt_info+opt_info_size*2
+	zero disk_data.sys_info+sys_info_size*3,devtab.opt_info+opt_info_size*3
+	zero disk_data.sys_info+sys_info_size*4,devtab.opt_info+opt_info_size*4
+	zero disk_data.sys_info+sys_info_size*5,devtab.opt_info+opt_info_size*5
+	zero disk_data.sys_info+sys_info_size*6,devtab.opt_info+opt_info_size*6
+	zero disk_data.sys_info+sys_info_size*7,devtab.opt_info+opt_info_size*7
+
+
+"     Constants for channel table and devtab subscripting.  Current basis is
+"     the limit on either is 64.
+
+chantab_subs:			" straight subscript (1:64)
+devtab_subs:			" disktab.devtab subscript
+	zero disktab.devtab+devtab_size*00,chantab_size*00  " @ 1
+	zero disktab.devtab+devtab_size*01,chantab_size*01
+	zero disktab.devtab+devtab_size*02,chantab_size*02
+	zero disktab.devtab+devtab_size*03,chantab_size*03
+	zero disktab.devtab+devtab_size*04,chantab_size*04
+	zero disktab.devtab+devtab_size*05,chantab_size*05
+	zero disktab.devtab+devtab_size*06,chantab_size*06
+	zero disktab.devtab+devtab_size*07,chantab_size*07
+	zero disktab.devtab+devtab_size*08,chantab_size*08
+	zero disktab.devtab+devtab_size*09,chantab_size*09
+	zero disktab.devtab+devtab_size*10,chantab_size*10
+	zero disktab.devtab+devtab_size*11,chantab_size*11
+	zero disktab.devtab+devtab_size*12,chantab_size*12
+	zero disktab.devtab+devtab_size*13,chantab_size*13
+	zero disktab.devtab+devtab_size*14,chantab_size*14
+	zero disktab.devtab+devtab_size*15,chantab_size*15
+	zero disktab.devtab+devtab_size*16,chantab_size*16
+	zero disktab.devtab+devtab_size*17,chantab_size*17
+	zero disktab.devtab+devtab_size*18,chantab_size*18
+	zero disktab.devtab+devtab_size*19,chantab_size*19
+	zero disktab.devtab+devtab_size*20,chantab_size*20
+	zero disktab.devtab+devtab_size*21,chantab_size*21
+	zero disktab.devtab+devtab_size*22,chantab_size*22
+	zero disktab.devtab+devtab_size*23,chantab_size*23
+	zero disktab.devtab+devtab_size*24,chantab_size*24
+	zero disktab.devtab+devtab_size*25,chantab_size*25
+	zero disktab.devtab+devtab_size*26,chantab_size*26
+	zero disktab.devtab+devtab_size*27,chantab_size*27
+	zero disktab.devtab+devtab_size*28,chantab_size*28
+	zero disktab.devtab+devtab_size*29,chantab_size*29
+	zero disktab.devtab+devtab_size*30,chantab_size*30
+	zero disktab.devtab+devtab_size*31,chantab_size*31
+	zero disktab.devtab+devtab_size*32,chantab_size*32
+	zero disktab.devtab+devtab_size*33,chantab_size*33
+	zero disktab.devtab+devtab_size*34,chantab_size*34
+	zero disktab.devtab+devtab_size*35,chantab_size*35
+	zero disktab.devtab+devtab_size*36,chantab_size*36
+	zero disktab.devtab+devtab_size*37,chantab_size*37
+	zero disktab.devtab+devtab_size*38,chantab_size*38
+	zero disktab.devtab+devtab_size*39,chantab_size*39
+	zero disktab.devtab+devtab_size*40,chantab_size*40
+	zero disktab.devtab+devtab_size*41,chantab_size*41
+	zero disktab.devtab+devtab_size*42,chantab_size*42
+	zero disktab.devtab+devtab_size*43,chantab_size*43
+	zero disktab.devtab+devtab_size*44,chantab_size*44
+	zero disktab.devtab+devtab_size*45,chantab_size*45
+	zero disktab.devtab+devtab_size*46,chantab_size*46
+	zero disktab.devtab+devtab_size*47,chantab_size*47
+	zero disktab.devtab+devtab_size*48,chantab_size*48
+	zero disktab.devtab+devtab_size*49,chantab_size*49
+	zero disktab.devtab+devtab_size*50,chantab_size*50
+	zero disktab.devtab+devtab_size*51,chantab_size*51
+	zero disktab.devtab+devtab_size*52,chantab_size*52
+	zero disktab.devtab+devtab_size*53,chantab_size*53
+	zero disktab.devtab+devtab_size*54,chantab_size*54
+	zero disktab.devtab+devtab_size*55,chantab_size*55
+	zero disktab.devtab+devtab_size*56,chantab_size*56
+	zero disktab.devtab+devtab_size*57,chantab_size*57
+	zero disktab.devtab+devtab_size*58,chantab_size*58
+	zero disktab.devtab+devtab_size*59,chantab_size*59
+	zero disktab.devtab+devtab_size*60,chantab_size*60
+	zero disktab.devtab+devtab_size*61,chantab_size*61
+	zero disktab.devtab+devtab_size*62,chantab_size*62
+	zero disktab.devtab+devtab_size*63,chantab_size*63
+	zero disktab.devtab+devtab_size*64,chantab_size*64
+"
+	include	device_error
+	include	disk_error_interp
+	include	io_manager_dcls
+	include	iom_ctl_words
+
+" sectors per record must be used in seek calculations and are indexed by the pvte dev_type
+
+"
+	include	dskdcl
+"
+	include	pvte
+
+	end

@@ -1,0 +1,1084 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/* Dumps a branch to tape and, optionally, dumps the contents of the subtree if the branch is a directory */
+
+
+/*   Modified: 10 January 1972 by A. Kobziar to use special status entry instead of branch_info for actime,actind
+     Modified: 01 March 1973 by A. Downing to make all calls to (area_,alloc_,freen_) be made to the old area package
+     Modified: 15 December 1974 by A. Kobziar to set up sec_directory_list record with security info
+     Modified: April 1976 by R. Bratt for tpd stuff and pv dump
+     Modified: September 1976 by R. Bratt to no longer terminate directories
+     Modified: ? by B. Greenberg for VTOC errors
+     Modified: 26 June 1979 by S. Herbst to make incremental dumps ignore ring-0 entries
+     Modified: 17 November 1980 by G. Palter to honor bk_ss_$no_primary and to always sort branches to allow restart bit to
+     work properly
+     Modified: 24 February 1981 by S. Herbst to retry dump twice after error_table_$device_attention
+     Modified: 1 July 1981 by S. Herbst to add support -setdtd and -nosetdtd
+     Modified: 4 August 1981 by G. Palter to properly handle dumping of top-level directories in the control file
+     Modified: July 1982 by G. Palter to add features for IMFT support of AIM: enforce a maximum access class for dumping,
+     refuse to dump upgraded directories, and check a user's effective access to each branch before dumping
+     Modified: February 1983 by E. N. Kittlitz for 256K segs
+     Modified: August 1983 by Robert Coren to enforce minimum access class for dumping
+     Modified: November 1983 by Robert Coren to upgrade object access class to user's authorization if requested
+     Modified 1985-03-21, BIM: fixed prehistoric busted condition handler.
+     -------- -- Fixed not to force access in no-reload mode.
+     phx17078 -- bks is not correctly zeroed.
+     phx18650 -- does not reset transparency switches.
+     phx17329 -- mishandling empty acls.
+     phx17310 -- unitialized variables in cross-dumping.
+     phx16651 -- rqovers on the map do not always get to level 2.
+     phx13714 -- catching command_
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-16,Lippard), approve(86-06-02,MCR7427),
+     audit(86-06-16,Farley), install(86-06-17,MR12.0-1077):
+      To not use status_for_backup.(actime actind).
+  2) change(86-10-15,GWMay), approve(86-10-15,MCR7320), audit(86-11-19,GDixon),
+     install(86-11-21,MR12.0-1223):
+     changed to return a fatal error to the caller when a tape error occurs.
+  3) change(87-07-15,GDixon), approve(87-07-15,MCR7617),
+     audit(87-07-16,RBarstad), install(87-07-16,MR12.1-1040):
+     Modified for change to backup_record_types.incl.pl1.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+
+backup_dump_recurse: proc (A_cross_dump_dn,
+		       A_cross_dump_en,
+		       P_force_dump,
+		       Sfatal_error,
+		       A_code);
+
+dcl  P_force_dump bit (1) aligned parameter;		/* ON => dump this entry no matter what */
+
+dcl  A_code fixed binary (35);			/* returned non-zero if dump aborted */
+
+dcl  Sfatal_error bit (1) aligned;			/* used to signal a fatal tape error */
+						/* there are other errors which will */
+						/* stop only the current line in the */
+						/* control file from being dumped    */
+						/* For those, the flag should not be set */
+
+dcl  (i, j, used) fixed binary,			/* temporary storage */
+     retry_count fixed bin,
+     code fixed bin (35),
+     ignore fixed bin (35),				/* ignored error code */
+     found fixed bin,				/* Used in restarting a dump */
+     (havent_output_dirname, found_object) bit (1) aligned,
+     (bc, lc, dircount, curl, name_len) fixed binary,
+     (np, bp, lp, hnp, hbp, aclp, ix, jx) pointer,
+     pp pointer,			                    /* used within an incl file       */
+     nssp ptr,					/* -> bk_nss_info struct, in area */
+     dqip ptr,					/* -> bk_dq_info struct, in area */
+     (dtd, dtu, dtem, dtsm, cutoff_time) fixed binary (52), /* Temporaries for date-time values. */
+     blocks fixed binary (9),
+     ring fixed bin (3),
+     ac_stg char (256),				/* converted access class */
+     ac_stg_octal character (32) aligned,
+     name_line char (200),				/* dir name followed by access class */
+     sv_label label;
+
+dcl  (A_cross_dump_dn, cross_dump_dn, restore_dn) char (168);
+dcl  (A_cross_dump_en, cross_dump_en, restore_en, temp_en) char (32);
+dcl  (restore_dlen, restore_elen) fixed bin;
+
+dcl  (
+     incr_sw,
+     incr_sw_set init ("0"b)
+     ) bit (1) int static;
+
+dcl  initialize static bit (1) initial ("1"b),		/* Static storage. */
+     (header_areap, list_areap, hdp) static pointer,	/* Pointers to selected items in headers. */
+     br_size fixed binary static,			/* Number of words in branch info. */
+     1 ksta aligned like kst_attributes static;
+
+dcl  mover (curl) based;				/* For fast block moves. */
+
+dcl  (
+     error_table_$ai_restricted,
+     error_table_$device_attention,
+     error_table_$segknown,
+     error_table_$moderr,
+     error_table_$noentry,
+     error_table_$root
+     ) fixed binary (35) external;			/*  error code. */
+
+dcl  sys_info$seg_size_256K fixed bin (19) external,
+     sys_info$page_size fixed bin ext static,
+     max_length_list_area fixed bin (19) static,
+     max_length_header_area fixed bin (19) static;
+
+dcl  old_alloc_ entry (fixed bin, ptr, ptr),
+     old_area_ entry (fixed bin (19), ptr),
+     mdc_$find_volname entry (bit (36) aligned, char (*) aligned, char (*) aligned, fixed bin (35)),
+     aim_check_$greater_or_equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned),
+     convert_authorization_$to_string_short entry (bit (72) aligned, char (*), fixed bin (35)),
+     convert_aim_attributes_ entry (bit (72) aligned, char (32) aligned),
+     expand_pathname_ entry (char (*), char (*) aligned, char (*) aligned, fixed bin (35)),
+     (
+     hcs_$list_acl,
+     hcs_$list_dir_acl
+     ) ext entry (char (*) aligned, char (*) aligned, ptr, ptr, ptr, fixed bin, fixed bin (35)),
+     hcs_$get_max_length entry (char(*), char(*), fixed bin(19), fixed bin(35)),
+     hcs_$get_max_length_seg entry (ptr, fixed bin(19), fixed bin(35)),
+     hcs_$get_user_effmode entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35)),
+     hcs_$initiate
+	entry (char (*) aligned, char (*) aligned, char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35)),
+     hcs_$list_dir entry (char (*) aligned, (*) fixed bin, ptr, fixed bin, ptr, fixed bin, fixed bin (35)),
+     hcs_$quota_get
+	entry (char (*) aligned, fixed bin, fixed bin (35), fixed bin (35), fixed bin, fixed bin (1), fixed bin,
+	fixed bin (35)),
+     hcs_$dir_quota_read
+	entry (char (*) aligned, fixed bin, fixed bin (71), bit (36) aligned, fixed bin, fixed bin (1), fixed bin,
+	fixed bin (35)),
+     hcs_$get_access_class entry (char (*) aligned, char (*) aligned, bit (72) aligned, fixed bin (35)),
+     hcs_$status_long entry (char (*) aligned, char (*) aligned, fixed bin (1), ptr, ptr, fixed bin (35)),
+     pathname_ entry (char (*), char (*)) returns (char (168)),
+     phcs_$deactivate entry (ptr, fixed bin (35)),
+     hphcs_$set_kst_attributes entry (fixed bin (17), ptr, fixed bin (35)),
+     hphcs_$set_backup_dump_time entry (char (*) aligned, char (*) aligned, fixed bin (52), fixed bin (35)),
+     hcs_$terminate_noname entry (ptr, fixed bin (35)),
+     hcs_$list_inacl_all entry (char (*) aligned, ptr, ptr, ptr, fixed bin (35)),
+     hcs_$status_for_backup entry (char (*) aligned, char (*) aligned, ptr, fixed bin (35)),
+     ioa_$rsnnl entry options (variable);
+
+dcl  infoptr ptr;
+
+dcl  1 inacl_info based aligned,
+       2 sia_relp (0:7) bit (18),
+       2 sia_count (0:7) fixed bin,
+       2 dia_relp (0:7) bit (18),
+       2 dia_count (0:7) fixed bin;
+
+%include status_for_backup;
+
+dcl  1 bks aligned automatic like status_for_backup;
+
+dcl  backup_map_$detail_line2
+	entry (char (32) aligned, fixed bin (9), char (10) aligned, fixed bin (52), fixed bin (52), fixed bin (52),
+	fixed bin (52), fixed bin (52)),
+     backup_map_$error_line entry () options (variable),
+     backup_map_$fs_error_line entry (fixed bin (35), char (*) aligned, char (*) aligned, char (*) aligned),
+     (
+     backup_map_$directory_line,
+     backup_map_$name_line
+     ) entry (ptr, fixed bin),
+     bk_output$wr_tape entry (ptr, fixed bin (18), ptr, fixed bin, fixed bin (35));
+dcl  sort_branches entry (ptr, fixed bin) external;
+dcl  (addr, addrel, baseno, binary, bit, divide, fixed, index, length) builtin;
+dcl  (max, min, null, pointer, ptr, rel, rtrim, substr, unspec) builtin;
+dcl  clock builtin;
+dcl  size builtin;	
+
+
+
+/*	INITIALIZE	*/
+
+	if initialize then do;			/* Is this the first time? */
+	     bp = null;				/* Compute branch info size. */
+	     br_size = fixed (rel (addr (bp -> br (2))), 18) - fixed (rel (bp), 18);
+	     header_areap = addr (bk_ss_$hp -> h.list_area);
+						/* Compute pointers to areas in headers. */
+	     list_areap = addr (bk_ss_$areap -> h.list_area);
+						/* .. */
+	     call hcs_$get_max_length_seg (list_areap, max_length_list_area, code);
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "get_max_length_seg", "list_areap", "");
+		go to terminate_dump;
+	     end;
+	     call hcs_$get_max_length_seg (header_areap, max_length_header_area, code);
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "get_max_length_seg", "header_areap", "");
+		go to terminate_dump;
+	     end;
+	     hdp = addr (bk_ss_$hp -> h.dname);		/* Get pointer to directory name. */
+	     bk_ss_$areap -> h.elen = 0;		/* No entry name in "directory list" records. */
+	     bk_ss_$areap -> h.ename = "";
+	     bk_ss_$areap -> h.record_type = ndc_directory_list;
+						/* Set up type code. */
+	     unspec (ksta) = "0"b;
+	     ksta.set.tms, ksta.value.tms = "1"b;
+	     ksta.set.tus, ksta.value.tus = "1"b;
+	     ksta.set.tpd, ksta.value.tpd = "1"b;
+	     ksta.set.explicit_deactivate_ok, ksta.value.explicit_deactivate_ok = "1"b;
+	     ksta.set.allow_write = "1"b;
+	     ksta.value.allow_write = "0"b;
+	     initialize = ""b;
+	end;
+
+	retry_count = 0;
+retry_dump:
+	cross_dump_dn = A_cross_dump_dn;
+	cross_dump_en = A_cross_dump_en;
+	A_code = 0;
+	havent_output_dirname = "1"b;
+	bk_ss_$hp -> h.elen = 0;			/* Reset entry name to null. */
+	bk_ss_$hp -> h.ename = "";
+	sv_label = bk_ss_$err_label;			/* save previous error return label */
+	bk_ss_$err_label = dump_rtn;			/* set up error return label variable */
+	call old_area_ (max_length_list_area - 128, list_areap);
+						/* initialize empty area */
+	bk_ss_$areap -> h.dtd = clock ();		/* Get time data gathered. */
+	bk_ss_$error = 2;				/* Inform idump_signal to expect signals. */
+
+/* LIST THE DIRECTORY	*/
+
+	call hcs_$list_dir (bk_ss_$hp -> h.dname, bk_ss_$areap -> h.list_area, bp, bc, lp, lc, code);
+	bk_ss_$error = 0;				/* Signals are now fatal again. */
+	if code ^= 0 then do;
+	     call backup_map_$fs_error_line (code, "list_dir", bk_ss_$hp -> h.dname, "");
+	     if bk_ss_$tapesw | bk_ss_$mapsw then go to dump_rtn;
+						/* Are we still doing something? */
+terminate_dump:
+	     if code = error_table_$device_attention & retry_count < 3 then do;
+		retry_count = retry_count + 1;
+		go to retry_dump;
+	     end;
+	     if code = 0 then code = 1;
+	     A_code = code;
+	     go to dump_rtn;
+	end;
+
+	if bk_ss_$namesw then do;			/* we are dumping only a single record */
+	     found_object = "0"b;
+	     go to do_it;
+	end;
+	if bk_ss_$pvsw then go to do_it;		/*  only dump segments for pv dump */
+	if bk_ss_$restart_dumpsw then do;		/* Find comparison name for restart */
+	     found = 0;
+	     i = index (substr (bk_ss_$restart_path, bk_ss_$rlen + 1, bk_ss_$restart_plen), ">");
+						/* Find next ">" */
+	     if i > 0 then do;			/* Found one */
+		bk_ss_$ename = substr (bk_ss_$restart_path, bk_ss_$rlen + 1, i - 1);
+						/* Save compare name */
+		bk_ss_$rlen = bk_ss_$rlen + i;	/* Reset restart length */
+	     end;
+	     else do;
+		bk_ss_$ename = substr (bk_ss_$restart_path, bk_ss_$rlen + 1, bk_ss_$restart_plen - bk_ss_$rlen);
+		bk_ss_$rlen = 0;			/* This signals last name */
+	     end;
+	end;
+
+	cross_dump_dn = pathname_ (A_cross_dump_dn, A_cross_dump_en);
+
+	if bk_ss_$tapesw then do;			/* Is tape writing enabled? */
+	     bk_ss_$areap -> h.dlen = bk_ss_$hp -> h.dlen;/* Copy directory name */
+	     bk_ss_$areap -> h.dname = bk_ss_$hp -> h.dname;
+	     if bc > 0 then bk_ss_$areap -> h.bp = rel (bp);
+						/* Set up pointers in header if not garbage. */
+	     bk_ss_$areap -> h.bc = bc;		/* Set up counts. */
+	     if lc > 0 then bk_ss_$areap -> h.lp = rel (lp);
+	     bk_ss_$areap -> h.lc = lc;
+	     bk_ss_$areap -> h.aclc = 0;		/* Indicate no CACL. */
+	     bk_ss_$areap -> h.aclp = ""b;
+
+/* GET ACCESS CLASS AND VOLUME INFO */
+
+	     bk_ss_$areap -> h.nss_info_relp = "0"b;
+	     bk_ss_$error = 20;
+
+	     unspec (bks) = ""b;
+	     bks.version = status_for_backup_version_2;
+
+	     call hcs_$status_for_backup (bk_ss_$hp -> h.dname, "", addr (bks), code);
+						/* get access class */
+	     bk_ss_$error = 0;
+	     if code ^= 0 then
+		if code = error_table_$root then do;
+		     bks.access_class = "0"b;		/* root starts low */
+		     bks.switches.multiple_class = "0"b;
+		end;
+		else do;
+		     call backup_map_$fs_error_line (code, "hcs_$status_for_backup", bk_ss_$hp -> h.dname, "");
+		     go to terminate_dump;
+		end;
+	     else do;
+		curl = size (bk_nss_info);
+		call old_alloc_ (curl, list_areap, nssp);
+		bk_ss_$areap -> h.nss_info_relp = rel (nssp);
+		nssp -> bk_nss_info.version = 1;
+		nssp -> bk_nss_info.lvid = bks.lvid;
+		nssp -> bk_nss_info.pvid = bks.pvid;
+		call mdc_$find_volname (bks.pvid, nssp -> bk_nss_info.pvname, nssp -> bk_nss_info.lvname, ignore);
+	     end;
+
+	     if bk_ss_$upgrade_to_user_auth then	/* dump segment at user's authorization (hopefully >= access class) */
+		bks.access_class = bk_ss_$user_authorization;
+
+	     bk_ss_$areap -> h.switches = bks.switches;
+	     bk_ss_$areap -> h.access_class = bks.access_class;
+	     bk_ss_$areap -> h.status_version = bks.version;
+						/* pass thru version for reloader */
+
+/* GET THE INITIAL ACLS */
+
+	     infoptr = addr (bk_ss_$areap -> h.inaclp (0));
+	     bk_ss_$error = 4;
+	     call hcs_$list_inacl_all (bk_ss_$hp -> h.dname, list_areap, aclp, infoptr, code);
+	     bk_ss_$error = 0;
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "hcs_$list_inacl_all", bk_ss_$hp -> h.dname, "");
+		if ^(bk_ss_$tapesw | bk_ss_$mapsw) then go to terminate_dump;
+		unspec (infoptr -> inacl_info) = ""b;
+	     end;
+	     else do;				/* make ia_relp's relative to base of seg */
+		do ring = 0 to 7;
+		     if infoptr -> inacl_info.sia_count (ring) ^= 0 then
+			infoptr -> inacl_info.sia_relp (ring) =
+			     rel (addrel (aclp, infoptr -> inacl_info.sia_relp (ring)));
+		     if infoptr -> inacl_info.dia_count (ring) ^= 0 then
+			infoptr -> inacl_info.dia_relp (ring) =
+			     rel (addrel (aclp, infoptr -> inacl_info.dia_relp (ring)));
+		end;
+	     end;
+
+/* GET QUOTA AND ACCOUNTING INFO. */
+
+	     bk_ss_$error = 6;			/* Set up to try error recovery. */
+	     call hcs_$quota_get (bk_ss_$hp -> h.dname, bk_ss_$areap -> h.quota, bk_ss_$areap -> h.trp,
+		bk_ss_$areap -> h.tlu, bk_ss_$areap -> h.inf_acct, bk_ss_$areap -> h.term_acct, used, code);
+	     bk_ss_$error = 0;			/* Clear recovery indicator. */
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "quota_get", bk_ss_$hp -> h.dname, "");
+		bk_ss_$areap -> h.quota, bk_ss_$areap -> h.trp, bk_ss_$areap -> h.tlu, bk_ss_$areap -> h.inf_acct,
+		     bk_ss_$areap -> h.term_acct = 0;
+	     end;
+	     curl = size (bk_dq_info);
+	     call old_alloc_ (curl, list_areap, dqip);	/* make room for dirquota */
+	     bk_ss_$areap -> h.dq_info_relp = rel (dqip); /* set relp for reloader */
+	     dqip -> bk_dq_info.version = 1;
+	     bk_ss_$error = 21;			/* Set up to try error recovery. */
+	     call hcs_$dir_quota_read (bk_ss_$hp -> h.dname, dqip -> bk_dq_info.quota, dqip -> bk_dq_info.ltrp,
+		dqip -> bk_dq_info.tlu, dqip -> bk_dq_info.inf_acct, dqip -> bk_dq_info.term_acct, used, code);
+	     bk_ss_$error = 0;			/* Clear recovery indicator. */
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "dir_quota_read", bk_ss_$hp -> h.dname, "");
+		bk_ss_$areap -> h.dq_info_relp = ""b;
+	     end;
+
+/* WRITE OUT THE PREAMBLE, LIST_DIR AND ACCOUNTING INFO for a DIRECTORY */
+
+	     cross_dump_en = "";
+	     call output (bk_ss_$areap, null, 0, code);
+	     if code ^= 0 then go to terminate_dump;
+	end;
+
+	if bk_ss_$mapsw then do;			/* if map option is on */
+	     if ^bk_ss_$tapesw then do;		/* get access class if -notape */
+		call hcs_$get_access_class (bk_ss_$hp -> h.dname, "", bks.access_class, code);
+		if code ^= 0 then bks.access_class = "0"b;
+	     end;
+	     if bks.access_class ^= "0"b then do;	/* format access class */
+		call convert_authorization_$to_string_short (bks.access_class, ac_stg, code);
+		if code ^= 0 then do;		/* couldn't get the conversion */
+		     call convert_aim_attributes_ (bks.access_class, ac_stg_octal);
+		     ac_stg = ac_stg_octal;
+		end;
+		call ioa_$rsnnl ("^a[ac:^a]", name_line, name_len, bk_ss_$hp -> h.dname, ac_stg);
+		call directory_line (addr (name_line), name_len);
+	     end;
+	     else call directory_line (hdp, bk_ss_$hp -> h.dlen);
+	end;
+
+/* PROCESS THE BRANCHES */
+
+do_it:
+	if bc >= 15 then
+	     call sort_branches (bp, bc);		/* sort the branches in order of primary name */
+	else call sort_small (bp, bc);
+
+	bk_ss_$err_label = skip_branch;		/* Set up label for skipping segments. */
+	bk_ss_$hp -> h.lp = ""b;			/* Reset link pointer. */
+	bk_ss_$hp -> h.lc = 0;			/* Reset link count. */
+	bk_ss_$hp -> h.bc = 1;			/* Set branch count. */
+	dircount = 0;
+
+	if ^incr_sw_set then do;
+	     if bk_ss_$myname ^= "backup_dump" & bk_ss_$myname ^= "backup_dump_" then
+		incr_sw = "1"b;
+	     else incr_sw = "0"b;
+	     incr_sw_set = "1"b;
+	end;
+
+/* GET TIMES AND COMPARE FOR OUTPUTTING */
+
+	do i = 1 to bc;				/* scan through all branches */
+	     ix = pointer (bp, bp -> br (i).ix);	/* Get effective index. */
+	     np = pointer (bp, ix -> br (1).namerp);	/* Get pointer to names. */
+	     if bk_ss_$namesw			/* Are we looking to dump a single branch? */
+	     then do;
+		do j = 1 to binary (ix -> br (1).nnames, 17, 0);
+		     if (bk_ss_$ename = np -> name (j).string) then do;
+			found_object = "1"b;
+			go to dump_me;
+		     end;
+		end;
+		go to skip_branch;			/* here iff no match */
+	     end;
+	     else if bk_ss_$restart_dumpsw		/* only if dumping more than branches */
+		then
+		if bk_ss_$ename > np -> name (1).string then go to skip_branch;
+						/* skip all already dumped */
+		else if found > 0			/* Passed dir or branches already dumped */
+		     then
+		     if ^ix -> br (1).dirsw then
+			go to skip_branch;		/* only want dirs till last level */
+		     else ;
+		else if bk_ss_$ename = np -> name (1).string
+						/* Found it? */
+		     then
+		     if bk_ss_$rlen = 0 then
+			bk_ss_$restart_dumpsw = ""b;	/* Done restarting, normal dump */
+		     else found = 1;		/* Found it but continue restart to lower level */
+		else if bk_ss_$rlen = 0 then bk_ss_$restart_dumpsw = ""b;
+						/* Done restarting */
+		else found = 2;			/* Didn't find name, beyond it. Bad dir. End restart */
+
+dump_me:
+	     if incr_sw then			/* incremental dumps ignore ring 0 */
+		if ix -> br (1).rb2 = "0"b then go to skip_branch;
+	     if ix -> br (1).vtoc_error then
+		begin;				/* handle vtoc error case */
+
+dcl  1 brst like branch_status aligned;
+dcl  mxl fixed bin (19);
+dcl  cleanup condition;
+
+		on cleanup ;			/* Force non-quick */
+
+		np = ptr (bp, ix -> br (1).namerp);	/* Get names ptr */
+		bk_ss_$error = 40;
+		call hcs_$status_long (bk_ss_$hp -> h.dname, np -> name (1).string, 0, addr (brst), null (), code);
+		bk_ss_$error = 0;
+		if code = 0 then do;		/* Lucked out */
+		     ix -> br (1).cl = bit (fixed (fixed (brst.current_length, 12), 9), 9);
+		     ix -> br (1).dtu = brst.date_time_used;
+		     ix -> br (1).dtm = brst.date_time_modified;
+		     call hcs_$get_max_length ((bk_ss_$hp -> h.dname), (np -> name (1).string), mxl, code);
+		     if code = 0 then ix -> br (1).ml = bit (divide (mxl, sys_info$page_size, 9, 0), 9);
+		end;
+		if code ^= 0 then do;		/* Could be bad from max-length */
+		     call backup_map_$fs_error_line (code, "VTOCE error on segment", bk_ss_$hp -> h.dname,
+			np -> name (1).string);
+		     go to skip_branch;
+		end;
+	     end;
+	     if bk_ss_$pvsw & ix -> br (1).dirsw then do; /* skip dirs on pvdump (must still count) */
+		dircount = dircount + 1;
+		go to skip_branch;
+	     end;
+	     dtem = fixed (ix -> br (1).dtbm, 52);	/* Extract modification times. */
+	     dtsm = fixed (ix -> br (1).dtm, 52);
+	     dtd = fixed (ix -> br (1).dtd, 52);	/* Extract time last dumped. */
+	     ix -> br (1).dump_me = ""b;		/* Clear dump indicator. */
+	     if bk_ss_$datesw then do;		/* Are we dumping by date? */
+		if bk_ss_$dtdsw then		/* Are we dumping by dtd as well? */
+		     cutoff_time = min (bk_ss_$date, dtd);
+						/* Get earliest cutoff time. */
+		else cutoff_time = bk_ss_$date;	/* By date, get it. */
+		go to compare;			/* Go compare criteria. */
+	     end;
+	     if bk_ss_$dtdsw then do;			/* Are we dumping only by dtd? */
+		cutoff_time = dtd;			/* Get cutoff time. */
+compare:
+		if ^P_force_dump then		/* don't have to dump this branch unless ... */
+		     if max (dtem, dtsm) < cutoff_time then go to skip_branch;
+	     end;					/* ... it has changed since last time */
+
+/* STORE RECORD TYPE IN PREAMBLE HEADER */
+
+	     if bk_ss_$enforce_max_access_class | bk_ss_$enforce_min_access_class | bk_ss_$dont_dump_upgraded_dirs
+		| bk_ss_$check_effective_access then
+		call perform_access_checks ();	/* only returns if OK ... */
+
+	     ix -> br (1).dump_me = "1"b;		/* Dumpable, set indicator. */
+	     if ix -> br (1).dirsw then do;		/* Is this a directory? */
+		dircount = dircount + 1;		/* Count directory branches. */
+		bk_ss_$hp -> h.record_type = sec_dir;	/* Insert record type in header. */
+	     end;
+	     else bk_ss_$hp -> h.record_type = sec_seg;	/* Insert record type in header. */
+	     blocks =
+		min (fixed (ix -> br (1).cl, 9),
+		divide (sys_info$seg_size_256K + sys_info$page_size - 1, sys_info$page_size, 17, 0));
+						/* Get current length (in 1024-word blocks) */
+	     nnames = fixed (ix -> br (1).nnames, 17);	/* Extract number of names. */
+	     bk_ss_$hp -> h.dtd = clock ();		/* Get time this branch processed. */
+
+/* SET UP THE PREAMBLE */
+
+	     call old_area_ (max_length_header_area - 128, header_areap);
+						/* Reset and reinitialize buffer area. */
+	     call old_alloc_ (br_size, header_areap, hbp);/* Make room for branch in preamble. */
+	     bk_ss_$hp -> h.bp = rel (hbp);		/* Insert pointer to it in preamble. */
+	     curl = br_size;
+	     hbp -> mover = ix -> mover;		/* Compute number of words taken by name array. */
+	     curl = fixed (rel (addr (np -> name (nnames + 1))), 18) - fixed (rel (np), 18);
+	     call old_alloc_ (curl, header_areap, hnp);	/* Make room for the names. */
+	     hbp -> br (1).namerp = rel (hnp);		/* Insert pointer to name list. */
+	     hnp -> mover = np -> mover;
+
+	     if bk_ss_$namesw & bk_ss_$no_primary then do;/* put on tape name user supplied */
+		bk_ss_$hp -> h.elen = length (rtrim (bk_ss_$ename));
+		bk_ss_$hp -> h.ename = bk_ss_$ename;
+	     end;
+	     else do;
+		bk_ss_$hp -> h.elen = length (rtrim (np -> name (1).string));
+		bk_ss_$hp -> h.ename = np -> name (1).string;
+	     end;
+
+	     bk_ss_$hp -> h.nss_info_relp = ""b;	/* assume volid's not known */
+	     bk_ss_$error = 11;			/* Enable error recovery attempt */
+
+	     unspec (bks) = ""b;
+	     bks.version = status_for_backup_version_2;
+
+	     call hcs_$status_for_backup (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, addr (bks), code);
+	     bk_ss_$error = 0;			/* Disable error recovery */
+	     if code ^= 0 then do;
+		call backup_map_$fs_error_line (code, "hcs_$status_for_backup", bk_ss_$hp -> h.dname,
+		     bk_ss_$hp -> h.ename);		/* Now zero or default all fields */
+		unspec (bks) = ""b;
+		bks.author = "";
+		bks.bc_author = "";
+	     end;
+	     else do;
+		curl = size (bk_nss_info);
+		call old_alloc_ (curl, header_areap, nssp);
+		bk_ss_$hp -> h.nss_info_relp = rel (nssp);
+		nssp -> bk_nss_info.version = 1;
+		nssp -> bk_nss_info.lvid = bks.lvid;
+		nssp -> bk_nss_info.pvid = bks.pvid;
+		call mdc_$find_volname (bks.pvid, nssp -> bk_nss_info.pvname, nssp -> bk_nss_info.lvname, ignore);
+		if bk_ss_$pvsw & bk_ss_$pvname ^= nssp -> bk_nss_info.pvname then go to skip_branch;
+	     end;
+
+	     if bk_ss_$upgrade_to_user_auth then	/* dump segment at user's authorization (hopefully >= access class) */
+		bks.access_class = bk_ss_$user_authorization;
+
+	     if bk_ss_$tapesw then do;
+		bk_ss_$hp -> h.status_version = bks.version;
+						/* pass thru version so reloader
+						   knws how much to believe */
+		bk_ss_$hp -> h.actime = ""b;
+		bk_ss_$hp -> h.actind = ""b;
+						/* with NSS, maxl on page bndry */
+		bk_ss_$hp -> h.max_length = fixed (ix -> br (1).ml) * sys_info$page_size;
+		bk_ss_$hp -> h.switches = bks.switches;
+		bk_ss_$hp -> h.entrypt_bound = bks.entrypt_bound;
+		addr (bk_ss_$hp -> h.quota) -> author = bks.author;
+						/* is quota only for dir_list recs */
+		bk_ss_$hp -> h.bitcount_author = bks.bc_author;
+		bk_ss_$hp -> h.switches.multiple_class = bks.switches.multiple_class;
+		bk_ss_$hp -> h.access_class = bks.access_class;
+
+		bk_ss_$error = 7;			/* Enable error recovery for reading ACL. */
+		if ix -> br (1).dirsw then
+		     call hcs_$list_dir_acl (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, header_areap, aclp, null (),
+			bk_ss_$hp -> h.aclc, code);
+		else call hcs_$list_acl (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, header_areap, aclp, null (),
+			bk_ss_$hp -> h.aclc, code);
+		bk_ss_$error = 0;			/* Disable error recovery attempts. */
+		if code ^= 0 then do;
+		     call backup_map_$fs_error_line (code, "hcs_$list_acl", bk_ss_$hp -> h.dname,
+			bk_ss_$hp -> h.ename);
+		     if code = error_table_$noentry then go to skip_branch;
+		     bk_ss_$hp -> h.aclc = 0;		/* Indicate no ACL. */
+		     bk_ss_$hp -> h.aclp = ""b;
+		end;
+		else if bk_ss_$hp -> h.aclc > 0 then	/* Are we safe from evaluating garbage? */
+		     bk_ss_$hp -> h.aclp = rel (aclp);	/* Yes, insert pointer to it. */
+		bk_ss_$hp -> h.bitcnt = fixed (ix -> br (1).bc, 24);
+						/* pick up segment bit count */
+
+/* WRITE THE PREAMBLE IF A DIRECTORY -- this is the branch info for a directory */
+
+		if ix -> br (1).dirsw then do;
+		     if bk_ss_$namesw then
+			cross_dump_en = A_cross_dump_en;
+		     else cross_dump_en = np -> name (1).string;
+		     call output (bk_ss_$hp, null, 0, code);
+		     if code ^= 0 then go to terminate_dump;
+		end;
+		else do;				/* Non-directory segment. */
+		     bk_ss_$error = 8;		/* Enable error recovery attempt. */
+		     call hcs_$initiate (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, "", 0, 1, bk_ss_$segptr, code);
+		     bk_ss_$error = 0;		/* Disable error recovery. */
+		     if code ^= 0 then
+			if code ^= error_table_$segknown then do;
+			     call backup_map_$fs_error_line (code, "initiate", bk_ss_$hp -> h.dname,
+				bk_ss_$hp -> h.ename);
+			     if ^(bk_ss_$tapesw | bk_ss_$mapsw) then go to terminate_dump;
+						/* Still doing anything? */
+			     go to skip_branch;	/* Yes, just skip this branch. */
+			end;
+			else ;
+		     else if ^bk_ss_$debugsw then
+			call hphcs_$set_kst_attributes (binary (baseno (bk_ss_$segptr), 18), addr (ksta), (0));
+						/* unless we use it treat carefully */
+		     bk_ss_$wasnt_known = "1"b;	/* We have pointer to segment. */
+		     curl = min (blocks * sys_info$page_size, bk_ss_$hp -> h.max_length);
+						/* get length of segment in words */
+
+
+/* OUTPUT PREAMBLE (branch info) AND DATA SEGMENT IF NOT A DIRECTORY */
+/* NOTE: a ptr to the segment is passed to bk_output which will copy one record */
+/* at a time into a one record buffer, and then write the buffer to tape. */
+/* Formerly the whole segment was copied at once to the buffer, and then */
+/* the whole buffer was written.  Now, if a user deletes the segment during */
+/* one of the mini-copys, bk_output will write zeroes for the rest of the */
+/* segment.  (Iff that happens the fault catcher will have reset bk_ss_$wasnt_known.) */
+/* It is known that this strategy will cause fewer page faults on the buffer */
+/* and in addition reduce backups working set.  It may also be  advantageous */
+/* that page faults from disk are more spread out, rather than coming in bursts. */
+
+/* It may be that a two record buffer would be more efficiently written to tape */
+/* while still maintaining a small working set---but the needed metering */
+/* has not been pursued.  REM */
+
+		     cross_dump_en = np -> name (1).string;
+
+		     call output (bk_ss_$hp, bk_ss_$segptr, curl, code);
+						/* Write segment out. */
+		     if code ^= 0 then go to terminate_dump;
+		     if ^bk_ss_$wasnt_known then	/* fault & termination must have occured */
+			go to terminate_branch;	/* forget about this segment */
+
+		     bk_ss_$wasnt_known = ""b;	/* Reset indicator for safety. */
+		     bk_ss_$error = 10;		/* Enable error recovery attempt. */
+		     if ^bk_ss_$debugsw then call phcs_$deactivate (bk_ss_$segptr, (0));
+						/* try to deactivate it */
+		     call hcs_$terminate_noname (bk_ss_$segptr, code);
+						/* Terminate original segment. */
+		     bk_ss_$error = 0;		/* Disable error recovery. */
+		     if code ^= 0 then
+			call backup_map_$fs_error_line (code, "hcs_$terminate_noname", bk_ss_$hp -> h.dname,
+			     bk_ss_$hp -> h.ename);
+		end;
+
+		if ix -> br (1).dirsw		/* Is this a directory? */
+		     then
+		     ix -> br (1).dtd = bit (bk_ss_$hp -> h.dtd, 52);
+						/* Yes, stash the time the dump started. */
+		else call set_dtd (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, bk_ss_$hp -> h.dtd, 30);
+	     end;
+	     if bk_ss_$mapsw then do;
+		if bk_ss_$pvsw & havent_output_dirname then do;
+						/* identify the directory we are in */
+		     call directory_line (hdp, bk_ss_$hp -> h.dlen);
+		     havent_output_dirname = "0"b;
+		end;
+		dtu = fixed (ix -> br (1).dtu, 52);
+		if A_cross_dump_dn ^= "" then
+		     temp_en = cross_dump_en;
+		else temp_en = np -> name (1).string;
+		call backup_map_$detail_line2 ((temp_en), blocks, RECORD_TYPE (bk_ss_$hp -> h.record_type),
+		     bk_ss_$hp -> h.dtd, dtem, dtd, dtu, dtsm);
+		do j = 2 to nnames;			/* Write all the entry names. */
+		     if ^bk_ss_$mapsw then go to terminate_branch;
+		     jx = addr (np -> name (j));
+		     call backup_map_$name_line (addr (jx -> name (1).string), fixed (jx -> name (1).size, 17));
+		end;
+terminate_branch:
+		if ^(bk_ss_$tapesw | bk_ss_$mapsw) then go to terminate_dump;
+						/* Still doing something? */
+	     end;
+skip_branch:
+	end;
+
+/* PROCESS INFERIOR DIRECTORIES */
+
+	if bk_ss_$restart_dumpsw & found = 2 then bk_ss_$restart_dumpsw = ""b;
+						/* Finish restart for this level then normal dump */
+	if bk_ss_$namesw then do;
+	     if ^found_object then do;
+		code = error_table_$noentry;
+		call backup_map_$fs_error_line (code, "Searching for object.", bk_ss_$hp -> h.dname, bk_ss_$ename);
+	     end;
+	     go to terminate_dump;
+	end;
+	if ^bk_ss_$onlysw & dircount > 0		/* dump inferior directories */
+	     then
+	     call dir_scan (dircount);
+dump_rtn:
+	bk_ss_$err_label = sv_label;			/* restore error label */
+	return;					/* Return to caller. */
+
+/**/
+
+/* Performs several access checks required by IMFT */
+
+perform_access_checks:
+     procedure ();
+
+dcl  the_dirname character (168);
+dcl  the_ename character (32);
+
+dcl  (other_access_class_text, object_access_class_text) character (256);
+dcl  access_class_octal character (32) aligned;
+dcl  object_access_class bit (72) aligned;
+dcl  (code, aim_code) fixed binary (35);
+dcl  user_mode fixed binary (5);
+
+
+	the_dirname = bk_ss_$hp -> h.dname;		/* makes life simpler */
+
+	if bk_ss_$namesw & bk_ss_$no_primary then	/* use name provided by user */
+	     the_ename = bk_ss_$ename;
+	else the_ename = np -> name (1).string;		/* random branch in a subtree: use primary name */
+
+	call hcs_$get_access_class ((the_dirname), (the_ename), object_access_class, code);
+	if code ^= 0 then do;
+	     call backup_map_$error_line (code, bk_ss_$myname, "Getting access class of ^a.",
+		pathname_ (the_dirname, the_ename));
+	     go to skip_branch;
+	end;
+
+	if bk_ss_$enforce_max_access_class then
+	     if ^aim_check_$greater_or_equal (bk_ss_$maximum_access_class, object_access_class) then do;
+		call convert_authorization_$to_string_short (bk_ss_$maximum_access_class, other_access_class_text,
+		     aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (bk_ss_$maximum_access_class, access_class_octal);
+		     other_access_class_text = access_class_octal;
+		end;
+		call convert_authorization_$to_string_short (object_access_class, object_access_class_text, aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (object_access_class, access_class_octal);
+		     object_access_class_text = access_class_octal;
+		end;
+		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+		     "Access class of ^a (^[^a^;^ssystem_low^]) exceeds the maximum permitted for this dump (^[^a^;^ssystem_low^]).",
+		     pathname_ (the_dirname, the_ename), (object_access_class_text ^= ""), object_access_class_text,
+		     (other_access_class_text ^= ""), other_access_class_text);
+		go to skip_branch;
+	     end;
+
+	if bk_ss_$enforce_min_access_class then
+	     if ^aim_check_$greater_or_equal (object_access_class, bk_ss_$minimum_access_class) then do;
+		call convert_authorization_$to_string_short (bk_ss_$minimum_access_class, other_access_class_text,
+		     aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (bk_ss_$minimum_access_class, access_class_octal);
+		     other_access_class_text = access_class_octal;
+		end;
+		call convert_authorization_$to_string_short (object_access_class, object_access_class_text, aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (object_access_class, access_class_octal);
+		     object_access_class_text = access_class_octal;
+		end;
+		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+		     "Access class of ^a (^[^a^;^ssystem_low^]) is below the minimum permitted for this dump (^[^a^;^ssystem_low^]).",
+		     pathname_ (the_dirname, the_ename), (object_access_class_text ^= ""), object_access_class_text,
+		     (other_access_class_text ^= ""), other_access_class_text);
+		go to skip_branch;
+	     end;
+
+	if bk_ss_$dont_dump_upgraded_dirs & (ix -> br (1).dirsw) then
+	     if ^aim_check_$greater_or_equal (bk_ss_$maximum_dir_access_class, object_access_class) then do;
+		call convert_authorization_$to_string_short (bk_ss_$maximum_dir_access_class, other_access_class_text,
+		     aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (bk_ss_$maximum_dir_access_class, access_class_octal);
+		     other_access_class_text = access_class_octal;
+		end;
+		call convert_authorization_$to_string_short (object_access_class, object_access_class_text, aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (object_access_class, access_class_octal);
+		     object_access_class_text = access_class_octal;
+		end;
+		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+		     "Access class of ^a (^[^a^;^ssystem_low^]) exceeds the maximum permitted for a directory for this dump (^[^a^;^ssystem_low^]).",
+		     pathname_ (the_dirname, the_ename), (object_access_class_text ^= ""), object_access_class_text,
+		     (other_access_class_text ^= ""), other_access_class_text);
+		go to skip_branch;
+	     end;
+
+	if bk_ss_$check_effective_access then do;
+	     call hcs_$get_user_effmode (the_dirname, the_ename, bk_ss_$user_id, bk_ss_$user_ring, user_mode, code);
+	     if code ^= 0 then do;
+		call backup_map_$error_line (code, bk_ss_$myname, "Attempting to determine ^a's access to ^a.",
+		     bk_ss_$user_id, pathname_ (the_dirname, the_ename));
+		go to skip_branch;
+	     end;
+	     if ^((bit (user_mode, 5) & bit (R_ACCESS_BIN, 5)) = bit (R_ACCESS_BIN, 5)) then do;
+		call backup_map_$error_line (error_table_$moderr, bk_ss_$myname,
+		     "^a does not have at least ""^[s^;r^]"" access to ^a.", bk_ss_$user_id,
+		     (ix -> br (1).dirsw & (ix -> br (1).bc = ""b)), pathname_ (the_dirname, the_ename));
+		go to skip_branch;
+	     end;
+
+	     if ^aim_check_$greater_or_equal (bk_ss_$maximum_dir_access_class, object_access_class) then do;
+		call convert_authorization_$to_string_short (bk_ss_$user_authorization, other_access_class_text,
+		     aim_code);
+		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+		     call convert_aim_attributes_ (bk_ss_$user_authorization, access_class_octal);
+		     other_access_class_text = access_class_octal;
+		end;
+		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+		     "^a (at authorization ^[^a^;^ssystem_low^]) can not ^[examine^;read^] ^a.", bk_ss_$user_id,
+		     (object_access_class_text ^= ""), object_access_class_text,
+		     (ix -> br (1).dirsw & (ix -> br (1).bc = ""b)), pathname_ (the_dirname, the_ename));
+		go to skip_branch;
+	     end;
+	end;
+
+	return;					/* here iff everything's OK */
+
+     end perform_access_checks;
+
+/**/
+
+/* SCAN INFERIOR DIRECTORIES */
+
+dir_scan:
+     procedure (dcount);
+
+dcl  (
+     dcount,
+     i,
+     j init (0),
+     save_dlen
+     ) fixed bin,					/* Additional temporary storage for dir_scan. */
+     code fixed bin (35),
+     (ix, jx, np) pointer,				/* Declare inside block to speed up execution. */
+     save_dname character (168) aligned;		/* Temporary storage for directory path name. */
+
+dcl  1 save (dcount) aligned,				/* One adjustable structure. */
+       2 ename character (32),			/* temporary storage for directory names */
+       2 dtd fixed binary (52);			/* Time directory dump began. */
+
+dcl  1 save1 based (jx) aligned,
+       2 ename character (32),			/* temporary storage for directory names */
+       2 dtd fixed binary (52);
+	do i = 1 to bc;				/* pick up all first directory names */
+	     ix = pointer (bp, bp -> br (i).ix);	/* Get effective index. */
+	     if ix -> br (1).dirsw & (ix -> br (1).dump_me | bk_ss_$pvsw) then do;
+						/* Is this a dumpable directory? */
+		j = j + 1;			/* Count directory names. */
+		jx = addr (save (j));
+		np = pointer (bp, ix -> br (1).namerp); /* get pointer to directory name array */
+		jx -> save1.ename = np -> name (1).string;
+						/* Pick up directory entry name. */
+		jx -> save1.dtd = fixed (ix -> br (1).dtd, 52);
+						/* Copy time directory dump started. */
+	     end;
+	end;
+	save_dlen = bk_ss_$hp -> h.dlen;		/* Save current path name length. */
+	save_dname = bk_ss_$hp -> h.dname;		/* Save the name. */
+						/* DUMP INFERIOR DIRECTORYS */
+	do i = 1 to j;
+	     jx = addr (save (i));			/* Get pointer to structure element. */
+	     call ioa_$rsnnl ("^a^[>^]^a", bk_ss_$hp -> h.dname, bk_ss_$hp -> h.dlen, save_dname, save_dlen ^= 1,
+		jx -> save1.ename);
+	     if A_cross_dump_dn = "" then
+		cross_dump_dn, cross_dump_en = "";
+	     else do;
+		cross_dump_dn = pathname_ (A_cross_dump_dn, A_cross_dump_en);
+		cross_dump_en = jx -> save1.ename;
+	     end;
+
+	     call backup_dump_recurse (cross_dump_dn, cross_dump_en, "0"b, Sfatal_error, code);
+	     if code ^= 0 then do;
+		A_code = code;
+		go to scan_rtn;
+	     end;
+	     call set_dtd (save_dname, jx -> save1.ename, jx -> save1.dtd, 31);
+	end;
+scan_rtn:
+	bk_ss_$hp -> h.dlen = save_dlen;		/* Restore directory name. */
+	bk_ss_$hp -> h.dname = save_dname;
+	return;
+     end dir_scan;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+set_dtd:
+     procedure (dirname, ename, dtd, bk_ss_error_value);
+
+dcl  dirname character (*) aligned parameter;
+dcl  ename character (*) aligned parameter;
+dcl  dtd fixed binary (52) parameter;
+dcl  bk_ss_error_value fixed binary parameter;
+
+dcl  local_code fixed binary (35);
+
+	if ^bk_ss_$debugsw then			/* don't set DTD without hphcs_ */
+	     if bk_ss_$set_dtd_explicit & bk_ss_$set_dtd then go to SET_DTD;
+						/* caller asked for it */
+
+	     else if ^bk_ss_$set_dtd_explicit & (bk_ss_$datesw | bk_ss_$dtdsw) then
+						/* otherwise, only set it for incremental dumps */
+		if bk_ss_$myname ^= "catchup_dump" then /* but never for catchup dumps */
+		     if ^bk_ss_$no_output & bk_ss_$tapesw then do;
+						/* and only if writing a tape */
+SET_DTD:
+			bk_ss_$error = bk_ss_error_value;
+			call hphcs_$set_backup_dump_time (dirname, ename, dtd, local_code);
+			bk_ss_$error = 0;
+			if local_code ^= 0 then
+			     call backup_map_$fs_error_line (code, "hphcs_$set_backup_dump_time", dirname, ename);
+		     end;
+
+	return;
+
+     end set_dtd;
+
+
+set_directory_dtd:					/* for backup_dump */
+     entry (P_dirname, P_dtd);
+
+dcl  P_dirname character (*) aligned parameter;
+dcl  P_dtd fixed binary (52) parameter;
+
+	begin;
+dcl  dirname character (168) aligned;
+dcl  ename character (32) aligned;
+
+	     call expand_pathname_ ((P_dirname), dirname, ename, (0));
+	     call set_dtd (dirname, ename, P_dtd, 30);
+	end;
+
+	return;
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+output:
+     procedure (area_pointer, seg_pointer, seg_count, code);/* Compute preamble length and write record. */
+dcl  (area_pointer, seg_pointer, p) pointer;
+dcl  seg_count fixed bin,
+     code fixed bin (35),
+     n fixed bin (18);
+
+
+          Sfatal_error = "0"b;
+	if A_cross_dump_dn ^= "" then do;		/* fake pathname in preamble */
+	     restore_dlen = area_pointer -> h.dlen;
+	     restore_dn = area_pointer -> h.dname;
+	     restore_elen = area_pointer -> h.elen;
+	     restore_en = area_pointer -> h.ename;
+	     area_pointer -> h.dname = cross_dump_dn;
+	     area_pointer -> h.ename = cross_dump_en;
+	     area_pointer -> h.dlen = length (rtrim (area_pointer -> h.dname));
+	     area_pointer -> h.elen = length (rtrim (area_pointer -> h.ename));
+	end;
+	call old_alloc_ (1, addr (area_pointer -> h.list_area), p);
+						/* Compute length of preamble. */
+	if p ^= null then n = fixed (rel (p), 18);
+	else if area_pointer = bk_ss_$hp		/* Pointer to header area */
+	     then
+	     n = max_length_header_area;
+	else n = max_length_list_area;		/* Otherwise pointer to list area */
+	call bk_output$wr_tape (area_pointer, n, seg_pointer, seg_count, code);
+						/* Write the record. */
+	if code ^= 0 then Sfatal_error = "1"b;
+
+	if A_cross_dump_dn ^= "" then do;
+	     area_pointer -> h.dlen = restore_dlen;
+	     area_pointer -> h.dname = restore_dn;
+	     area_pointer -> h.elen = restore_elen;
+	     area_pointer -> h.ename = restore_en;
+	end;
+     end output;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+directory_line:
+     proc (P_ptr, P_len);
+
+dcl  P_ptr ptr;
+dcl  P_len fixed bin;
+
+	if A_cross_dump_dn ^= "" then
+	     call backup_map_$directory_line (addr (cross_dump_dn), length (rtrim (cross_dump_dn)));
+
+	else call backup_map_$directory_line (P_ptr, P_len);
+
+     end directory_line;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+sort_small:
+     proc (aap, ac);				/* Proceedure to shell sort less than 15 branches */
+						/* Actually sort an array of indices of the branches */
+						/* Then insert pointers in order of the sorted indices */
+dcl  (aap, ap, pxk) ptr,
+     (
+     ac,
+     count,
+     d,
+     i,
+     j,
+     k,
+     n,
+     xj,
+     xk,
+     x (14)
+     ) fixed bin;
+
+	ap = aap;					/* copy args, pointer to branch array */
+	count = ac;
+	if count = 1 then do;
+	     ap -> br (1).ix = rel (addr (ap -> br (1)));
+	     return;
+	end;
+	do n = 1 to count;				/* loop over all branches */
+	     x (n) = n;				/* place index in index list */
+	end;
+	d = count;				/* initialize distance for shell sort */
+	do;					/* do the shell sort */
+down:
+	     d = 2 * divide (d, 4, 17, 0) + 1;		/* set the distance for the sort */
+	     do i = 1 to count - d;
+		k = i + d;			/* higher index */
+		xk = x (k);			/* index from index array */
+		pxk = ptr (ap, ap -> br (xk).namerp);	/* pointer for name comparixon */
+up:
+		j = k - d;			/* lower index */
+		xj = x (j);			/* lower index from index array */
+		if ptr (ap, ap -> br (xj).namerp) -> name (1).string <= pxk -> name (1).string then go to ok;
+						/* no change if ok */
+		x (k) = xj;			/* swap in index array */
+		k = j;				/* check next lower in steps of size d */
+		if k > d then go to up;		/* if there is a lower element */
+ok:
+		x (k) = xk;			/* finish, put highest index in its proper place */
+	     end;
+	     if d > 1 then go to down;		/* sort with smaller distance */
+	end;
+	do i = 1 to count;				/* now thread branches according to index array */
+	     xk = x (i);
+	     ap -> br (i).ix = rel (addr (ap -> br (xk)));
+	end;
+	return;
+     end sort_small;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/**/
+
+%include kst_attributes;
+
+%include bk_nss_info;
+%include backup_dir_list;
+%include backup_fs_times;
+%include backup_preamble_header;
+%include backup_record_types;
+%include bk_ss_;
+
+%include branch_status;
+
+%include access_mode_values;
+
+     end backup_dump_recurse;

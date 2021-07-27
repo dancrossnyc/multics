@@ -1,0 +1,3403 @@
+" **************************************************************
+" *                                                            *
+" * Copyright, (C) Massachusetts Institute of Technology, 1973 *
+" *                                                            *
+" **************************************************************
+" lisp_.alm	-- evaluator for Multics MACLISP
+"
+" David Moon, 17 July 1972
+" cleaned up and "map" functions added, 1 Aug 72 DAM
+" pdl ptr format changed for pdp-10 compatible, 5 Aug 72 DAM
+" bug in evaluated functions fixed, 7 Aug 72, DPR
+" bug in eval_funarg fixed, 7 Aug 72, DPR
+" go, return, eval_list (for prog) added 19 Aug 72, DAM
+" call1, callf added 22 Aug 1972 DAM
+" nouuo function added 24 Aug 72 DAM
+" freturn_real added, meaning of frame.dat1 changed, 24 Jan 73 DAM
+" changed to make *rset a variable, 24 May 1973
+"
+" modified 74.2.07 by DAM to fix bugs in apply of 3 args
+" modified 74.04.15 by DAM to make an evalframe for an unbnd vrbl and to ignore
+"	macro properties when snapping subr links.
+" Modified 74.09.18 by DAM to use the new binding-reversal scheme for funargs and
+"  calls to eval or apply with a binding-context-pointer
+" Modified 75.03.31 by DAM for evalhook + bug fixes
+" Modified 78.09.12 by BSG for "let" fsubr.
+
+"flag bits in x2
+
+	equ	macrobit,1	distinguish macros from fexprs
+	equ	exprbit,4		distinguish expr/lexpr from subr/lsubr
+	equ	framebit,8	an evalframe was created and must be destroyed
+	equ	lsubrbit,16	distinguish lexpr/lsubr from expr/subr
+	equ	noteval,32	spread_args should not evaluate args (for apply)
+	equ	already_spread,1024	args are already spread, beginning at ap|qsrac+2,x4
+	equ	applybit,2	entered by apply rather than eval
+	equ	bbf,64		pseudo-binding-block exists because of label or funarg
+	equ	fbb,128		flag for a reversal block needed
+				" used by eval_funarg
+	equ	ignore_macros,256	find_type should ignore macro properties
+	equ	went_through_value_cell,512
+	equ	already_autoloaded_once,2048
+	equ	entered_by_funcall,4096		" to distinguish between funcall and call1
+
+" temporaries on marked pdl
+
+	equ	form,-8		form being evaled.  Inviolable since pdlframe uses it.
+				" for apply, is name of fcn being applied
+	equ	fcn,-6		function being applied
+	equ	argl,-4		argument list. Inviolable since used to construct "form"
+				"also handy temporary, contains result of fcn, etc.
+					" in case of error during apply
+	equ	qsrac,-2		all kinds of random things go here
+
+
+" temporaries on unmarked pdl
+
+" -2, -1			regular binding block
+	equ	pdlptr,-4 a temporary
+	equ	svx5u,-4	register save area
+	equ	svx2l,-4	..
+	equ	svx0u,-3	..
+	equ	svx4l,-3	..
+	equ	svx3l,-5		since no one uses frame.dat2, save a reg here
+	equ	funarg_pdlptr,-7  holds pdl ptr for a funarg
+" -6, -5			evalframe goes here
+" -8, -7			if a funarg is used, its reversal bb is put here
+" -10, -9			random cruft is put here by map, if not map these don't exist
+
+"use of index registers
+
+" x0	calls to recurse,error,...
+" x1	scan through stack during binding, random data
+" x2	flag bits escribed above)
+" x3	number of arguments	
+" x4	offset from top of marked pdl to get to above-mentioned temporaries,
+		"sometimes random data preserved through a recursion.
+" x5	call evalu by tsx5
+" x6	random data
+" x7	unmarked pdl pointer
+
+"use of base registers
+
+" ab	points to stack header, together with x7 points to unmarked pdl
+" ap	points to marked pdl
+" bp	random pointer
+" bb	temporary
+" lp	untouchable
+" lb	temporary
+" sp	sacred
+" sb	sacred
+
+
+"
+"	Use of pdls
+
+" the unmarked pdl contains space for an eval frame (2 words),
+" a register save area for recursing and random temps (2 words),
+" 2 words for a funarg binding block, 2 words that only exist for map,
+" and a binding_block (2 words).  The binding block starts out
+" containing no bindings and grows whenever an atom needs to be
+" bound.  Since the binding block is created and then added to, the
+" same atom may appear more than once and all routines that can unwind
+" eval - created binding blocks _m_u_s_t do so from the top down.
+
+" The eval frame is only created in *rset-t mode, but the space for
+" it is always allocated since that is easier.  The contents of
+" the eval frame are:
+"	frame.prev_frame		thread
+"	frame.stack_ptr		-> form being evaled (on marked pdl)
+"	frame.dat1		rel(sp) at time frame was created.  Low order
+"				bit is 1 if this frame is due to apply or map,
+"				in which case form is really = fcn, you can cons
+"				on argl if you want.
+"	frame.dat2		no useful information.  recurse saves x3 here
+
+" the marked  pdl:
+"	ap|form			form being evaled or function being applied
+"	ap|fcn			functional property of function being applied/evaluated
+"	ap|argl			argument list
+"	ap|qsrac			temp., holds property lits amung other things
+
+" the above 4 are often referenced with the aid of x4, since the binding block
+" is above them on the marked pdl.  x4 contains (almost always) the negative size
+" of the binding block (and any other cruft that may be there) so that"ap|form,x4" works.
+
+""" FORMAT OF BINDING BLOCKS
+
+"	Normal Binding Block
+
+"   top_block           bot_block		-> top & bottom of marked pdl cells
+"					containing atom,value pairs
+"   back_ptr              rev_ptr	--- points at reversal block which reversed this one.
+"       A
+"    points at previous b.b.
+
+
+"	Reversal Binding Block  (set up when a binding-context-pointer is used)
+
+"   PDLP                   0			-> lowest b.b. in range, flag for this type
+"   back_ptr            rev_ptr		same back_ptr, pointer to reversal
+"					block whose range overlaps this one
+"					in such a way as to require re-reversing
+"					part of the range of this one.
+"
+" use of "pseudo-binding-blocks"
+
+" a pseudo binding block is a record that at some later time bindings
+" are to be made.  labels and funargs create pseudo-binding-blocks
+" because they can't do their binding until after the arguments
+" have been evaluated, and you can't evaluate the arguments  until
+" the real functional property being applied is found.
+" a pseudo-binding-block exists on the marked pdl above
+" the regular binding block.  It has the same format, except that
+" where a binding block would have "saved old value", in the
+" pseudo binding block a new value is saved. After the args
+" have been evaluated, the pseudo binding block is converted
+" into a regular binding block (actually the one just below it
+" on the pdl is extended, since they are always contiguous)
+" The old value of the atom is put in the binding block, and the
+" new-value that was saved in the pseudo binding block is assigned
+" to the atomic symbol.
+" expr's and lexpr's use variants of the
+" pseudo binding block: they can't bind their lambda atoms until
+" after the args have been evaluated, since one of the args
+" might be a setq, so they just figure out how much pdl space it
+" will take to bind their lambda atoms and leave room for
+" that before evaluating the args.
+
+"
+
+	include 	lisp_unmkd_pdl
+	include	lisp_iochan
+	include	lisp_stack_seg
+	include	lisp_object_types
+	include	lisp_name_codes
+"
+" entry point for calling eval by pl1 subrs
+
+	entry	eval
+eval:	tsx0	pl1_entry-*,ic
+	tsx5	evalu-*,ic		enter common code
+pl1_return:
+	staq	ap|form
+	eppap	ap|form+2
+pl1_exit:	spriap	lisp_static_vars_$stack_ptr
+	stx7	lisp_static_vars_$unmkd_ptr+1
+	stc1	ab|in_pl1_code
+	short_return
+
+" routine to set up ap, ab, x7 on entry from pl1 code
+
+pl1_entry:
+	epbpab	lisp_static_vars_$unmkd_ptr,*
+	eppap	lisp_static_vars_$stack_ptr,*
+	ldx7	lisp_static_vars_$unmkd_ptr+1
+	stz	ab|in_pl1_code
+	tra	0,0
+
+
+" entry point for the lisp lsubr "eval"  Fast call but with lp
+
+	segdef	eval_		  & no prologue
+
+eval_:	cmpx5	-2,du		1 argument?
+	tnz	eval_with_2_args-*,ic	no, go do a-list hack.
+	tsx5	evalu-*,ic	yes, so enter common code.
+lisp_retn:				" deliver us from eval.
+	eppap	ap|form
+lisp_rtn_1:
+	eppbp	ab|-2,x7*
+	epplp	ab|-4,x7*
+	eax7	-4,x7			(popj)
+	tra	bp|0
+
+
+" Routine called by lisp_prog_fns_ to unwind a reversal bb
+
+	segdef	unwind_reversal
+
+unwind_reversal:
+	tsx0	pl1_entry-*,ic
+	epplb	lisp_static_vars_$binding_top,*	-> bb to unwind
+	tsx3	unwind_reversal_bb-*,ic
+	tra	pl1_exit-*,ic
+"
+" internal entry point for recursive calls to eval (by tsx0)
+" on entry object to be evaluated is at ap|-2
+" if the object is not a list, its value is immediately found.
+"  if it is a list, registers are saved on the unmkd pdl
+"    and evalu is called.
+" on return, x4,x2,x5,x3 are undisturbed, 
+"    aq = ap|-2 = evaluated object, and ap and x7 are unchanged.
+
+	tra	0,0			exit used by evalhook
+
+recurse:	xec	lisp_static_vars_$evalhook_status
+	ldaq	ap|-2			check for easy cases and do them quickly
+	cana	Unevalable,dl
+	tnz	0,0
+	cmpaq	ab|nil
+	tze	0,0
+	cana	Atsym,dl
+	tze	full_recurse-*,ic		list -- hard case -- have to really recurse
+	ldaq	ap|-2,*			atomic symbol -- get its value
+	tze	3,ic			undefined?
+	staq	ap|-2			  no, return it.
+	tra	0,0
+
+undefined_atom_error:
+	" undefined atomic symbol -- error
+
+		" atomic symbol which was undef is at ap|-2
+		" returns by tra 0,0 with new value in aq and ap|-2
+		" if necessary, pushes an evalframe
+
+	ldaq	lisp_static_vars_$star_rset,*
+	cmpaq	ab|nil
+	tnz	undefined_atom_error_hard-*,ic
+
+	lda	lisp_error_table_$undefined_atom
+	tra	error-*,ic			error must return value in aq and ap|-2
+
+undefined_atom_error_hard:	" push evalframe
+
+	eax7	8,x7
+	eppap	ap|2	copy atom to avoid destroying evalframe during error proc
+	ldaq	ap|-4
+	staq	ap|-2
+	eax6	ap|-4
+	sxl6	ab|frame.stack_ptr-6,x7
+	eax6	sp|0
+	stx6	ab|frame.dat1-6,x7
+	ldx6	lisp_static_vars_$eval_frame+1
+	stx6	ab|frame.prev_frame-6,x7
+	eax6	ab|-6,x7
+	stx6	lisp_static_vars_$eval_frame+1
+
+	stx0	ab|frame.ret-6,x7			save return address
+	lda	lisp_error_table_$undefined_atom
+	tsx0	error-*,ic			go signal the error
+
+		" now pop this evalframe
+
+	ldx6	ab|frame.prev_frame-6,x7
+	stx6	lisp_static_vars_$eval_frame+1
+	ldx0	ab|frame.ret-6,x7			return addr saved
+	eax7	-8,x7
+	ldaq	ap|-2
+	eppap	ap|-2		undo push above
+	staq	ap|-2		some callers want it in stack
+	tra	0,0
+
+full_recurse:
+	stx5	ab|svx5u,x7
+	sxl2	ab|svx2l,x7
+	sxl4	ab|svx4l,x7
+	stx0	ab|svx0u,x7
+	sxl3	ab|svx3l,x7
+	eppap	ap|6			get new work area on marked pdl
+	tsx5	eval_fcn-*,ic
+	lxl4	ab|svx4l,x7
+	ldx0	ab|svx0u,x7
+	lxl2	ab|svx2l,x7
+	ldx5	ab|svx5u,x7
+	lxl3	ab|svx3l,x7
+	staq	ap|form			return result in both aq and stack
+	eppap	ap|form+2			restore caller's ap
+	tra	0,0			return to caller of recurse
+
+
+" symeval	SUBR 1 arg - evaluate a symbol.  used for compiled efficiency
+
+	segdef	symeval
+
+symeval:	ldaq	ap|-2		fetch argument
+	cana	Atsym,dl		is it an atomic symbol?
+	tze	symeval_loss-*,ic	no, error (if compiled, would be bug)
+	ldaq	ap|-2,*		yes, get its value
+	tze	symeval_loss-*,ic	and err if unbound
+symeval_ret:
+	eppap	ap|-2		pop argument
+	tra	lisp_rtn_1-*,ic	and return
+
+symeval_loss:
+	tsx0	undefined_atom_error-*,ic
+	tra	symeval_ret-*,ic
+"
+"pl1 - callable apply function
+
+	entry	apply
+apply:	tsx0	pl1_entry-*,ic
+	tsx5	apply_com-*,ic
+
+	tra	pl1_return-*,ic
+
+
+"lisp - callable apply lsubr
+
+	segdef	apply_
+
+apply_:	cmpx5	-4,du			2 args?
+	tnz	apply_with_3_args-*,ic
+	eax5	lisp_retn-*,ic
+
+" set up the pdl with form, fcn, argl as when evaling a fcn.
+" set applybit to indicate that ap|form = fcn instead of full form
+" go to common code with eval
+
+apply_com:
+	eax2	noteval+applybit
+	ldaq	ap|-2
+	eppap	ap|4
+	staq	ap|argl
+	ldaq	ap|form
+	staq	ap|fcn
+	tra	evaler-*,ic			return addr is in x5
+
+
+
+"
+" interface to lisp_error_
+
+" called by tsx0, preserves x0,x5,x2,x4
+" error code must be in the a.
+
+error:	eax7	2,x7			going to push error code onto unmkd pdl
+	staq	ab|-2,x7			errcode(1) from a, errcode(2) from q.
+	tsx6	call_ext_out-*,ic		-- now call lisp_error_, which
+	eppbp	lisp_error_$lisp_error_    will clear the unmkd pdl for us
+
+" come here to call out to a pl1 program.
+" x6 -> an eppbp instruction to get address of entry being called
+" x0 =  return address
+" x1,x2,x3,x4,x5 are saved (by the call macro)
+"
+" on return aq is loaded with value on top of marked pdl
+" on entry, a is zeroed unless from error, where it is pushed onto unmkd pdl
+"
+" this code just saves things, updates the pl1 copies of
+" the two stack pointers, and builds a stack frame from which to call out
+"
+" ***** this piece of code relies on the knowledge that the save macro does
+" ***** not change any index registers except x7
+
+call_ext_out:
+	spriap	lisp_static_vars_$stack_ptr
+	stx7	lisp_static_vars_$unmkd_ptr+1
+	stc1	ab|in_pl1_code
+	push				" ** this is where x6 must not change
+	xec	0,x6			an eppbp instruction.
+" *** here we rely on the new call macro doing an sreg and an lreg to save x0,x2,x4,x5
+	call	bp|0(=v18/0,18/4,18/0,18/0)		no args arg list
+	eaa	sp|16,*			pop stack frame
+	sprisp	sb|stack_header.stack_end_ptr
+	eppsp	sb|0,au
+
+	eppap	lisp_static_vars_$stack_ptr,*
+	epbpab	lisp_static_vars_$unmkd_ptr,*
+	ldx7	lisp_static_vars_$unmkd_ptr+1
+	stz	ab|in_pl1_code
+	ldaq	ap|-2			needed when unbnd-vrbl in recurse.
+	tra	0,0
+
+"
+
+" eval with an a-list 2nd argument (actually a pdl pointer)
+
+eval_with_2_args:
+	eax7	2,x7
+	tsx3	fetch_binding_context_ptr-*,ic	sets x4 to bcp to a bb
+	epplb	ab|-2,x7				set up ptr to bb
+	tsx3	reverse_binding_context-*,ic		reverse context to there
+	tsx5	evalu-*,ic			now eval 1st arg in that context
+	staq	ap|form				save result
+	epplb	ab|-2,x7				set up ptr to bb
+	tsx3	unwind_reversal_bb-*,ic		restore to calling context
+	eax7	-2,x7				restore unmarked pdl
+	ldaq	ap|form				put result in AQ
+	tra	lisp_retn-*,ic			and return from type 1 subr
+
+
+" hack for apply with 3rd arg a pseudo-a-list (pdl ptr)
+" have to neutralize all the binding blocks between the top of
+" the pdl and the pdl ptr.
+
+apply_with_3_args:
+	eax7	2,x7
+apply_tsx3:
+	tsx3	fetch_binding_context_ptr-*,ic
+	epplb	ab|-2,x7
+	tsx3	reverse_binding_context-*,ic
+	tsx5	apply_com-*,ic		now do the apply
+	staq	ap|form
+	epplb	ab|-2,x7
+	tsx3	unwind_reversal_bb-*,ic
+	ldaq	ap|form
+	eax7	-2,x7
+	tra	lisp_retn-*,ic
+
+" Routine to accept a lisp a-list-ptr (or binding-context-ptr), and
+" convert it into a pointer to the lowest binding block on the unmarked
+" pdl which is affected.  the input is in ap|-2 and is popped.
+" the output is in x4.
+" called by tsx3
+" the pointer input to this routine has -2 in its left half and
+" a pointer to the unmarked pdl in its right half.  NOTE that this
+" is a change from the previous version in which it pointed at the marked pdl.
+" The pointer to the unmarked pdl need not point exactly at a bb.
+" ab|-2,x7 and ab|-1,x7 are used for temporary storage.
+
+fetch_binding_context_ptr:
+	ldaq	ap|-2
+	cmpaq	ab|nil			nil means zero level context
+	tze	fetch_bcp_nil-*,ic		which has to be special cased
+
+	cana	Fixed,dl			make sure it is a fixnum
+	tze	fetch_bcp_error-*,ic
+	eax1	0,qu			make sure left half is -2
+	cmpx1	-2,du
+	tnz	fetch_bcp_error-*,ic
+	eax4	0,ql			make a few other useless checks
+	stx7	ab|-2,x7
+	cmpx4	ab|-2,x7
+	trc	fetch_bcp_error-*,ic	too high
+	cmpx4	ab|marked_stack_bottom+1
+	tnc	fetch_bcp_error-*,ic	too low
+
+fetch_bcp_ret:
+	eppap	ap|-2			pop argument
+	tra	0,x3			and return
+
+fetch_bcp_error:
+	lcq	-fn_eval,dl		assume called by eval
+	cmpx3	apply_tsx3+1,du
+	tnz	2,ic
+	 lcq	 -fn_apply,dl		no, called by apply
+
+	lda	lisp_error_table_$not_pdl_ptr
+	stx3	ab|-2,x7
+	tsx0	error-*,ic		call error routine
+	ldx3	ab|-2,x7			which returns with new data in ap|-2
+	tra	fetch_binding_context_ptr-*,ic	so retry
+
+fetch_bcp_nil:
+	ldx4	ab|unmkd_stack_bottom+1
+	tra	fetch_bcp_ret-*,ic
+"
+" reverse one binding block
+"  x6	-> block to be reversed
+"  x5	what to set its rev_ptr to
+"  x0	calling reg
+"  lp	-> lisp static
+" aq, x1, all pointers are clobbered except lb
+
+reversal:	stc1	lisp_static_vars_$binding_reversal_flag	lock interrupts
+	epbpbb	ap|0		-> marked pdl
+	eppap	ap|2		get temp on stack
+	lxl1	ab|0,x6		pick up binding_block.bot_block
+reverse_1_binding:
+	cmpx1	ab|0,x6		reached top of block?
+	tze	reverse_1_binding_aa-*,ic	yes, stop
+	ldaq	bb|0,x1		pick up saved value
+	staq	ap|-2		save it for a moment
+	ldaq	bb|2,x1*		pick up current value of symbol bound
+	staq	bb|0,x1		set as saved value
+	ldaq	ap|-2		and set saved value as current value
+	staq	bb|2,x1*		..
+	eax1	4,x1		proceed to the next binding in this block
+	tra	reverse_1_binding-*,ic
+
+reverse_1_binding_aa:
+	sxl5	ab|1,x6		yes, set this block's rev_ptr
+	eppap	ap|-2		police area
+	ldac	lisp_static_vars_$binding_reversal_flag	test & clear intr lock
+	ana	=o7,dl		mask to just interrupt bits
+	tze	0,x0		none set, return
+
+" interrupt happened and was deferred - signal it now.
+" the following code is copied from lisp_alloc_
+
+	eax7	2,x7				store interrupt bits
+	sta	ab|-2,x7
+	spriap	lisp_static_vars_$stack_ptr	save environment
+	stx7	lisp_static_vars_$unmkd_ptr+1
+	stc1	ab|in_pl1_code
+	tempd	arglist(4)
+	push
+	eppbp	lisp_static_vars_$unmkd_ptr,*	get address of intr code
+	eppbp	bp|-2
+	spribp	arglist+2
+	ldaq	arg_list_1_hdr-*,ic
+	staq	arglist
+	call	lisp_default_handler_$alloc_fault(arglist)	saves all xr's, lb
+	eaa	sp|16,*			now pop back to lisp
+	sprisp	sb|20
+	eppsp	sb|0,au
+	epbpab	lisp_static_vars_$unmkd_ptr,*
+	eppap	lisp_static_vars_$stack_ptr,*
+	ldx7	lisp_static_vars_$unmkd_ptr+1
+	stz	ab|in_pl1_code
+	eax7	-2,x7			flush arg loc pushed earlier
+	tra	0,x0			now return from reversal
+
+" Procedure to reverse binding context down to a specified binding context pointer
+"  x4	-> the bb which is last to reverse down to
+"  x3	call reg
+"  lp	-> lisp static
+"  lb	-> 2 words on unmkd pdl to put the bb in
+" uses
+"  x6	-> current binding block
+"  x5	-> newly-constructed reversal bb, (used to set rev_ptr's)
+"  x1	temp
+" aq, bb, bp clobbered
+" x2 is guaranteed untouched
+" NOTE:  the 2 words on unmkd pdl for the bb constructed are assumed already pushed
+
+reverse_binding_context:
+	eax5	lb|0			-> reversal bb to construct
+	eax6	0,x5			init scan ptr
+	stz	lb|0			set reversal-bb flag in dl
+"	stx4	lb|0			set PDLP in du
+	ldq	lisp_static_vars_$binding_top+1  set thread, clearing rev_ptr
+	stq	lb|1
+	stx5	lisp_static_vars_$binding_top+1  thread into bindings list
+
+rbc00:	" trace thread of binding blocks until the pdl ptr is reached...
+
+	cmpx4	ab|1,x6			gone down far enough?
+	tpnz	rbc_ret-*,ic		yes, return (RELIES ON STACK = 64K)
+	ldx6	ab|1,x6			no - chase thread to a block
+	lxl1	ab|0,x6			check type of block
+	tze	rbc01-*,ic		tra if a reversal block
+	tsx0	reversal-*,ic		normal block - reverse it and set rev_ptr
+	tra	rbc00-*,ic		and continue scanning pdl
+
+rbc01:	cmpx4	ab|0,x6			reversal block - compare its PDLP to ours
+	tpnz	rbc02-*,ic	*** KLUDGE *** relies on lisp stacks limited to 64K
+	"its range is contained in ours. skip over it since it has already
+	"done the reversals that we want
+	ldx6	ab|0,x6			skip down to its PDLP
+	tra	rbc00-*,ic		and look at next block below that
+
+rbc02:	"its range exceeds ours - take the part of its range we want, and
+	"reverse the rest, because it did the opposite of what we want.
+	"this is referred to as the "extended range."
+
+	sxl5	ab|1,x6			set rev_ptr to us to mark end of range
+	eax1	0,x4
+	ldx4	ab|0,x6			set scan limit to its PDLP
+rbc03a:	cmpx1	ab|1,x6			set scan position to our PDLP, also
+	tpnz	rbc03b-*,ic		setting our PDLP to really point at a bb
+	ldx6	ab|1,x6
+	tra	rbc03a-*,ic
+
+rbc03b:	stx6	lb|0			set our pdlp
+rbc03:	ldx6	ab|1,x6			and go down one more block
+	tze	0,x3			return if no more
+	lxl1	ab|0,x6			what type BB is this?
+	tze	rbc04-*,ic		reversal - skip it
+	lxl5	ab|1,x6			normal - reverse it but
+	tsx0	reversal-*,ic		don't change its rev_ptr
+rbc04:	cmpx4	ab|1,x6			done?
+	tpnz	0,x3		*** KLUDGE *** relies on lisp stacks 64K
+	tra	rbc03-*,ic
+
+" come here to return from reverse_binding_context.
+" the PDLP field is changed to be an accurate pointer to a binding block
+
+rbc_ret:	stx6	lb|0		bb.pdlp := addr of lowest bb in range
+	tra	0,x3
+
+" Procedure to unwind a reversal bb
+" called by tsx3 with the reversal bb at lb|0
+" uses all the registers
+
+unwind_reversal_bb:
+	eax5	0		for clearing rev_ptr's
+	eax6	lb|0		and begin scanning down stack
+	ldx4	lb|0		pick up pdl ptr of this reversal bb
+urbre:	eaa	lb|0		prepare to do r-r arithmetic in pointer register
+	neg	0
+	eppbb	0,au
+urb00:	cmpx4	ab|1,x6		done?
+	tpnz	urbxx-*,ic	yes (RELIES ON STACK BEING 64K)
+	ldx6	ab|1,x6		no, thread through back_ptr
+	lxl1	ab|1,x6		pick up its rev_ptr
+	eax1	bb|0,x1		does it point at the block being reversed?
+	tnz	urb00-*,ic	no - this block didn't change it so don't change back
+	lxl1	ab|0,x6		yes - check type
+	tze	urb01-*,ic	reversal bb - tra
+	tsx0	reversal-*,ic	normal - reverse it and zero its rev_ptr
+	tra	urbre-*,ic	and chain to next, fixing bb
+
+" here the extended range begins, reverse everything without touching its rev_ptr
+
+urb01:	ldx4	ab|0,x6		pick up its PDLP hwich limits our range
+urb02:	cmpx4	ab|1,x6		done?
+	tpnz	urbxx-*,ic	yes
+	ldx6	ab|1,x6		no, thread through back_ptr
+	lxl1	ab|0,x6		check its type
+	tze	urb02-*,ic	ignore reversal bb's
+	lxl5	ab|1,x6		normal bb's get reversed but rev_ptr left alone
+	tsx0	reversal-*,ic
+	tra	urb02-*,ic
+
+urbxx:	ldx1	lb|1		now unthread this bb from bindings list
+	stx1	lisp_static_vars_$binding_top+1
+	tra	0,x3		and return
+"
+" this is the actual evaluator
+" it is called by tsx5 with ap|-2 the object to be evaled.
+" it returns with ap bumped by 6, the result in the aq,
+"  x7 the same, and the contents of the other regs randomized.
+
+	tra	evalu_exit-*,ic	used by evalhook
+
+evalu:	xec	lisp_static_vars_$evalhook_status
+	eppap	ap|6			room to work
+	ldaq	ap|form			object to be evaled
+	cana	Unevalable,dl
+	tnz	0,5			if number or string, just return it
+	cana	Atsym,dl
+	tze	eval_fcn-*,ic
+"Atomic symbol.  Return its value.  Error if undefined
+	ldaq	ap|form,*			get value of atom
+	tnz	0,5
+	eppap	ap|form+2			undefined - give correctable error
+	tsx0	undefined_atom_error-*,ic
+	eppap	ap|-form-2
+	"ldaq	ap|form			replacement value.(already in aq)
+	tra	0,5
+
+evalu_exit:
+	eppap	ap|6			exit routine for evalhook
+	tra	0,5
+
+" evaluate a non-atomic expression
+
+eval_fcn:	eax2	0			clear all flags
+	eppbp	ap|form,*
+	ldaq	bp|2			cdr = args
+	staq	ap|argl
+	ldaq	bp|0			car = fcn
+	staq	ap|fcn
+
+" apply, label, and funarg join us here. (by tsx5, with
+"   x2, ap|form, ap|fcn, ap|argl properly set up.)
+
+evaler:
+	eax3	find_type_tv-*,ic
+
+evaler1:
+
+" set up the unified binding block, initially empty of bindings
+
+	eax7	8,x7
+	eax6	ap|0			= bot_block, for now = top_block too
+	stx6	ab|-2,x7
+	sxl6	ab|-2,x7
+	eax4	0			-- binding block takes 0 words right now
+
+" in *rset t mode, make an evalframe for baktrace & pdlframe
+
+set_eval_frame: set_eval_frame_1:
+	ldaq	lisp_static_vars_$star_rset,*
+	cmpaq	ab|nil
+	tze	make_no_frame-*,ic
+	  eppbp	ab|-6,x7
+	  eax6	sp|0			make frame.dat1, which = rel(sp),
+	  canx2	applybit,du
+	  tze	2,ic
+	  orx6	1,du			+1 if in apply or map
+	  stx6	bp|frame.dat1
+	  eax6	ap|form,x4			-> form for pdlframe to get
+	  sxl6	bp|frame.stack_ptr
+	  ldx6	lisp_static_vars_$eval_frame+1
+	  stx6	bp|frame.prev_frame
+	  spribp	lisp_static_vars_$eval_frame
+	  orx2	framebit,du
+
+make_no_frame:
+	tra	find_type-*,ic
+find_type_tv:
+"return transfer vector for find_type
+	tra	eval_subrs_and_arrays-*,ic		"array
+	tra	eval_subrs_and_arrays-*,ic		"subr
+	tra	eval_lsubr-*,ic
+	tra	eval_expr-*,ic
+	tra	eval_fexpr-*,ic
+	tra	eval_fsubr-*,ic
+	tra	eval_lexpr-*,ic
+"
+" routine to bind all the atomic symbols in a lambda list
+" ap|fcn,x4 is cons lambdalist body, as returned by find_type
+" uses pre-existing binding_block
+" called by tsx0.  Uses x1, bb.
+" updates x4, ap, returns number of variables bound in x6
+" just binds the variables - does not assign them to new values.
+
+lambda_bind:
+	eax6	0			init counter
+	ldaq	ap|fcn,x4*
+lambda_bind_1:
+	cana	lisp_ptr.type,dl
+	tnz	0,0			... end of the lambda - list
+	eppap	ap|4
+	eax4	-4,x4
+	eax6	1,x6
+	staq	ap|-2
+	eppbp	ap|-2,*
+	ldaq	bp|0			a lambda var
+	staq	ap|-2
+	cana	Atsym,dl			ok to bind?
+	tze	bad_bound_var-*,ic		  nope.
+	cmpaq	ab|nil
+	tze	loser_binding_nil-*,ic
+	ldaq	ap|-2,*			yes, ok to bind.
+	staq	ap|-4
+	eax1	ap|0
+	stx1	ab|-2,x7			update binding_block.top_block
+	ldaq	bp|2			(cdr of the lambda list)
+	tra	lambda_bind_1-*,ic
+"
+" evaluator of fexpr's and macros
+"
+" binds the lambda-atom to the argument list.
+" if a second lambda atom is present, binds it to a pdl ptr
+"  so that it can be used with eval or apply as an a-list.
+" then joins with expr code to eval lambda body.
+
+eval_fexpr:
+	canx2	bbf,du
+	tze	3,ic			no pseudo bb, skip...
+	eax1	ap|0
+	tsx0	finish_bindings-*,ic
+	tsx0	lambda_bind-*,ic
+	cmpx6	1,du			just 1 lambda variable?
+	tnc	bad_fcnl-*,ic		"fexpr (lambda nil ...
+	tze	fexpr_1_arg-*,ic		yes, easy.
+	eaq	ab|-2,x7			-> binding block
+	qrl	18
+	orq	-2,du
+	lda	fixnum_type,dl
+	staq	ap|-2,*			rebind 2nd arg
+	ldaq	ap|argl,x4
+	staq	ap|-6,*			rebind 1st arg
+	tra	eval_lambda_body-*,ic
+
+fexpr_1_arg:
+	ldaq	ap|argl,x4
+	staq 	ap|-2,*			rebind 1st (only) arg
+	tra 	eval_lambda_body-*,ic
+
+"
+
+eval_lexpr:
+	orx2	exprbit+lsubrbit,du
+	eppap	ap|8			reserve space for binding block
+	eax4	-8,x4			 but don't update binding_block.top_block yet.
+	tra	arg_spreader-*,ic		comes back to args_spread_for_lexpr
+
+eval_expr:
+
+	orx2	exprbit,du
+
+	" before spreading args, allocate enough space to bind
+	" the lambda variables, but don't bind them until
+	" after the args are spread because one of the args
+	" might be a setq or something
+
+	ldaq	ap|fcn,x4*
+	eax1	ap|0			where first lambda var will be bound
+	stx4	ab|-4,x7
+expr_bb_alloc:
+	cana	lisp_ptr.type,dl		end of lambda-list?
+	tnz	expr_bb_fin-*,ic		  yes.
+	eppap	ap|4			no, 1 more binding (at least)
+	eax4	-4,x4
+	staq	ap|-2
+	eppbp	ap|-2,*
+	ldaq	bp|2			cdr lambda-list
+	tra	expr_bb_alloc-*,ic
+
+expr_bb_fin:	" in last binding slot, save addr of first binding slot for lambda vars
+		" (because there might be a label pseudo bb too)
+
+	cmpx4	ab|-4,x7			anything in lambda list?
+	tze	expr_nil-*,ic		 no.
+	eaq	0,x1			 yes, save ptr to first
+	lda	Uncollectable,dl
+	staq	ap|-4
+	tra	arg_spreader-*,ic
+
+" expr with no lambda vars - still have to use arg_spreader for wrong_no_args check
+
+expr_nil:	
+	tra	arg_spreader-*,ic
+
+
+
+args_spread_for_expr:
+	canx2	lsubrbit,du
+	tnz	args_spread_for_lexpr-*,ic
+	ldaq	ap|fcn,x4*		which kind of expr?
+	cana	lisp_ptr.type,dl
+	tze	expr_bind-*,ic		 the kind with args
+	canx2	bbf,du			the kind with no args.
+	tze	3,ic
+	eax1	ap|0			if necc., do pseudo-bb stuff
+	tsx0	finish_bindings-*,ic
+
+	cmpx3	0,du			we want no args. have we none?
+	tnz	too_many_args_expr-*,ic	 no, barf.
+	tra	eval_lambda_body-*,ic	yes, go eval fcn
+
+expr_bind:
+
+"ok, bind the lambda variables...
+"
+" finish making the binding block then pop the args off of the marked
+" pdl and assign them to the lambda variables.
+
+	epbpbb	ap|0
+	canx2	already_spread,du
+	tze	expr_bind_1-*,ic
+
+" args are at bottom of pdl, pseudo binding block is at top
+
+	ldx0	ap|argl,x4
+	eax1	ap|0
+	tra	expr_bind_0-*,ic
+
+" args are at top of pdl, pseudo binding block is right below them.
+
+expr_bind_1:
+	tsx0	set_x1_args-*,ic
+	eax0	0,x1			top of pseudo bb = base of args
+expr_bind_0:
+	sxl1	ab|-4,x7			save top of pseudo bb for later
+	ldx1	bb|-3,x1			-> start of lambda var bindings
+
+" at this point x0 -> args and x1 -> top of future binding block of lambda vars (pseudo bb)
+
+	ldaq	ap|fcn,x4*		scan through lambda-list again 
+	eax6	0			init counter
+expr_binder:
+	cana	lisp_ptr.type,dl		done?
+	tnz	expr_assign_0-*,ic		   yes
+	staq	bb|0,x1
+	epplb	bb|0,x1*
+	ldaq	lb|0			= the lambda-atom
+	staq	bb|2,x1
+	cana	Atsym,dl			make sure it is bindable
+	tze	bad_bound_var_sp-*,ic
+	cmpaq	ab|nil
+	tze	loser_bind_nil-*,ic
+	ldaq	bb|0,x0			get value of arg
+	staq	bb|0,x1			store into pseudo binding block
+					" lambda var will be bound to it later
+	eax0	2,x0
+	eax6	1,x6			count lambda vars
+	eax1	4,x1
+	ldaq	lb|2			cdr lamda-list
+	tra	expr_binder-*,ic
+
+loser_bind_nil:
+	tra	loser_binding_nil-*,ic
+
+
+expr_assign_0:
+	stx6	ab|pdlptr,x7		check for right number of args
+	cmpx3	ab|pdlptr,x7
+	tze	3,ic
+	tmi	too_few_args_expr-*,ic
+	tra	too_many_args_expr-*,ic
+
+" now that we have made a pseudo binding block out of the
+" lambda variables and the values of the arguments, pop the args
+" (no longer needed) off the pdl and call finish_bindings which
+" will change the pseudo bb into a real bb bind thr lambda
+" vars to the args.
+
+	lxl1	ab|-4,x7			saved top of pseudo bb
+	tsx0	finish_bindings-*,ic
+	ldx1	ab|-2,x7			= binding_block.top_block
+	eax0	ap|0,x4			so can adjust x4
+	stx0	ab|-4,x7
+	eppap	bb|0,x1			clear the spread args off the pdl
+					" (finish_bindings sets bb)
+	ldx4	ab|-4,x7			adjust x4
+	sbx4	ab|-2,x7
+	"tra	eval_lambda_body-*,ic	*** fall into eval_lambda_body
+"
+" come here to evaluate a lambda body which is the cdr of ap|fcn,
+"  and consists of a list of 0 or more objects to be evaluated,
+"  the value of the last of which is returned as the value of the lambda.
+" After evaluating the lambda body, the topmost binding block is
+"  unwound, restoring the lambda atoms to thwir former values.
+
+eval_lambda_body:
+	eppap	ap|2			place for return value
+	eax4	-2,x4
+	ldaq	ab|nil
+	staq	ap|-2			initial value nil in case empty body
+
+eval_lambda_body_loop:
+	eppbp	ap|fcn,x4*		cdr down lambda body, first time is list of
+					"  lambda list and lambda body
+	ldaq	bp|2
+	staq	ap|fcn,x4
+	cana	lisp_ptr.type,dl
+	tnz	end_eval_lambda_body-*,ic
+	ldaq	ap|fcn,x4*
+	staq	ap|-2			thing to pass to eval
+	tsx0	recurse-*,ic
+	tra	eval_lambda_body_loop-*,ic
+
+end_eval_lambda_body:
+	ldaq	ap|-2			move result down
+	eppap	ap|-2
+	eax4	2,x4
+
+" come here to unwind & exit
+
+fcn_fin:	staq	ap|qsrac,x4		save result of fcn
+	canx2	mapf,du			from a map fcn?
+	tnz	map_fcn_fin-*,ic		yes, go loop.
+	tsx0	unbinder-*,ic
+
+" if macro bit is set, send the macro around for another evaluation
+" else return
+
+freturn_join:
+	ldaq	ap|qsrac			get result
+	canx2	macrobit,du
+	tze	0,5			return with result in aq,
+					" and our 4 temp.'s on stack
+
+
+
+	staq	ap|form			allowed since frame has been destroyed
+	eppap	ap|form+2
+	tra	evalu-*,ic		...and go around again
+
+" this is code to finish up an freturn
+" entered with the binding block already unwound, but the eval_frame still present
+" there is nothing on either pdl except the usual 3 unmkd and 4 marked words - huh?
+" we restore the index registers, get rid of the eval frame, and join up with fcn_fin
+
+	segdef	freturn_real
+
+freturn_real:
+	getlp
+	epbpab	lisp_static_vars_$unmkd_ptr,*	switch to lisp mode from pl1 mode
+	eppap	lisp_static_vars_$stack_ptr,*
+	ldx7	lisp_static_vars_$unmkd_ptr+1
+	stz	ab|in_pl1_code
+
+	" back in lisp mode -- restore index regs
+
+	ldx5	ab|svx5u,x7
+	lxl2	ab|svx2l,x7
+
+	" ap|qsrac has the return value in it
+
+	ldaq	ab|-2,x7				restore return_ptr in our caller's stack frame
+	staq	sp|20				***** stack_frame.return_ptr
+	canx2	mapf,du
+	tnz	map_freturn		freturn to mapped fcn - go fix it up.
+
+	" get rid of the stupid eval_frame
+
+	canx2	framebit,du
+	tze	3,ic
+	 ldx1	 ab|frame.prev_frame-6,x7
+	 stx1	 lisp_static_vars_$eval_frame+1
+	eax7	-8,x7				flush the unmkd pdl
+	tra	freturn_join			go join in with fcn_fin
+"
+
+" this routine is called to unwind the binding block,
+"  and the eval frame (if there is one).   It clears
+" the unmarked pdl and clears the binding block off
+" of the marked pdl.  It must not change x3 (for map).
+" also unwinds the funarg reversal binding block if fbb flag is on
+
+unbinder:					" called by tsx0
+
+	lxl1	ab|-2,x7			binding_block.bot_block
+	cmpx1	ab|-2,x7			binding_block.top_block
+	tze	lambda_completion		no bindings at all
+
+	epbpbp	ap|0
+	adwpbp	ab|-2,x7			binding_block.top_block
+					" used to scan top - down
+unwind_bindings:
+	eppbp	bp|-4			-> next binding
+	ldaq	bp|0			old value
+	staq	bp|2,*			put back in atom.value
+	eax1	4,x1			next binding
+	cmpx1	ab|-2,x7			done? - check with binding_block.top_block
+	tnz	unwind_bindings-*,ic
+
+lambda_completion:
+	eax1	ab|-2,x7			this bb may not have been threaded in (subr)
+	cmpx1	lisp_static_vars_$binding_top+1
+	tnz	3,ic
+	 ldx1	 ab|-1,x7			binding_block.back_ptr
+	 stx1	 lisp_static_vars_$binding_top+1
+
+"if an evalframe was made, destroy it
+
+	canx2	framebit,du
+	tnz	destroy_evalframe
+lambda_completion_1:
+	canx2	fbb,du			funarg bb?
+	tze	lambda_completion_2-*,ic	no, don't have to unwind it
+	stx5	ab|svx5u,x7		stash registers
+	stx0	ab|svx0u,x7
+	sxl3	ab|svx3l,x7
+	sxl4	ab|svx4l,x7
+	epplb	ab|-8,x7			and unwind the funarg reversal bb
+	tsx3	unwind_reversal_bb-*,ic
+	lxl4	ab|svx4l,x7		now reload the regs
+	lxl3	ab|svx3l,x7
+	ldx0	ab|svx0u,x7
+	ldx5	ab|svx5u,x7
+lambda_completion_2:
+	eppap	ap|0,x4			remove cruft from marked pdl
+	eax7	-8,x7			remove cruft from unmarked pdl
+	tra	0,0			& return.
+
+destroy_evalframe:
+	ldx1	ab|frame.prev_frame-6,x7
+	stx1	lisp_static_vars_$eval_frame+1
+	tra	lambda_completion_1
+"
+" the arguments are spread on the marked pdl where the arg function
+"  can get at them.  The atomic symbol that was used as a lambda-list
+"  is assigned to the number of arguments.  The pseudo-atom "argatom"
+"  in lisp_static_vars_ is assigned to an uncollectable structure
+"  representing the location and number of the stacked up args.
+" then common code with expr is entered to eval the lambda
+"  body, unwind the bindings, and return.
+
+args_spread_for_lexpr:
+
+	epbpbb	ap|0
+	eax1	ap|0
+	canx2	already_spread,du		args not at top of pdl?
+	tnz	2,ic			yes, leave x1 = ap
+	tsx0	set_x1_args-*,ic		-> spread arguments
+	ldaq	ap|fcn,x4*		bind the atomic lambda list
+	staq	bb|-2,x1
+	eppbp	lisp_static_vars_$argatom  and the "argatom" used by arg function
+	spribp	ab|-4,x7			- not really an atom, so have to set
+	ldaq	ab|-4,x7			Uncollectable type-bits.
+	ora	Uncollectable,dl
+	staq	bb|-6,x1
+	ldq	ap|argl,x4		find args.
+	canx2	already_spread,du		are they below binding block?
+	tnz	2,ic			yes
+	eaq	0,x1			no, args are above binding block
+	eaa	0,x3			number of arguments
+	ora	Uncollectable,dl
+	staq	bb|-8,x1
+	lrl	54			shift number of args into ql
+	lda	fixnum_type,dl
+	staq	bb|-4,x1
+	tsx0	finish_bindings-*,ic
+	tra	eval_lambda_body-*,ic
+"
+eval_lsubr:
+	orx2	lsubrbit,du
+					" and fall into eval_subrs_and_arrays
+
+eval_subrs_and_arrays:
+	tra	arg_spreader-*,ic
+
+args_spread_for_subr:
+	canx2	lsubrbit,du
+	tnz	args_spread_for_lsubr-*,ic
+
+" subr - check arg count
+
+	cmpx3	ap|fcn,x4*		compare number args to number in subr pointer
+	tze	3,ic
+	tnc	too_few_args_subr-*,ic
+	trc	too_many_args_subr-*,ic
+
+call_subr_bbf:
+	canx2	bbf,du
+	tze	call_subroutine-*,ic
+	tsx0	set_x1_args-*,ic		do funarg stuff before calling subr
+	tsx0	finish_bindings-*,ic
+
+" to call a subr, etc.
+" with the args spread on the marked pdl.
+" For lsubrs, x6 contains -2*the number of arguments,
+"  which is moved into x5 just before the call.
+" ap|fcn,x4 points to the subr-link block which contains
+"  a Multics dynamic link to the subr and an interface procedure.
+
+call_subroutine:
+	eppbp	ap|fcn,x4*		-> subr pointer
+	stx5	ab|svx5u,x7		save regs through the call
+	sxl2	ab|svx2l,x7
+	eax5	0,x6			in case of lsubr, get arg count into x5
+	tspbp	bp|1
+returned_from_subroutine:
+	ldx5	ab|svx5u,x7
+	lxl2	ab|svx2l,x7
+	lxl4	ab|-2,x7			since only the binding blocks is there now (the subr
+	sbx4	ab|-2,x7			 has popped its args), restore proper x4
+	tra	fcn_fin-*,ic		go finish up
+" 
+" args are spread out on stack just like for subr,
+"  but -2 * argcount is passed in x5 so that first arg will be at ap|0,x5
+
+args_spread_for_lsubr:
+
+	canx2	bbf,du
+	tze	3,ic
+	tsx0	set_x1_args-*,ic
+	tsx0	finish_bindings-*,ic
+	tsx0	ck_lsubr_nargs-*,ic
+	eaq	0,x3			get arg count...
+	qrl	17			...times -2
+	negl	0,du
+	eax6	0,ql			will be moved into x5 ...
+	tra	call_subroutine-*,ic	and go call it.
+
+
+
+" like a subr with one argument, which is the unevaluated list of args
+
+eval_fsubr:
+	ldaq	ap|argl,x4			move arg list up to 1st arg position
+	eppap	ap|2
+	eax4	-2,x4
+	staq	ap|-2
+	tra	call_subr_bbf-*,ic		and go call it.
+ 
+" routine to check number of arguments on an lsubr
+" called with x3 containing number of args
+" and ap|fcn,x4 being the subr ptr
+" called by tsx0. Does not return if number of args is wrong
+
+ck_lsubr_nargs:
+
+" only check number of arguments in *rset t mode
+
+	ldaq	lisp_static_vars_$star_rset,*
+	cmpaq	ab|nil
+	tze	0,0
+
+" check against max & min number of args stored in subr ptr
+
+	lda	ap|fcn,x4*		first word of subr pointer has max,min
+	ana	=o000777,du		get min
+	sta	ab|-4,x7
+	lda	ap|fcn,x4*
+	ana	=o777000,du		get max
+	arl	9
+	tnz	2,ic
+	lda	=o777777,du		if 0, substitute a big number
+	sta	ab|-3,x7
+	cmpx3	ab|-4,x7
+	tnc	too_few_args_lsubr-*,ic
+	cmpx3	ab|-3,x7
+	tze	2,ic
+	trc	too_many_args_lsubr-*,ic
+	tra	0,0
+"
+" routine to spread arguments
+
+" entered with ap|argl,x4 pointing to argument list
+
+" returns with arguments spread out on marked pdl
+"  x3	number of arguments
+"  x4	offset from new top of marked pdl to old top of marked pdl
+" action is controlled by bits in x2
+"  noteval	0 - arguments are evaluated
+"		1 - arguments not evaluated
+"  exprbit	controls where arg_spreader returns to
+"		(NB: arg_spreader is called by tra, not tsx)
+" on return, ap|argl,x4 is unchanged
+" uses ap|qsrac,x4 to avoid modifying ap|argl,x4
+
+arg_spreader:
+	eax3	0		start with no args
+	canx2	already_spread,du
+	tnz	spread_adj-*,ic
+	ldaq	ap|argl,x4	copy arg list
+	staq	ap|qsrac,x4
+spread1:
+	cana	lisp_ptr.type,dl		any arguments left?
+	tnz	spread_no_more-*,ic		no.
+	ldaq	ap|qsrac,x4*	yes, get one
+	eppap	ap|2		room to eval it
+	staq	ap|-2
+	eax3	1,x3		count arguments
+	eax4	-2,x4		keep x4 pointing back below arguments
+	canx2	noteval,du	should it be evaled?
+	tnz	2,ic		no.
+	tsx0	recurse-*,ic	yes, so do it.
+	eppbp	ap|qsrac,x4*	cdr-ize argument list
+	ldaq	bp|2
+	staq	ap|qsrac,x4
+	tra	spread1-*,ic
+
+spread_no_more:
+	canx2	exprbit,du
+	tnz	args_spread_for_expr-*,ic
+	tze	args_spread_for_subr-*,ic
+
+
+
+
+" come here when spreading args that are already spread
+
+" for subr, lsubr have to move them to top of pdl
+" for expr, lexpr, can leave them where they are
+
+spread_adj:
+	ldx3	ap|argl+1,x4		get number of args
+	canx2	exprbit,du		expr or subr?
+	tnz	args_spread_for_expr-*,ic	expr, no problem
+" subr, make sure args are at top of pdl
+" they will be unless we had to create a binding block
+
+
+	cmpx4	0,du			is there a binding block?
+	tze	spread_adj_aa-*,ic		no, can use args where they stand
+
+" have to move args up to top of pdl
+
+spread_adj_0:
+	lda	ap|argl,x4		au -> start of args
+	epbpbb	ap|0
+	eppbp	bb|0,au			bp -> start of args
+	eax0	0,x3			number of args
+spread_up:
+	tze	args_spread_for_subr-*,ic	all done when x0 = 0
+	eppap	ap|2
+	eax4	-2,x4
+	ldaq	bp|0
+	staq	ap|-2
+	eppbp	bp|2
+	eax0	-1,x0
+	tra	spread_up-*,ic
+
+
+" nothing above the args but this ap|form, etc.
+" so we can remove the eval frame and call the
+" subr with the args in place
+
+spread_adj_aa:
+	canx2	fbb,du			can't do this if a funarg
+	tnz	spread_adj_0-*,ic
+
+	ldaq	lisp_static_vars_$star_rset,*
+	cmpaq	ab|nil			- in *rset t mode must keep eval frame for baktrace
+	tnz	spread_adj_0-*,ic
+	canx2	framebit,du
+	tze	3,ic
+	  ldx1	  ab|frame.prev_frame-6,x7
+	  stx1	  lisp_static_vars_$eval_frame+1
+	canx2	lsubrbit,du
+	tnz	spread_for_lsubr-*,ic
+	cmpx3	ap|fcn,*			check number of args
+	tze	3,ic
+	tnc	too_few_args_subr-*,ic
+	trc	too_many_args_subr-*,ic
+call1_call:
+	eppbp	ap|fcn,*
+	eppap	ap|form
+	eax7	-8,x7			get rid of junk on unmkd pdl
+	tspbp	bp|1
+	tra	call1_rtn_1-*,ic
+
+spread_for_lsubr:
+	tsx0	ck_lsubr_nargs-*,ic
+	lxl5	ap|argl+1
+	tra	call1_call-*,ic
+" 
+" routine to determine type of function being used.
+
+" on entry ap|fcn,x4 is original function -- usually atom.
+" on exit, ap|fcn,x4 is function actually to be used, ass follows:
+"  subr,array,fsubr,lsubr:	pointer to subr-link block
+"  expr,fexpr,lexpr,macro,lambda:
+"			cdr of lambda-expression,
+"			i.e. cons of lambda-list and body
+
+
+" register usage
+" ap|qsrac,x4 points to property list
+" ap|fcn,x4 comes in with function, returns with real function, dep on type
+" ap|argl,x4 comes in with args, is reset to ap|form if macro
+"  bp	 "
+"  x3	points to return transfer vector
+"  x6     temporary, + fexpr indicator in ck_lambda
+"  aq	in property - list searching loop, contains current
+"		indicator (= bp|0).
+"  x4	offset from top of marked pdl of ap|form, etc.
+" the bits in x2 exprbit,lsubrbit are NOT set by find_type.
+" however, macrobit is set (a macro looks like a fexpr
+"  except that this bit is turned on, causing re-evaluation later)
+
+
+find_type:	" x3 points to return transfer vector, entries in the following order:
+		" array,subr,lsubr,expr,fexpr,fsubr,lexpr
+
+	equ	array_offset,0
+	equ	subr_offset,1
+	equ	lsubr_offset,2
+	equ	expr_offset,3
+	equ	fexpr_offset,4
+	equ	fsubr_offset,5
+	equ	lexpr_offset,6
+
+		" NOTE: nil can never be a function because this code doesn't
+		" know how to get at the property list of nil.
+
+	anx2	-already_autoloaded_once-1,du " turn off the already autoloaded bit
+find_type_reenter:
+	ldaq	ap|fcn,x4
+	cana	Atsym,dl			check for symbol...most common case
+	tze	unsymbolic_function
+	eppbp	ap|fcn,x4*
+	epplb	lisp_static_vars_$function_properties	for rpt loop.
+find_type_1:
+	ldaq	bp|2		-> plist
+	cana	lisp_ptr.type,dl
+	tnz	end_of_plist-*,ic
+	eppbp	bp|2,*
+	ldaq	bp|0		get the indicator
+	eax6	0		free index register used in rpt loop
+	rpt	8,2,tze		scan all 8 indicators, and skip if equal
+	cmpaq	lb|0,x6
+	ttf	fn_checks-2,x6	rpt leaves x6 2 too high.
+skip_autoload:
+	eppbp	bp|2,*		" try again on next property.
+	tra	find_type_1
+fn_checks:
+	eax0	subr_offset,x3
+	tra	cksubr		" subr
+
+	eax0	lsubr_offset,x3
+	tra	cksubr		" lsubr
+
+	eax0	fsubr_offset,x3
+	tra	cksubr		" fsubr
+
+	eax6	0		" set x6 0 for ck_lambda
+	tra	ck_lambda		" expr .. doesn't return
+
+	tsx6	ck_lambda		" fexpr .. doesn't return(sets x6 non-zero too)
+	drl	0
+
+	eax0	array_offset,x3	" return for array
+	tra	cksubr		" array
+
+	tra	ck_macro		" macro
+	drl	0		" doesn't return
+
+	tra	ck_autoload	" autoload
+	drl	0		" doesn't return
+
+" Routine to check for lambda forms (or symbols - synonym hack)
+" Exits to appropriate transfer vector entry
+" called with x6 non zero for fexprs and macros.
+
+ck_lambda:
+	  ldaq	  bp|2,*		make sure is lambda expression
+	  staq	  ap|fcn,x4
+	  cana	  Atsym,dl	Atomic symbol instead of list as fcnl property
+	  tnz	  find_type-*,ic
+	  eppbp	  ap|fcn,x4*	lambda expression, get cdr which is lambda-list & body
+	  ldaq	  bp|0
+	  cmpaq	  lisp_static_vars_$lambda
+	  tnz	  bad_fcnl_form-*,ic
+	  ldaq	  bp|2
+xx_lambda:  staq	  ap|fcn,x4
+	  cmpx6	  0,du			fexpr or macro?
+	  tnz	  fexpr_offset,x3		yes, appropriate exit
+	  canx2	  macrobit,du		Is this a linked macro def?
+	  tnz	  fexpr_offset,x3		Yup, fexpr/macroize it.
+	  ldaq	  ap|fcn,x4*		check for lexpr
+	  cmpaq	  ab|nil
+	  tze	  expr_offset,x3
+	  cana	  Atsym,dl
+	  tnz	  lexpr_offset,x3		yes.
+	  tra	  expr_offset,x3
+
+ck_macro:
+	  canx2	  applybit,du	macros may not be applied!
+	  tnz	  illegal_use_of_a_macro-*,ic
+	  orx2	  macrobit,du
+	  ldaq	  ap|form,x4	arg to macro is whole body
+	  staq	  ap|argl,x4
+	  tsx6	  ck_lambda-*,ic
+
+illegal_use_of_a_macro:
+	  canx2	  ignore_macros,du	is this an error?
+	  tnz	  skip_autoload-*,ic  no, just ignore the macro prop
+	  tra	  bad_fcnl_form-*,ic  yes, barf
+
+ck_autoload:
+	canx2	already_autoloaded_once,du
+	tnz	skip_autoload		" if already autoloaded, try next indicator
+	orx2	already_autoloaded_once,du	remember that we did
+	ldaq	lisp_static_vars_$user_intr_array+2*(18-1),*	user interrupt 18.
+	cmpaq	ab|nil
+	tze	skip_autoload		if autoload interrupt not enabled.
+	eppap	ap|6
+	staq	ap|-6
+	ldaq	bp|2,*			load value under property
+	staq	ap|-2
+	ldaq	ap|fcn-6,x4		" remember we have pushed 6 words on
+	staq	ap|-4			" pass cons of name and autoload prop.
+	tsx0	call_cons
+	eax7	10,x7
+	stx1	ab|-10,x7
+	stx2	ab|-9,x7
+	stx3	ab|-8,x7
+	stx4	ab|-7,x7
+	stx5	ab|-6,x7
+	eax5	-4
+	sprilp	ab|-4,x7
+	stcd	ab|-2,x7
+	tra	funcall
+	ldx1	ab|-6,x7
+	ldx2	ab|-5,x7
+	ldx3	ab|-4,x7
+	ldx4	ab|-3,x7
+	ldx5	ab|-2,x7
+	eax7	-6,x7
+	tra	find_type_reenter		and try again to get function
+
+
+
+end_of_plist:	" atom has no functional properties, eval its value
+	orx2	went_through_value_cell,du
+	ldaq	ap|fcn,x4*		atom.value
+	tze	undef_fcn-*,ic	  if undefined.
+	cmpaq	ap|fcn,x4			Is it bound to itself (e.g. nil)?
+	tze	undef_fcn-*,ic		  yes, avoid embarrassing loop.
+	staq	ap|fcn,x4
+	tra	find_type-*,ic
+
+unsymbolic_function:
+	cana	lisp_ptr.type,dl
+	tze	non_atom_fcn
+	cana	Subr,dl
+	tnz	subr_offset,x3		a direct subr pointer.
+	tra	undef_fcn
+
+non_atom_fcn:	" non-functional function, so eval it.
+
+
+" check for lambda expression or label expression, since we now know it's a list
+
+	eppbp	ap|fcn,x4*
+	ldaq	bp|0		car of the list
+	eax6	0
+	epplb	lisp_static_vars_$lambda
+	rpt	3,2,tze
+	cmpaq	lb|0,x6	" lambda, label, and funarg are together.
+	ttn	x13
+	ldaq	bp|2
+	tra	*+1-2,x6		x6 is set 2 too high on successful compare
+
+	eax6	0
+	tra	xx_lambda		jump to lambda code
+
+	staq	ap|fcn,x4		set fcn
+	tra	eval_label
+
+	staq	ap|fcn,x4
+	tra	eval_funarg
+
+" just a random list, eval it and use its value as the function
+
+x13:	ldaq	ap|fcn,x4
+	orx2	went_through_value_cell,du
+	eppap	ap|2
+	staq	ap|-2
+	tsx0	recurse-*,ic
+	"ldaq	ap|-2		(the result is really already in aq, also)
+	eppap	ap|-2		back up ap, from call.
+	staq	ap|fcn,x4		and restore new function.
+	tra	find_type-*,ic
+
+
+cksubr:	ldaq	bp|2,*			get the supposed subr pointer
+	cana	Subr,dl
+	tze	undef_fcn-*,ic		not a subr ptr -- barf.
+	staq	ap|fcn,x4			yes, subr ptr is fcn we are applying
+	canx2	macrobit,du		Is this a subr-macro?
+	tnz	fsubr_offset,x3		Treat like fsubr
+	tra	0,0
+
+ck_bound_var:			" procedure to check if aq contains
+				" something that can legally be bound.
+				" the object being checked must be in both aq & ap|-2
+	cana	Atsym,dl
+	tze	bad_bound_var-*,ic	if not even an atomic symbol, barf.
+	cmpaq	ab|nil
+	tnz	0,0		ok.
+
+" loser trying to bind nil.  Give him a nihil ex nihile message
+
+loser_binding_nil:
+	lda	lisp_error_table_$nihil_ex_nihile
+	tra	error-*,ic	...never returns
+
+" eval a funarg, which is generated by *function
+"  and looks like: (funarg <fcn> . <pdl ptr> )
+
+" stashes the pdl_ptr and sets bbf and fbb flags
+" so that finish_bindings will reverse context back to this pdl ptr,
+" after the arguments have been evaled.
+" substitutes the function from the funarg for the funarg and goes
+" back into find_type to handle the substituted fnction
+
+eval_funarg:
+	eppbp	ap|fcn,x4*		-> cdr of the funarg list
+	ldaq	bp|0			... the function
+	staq	ap|fcn,x4
+	orx2	bbf+fbb+went_through_value_cell,du
+	lxl1	bp|3			assume proper pdl ptr put by *function
+	tnz	2,ic			0 cuases lossage so check...
+	 eax1	 1
+	stx1	ab|funarg_pdlptr,x7
+	tra	find_type-*,ic
+"
+" routine to make a pseudo binding block into a real binding block
+" this is called after argument evaluation, when it safe to make bindings
+" for funarg, label.
+
+" called by tsx0
+" changes only registers x0, x1, x6, aq, lb, bb
+" sets bb to segment number of marked pdl
+
+" when called by tsx0, pseudo bb extends from binding_block.top_block to bb|0,x1
+
+finish_bindings:
+	canx2	fbb,du			need a reversal bb?
+	tze	finish_bindings_aa-*,ic	no
+	stx5	ab|svx5u,x7		save registers
+	stx0	ab|svx0u,x7
+	sxl3	ab|svx3l,x7
+	sxl4	ab|svx4l,x7
+	sxl1	ab|svx2l,x7
+	ldx4	ab|funarg_pdlptr,x7	pick up pdl ptr to be used
+	epplb	ab|-8,x7			set ptr to where to put bb
+	tsx3	reverse_binding_context-*,ic	switch worlds
+	lxl1	ab|svx2l,x7
+	lxl4	ab|svx4l,x7		and get registers back
+	lxl3	ab|svx3l,x7
+	ldx0	ab|svx0u,x7
+	ldx5	ab|svx5u,x7
+
+finish_bindings_aa:
+	stx1	ab|pdlptr,x7		save top of pseudo bb for compare
+	ldx1	ab|-2,x7			binding_block.top_block, = bottom of pseudo bb
+	epbpbb	ap|0
+	eppap	ap|2			temp.
+					"that gets garbage collected
+
+	ldq	lisp_static_vars_$binding_top+1
+	stq	ab|-1,x7			now thread in this block
+	eaq	ab|-2,x7
+	stq	lisp_static_vars_$binding_top+1
+
+fin_loop: cmpx1	ab|pdlptr,x7		done whole pseudo bb?
+	tze	fin_xx-*,ic			  yes, return.
+	ldaq	bb|0,x1			no, get new value
+	staq	ap|-2			save it
+	ldaq	bb|2,x1*			get old value
+	staq	bb|0,x1			put it in binding block
+	eax1	4,x1
+	stx1	ab|-2,x7			update binding_block.top_block
+	ldaq	ap|-2			assign new value to the atom
+	staq	bb|2-4,x1*
+	tra	fin_loop-*,ic
+
+fin_xx:	eppap	ap|-2			pop off our temp
+	tra	0,0
+
+
+
+" proc to set x1 and bb to point at the spread args
+" called by tsx0
+" uses the arg count in x3
+" also sets au to offset from top of pdl to 1st arg
+" thus return values are bb|,x1=abs loc, au=rel loc
+
+set_x1_args:
+	epbpbb	ap|0
+	eaa	0,x3			get arg count
+	als	1			- each arg takes 2 words
+	neg	0
+	eax1	ap|0,au
+	tra	0,0
+"
+	segdef	stfunction	- the lisp *function fsubr, which makes funargs
+
+stfunction:
+
+" on entry ap|-2 is arg list, i.e. ( <fcn> . nil)
+" we want to return the list (funarg <fcn> . <pdlptr> )
+
+" this function is equivalent to:
+" (defun *function fexpr (x y) (cons 'funarg (cons (car x) y)))
+" modified 73.11.02 by DAM to get rid of bug of assuming that there is a binding
+"	block for our own invocation
+
+	eppap	ap|4		room for 3 things
+	ldaq	ap|-6,*		get our first (and only) arg - the function
+	staq	ap|-4
+	ldx1	lisp_static_vars_$binding_top+1 -> most recent binding_block
+	tze	stfunction_00-*,ic		if no bb at all, don't give 0 pdl ptr
+	lxl0	ab|0,x1			Kludgey way to check if we have own binding block.
+	cmpx0	ab|0,x1			empty binding blocks are only generated by evaluator,
+	tnz	2,ic			plus it doesn't hurt to skip over an empty b.b.
+	ldx1	ab|1,x1			this is empty, prob. our own - skip over it
+	eaq	0,x1			-> binding block itself
+	tnz	2,ic
+stfunction_00:
+	eaq	ab|unmkd_stack_bottom,*	no binding_blocks, use stack base addr
+	qrl	18
+	orq	-2,du
+	lda	fixnum_type,dl
+	staq	ap|-2
+	ldaq	lisp_static_vars_$funarg
+	staq	ap|-6
+	eax7	6,x7
+	tsx0	call_cons-*,ic
+	tsx0	call_cons-*,ic
+	eax7	-6,x7
+	ldaq	ap|-2
+	eppap	ap|-2
+	tra	lisp_rtn_1-*,ic
+"
+" handle functional forms such as (label foo (cruft))
+
+" pseudo binds the function name to the function, then substitutes
+" the new function for the label-expression and goes back to find_type.
+
+" NB: atoms with functional properties cannot be successfully
+" labelled to a recursive function since the property list
+" is checked before the value. However, this is compatible
+" since MACLISP has this same bug (or feature).
+
+eval_label:
+	eppbp	ap|fcn,x4*
+	ldaq	bp|0			function name
+	eppap	ap|4
+	eax4	-4,x4
+	staq	ap|-2
+	tsx0	ck_bound_var-*,ic
+	orx2	bbf+went_through_value_cell,du	set flag for pseudo bb existence
+	ldaq	bp|2,*			2nd arg to label is function
+	staq	ap|-4			rebind it.
+	staq	ap|fcn,x4
+	tra	find_type-*,ic		now proceed with the labelled function
+"
+" Evalhook stuff
+
+" lisp_static_vars_$evalhook_status contains one
+" of the following two instructions:
+
+	segdef	evalhook_on_status,evalhook_off_status
+
+evalhook_off_status:
+	nop	0		evalhook checking disabled
+
+evalhook_on_status:
+	tsx6	evalhook_check
+
+" Come here if evalhook checking is enabled.
+" ap|-2 contains the item being evaluated.
+" x1 and x6 are usable but all other registers are to be preserved
+" if the value of evalhook is non-null it is applied
+" in place of the evaluation that was to be done
+
+
+evalhook_check:
+	ldaq	lisp_static_vars_$evalhook_atom,*
+	cmpaq	ab|nil		evalhook on?
+	tze	0,x6		no, go on evaling
+
+evalhook_trap:
+	eax1	0,x7
+	eax7	15+32,x7
+	anx7	-16,du
+	spri	ab|-32,x7
+	sreg	ab|-16,x7
+
+	eppap	ap|8		generate call to apply
+	staq	ap|-8		saved value of evalhook
+	staq	ap|-4		function to be applied
+	ldaq	lisp_static_vars_$evalhook_atom
+	staq	ap|-6		atom to be bound
+	ldaq	ap|-10		form being evaled
+	staq	ap|-2
+	eax1	ap|-4		top
+	stx1	ab|-12,x7
+	eax1	ap|-8		bottom
+	sxl1	ab|-12,x7
+	lda	lisp_static_vars_$binding_top+1
+	sta	ab|-11,x7
+	eax1	ab|-12,x7
+	stx1	lisp_static_vars_$binding_top+1
+	ldaq	ab|nil		evalhook is bound, turn off
+	staq	ap|-6,*
+
+	sprilp	ab|-8,x7		prime return blocks
+	sprilp	ab|-4,x7
+
+	stcd	ab|-2,x7		ncons the 2nd arg to apply
+	tra	lisp_alloc_$ncons_
+	eppap	ap|2		push result back on stack
+	staq	ap|-2
+
+	eax5	-4
+	stcd	ab|-2,x7		now apply the evalhooker
+	tra	apply_-*,ic
+
+	staq	ap|-6		returned value is new form to eval
+	ldaq	ap|-4		restore evalhook value
+	staq	ap|-2,*
+	ldx1	ab|-3,x7		unbind
+	stx1	lisp_static_vars_$binding_top+1
+	lreg	ab|-8,x7		restore state
+	lpri	ab|-24,x7
+	eax7	0,x1
+	ldaq	ap|-2		get result in aq
+	tra	-2,x6		and return from the evaluation
+
+
+" The evalhook function
+
+	segdef	evalhook
+
+evalhook:	eax7	4,x7		save evalhook_status, bind evalhook_atom
+	lda	lisp_static_vars_$evalhook_status
+	sta	ab|-4,x7
+	lda	evalhook_on_status-*,ic
+	sta	lisp_static_vars_$evalhook_status
+	eppap	ap|6
+	ldaq	lisp_static_vars_$evalhook_atom
+	staq	ap|-4
+	ldaq	ap|-4,*
+	staq	ap|-6
+	eax1	ap|-2
+	stx1	ab|-2,x7
+	eax1	ap|-6
+	sxl1	ab|-2,x7
+	lda	lisp_static_vars_$binding_top+1
+	sta	ab|-1,x7
+	eax1	ab|-2,x7
+	stx1	lisp_static_vars_$binding_top+1
+
+	ldaq	ap|-8		bind evalhook to 2nd arg
+	staq	ap|-4,*
+	ldaq	ap|-10		eval first arg
+	staq	ap|-2
+	tsx5	evalu+1-*,ic	go join evaluator after evalhook test
+	eppap	ap|-6
+
+	staq	ap|-8		store result back over first arg
+	ldaq	ap|-4		unbind evalhook
+	staq	ap|-2,*
+	ldx1	ab|-1,x7		undo binding block
+	stx1	lisp_static_vars_$binding_top+1
+	lda	ab|-4,x7		restore evalhook_status
+	sta	lisp_static_vars_$evalhook_status
+	eax7	ab|-4,x7		clear one pdl
+	ldaq	ap|-8		get return value
+	eppap	ap|-8		clear other pdl
+	tra	lisp_rtn_1-*,ic	and return
+
+" error handlers.
+
+bad_fcnl_form:
+				" uncorrectable error!
+	ldaq	ap|fcn,x4
+	eppap	ap|2
+	staq	ap|-2
+	lda	lisp_error_table_$bad_function
+	tsx0	error-*,ic
+
+
+bad_fcnl:
+
+	ldaq	ap|form,x4*		the fnc name
+	staq	ap|fcn,x4
+	tra	bad_fcnl_form-*,ic
+
+
+undef_fcn:
+	ldaq	ap|fcn,x4
+	eppap	ap|2
+	staq	ap|-2
+	lda	lisp_error_table_$undefined_function
+	tsx0	error-*,ic
+	"ldaq	ap|-2
+	eppap	ap|-2
+	staq	ap|fcn,x4
+	tra	find_type-*,ic
+
+subrcall_error:
+	tsx0	foocall_error-*,ic
+	lda	lisp_error_table_$subrcall_bad_ptr
+
+lsubrcall_error:
+	tsx0	foocall_error-*,ic
+	lda	lisp_error_table_$lsubrcall_bad_ptr
+
+arraycall_error:
+	tsx0	foocall_error-*,ic
+	lda	lisp_error_table_$arraycall_bad_ptr
+
+arraycall_mismatch:
+	tsx0	foocall_error-*,ic
+	lda	lisp_error_table_$arraycall_wrong_type
+
+foocall_error:
+	ldaq	ap|fcn		the faulty argument
+	staq	ap|-2		error is uncorrectable
+	xec	0,x0		lda the error code
+	tsx0	error-*,ic	never returns.
+
+
+illegal_f_fcn:	" call from compiled code to fsubr/fexpr with args already evaled
+
+	eppap	ap|2
+	ldaq	ap|form-2,x4
+	staq	ap|-2
+	lda	lisp_error_table_$bad_f_fcn
+	tsx0	error-*,ic			never returns - uncorrectable
+
+
+bad_bound_var_sp:
+	epplp	ab|-4,x7*			get back our lp
+	eppap	bb|4,x1			from expr_binder, make sure that bad bv
+					" is really located at ap|-2
+
+bad_bound_var:			" uncorrectable
+
+	" the non-atomic symbol trying to be bound is in ap|-2
+	" callers of ck_bound_var, be sure of this!!!!
+
+	lda	lisp_error_table_$bad_bv
+	tsx0	error-*,ic
+
+wrong_no_args_expr:
+too_many_args_expr:			" correctable - by substituting a whole new form
+too_few_args_expr:
+	ldaq	ap|fcn,x4*			-> the lambda list
+	eppap	ap|4
+	staq	ap|-2				and fall into wna_com
+
+" make list of form and its lambda list
+
+
+wna_com:
+	eppap	ap|2			total of 6. up
+	ldaq	ap|form-6,x4
+	canx2	applybit,du		need to construct fake form?
+	tze	wna_com_1-*,ic		  no.
+	canx2	already_spread,du		is there an argl?
+	tnz	wna_com_1-*,ic		no, can't make fake form so use(atomic)
+					" function name in place of form.
+	staq	ap|-2
+	eppap	ap|2
+	ldaq	ap|argl-8,x4
+	staq	ap|-2
+	tsx0	call_cons-*,ic
+	ldaq	ap|-2
+wna_com_1:
+	staq	ap|-6
+	ldaq	ab|nil
+	staq	ap|-2
+	tsx0	call_cons-*,ic
+	tsx0	call_cons-*,ic
+	lda	lisp_error_table_$wrong_no_args
+	tsx0	error-*,ic
+	"ldaq	ap|-2
+	eppap	ap|-2
+	anx2	-macrobit-1,du		clear macrobit
+	canx2	mapf,du		from map?
+	tnz	map_abending-*,ic	yes.
+	tra	fcn_fin-*,ic
+
+wrong_no_args_subr:
+too_many_args_subr:
+too_few_args_subr:
+
+	" make list of form and fake args property (nil.nargs)
+
+	ldq	ap|fcn,x4*
+	qrl	18
+	lda	fixnum_type,dl
+	eppap	ap|6
+	staq	ap|-2
+	ldaq	ab|nil
+cons2zz:	staq	ap|-4
+	tsx0	call_cons-*,ic
+	tra	wna_com-*,ic
+
+
+wrong_no_args_lsubr:
+too_many_args_lsubr:
+too_few_args_lsubr:
+
+	" make list of form and fake args property (min.max)
+
+	ldq	ap|fcn,x4*
+	qrl	27			max
+	lda	fixnum_type,dl
+	eppap	ap|6
+	staq	ap|-2
+	ldq	ap|fcn-6,x4*
+	qrl	18
+	anq	=o777,dl			min
+"	lda	fixnum_type,dl
+	tra	cons2zz-*,ic
+
+"
+"
+"	"let" fsubr    BSG 09/12/78
+"
+	segdef	let
+let:	eppap	ap|6		Allocate marked PDL work area.
+	eax7	8,x7		Allocate binding block
+	eax6	ap|0		= bot block, now also top.
+	stx6	ab|-2,x7		Init binding block ctrs.
+	sxl6	ab|-2,x7
+	eax4	0		Current size (-) of binding blk.
+"
+"	Dredge out the vars for the binding block
+"
+	ldaq	ap|form		(let . foo)?
+	cana	lisp_ptr.type,dl
+	tnz	bad_fcnl-*,ic
+	eppbp	ap|form,*		bp -> (((var1 val1)....
+	ldaq	bp|0		s/b let list
+	cmpaq	ab|nil		special case this atomic l.l.
+	tze	let_ll_done
+	cana	lisp_ptr.type,dl	Is it atomic, not nil?
+	tnz	bad_fcnl-*,ic	Yes, (let foo ..)  Barf loudly.
+let_bind_1: 			"Scan let list.
+	"Rest of let list is in AQ, x4 is -4* nargs processed.
+	cana	lisp_ptr.type,dl	Done?
+	tnz	let_ll_done	All done.
+	eppap	ap|4		Push marked pdl
+	eax4	-4,x4
+	staq	ap|argl,x4	Set for indirect
+	eppbp	ap|argl,x4*	bp -> letlist
+	ldaq	bp|0		Letlist element
+	cana	lisp_ptr.type,dl	Atomic, i.e. (let (foo ...
+	tnz	bad_fcnl-*,ic	This is what interpreters are for.
+	ldaq	bp|0,*		car of letlist = symbol
+	staq	ap|-2		Save lambda var
+	cana	Atsym,dl		Make lambda var checks.
+	tze	bad_bound_var-*,ic
+	cmpaq	ab|nil
+	tze	loser_binding_nil-*,ic
+	ldaq	ap|-2,*		Get current val
+	staq	ap|-4		Save in binding block.
+	eppbp	ap|argl,x4*	Point to "rest" of letlist
+	ldaq	bp|2		Get that cdr.
+	tra	let_bind_1-*,ic
+
+let_ll_done:
+	eax1	ap|0
+	stx1	ab|-2,x7		set binding_block.topblock.
+	ldq	lisp_static_vars_$binding_top+1 Avoid fbb hackery for let.
+	stq	ab|-1,x7
+	eaq	ab|-2,x7
+	stq	lisp_static_vars_$binding_top+1
+"	Now eval the things to be assigned.
+
+	ldaq	ap|form,x4*	Point at cons which heads let cdr.
+	staq	ap|argl,x4	Now have let list.
+
+	eax3	0,x4		Duplicate x4.
+	eppap	ap|2		Push work var.
+let_bind_2:
+	cana	lisp_ptr.type,dl	Is it done?
+	tnz	let_bind_2_done	yes.
+
+	eppbp	ap|argl-2,x4*	Point at current letlist head.
+	eppbp	bp|0,*		Point at car, guaranteed non-atomic
+	ldaq	bp|2		Is there a cadr?
+	cana	lisp_ptr.type,dl	...
+	tnz	let_bind_2_gets_nil no
+	ldaq	bp|2,*		Get the cadr.
+	staq	ap|-2
+	tsx0	recurse-*,ic	Get the result of evalling it.
+	tra	*+2-*,ic
+let_bind_2_gets_nil:
+	ldaq	ab|nil
+	staq	ap|2-2,3*	-2 for atsym, 2 for work temp.
+	eax3	4,3		Account for one var.
+	eppbp	ap|argl-2,x4*	Point a letlist cons.
+	ldaq	bp|2		Get cdr.
+	staq	ap|argl-2,x4	Cdr down list.
+	tra	let_bind_2	Loop some more.
+"
+"	Now make like we were a real lambda.
+"
+let_bind_2_done:
+	eax2	0		Zero all of Moon's flags.
+	eppap	ap|-2		Drop the work temp.
+	ldaq	ap|form,x4	Get letlist and body.
+	staq	ap|fcn,x4		Put where eval_lambda_body wants it.
+	tsx5	eval_lambda_body-*,ic
+	tra	lisp_retn-*,ic
+"
+" arg & setarg subrs for lisp
+
+	segdef	arg,setarg,listify
+
+argcom:	ldaq	ap|-2			argument which is arg number.
+	cmpa	fixnum_type,dl
+	tze	5,ic
+wta_arg:	  lda	  lisp_error_table_$meaningless_argument_number
+	  ldq	  -1,x2			get fcn name code.
+	  tsx0	  error-*,ic
+	  tra	  argcom-*,ic
+	cmpx2	qqlistify,du		see if called by listify.
+	tnz	not_listify-*,ic
+	eax1	0,ql
+	tpl	argcom1-*,ic		if positive or zero, ok.
+	ldaq	lisp_static_vars_$argatom	check for lexpr
+	tze	bad_use_arg-*,ic
+	adx1	lisp_static_vars_$argatom
+	tmi	wta_arg-*,ic		if want more args than we got, error.
+	ldx1	lisp_static_vars_$argatom now get last arg addr.
+	tra	argcom2-*,ic
+not_listify:
+	cmpq	1,dl
+	tmi	wta_arg-*,ic
+argcom1:
+	eax1	0,ql
+
+" is there really an arg atom?
+
+	ldaq	lisp_static_vars_$argatom
+	tze	bad_use_arg-*,ic		****** argatom inited to 0 ******
+argcom2:
+	cmpx1	lisp_static_vars_$argatom   check against arg count
+	tze	2,ic
+	tpl	wta_arg-*,ic
+	epbpbb	ap|0
+	eppbp	bb|0,qu			start of arguments on stack
+	eppbp	bp|-1,x1
+	eppbp	bp|-1,x1			(twice because args are double-words
+	tra	0,5
+
+arg:	eax2	qqarg-*,ic
+	ldaq	ap|-2			get argument
+	cmpaq	ab|nil			if nil, get arg count!
+	tnz	arg_non_nil
+	ldaq	lisp_static_vars_$argatom
+	tze	bad_use_arg-*,ic
+	lrl	54			move arg count to q
+	lda	fixnum_type,dl
+	tra	arg_return
+arg_non_nil:
+	tsx5	argcom-*,ic
+	ldaq	bp|0			the arg
+arg_return:
+	eppap	ap|-2
+	tra	lisp_rtn_1-*,ic
+
+listify:	eax2	qqlistify-*,ic		to get right name for wta message.
+	tsx5	argcom-*,ic		go to common code for arg and setarg,
+"					which will get address of last arg to be in list into bp,
+	lda	ap|-1			load number of things to be consed.
+	tpl	2,ic
+	neg	0,du			" make sure positive.
+	eax1	0,al			and put into x1.
+
+	ldaq	ab|nil			get nil result.
+	eax7	2,x7
+lstfy_loop:eax1	-1,x1			decrement count of things to be consed.
+	tmi	lstfy_end
+	sprpbp	ab|-2,x7			save ptr to arg.
+	stx1	ab|-1,x7			and number of args.
+	eppap	ap|4			get room for args to cons.
+	staq	ap|-2			store previous result
+	ldaq	bp|0			get next most recent argument from bp
+	staq	ap|-4			and make first arg to cons.
+	eax7	4,x7			now call cons
+	sprilp	ab|-4,x7			save lp
+	stcd	ab|-2,x7		and return addr.
+	tra	lisp_alloc_$cons_	and jump.
+
+	lprpbp	ab|-2,x7			get back the ptr to args,
+	ldx1	ab|-1,x7			and count.
+	eppbp	bp|-2			move back one arg
+	tra	lstfy_loop-*,ic		and loop if more args.
+
+lstfy_end:
+	eax7	-2,x7			pop off save space
+	eppap	ap|-2			and argument
+	tra	lisp_rtn_1-*,ic		and return.
+
+	vfd	18/-1,18/fn_listify
+qqlistify:
+	ldaq	ab|nil
+	staq	ap|-2
+	ldaq	lisp_static_vars_$qlstfy
+	tra	b_u_a_com
+
+
+setarg:	eax2	qqsetarg-*,ic
+	ldaq	ap|-4			move first arg up
+	eppap	ap|2
+	staq	ap|-2
+	tsx5	argcom-*,ic
+	ldaq	ap|-4			get 2nd arg
+	staq	bp|0			store into stacked args
+	eppap	ap|-6			clear stack
+	tra	lisp_rtn_1-*,ic
+
+" arg or setarg with no lexpr in process
+
+bad_use_arg:
+	eppap	ap|4
+	ldaq	ap|-6
+	staq	ap|-4
+	tra	0,x2
+
+	vfd	18/-1,18/fn_arg
+qqarg:	ldaq	ab|nil
+	staq	ap|-2
+	ldaq	lisp_static_vars_$qarg
+	tra	b_u_a_com-*,ic
+
+	vfd	18/-1,18/fn_setarg
+qqsetarg:	eppap	ap|2			this one has two args, have to make list of them
+	ldaq	ap|-10			get 2nd arg to setarg
+	staq	ap|-4
+	ldaq	ab|nil
+	staq	ap|-2
+	tsx0	call_cons-*,ic
+	ldaq	lisp_static_vars_$qsetarg
+b_u_a_com:
+	staq	ap|-6
+	tsx0	call_cons-*,ic		make list of fcn-name and arg list
+	eppap	ap|2
+	ldaq	ab|nil
+	staq	ap|-2
+	tsx0	call_cons-*,ic
+	tsx0	call_cons-*,ic
+	lda	lisp_error_table_$no_lexpr
+	tsx0	error-*,ic
+	" never returns
+
+
+call_cons:
+	eax7	10,x7		save registers
+	stx0	ab|-5,x7
+	stx1	ab|-10,x7
+	stx2	ab|-9,x7
+	stx3	ab|-8,x7
+	stx4	ab|-7,x7
+	stx5	ab|-6,x7
+
+	sprilp	ab|-4,x7
+	stcd	ab|-2,x7
+	tra	lisp_alloc_$cons_
+	eppap	ap|2
+	staq	ap|-2
+
+	ldx1	ab|-6,x7
+	ldx2	ab|-5,x7
+	ldx3	ab|-4,x7
+	ldx4	ab|-3,x7
+	ldx5	ab|-2,x7
+	ldx0	ab|-1,x7
+	eax7	-6,x7
+	tra	0,x0
+
+
+
+"
+" map functions
+
+" written by D. Moon, 3 Aug 72
+
+" the function being mapped is checked first (by find_type)
+" to see what kind it is.  As much of the work of making
+" binding_blocks, etc. as possible is done once only, instead
+" of each time the function is called.  Then a quick loop is
+" entered: the arguments are spread out on the pdl, and in the
+" case of a fsubr or fexpr they are consed up again. The
+" function is executed, the result it returns is taken care of,
+" and the loop repeats.  When one (or more) of the map lists is
+" exhausted, control passes to map_ending which cleans up and
+" returns.  Note that becuase of this, if one of the map lists
+" is initially nil (or atomic) the number-of-arguments
+" checking may never get done.
+
+" use of the marked pdl.
+"
+" there is some stuff peculiar to map, and above that
+" the standard junk used by eval:
+"
+" bb|0,x3
+"	mapfcn		function being mapped, as 
+"			  returned by find_type
+"	firstlist		first list being mapped over
+"	   .
+"	   .
+"	   .
+"	firstlist+2n-2	last list being mapped over
+"(the above are initially the args to 'map', later
+" cdr-ized or whatever)
+"	mapresult		accumulates result of map.
+"	form		as in apply
+"	fcn		     "
+"	argl		     "
+"	qsrac		     "
+"ap|0,x4
+"	<possibly-empty binding block>
+"
+"	<args>		- pieces of the lists being mapped over
+"ap|0
+
+
+" use of the unmarked pdl
+"	(much same as in apply)
+"
+"	save x3 and x5	(2 words, peculiar to map)
+"	funarg binding block (2 words)
+"	eval-frame	(2 words)
+"	reg save area	(2 words)	- also handy non-gc temporaries
+"	binding_block	(2 words)
+"ab|0,x7
+
+"
+" register usage		- registers not listed are temp's
+"
+" x0	calling (tsx0)
+" x2	control flags as in eval & apply
+" x3	-> original args to map, on marked pdl
+" x4	-size of binding block, as in eval & apply
+" x5	number of lists being mapped over.
+"	   ( = number of args to map-1)
+" x7	unmarked pdl ptr (with ab)
+" ap	marked pdl ptr
+" bb	marked pdl base, used with x3 to get to mapfcn, map lists
+" ab	unmarked pdl base
+
+
+" define bits in x2 specifically for map
+
+	bool	mapcarf,400000	mapc,mapcar,mapcan if 1
+				"map,maplist,mapcon if 0
+	bool	mapretf,200000	cons up list of return values
+	bool	mapconf,100000	nconc up list of return values
+	bool	listargs,40000	fsubr or fexpr
+	bool	mapf,20000	so fcn_fin knows where to return to
+
+"
+
+	equ	mapfcn,0
+	equ	firstlist,2
+	equ	mapresult,form-2
+
+"
+
+	equ	mapsvx3,-10
+	equ	mapsvx5,-9	PROBABLY NOT USED
+
+
+	segdef	map,mapc,mapcar,maplist,mapcan,mapcon
+
+"
+" entry points	- just set x2 bits & enter common code
+
+" these are type 1 lsubr's.
+" the args property should be (2 . 777) or 777002
+
+map:	eax2	applybit+mapf
+	tra	mapcom-*,ic
+
+mapc:	eax2	applybit+mapf+mapcarf
+	tra	mapcom-*,ic
+
+mapcar:	eax2	applybit+mapf+mapcarf+mapretf
+	tra	mapcom-*,ic
+
+maplist:	eax2	applybit+mapf+mapretf
+	tra	mapcom-*,ic
+
+mapcan:	eax2	applybit+mapf+mapcarf+mapconf
+	tra	mapcom-*,ic
+
+mapcon:	eax2	applybit+mapf+mapconf
+	"tra	mapcom-*,ic
+
+"
+mapcom:	epbpbb	ap|0
+	eax3	ap|0,x5		points to our args (lsubt)
+	eaa	0,x5		get number of lists being  
+	ars	19		 mapped over in x5
+	neg	0
+	eax5	-1,al
+
+" if map or mapc, have to save first list so we can return it
+
+	canx2	mapretf+mapconf,du
+	tnz	mapc_klg_xx-*,ic			not map or mapc, skip it
+	eppap	ap|2			sanwich in between map lists and mapresult,etc.
+	ldaq	bb|firstlist,x3
+	staq	ap|-2
+mapc_klg_xx:
+	eppap	ap|-mapresult	get room to work
+	eax7	10,x7		..
+	eax6	ap|0
+	stx6	ab|-2,x7		binding_block.top_block
+	sxl6	ab|-2,x7		binding_block.bot_block
+	eax4	0		...binding block is empty (now)
+	ldaq	ab|nil
+	staq	ap|mapresult	init.
+	ldaq	bb|mapfcn,x3
+	staq	ap|form
+	staq	ap|fcn		- as in apply
+	stx3	ab|mapsvx3,x7	save ptr to our arguments
+
+" in *rset t mode, make eval_frame
+
+	ldaq	lisp_static_vars_$star_rset,*
+	cmpaq	ab|nil
+	tze	map_mnf-*,ic
+
+	  eax6	  sp|1		apply-type frame
+	  stx6	  ab|frame.dat1-6,x7
+	  eax6	  ap|form		fcn being mapped
+	  sxl6	  ab|frame.stack_ptr-6,x7
+	  ldx6	  lisp_static_vars_$eval_frame+1
+	  stx6	  ab|frame.prev_frame-6,x7
+	  eax6	  ab|-6,x7
+	  stx6	  lisp_static_vars_$eval_frame+1
+	  orx2	  framebit,du
+
+map_mnf:
+
+	tsx3	find_type-*,ic	go analyze the fcn being mapped
+" return transfer vector for find_type
+	tra	map_subr-*,ic	array
+	tra	map_subr-*,ic	subr
+	tra	map_lsubr-*,ic
+	tra	map_expr-*,ic
+	tra	map_fexpr-*,ic
+	tra	map_fsubr-*,ic
+	tra	map_lexpr-*,ic
+
+"
+" set up various things on return from find_type
+" called by tsx0
+
+map_set_up:
+	ldx3	ab|mapsvx3,x7	restore x3
+	epbpbb	ap|0		base of marked pdl
+	ldaq	ap|fcn,x4		save fcn for multiple applications
+	staq	bb|mapfcn,x3
+	eax1	ap|0			since mapped fcns never eval their args,
+	tra	finish_bindings-*,ic	it is safe to make the pseudo bb a real bb now
+
+"
+" set up to map a fexpr
+
+map_fexpr:
+	tsx0	map_set_up-*,ic
+	orx2	listargs+exprbit,du
+	tsx0	lambda_bind-*,ic
+	cmpx6	1,du		how many lambda variables?
+	tnc	bad_fcnl-*,ic	 0 -- lose.
+	tze	map_go-*,ic	 1 -- easy.
+"				 2 -- bind 2nd to pdl ptr
+	eaq	ab|-2,x7			make pdl ptr -> binding block
+	qrl	18
+	orq	-2,du
+	lda	fixnum_type,dl
+	staq	ap|-2,*
+	tra	map_go-*,ic
+
+
+" set up to map an expr -- or '(lambda ( ) ...)
+
+map_expr:
+	tsx0	map_set_up-*,ic
+	orx2	exprbit,du
+	tsx0	lambda_bind-*,ic
+	stx5	ab|svx5u,x7
+	cmpx6	ab|svx5u,x7	right number of args?
+	tze	map_go-*,ic	yes.
+
+	tsx6	make_argl-*,ic	no, give error
+	tra	wrong_no_args_expr-*,ic
+
+
+
+
+" set up to map a lexpr
+" we can bind both the lambda atom and the argatom now,
+" since we know how many args and where they will be.
+
+map_lexpr:
+	tsx0	map_set_up-*,ic
+	orx2	exprbit+lsubrbit,du
+	eppap	ap|8		going to bind two things
+	eax4	-8,x4
+	ldaq	ap|fcn,x4*	get the lambda - atom
+	staq	ap|-2
+	tsx0	ck_bound_var-*,ic
+	ldaq	ap|-2,*
+	staq	ap|-4
+	eppbp	lisp_static_vars_$argatom
+	spribp	ab|-4,x7		save area is not in use right now
+	ldaq	ab|-4,x7
+	ora	Uncollectable,dl	not really an atom
+	staq	ap|-6
+	ldaq	ap|-6,*
+	staq	ap|-8
+	eax1	ap|0
+	stx1	ab|-2,x7		update binding_block.top_block
+
+	eaq	ap|0		loc. of spread args
+	eaa	0,x5		number of args
+	ora	Uncollectable,dl
+	staq	ap|-6,*		bind "argatom"
+	lrl	54
+	lda	fixnum_type,dl
+	staq	ap|-2,*		bind lambda-atom
+	tra	map_go-*,ic
+
+"
+" set up to map a subr - check number of args
+
+map_subr:
+	tsx0	map_set_up-*,ic
+	cmpx5	ap|fcn,x4*	check number of args
+	tze	map_go-*,ic	 ok.
+
+	tsx6	make_argl-*,ic	no, error
+	tra	wrong_no_args_subr-*,ic
+
+
+" set up to map an fsubr - not hard
+
+map_fsubr:
+	tsx0	map_set_up-*,ic
+	orx2	listargs,du
+	tra	map_go-*,ic
+
+
+" set up to map an lsubr - check number of args
+
+map_lsubr:
+	tsx0	map_set_up-*,ic
+	orx2	lsubrbit,du
+	ldaq	lisp_static_vars_$star_rset,*
+	cmpaq	ab|nil		- only check # args in *rset t mode
+	tze	map_go-*,ic
+
+	lda	ap|fcn,x4*
+	ana	=o000777,du	min
+	sta	ab|-4,x7
+	lda	ap|fcn,x4*
+	ana	=o777000,du	max
+	arl	9
+	tnz	2,ic
+	lda	=o777777,du	if max=0, use big number
+	sta	ab|-3,x7
+	cmpx5	ab|-4,x7
+	tnc	map_tfa_lsubr-*,ic
+	cmpx5	ab|-3,x7
+	tze	map_go-*,ic
+	tnc	map_go-*,ic
+map_tma_lsubr:
+	tsx6	make_argl-*,ic
+	tra	too_many_args_lsubr-*,ic
+map_tfa_lsubr:
+	tsx6	make_argl-*,ic
+	tra	too_few_args_lsubr-*,ic
+
+"
+" routine to put arguments up on top of marked pdl
+" this is the map version of arg_spreader
+
+" requires bb,x3 set up to get to map lists
+" requires x5 to contain arg count
+" updates x4
+" uses x1,aq
+" Doesn't change x6 or bb
+" called by tsx0
+
+mv_args:	eax1	bb|firstlist,x3
+	eaa	0,x5		get number of lists times 2
+	als	1
+	sta	ab|svx5u,x7
+	asx1	ab|svx5u,x7	used by cmpx1 to end the loop
+
+mv_args_loop:
+	cmpx1	ab|svx5u,x7	done all map lists?
+	tze	0,0		  yes.
+	ldaq	bb|0,x1		no, get one.
+	cana	lisp_ptr.type,dl	end?
+	tnz	map_ending-*,ic	  yes, go clean up
+	canx2	mapcarf,du
+	tze	2,ic
+	ldaq	bb|0,x1*
+	eppap	ap|2
+	eax4	-2,x4
+	staq	ap|-2		put an arg on pdl
+	eax1	2,x1		..and advance to next list
+	tra	mv_args_loop-*,ic
+
+"
+" routine to cons up an argument list
+" used by fsubr, fexpr, and wrong_no_args
+
+" called by tsx6 (yes 6, not 0)
+" bb,x3 must be set up to get to map lists
+" x5 must contain number of map lists
+" uses x1
+" destroys bb
+" leaves x4, ap unchanged
+" returns the argument list in ap|argl,x4
+
+" this routine operates by calling mv_args to spread them out,
+" then it pushes a nil on top of pdl to end the list,
+" and calls cons enough times to bring them all down
+" into a list.
+
+" the entry point make_argl_nmv is for when mv_args
+"  has already been called
+
+make_argl:
+	tsx0	mv_args-*,ic	first spread them out...
+make_argl_nmv:
+	eppap	ap|2		then put a nil at the end
+	ldaq	ab|nil
+	staq	ap|-2
+	eax7	4,x7		-- extra save area
+	stx5	ab|-1,x7
+	adx4	ab|-1,x7		adjust x4 back to what it should be,
+	adx4	ab|-1,x7		after all the consing is done
+	stx6	ab|-2,x7		save our return addr
+
+	tsx0	call_cons-*,ic	-- known to be at least 1 arg
+	sbx5	1,du
+	tnz	-2,ic
+
+	ldx6	ab|-2,x7
+	ldx5	ab|-1,x7
+	"ldaq	ap|-2
+	eppap	ap|-2
+	eax7	-4,x7
+	staq	ap|argl,x4
+	tra	0,6
+"
+" here we have the routine to actually apply the function
+
+map_go3:	ldx3	ab|mapsvx3,x7	restore x3 after function call
+
+map_go:	epbpbb	ap|0		bb may have been munged
+	tsx0	mv_args-*,ic	spread out the args
+	ldaq	bb|mapfcn,x3	get the fcn
+	staq	ap|fcn,x4		where eval wants it
+	canx2	exprbit,du	expr type or subr type?
+	tnz	map_do_expr-*,ic
+
+" subr type
+
+	canx2	listargs,du	fsubr?
+	tnz	map_do_fsubr-*,ic	 yes.
+	canx2	lsubrbit,du	lsubr?
+	tze	call_subroutine-*,ic   no, subr is simple
+	eaa	0,x5		yes, make argcount
+	als	1
+	neg	0
+	eax6	0,au
+	tra	call_subroutine-*,ic
+
+
+map_do_fsubr:
+	tsx6	make_argl_nmv-*,ic
+	ldaq	ap|argl,x4
+	eppap	ap|2		pass arg list on top of marked pdl
+	eax4	-2,x4
+	staq	ap|-2
+	tra	call_subroutine-*,ic
+
+
+
+" expr type
+
+map_do_expr:
+	canx2	listargs,du	fexpr?
+	tnz	map_do_fexpr-*,ic	 yes.
+
+" do any necc bindings then go to eval_lambda_body
+
+	canx2	lsubrbit,du	lexpr?
+	tnz	map_do_lexpr-*,ic	    yes - go reassign nargs to lambda atom
+
+" bind lambda variables for expr - args are on marked pdl
+
+
+	ldaq	ap|fcn,x4*	= lambda list
+	ldx1	ab|-2,x7		binding_block.top_block = base of args
+map_expr_bind_loop:
+	cana	lisp_ptr.type,dl	end?
+	tnz	map_expr_bind_end-*,ic   yes...
+	staq	ap|qsrac,x4	no.
+	epplb	ap|qsrac,x4*
+	ldaq	bb|0,x1		get an arg
+	staq	lb|0,*		assign a var
+	eax1	2,x1
+	ldaq	lb|2
+	tra	map_expr_bind_loop-*,ic
+
+map_expr_bind_end:
+	ldx1	ab|-2,x7		remove spread args from pdl
+	eppap	bb|0,x1
+	lxl4	ab|-2,x7		reset x4
+	sbx4	ab|-2,x7
+	tra	eval_lambda_body-*,ic
+
+
+" bind 1 lambda variable of fexpr
+
+map_do_fexpr:
+	tsx6	make_argl_nmv-*,ic
+	eppbp	ap|fcn,x4*	cons lambdalist body
+	eppbp	bp|0,*		cons firstlambdavar restoflambdalist
+	ldaq	ap|argl,x4	get argument list
+	staq	bp|0,*		assign it to first lambda-var
+	tra	eval_lambda_body-*,ic
+
+" for a lexpr, reset the lambda atom to the number of args
+" each time in case loser clobbers it:
+"  (map '(lambda y (setq y 'foo)) '(1 23) '(4  5))
+
+map_do_lexpr:
+
+	eaq	0,x5			get nargs
+	qrl	18
+	lda	fixnum_type,dl		convert to lisp-number
+	eppbp	ap|fcn,x4*		-> atom_ptr -> atom.value
+	staq	bp|0,*			store into atom's value cell
+	tra	eval_lambda_body-*,ic	now go eval fcn
+"
+" come here after one evaluation by map
+" causes cleanup, resultmunging, and around again going
+" NB: x3 doesn't get restored until we go back to map_go3
+
+map_fcn_fin:
+	ldx1	ab|-2,x7		remove spread args from pdl if still there
+	epbpbb	ap|0		 (lexpr)
+	eppap	bb|0,x1
+	lxl4	ab|-2,x7		reset x4
+	sbx4	ab|-2,x7
+"" Now (after calling the fcn) cdr-ize all the lists
+"   at this point we assume x5 has arg count and x3 can be loaded to point at lists
+	ldx3	ab|mapsvx3,x7
+	eax1	bb|firstlist,x3
+	eax6	0,x5		x1 -> list, x6 = counter
+	tze	map_cdr_loop_end-*,ic
+map_cdr_loop:
+	eppbp	bb|0,x1*		-> cons whose car has been done.
+	ldaq	bp|2		cdr of that cons
+	staq	bb|0,x1
+	eax1	2,x1
+	eax6	-1,x6		count the lists
+	tnz	map_cdr_loop-*,ic
+map_cdr_loop_end:
+	canx2	mapretf,du
+	tnz	map_ret_er-*,ic
+	canx2	mapconf,du
+	tnz	map_con_er-*,ic
+	tra	map_go3-*,ic	-- go around again
+
+map_ret_er:
+	eax1	map_go3
+	eppap	ap|4
+	ldaq	ap|qsrac-4,x4	current result
+	staq	ap|-4
+	ldaq	ap|mapresult-4,x4	last cons in list of previous results, cdr = first cons
+	cmpaq	ab|nil		first time?
+	tze	map_ret_1st-*,ic
+	eppbp	ap|mapresult-4,x4*	no, get cdr
+	ldaq	bp|2
+	staq	ap|-2
+	tsx0	call_cons-*,ic
+	ldaq	ap|-2
+	eppbp	ap|mapresult-2,x4*
+	staq	bp|2
+	staq	ap|mapresult-2,x4
+	eppap	ap|-2
+	tra	0,x1
+
+map_ret_1st:
+	staq	ap|-2
+	tsx0	call_cons-*,ic
+	ldaq	ap|-2
+	eppap	ap|-2
+	staq	ap|mapresult,x4
+	eppbp	ap|mapresult,x4*
+	staq	bp|2		set cdr back to start of list
+	tra	0,x1
+"
+map_con_er:
+	eax0	map_go3
+
+	ldaq	ap|mapresult,x4
+	eppap	ap|4
+	staq	ap|-4
+	ldaq	ap|qsrac-4,x4
+	staq	ap|-2
+	eax7	6,x7		get space to save regs, make call.
+	stx2	ab|-6,x7		store registers we still need
+	stx5	ab|-5,x7		save x5, since we will clobber it.
+	sxl0	ab|-5,x7		save x0, our return ptr
+	sxl4	ab|-6,x7		also save x4.
+	eax5	-4		nconc gets 2 args, lsubr convention.
+	sprilp	ab|-4,x7		save our lp...
+	stcd	ab|-2,x7		save return address.
+	tra	lisp_alloc_$nconc
+	ldx2	ab|-2,x7		reload registers.
+	ldx5	ab|-1,x7
+	lxl0	ab|-1,x7
+	lxl4	ab|-2,x7
+	eax7	-2,x7		and pop off stack
+	staq	ap|mapresult,x4	save result of nconc.
+	tra	0,0
+
+" come here when freturn returns from a function being mapped
+" have to re-establish binding block, & c.
+" and restart the mapping process all over again.
+
+map_freturn:
+	eax4	0		the binding block is all gone
+	canx2	mapretf,du
+	tnz	map_ret_er_freturn
+	canx2	mapconf,du
+				" and fall into map_freturn_restart
+map_freturn_restart:
+
+" re-make binding block
+
+	eax6	ap|0
+	stx6	ab|-2,x7
+	sxl6	ab|-2,x7
+	ldaq	ap|form			the fcn being mapped
+	staq	ap|fcn			put it back
+	tra	map_mnf
+
+map_ret_er_freturn:
+	eax1	map_freturn_restart
+	tra	map_ret_er+1
+map_con_er_freturn:
+	eax0	map_freturn_restart
+	tra	map_con_er+1
+	tra	map_freturn_restart"
+"
+"come here when map is done.
+
+map_ending:		" first get the result into proper form
+
+	canx2	mapretf,du
+	tze	map_ending_aa-*,ic
+	ldaq	ap|mapresult,x4		check for nil
+	cmpaq	ab|nil
+	tze	map_ending_2-*,ic		nil => don't rplacd
+	eppbp	ap|mapresult,x4*		mapcar, uncircularize return list
+	ldaq	bp|2
+	staq	ap|qsrac,x4
+	ldaq	ab|nil			- put nil at end of list
+	staq	bp|2
+	ldaq	ap|qsrac,x4		get back ptr to start of list
+	tra	map_ending_2-*,ic
+
+map_ending_aa:
+	canx2	mapconf,du
+	tnz	map_ending_1-*,ic		mapresult already ok if mapconf
+
+" map or mapc, return first map list as result
+
+	ldaq	ap|mapresult-2,x4		was saved here on entry
+	tra	map_ending_2-*,ic
+
+map_abending:
+map_ending_2:
+	staq	ap|mapresult,x4
+
+map_ending_1:
+	ldx3	ab|mapsvx3,x7		get back x3
+	tsx0	unbinder-*,ic
+	eax7	-2,x7			pop map's extra 2 words
+	ldaq	ap|mapresult		= out return value
+	awdx	ap|0,x3			clear rest of marked pdl
+	tra	lisp_rtn_1-*,ic
+
+
+
+" routine to evaluate the bodies of prog's and do's
+" called with a pointer to the stack cell containing the
+" body of the prog or do on top of unmarked pdl.  Pops it off,
+" evaluates the nonatomic elements of the body, ignoring the
+" values, and returns when it gets to the end.
+
+	entry	eval_list
+
+eval_list: tsx0	pl1_entry-*,ic
+	eppap	ap|10			room to eval in
+	eppbp	ab|-2,x7*			-> stack temp containing body
+	eax7	-2,x7
+	eppbp	bp|-2			look like a cons
+
+" cdr-ize the list and eval next element
+
+ev_list_1:
+	ldaq	bp|2			is cdr atomic?
+	cana	lisp_ptr.type,dl		..
+	tnz	ev_list_end-*,ic		 yes.
+	eppbp	bp|2,*			no, point bp at cdr
+	spribp	ap|-10			and save it (no type bits since is list)
+	ldaq	bp|0			get cadd...ddr of body
+	cana	lisp_ptr.type,dl
+	tnz	ev_list_2-*,ic		skip over it if it is atomic
+	staq	ap|form			otherwise, evaluate it
+	tsx5	eval_fcn-*,ic
+ev_list_2:
+	eppbp	ap|-10,*			get back a ptr to current cons of list
+	tra	ev_list_1-*,ic		and go eval next elem
+
+ev_list_end:
+	eppap	ap|-4			clear the pdl
+	tra	pl1_return-*,ic		and return.
+
+" the return function, a type 1 subr
+
+	segdef	return
+return:	eppap	ap|2			put 2 things at top of pdl:
+	lda	Uncollectable,dl		 1) the return value
+	staq	ap|-2			 2) a non_nil value to distinguish from go
+	tra	go_ret-*,ic		and return to prog
+
+
+" the go function, a type 1 fsubr
+
+	segdef	go
+go:	ldaq	ap|-2,*			get our arg
+	eppap	ap|6			room to eval in
+
+" keep evaling the arg until it is atomic
+
+re_go:	cana	lisp_ptr.type,dl
+	tnz	go_1-*,ic
+	staq	ap|form
+	tsx5	eval_fcn-*,ic
+	tra	re_go-*,ic
+
+go_1:	staq	ap|form			save label on marked pdl for prog
+	ldaq	ab|nil			and put nil to mark this as a go
+	staq	ap|form+2
+	eppap	ap|form+4
+
+go_ret:	" now do a non-local goto to the most recent prog (or do)
+
+	ldx1	lisp_static_vars_$prog_frame+1
+	tze	bad_go-*,ic		err if no prog active
+
+" prog is a pl1 program, so return to pl1_code mode
+
+	spriap	ab|stack_ptr_ptr,*
+	stx7	ab|unmkd_ptr_ptr,*
+	stc1	ab|in_pl1_code
+
+	eax2	sp|0			are we in same stack frame as prog?
+	cmpx2	ab|frame.ret+3,x1		 (this is the usual case)
+	tze	go_ret_same_sp-*,ic		yes, go without changing sp
+
+	" check if there possibly could be cleanup handlers in the stack
+
+	cmpx1	lisp_static_vars_$err_recp+1
+	tnc	go_ret_full_unwind		might be cleanup handlers, have to go call unwinder_
+	eppbp	ab|frame.ret+2,x1*		no, get ptr to stack frame of prog
+	spribp	sp|16			delete intervening frames. (allowed since
+					 " there are no cleanup handlers in lisp)
+	eax2	bp|0
+	eppbp	ab|frame.ret,x1*		get return address
+	spribp	sb|20,x2			set call out return addr in prog's frame
+	return				" quickly return to prog
+
+go_ret_same_sp:
+	eppbp	ab|frame.ret,x1*
+	spribp	sp|20
+	short_return
+
+" come here when go or return is done with no prog active
+
+bad_go:	lda	lisp_error_table_$bad_prog_op
+	tsx0	error-*,ic
+	arg	0			uncorrectable fail-act, should never return
+
+
+" have to do the go by calling unwinder.
+
+go_ret_full_unwind:
+	push			"must save ab, x1 - get ready to call unwinder_
+	tempd	Argl(2)		arg list of one arg
+
+	ldaq	arg_list_1_hdr
+	staq	Argl
+	eppbp	ab|frame.ret,x1	-> label to return to
+	spribp	Argl+2
+	eppap	Argl
+	short_call  unwinder_$unwinder_
+
+
+	even
+arg_list_1_hdr:
+	zero	2,4
+	zero	0,0
+
+negative_4:
+	zero	0,fixnum_type
+	dec	-4
+
+" come here to call a function with unevaluated arguments from
+" lisp-compiled code.  ap|form=ap|fcn=function, ap|argl = arg list,
+" unmkd pdl has: ptr to link, caller's lp, return addr(bp)
+
+" we find the type of the function and if its an fsubr link directly
+" to it, otherwise go through regular apply.
+
+	segdef	callf
+
+callf:
+	eax2	applybit
+	eax5	callf_rtn-*,ic
+	tsx3	evaler1-*,ic
+" return transfer vector for find_type
+
+	tra	eval_subrs_and_arrays-*,ic		array
+	tra	eval_subrs_and_arrays-*,ic		subr
+	tra	eval_lsubr-*,ic			lsubr
+	tra	eval_expr-*,ic			expr
+	tra	eval_fexpr-*,ic			fexpr
+	tra	callf_fsubr-*,ic			fsubr - special case
+	tra	eval_lexpr-*,ic			lexpr
+
+
+
+" callf to an fsubr -- attempt to direct-link it
+
+callf_fsubr:
+	tsx0	snappable_p-*,ic	snappable?
+	tra	eval_fsubr-*,ic		 no.
+					" yes, so do it.
+	ldaq	ap|fcn,x4				get subr ptr
+	adq	1,du				place to tspbp to
+	stz	lisp_static_vars_$no_snapped_links
+	eppbb	ab|-12,x7*			caller's lp
+	eax0	-1
+	ansx0	bb|-6				clear low half - clears no snapped links bit
+	staq	ab|-14,x7*			store over link
+	tsx0	unbinder-*,ic			get rid of binding block, eval frame
+	ldaq	ap|argl				put argl back where it was when we were called
+	staq	ap|form
+	eppap	ap|form+2
+	epplp	ab|-4,x7*				restore caller's lp
+	eppbp	ab|-2,x7*
+	eax7	-6,x7				pop off our temps
+	tra	bp|-1				return to the tspbp which now goes
+						" direct to the subr
+
+ 
+" come here when done with a callf. This routine packs up and goes home.
+
+callf_rtn:
+	eppap	ap|form
+	epplp	ab|-4,x7*
+	eppbp	ab|-2,x7*
+	eax7	-6,x7
+	tra	bp|0				return with result in aq
+
+" routine to apply subr's to arguments which are already separated by lisp code.
+
+	entry	pl1_callable_funcall_
+pl1_callable_funcall_:
+	tsx0	pl1_entry		Establish ALM environment
+	lxl5	ap|-1		Get # of args
+	eppap	ap|-2		Pop arg count
+	tsx0	funcall0
+	eppap	lp|2		Pop stack, leave ret loc.
+	staq	ap|-2
+	getlp	
+	tra	pl1_exit
+
+	segdef	funcall
+funcall:	tsx0	funcall0
+	eppap	lp|0		pop stack
+	tra	lisp_rtn_1	and return to caller
+
+funcall0: eax5	2,x5
+	tpnz	fc_0_args
+	eppap	ap|-form
+	ldaq	ap|form-2,x5
+	staq	ap|form
+	staq	ap|fcn
+	eax2	applybit+already_spread+entered_by_funcall
+	eax7	6,x7
+	ldaq	negative_4	for causing fault if used!
+	staq	ab|-6,x7
+	eppbp	ap|form-2,x5	we want to sve location to which to pop
+	spribp	ab|-4,x7		which will come back in lp
+	eppbp	0,x0		Set exit
+	spribp	ab|-2,x7
+	tra	fc_join
+
+
+fc_0_args:
+	drl	0
+
+""" fsubr's arraycall, subrcall, lsubrcall.
+
+	segdef	arraycall,subrcall,lsubrcall
+
+subrcall:	tsx4	foocall-*,ic
+	tra	subrcall_error-*,ic
+	lda	ap|fcn,*		make sure it really is a subr.
+	cana	=o777000,du
+	tnz	subrcall_error-*,ic	looks more like an lsubr, barf.
+	tra	evaler-*,ic	OK, go apply it.
+
+lsubrcall:tsx4	foocall-*,ic
+	tra	lsubrcall_error-*,ic
+	lda	ap|fcn,*		make sure it really is an lsubr
+	cana	=o777000,du
+	tze	lsubrcall_error-*,ic	looks more like a subr.
+	orx2	lsubrbit,du
+	tra	evaler-*,ic	OK, go apply it.
+
+arraycall:eppap	ap|2
+	ldaq	ap|-4
+	staq	ap|-2
+	ldaq	ap|-2,*		get car of arglist, which is type
+	staq	ap|-4		save it.
+	tsx4	foocall-*,ic
+	tra	arraycall_error-*,ic
+	cana	Array,dl		make sure it really is an array.
+	tze	arraycall_error-*,ic   no, barf.
+	eppbp	ap|fcn,*		pick up array pointer
+	ldx0	bp|7		pick up type off array
+	ldaq	ap|form-2		pick up type in other form
+	xec	array_test,x0	see if it is right type
+	tnz	arraycall_mismatch-*,ic	type mismatch, loser.
+	tsx5	evaler-*,ic	OK, go call the array.
+	eppap	ap|form-2		clear all stuff from stack
+	tra	lisp_rtn_1-*,ic
+
+array_test:
+	cmpaq	lisp_static_vars_$t_atom
+	cmpaq	lisp_static_vars_$nil
+	cmpaq	lisp_static_vars_$fixnum
+	cmpaq	lisp_static_vars_$flonum
+	cmpaq	lisp_static_vars_$readtable
+	cmpaq	lisp_static_vars_$obarray
+	tra	arraycall_mismatch
+
+foocall:	eppap	ap|-form-2
+	eppbp	ap|form,*		-> arg list
+	eppbp	bp|2,*		discard the type.
+	eax2	applybit		no form available, but arguments are to be evaluated.
+	ldaq	bp|0		get the alleged subr pointer.
+	staq	ap|-2		which has to be evaluated
+	ldaq	bp|2		get list of arguments to be passed
+	staq	ap|argl
+	eax7	8,x7
+	tsx0	recurse-*,ic	evaluate the subr pointer
+	eax7	-8,x7
+	staq	ap|form		and put it away
+	staq	ap|fcn
+	cana	Subr,dl		is it at least a subr pointer?
+	tze	0,x4		no, couldn't possibly win
+	eax5	lisp_retn-*,ic	set exit going to use.
+	tra	1,x4
+
+" come here to call a function with already evaluated arguments from
+" lisp - compiled code.  ap|form = fcn, x5 = -2*nargs, unmkd pdl
+" has: ptr to link, caller's lp, return addr (bp)
+" underneath ap|form on the marked pdl we have the args
+
+" we first call find_type and then if possible
+" change the link to point directly to the function, otherwise
+" call it in the usual way and then return the result.
+
+	segdef	call1
+
+call1:
+	eax2	applybit+already_spread
+	ldaq	ap|form
+	staq	ap|fcn				needs to be in both places
+
+" set ap|argl to an Uncollectable object containing 
+" nargs in qu and -2*nargs in ql and ptr to args in au
+" the already_spread bit in x2 indicates that this is not an argl
+
+fc_join:			"funcall joins here.
+	eaa	0,x5
+	ars	19
+	neg	0				al has nargs
+	eaq	0,x5
+	lrl	18				qu has nargs, ql has -2*nargs
+	eaa	ap|form,x5		 	ptr to args
+	ora	Uncollectable,dl
+	staq	ap|argl
+	eax5	call1_rtn-*,ic			where to come back to after applying
+	tsx3	evaler1-*,ic			go to find_type
+" return transfer vector for find_type
+	tra	cc_subr-*,ic			array
+	tra	cc_subr-*,ic			subr
+	tra	cc_lsubr-*,ic			lsubr
+	tra	eval_expr-*,ic			expr - same as usual
+	tra	call1_fexpr_check-*,ic			fexpr - lose, args already evaled
+	tra	call1_fsubr_check-*,ic			fsubr - lose, args already evaled
+	tra	eval_lexpr-*,ic			lexpr - same as usual
+
+
+
+call1_fexpr_check:
+	eax0	eval_fexpr
+fc_f_fcn_check:
+	canx2 	entered_by_funcall,du
+	tze	illegal_f_fcn
+	ldx3	ap|argl+1,x4		check n args
+	cmpx3	1,du
+	tpnz	too_many_args_subr
+	tmi	too_few_args_subr
+	ldaq	ap|form-2,x4
+	staq	ap|argl,x4
+	tra	0,x0
+
+call1_fsubr_check:
+	tsx0	fc_f_fcn_check
+	tra	eval_fsubr
+
+
+" routines for lsubr's and subr's which check to see if direct linking can
+" be used.  If so they change the link and then return to the tspbp,
+" otherwise they go through the regular cruft
+
+cc_lsubr:	orx2	lsubrbit,du
+	canx2	entered_by_funcall,du
+	tnz	eval_lsubr
+	lda	ab|-14,x7*			get first word of link
+	ana	=o77700,dl
+	cmpa	=o77700,dl			was x5 loaded by caller?
+	tnz	eval_lsubr-*,ic			if not, must interpret call.
+
+
+cc_subr:
+	tsx0	snappable_p-*,ic		snappable?
+	tra	cant_snap-*,ic		 no.
+					" yes, so do it.
+
+
+" seems to be snappable, check the number of args
+
+	ldx3	ap|argl+1			get number of args called with
+	canx2	lsubrbit,du
+	tnz	cc_lsubr_ckna-*,ic
+	cmpx3	ap|fcn,*
+	tze	3,ic
+	tnc	too_few_args_subr-*,ic
+	trc	too_many_args_subr-*,ic
+cc_lsubr_ck_ret:
+
+" snappable, so change the link to point directly at the function instead of at us
+
+	ldaq	ap|fcn,x4			get subr ptr
+	adq	1,du			-> place to tspbp to
+	stz	lisp_static_vars_$no_snapped_links
+	eppbb	ab|-12,x7*		caller's lp
+	staq	ab|-14,x7*		store over link
+	eaa	-1			now clear his no snapped links bit
+	ansa	bb|-6
+can_snap:	tsx0	unbinder-*,ic		get rid of binding block, eval frame
+	lxl5	ap|argl+1			get back caller's x5
+	eppap	ap|form			set ap back to caller">'s value
+	epplp	ab|-4,x7*			restore caller's lp
+	eppbp	ab|-2,x7*
+	eax7	-6,x7			set x7 back to caller's value
+	tra	bp|-1			return to the tspbp, which now goes
+					" direct to the subr.
+
+" unspappable, do it the regular way
+
+cant_snap:
+	canx2	lsubrbit,du
+	tnz	eval_lsubr-*,ic
+	tra	eval_subrs_and_arrays-*,ic
+
+cc_lsubr_ckna:
+	tsx0	ck_lsubr_nargs-*,ic
+	tra	cc_lsubr_ck_ret-*,ic
+" 
+" routine to see if this call can be snapped, i.e. if the
+" itb link through which we were called can be changed
+" to point directly at the function.
+" called by tsx0, skip return if snappable
+
+snappable_p:
+	canx2	entered_by_funcall+went_through_value_cell,du
+	tnz	0,0
+	cmpx4	0,du
+	tnz	0,0
+	lxl6	ab|-14,x7*		test snap bit in calling link
+	tpl	0,0
+	ldaq	lisp_static_vars_$nouuo_flag,*
+	cmpaq	ab|nil
+	tnz	0,0			suppressed by user
+	tra	1,0		        - can snap, skip return.
+
+
+" the lisp nouuo function, which is a type 1 subr of one arg
+" If the arg is nil, snapping is allowed. If anything else (t),
+" snapping is disallowed.
+
+	segdef	nouuo
+
+nouuo:	ldaq	ap|-2			get arg
+	eppap	ap|-2
+	cmpaq	ab|nil			is it nil?
+	tze	2,ic
+	ldaq	ab|true			no, assume t.
+	staq	lisp_static_vars_$nouuo_flag,*
+	tra	lisp_rtn_1-*,ic
+ 
+" come here when done evaling from a call1
+
+call1_rtn:
+	lxl5	ap|argl+1
+	eppap	ap|form,x5
+call1_rtn_1:
+	epplp	ab|-4,x7*
+	eppbp	ab|-2,x7*
+	eax7	-6,x7
+	tra	bp|0				return with result in aq
+"
+
+"  snapcaller -- entry for pl1 subrs with function args that are
+"		called repeatedly to use for applying the
+"		function arg to its arguments.  It acts
+"		quite similarly to callf and call1, since
+"		it takes a function to be called, and replaces
+"		that function with a pointer to the subroutine
+"		entry if the number args match.
+"
+"		called with ab|-2,x7 containing offset of
+"		function from stack top, and ab|-1,x7
+"		containing -2*nargs, and with the arguments
+"		on the top of the marked pdl.
+
+" Last modified by D Reed, 7/7/73
+
+
+	entry	snapcaller
+snapcaller:
+	tsx0	pl1_entry
+	lxl0	ab|-2,x7		get offset of fcn from stack top
+	lxl5	ab|-1,x7		and -2*nargs into x5.
+	ldaq	ap|0,x0		load function
+	cana	Subr,dl		if function is a subr object
+	tze	chk_snapper
+	canq	1,du		and points at odd address,
+	tze	chk_snapper
+call_snapped:
+	tspbp	ap|0,x0*		call the subr.
+	eppap	ap|2		get room to return result
+	staq	ap|-2		and do it.
+	tra	pl1_exit		return to caller
+
+chk_snapper:
+	eax2	applybit+already_spread
+	eppap	ap|-form		get save area
+	staq	ap|form		and initialize it
+	staq	ap|fcn
+	eaa	0,x5		put special object in ap|argl
+	neg	0
+	ars	19
+	eaq	0,x5
+	lrl	18
+	eaa	ap|form,x5		address of args.
+	ora	Uncollectable,dl
+	staq	ap|argl		...
+
+	eax5	snapcall_rtn-*,ic	set return for snapcall resulting in apply
+	tsx3	evaler1
+	tra	sn_subr
+	tra	sn_subr		subrs and arrays
+	tra	sn_lsubr
+	tra	eval_expr
+	tra	illegal_f_fcn	bad function
+	tra	illegal_f_fcn
+	tra	eval_lexpr	interpret lexpr
+
+sn_lsubr:	orx2	lsubrbit,du	note that lsubr is slightly different.
+sn_subr:	canx2	went_through_value_cell,du	check for snappability.
+	tnz	sn_cant
+	cmpx4	0,du		if bindings made, cant dnap
+	tnz	sn_cant
+	ldx3	ap|argl+1		get number of args
+	canx2	lsubrbit,du
+	tnz	sn_lsubr_ckna
+	cmpx3	ap|fcn,*		(check number of args, note x4 = 0)
+	tze	3,ic
+	tnc	too_few_args_subr-*,ic
+	tra	too_many_args_subr-*,ic
+sn_lsubr_chk_ret:
+	tsx0	unbinder-*,ic	get rid of junk
+	lxl5	ap|argl+1		reload x5 for call
+	lxl0	ab|-2,x7	reload offset of function
+	ldaq	ap|fcn
+	adq	1,du		make address odd.
+	staq	ap|form,x0		snap link
+	eppap	ap|form
+	tra	call_snapped	and do the call
+
+sn_lsubr_ckna:
+	tsx0	ck_lsubr_nargs
+	tra	sn_lsubr_chk_ret
+
+sn_cant:	canx2	lsubrbit,du	if cant snap, then apply function
+	tnz	eval_lsubr
+	tra	eval_subrs_and_arrays
+
+snapcall_rtn:
+	lxl5	ap|argl+1
+	eppap	ap|form+2,x5	get place to store argument
+	staq	ap|-2
+	tra	pl1_exit
+
+
+
+	include	stack_header
+	end

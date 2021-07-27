@@ -1,0 +1,375 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+move_log_segments:
+     procedure ();
+
+/* *      MOVE_LOG_SEGMENTS
+   *
+   *      An interim solution to the problem of migrating log segments from one
+   *      directory to the next.  Someday, this should be done to individual
+   *      messages, not just whole segments, but since log_migrate_ doesn't work
+   *      yet, this will have to do.
+   *
+   *      84-10-31, W. Olin Sibert: Initial coding, mostly out of log_list_history_
+   *	85-03-07, Steve Herbst: Added -force/-no_force, namedup handling.
+   *	85-03-21, Steve Herbst: Fixed bug that saw relative time cutoff
+   *		such as -2days as a control argument.
+   */
+
+declare   code fixed bin (35);
+declare   system_area_ptr pointer;
+declare   system_area area based (system_area_ptr);
+declare   sort_pointers_ptr pointer;
+declare   next_log_ptr pointer;
+declare   this_log_ptr pointer;
+declare   segment_count fixed bin;
+declare   move_count fixed bin;
+declare	force_sw bit (1);
+
+declare 1 sort_pointers aligned based (sort_pointers_ptr),
+          2 n_entries fixed bin,
+          2 ptr (star_entry_count refer (sort_pointers.n_entries)) pointer unaligned;
+
+declare   log_dir char (168);
+declare   log_name char (32);
+declare   migration_dir char (168);
+declare   cutoff fixed bin (71);
+
+declare   absolute_pathname_ entry (char (*), char (*), fixed bin (35));
+declare   com_err_ entry options (variable);
+declare	error_table_$badopt fixed bin (35) external static;
+declare   error_table_$no_w_permission fixed bin (35) external static;
+
+declare   convert_date_to_binary_ entry (char (*), fixed bin (71), fixed bin (35));
+declare   copy_ entry (pointer);
+declare   cu_$arg_count entry (fixed bin, fixed bin (35));
+declare   cu_$arg_ptr entry (fixed bin, pointer, fixed bin (21), fixed bin (35));
+declare   expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+declare   get_system_free_area_ entry () returns (pointer);
+declare   hcs_$fs_get_mode entry (pointer, fixed bin (5), fixed bin (35));
+declare   hcs_$star_ entry (char (*), char (*), fixed bin (2), pointer, fixed bin, pointer, pointer, fixed bin (35));
+declare   hcs_$terminate_noname entry (pointer, fixed bin (35));
+declare   ioa_ entry options (variable);
+declare   log_initiate_ entry (char (*), char (*), fixed bin, pointer, fixed bin (35));
+declare   log_name_$starname entry (char (*)) returns (char (32));
+declare   log_name_$time entry (char (*)) returns (fixed bin (71));
+declare	pathname_ entry (char(*), char(*)) returns(char(168));
+declare   sort_items_$general entry (pointer, entry);
+
+declare	index builtin;
+
+declare   WHOAMI char (32) internal static options (constant) init ("move_log_segments");
+
+declare   cleanup condition;
+
+/*  */
+
+          star_entry_ptr = null ();                         /* Initialize for cleanup handler */
+          star_names_ptr = null ();                         /* Initialize for cleanup handler */
+          sort_pointers_ptr = null ();                      /* Initialize for cleanup handler */
+          next_log_ptr = null ();
+          this_log_ptr = null ();
+          system_area_ptr = get_system_free_area_ ();
+
+          on condition (cleanup) begin;
+               call clean_up ();
+               end;
+
+          call process_arguments ();
+
+          call list_directory ();
+
+          call move_segments ();
+
+          call ioa_ ("^a: ^[No log segments moved.^;Moved ^d log segment^[s^] to ^a.^]",
+               WHOAMI, (move_count = 0), move_count, (move_count ^= 1), migration_dir);
+
+MAIN_RETURN:
+          call clean_up ();
+          return;
+
+/*  */
+
+list_directory:
+     procedure ();
+
+declare   entry_idx fixed bin;
+declare   log_starname char (32);
+
+
+          log_starname = log_name_$starname (log_name);
+
+          call hcs_$star_ (log_dir, log_starname, star_BRANCHES_ONLY, system_area_ptr,
+               star_entry_count, star_entry_ptr, star_names_ptr, code);
+
+          if (code ^= 0) then do;
+               call com_err_ (code, WHOAMI, "Listing ^a>^a", log_dir, log_starname);
+               goto MAIN_RETURN;
+               end;
+
+          allocate sort_pointers in (system_area) set (sort_pointers_ptr);
+          sort_pointers.n_entries = star_entry_count;
+
+          segment_count = 0;
+          move_count = 0;
+          do entry_idx = 1 to star_entry_count;
+               sort_pointers.ptr (entry_idx) = addr (star_entries (entry_idx));
+               if (star_entries.type (entry_idx) = star_SEGMENT) then
+                    segment_count = segment_count + 1;
+               end;
+
+          if (segment_count < 2) then do;
+               call com_err_ (0, WHOAMI,
+                    "At least two log segments must be present in ^a in order to migrate one.",
+		     pathname_ (log_dir, log_name));
+               goto MAIN_RETURN;
+               end;
+
+          call sort_items_$general (addr (sort_pointers), compare_entries);
+
+          end list_directory;
+
+/*  */
+
+compare_entries:
+     procedure (P_entry_1, P_entry_2) returns (fixed bin (35));
+
+declare   P_entry_1 unaligned pointer parameter;
+declare   P_entry_2 unaligned pointer parameter;
+
+declare   entry_1_ptr pointer;
+declare   entry_2_ptr pointer;
+declare 1 entry_1 aligned like star_entries based (entry_1_ptr);
+declare 1 entry_2 aligned like star_entries based (entry_2_ptr);
+
+
+          entry_1_ptr = P_entry_1;
+          entry_2_ptr = P_entry_2;
+
+/* These first two cases make non-segments always sort at the end, which means
+   they will be ignored when collection time comes. */
+
+          if (entry_1.type = star_SEGMENT) & (entry_2.type ^= star_SEGMENT) then
+               return (-1);
+          else if (entry_1.type ^= star_SEGMENT) & (entry_2.type = star_SEGMENT) then
+               return (1);
+          else if (star_names (entry_1.nindex) < star_names (entry_2.nindex)) then
+               return (1);
+          else return (-1);
+
+          end compare_entries;
+
+/*  */
+
+move_segments:
+     procedure ();
+
+declare   segment_idx fixed bin;
+declare   this_ename char (32);
+declare   next_ename char (32);
+declare   suffix_time fixed bin (71);
+
+declare 1 copy_opt aligned like copy_options automatic;
+declare 1 one_star_entry aligned based like star_entries;
+
+
+          unspec (copy_opt) = ""b;
+          copy_opt.version = COPY_OPTIONS_VERSION_1;
+          copy_opt.caller_name = WHOAMI;
+          copy_opt.source_dir = log_dir;
+          copy_opt.target_dir = migration_dir;
+          copy_opt.force = force_sw;
+          copy_opt.delete = "1"b;
+
+          copy_opt.copy_items.names = "1"b;
+          copy_opt.copy_items.acl = "1"b;
+          copy_opt.copy_items.ring_brackets = "1"b;
+          copy_opt.copy_items.max_length = "1"b;
+          copy_opt.copy_items.safety_switch = "1"b;
+
+          do segment_idx = segment_count to 2 by -1;        /* Do NOT move the first one */
+               this_ename = star_names (sort_pointers.ptr (segment_idx) -> one_star_entry.nindex);
+               next_ename = star_names (sort_pointers.ptr (segment_idx - 1) -> one_star_entry.nindex);
+               suffix_time = log_name_$time (this_ename);
+
+               if (suffix_time > cutoff) then               /* All finished */
+                    return;
+
+               call initiate_log (next_ename, next_log_ptr); /* Get the next log so we can set its history */
+
+               if (segment_idx = segment_count) then do;    /* If first moved, set its history dir, too */
+                    call initiate_log (this_ename, this_log_ptr);
+                    this_log_ptr -> log_segment.previous_log_dir = migration_dir;
+                    call hcs_$terminate_noname (this_log_ptr, (0));
+                    end;
+
+               copy_opt.source_name = this_ename;
+               copy_opt.target_name = this_ename;
+
+               call ioa_ ("^a: Moving ^a>^a", WHOAMI, log_dir, this_ename);
+
+               call copy_ (addr (copy_opt));
+
+               if copy_opt.target_err_switch then
+                    return;
+               else move_count = move_count + 1;
+
+               next_log_ptr -> log_segment.previous_log_dir = migration_dir;
+               call hcs_$terminate_noname (next_log_ptr, (0));
+               end;
+
+          return;
+          end move_segments;
+
+/*  */
+
+initiate_log:
+     procedure (P_name, P_ptr);
+
+declare   P_name char (*) parameter;
+declare   P_ptr pointer parameter;
+
+declare   log_mode fixed bin (5);
+
+
+          call log_initiate_ (log_dir, P_name, 10, P_ptr, code);
+
+          if (code ^= 0) then do;
+               call com_err_ (code, WHOAMI, "Cannot initiate ^a>^a", log_dir, P_name);
+               goto MAIN_RETURN;
+               end;
+
+          call hcs_$fs_get_mode (P_ptr, log_mode, code);
+          if (code = 0) then
+               if (log_mode ^= RW_ACCESS_BIN) & (log_mode ^= REW_ACCESS_BIN) then
+                    code = error_table_$no_w_permission;
+
+          if (code ^= 0) then do;
+               call com_err_ (code, WHOAMI, "^a>^a", log_dir, P_name);
+               goto MAIN_RETURN;
+               end;
+
+          return;
+          end initiate_log;
+
+/*  */
+
+process_arguments:
+     procedure ();
+
+declare   arg_ptr pointer;
+declare   arg_lth fixed bin (21);
+declare   arg char (arg_lth) based (arg_ptr);
+declare   arg_count fixed bin;
+declare   arg_idx fixed bin;
+declare  (got_log_name, got_from_dir, got_to_dir, got_time_cutoff) bit (1);
+
+          call cu_$arg_count (arg_count, code);
+          if (arg_count < 4) then do;
+USAGE:         call com_err_ (0, WHOAMI, "Usage:^-^a LogName FromDir ToDir TimeCutoff {-control_args}", WHOAMI);
+               goto MAIN_RETURN;
+               end;
+
+	force_sw = "0"b;
+	got_log_name, got_from_dir, got_to_dir, got_time_cutoff = "0"b;
+
+	do arg_idx = 1 to arg_count;
+
+	     call cu_$arg_ptr (arg_idx, arg_ptr, arg_lth, (0));
+
+	     if index (arg, "-") = 1 then do;
+		if got_to_dir & ^got_time_cutoff then do;
+		     call convert_date_to_binary_ (arg, cutoff, code);
+		     if code = 0 then do;		/* relative time, not a control arg */
+			got_time_cutoff = "1"b;
+			go to END_ARG_LOOP;
+			end;
+		     end;
+		if arg = "-force" | arg = "-fc" then force_sw = "1"b;
+		else if arg = "-no_force" | arg = "-nfc" then force_sw = "0"b;
+		else do;
+		     call com_err_ (error_table_$badopt, WHOAMI, "^a", arg);
+		     go to MAIN_RETURN;
+		     end;
+		end;
+
+	     else if ^got_log_name then do;
+		got_log_name = "1"b;
+		log_name = arg;
+		end;
+
+	     else if ^got_from_dir then do;
+		got_from_dir = "1"b;
+		call absolute_pathname_ (arg, log_dir, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, WHOAMI, "Directory to move from: ^a", arg);
+		     go to MAIN_RETURN;
+		     end;
+		end;
+
+	     else if ^got_to_dir then do;
+		got_to_dir = "1"b;
+		call absolute_pathname_ (arg, migration_dir, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, WHOAMI, "Directory to move to: ^a", arg);
+		     go to MAIN_RETURN;
+		     end;
+		end;
+
+	     else if ^got_time_cutoff then do;
+		got_time_cutoff = "1"b;
+		call convert_date_to_binary_ (arg, cutoff, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, WHOAMI, "Cutoff time ^a", arg);
+		     go to MAIN_RETURN;
+		     end;
+		end;
+
+	     else go to USAGE;
+END_ARG_LOOP:
+	     end;
+
+	if ^got_time_cutoff then go to USAGE;
+
+          return;
+
+          end process_arguments;
+
+/*  */
+
+clean_up:
+     procedure ();
+
+declare   based_word fixed bin based;
+
+/* This procedure has to have its own based variable to use when freeing, because the
+   standard include file declares the star structures in a way that requires various
+   pointers to be set properly when they may not be. BRAINDAMAGE. It should use fixed
+   array bounds the way it used to before Davidoff got to it. */
+
+
+          if (star_entry_ptr ^= null ()) then
+               free star_entry_ptr -> based_word in (system_area);
+          if (star_names_ptr ^= null ()) then
+               free star_names_ptr -> based_word in (system_area);
+          if (sort_pointers_ptr ^= null ()) then
+               free sort_pointers_ptr -> based_word in (system_area);
+          if (next_log_ptr ^= null ()) then
+               call hcs_$terminate_noname (next_log_ptr, (0));
+
+          if (this_log_ptr ^= null ()) then
+               call hcs_$terminate_noname (this_log_ptr, (0));
+
+          return;
+          end clean_up;
+
+%page; %include star_structures;
+%page; %include copy_options;
+%page; %include copy_flags;
+%page; %include access_mode_values;
+%page; %include log_segment;
+
+          end move_log_segments;

@@ -1,0 +1,216 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+/* DESCRIPTION:
+
+         This  routine  renames a pathname in the file_manager_'s System
+     Pathname  Table  (sys_pn_tbl).    This  routine  locks  and  unlocks  the
+     sys_pn_tbl, so if the caller already has the sys_pn_tbl locked and wishes
+     it  to  stay  locked,  the  must  lock  the sys_pn_tbl after this routine
+     returns.    The  caller  must  also  have  set   the   validation   level
+     appropriately.
+
+         The current transaction must have obtained an exclusive (X) lock on 
+     the file being renamed.  This guarantees that there are no outstanding
+     before images against the file other than those held by the current
+     transaction (actually, a share (S) lock might be sufficient).
+
+         If we are unable to find the file in the sys_pn_tbl at the
+     p_sys_pn_tbl_idx location, we search the sys_pn_tbl for the file uid to
+     get the index.  If the file's uid is not in the table, it is a fatal
+     error.
+*/
+
+/* HISTORY:
+
+Written by Matthew, 10/29/84.
+Modified:
+01/10/85 by Matthew C. Pierret:  Changed myname to MYNAME.  Added ERROR_RETURN
+            and MAKE_MESSAGE routines.  Made to call fm_error_util_$signal via
+            ERROR_RETURN if the call to lock_manager_$unlock_fast in the
+            normal execution path fails, but to only log and continue if in
+            FINISH (the cleanup on-unit handler).
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+03/14/85 by Matthew C. Pierret:  Changed to only try to unlock the sys_pn_tbl
+            lock once and only if the lock was validly obtained.  In this
+            context, valid means the lock was previously not held (lock_code
+            is 0) or the lock was held by a dead process (lock_code is
+            dm_error_$fast_lock_invalid_reset).  It is invalid if the lock was
+            previously held by this process.
+05/02/85 by Lee A. Newcomb:  Changed to search the sys_pn_tbl by uid if the
+            entry located by p_sys_pn_tbl_idx is not the file we expected;
+            this is required for recovery to work correctly.
+*/
+/* format: style2,ind3 */
+%page;
+fm_sys_pn_tbl_rename:
+   proc (p_file_uid, p_sys_pn_tbl_idx, p_new_name);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+      dcl	    p_file_uid	       bit (36) aligned;	/*unique id of the DM file*/
+      dcl	    p_sys_pn_tbl_idx       fixed bin (17);	/*index of entry in sys_pn_tbl*/
+      dcl	    p_new_name	       char (32);		/*new entry name of file*/
+
+/* Automatic */
+
+      dcl	    absolute_path	       char (168);
+      dcl	    dir_path	       char (168);
+      dcl	    entry_name	       char (32);
+      dcl	    code		       fixed bin (35) init (0);
+      dcl	    file_uid	       bit (36) aligned init (""b);
+      dcl	    lock_code	       fixed bin (35) init (LOCK_NOT_YET_ATTEMPTED);
+      dcl	    sys_pn_tbl_idx	       fixed bin init (-1);
+      dcl	    unlock_code	       fixed bin (35) init (UNLOCK_NOT_YET_ATTEMPTED);
+
+/* Based */
+/* Builtin */
+
+      dcl	    (addr, length, min, substr)
+			       builtin;
+
+/* Condition */
+
+      dcl	    cleanup	       condition;
+
+/* Constant */
+
+      dcl	    MYNAME	       init ("fm_sys_pn_tbl_rename") char (32) varying internal static options (constant);
+      dcl	    LOCK_WAIT_TIME	       init (1e9) fixed bin (71) internal static options (constant);
+      dcl	    (LOCK_NOT_YET_ATTEMPTED, UNLOCK_NOT_YET_ATTEMPTED)
+			       fixed bin (35) init (-1) internal static options (constant);
+
+/* Entry */
+
+      dcl	    cu_$arg_list_ptr       entry (ptr);
+      dcl	    cu_$arg_ptr_rel	       entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr);
+      dcl	    dm_misc_util_$log      entry options (variable);
+      dcl	    expand_pathname_       entry (char (*), char (*), char (*), fixed bin (35));
+      dcl	    fm_error_util_$signal  entry options (variable);
+      dcl	    hcs_$force_write       entry (ptr, bit (36), fixed bin (35));
+      dcl	    ioa_$general_rs	       entry (ptr, fixed bin, fixed bin, char (*), fixed bin (21), bit (1) aligned,
+			       bit (1) aligned);
+      dcl	    lock_manager_$lock_fast
+			       entry (ptr, fixed bin (71), fixed bin (35));
+      dcl	    lock_manager_$unlock_fast
+			       entry (ptr, fixed bin (35));
+      dcl	    pathname_	       entry (char (*), char (*)) returns (char (168));
+
+/* External */
+
+      dcl	    (
+	    dm_error_$fast_lock_invalid_reset,
+	    dm_error_$file_uid_not_found,
+	    dm_error_$fm_sys_pne_clobbered
+	    )		       ext fixed bin (35);
+
+/* END OF DECLARATIONS */
+%page;
+
+      file_uid = p_file_uid;
+      sys_pn_tbl_idx = p_sys_pn_tbl_idx;
+
+      on cleanup call FINISH ();
+
+      call lock_manager_$lock_fast (addr (sys_pn_tbl.h.lock), LOCK_WAIT_TIME, lock_code);
+      if lock_code ^= 0 & lock_code ^= dm_error_$fast_lock_invalid_reset
+      then call ERROR_RETURN (lock_code, "  Unable to lock ^a.", fm_data_$sys_pn_tbl_name);
+
+      if sys_pn_tbl.e (sys_pn_tbl_idx).in_use = 0 | sys_pn_tbl.e (sys_pn_tbl_idx).file_uid ^= file_uid
+      then
+GET_SYS_PN_TBL_INDEX:
+         do;
+
+/* following loop stops when the UID is found in active entry. */
+/* This is based on the UID search loop in fm_sys_pn_tbl_insert. */
+	  do sys_pn_tbl_idx = lbound (sys_pn_tbl.e, 1) to sys_pn_tbl.h.last_entry
+	       while (sys_pn_tbl.e (sys_pn_tbl_idx).file_uid ^= file_uid
+	       | sys_pn_tbl.e (sys_pn_tbl_idx).in_use = SPT_ENTRY_NOT_IN_USE);
+	  end;
+	  if sys_pn_tbl_idx > sys_pn_tbl.h.last_entry
+	  then call ERROR_RETURN (dm_error_$file_uid_not_found, "Unable to re-name file with unique id ^w.", file_uid);
+         end GET_SYS_PN_TBL_INDEX;
+
+      absolute_path = sys_pn_tbl.paths (sys_pn_tbl_idx);
+      call expand_pathname_ (absolute_path, dir_path, entry_name, code);
+      if code ^= 0
+      then call ERROR_RETURN (code, "  Unable to expand ^a entry ^d: ^a.", fm_data_$sys_pn_tbl_name, sys_pn_tbl_idx,
+	      sys_pn_tbl.paths (sys_pn_tbl_idx));
+
+      sys_pn_tbl.paths (sys_pn_tbl_idx) = pathname_ (dir_path, p_new_name);
+
+      call hcs_$force_write (fm_data_$sys_pn_tbl_ptr, ""b, code);
+      if code ^= 0
+      then call ERROR_RETURN (code, "  Unable to force-write ^a (^p).", fm_data_$sys_pn_tbl_name, fm_data_$sys_pn_tbl_ptr)
+	      ;
+
+      call lock_manager_$unlock_fast (addr (sys_pn_tbl.h.lock), unlock_code);
+      if unlock_code ^= 0
+      then call ERROR_RETURN (unlock_code, "  Unable to unlock ^a.", fm_data_$sys_pn_tbl_name);
+
+      return;
+
+%page;
+ERROR_RETURN:
+   proc options (variable);
+
+
+      dcl	    er_arg_list_ptr	       ptr;
+      dcl	    er_code	       fixed bin (35) based (er_code_ptr);
+      dcl	    er_code_ptr	       ptr;
+      dcl	    er_code_len	       fixed bin (21);
+
+      call cu_$arg_list_ptr (er_arg_list_ptr);
+      call cu_$arg_ptr_rel (1, er_code_ptr, er_code_len, (0), er_arg_list_ptr);
+      call fm_error_util_$signal (er_code, MYNAME, FM_ACTION_CANT_RESTART | FM_ACTION_LOG, LOG_SV,
+	 MAKE_MESSAGE (er_arg_list_ptr));
+
+/* fm_error_util_$signal never returns, however FINISH will be invoked when
+   the stack is unwound. */
+
+   end ERROR_RETURN;
+
+MAKE_MESSAGE:
+   proc (mm_p_arg_list_ptr) returns (char (*));
+
+      dcl	    mm_p_arg_list_ptr      ptr;
+      dcl	    mm_message_len	       fixed bin (21);
+      dcl	    mm_message_buffer      char (1024);
+      dcl	    (DONT_PAD, NO_NEW_LINE)
+			       init ("0"b) bit (1) aligned;
+
+      call ioa_$general_rs (mm_p_arg_list_ptr, 2, 3, mm_message_buffer, mm_message_len, DONT_PAD, NO_NEW_LINE);
+
+      return (substr (mm_message_buffer, 1, min (length (mm_message_buffer), mm_message_len)));
+
+   end MAKE_MESSAGE;
+
+
+FINISH:
+   proc ();
+
+
+      if (lock_code = 0 | lock_code = dm_error_$fast_lock_invalid_reset) & unlock_code = UNLOCK_NOT_YET_ATTEMPTED
+      then
+         do;
+	  call lock_manager_$unlock_fast (addr (sys_pn_tbl.h.lock), unlock_code);
+	  if unlock_code ^= 0
+	  then call dm_misc_util_$log (LOG_SV, unlock_code, MYNAME, "  Unable to unlock ^a during cleanup.",
+		  fm_data_$sys_pn_tbl_name);
+         end;
+
+      return;
+
+   end FINISH;
+%page;
+%include dm_fm_sub_error_flags;
+%page;
+%include dm_fm_sys_pn_tbl;
+%page;
+%include dm_log_sv_codes;
+
+   end fm_sys_pn_tbl_rename;

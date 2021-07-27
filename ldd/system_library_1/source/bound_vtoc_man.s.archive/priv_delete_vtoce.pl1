@@ -1,0 +1,259 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1987 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+/* format: style4 */
+priv_delete_vtoce: procedure (a_uid, a_pvid, a_vtocx, a_code);
+
+/* priv_delete_vtoce: a program to quietly and mysteriously induce a connection
+   failure.  Intended to be used on a VTOCE for which it has been determined that
+   no branch exists.  Several gullibility checks are applied. The only case that
+   this program cannot protect itself against is the case of a wrong UID pathname
+   for an existant segment.
+
+   The priv_delete_vtoce$clear entry is used to get rid of a VTOCE completely--
+   it writes zeros into it. This is used when it is necessary to eliminate a damaged
+   VTOCE without regard to its possible contents.
+
+   In the normal priv_delete_vtoce case, pages are freed, but quotas are not updated.
+   In the $clear case, the vtoce is simply zeroed, without even freeing pages.
+   However, normal volume salvage can be expected to pick them up next time. Neither
+   of these entries will permit a VTOCE which appears to be active to be deleted.
+
+   Bernard Greenberg   06/02/74
+   Modified 06/02/81, W. Olin Sibert, to not lock directory for damaged VTOCE
+   Modified 9 August 1981 WOS, to add priv_delete_vtoce$clear
+   Modified January 82 BIM, for write lock for exclusive dir lock.
+   Modified March 1982, J. Bongiovanni, to fix bug in find_aste and to cleanup locks
+   Modified September 1982, J. Bongiovanni, to validate the moribund VTOCE before
+   deleting it
+   Modified August 1983, E. N. Kittlitz, set uid in clear case
+*/
+
+dcl  a_uid bit (36) aligned parameter;
+dcl  a_pvid bit (36) aligned parameter;
+dcl  a_vtocx fixed bin parameter;
+dcl  a_code fixed bin parameter;
+
+dcl  uid bit (36) aligned;
+dcl  par_uid bit (36) aligned;
+dcl  pvid bit (36) aligned;
+dcl  code fixed bin (35);
+dcl  pvtx fixed bin;
+dcl  i fixed bin;
+dcl  vtocx fixed bin;
+dcl  clear_sw bit (1) aligned;
+
+dcl  1 local_entry like entry aligned automatic;
+dcl  1 local_dir like dir aligned automatic;
+dcl  1 local_vtoce like vtoce aligned automatic;
+
+dcl  sst$astap pointer external static;
+dcl  sst$astsize fixed bin external static;
+dcl  sst$pts (0:3) fixed bin external static;
+dcl  1 sst$level (0:3) external static aligned,
+       2 ausedp bit (18) unaligned,
+       2 no_aste fixed bin (18) unsigned unaligned;
+
+dcl  error_table_$vtoce_connection_fail fixed bin (35) external static;
+dcl  error_table_$illegal_deactivation fixed bin (35) external static;
+dcl  error_table_$invalid_vtoce fixed bin (35) external static;
+
+dcl  delete_vtoce entry (pointer, fixed bin (35));
+dcl  get_pvtx entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+dcl  lock$dir_lock_write entry (pointer, fixed bin (35));
+dcl  lock$lock_ast entry ();
+dcl  lock$unlock_ast entry ();
+dcl  lock$dir_unlock_given_uid entry (bit (36) aligned);
+dcl  search_ast entry (bit (36) aligned) returns (ptr);
+dcl  syserr$error_code entry options (variable);
+dcl  vtoc_man$free_vtoce entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+dcl  vtoc_man$get_vtoce entry (bit (36) aligned, fixed bin, fixed bin, bit (3), pointer, fixed bin (35));
+
+dcl  (addr, addrel, binary, dim, fixed, null, unspec) builtin;
+
+%page;
+
+	clear_sw = "0"b;
+	uid = a_uid;
+	goto COMMON;
+
+
+priv_delete_vtoce$clear: entry (a_pvid, a_vtocx, a_code);
+
+	clear_sw = "1"b;
+	uid = ""b;				/* don't have a UID yet */
+	goto COMMON;
+
+
+COMMON:	pvid = a_pvid;				/* Copy parameters, zero code */
+	vtocx = a_vtocx;
+	code = 0;
+	par_uid = ""b;				/* Means parent not locked */
+
+	pvtx = get_pvtx (pvid, code);			/* Try to get the pvtx */
+	if code ^= 0 then go to finale;		/* Already off line. Lose */
+
+	vtocep = addr (local_vtoce);
+	dp = addr (local_dir);
+	ep = addr (local_entry);			/* Set up local copy and fraud branch. */
+
+	call vtoc_man$get_vtoce (pvid, pvtx, vtocx, "101"b, vtocep, code);
+	if code ^= 0 then go to finale;		/* Some other lossage, could be demount, i/o err. */
+
+	if (vtoce.uid ^= uid) & (^clear_sw) then do;	/* Only check if not simply clearing */
+	     code = error_table_$vtoce_connection_fail;	/* Gone already */
+	     go to finale;
+	end;
+	if clear_sw then uid = vtoce.uid;		/* why not use this? */
+
+%page;
+
+	if clear_sw then goto BAD_PARENT;		/* Don't bother trying if just clearing */
+
+	if vtoce.uid_path (0) ^= "777777777777"b3 then goto BAD_PARENT; /* Can't be locked: UID path is bogus */
+
+	do i = 15 to 0 by -1 while (vtoce.uid_path (i) = "0"b);
+	end;					/* Get parent UID */
+
+	par_uid = vtoce.uid_path (i);
+	if par_uid = ""b then goto BAD_PARENT;		/* UID pathname is bad */
+
+	unspec (dir) = "0"b;			/* Clear the fraudulent dir */
+	dir.uid = par_uid;
+
+	call lock$dir_lock_write (dp, code);		/*  Lock the UID in the dirlock table */
+	if code ^= 0 then call syserr$error_code (CRASH, code, "priv_delete_vtoce: failed to lock ^w ", par_uid);
+
+BAD_PARENT:
+	call lock$lock_ast;				/* Check if active */
+
+	call vtoc_man$get_vtoce (pvid, pvtx, vtocx, "101"b, vtocep, code);
+	if code ^= 0 then go to unlock_ast_finale;	/* funny thing.. */
+
+	if (vtoce.uid ^= uid) & (^clear_sw) then do;	/* Again, skip check */
+	     code = error_table_$vtoce_connection_fail;
+	     go to unlock_ast_finale;			/* gone in window */
+	end;
+
+	if find_aste (pvtx, vtocx) ^= null () then do;	/* Active, refuse to do this. */
+	     code = error_table_$illegal_deactivation;
+	     go to unlock_ast_finale;
+	end;
+
+	if (search_ast (uid) ^= null ()) & (^clear_sw) then do; /* UID in VTOCE is bad for sure */
+	     code = error_table_$invalid_vtoce;
+	     goto unlock_ast_finale;
+	end;
+
+%page;
+
+	if clear_sw then do;			/* If clearing, just write (and await) */
+
+	     call vtoc_man$free_vtoce (pvid, pvtx, vtocx, code); /* Let vtoc_man do the work */
+	     if code ^= 0 then go to unlock_ast_finale;	/* funny thing.. */
+
+	     call lock$unlock_ast ();			/* Unlock AST only after finished */
+	end;
+
+	else do;					/* In normal case, unlock AST immediately, since we have */
+	     call lock$unlock_ast ();			/* parent locked, and it can't be activated while that */
+						/* situation prevails */
+
+	     if fixed (vtoce.records) > fixed (vtoce.csl) /* Validate the VTOCE a bit */
+		| fixed (vtoce.csl) > fixed (vtoce.msl)
+		| fixed (vtoce.msl) > dim (vtoce.fm, 1)
+	     then do;
+		code = error_table_$invalid_vtoce;
+		goto finale;
+	     end;
+
+	     unspec (entry) = ""b;
+	     entry.owner = "777777777770"b3;		/* No owner, until this field set right */
+	     entry.pvid = pvid;			/* Inhibit quota grubbing-- */
+	     entry.uid = uid;			/* This UID is special-cased by delete_vtoce */
+	     entry.vtocx = vtocx;
+
+	     call delete_vtoce (ep, code);		/* Now delete the vtoce */
+	end;
+
+finale:	if par_uid ^= ""b then			/* If there was a parent, then */
+	     call lock$dir_unlock_given_uid (par_uid);	/* Unlock it */
+
+	a_code = code;
+	return;
+
+unlock_ast_finale:
+	call lock$unlock_ast;
+	goto finale;
+
+%page;
+
+find_aste: proc (P_pvtx, P_vtocx) returns (pointer);
+
+/* This procedure is used to look for an ASTE which claims to own a particular VTOC entry.
+   It is used instead of search_ast because it is possible that there is some damage present,
+   which might cause the UID to be completely bogus, and not be properly picked up by
+   search_ast. It simply looks through all the pools looking for the proper pvtx/vtocx pair.
+*/
+
+dcl  P_pvtx fixed bin parameter;
+dcl  P_vtocx fixed bin parameter;
+
+dcl  pool_idx fixed bin;
+dcl  aste_idx fixed bin;
+dcl  my_astep pointer;
+
+
+	my_astep = sst$astap;
+
+	do pool_idx = 0 to 3;			/* Walk through all pools, rather than trusting search_ast */
+	     do aste_idx = 1 to sst$level (pool_idx).no_aste;
+		if (my_astep -> aste.vtocx = P_vtocx) then
+		     if (my_astep -> aste.pvtx = P_pvtx) then
+			return (my_astep);		/* This is it */
+
+		my_astep = addrel (my_astep, binary (sst$pts (pool_idx) + sst$astsize, 18));
+	     end;
+	end;
+
+	return (null ());				/* Didn't find it */
+
+     end find_aste;
+
+/* format: off */
+
+%page; %include aste;
+%page; %include dir_entry;
+%page; %include dir_header;
+%page; %include syserr_constants;
+%page; %include vtoce;
+%page;
+/* format: on */
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   priv_delete_vtoce: failed to lock WWWWWW ERROR_MESSAGE
+
+   S: $crash
+
+   T: $run
+
+   M: An attempt to lock a directory has failed.
+   $err
+
+   A: $recover
+   $boot_tape
+
+   END MESSAGE DOCUMENTATION */
+
+     end priv_delete_vtoce;

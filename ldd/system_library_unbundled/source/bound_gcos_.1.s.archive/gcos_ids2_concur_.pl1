@@ -1,0 +1,409 @@
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+gcos_ids2_concur_: proc;
+
+/*
+   IDS 2 concurrency control
+
+   Provides for control of access of multiple processes to the same IDS2
+   data bases.
+
+   Whenever an IDS file is created, a lock control seg will be created
+   for it. When the simulator is asked by the IDS process to allocate
+   an IDS file, the simulator gets the lock control seg and locks other
+   processes out temporarily with set_lock_. The control seg is examined
+   for a valid combination of Gcos access by current processes that will
+   allow the requesting process allocation. If allocation is permitted,
+   this is noted in the control seg, the seg is unlocked and the IDS
+   file is allocated. If allocation is not permitted, the control seg
+   is unlocked and the simulator returns to the IDS process with
+   "file busy". When a file is deallocated, the control seg
+   is locked and the allocation is removed from the record of current
+   allocations in the control seg. When an IDS file is released (deleted)
+   the control seg is also deleted.
+
+   In a Gcos environment there are basically two allocation types
+   to keep track of.
+      - one writer with no other readers
+      - many readers with no concurrent writer
+   Multiple readers are always ok. There are other esoteric types
+   of allocation, but these two are the ones implemented.
+
+   The concurrency control is on a file basis rather than per record
+   or per entry. The problem of deadlocks is dealt with by the
+   application. If it has more that one data base then it has to
+   decide what to do if it can't get one of them.
+
+   There are five entry points to this module. They are:
+
+      gcos_ids2_concur_$create_control  Create an ids2 control segment
+      gcos_ids2_concur_$delete_control  Delete ids2 control segment
+      gcos_ids2_concur_$allocate        Try allocate ids2 data base
+      gcos_ids2_concur_$deallocate      remove allocation lock
+      gcos_ids2_concur_$have_xid        returns "1"b if file has ids2 ACL
+
+   The parameters and returned status are discussed in the comments
+   for each entry.
+
+   Written:  Ron Barstad  10/18/82
+*/
+%page;
+dcl  ids_dir char (168) parameter;                          /* input */
+dcl  ids_entry_name char (32) parameter;                    /* input */
+dcl  read_access bit (1) parameter;                         /* input: "1"b if have read access */
+dcl  write_access bit (1) parameter;                        /* input: "1"b if have write access */
+dcl  busy_status bit (1) parameter;                         /* output: "1"b = busy, "0"b = ok, was allocated */
+dcl  code fixed bin (35) parameter;                         /* output */
+
+dcl  acl_ptr ptr;
+dcl  addr builtin;
+dcl  adj_bit_count fixed bin (35);
+dcl  adjust_bit_count_ entry (char(168), char(32), bit(1) aligned,
+	fixed bin(35), fixed bin(35));
+dcl  bit_count fixed bin (24);
+dcl  control_seg_ename char (32);
+dcl  CONTROL_SEG_SUFFIX char (12) internal static options (constant)
+     initial (".CONCURRENCY");
+dcl  delete_$path entry (char (*), char (*), bit (6), char (*), fixed bin (35));
+dcl  divide builtin;
+dcl  e_code fixed bin(35); /* local version of code */
+dcl  error_table_$invalid_lock_reset fixed bin (35) ext static;
+dcl  error_table_$lock_not_locked fixed bin (35) ext static;
+dcl  error_table_$lock_wait_time_exceeded fixed bin (35) ext static;
+dcl  error_table_$locked_by_this_process fixed bin (35) ext static;
+dcl  error_table_$segknown fixed bin (35) ext static;
+dcl  have_ids_acl bit (1);
+dcl  hcs_$add_acl_entries entry (char (*), char (*), ptr, fixed bin,
+     fixed bin (35));
+dcl  hcs_$initiate_count entry (char (*), char (*), char (*), fixed bin (24),
+     fixed bin (2), ptr, fixed bin (35));
+dcl  hcs_$list_acl entry (char (*), char (*), ptr, ptr, ptr, fixed bin,
+     fixed bin (35));
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr,
+     fixed bin (35));
+dcl  hcs_$set_bc entry (char(*), char(*), fixed bin(24), fixed bin(35));
+dcl  lock_control_ptr pointer;
+dcl  max builtin;
+dcl  MAX_READERS fixed bin(17) internal static options(constant) init(1000);
+dcl  null builtin;
+dcl  read_index fixed bin (17);
+dcl  rtrim builtin;
+dcl  set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+dcl  terminate_file_ entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+
+
+dcl 01 segment_acl (1) aligned,
+    02 access_name char (32), 
+    02 modes bit (36),
+    02 xmodes bit (36),
+    02 acl_status_code fixed bin (35);
+
+
+dcl 01 lock_control_seg_acl (1) aligned,
+    02 access_name char (32),
+    02 modes bit (36),
+    02 xmodes bit (36),
+    02 acl_status_code fixed bin (35);
+
+
+dcl 01 lock_control_seg aligned based (lock_control_ptr),
+    02 seg_lock bit (36),
+    02 write_lock bit (36),
+    02 number_of_readers fixed bin (24),
+    02 read_lock (MAX_READERS) bit(36);
+%page;
+/*
+   create_control
+
+   Create the ids concurrency control segment. The ids data base file has
+   just been created or the control segment was not found.
+
+   parameters:
+
+   ids_entry_name     the name of the ids file - input
+   ids_dir            the directory of the ids file - input
+   code               the error_table_ status - output
+
+   result:
+
+   If all goes well, the seg, <ids_file_abs_path>.CONCURRENCY will be
+   created and initialized. An ACL is added to the IDS2 file to give it
+   an extrinsic identification for later recognition.
+*/
+create_control: entry (ids_dir, ids_entry_name, code);
+
+/* add an acl to ids2 file to give it an extrinsic characteristic */
+	segment_acl.access_name = "*.*.I";
+	segment_acl.modes = R_ACCESS;
+	segment_acl.xmodes = "0"b;
+	acl_ptr = addr (segment_acl);
+	call hcs_$add_acl_entries (ids_dir, ids_entry_name, acl_ptr, 1, code);
+	if code ^= 0 then goto create_exit;
+
+/* create the lock control seg */
+	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+	call hcs_$make_seg (ids_dir, control_seg_ename, "",
+	     RW_ACCESS_BIN, lock_control_ptr, code);
+	if code ^= 0 then goto create_exit;
+
+/* add the acl to allow all to read and write */
+	lock_control_seg_acl.access_name = "*.*.*";
+	lock_control_seg_acl.modes = RW_ACCESS;
+	lock_control_seg_acl.xmodes = "0"b;
+	acl_ptr = addr (lock_control_seg_acl);
+	call hcs_$add_acl_entries (ids_dir, control_seg_ename, acl_ptr, 1, code);
+	if code ^= 0 then goto create_exit;
+	
+/* intialize control seg */
+	lock_control_seg.seg_lock = "0"b;
+	lock_control_seg.write_lock = "0"b;
+	lock_control_seg.number_of_readers = 0;
+	lock_control_seg.read_lock (1) = "0"b;
+	call terminate_file_(lock_control_ptr, 4*36,
+	     TERM_FILE_BC | TERM_FILE_TERM, code);
+
+create_exit:
+	return;
+%page;
+/*
+   delete_control
+
+   Delete the ids concurrency control segment. The ids data base file has
+   just been deleted.
+
+   parameters:
+
+   ids_entry_name     the name of the ids file - input
+   ids_dir            the directory of the ids file - input
+   code               the error_table_ status - output
+
+   result:
+
+   If all goes well, the seg, <ids_file_abs_path>.CONCURRENCY will be
+   deleted.
+*/
+delete_control: entry (ids_dir, ids_entry_name, code);
+
+	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+	call delete_$path (ids_dir, control_seg_ename,
+	     "100100"b, "gcos", code);
+
+	return;
+%page;
+/*
+   allocate
+
+   Allocate, or attempt to allocate, the given ids file through the
+   control seg.
+
+   parameters:
+
+   ids_entry_name     the name of the ids file - input
+   ids_dir            the directory of the ids file - input
+   read_access        "1"b if have read access - input
+   write_access       "1"b if have write access - input
+   busy_status        "0"b if ok, "1"b if busy - output
+   code               the error_table_ status - output
+
+   algorithm:
+
+   lock the control seg
+   if access_type includes write
+      then
+         if have any readers
+            then busy := true
+            else
+               try write lock
+               if ok
+                  then busy := false
+                  else busy := true
+      else {read access}
+         if valid write lock exits
+            then busy := true
+            else
+               set another read lock and increment reader count
+               busy := false
+   unlock the control seg
+
+   result:
+
+   If the file is available for this allocation type, then status ok
+   is returned, otherwise status busy is returned.
+*/
+allocate:	entry (ids_dir, ids_entry_name, read_access, write_access, busy_status, code);
+
+	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+	call hcs_$initiate_count (ids_dir, control_seg_ename,
+	     "", bit_count, 0, lock_control_ptr, code);
+	if code ^= 0 
+	     then if code ^= error_table_$segknown then goto allocate_exit;
+
+/* try to allocate */
+
+	busy_status = "0"b;			/* assume ok */
+	call set_lock_$lock (lock_control_seg.seg_lock, 10, code);
+	if code ^= 0 
+	     then if code ^= error_table_$invalid_lock_reset
+	     then if code ^= error_table_$locked_by_this_process then goto allocate_exit;
+	if write_access
+	then do;					/* write access */
+	     if lock_control_seg.number_of_readers >0 then do;
+		call clean_out_dead_locks;
+		if lock_control_seg.number_of_readers /* still */ > 0 then goto alloc_busy_exit;
+	     end;
+	     call set_lock_$lock (lock_control_seg.write_lock, 0, code);
+	     if (code = 0 | code = error_table_$invalid_lock_reset
+		| code = error_table_$locked_by_this_process) then goto alloc_ok_exit;
+	     if code = error_table_$lock_wait_time_exceeded then goto alloc_busy_exit;
+	     goto alloc_unlock_exit;
+	end;
+	else do;					/* read access */
+	     if lock_control_seg.write_lock then do;
+		call set_lock_$lock(lock_control_seg.write_lock, 0, code); /* maybe it's dead, code is irrelevant now */
+		call set_lock_$unlock(lock_control_seg.write_lock, code);
+		if code ^= 0 then goto alloc_busy_exit; 
+		end;
+	     do read_index = 1 to MAX_READERS;
+		call set_lock_$lock (lock_control_seg.read_lock (read_index), 0, code);
+		if code = 0 then do;
+		     lock_control_seg.number_of_readers = lock_control_seg.number_of_readers + 1;
+		     call adjust_bit_count_(ids_dir, control_seg_ename, "0"b, adj_bit_count, code);
+		     if code = 0 then goto alloc_ok_exit;
+		     goto alloc_unlock_exit;
+		end;
+		if (code = error_table_$invalid_lock_reset
+		| code = error_table_$locked_by_this_process) then goto alloc_ok_exit;
+	     end;
+	end;
+
+alloc_busy_exit:
+	busy_status = "1"b; /* busy */
+alloc_ok_exit:
+	code = 0;
+alloc_unlock_exit:
+	call set_lock_$unlock (lock_control_seg.seg_lock, e_code);
+	if code = 0 then code = e_code; /* report earliest error */
+allocate_exit:
+	return;
+%page;
+/*
+   deallocate
+
+   deallocate the given ids file through the control seg.
+
+   parameters:
+
+   ids_entry_name     the name of the ids file - input
+   ids_dir            the directory of the ids file - input
+   read_access        "1"b if have read access - input
+   write_access       "1"b if have write access - input
+   code               the error_table_ status - output
+
+   algorithm:
+
+   lock control seg
+   if access_type includes write access
+      then
+         unlock write lock
+      else
+         for read_lock := first_read_lock to end of segment
+            unlock read lock
+            if ok then exit loop
+   unlock control seg
+   terminate control seg
+
+   result:
+
+   If the process id is in the control seg, then the lock is unlocked.
+
+*/
+deallocate: entry (ids_dir, ids_entry_name, read_access, write_access, code);
+
+	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+	call hcs_$initiate_count (ids_dir, control_seg_ename,
+	     "", bit_count, 0, lock_control_ptr, code);
+	if code ^= 0
+	     then if code ^= error_table_$segknown then goto deallocate_exit;
+
+/* try to deallocate */
+
+	call set_lock_$lock (lock_control_seg.seg_lock, 120, code);
+	if code ^= 0 
+	     then if code ^= error_table_$invalid_lock_reset
+	     then if code ^= error_table_$locked_by_this_process then goto deallocate_exit;
+	if write_access
+	then do;					/* write access */
+	     call set_lock_$unlock (lock_control_seg.write_lock, code);
+	     if code ^= 0 
+		then if code ^= error_table_$lock_not_locked then goto dealloc_unlock_exit;
+	end;
+	else 					/* read access */
+	     do read_index = 1 to (divide(bit_count,36,17)-3);
+	        if (lock_control_seg.read_lock(read_index)) then do;
+	           call set_lock_$unlock (lock_control_seg.read_lock (read_index), code);
+		 if code = 0 then do;
+		     lock_control_seg.number_of_readers = lock_control_seg.number_of_readers - 1;
+		     call adjust_bit_count_(ids_dir, control_seg_ename, "0"b, adj_bit_count, code);
+		     if code ^= 0 then goto dealloc_unlock_exit;
+		     bit_count = max(adj_bit_count, 4*36);
+		     call hcs_$set_bc(ids_dir, control_seg_ename, bit_count, code);
+		     if code ^= 0 then goto dealloc_unlock_exit;
+		     goto dealloc_ok_exit;
+	           end;
+	        end;
+	     end;
+dealloc_ok_exit:
+	code = 0;
+dealloc_unlock_exit:
+	call set_lock_$unlock(lock_control_seg.seg_lock, e_code);
+	if code = 0 then code = e_code; /* report only earliest error */
+          call terminate_file_(lock_control_ptr, bit_count, TERM_FILE_TERM,e_code);
+	if code = 0 then code = e_code;
+deallocate_exit:
+	return;
+%page;
+/*
+   have_xid
+
+   returns "1"b if ids_entry_name has an acl (extrinsic id) identifying
+   it as an IDS2 file
+*/
+have_xid:	entry (ids_dir, ids_entry_name, code) returns (bit (1));
+
+	segment_acl.access_name = "*.*.I";
+	segment_acl.modes = R_ACCESS;
+	segment_acl.xmodes = "0"b;
+
+	have_ids_acl = "0"b;			/* assume not */
+	acl_ptr = addr (segment_acl);
+	call hcs_$list_acl (ids_dir, ids_entry_name, null (),
+	     null (), acl_ptr, 1, code);
+	if code = 0 & segment_acl (1).acl_status_code = 0
+	then have_ids_acl = "1"b;
+	return (have_ids_acl);
+%page;
+clean_out_dead_locks:
+	proc;
+/* clean out all dead read processes in lock control seg */
+	     do read_index = 1 to MAX_READERS;
+		if (lock_control_seg.read_lock(read_index )) then do;
+		     call set_lock_$lock (lock_control_seg.read_lock(read_index), 0, code);
+		     if code = error_table_$invalid_lock_reset then do;
+			lock_control_seg.number_of_readers = lock_control_seg.number_of_readers -1;
+			code = 0;
+			end;
+		     if code = 0 then call set_lock_$unlock (lock_control_seg.read_lock (read_index), code);
+		     end;
+		end;
+	     code = 0; /* code is irrelevant here */
+	     return;
+	end;
+%page;
+%include access_mode_values;
+%include terminate_file;
+     end gcos_ids2_concur_;

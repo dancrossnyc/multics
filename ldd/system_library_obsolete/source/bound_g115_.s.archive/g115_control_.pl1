@@ -1,0 +1,540 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+g115_control_: proc;
+
+
+/* g115_control_ - Main control procedure for the g115_ DIM.
+   This routine controls attaching and detaching of the device and
+   the order and mode calls. Attaching includes a step which waits
+   for the device to become ready, called listening. */
+
+/* Coded April 26, 1974 Mike Grady */
+
+/* modified 06/10/75 by Bob Adsit to move line_control to MCS/355 */
+/* modified 04/10/77 by Bob Franklin to fix bugs, add order codes of
+   start, quit_disable, and quit_enable.  */
+/* Modified 2/78 by J. C. Whitmore to use new prt_conv_info.incl.pl1 */
+
+dcl (dev_index, nelemt, j, lmode, k, state, new_line_type, msg_len) fixed bin,
+     periph_type based (order_ptr) fixed bin,
+     code fixed bin (35),
+    (error_table_$undefined_order_request, error_table_$ionmat,
+     error_table_$bad_mode, error_table_$bad_arg, error_table_$inconsistent,
+     error_table_$noalloc) fixed bin (35) ext,
+     ostring char (120) varying,
+    (request, new_mode, old_mode, dev_name) char (*),
+    (order_ptr, sysareap int static, msg_ptr) ptr,
+    (addr, bool, null, rel) builtin,
+    (area, storage) condition;
+
+dcl  g115_io_$write entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin (35));
+
+dcl  NL char (1) init ("
+"),
+     VT_or_FF char (2) init ("");
+
+dcl  g115_conv_$g115_conv_ fixed bin ext;
+
+dcl  sys_area area based (sysareap);
+
+dcl 1 page_labels based (order_ptr) aligned,		/* structure used in "page_labels" call */
+    2 top_label char (136),				/* label for top of page */
+    2 bottom_label char (136);			/* label for bottom of page */
+
+dcl 1 counts based (order_ptr) aligned,			/* structure used in "get_count" call */
+    2 line fixed bin,				/* line number */
+    2 page_length fixed bin,				/* length of page */
+    2 lmarg fixed bin,				/* left margin indentation */
+    2 rmarg fixed bin,				/* line length */
+    2 line_count fixed bin,				/* count of lines printed */
+    2 page_count fixed bin;				/* count of pages printed */
+
+dcl 1 info_structure aligned based (order_ptr),
+    2 ev_chan fixed bin (71),
+    2 input_available bit (1);
+
+dcl 1 modes aligned,
+    2 len fixed bin,
+    2 str char (256);
+
+dcl 1 chan_info aligned,
+    2 id char (4),
+    2 baud_rate fixed bin (17) unal,
+    2 line_type fixed bin (17) unal,
+    2 pad bit (36),
+    2 tty_type fixed bin;
+
+dcl  g115_util_$get_ptr entry returns (ptr),
+     g115_util_$set_ptr entry (ptr),
+     g115_util_$get_data_ptr entry (fixed bin) returns (ptr),
+     g115_util_$link_data_ptr entry (ptr),
+     g115_util_$unlink_data_ptr entry (fixed bin) returns (ptr),
+     g115_util_$block entry (fixed bin (35)),
+     g115_message_$read entry (ptr, fixed bin, fixed bin (35)),
+     hcs_$tty_index entry (char (*), fixed bin, fixed bin, fixed bin (35)),
+     hcs_$tty_event entry (fixed bin, fixed bin (71), fixed bin, fixed bin (35)),
+     hcs_$tty_state entry (fixed bin, fixed bin, fixed bin (35)),
+     hcs_$tty_detach entry (fixed bin, fixed bin, fixed bin, fixed bin (35)),
+     hcs_$tty_order entry (fixed bin, char (*), ptr, fixed bin, fixed bin (35)),
+     ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35)),
+     get_system_free_area_ entry returns (ptr);
+dcl  hcs_$tty_abort entry (fixed bin, fixed bin, fixed bin, fixed bin (35));
+
+
+%include g115_data;
+
+%include g115_msg;
+%include g115_stat;
+/*  */
+init:	entry (dev_name, dev_index, code);
+						/*  called to establish a g115_data structure for the device */
+
+	data_ptr = g115_util_$get_data_ptr (dev_index);
+	if data_ptr = null then do;			/* first call for this device */
+
+	     on condition (storage) call clean;		/* establish handlers to catch area package signals */
+	     on condition (area) call clean;
+
+	     sysareap = get_system_free_area_ ();	/* get pointer to system free segment */
+
+	     allocate g115_data in (sys_area) set (data_ptr); /* allocate the global data base */
+	     unspec (g115_data) = "0"b;
+	     call g115_util_$link_data_ptr (data_ptr);	/* link into chain - new g115_data structure */
+
+	     revert condition (area);
+	     revert condition (storage);
+	end;
+	g115_data.dev_name = dev_name;
+	g115_data.twx = dev_index;
+
+	g115_data.write_split,
+	     g115_data.punch,
+	     g115_data.teleprinter = "0"b;
+
+	g115_data.write_compress = "1"b;
+	g115_data.mask_sw = bool (rel (addr (g115_data.output_buffer1)),
+	     rel (addr (g115_data.output_buffer2)), "0110"b);
+	g115_data.wait_list.nchan = 2;
+	call ipc_$create_ev_chn (g115_data.wait_list.hcs_ev_chan, code); /* create ring 0  event channel */
+	if code ^= 0 then return;
+	call ipc_$create_ev_chn (g115_data.wait_list.timeout_chan, code);
+	if code ^= 0 then return;
+
+	pcip = addr (g115_data.conv_info);
+	pci.cv_proc = addr (g115_conv_$g115_conv_);
+	pci.phys_line_length = 132;
+	pci.phys_page_length = 66;
+	pci.lpi = 6;				/* assume 6 lines per inch */
+	call g115_util_$set_ptr (data_ptr);
+	call order (dev_index, "reset", null, code);
+	pci.line = 1;				/* the final initialization of pci */
+						/* all other variables xeroed by "unspec" above */
+
+	do slot_ptr = addr (g115_data.output_buffer1 (1)),
+		addr (g115_data.output_buffer2 (1));
+
+	     g115_hdr.full_cc,
+		g115_hdr.msg_type,
+		g115_hdr.sub_type,
+		g115_hdr.aux_bit_count,
+		g115_hdr.null_ct,
+		g115_hdr.text_char_count = 0;
+	     g115_msg.soh = g115_stat.soh_char;
+	     g115_msg.fmt_code = g115_stat.service_noaux;
+	     g115_msg.addr_code = g115_stat.addr_code_char;
+	     g115_msg.op_code.ascii_pad = "00"b;
+	     g115_msg.op_code.use = "1"b;
+	     g115_msg.op_code.ack,
+		g115_msg.op_code.cmd = "0"b;
+	     g115_msg.id_code = g115_stat.id_code_char;
+	     g115_msg.stx = g115_stat.stx_char;
+	     g115_msg.etx = g115_stat.etx_char;
+	end;
+
+	slot_ptr = addr (g115_data.input_buffer (1));
+	g115_hdr.full_cc,
+	     g115_hdr.text_char_count = 0;
+
+	code = 0;					/* no error */
+ret:	return;
+
+
+
+
+clean:	proc;
+
+	     code = error_table_$noalloc;
+	     go to ret;
+
+	end clean;
+
+
+
+
+
+
+/*  */
+modes:	entry (dev_index, new_mode, old_mode, code);
+
+	code = 0;
+	data_ptr = g115_util_$get_ptr ();
+	pcip = addr (g115_data.conv_info);
+
+	ostring = "";				/* Initialize current modes. */
+
+	pcip = addr (g115_data.conv_info);		/* Get pointer to conversion info. */
+
+	call add_bit ("noskip,", pci.overflow_off);	/* Insert noskip mode. */
+
+	call add_bit ("single,", pci.single_space);	/* Insert single space mode. */
+
+	call add_bit ("non_edited,", pci.non_edited);	/* Insert non-edited mode. */
+
+	call add_bit ("truncate,", pci.truncate);	/* Insert truncate mode. */
+
+	call add_bit ("trim,", g115_data.trim);		/* Insert trim mode. */
+
+	call add_num ("ll", pci.rmarg);		/* Insert line length mode. */
+
+	call add_num (",in", pci.lmarg);		/* Insert indent mode. */
+
+	call add_num (",pl", pci.page_length);		/* Insert page length mode. */
+
+	ostring = ostring || ".";			/* Place period at end of string. */
+	old_mode = ostring;				/* Return old mode settings. */
+
+
+add_num:	proc (m, n);				/* internal proc to add numeric mode to ostring */
+
+dcl  m char (*),					/* mode name */
+     n fixed bin;					/* number to be converted */
+
+dcl  number pic "zzzzz9",				/* for converting number */
+     i fixed bin;					/* offset of first nonblank character */
+
+	     ostring = ostring || m;			/* Insert mode name in ostring. */
+
+	     number = n;				/* Zap! You're converted. */
+	     i = verify (number, " ");		/* Search for nonblank. */
+	     ostring = ostring || substr (number, i);	/* Insert number in ostring. */
+
+	     return;
+
+
+add_bit:	     entry (m, b);				/* internal proc to add on/off mode to ostring */
+
+dcl  b bit (1);					/* mode bit */
+
+	     if ^b then ostring = ostring || "^";	/* If bit off, add NOT sign. */
+	     ostring = ostring || m;			/* Insert mode name in ostring. */
+
+	     return;
+
+
+	end add_num;
+
+
+
+	j = verify (reverse (new_mode), " .;");		/* Search backwards over final breaks. */
+	if j = 0 then return;			/* If no meat on the bones, just return. */
+	lmode = length (new_mode) - j + 1;		/* Compute length to be examined. */
+
+	do k = 1 repeat k + j while (k < lmode);	/* Step through new modes. */
+	     j = search (substr (new_mode, k), ",;. ");	/* Search for break character. */
+	     if j = 0 then j = lmode - k + 2;		/* If no breaks, take remaining length. */
+
+	     if test ("default") then do;		/* Default should be first and only mode. */
+		pci.modes = "0"b;			/* Reset all mode bits. */
+		pci.top_label_length,
+		     pci.bot_label_length = 0;	/* Reset labels. */
+		pci.rmarg = pci.phys_line_length;	/* Reset line and page lengths. */
+		pci.lmarg = 0;
+		pci.page_length = pci.phys_page_length - pci.lpi;
+	     end;
+
+	     else if tests ("noskip", pci.overflow_off) then;
+						/* If page overflow to be ignored ... */
+
+	     else if tests ("single", pci.single_space) then;
+						/* If single spacing to be forced ... */
+
+	     else if tests ("non_edited", pci.non_edited) then;
+						/* If non-edited mode to be forced ... */
+
+	     else if tests ("truncate", pci.truncate) then;
+						/* If long lines to be truncated ... */
+
+	     else if tests ("trim", g115_data.trim) then; /* If setting/resetting trim mode ... */
+
+	     else if testn ("ll", pci.rmarg) then;	/* If changing line length ... */
+
+	     else if testn ("in", pci.lmarg) then;	/* If changing indentation ... */
+
+	     else if testn ("pl", pci.page_length) then;	/* If changing page length ... */
+
+	     else					/* If unrecognized key ... */
+	     code = error_table_$bad_mode;
+
+	end;
+
+	pci.rmarg = min (pci.rmarg, pci.phys_line_length); /* Insure that line is not too long. */
+	pci.lmarg = min (pci.lmarg, pci.rmarg);		/* Left margin must be to left of right margin. */
+
+	if pci.overflow_off then do;			/* Check for "noskip" mode set. */
+	     pci.top_label_length,			/* "noskip" and page labels are inconsistent. */
+		pci.bot_label_length = 0;
+	     pci.sheets_per_page = 1;			/* One sheet per page in noskip mode. */
+	     pci.page_length = pci.phys_page_length - pci.lpi; /* Reset logical page length. */
+	end;
+	else					/* If "^noskip" mode ... */
+	pci.sheets_per_page = divide (pci.page_length + (pci.lpi - 1) + pci.phys_page_length, pci.phys_page_length, 17, 0);
+						/* Compute physical sheets of paper per page. */
+
+	return;
+
+
+
+test:	proc (s) returns (bit (1) aligned);		/* internal proc to test for mode key */
+
+dcl  s char (*) aligned;				/* mode key */
+
+
+	     return (substr (new_mode, k, length (s)) = s); /* Return success or failure. */
+
+
+tests:	     entry (s, t) returns (bit (1) aligned);	/* entry to test for mode or ^mode */
+
+dcl  t bit (1) unal;				/* key or ^key flag */
+
+
+	     if substr (new_mode, k, length (s)) = s then do; /* If key found ... */
+		t = "1"b;				/* Set flag to true. */
+		return ("1"b);			/* And return. */
+	     end;
+	     else if substr (new_mode, k+1, length (s)) = s then
+		if substr (new_mode, k, 1) = "^" then do;
+		     t = "0"b;			/* If ^key found, set flag to false. */
+		     return ("1"b);			/* And return. */
+		end;
+
+	     return ("0"b);				/* Key not found. */
+
+
+testn:	     entry (s, i) returns (bit (1) aligned);	/* internal proc to set numeric mode */
+
+dcl  i fixed bin;					/* numeric mode */
+
+
+	     if substr (new_mode, k, length (s)) = s then do; /* If key found ... */
+		i = convert (i, substr (new_mode, k + 2, j - 3)); /* Return converted number. */
+		return ("1"b);
+	     end;
+
+	     return ("0"b);
+
+
+	end test;
+
+/*  */
+order:	entry (dev_index, request, order_ptr, code);
+
+	data_ptr = g115_util_$get_ptr ();		/* get ptr to dcms' global data base */
+
+	code = 0;					/* initialize return argument */
+	pcip = addr (g115_data.conv_info);
+
+	if request = "set_periph" then do;		/* request to set target periph type */
+	     g115_data.teleprinter = "0"b;		/* init to default to printer */
+	     g115_data.punch = "0"b;
+	     if order_ptr = null then return;		/* cant continue */
+	     if periph_type = 3 then
+		g115_data.teleprinter = "1"b;
+	     if periph_type = 4 then
+		g115_data.punch = "1"b;
+	end;
+	else if request = "read_status" then do;	/* request to get read status */
+	     info_structure.ev_chan = g115_data.hcs_ev_chan; /* return ev chn on which read will return */
+	     info_structure.input_available = "0"b;	/* none yet */
+	     msg_ptr = addr (g115_data.input_buffer);	/* set ptr */
+	     if msg_ptr -> g115_hdr.full_cc ^= 0 then do; /* input is ready */
+		info_structure.input_available = "1"b;	/* go to it daemons */
+		return;
+	     end;
+	     call g115_message_$read (msg_ptr, msg_len, code); /* read any ring-0 data */
+	     if msg_len = 0 then return;
+	     if msg_ptr -> g115_hdr.full_cc ^= 0 then	/* go some real data */
+		info_structure.input_available = "1"b;
+	     return;
+	end;
+
+	else if request = "inside_page" then		/* Space to top of inside page. */
+	     call write_nl (2);
+
+	else if request = "outside_page" then		/* Space to top of outside page */
+	     call write_nl (4);
+
+	else if request = "end_of_page" then		/* Position at end of page, below bottom label */
+	     call write_nl (3);
+
+	else if request = "page_labels" then do;	/* set page top and bottom labels */
+	     if order_ptr = null () then do;		/* If null, reset labels. */
+		pci.top_label_length,
+		     pci.bot_label_length = 0;
+	     end;
+
+	     else if pci.overflow_off then		/* Cannot have labels with overflow off. */
+		code = error_table_$inconsistent;
+
+	     else do;				/* Set the labels. */
+		pci.top_label_line = page_labels.top_label;
+		call set_label (pci.top_label_line, pci.top_label_length);
+
+		pci.bot_label_line = page_labels.bottom_label;
+		call set_label (pci.bot_label_line, pci.bot_label_length);
+	     end;
+	end;
+
+	else if request = "reset" then do;		/* Reset modes and counts. */
+	     pci.lmarg = 0;
+	     pci.rmarg = pci.phys_line_length;
+	     pci.page_length = pci.phys_page_length - pci.lpi;
+	     pci.sheets_per_page = 1;
+	     pci.line_count = 0;
+	     pci.page_count = 0;
+	     pci.func = 0;
+	     pci.modes = "0"b;
+	     pci.top_label_line = "";
+	     pci.bot_label_line = "";
+	     pci.top_label_length = 0;
+	     pci.bot_label_length = 0;
+	end;
+
+	else if request = "get_count" then do;		/* Get lengths and counts. */
+	     counts.line = pci.line;
+	     counts.page_length = pci.page_length;
+	     counts.lmarg = pci.lmarg;
+	     counts.rmarg = pci.rmarg;
+	     counts.line_count = pci.line_count;
+	     counts.page_count = pci.page_count * pci.sheets_per_page;
+	end;
+
+	else if request = "start" then
+	     call hcs_$tty_order (dev_index, "start", null, state, code); /* pass it on */
+
+	else if request = "quit_enable" then do;
+	     call hcs_$tty_order (dev_index, "quit_enable", null, state, code);
+	end;
+
+	else if request = "quit_disable" then do;
+	     call hcs_$tty_order (dev_index, "quit_disable", null, state, code);
+	end;
+
+	else code = error_table_$undefined_order_request; /* unrecognized order call */
+
+	return;
+
+
+write_nl:	proc (f);
+
+dcl  f fixed bin;					/* function code */
+
+	     pci.func = f;				/* Set correct function code. */
+	     call g115_io_$write (g115_data.twx, addr (NL), 0, length (NL), nelemt, code);
+	     pci.func = 0;				/* Make sure function code reset. */
+	     if code ^= 0 then return;
+
+	     return;
+
+
+	end write_nl;
+
+
+
+
+set_label: proc (line, lth);
+
+dcl  line char (136) aligned,				/* label line */
+     lth fixed bin;					/* label length */
+
+
+	     if line = "" then lth = 0;		/* If line is all blank, length is zero. */
+
+	     else if search (line, VT_or_FF) ^= 0 then do; /* Do not allow VT or FF. */
+		lth = 0;				/* Set length to zero. */
+		code = error_table_$bad_arg;
+	     end;
+
+	     else do;
+		lth = 136 + 1 - verify (reverse (line), " ");
+	     end;
+
+	     return;
+
+
+	end set_label;
+
+/*  */
+
+attach:	entry (dev_name, dev_index, code);		/* entry to get device started */
+
+	call hcs_$tty_index (dev_name, dev_index, state, code);
+	if code ^= 0 then return;
+
+	call init (dev_name, dev_index, code);		/* allocate and initialize g115_data structure */
+	if code ^= 0 then return;
+
+	data_ptr = g115_util_$get_data_ptr (dev_index);
+
+	if data_ptr = null then do;
+	     code = error_table_$ionmat;
+	     return;
+	end;
+	call g115_util_$set_ptr (data_ptr);
+
+	call hcs_$tty_event (dev_index, g115_data.hcs_ev_chan, state, code); /* pass the call event to ring 0 */
+	if code ^= 0 then return;
+
+	call hcs_$tty_order (dev_index, "info", addr (chan_info), state, code);
+	if chan_info.line_type ^= 6 & chan_info.line_type ^= 7 then do; /* not set right */
+	     new_line_type = 6;			/* set to hardwired type */
+	     call hcs_$tty_order (dev_index, "set_line_type", addr (new_line_type), state, code);
+	     if code ^= 0 then return;
+	end;
+
+	call hcs_$tty_order (dev_index, "listen", null, state, code);
+	do while (state ^= 5);
+	     call g115_util_$block (code);
+	     call hcs_$tty_state (dev_index, state, code);
+	end;
+
+	modes.len = length (modes.str);
+	modes.str = "rawo,rawi,hndlquit";
+	call hcs_$tty_order (dev_index, "modes", addr (modes), state, code);
+
+	call hcs_$tty_order (dev_index, "quit_enable", null, state, code);
+
+	return;
+
+
+
+detach:	entry (dev_index, code);
+
+	code = 0;
+
+	data_ptr = g115_util_$unlink_data_ptr (dev_index);
+	if data_ptr = null then return;		/* nothing to free */
+	free g115_data in (sys_area);
+
+	call hcs_$tty_detach (dev_index, 1, state, code);
+	return;
+
+
+
+     end;

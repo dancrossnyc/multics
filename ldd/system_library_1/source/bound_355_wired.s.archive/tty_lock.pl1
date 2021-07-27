@@ -1,0 +1,649 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,^ifthendo */
+tty_lock:
+     proc;
+
+/* This procedure locks and unlocks channel locks.  Locking
+   performed at interrupt time differs from ordinary locking
+   in two ways:
+
+   1.  At interrupt time, one cannot wait for a channel that
+   is locked to be unlocked.  Therefore, failure to lock immediately
+   at interrupt time results in the interrupt operation being
+   queued (i.e., postponed) for later execution.  Queued
+   interrupts for a channel are processed the next time the
+   channel is unlocked.
+
+   2.  Ordinarily, it is considered an error when a process
+   attempts to lock a channel that it has already locked.
+   However, if the channel was previously locked for an
+   interrupt operation, then subsequent attempts by the same
+   process to lock and unlock for non-interrupt operations are
+   simply ignored.  This permits an interrupt handler executing
+   on behalf of some subchannel to perform an operation on its
+   major channel even though the major channel was previously
+   locked for the same interrupt.
+*/
+
+/* Recoded by J. Stern 8/8/78 */
+/* lock_lcte entry added 12/12/79 by Robert Coren */
+/* Modified 6 Apr 82, W. Olin Sibert: check_for_interrupt, dequeue_interrupt entries added for mcs_timer */
+/* Modified 83-12-19 BIM to add pm_code to lock_lcte, which can set it! */
+/* Modified September 1984 by Robert Coren to make dequeue_*_interrupt entries
+   avoid calling tty_space_man$free_space while holding the queue lock  */
+/* Modified March 1985 by EJ Sharpe to return bit from $verify */
+
+/* Parameters */
+
+dcl  pm_lctep ptr;
+dcl  pm_devx fixed bin;
+dcl  pm_subchan_devx fixed bin;
+dcl  pm_int_type fixed bin;
+dcl  pm_int_data bit (72) aligned;
+dcl  pm_locked bit (1) aligned;
+dcl  pm_code fixed bin (35);
+
+
+/* Automatic */
+
+dcl  devx fixed bin;
+dcl  subchan_devx fixed bin;
+dcl  tried bit (1) aligned;
+dcl  locked bit (1) aligned;
+dcl  i fixed bin;
+dcl  wire_arg fixed bin (71);
+dcl  wire_ptr ptr;
+dcl  qep ptr;
+dcl  qtp ptr;
+dcl  (prev_qep, next_qep) ptr;
+dcl  (first_free_qep, last_free_qep) ptr;
+dcl  dequeue_all bit (1) aligned;
+dcl  int_type fixed bin;
+dcl  int_data bit (72) aligned;
+dcl  start_wait_time fixed bin (71);
+dcl  wait_time fixed bin (35);
+dcl  unlocked_something bit (1) aligned;
+
+/* Based */
+
+dcl  1 queue_entry aligned based (qep),
+       2 next_entry bit (18) unal,
+       2 subchan_devx fixed bin (18) unsigned unal,
+       2 int_type fixed bin,
+       2 int_data bit (72);
+
+
+/* External static */
+
+dcl  pds$process_id bit (36) ext;
+dcl  pds$process_group_id char (32) aligned ext;
+dcl  error_table_$io_no_permission fixed bin (35) ext;
+
+
+/* Builtins */
+
+dcl  (addr, clock, max, null, stac, stacq, size, rel, pointer, ptr) builtin;
+
+
+/* Entries */
+
+dcl  pxss$addevent entry (fixed bin);
+dcl  pxss$delevent entry (fixed bin);
+dcl  pxss$notify entry (fixed bin);
+dcl  pxss$wait entry;
+dcl  syserr entry options (variable);
+dcl  pmut$wire_and_mask entry (fixed bin (71), ptr);
+dcl  pmut$unwire_unmask entry (fixed bin (71), ptr);
+dcl  mcs_timer$verify_lock entry ();
+%page;
+lock_lcte:
+     entry (pm_lctep, pm_code);			/* locks a channel before a non-interrupt operation given an LCTE pointer */
+
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	lctep = pm_lctep;
+	go to lock_it;
+
+
+lock_channel:
+     entry (pm_devx, pm_code);			/* locks a channel before a non-interrupt operation */
+
+	pm_code = 0;
+	call setup ();
+	if ^lcte.entry_in_use | lcte.special_lock
+	then go to no_permission;
+lock_it:
+	tty_buf.tty_lock_calls = tty_buf.tty_lock_calls + 1;
+	if lcte.lock = pds$process_id			/* we've already locked this channel */
+	then if lcte.locked_for_interrupt		/* ok, don't lock it again */
+	     then return;
+	     else call syserr (SYSERR_CRASH_SYSTEM, "tty_lock: attempt to lock channel already locked by same process.")
+		     ;
+
+	locked = "0"b;
+	tried = "0"b;
+	do while (^locked);
+	     if stac (addr (lcte.lock), pds$process_id)
+	     then locked = "1"b;			/* we locked it */
+	     else do;				/* must wait for lock to be unlocked */
+		if ^tried
+		then do;
+		     tty_buf.found_channel_locked = tty_buf.found_channel_locked + 1;
+		     start_wait_time = clock ();
+		     tried = "1"b;
+		end;
+
+		call pxss$addevent (tty_ev);		/* get ready to wait for this event */
+		lcte.notify_reqd = "1"b;		/* ask to be notified when lock is unlocked */
+		if stac (addr (lcte.lock), pds$process_id)
+						/* try once more to lock) it */
+		then do;				/* got it, no need to wait */
+		     call pxss$delevent (tty_ev);
+		     locked = "1"b;
+		end;
+		else call pxss$wait ();
+	     end;
+	end;
+
+	if tried
+	then do;					/* if we had to wait, meter */
+	     wait_time = clock () - start_wait_time;
+	     tty_buf.total_wait_time = tty_buf.total_wait_time + wait_time;
+	     tty_buf.max_wait_time = max (tty_buf.max_wait_time, wait_time);
+	end;
+
+	if lcte.initialized
+	then return;
+
+	call unlock ();				/* don't keep uninitialized channel locked */
+
+no_permission:
+	pm_code = error_table_$io_no_permission;
+
+	return;
+%page;
+lock_channel_int:
+     entry (pm_devx, pm_int_type, pm_int_data, pm_locked);	/* locks a channel before an interrupt operation */
+
+
+	int_type = pm_int_type;
+	int_data = pm_int_data;
+	subchan_devx = 0;
+	pm_locked = "0"b;
+	call setup ();
+	tty_buf.tty_lock_calls = tty_buf.tty_lock_calls + 1;
+	if ^lcte.entry_in_use
+	then call syserr (SYSERR_CRASH_SYSTEM, "tty_lock: attempt to lock unused channel for interrupt.");
+
+	call lock_queue;
+	if ^stac (addr (lcte.lock), pds$process_id)
+	then do;					/* cannot set lock, must queue the interrupt */
+	     call enqueue;
+	     call unlock_queue;
+	     return;
+	end;
+	call unlock_queue;
+
+	if ^lcte.initialized
+	then do;					/* ignore interrupts for uninitialized channels */
+	     call unlock ();
+	     return;
+	end;
+
+	lcte.locked_for_interrupt = "1"b;
+	pm_locked = "1"b;
+	return;
+%page;
+queue_interrupt:
+     entry (pm_devx, pm_int_type, pm_int_data, pm_subchan_devx);
+
+/* This entry adds an entry to the queue for a major channel on behalf of one of
+   its subchannels. it is used by channel_manager$interrupt_later
+*/
+
+	int_type = pm_int_type;
+	int_data = pm_int_data;
+	subchan_devx = pm_subchan_devx;
+	call setup ();
+
+	call lock_queue;
+	call enqueue;
+	call unlock_queue;
+	return;
+%page;
+unlock_channel:
+     entry (pm_devx);				/* unlocks a channel after a non-interrupt operation */
+
+	call setup ();
+
+	if lcte.lock = pds$process_id			/* we have channel locked as expected */
+	then if lcte.locked_for_interrupt		/* but we don't really want to unlock it now */
+	     then return;
+
+	call unlock ();
+
+	return;
+
+
+
+unlock_channel_int:
+     entry (pm_devx);				/* unlocks a channel after an interrupt operation */
+
+	call setup ();
+
+	lcte.locked_for_interrupt = "0"b;
+	call unlock ();
+	return;
+%page;
+flush_queue:
+     entry (pm_devx);				/* deletes all queue entries for a given channel */
+
+	call setup ();
+
+	do while (dequeue ());
+	end;
+	return;
+
+
+
+cleanup_locks:
+     entry;					/* called only by terminate_proc */
+
+	call CLEANUP_LOCKS;
+	return;
+
+
+verify:
+     entry () returns (bit (1) aligned);
+
+	call CLEANUP_LOCKS;
+	return (unlocked_something);
+
+
+CLEANUP_LOCKS:			/* internal procedure for $cleanup_locks and $verify entrypoints */
+     procedure ();
+
+	unlocked_something = "0"b;
+	ttybp = addr (tty_buf$);
+	if tty_buf.slock = pds$process_id
+	then call syserr (SYSERR_CRASH_SYSTEM, "tty_lock$verify: attempted crawlout with tty_buf lock set.");
+
+	lctp = tty_buf.lct_ptr;
+	if lctp = null ()
+	then return;				/* MCS not started yet, never mind */
+	if lct.queue_lock = pds$process_id
+	then call syserr (SYSERR_CRASH_SYSTEM, "tty_lock$verify: attempted crawlout with queue lock set.");
+
+	call mcs_timer$verify_lock ();		/* will crash system if timer lock locked */
+
+	do i = 1 to lct.max_no_lctes;
+	     lctep = addr (lcte_array (i));
+	     if lcte.entry_in_use
+	     then if lcte.lock = pds$process_id
+		then if lcte.special_lock
+		     then call syserr (SYSERR_CRASH_SYSTEM,
+			     "tty_lock$verify: attempted crawlout with special channel lock set.");
+		     else do;
+			devx = i;
+			call force_unlock;		/* clear the lock so next caller won't hang */
+			unlocked_something = "1"b;
+		     end;
+	end;
+
+	return;
+
+     end CLEANUP_LOCKS;
+%page;
+check_for_interrupt:
+     entry (pm_devx, pm_int_type, pm_int_data) returns (bit (1) aligned);
+
+	int_type = pm_int_type;
+	int_data = pm_int_data;
+	call setup ();
+
+	call lock_queue ();
+
+	do qep = pointer (ttybp, lcte.queue_head) repeat (pointer (ttybp, queue_entry.next_entry))
+	     while (rel (qep) ^= ""b);
+
+	     if (queue_entry.int_type = int_type) & (queue_entry.int_data = int_data)
+	     then do;
+		call unlock_queue ();
+		return ("1"b);			/* You're our boy */
+	     end;
+	end;
+
+	call unlock_queue ();
+
+	return ("0"b);				/* None found */
+%page;
+dequeue_one_interrupt:
+     entry (pm_devx, pm_int_type, pm_int_data);
+
+	dequeue_all = "0"b;
+	int_data = pm_int_data;
+	goto dequeue_common;
+
+
+dequeue_all_interrupts:
+     entry (pm_devx, pm_int_type);
+
+	dequeue_all = "1"b;
+
+
+dequeue_common:
+	int_type = pm_int_type;
+	call setup ();
+
+	call lock_queue ();
+
+/* it's not safe to call tty_space_man with the queue lock locked, because it can
+   generate "space_available" interrupts; so we'll keep a list of entries to free
+   and free them all after we've unthreaded them and released the lock.
+*/
+
+	prev_qep, first_free_qep = pointer (ttybp, 0);
+	do qep = pointer (ttybp, lcte.queue_head) repeat (next_qep) while (rel (qep) ^= ""b);
+	     next_qep = pointer (ttybp, queue_entry.next_entry);
+
+	     if (queue_entry.int_type = int_type) & (dequeue_all | (queue_entry.int_data = int_data))
+	     then do;
+		if (lcte.queue_head = rel (qep))
+		then lcte.queue_head = queue_entry.next_entry;
+
+		if (lcte.queue_tail = rel (qep))
+		then lcte.queue_tail = rel (prev_qep);
+
+		if (rel (prev_qep) ^= ""b)
+		then prev_qep -> queue_entry.next_entry = queue_entry.next_entry;
+
+/* put this one on the "to be freed" list */
+
+		queue_entry.next_entry = ""b;
+		if rel (first_free_qep) = ""b
+		then first_free_qep, last_free_qep = qep;
+		else do;
+		     last_free_qep -> queue_entry.next_entry = rel (qep);
+		     last_free_qep = qep;
+		end;
+	     end;
+	     else prev_qep = qep;
+	end;					/* Of loop through queue entries */
+
+	call unlock_queue ();
+
+/* now go through the free list (if any) and free the entries on it */
+
+	do qep = first_free_qep repeat (next_qep) while (rel (qep) ^= ""b);
+	     next_qep = pointer (ttybp, queue_entry.next_entry);
+	     call tty_space_man$free_space (size (queue_entry), qep);
+	end;
+
+	return;
+%page;
+setup:
+     proc;
+
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	devx = pm_devx;
+	lctep = addr (lct.lcte_array (devx));
+	return;
+     end setup;
+
+
+
+unlock:
+     proc;
+
+/* process all entries in the channel queue before unlocking */
+/* last call to dequeue will unlock the channel lock */
+
+	do while (dequeue ());
+	     lcte.locked_for_interrupt = "1"b;		/* make queued interrupt look real */
+	     if subchan_devx ^= 0			/* this is really for a subchannel */
+	     then call channel_manager$interrupt (subchan_devx, int_type, int_data);
+	     else call channel_manager$queued_interrupt (devx, int_type, int_data);
+	     lcte.locked_for_interrupt = "0"b;
+	end;
+
+	if lcte.notify_reqd				/* someone is waiting for this lock */
+	then do;					/* let everyone know it's available */
+	     lcte.notify_reqd = "0"b;
+	     call pxss$notify (tty_ev);
+	end;
+
+     end;						/* unlock */
+
+
+
+force_unlock:
+     procedure;
+
+/* lock is to be forced because process is crawling out. Send notify if necessary,
+   but flush queued interrupts rather than attempting to process them.
+*/
+
+	call syserr (SYSERR_LOG_OR_PRINT, "tty_lock: forcing unlock of channel ^a from ^a",
+	     lct.lcnt_ptr -> lcnt.names (devx), pds$process_group_id);
+
+	lcte.locked_for_interrupt = "0"b;
+	do while (dequeue ());			/* this flushes the queue and unlocks the channel when it's done */
+	end;
+
+	if lcte.notify_reqd
+	then do;
+	     lcte.notify_reqd = "0"b;
+	     call pxss$notify (tty_ev);
+	end;
+
+	return;
+     end force_unlock;
+%page;
+lock_queue:
+     proc;
+
+	call pmut$wire_and_mask (wire_arg, wire_ptr);
+
+	do while (^stac (addr (lct.queue_lock), pds$process_id));
+	end;
+
+     end;						/* lock_queue */
+
+
+
+unlock_queue:
+     proc;
+
+	if ^stacq (lct.queue_lock, "0"b, pds$process_id)
+	then call syserr (SYSERR_CRASH_SYSTEM, "tty_lock: attempt to unlock queue not locked by same process.");
+
+	call pmut$unwire_unmask (wire_arg, wire_ptr);
+
+     end;						/* unlock_queue */
+%page;
+enqueue:
+     proc;					/* adds queue entry to head of channel queue */
+
+
+	if ^lcte.initialized			/* don't queue anything for an uninitialized channel */
+	then return;
+
+	call tty_space_man$get_space (size (queue_entry), qep);
+	if qep = null
+	then do;
+	     call syserr (SYSERR_PRINT_WITH_ALARM, "tty_lock: Cannot get space for queue entry. (devx = ^d)", devx);
+	     return;
+	end;
+
+	queue_entry.int_type = int_type;
+	queue_entry.int_data = int_data;
+	queue_entry.subchan_devx = subchan_devx;
+	if lcte.queue_tail = "0"b			/* queue is empty */
+	then lcte.queue_tail, lcte.queue_head = rel (qep);/* new entry is both first and last */
+	else do;
+	     qtp = ptr (ttybp, lcte.queue_tail);	/* get ptr to last entry */
+	     qtp -> queue_entry.next_entry = rel (qep);	/* put new entry after it */
+	     lcte.queue_tail = rel (qep);		/* new entry is now the last */
+	end;
+	queue_entry.next_entry = "0"b;		/* nothing follows last entry */
+	tty_buf.n_queued_interrupts = tty_buf.n_queued_interrupts + 1;
+
+     end;
+
+
+
+dequeue:
+     proc returns (bit (1));				/* removes entry from head of channel queue */
+
+	call lock_queue ();
+	if lcte.queue_head = "0"b			/* queue is empty */
+	then do;
+	     qep = null;
+	     if ^stacq (lcte.lock, "0"b, pds$process_id)
+	     then call syserr (SYSERR_CRASH_SYSTEM, "tty_lock: attempt to unlock channel not locked by same process.");
+	end;
+
+	else do;
+	     qep = ptr (ttybp, lcte.queue_head);	/* get ptr to first queue entry */
+	     lcte.queue_head = queue_entry.next_entry;	/* next entry is now first */
+	     if lcte.queue_head = "0"b		/* there was no next entry */
+	     then lcte.queue_tail = "0"b;
+	end;
+	call unlock_queue ();
+
+	if qep = null
+	then return ("0"b);				/* indicate empty queue */
+	else do;
+	     int_type = queue_entry.int_type;
+	     int_data = queue_entry.int_data;
+	     subchan_devx = queue_entry.subchan_devx;
+	     call tty_space_man$free_space (size (queue_entry), qep);
+	     return ("1"b);
+	end;
+
+     end;
+%page;
+%include lct;
+%include tty_buf;
+%include tty_space_man_dcls;
+%include channel_manager_dcls;
+%include syserr_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   tty_lock: attempt to lock channel already locked by same process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A locking error was detected when a process tried to lock a
+   channel that it had already locked.
+
+   A:	$inform
+
+
+   Message:
+   tty_lock: attempt to lock unused channel for interrupt.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A locking error was detected when an interrupt handler
+   tried to lock an ununsed channel.
+
+   A:	$inform
+
+
+   Message:
+   tty_lock: attempt to unlock channel not locked by same process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A locking error was detected when a process tried to unlock
+   a channel that was either not locked or locked by another process.
+
+   A:	$inform
+
+
+   Message:
+   tty_lock$verify: attempted crawlout with tty_buf lock set.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	There was an attempt to crawl out while the tty_buf lock used
+   by tty_space_man was locked.
+
+   A:	$inform
+
+
+   Message:
+   tty_lock$verify: attempted crawlout with special channel lock set.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	There was an attempt to crawl out while a channel lock that
+   is also a processor lock was locked.
+
+   A:	$inform
+
+   Message:
+   tty_lock$verify: attempted crawlout with queue lock set.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	There was an attempt to crawl out while the tty queue
+   lock was locked.
+
+   A:	$inform
+
+   Message:
+   tty_lock: Cannot get space for queue entry. (devx = N)
+
+   S:	$beep
+
+   T:	$run
+
+   M:	An attempt to queue an interrupt for the channel with devx N
+   failed due to lack of space.  The interrupt was lost which may cause
+   loss of data or improper channel operation.
+
+   A:	$inform
+
+
+   Message:
+   tty_lock: attempt to unlock queue not locked by same process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A locking error was detected when a process tried to unlock
+   the global queue lock which was either not locked or was locked by another
+   process.
+
+   END MESSAGE DOCUMENTATION */
+
+     end tty_lock;

@@ -1,0 +1,2698 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/* Inter-Multics File Transfer Daemon */
+
+/* Created:  October 1980 by G. Palter using hasp_ws_sim_driver_ as a base */
+/* Modified: 24 September 1981 by G. Palter to perform synchronization and automatically start processing requests */
+/* Modified: April 1982 by G. Palter to complete initial implementation */
+/* Modified: July 1982 by G. Palter to accept "indirect=<pathname>" keyword and implement true AIM support */
+/* Modified: February 1983 by Robert Coren to accept "-io_description" as alternative to "-input_description" and
+   "-output_description", and to process "version" keyword */
+/* Modified: March 1983 by Robert Coren to set up for 2 minor devices for output driver (for remote requests)
+   and to make "yes_no_p" tell whether it was yes or no */
+/* Modified: 28 April 1983 by G. Palter to make the indirect keyword accept archive component pathnames */
+/* Modified: August 1983 by Robert Coren to handle minimum access class */
+/* Modified: 1984-09-17 by E. Swenson to remove call to pnt_manager_$test. */
+/* Modified: February 23, 1985 by C. Marker to use version 5 message segments */
+
+/****^  HISTORY COMMENTS:
+  1) change(87-11-15,Oke), approve(88-08-01,MCR7948), audit(88-10-11,Farley),
+     install(88-10-14,MR12.2-1165):
+     a. Permit use as an in-dial/out-dial daemon using a data protocol to
+        establish the connection.
+     b. Numerous minor bug fixes and cleanups, such as releasing attribute
+        storage which was allocated.
+     c. Add line_speed command for a driver.  Permit receiver to be out-dial
+        and transmitter as in-dial.  Reduce instances of having to reinitialize
+        due to line detachment by resectioning code and permitting line
+        reattachment and synchronization.
+  2) change(88-06-20,Beattie), approve(88-08-01,MCR7948),
+     audit(88-10-11,Farley), install(88-10-14,MR12.2-1165):
+     a. Internal date time routine replaced with date_time_$format calls.
+     b. Add support for min_time_est_msg keyword.
+     c. Prevent driver from initializing if execution ring less than 4.
+  3) change(88-08-20,Brunelle), approve(88-08-19,MCR7911),
+     audit(88-10-26,Wallman), install(88-10-28,MR12.2-1199):
+     Upgrade to version 5 iod tables.
+                                                   END HISTORY COMMENTS */
+
+/* format: style4,delnl,insnl,ifthenstmt,ifthen */
+
+imft_driver_:
+     procedure ();
+
+	return;					/* not an entry */
+%page;
+/* Initialize the driver */
+
+init:
+     entry (P_stat_p);
+
+/****
+      Extended object access checks get more complicated when the driver is
+      executing in a ring lower than 4.  This restriction is not seen as a
+      problem since it is expected that sites are running their daemons in a
+      ring 4 process.  This prevents mailboxes, PNTs, DM files, etc, from being
+      handled by an IMFT connection.
+*/
+
+	my_ring = get_ring_ ();
+	if my_ring < 4 then do;
+	     call iodd_msg_ (ERROR, MASTER, error_table_$fatal_error, IMFT_DRIVER_,
+		"The IMFT driver must be executing in a ring not less than 4.");
+	     return;
+	end;
+
+	system_area_ptr = get_system_free_area_ ();
+
+	stat_p = P_stat_p;
+	static_pause_time = 10;			/* need to set the default somewhere */
+
+	text_strings_ptr = iodd_static.text_strings_ptr;	/* get ptr to i/o daemon table text area */
+
+	if iodd_static.attach_type ^= ATTACH_TYPE_TTY then do;
+						/* this driver expects a tty channel */
+
+BAD_LINE_STATEMENT:
+	     call iodd_msg_ (ERROR, MASTER, error_table_$fatal_error, IMFT_DRIVER_,
+		"The IMFT driver must be defined with a ""line: *;"" statement.");
+	     return;				/* quit now */
+	end;
+
+	if iodd_static.attach_name ^= "*" then go to BAD_LINE_STATEMENT;
+
+	if iodd_static.slave.active then do;		/* no slave device allowed */
+	     call iodd_msg_ (ERROR, MASTER, error_table_$fatal_error, IMFT_DRIVER_,
+		"The IMFT driver does not accept slave terminals.");
+	     return;
+	end;
+
+	iodd_static.dev_io_stream, iodd_static.dev_in_stream = "Undefined_stream!";
+						/* not used by this driver */
+
+	ds_ptr = iodd_static.driver_ptr;		/* preset by iodd_ */
+	ds_ptr -> driver_status.dev_out_iocbp, ds_ptr -> driver_status.dev_in_iocbp = null ();
+	ds_ptr -> driver_status.dev_out_stream, ds_ptr -> driver_status.dev_in_stream = "null_stream";
+	ds_ptr -> driver_status.dev_ctl_ptr = null ();
+
+	ds_ptr -> driver_status.bit_rate_est,		/* no output rate defined yet */
+	     ds_ptr -> driver_status.defer_time_limit = 0;/* make operator specify */
+
+	saved_test_entry = iodd_static.test_entry;	/* will restore before returning to iodd_ */
+	major_args_ptr = null ();			/* for cleanup handler */
+	send_logout_record = "1"b;			/* tell the other side about ordinary logouts */
+	dma.dial_channel = 0;
+
+/* Establish initial condition of aim_attributes_ptr to ensure allocated
+   storage is freed. */
+
+	static.local_system.aim_attributes_ptr = null ();
+	static.foreign_system.aim_attributes_ptr = null ();
+	static.dial_service = ""b;			/* not a dial protocol */
+
+	on condition (daemon_logout), condition (daemon_new_device), condition (no_coord)
+	     begin;
+	     if send_logout_record then do;		/* don't tell other side if they told us */
+		local_icri.record_type = IMFT_LOGOUT;
+		local_icri.version = ICRI_VERSION_1;
+		local_icri.timeout = 15;		/* ... doesn't really have to get through */
+		local_icri.record_ptr = null ();	/* ... no associated data */
+		local_icri.record_lth, local_icri.record_max_lth = 0;
+		if static.input_driver then		/* ... be sure to issue proper type of control order */
+		     if ds_ptr -> driver_status.dev_in_iocbp ^= null () then
+			call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "write_reply_record",
+			     addr (local_icri), ignore_code);
+		     else ;			/* ... no connection to the remote system yet */
+		else if ds_ptr -> driver_status.dev_out_iocbp ^= null () then do;
+		     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "write_command_record",
+			addr (local_icri), ignore_code);
+		     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "runout", null (), ignore_code);
+		end;				/* ... make sure the record gets through before the hangup */
+	     end;
+	     iodd_static.test_entry = saved_test_entry;
+	     if (major_args_ptr ^= null ())
+		& (major_args_ptr
+		^= add_char_offset_ (addr (text_strings.chars), iodd_static.major_args.first_char - 1)) then
+		call terminate_file_ (major_args_ptr, 0, TERM_FILE_TERM, ignore_code);
+	     call drop_device ();
+	end;
+
+	on condition (daemon_slave_logout) go to LOGOUT_SLAVE;
+
+	on condition (cleanup)
+	     begin;
+	     iodd_static.test_entry = saved_test_entry;
+	     if (major_args_ptr ^= null ())
+		& (major_args_ptr
+		^= add_char_offset_ (addr (text_strings.chars), iodd_static.major_args.first_char - 1)) then
+		call terminate_file_ (major_args_ptr, 0, TERM_FILE_TERM, ignore_code);
+	     call detach_device ();
+	     call free_aim_attributes_storage;
+	     iodd_static.attach_name = "*";
+	end;
+
+	on condition (imft_remote_logout_)
+	     begin;
+	     send_logout_record = "0"b;		/* they told us so we shouldn't tell them ... */
+	     call iodd_msg_ (NORMAL, MASTER, 0, IMFT_DRIVER_,
+		"^a's ^[output^;input^] driver disconnected; local driver will ^[wait for reconnection^;logout^].",
+		static.foreign_system.name, static.input_driver, static.automatic_operation);
+	     if static.automatic_operation then do;
+		if static.dial_service then do;
+		     call drop_device;
+		     call attach_and_init_line;	/* restablish link */
+		end;
+		go to RESYNCHRONIZE_DRIVER;
+	     end;
+	     else signal condition (daemon_logout);	/* ... will never return (we hope) */
+	end;
+
+	on condition (imft_resynchronize_driver_)
+	     begin;
+	     call iodd_msg_ (LOG, MASTER, 0, "", "^a requested resynchronization.", static.foreign_system.name);
+	     if static.input_driver then do;		/* must get the SYNC1 command retransmitted */
+		local_icri.version = ICRI_VERSION_1;
+		local_icri.timeout = 15;		/* don't have to wait for this to finish */
+		local_icri.record_type = IMFT_RESYNCHRONIZE;
+		local_icri.record_ptr = null ();
+		local_icri.record_lth, local_icri.record_max_lth = 0;
+		if ds_ptr -> driver_status.dev_in_iocbp ^= null () then
+		     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "write_reply_record", addr (local_icri),
+			code);
+	     end;
+	     go to RESYNCHRONIZE_DRIVER;
+	end;
+
+	on condition (imft_debug_)
+	     begin;				/* lets a programmer see what's wrong */
+	     call iodd_msg_ (NORMAL, MASTER, 0, IMFT_DRIVER_,
+		"Driver detected a condition which requires programmer intervention.");
+	     call iodd_quit_handler_$command_level ();
+	end;
+
+	on condition (re_init)
+	     begin;				/* driver is reinitializing */
+	     if static.input_driver then do;		/* make the output driver aware that we're restarting */
+		local_icri.version = ICRI_VERSION_1;
+		local_icri.timeout = 15;		/* don't have to wait for this to finish */
+		local_icri.record_type = IMFT_RESYNCHRONIZE;
+		local_icri.record_ptr = null ();
+		local_icri.record_lth, local_icri.record_max_lth = 0;
+		if ds_ptr -> driver_status.dev_in_iocbp ^= null () then
+		     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "write_reply_record", addr (local_icri),
+			code);
+	     end;
+	     call continue_to_signal_ (ignore_code);	/* let iodd_ start us over */
+	end;
+
+
+/* Parse the args statement which defines what this driver will be doing and how to get to the remote system */
+
+	major_args_ptr = add_char_offset_ (addr (text_strings.chars), iodd_static.major_args.first_char - 1);
+						/* use args statement value by default */
+	major_args_lth = iodd_static.major_args.total_chars;
+
+	if major_args_lth = 0 then do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "The IMFT driver requires an ""args:"" statement.");
+	     go to RETURN_FROM_INIT;
+	end;
+
+	major_args_path = iodd_parse_$args ("indirect=", major_args);
+						/* check for the arguments being in a file */
+	if major_args_path ^= "" then do;
+	     call expand_pathname_$component (major_args_path, major_args_dirname, major_args_ename,
+		major_args_component, code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "^a", major_args_path);
+		go to RETURN_FROM_INIT;
+	     end;
+	     call initiate_file_$component (major_args_dirname, major_args_ename, major_args_component, R_ACCESS,
+		major_args_ptr, major_args_bc, code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "^a",
+		     pathname_$component (major_args_dirname, major_args_ename, major_args_component));
+		go to RETURN_FROM_INIT;
+	     end;
+	     major_args_lth = divide ((major_args_bc + 8), 9, 21, 0);
+	     major_args_lth = length (rtrim (major_args, WHITESPACE));
+	     if major_args_lth = 0 then do;
+		call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "Arguments file ^a is empty.",
+		     pathname_$component (major_args_dirname, major_args_ename, major_args_component));
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	keyword_value = iodd_parse_$args ("function=", major_args);
+	if (keyword_value = "") | (keyword_value = "file_transfer") then
+	     static.function = FILE_TRANSFER;
+	else do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "Unsupported function.  ""^a""", keyword_value);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	keyword_value = iodd_parse_$args ("direction=", major_args);
+	if keyword_value = "" then do;		/* this is required */
+	     call iodd_msg_ (ERROR, MASTER, error_table_$noarg, IMFT_DRIVER_, "Direction must be supplied.");
+	     go to RETURN_FROM_INIT;
+	end;
+	else if keyword_value = "input" then static.input_driver = "1"b;
+	else if keyword_value = "output" then static.input_driver = "0"b;
+	else do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "Unsupported direction.  ""^a""", keyword_value);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	static.validate_system_id = "1"b;
+	keyword_value = iodd_parse_$args ("validate_system_id=", major_args);
+	if keyword_value ^= "" then static.validate_system_id = yes_no_p ("validate_system_id", keyword_value);
+
+	static.local_system.name = iodd_parse_$args ("local_system=", major_args);
+
+	if static.validate_system_id = "0"b then
+	     static.local_system.password = "";
+	else do;
+	     if static.local_system.name ^= "" then do;
+		call imft_pnt_interface_$get_system_password (static.local_system.name, static.local_system.password,
+		     code);
+		if code ^= 0 then do;
+		     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "local_system= ^a", static.local_system.name);
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+	     else do;
+		call iodd_msg_ (ERROR, MASTER, error_table_$noarg, IMFT_DRIVER_,
+		     "Local system name must be supplied.");
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	static.foreign_system.name = iodd_parse_$args ("foreign_system=", major_args);
+
+	if static.validate_system_id = "0"b then
+	     static.foreign_system.password = "";
+	else do;
+	     if static.foreign_system.name ^= "" then do;
+		call imft_pnt_interface_$get_system_password (static.foreign_system.name,
+		     static.foreign_system.password, code);
+		if code ^= 0 then do;
+		     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "foreign_system= ^a",
+			static.foreign_system.name);
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+	     else do;
+		call iodd_msg_ (ERROR, MASTER, error_table_$noarg, IMFT_DRIVER_,
+		     "Foreign system name must be supplied.");
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	keyword_value = iodd_parse_$args ("version=", major_args);
+	if keyword_value = "" | keyword_value = CURRENT_IMFT_VERSION then do;
+	     static.old_version = "0"b;
+	     static.foreign_system.imft_version = CURRENT_IMFT_VERSION;
+	end;
+	else if keyword_value = "3.0" then do;
+	     static.old_version = "0"b;
+	     static.foreign_system.imft_version = "3.0";
+	end;
+	else if keyword_value = "2.0" then do;
+	     static.old_version = "1"b;
+	     static.foreign_system.imft_version = "2.0";
+	end;
+	else do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "Invalid version keyword: ""^a""", keyword_value);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if static.old_version then
+	     static.local_system.imft_version = "2.0";
+	else static.local_system.imft_version = CURRENT_IMFT_VERSION;
+
+	foreign_system_version = convert (foreign_system_version, static.foreign_system.imft_version);
+%page;
+/* Determine if this is an in_dial connection, and out_dial connection, or
+   a normal IO connection. */
+
+	static.in_dial_qualifier, static.out_dial_text = "";
+	static.idle_line_drop = "0"b;
+
+	static.in_dial_qualifier = iodd_parse_$args ("in_dial=", major_args);
+	if static.in_dial_qualifier ^= "" then do;
+	     static.single_switch = "1"b;		/* stop errors */
+	     static.dial_service = "1"b;
+	end;
+	else do;
+	     static.out_dial_text = iodd_parse_$args ("out_dial=", major_args);
+	     if static.out_dial_text ^= "" then do;
+
+/* We must dial-out to the distant system, then recognize a connection
+   protocol to the dial-in channel when we get there.
+
+   First form the dial-out io description as for a normal dial-out */
+
+		static.dial_service = "1"b;
+		static.input_attach_description = iodd_parse_$args ("io_description=", major_args);
+		if static.input_attach_description = "" then
+		     static.input_attach_description = iodd_parse_$args ("iods=", major_args);
+		static.single_switch = (static.input_attach_description ^= "");
+		static.trigger_text = iodd_parse_$args ("trigger_text=", major_args);
+		if static.trigger_text = "" then do;
+		     call iodd_msg_ (ERROR, MASTER, error_table_$noarg, IMFT_DRIVER_,
+			"The trigger_text string must be non-null.");
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+	end;
+
+/* Capture dial protocol control information. */
+
+	if static.dial_service then do;
+	     keyword_value = iodd_parse_$args ("debug_connect=", major_args);
+	     if keyword_value = "" then
+		static.debug_connect = "0"b;
+	     else static.debug_connect = yes_no_p ("debug_connect", keyword_value);
+
+	     keyword_value = iodd_parse_$args ("idle_line_drop=", major_args);
+	     if keyword_value ^= "" then do;
+		if static.input_driver then do;
+		     call iodd_msg_ (ERROR, MASTER, error_table_$inconsistent, IMFT_DRIVER_,
+			"idle_line_drop keyword is not valid for an input driver.");
+		     go to RETURN_FROM_INIT;
+		end;
+		static.idle_line_drop = yes_no_p ("idle_line_drop", keyword_value);
+
+		keyword_value = iodd_parse_$args ("idle_delay_count=", major_args);
+		if keyword_value = "" then
+		     static.idle_delay_count = 2;	/* wait 2 idles */
+		else do;
+		     static.idle_delay_count = cv_dec_check_ (keyword_value, code);
+		     if code ^= 0 | static.idle_delay_count < 0 | static.idle_delay_count > 1000 then do;
+			call iodd_msg_ (ERROR, MASTER, error_table_$bad_conversion, "",
+			     "Value of idle_delay_count must be a number between 0 and 1000; not ""^a""",
+			     keyword_value);
+			go to RETURN_FROM_INIT;
+		     end;
+		end;
+		static.idle_delay = 0;
+	     end;
+
+	     keyword_value = iodd_parse_$args ("sleep_time=", major_args);
+	     if keyword_value = "" then
+		static.sleep_time = 5;		/* minutes */
+	     else do;
+		static.sleep_time = cv_dec_check_ (keyword_value, code);
+
+		if code ^= 0 | static.sleep_time < 1 | static.sleep_time > 60 then do;
+		     call iodd_msg_ (ERROR, MASTER, error_table_$bad_conversion, "",
+			"Value of sleep_time must be between 1 and 60 minutes; not ""^a""", keyword_value);
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+	end;
+
+/* Normal connection by just doing the attachment to slave lines. */
+
+	else do;
+	     static.input_attach_description = iodd_parse_$args ("io_description=", major_args);
+	     if static.input_attach_description = "" then
+		static.input_attach_description = iodd_parse_$args ("iods=", major_args);
+	     static.single_switch = (static.input_attach_description ^= "");
+	end;
+
+	if ^static.single_switch then do;
+	     static.input_attach_description = iodd_parse_$args ("input_description=", major_args);
+	     if static.input_attach_description = "" then
+		static.input_attach_description = iodd_parse_$args ("ids=", major_args);
+	     if static.input_attach_description = "" then do;
+
+		call iodd_msg_ (ERROR, MASTER, error_table_$noarg, IMFT_DRIVER_, "Input attach description.");
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     static.output_attach_description = iodd_parse_$args ("output_description=", major_args);
+	     if static.output_attach_description = "" then
+		static.output_attach_description = iodd_parse_$args ("ods=", major_args);
+	     if static.output_attach_description = "" then do;
+		call iodd_msg_ (ERROR, MASTER, error_table_$noarg, IMFT_DRIVER_, "Output attach description.");
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	else do;
+	     if static.old_version then do;		/* can't use -io_description in pre10.2 connection" */
+		call iodd_msg_ (ERROR, MASTER, error_table_$inconsistent, IMFT_DRIVER_,
+		     "version=2.0 and io_description");
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     temp_attach_description = iodd_parse_$args ("input_description=", major_args);
+	     if temp_attach_description = "" then temp_attach_description = iodd_parse_$args ("ids=", major_args);
+	     if temp_attach_description ^= "" then do;
+		call iodd_msg_ (ERROR, MASTER, error_table_$inconsistent, IMFT_DRIVER_,
+		     "input_description and io_description");
+		go to RETURN_FROM_INIT;
+	     end;
+	     temp_attach_description = iodd_parse_$args ("output_description=", major_args);
+	     if temp_attach_description = "" then temp_attach_description = iodd_parse_$args ("ods=", major_args);
+	     if temp_attach_description ^= "" then do;
+		call iodd_msg_ (ERROR, MASTER, error_table_$inconsistent, IMFT_DRIVER_,
+		     "output_description and io_description");
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	local_explicit_ceiling_given = "0"b;		/* use ceiling the two systems agree upon */
+	max_access_class_string = iodd_parse_$args ("max_access_class=", major_args);
+	if max_access_class_string ^= "" then do;	/* explicit ceiling for data transfer */
+	     local_explicit_ceiling_given = "1"b;
+	     call convert_authorization_$from_string (local_explicit_ceiling, max_access_class_string, code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "^a", max_access_class_string);
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	if ^static.old_version then do;
+	     local_explicit_floor_given = "0"b;		/* use floor the two systems agree upon */
+	     min_access_class_string = iodd_parse_$args ("min_access_class=", major_args);
+	     if min_access_class_string ^= "" then do;	/* explicit floor for data transfer */
+		local_explicit_floor_given = "1"b;
+		call convert_authorization_$from_string (local_explicit_floor, min_access_class_string, code);
+		if code ^= 0 then do;
+		     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "^a", min_access_class_string);
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+
+	     if local_explicit_ceiling_given & local_explicit_floor_given then
+		if ^aim_check_$greater_or_equal (local_explicit_ceiling, local_explicit_floor) then do;
+		     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+			"max_access_class (""^a"") is not greater than or equal to min_access_class (""^a"")",
+			max_access_class_string, min_access_class_string);
+		     go to RETURN_FROM_INIT;
+		end;
+	end;
+
+	keyword_value = iodd_parse_$args ("mode=", major_args);
+	if (keyword_value = "") | (keyword_value = "manual") then do;
+	     static.automatic_operation = "0"b;		/* manual mode: operator intervention required */
+	     static.auto_receive, static.auto_go = "0"b;	/* whichever is appropriate defaults to no */
+	end;
+	else if (keyword_value = "automatic") | (keyword_value = "auto") then do;
+	     static.automatic_operation = "1"b;		/* automatic mode: keep running without intervention */
+	     static.auto_receive, static.auto_go = "1"b;	/* whichever is appropriate defaults to yes */
+	end;
+	else do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "Unsupported operational mode.  ""^a""", keyword_value);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	keyword_value = iodd_parse_$args ("allow_remote_request=", major_args);
+	if keyword_value ^= "" then do;
+	     if ^static.input_driver then do;
+		call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		     "The ""allow_remote_request"" keyword may not be specified for an output driver.");
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     if yes_no_p ("allow_remote_request", keyword_value) then do;
+						/* said we could accept remote requests */
+		if static.old_version		/* not with an old other end, we can't */
+		then do;
+		     call iodd_msg_ (ERROR, MASTER, error_table_$inconsistent, IMFT_DRIVER_,
+			"Remote requests cannot be allowed if version=2.0.");
+		     go to RETURN_FROM_INIT;
+		end;
+
+		static.remote_request_allowed = "1"b;
+
+		keyword_value = iodd_parse_$args ("explicit_access=", major_args);
+		if keyword_value = ""		/* this one defaults to "yes" */
+		     then
+		     static.explicit_access_required = "1"b;
+		else static.explicit_access_required = yes_no_p ("explicit_access", keyword_value);
+	     end;
+
+	     else static.remote_request_allowed = "0"b;
+	end;
+
+	else static.remote_request_allowed = "0"b;
+
+	keyword_value = iodd_parse_$args ("auto_receive=", major_args);
+	if keyword_value ^= "" then
+	     if static.input_driver then		/* only valid for input drivers */
+		static.auto_receive = yes_no_p ("auto_receive", keyword_value);
+	     else do;
+		call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		     "The ""auto_receive"" keyword may not be specified for an output driver.");
+		go to RETURN_FROM_INIT;
+	     end;
+
+	keyword_value = iodd_parse_$args ("auto_go=", major_args);
+	if keyword_value ^= "" then
+	     if ^static.input_driver then		/* only valid for output drivers */
+		static.auto_go = yes_no_p ("auto_go", keyword_value);
+	     else do;
+		call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		     "The ""auto_go"" keyword may not be specified for an input driver.");
+		go to RETURN_FROM_INIT;
+	     end;
+
+	keyword_value = iodd_parse_$args ("min_time_est_msg=", major_args);
+	if keyword_value = "" then
+	     static.min_time_to_log = 60;		/* seconds */
+	else do;
+	     static.min_time_to_log = cv_dec_check_ (keyword_value, code);
+
+	     if code ^= 0 | static.min_time_to_log < 30 | static.min_time_to_log > 3600 then do;
+		call iodd_msg_ (ERROR, MASTER, error_table_$bad_conversion, IMFT_DRIVER_,
+		     "Value of min_time_est_msg must be a number between 30 and 3600 seconds, not ""^a""",
+		     keyword_value);
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	static.debug_mode, static.copy_data = "0"b;	/* defaults to not debugging, of course */
+	if iodd_static.test_entry then do;		/* recognize debug_mode when running in test mode */
+	     keyword_value = iodd_parse_$args ("debug_mode=", major_args);
+	     if keyword_value ^= "" then static.debug_mode = yes_no_p ("debug_mode", keyword_value);
+
+	     keyword_value = iodd_parse_$args ("copy_data=", major_args);
+	     if keyword_value ^= "" then static.copy_data = yes_no_p ("copy_data", keyword_value);
+
+	end;
+
+	iodd_static.test_entry = static.debug_mode;	/* if not in debug_mode, disable all debugging facilities
+						   and allow the driver to run a "real" service */
+
+/* Function specific args statement processing goes here */
+
+	on condition (linkage_error)
+	     begin;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		"Driver process lacks access to the system_privilege_ gate.");
+	     go to RETURN_FROM_INIT;
+	end;
+
+	test_initiate_entry = system_privilege_$initiate; /* check that we can get appropriate privileges */
+
+	revert condition (linkage_error);
+
+	call attach_and_init_line;
+
+	if ^static.input_driver then on condition (daemon_idle) call check_for_resync_request ();
+
+/* Synchronize operations with the remote system: control will also arrive
+   here whenever the remote system requests explicit resynchronization */
+
+RESYNCHRONIZE_DRIVER:				/* Ensure that we are properly attached. */
+	if ds_ptr -> driver_status.dev_in_iocbp = null () then call attach_and_init_line;
+
+	iodd_static.master_hold = "1"b;		/* wait for commands from the master console by default */
+	iodd_static.slave_hold = "0"b;		/* actually, there is no slave terminal, but ... */
+
+	call resynch_and_validate;
+
+	if static.input_driver then			/* input device ... */
+	     if static.auto_receive then do;		/* ... start receiving immediately */
+		on condition (quit) call iodd_quit_handler_ ();
+		on condition (resume) go to PREPARE_TO_CALL_IODD_LISTEN_;
+		call iodd_msg_ (NORMAL, MASTER, 0, "", "Waiting for ^[files/subtrees^] from ^a.", static.function,
+		     static.foreign_system.name);
+		if static.function = FILE_TRANSFER then
+		     call imft_receive_object_ (addr (static), addr (static_fis_info), code);
+		if code ^= 0 then do;		/* error has already been reported */
+		     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+			"Fatal error during ""receive"" command; driver will re-initialize.");
+		     call detach_device ();		/* just in case */
+		     signal condition (re_init);
+		end;
+PREPARE_TO_CALL_IODD_LISTEN_:				/* release command from a quit will arrive here */
+		revert condition (quit), condition (resume);
+	     end;
+	     else ;				/* go directly to the command loop */
+
+	else do;					/* output device ... */
+	     if static.auto_go then do;		/* ... start processing immediately if requested */
+		do i = 1 to iodd_static.assigned_devices;
+		     devp = driver_ptr_list.stat_segp (i);
+		     call iodd_command_processor_ (MASTER, LISTEN_COMMAND_LEVEL,
+			"restart_q " || devp -> driver_status.device_id, ignore_code);
+		end;
+		iodd_static.master_hold = "0"b;
+	     end;
+	end;
+
+	call iodd_listen_ (stat_p);			/* start the driver operating */
+
+
+/* Control arrives here iff initialization fails */
+
+RETURN_FROM_INIT:
+	iodd_static.test_entry = saved_test_entry;
+	if (major_args_ptr ^= null ())
+	     & (major_args_ptr ^= add_char_offset_ (addr (text_strings.chars), iodd_static.major_args.first_char - 1))
+	     then
+	     call terminate_file_ (major_args_ptr, 0, TERM_FILE_TERM, ignore_code);
+	call drop_device ();
+	call free_aim_attributes_storage;
+	return;
+
+
+/* Control arrives here if a logout is received from the slave (this won't happen, but...) */
+
+LOGOUT_SLAVE:
+	iodd_static.re_init_in_progress = "1"b;		/* re-initialize the driver */
+	iodd_static.slave.log_msg = "1"b;		/* send to log and slave */
+	call iodd_msg_ (LOG, BOTH, 0, "", "Logout for ^a ^a ^[input^;output^] driver at ^a.",
+	     static.foreign_system.name, FUNCTION_NAMES (static.function), static.input_driver,
+	     date_time_$format ("date_time", clock (), "", ""));
+	call iox_$control (iodd_static.slave_out, "runout", null (), ignore_code);
+	call drop_device ();
+	call iodd_msg_ (NORMAL, MASTER, 0, "", "Driver starting re-initialization...");
+	go to iodd_static.re_init_label;		/* this will do everything */
+%page;
+/* Entry to attach the line and initialize driver_status information. */
+
+attach_and_init_line:
+     proc;
+	if static.input_driver then do;
+
+/* An input driver: requests are not processed from the coordinator; this driver is controlled by the remote system's
+   output driver */
+
+	     if iodd_static.assigned_devices > 1 then do; /* only one device per input driver */
+		call iodd_msg_ (ERROR, MASTER, error_table_$fatal_error, IMFT_DRIVER_,
+		     "The IMFT driver only supports one minor device for an input driver.");
+		return;
+	     end;
+
+	     call validate_request_type (ds_ptr);
+	     ds_ptr -> driver_status.attached = "0"b;	/* do not accept anything from coordinator */
+
+	     call iodd_msg_ (NORMAL, MASTER, 0, "", "^/Initializing ^a ^a input driver...", static.foreign_system.name,
+		FUNCTION_NAMES (static.function));
+
+	     call attach_line ();
+
+	     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "read_status", addr (trsi), code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Can not determine when input is available.");
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     static_fis_info.version = FIS_INFO_VERSION_1;
+	     static_fis_info.n_iocbs, static_fis_info.n_channels = 2;
+	     static_fis_info.iocbs (1) = iodd_static.master_in;
+	     static_fis_info.event_channels (1) = iodd_static.chan_list_ptr -> event_channel_list.channels (1);
+	     static_fis_info.iocbs (2) = ds_ptr -> driver_status.dev_in_iocbp;
+	     static_fis_info.event_channels (2) = trsi.event_channel;
+	end;
+
+
+	else do;
+
+/* Transmitting to foreign Multics system: process requests from the coordinator */
+
+	     list_ptr = iodd_static.driver_list_ptr;
+	     do i = 1 to iodd_static.assigned_devices;	/* check request types for minor device(s) */
+						/* doesn't return if an error occurs */
+		call validate_request_type (driver_ptr_list.stat_segp (i));
+	     end;
+
+	     call iodd_msg_ (NORMAL, MASTER, 0, "", "^/Initializing ^a ^a output driver...", static.foreign_system.name,
+		FUNCTION_NAMES (static.function));
+
+	     if static.function = FILE_TRANSFER then do;	/* expect use of enter_imft_request */
+		ds_ptr -> driver_status.generic_type = FT_GENERIC_TYPE;
+		ds_ptr -> driver_status.message_type = FT_MESSAGE_TYPE;
+	     end;
+
+	     if ds_ptr -> driver_status.rqti_ptr ^= null () then
+		call iodd_msg_ (NORMAL, MASTER, 0, IMFT_DRIVER_, "This driver cannot decode an RQTI segment.");
+
+	     call attach_line ();
+
+	     ds_ptr -> driver_status.attached = "1"b;
+
+	     ds_ptr -> driver_status.elem_size = 9;
+
+	     ds_ptr -> driver_status.ready = "1"b;	/* mark as ready to save an operator command */
+
+	     local_terminal_info.version = terminal_info_version;
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "terminal_info", addr (local_terminal_info),
+		code);
+	     if code = 0 then
+		ds_ptr -> driver_status.bit_rate_est = divide (local_terminal_info.baud_rate * 2, 3, 35, 0);
+	     else ds_ptr -> driver_status.bit_rate_est = INITIAL_IMFT_RATE;
+
+	     if iodd_static.assigned_devices = 2 then do; /* copy necessary stuff to second minor device's */
+		devp = driver_ptr_list.stat_segp (2);	/* status structure */
+		devp -> driver_status.attached = "1"b;
+		devp -> driver_status.ready = "1"b;
+		devp -> driver_status.dev_out_iocbp = ds_ptr -> driver_status.dev_out_iocbp;
+		devp -> driver_status.dev_in_iocbp = ds_ptr -> driver_status.dev_in_iocbp;
+		devp -> driver_status.dev_out_stream = ds_ptr -> driver_status.dev_out_stream;
+		devp -> driver_status.dev_in_stream = ds_ptr -> driver_status.dev_in_stream;
+		devp -> driver_status.elem_size = ds_ptr -> driver_status.elem_size;
+		devp -> driver_status.message_type = ds_ptr -> driver_status.message_type;
+		devp -> driver_status.bit_rate_est = ds_ptr -> driver_status.bit_rate_est;
+		devp -> driver_status.generic_type = ds_ptr -> driver_status.generic_type;
+		devp -> driver_status.dev_ctl_ptr = null ();
+		devp -> driver_status.defer_time_limit = 0;
+	     end;
+	end;
+     end attach_and_init_line;
+%page;
+/* Procedure to validate the IMFT synchronization and aim levels. */
+
+resynch_and_validate:
+     proc;
+	if static.input_driver then do;		/* the actual code is fairly complex ... */
+	     call synchronize_input_driver ();
+	     call establish_input_access_ceiling ();
+	end;
+
+	else do;					/* ... so it's not shown here */
+	     call synchronize_output_driver ();
+	     call establish_output_access_ceiling ();
+	end;
+
+
+/* Synchronization completed: start things running ... */
+
+	call convert_authorization_$to_string_short (static.local_system.access_ceiling, max_access_class_string, code);
+	if code ^= 0 then do;			/* can't convert it: use octal representation */
+	     call convert_aim_attributes_ (static.local_system.access_ceiling, max_access_class_octal);
+	     max_access_class_string = max_access_class_octal;
+	end;
+
+	if ^static.old_version then do;
+	     call convert_authorization_$to_string_short (static.local_system.access_floor, min_access_class_string,
+		code);
+	     if code ^= 0 then do;			/* can't convert it: use octal representation */
+		call convert_aim_attributes_ (static.local_system.access_floor, min_access_class_octal);
+		min_access_class_string = min_access_class_octal;
+	     end;
+	end;
+	else min_access_class_string = "";
+
+	call iodd_msg_ (NORMAL, MASTER, 0, "",
+	     "^a ^a ^[input^;output^] driver (version ^a) ready at ^a^/^[^3xusing channel ^a for input^[/^s^;, channel ^a for ^]output, and^/^3x^;^s^s^s^3xusing ^]^[^a^;^ssystem_low^]:^[^a^;^ssystem_low^] as the allowable range of access classes for data transfer.",
+	     static.foreign_system.name, FUNCTION_NAMES (static.function), static.input_driver,
+	     static.local_system.imft_version, date_time_$format ("date_time", clock (), "", ""), have_channel_names,
+	     local_gcn.input_channel, static.single_switch, local_gcn.output_channel, (min_access_class_string ^= ""),
+	     min_access_class_string, (max_access_class_string ^= ""), max_access_class_string);
+     end resynch_and_validate;
+%page;
+/* Process request:  Invoked by iodd_listen_ when a request has been received
+   from the coordinator for transmission to the remote system.  Validate the
+   request format and then pass it off to the appropriate module */
+
+request:
+     entry ();
+
+dcl  driver_ptr ptr static;
+
+	driver_ptr = iodd_static.driver_ptr;
+	if driver_ptr -> driver_status.dev_out_iocbp = null () then do;
+	     call iodd_msg_ (NORMAL, MASTER, 0, "", "Driver waking up to start re-initialization...");
+	     call attach_and_init_line;		/* restablish link */
+	     call resynch_and_validate;
+	end;
+
+	static.idle_delay = 0;			/* reset counter */
+	rd_ptr = addr (driver_ptr -> driver_status.descriptor);
+						/* ... the request descriptor ... */
+
+	p = addr (driver_ptr -> driver_status.message);	/* ... and the request itself */
+
+	if p -> queue_msg_hdr.hdr_version ^= queue_msg_hdr_version_1 then do;
+	     call iodd_msg_ (LOG, MASTER, 0, "", "Invalid message header.  Cannot read request ^d (queue ^d).",
+		rd_ptr -> request_descriptor.seq_id, rd_ptr -> request_descriptor.q);
+	     rd_ptr -> request_descriptor.keep_in_queue = "1"b;
+	     rd_ptr -> request_descriptor.dont_delete = "1"b;
+	     rd_ptr -> request_descriptor.finished = "1"b;
+	     return;				/* leave in queue for possible upgrade later ... */
+	end;					/* ... and give it back to the coordinator */
+
+	if p -> queue_msg_hdr.message_type ^= driver_ptr -> driver_status.message_type then do;
+	     call iodd_msg_ (LOG, MASTER, 0, "",
+		"Incorrect message type.^/Request ^d (queue ^d) for ^a (entry ^a) not processed.",
+		rd_ptr -> request_descriptor.seq_id, rd_ptr -> request_descriptor.q,
+		rd_ptr -> request_descriptor.sender_id, p -> queue_msg_hdr.ename);
+	     rd_ptr -> request_descriptor.cancelled = "1"b;
+	     rd_ptr -> request_descriptor.dont_delete = "1"b;
+	     rd_ptr -> request_descriptor.finished = "1"b;
+	     return;				/* give up: it won't ever work ... */
+	end;					/* ... but don't get rid of the object */
+
+	if static.function = FILE_TRANSFER then
+	     if p -> ft_request.version ^= FT_REQUEST_VERSION_1 then do;
+		call iodd_msg_ (LOG, MASTER, 0, "",
+		     "Wrong message version found.^/Request ^d (queue ^d) for ^a (entry ^a) not processed.",
+		     rd_ptr -> request_descriptor.seq_id, rd_ptr -> request_descriptor.q,
+		     rd_ptr -> request_descriptor.sender_id, p -> queue_msg_hdr.ename);
+		rd_ptr -> request_descriptor.keep_in_queue = "1"b;
+		rd_ptr -> request_descriptor.dont_delete = "1"b;
+		rd_ptr -> request_descriptor.finished = "1"b;
+		return;				/* leave it around to be upgraded later */
+	     end;
+	     else ;				/* request is proper version */
+
+
+/* Format is OK: do the request */
+
+	iodd_static.quit_during_request = "0"b;
+
+	on condition (cleanup)
+	     call iox_$control (driver_ptr -> driver_status.dev_out_iocbp, "runout", null (), ignore_code);
+
+	if static.function = FILE_TRANSFER then
+	     call imft_transmit_object_ (driver_ptr -> driver_status.dev_out_iocbp, stat_p, addr (static), code);
+
+	if code ^= 0 then do;			/* error has already been reported */
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		"Fatal error during processing of the request; driver will re-initialize.");
+	     signal condition (re_init);
+	end;
+
+	call iox_$control (driver_ptr -> driver_status.dev_out_iocbp, "runout", null (), ignore_code);
+
+	if static_pause_time > 1 then call timer_manager_$sleep (static_pause_time, RELATIVE_SECONDS);
+
+	return;
+%page;
+/* Process a driver command */
+
+command:
+     entry (P_source, P_state, P_arglist_ptr, P_code);
+
+	source = P_source;
+	arglist_ptr = P_arglist_ptr;			/* structure containing command arguments */
+
+	saved_code = P_code;			/* save input code in case command is unknown */
+
+	P_code, code = 0;				/* claim to handle it */
+
+/* Process the command if recognized */
+
+	if (arglist.command = "help") then do;
+	     call iodd_msg_ (NORMAL, source, 0, "", "^/** Commands for the IMFT driver **^/");
+	     if static.input_driver then		/* an input driver */
+		call iodd_msg_ (NORMAL, source, 0, "", "receive");
+	     else do;
+		call iodd_msg_ (NORMAL, source, 0, "", "pause_time [<seconds_to_delay_between_requests>]");
+		call iodd_msg_ (NORMAL, source, 0, "", "line_speed");
+	     end;
+	end;
+
+	else if (arglist.command = "pause_time") | (arglist.command = "pausetime") then do;
+	     if static.input_driver then do;		/* only for output drivers */
+		call iodd_msg_ (NORMAL, source, 0, "", "Invalid command for an input driver.");
+		go to COMMAND_ERROR;
+	     end;
+	     if (arglist.n_tokens > 1) then do;		/* a specific time is given */
+		value = cv_dec_check_ ((arglist.arguments (1)), code);
+		if (code ^= 0) then do;
+BAD_PAUSE_TIME_SPECIFICATION:
+		     call iodd_msg_ (NORMAL, source, error_table_$bad_conversion, "",
+			"Pause time specification must be a number between 0 and 30 seconds; not ""^a"".",
+			arglist.arguments (1));
+		     go to COMMAND_ERROR;
+		end;
+		if (value < 0) | (value > 30) then go to BAD_PAUSE_TIME_SPECIFICATION;
+		static_pause_time = value;		/* good value */
+	     end;
+	     else static_pause_time = 10;		/* reset to default value */
+	end;
+
+	else if (arglist.command = "receive") then do;
+	     if ^static.input_driver then do;		/* only valid for input drivers */
+		call iodd_msg_ (NORMAL, source, 0, "", "Invalid command for an output driver.");
+		go to COMMAND_ERROR;
+	     end;
+
+/* Ensure that we are properly attached. */
+
+	     if ds_ptr -> driver_status.dev_in_iocbp = null () then do;
+		call attach_and_init_line;		/* restablish link */
+		call resynch_and_validate;
+	     end;
+
+	     call iodd_msg_ (NORMAL, MASTER, 0, "", "Waiting for ^[files/subtrees^] from ^a.", static.function,
+		static.foreign_system.name);
+	     if static.function = FILE_TRANSFER then
+		call imft_receive_object_ (addr (static), addr (static_fis_info), code);
+	     if code ^= 0 then do;			/* error has already been reported */
+		call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		     "Fatal error during ""receive"" command; driver will re-initialize.");
+		signal condition (re_init);
+	     end;
+	end;
+
+	else if (arglist.command = "line_speed") | (arglist.command = "linespeed") then do;
+	     if static.input_driver then do;		/* only for output drivers */
+		call iodd_msg_ (NORMAL, source, 0, "", "Invalid command for an input driver.");
+		go to COMMAND_ERROR;
+	     end;
+	     call iodd_msg_ (NORMAL, source, 0, "", "line_speed = ^i Baud.", ds_ptr -> driver_status.bit_rate_est);
+	end;
+
+	else code = saved_code;			/* unknown request: let caller handle it */
+
+	P_code = code;				/* pass back any defined errors */
+	return;
+
+COMMAND_ERROR:
+	P_code = error_table_$action_not_performed;	/* cause a resetread */
+	return;
+%page;
+/* Handler for unexpected conditions during request processing */
+
+default_handler:
+     entry (P_condition_info_ptr);
+
+	condition_info_ptr = P_condition_info_ptr;
+
+	condition = condition_info.condition_name;
+
+	if iodd_static.request_in_progress then		/* will abort the request */
+	     if static.function = FILE_TRANSFER then call imft_transmit_object_$abort_running_request (condition);
+
+	return;					/* should not get here */
+%page;
+/* Synchronize an input driver: Wait for a SYNC1 command from the remote system.  When it arrives, validate the
+   ID/password in the command against the foreign ID/password specified locally.  If they match, send a SYNC1 reply
+   containing our ID/password to the remote system and wait for a SYNC2 command; otherwise, send a SYNC1 reply explaining
+   the problem and abort.  When the SYNC2 command arrives, send a SYNC2 reply if the command indicates that
+   synchronization suceeded; otherwise, abort */
+
+synchronize_input_driver:
+     procedure ();
+
+	call read_sync_command (IMFT_SYNC1);
+
+	sync_record_ptr = addr (input_buffer);
+	if static.foreign_system.name ^= sync_record.my_userid then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_ids, IMFT_DRIVER_,
+		"ID specified on local system is ^a; ID specified on remote system is ^a.",
+		static.foreign_system.name, sync_record.my_userid);
+	     call write_sync_reply (IMFT_SYNC1, "", "", imft_et_$non_matching_ids, static.foreign_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if static.foreign_system.password ^= sync_record.my_password then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_passwords, IMFT_DRIVER_,
+		"Validating foreign system ID.  ""^a""", sync_record.my_userid);
+	     call write_sync_reply (IMFT_SYNC1, "", "", imft_et_$non_matching_passwords, "");
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if local_icri.record_lth ^= 4 * currentsize (sync_record) then do;
+						/* remote driver is pre 4.0 */
+	     if foreign_system_version >= 4.0 then do;
+		call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_versions, IMFT_DRIVER_,
+		     "Remote system appears to be pre 4.0 but was specified to be ^a on local system.",
+		     static.foreign_system.imft_version);
+		call write_sync_reply (IMFT_SYNC1, "", "", imft_et_$non_matching_versions, "");
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	else if static.foreign_system.imft_version ^= sync_record.imft_version then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_versions, IMFT_DRIVER_,
+		"Remote system claims to be ""^a"" but specified locally to be ""^a"".", sync_record.imft_version,
+		static.foreign_system.imft_version);
+	     call write_sync_reply (IMFT_SYNC1, "", "", imft_et_$non_matching_versions, "");
+	     go to RETURN_FROM_INIT;
+	end;
+
+/* Here iff the ID/password in the SYNC1 command were acceptable */
+
+	call write_sync_reply (IMFT_SYNC1, static.local_system.name, static.local_system.password, 0, "");
+
+	call read_sync_command (IMFT_SYNC2);
+
+	sync_record_ptr = addr (input_buffer);
+	if sync_record.code = 0 then			/* remote system accepted our ID/password */
+	     call write_sync_reply (IMFT_SYNC2, "", "", 0, "");
+
+	else do;					/* remote output driver didn't like our ID/password */
+	     code = imft_convert_status_code_$decode (sync_record.code);
+	     if code = imft_et_$non_matching_ids then
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_,
+		     "ID specified on local system is ^a; ID specified on remote system is ^a.",
+		     static.local_system.name, sync_record.correct_userid);
+	     else call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Validating local system ID.  ""^a""",
+		     static.local_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	return;					/* here iff synchronized OK */
+%page;
+/* Internal to synchronize_input_driver: attempts to transmit a SYNC reply */
+
+write_sync_reply:
+	procedure (p_sync_type, p_my_userid, p_my_password, p_code, p_correct_userid);
+
+dcl  p_sync_type fixed binary (7) unaligned unsigned parameter;
+dcl  (p_my_userid, p_correct_userid) character (*) parameter;
+dcl  p_my_password character (8) aligned parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  code fixed binary (35);
+
+	     sync_record_ptr = addr (output_buffer);	/* need a place to put it */
+	     sync_record.my_userid = p_my_userid;
+	     sync_record.my_password = p_my_password;
+	     sync_record.code = imft_convert_status_code_$encode (p_code);
+	     sync_record.correct_userid = p_correct_userid;
+	     sync_record.imft_version = CURRENT_IMFT_VERSION;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* give the other side a chance to respond */
+	     local_icri.record_type = p_sync_type;
+	     local_icri.record_ptr = sync_record_ptr;
+	     local_icri.record_lth = 4 * currentsize (sync_record);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "write_reply_record", addr (local_icri), code);
+
+	     if code ^= 0 then do;			/* any I/O errors are fatal */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to synchronize with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     return;				/* success */
+
+	end write_sync_reply;
+
+
+
+/* Internal to synchronize_input_driver: attempts to read a SYNC command */
+
+read_sync_command:
+	procedure (p_sync_type);
+
+dcl  p_sync_type fixed binary (7) unaligned unsigned parameter;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     if static.automatic_operation & (p_sync_type = IMFT_SYNC1) then
+		local_icri.timeout = 0;		/* wait forever for start of synchronization sequence */
+	     else local_icri.timeout = FIVE_MINUTES;
+	     local_icri.record_ptr = addr (input_buffer);
+	     local_icri.record_max_lth = length (input_buffer);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "read_command_record", addr (local_icri), code);
+
+	     if code = 0 then			/* got something ... */
+		if local_icri.record_type = p_sync_type then
+		     return;			/* ... got the right type of command */
+
+		else do;				/* ... anything else causes us to try over again */
+		     call write_sync_reply (IMFT_RESYNCHRONIZE, "", "", 0, "");
+		     go to RESYNCHRONIZE_DRIVER;
+		end;
+
+	     else do;				/* some more serious error */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to synchronize with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	end read_sync_command;
+
+     end synchronize_input_driver;
+%page;
+/* Establish the AIM access class ceiling for an input driver: Wait for the AIM1 command giving the source system's AIM
+   attributes definition and then transmit an AIM1 reply consisting of our attributes.  Wait for the AIM2 command which
+   contains the source system's computed access ceiling and explicit ceiling (if any); verify that they match the local
+   values and that the local explicit ceiling is less than or equal to the computed ceiling.  If all goes well, send an
+   AIM2 reply with a zero code; otherwise, send a non-zero reply code and abort */
+
+establish_input_access_ceiling:
+     procedure ();
+
+dcl  1 local_aim2_record aligned like aim2_record;
+
+
+	call read_aim_command (IMFT_AIM1);		/* aborts if we can't get it */
+
+	if addr (input_buffer) -> aim_attributes.version ^= AIM_ATTRIBUTES_VERSION_1 then do;
+	     call iodd_msg_ (ERROR, MASTER, error_table_$unimplemented_version, IMFT_DRIVER_,
+		"Can not understand AIM definition from ^a.", static.foreign_system.name);
+	     go to RETURN_FROM_INIT;			/* ... other side will timeout */
+	end;
+
+	call free_aim_attributes_storage;
+
+	allocate aim_attributes in (system_area) set (static.foreign_system.aim_attributes_ptr);
+	static.foreign_system.aim_attributes_ptr -> aim_attributes = addr (input_buffer) -> aim_attributes;
+
+	call get_system_aim_attributes_ (get_system_free_area_ (), AIM_ATTRIBUTES_VERSION_1,
+	     static.local_system.aim_attributes_ptr, code);
+	if code ^= 0 then do;			/* shouldn't get this but... */
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to get local AIM definition.");
+	     go to RETURN_FROM_INIT;			/* ... other side will timeout */
+	end;
+
+	call write_aim_reply (IMFT_AIM1, static.local_system.aim_attributes_ptr,
+	     (4 * currentsize (static.local_system.aim_attributes_ptr -> aim_attributes)));
+
+
+/* Have exchanged AIM definitions: wait for AIM2 command and validate other system's computed ceiling and explicit ceiling
+   against our own */
+
+	call read_aim_command (IMFT_AIM2);
+
+	if static.old_version then do;		/* we read old, shorter form of AIM2 record */
+	     aim2_record_ptr = addr (local_aim2_record);
+	     aim2_record = addr (input_buffer) -> v2_aim2_record, by name;
+	end;
+
+	else aim2_record_ptr = addr (input_buffer);
+
+	if aim2_record.code ^= 0 then do;		/* remote system couldn't compute definition */
+	     code = imft_convert_status_code_$decode (aim2_record.code);
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		static.foreign_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	call compute_common_aim_ceiling_ (static.local_system.aim_attributes_ptr, static.local_system.access_ceiling,
+	     static.foreign_system.aim_attributes_ptr, static.foreign_system.access_ceiling, code);
+	if code ^= 0 then do;
+CANT_ESTABLISH_CEILING:
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		static.foreign_system.name);
+	     call write_aim2_reply (code);		/* let remote system know we lost */
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if ^aim_check_$equal (aim2_record.computed_ceiling, static.foreign_system.access_ceiling) then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$computed_ceiling_mismatch, IMFT_DRIVER_,
+		"Attempting to establish access ceiling with ^a.", static.foreign_system.name);
+	     call write_aim2_reply (imft_et_$computed_ceiling_mismatch);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if local_explicit_ceiling_given | aim2_record.explicit_ceiling_given then do;
+	     if ^local_explicit_ceiling_given then local_explicit_ceiling = static.local_system.access_ceiling;
+
+	     if aim2_record.explicit_ceiling_given then do;
+		call translate_aim_attributes_ (static.foreign_system.aim_attributes_ptr,
+		     aim2_record.explicit_ceiling, static.local_system.aim_attributes_ptr, foreign_explicit_ceiling,
+		     code);
+		if code ^= 0 then go to CANT_ESTABLISH_CEILING;
+	     end;
+	     else foreign_explicit_ceiling = static.local_system.access_ceiling;
+
+	     if aim_check_$greater_or_equal (local_explicit_ceiling, foreign_explicit_ceiling)
+						/* other side wants lower ceiling than we had specified */
+		then
+		static.local_system.access_ceiling = foreign_explicit_ceiling;
+
+	     else if aim_check_$greater (foreign_explicit_ceiling, local_explicit_ceiling) then do;
+		static.local_system.access_ceiling = local_explicit_ceiling;
+						/* our ceiling controls */
+		call translate_aim_attributes_ (static.local_system.aim_attributes_ptr,
+		     static.local_system.access_ceiling, static.foreign_system.aim_attributes_ptr,
+		     static.foreign_system.access_ceiling, code);
+						/* so we have to translate it for the other system */
+		if code ^= 0 then go to CANT_ESTABLISH_CEILING;
+	     end;
+
+	     else do;				/* neither one is >= the other, so they must be isolated */
+		call iodd_msg_ (ERROR, MASTER, imft_et_$explicit_ceiling_mismatch, IMFT_DRIVER_,
+		     "Attempting to establish access ceiling with ^a.", static.foreign_system.name);
+		call write_aim2_reply (imft_et_$explicit_ceiling_mismatch);
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	if ^static.old_version then do;
+	     if local_explicit_floor_given | aim2_record.explicit_floor_given then do;
+		if ^local_explicit_floor_given then local_explicit_floor = ""b;
+
+		if aim2_record.explicit_floor_given then do;
+		     call translate_aim_attributes_ (static.foreign_system.aim_attributes_ptr,
+			aim2_record.explicit_floor, static.local_system.aim_attributes_ptr, foreign_explicit_floor,
+			code);
+		     if code ^= 0 then go to CANT_ESTABLISH_CEILING;
+		end;
+		else foreign_explicit_floor = ""b;
+
+		if aim_check_$greater_or_equal (foreign_explicit_floor, local_explicit_floor)
+						/* other side wants higher floor than we had specified */
+		     then
+		     static.local_system.access_floor = foreign_explicit_floor;
+
+		else if aim_check_$greater (local_explicit_floor, foreign_explicit_floor) then do;
+		     static.local_system.access_floor = local_explicit_floor;
+						/* our floor controls */
+		     call translate_aim_attributes_ (static.local_system.aim_attributes_ptr,
+			static.local_system.access_floor, static.foreign_system.aim_attributes_ptr,
+			static.foreign_system.access_floor, code);
+						/* so we have to translate it for the other system */
+		     if code ^= 0 then go to CANT_ESTABLISH_CEILING;
+		end;
+
+		else do;				/* neither one is >= the other, so they must be isolated */
+		     call iodd_msg_ (ERROR, MASTER, imft_et_$explicit_floor_mismatch, IMFT_DRIVER_,
+			"Attempting to establish access floor with ^a.", static.foreign_system.name);
+		     call write_aim2_reply (imft_et_$explicit_floor_mismatch);
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+	     else static.local_system.access_floor, static.foreign_system.access_floor = ""b;
+						/* no explicit floors, use system low for both */
+
+	     if ^aim_check_$greater_or_equal (static.local_system.access_ceiling, static.local_system.access_floor)
+						/* make sure the resulting range is non-null */
+	     then do;
+		call convert_authorization_$to_string_short (static.local_system.access_ceiling,
+		     max_access_class_string, code);
+		if code ^= 0 then do;
+		     call convert_aim_attributes_ (static.local_system.access_ceiling, max_access_class_octal);
+		     max_access_class_string = max_access_class_octal;
+		end;
+
+		call convert_authorization_$to_string_short (static.local_system.access_floor,
+		     min_access_class_string, code);
+		if code ^= 0 then do;
+		     call convert_aim_attributes_ (static.local_system.access_floor, min_access_class_octal);
+		     min_access_class_string = min_access_class_octal;
+		end;
+
+		call iodd_msg_ (ERROR, MASTER, error_table_$ai_outside_common_range, IMFT_DRIVER_,
+		     "Computed access ceiling (^[^a^;^ssystem_low^]) is not greater than or equal to computed access floor (^[^a^;^ssystem_low^]).",
+		     (max_access_class_string ^= ""), max_access_class_string, (min_access_class_string ^= ""),
+		     min_access_class_string);
+		call write_aim2_reply (error_table_$ai_outside_common_range);
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	if ^aim_check_$greater_or_equal (get_authorization_ (), static.local_system.access_ceiling) then do;
+	     call convert_authorization_$to_string_short (static.local_system.access_ceiling, max_access_class_string,
+		code);
+	     if code ^= 0 then do;
+		call convert_aim_attributes_ (static.local_system.access_ceiling, max_access_class_octal);
+		max_access_class_string = max_access_class_octal;
+	     end;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$process_authorization_too_low, IMFT_DRIVER_,
+		"Minimum process authorization must be ^[^a^;^ssystem_low^].", (max_access_class_string ^= ""),
+		max_access_class_string);
+	     call write_aim2_reply (imft_et_$process_authorization_too_low);
+	     go to RETURN_FROM_INIT;
+	end;
+
+
+/* Here iff AIM ceiling is computed and OK */
+
+	call write_aim2_reply (NO_ERROR);
+
+	return;
+%page;
+/* Internal to establish_input_access_ceiling: attempts to transmit an AIM reply */
+
+write_aim_reply:
+	procedure (p_aim_type, p_record_ptr, p_record_lth);
+
+dcl  p_aim_type fixed binary (7) unaligned unsigned parameter;
+dcl  p_record_ptr pointer parameter;
+dcl  p_record_lth fixed binary (21) parameter;
+dcl  code fixed binary (35);
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* give the other side a chance */
+	     local_icri.record_type = p_aim_type;
+	     local_icri.record_ptr = p_record_ptr;
+	     local_icri.record_lth = p_record_lth;
+
+	     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "write_reply_record", addr (local_icri), code);
+
+	     if code ^= 0 then do;			/* any I/O error is fatal */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     return;
+
+	end write_aim_reply;
+
+
+
+/*  Internal to establish_input_access_ceiling: attempts to transmit an AIM2 reply */
+
+write_aim2_reply:
+	procedure (p_code);
+
+dcl  p_code fixed binary (35) parameter;
+
+	     aim2_record_ptr = addr (output_buffer);	/* need a place to put it */
+	     aim2_record.code = imft_convert_status_code_$encode (p_code);
+
+	     if static.old_version then
+		call write_aim_reply (IMFT_AIM2, aim2_record_ptr, (4 * currentsize (v2_aim2_record)));
+
+	     else do;
+		if aim2_record.code = 0 then do;
+		     aim2_record.computed_ceiling = static.local_system.access_ceiling;
+		     aim2_record.computed_floor = static.local_system.access_floor;
+		end;
+		call write_aim_reply (IMFT_AIM2, aim2_record_ptr, (4 * currentsize (aim2_record)));
+	     end;
+
+	     return;
+
+	end write_aim2_reply;
+%page;
+/* Internal to establish_input_access_ceiling: attempts to read an AIM command */
+
+read_aim_command:
+	procedure (p_aim_type);
+
+dcl  p_aim_type fixed binary (7) unaligned unsigned parameter;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* must be able to read it */
+	     local_icri.record_ptr = addr (input_buffer);
+	     local_icri.record_max_lth = length (input_buffer);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "read_command_record", addr (local_icri), code);
+
+	     if code = 0 then			/* got something ... */
+		if local_icri.record_type = p_aim_type then
+		     return;			/* ... got the right type of command */
+
+		else do;				/* ... anything else causes us to try over again */
+		     call write_aim_reply (IMFT_RESYNCHRONIZE, null (), 0);
+		     go to RESYNCHRONIZE_DRIVER;
+		end;
+
+	     else do;				/* some more serious error */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	end read_aim_command;
+
+     end establish_input_access_ceiling;
+%page;
+/* Synchronize an output driver: Write a SYNC1 command to the remote input driver with the our system ID and password and
+   wait for a SYNC1 response.  On receiving the SYNC1 response, check if the remote system validated that ID/password
+   combination and, if it did, validate the password/ID it sent us against the foreign system ID/password.  If the remote
+   input driver's ID/password match, send a SYNC2 command indicating that synchronization is completed; otherwise, send a
+   SYNC2 command explaining the synchronization failure */
+
+synchronize_output_driver:
+     procedure ();
+
+	call write_sync_command (IMFT_SYNC1, static.local_system.name, static.local_system.password, 0, "");
+						/* doesn't return on fatal errors */
+
+	call read_sync_reply (IMFT_SYNC1);
+
+	sync_record_ptr = addr (input_buffer);
+	if sync_record.code ^= 0 then do;		/* remote input driver didn't like our ID/password */
+	     code = imft_convert_status_code_$decode (sync_record.code);
+	     if code = imft_et_$non_matching_ids then
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_,
+		     "ID specified on local system is ^a; ID specified on remote system is ^a.",
+		     static.local_system.name, sync_record.correct_userid);
+	     else call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Validating local system ID.  ""^a""",
+		     static.local_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if static.foreign_system.name ^= sync_record.my_userid then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_ids, IMFT_DRIVER_,
+		"ID specified on local system is ^a; ID specified on remote system is ^a.",
+		static.foreign_system.name, sync_record.my_userid);
+	     call write_sync_command (IMFT_SYNC2, "", "", imft_et_$non_matching_ids, static.foreign_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if static.foreign_system.password ^= sync_record.my_password then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_passwords, IMFT_DRIVER_,
+		"Validating foreign system ID.  ""^a""", sync_record.my_userid);
+	     call write_sync_command (IMFT_SYNC2, "", "", imft_et_$non_matching_passwords, "");
+	     go to RETURN_FROM_INIT;
+	end;
+
+
+	if local_icri.record_lth ^= 4 * currentsize (sync_record) then do;
+						/* remote driver is pre 4.0 */
+	     if foreign_system_version >= 4.0 then do;
+		call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_versions, IMFT_DRIVER_,
+		     "Remote system appears to be pre 4.0 but was specified to be ^a on local system.",
+		     static.foreign_system.imft_version);
+		call write_sync_command (IMFT_SYNC2, "", "", imft_et_$non_matching_versions, "");
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	else if static.foreign_system.imft_version ^= sync_record.imft_version then do;
+	     call iodd_msg_ (ERROR, MASTER, imft_et_$non_matching_versions, IMFT_DRIVER_,
+		"Remote system claims to be ""^a"" but specified locally to be ""^a"".", sync_record.imft_version,
+		static.foreign_system.imft_version);
+	     call write_sync_command (IMFT_SYNC2, "", "", imft_et_$non_matching_versions, "");
+	     go to RETURN_FROM_INIT;
+	end;
+
+/* success */
+	call write_sync_command (IMFT_SYNC2, "", "", 0, "");
+	call read_sync_reply (IMFT_SYNC2);
+	if sync_record.code ^= 0 then do;
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Completing synchronization sequence.");
+	     go to RETURN_FROM_INIT;
+	end;
+
+	return;					/* here iff synchronized OK */
+%page;
+/* Internal to syncrhonize_output_driver: attempts to transmit a SYNC command */
+
+write_sync_command:
+	procedure (p_sync_type, p_my_userid, p_my_password, p_code, p_correct_userid);
+
+dcl  p_sync_type fixed binary (7) unaligned unsigned parameter;
+dcl  (p_my_userid, p_correct_userid) character (*) parameter;
+dcl  p_my_password character (8) aligned parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  code fixed binary (35);
+
+	     sync_record_ptr = addr (output_buffer);	/* need a place to put it */
+	     sync_record.my_userid = p_my_userid;
+	     sync_record.my_password = p_my_password;
+	     sync_record.code = imft_convert_status_code_$encode (p_code);
+	     sync_record.correct_userid = p_correct_userid;
+	     sync_record.imft_version = CURRENT_IMFT_VERSION;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* give the other side a chance to respond */
+	     local_icri.record_type = p_sync_type;
+	     local_icri.record_ptr = sync_record_ptr;
+	     local_icri.record_lth = 4 * currentsize (sync_record);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "write_command_record", addr (local_icri), code);
+
+	     if code = 0 then return;			/* success */
+
+	     else if code = imft_et_$reply_pending then	/* there's a reply to be checked out first ... */
+						/* ... must be other side asking us to start over */
+		call read_sync_reply (IMFT_RESYNCHRONIZE);
+
+	     else do;				/* some more serious error */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to synchronize with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	end write_sync_command;
+
+
+
+/* Internal to synchronize_output_driver: attempts to read a SYNC reply */
+
+read_sync_reply:
+	procedure (p_sync_type);
+
+dcl  p_sync_type fixed binary (7) unaligned unsigned parameter;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     if static.automatic_operation & (p_sync_type = IMFT_SYNC1) then
+		local_icri.timeout = 0;		/* wait forever for start of synchronization sequence */
+	     else local_icri.timeout = FIVE_MINUTES;
+	     local_icri.record_ptr = addr (input_buffer);
+	     local_icri.record_max_lth = length (input_buffer);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "read_reply_record", addr (local_icri), code);
+
+	     if code = 0 then			/* got something ... */
+		if local_icri.record_type = IMFT_RESYNCHRONIZE then go to RESYNCHRONIZE_DRIVER;
+						/* ... remote system wants us to start over */
+
+		else if (p_sync_type = 0) | (local_icri.record_type = p_sync_type) then return;
+						/* ... got the right type of reply or will take any reply */
+
+		else do;				/* ... anything else is residue from a now dead driver */
+		     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+			"Unexpected reply code ^d from ^a; driver will attempt to resyncrhonize.",
+			local_icri.record_type, static.foreign_system.name);
+		     go to RESYNCHRONIZE_DRIVER;
+		end;
+
+	     else do;				/* some more serious error */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to synchronize with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	end read_sync_reply;
+
+     end synchronize_output_driver;
+%page;
+/* Establish the AIM access class ceiling for an output driver: Send an AIM1 command giving our system's AIM attributes
+   definition and wait for the remote system to send an AIM1 reply with its AIM definition.  When we have both
+   definitions, compute the common access ceiling (if possible), validate our explicit ceiling (if any) which must be less
+   than the computed ceiling and, if all is OK, send an AIM2 command.  When the AIM2 response is received, check for the
+   remote system requesting termination */
+
+establish_output_access_ceiling:
+     procedure ();
+
+/* We will allocate storage for attributes, ensure any old stuff is freed. */
+
+	call free_aim_attributes_storage;
+
+	call get_system_aim_attributes_ (get_system_free_area_ (), AIM_ATTRIBUTES_VERSION_1,
+	     static.local_system.aim_attributes_ptr, code);
+	if code ^= 0 then do;			/* shouldn't get this but... */
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to get local AIM definition.");
+	     go to RETURN_FROM_INIT;			/* ... other side will timeout */
+	end;
+
+	call write_aim_command (IMFT_AIM1, static.local_system.aim_attributes_ptr,
+	     (4 * currentsize (static.local_system.aim_attributes_ptr -> aim_attributes)));
+
+	call read_aim_reply (IMFT_AIM1);		/* aborts if we can't get it */
+
+	if addr (input_buffer) -> aim_attributes.version ^= AIM_ATTRIBUTES_VERSION_1 then do;
+	     call iodd_msg_ (ERROR, MASTER, error_table_$unimplemented_version, IMFT_DRIVER_,
+		"Can not understand AIM definition from ^a.", static.foreign_system.name);
+	     go to RETURN_FROM_INIT;			/* ... other side will timeout */
+	end;
+
+	allocate aim_attributes in (system_area) set (static.foreign_system.aim_attributes_ptr);
+	static.foreign_system.aim_attributes_ptr -> aim_attributes = addr (input_buffer) -> aim_attributes;
+
+
+/* Have exchanged AIM definitions: compute common access class ceiling, validate our explicit ceiling (if any), and send
+   the AIM2 command */
+
+	call compute_common_aim_ceiling_ (static.local_system.aim_attributes_ptr, static.local_system.access_ceiling,
+	     static.foreign_system.aim_attributes_ptr, static.foreign_system.access_ceiling, code);
+	if code ^= 0 then do;
+CANT_ESTABLISH_CEILING:
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		static.foreign_system.name);
+	     call write_aim2_command (code);		/* let remote system know we lost */
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if local_explicit_ceiling_given then		/* check explicit ceiling */
+	     if aim_check_$greater_or_equal (static.local_system.access_ceiling, local_explicit_ceiling) then do;
+		call translate_aim_attributes_ (static.local_system.aim_attributes_ptr, local_explicit_ceiling,
+		     static.foreign_system.aim_attributes_ptr, foreign_explicit_ceiling, code);
+		if code ^= 0 then go to CANT_ESTABLISH_CEILING;
+		if ^aim_check_$greater_or_equal (get_authorization_ (), local_explicit_ceiling) then do;
+		     call convert_authorization_$to_string_short (local_explicit_ceiling, max_access_class_string,
+			code);
+		     if code ^= 0 then do;
+			call convert_aim_attributes_ (local_explicit_ceiling, max_access_class_octal);
+			max_access_class_string = max_access_class_octal;
+		     end;
+		     call iodd_msg_ (ERROR, MASTER, imft_et_$process_authorization_too_low, IMFT_DRIVER_,
+			"Minimum process authorization must be ^[^a^;^ssystem_low^].",
+			(max_access_class_string ^= ""), max_access_class_string);
+		     call write_aim2_command (imft_et_$process_authorization_too_low);
+		     go to RETURN_FROM_INIT;
+		end;
+	     end;
+
+	     else do;				/* explicit ceiling is out of range */
+		call iodd_msg_ (ERROR, MASTER, error_table_$ai_outside_common_range, IMFT_DRIVER_,
+		     "Attempting to establish access ceiling with ^a.", static.foreign_system.name);
+		call write_aim2_command (error_table_$ai_outside_common_range);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	else do;					/* not changing the ceiling: check driver's authoriztion */
+	     if ^aim_check_$greater_or_equal (get_authorization_ (), static.local_system.access_ceiling) then do;
+		call convert_authorization_$to_string_short (static.local_system.access_ceiling,
+		     max_access_class_string, code);
+		if code ^= 0 then do;
+		     call convert_aim_attributes_ (static.local_system.access_ceiling, max_access_class_octal);
+		     max_access_class_string = max_access_class_octal;
+		end;
+		call iodd_msg_ (ERROR, MASTER, imft_et_$process_authorization_too_low, IMFT_DRIVER_,
+		     "Minimum process authorization must be ^[^a^;^ssystem_low^].", (max_access_class_string ^= ""),
+		     max_access_class_string);
+		call write_aim2_command (imft_et_$process_authorization_too_low);
+		go to RETURN_FROM_INIT;
+	     end;
+	end;
+
+	if ^static.old_version then do;
+	     if local_explicit_floor_given then do;
+		if ^aim_check_$greater_or_equal (static.local_system.access_ceiling, local_explicit_floor) then do;
+						/* floor is not below common ceiling, we can't run */
+		     call iodd_msg_ (ERROR, MASTER, error_table_$ai_outside_common_range,
+			"Common access ceiling is not greater than or equal to minimum access class.");
+
+		     call write_aim2_command (error_table_$ai_outside_common_range);
+		     go to RETURN_FROM_INIT;
+		end;
+
+		static.local_system.access_floor = local_explicit_floor;
+	     end;
+
+	     else static.local_system.access_floor = ""b; /* use system_low */
+	end;
+
+	call write_aim2_command (NO_ERROR);		/* we're happy */
+
+/* Wait for AIM2 reply and abort if foreign system requests it */
+
+	call read_aim_reply (IMFT_AIM2);
+
+	aim2_record_ptr = addr (input_buffer);
+
+	if aim2_record.code ^= 0 then do;		/* remote system couldn't compute definition */
+	     code = imft_convert_status_code_$decode (aim2_record.code);
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		static.foreign_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if static.old_version then
+	     if local_explicit_ceiling_given then do;	/* OK: now set the true ceilings */
+		static.local_system.access_ceiling = local_explicit_ceiling;
+		static.foreign_system.access_ceiling = foreign_explicit_ceiling;
+	     end;
+	     else ;
+
+	else do;					/* real agreed-on ceiling and floor are in AIM2 reply record */
+	     call translate_aim_attributes_ (static.foreign_system.aim_attributes_ptr, aim2_record.computed_ceiling,
+		static.local_system.aim_attributes_ptr, static.local_system.access_ceiling, code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, "Translating final access ceiling.");
+		go to RETURN_FROM_INIT;		/* no way to tell other system */
+	     end;
+
+	     static.foreign_system.access_ceiling = aim2_record.computed_ceiling;
+
+	     call translate_aim_attributes_ (static.foreign_system.aim_attributes_ptr, aim2_record.computed_floor,
+		static.local_system.aim_attributes_ptr, static.local_system.access_floor, code);
+	     if code ^= 0 then do;
+		call iodd_msg_ (ERROR, MASTER, code, "Translating final access floor.");
+		go to RETURN_FROM_INIT;		/* no way to tell other system */
+	     end;
+
+	     static.foreign_system.access_floor = aim2_record.computed_floor;
+	end;
+
+	return;
+%page;
+/* Internal to establish_output_access_ceiling: attempts to transmit an AIM command */
+
+write_aim_command:
+	procedure (p_aim_type, p_record_ptr, p_record_lth);
+
+dcl  p_aim_type fixed binary (7) unaligned unsigned parameter;
+dcl  p_record_ptr pointer parameter;
+dcl  p_record_lth fixed binary (21) parameter;
+dcl  code fixed binary (35);
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* give the other side a chance */
+	     local_icri.record_type = p_aim_type;
+	     local_icri.record_ptr = p_record_ptr;
+	     local_icri.record_lth = p_record_lth;
+
+	     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "write_command_record", addr (local_icri), code);
+
+	     if code = 0 then return;			/* success */
+
+	     else if code = imft_et_$reply_pending then	/* there's a reply to be checked out first ... */
+						/* ... must be other side asking us to start over */
+		call read_aim_reply (IMFT_RESYNCHRONIZE);
+
+	     else do;				/* some more serious error */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	     return;
+
+	end write_aim_command;
+
+
+
+/*  Internal to establish_output_access_ceiling: attempts to transmit an AIM2 command */
+
+write_aim2_command:
+	procedure (p_code);
+
+dcl  p_code fixed binary (35) parameter;
+dcl  record_size fixed binary (21);
+
+	     aim2_record_ptr = addr (output_buffer);	/* need a place to put it */
+	     aim2_record.code = imft_convert_status_code_$encode (p_code);
+
+	     if static.old_version then do;
+		v2_aim2_record.computed_ceiling = static.local_system.access_ceiling;
+		v2_aim2_record.explicit_ceiling_given = local_explicit_ceiling_given;
+		v2_aim2_record.explicit_ceiling = local_explicit_ceiling;
+		record_size = 4 * currentsize (v2_aim2_record);
+	     end;
+
+	     else do;
+		aim2_record.computed_ceiling = static.local_system.access_ceiling;
+		aim2_record.explicit_ceiling_given = local_explicit_ceiling_given;
+		aim2_record.explicit_ceiling = local_explicit_ceiling;
+		aim2_record.computed_floor = static.local_system.access_floor;
+		aim2_record.explicit_floor_given = local_explicit_floor_given;
+		aim2_record.explicit_floor = local_explicit_floor;
+
+		record_size = 4 * currentsize (aim2_record);
+	     end;
+
+	     call write_aim_command (IMFT_AIM2, aim2_record_ptr, record_size);
+
+	     return;
+
+	end write_aim2_command;
+%page;
+/* Internal to establish_output_access_ceiling: attempts to read an AIM reply */
+
+read_aim_reply:
+	procedure (p_aim_type);
+
+dcl  p_aim_type fixed binary (7) unaligned unsigned parameter;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* must be able to read it */
+	     local_icri.record_ptr = addr (input_buffer);
+	     local_icri.record_max_lth = length (input_buffer);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_in_iocbp, "read_reply_record", addr (local_icri), code);
+
+	     if code = 0 then			/* got something ... */
+		if local_icri.record_type = IMFT_RESYNCHRONIZE then go to RESYNCHRONIZE_DRIVER;
+						/* ... remote system wants us to start over */
+
+		else if local_icri.record_type = p_aim_type then return;
+						/* ... got the right type of reply */
+
+		else do;				/* ... anything else is residue from a now dead driver */
+		     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+			"Unexpected reply code ^d from ^a; driver will atempt to resynchronize.",
+			local_icri.record_type, static.foreign_system.name);
+		     go to RESYNCHRONIZE_DRIVER;
+		end;
+
+	     else do;				/* some more serious error */
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_, "Attempting to establish access ceiling with ^a.",
+		     static.foreign_system.name);
+		go to RETURN_FROM_INIT;
+	     end;
+
+	end read_aim_reply;
+
+     end establish_output_access_ceiling;
+%page;
+/* Check for remote input driver termination:  This procedure is called every
+   iodd_static.wakeup_time seconds while an output driver is idle.  It checks
+   to see if the remote system has sent a reply requesting resynchronization
+   or logout of the local output driver */
+
+check_for_resync_request:
+     procedure ();
+
+/* If we are a dial sender, and we are supposed to drop the line to
+   conserve network costs when the driver goes idle, then drop it here
+   and signal the dial receiver that we are going away for a while.
+
+   We will pick up and reconnect the line in the request processing when
+   we see that the iocbp is null. */
+
+	if static.idle_line_drop = "1"b then do;
+
+/* Determine if we are to idle the line yet.  Each time the coord sends us
+   a daemon idle, we increment this counter.  When we have seen enough then
+   we will idle the line.  The prevents rapid line drops and raises. */
+
+	     static.idle_delay = static.idle_delay + 1;
+	     if static.idle_delay <= static.idle_delay_count then goto delay_idle_down;
+						/* wait a bit */
+
+	     if ds_ptr -> driver_status.dev_out_iocbp = null then goto idled;
+
+	     iodd_static.re_init_in_progress = "1"b;	/* re-initialize the driver */
+	     iodd_static.slave.log_msg = "1"b;		/* send to log and slave */
+	     call iodd_msg_ (LOG, BOTH, 0, "", "^a ^a ^[input^;output^] driver going to sleep at ^a.",
+		static.foreign_system.name, FUNCTION_NAMES (static.function), static.input_driver,
+		date_time_$format ("date_time", clock (), "", ""));
+	     local_icri.record_type = IMFT_LOGOUT;
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = 15;			/* ... doesn't really have to get through */
+	     local_icri.record_ptr = null ();		/* ... no associated data */
+	     local_icri.record_lth, local_icri.record_max_lth = 0;
+
+	     if ds_ptr -> driver_status.dev_out_iocbp ^= null () then do;
+		call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "write_command_record", addr (local_icri),
+		     ignore_code);
+	     end;
+
+	     call iox_$control (iodd_static.slave_out, "runout", null (), ignore_code);
+	     call drop_device ();
+
+idled:
+	     call continue_to_signal_ (ignore_code);
+	     return;
+	end;
+
+delay_idle_down:
+	call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "read_status", addr (trsi), code);
+	if code ^= 0 then do;
+COULD_NOT_RAISE_REMOTE:
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_,
+		"Fatal error while checking status of remote input driver; driver will re-initialize.");
+	     signal condition (re_init);
+	end;
+
+	if trsi.input_pending then do;		/* see what's going on */
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;		/* in case the remote input driver is sick */
+	     local_icri.record_ptr = addr (input_buffer); /* need to put is someplace */
+	     local_icri.record_max_lth = length (input_buffer);
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "read_reply_record", addr (local_icri), code);
+	     if code ^= 0 then go to COULD_NOT_RAISE_REMOTE;
+
+	     if local_icri.record_type = IMFT_RESYNCHRONIZE then signal condition (imft_resynchronize_driver_);
+
+	     else if local_icri.record_type = IMFT_LOGOUT then signal condition (imft_remote_logout_);
+
+	     else do;				/* some unexpected event */
+		call iodd_msg_ (NORMAL, MASTER, 0, IMFT_DRIVER_,
+		     "Unexpected reply code ^d from ^a; driver will re-initialize.", local_icri.record_type,
+		     static.foreign_system.name);
+		signal condition (re_init);
+	     end;
+	end;
+
+	call continue_to_signal_ (ignore_code);
+
+	return;
+
+     end check_for_resync_request;
+%page;
+/* Free allocated storage if it exists. */
+
+free_aim_attributes_storage:
+     proc;
+
+/* aim attributes occupy allocated storage.  We need to free it prior to
+   allocating new stuff.  Otherwise we end up cluttering area.linker. */
+
+	if static.foreign_system.aim_attributes_ptr ^= null () then
+	     free static.foreign_system.aim_attributes_ptr -> aim_attributes;
+	static.foreign_system.aim_attributes_ptr = null ();
+
+	if static.local_system.aim_attributes_ptr ^= null () then
+	     free static.local_system.aim_attributes_ptr -> aim_attributes;
+	static.local_system.aim_attributes_ptr = null ();
+
+     end free_aim_attributes_storage;
+%page;
+/* Drop the device and hang it up */
+
+drop_device:
+     procedure ();
+
+dcl  send_hangup bit (1) aligned;
+dcl  iocb_ptr ptr;
+
+	send_hangup = "1"b;
+	go to DROP_DEVICE_COMMON;
+
+
+/* Drop the device only */
+
+detach_device:
+     entry ();
+
+	if static.dial_service then
+	     send_hangup = "1"b;
+	else send_hangup = "0"b;
+
+DROP_DEVICE_COMMON:
+	iodd_static.attach_name = "*";
+	ds_ptr -> driver_status.attached = "0"b;
+	iocb_ptr = ds_ptr -> driver_status.dev_out_iocbp;
+	ds_ptr -> driver_status.dev_out_iocbp, ds_ptr -> driver_status.dev_in_iocbp = null ();
+
+/* Kill any possible associated minor device. */
+
+	if iodd_static.assigned_devices = 2 then do;	/* copy necessary stuff to second minor */
+						/* device's status structure */
+	     devp = iodd_static.driver_list_ptr -> driver_ptr_list.stat_segp (2);
+	     devp -> driver_status.attached = "0"b;
+	     devp -> driver_status.ready = "0"b;
+	     devp -> driver_status.dev_out_iocbp = ds_ptr -> driver_status.dev_out_iocbp;
+	     devp -> driver_status.dev_in_iocbp = ds_ptr -> driver_status.dev_in_iocbp;
+	end;
+
+	iodd_static.attach_name = "*";
+
+	call close_and_detach (iocb_ptr, send_hangup);
+
+/* If we were an in-dial then we have to drop the dial service and
+   kill the event channel too. */
+
+	if static.in_dial_qualifier ^= "" & dma.dial_channel ^= 0 then do;
+	     call ipc_$decl_ev_wait_chn (dma.dial_channel, code);
+	     call dial_manager_$shutoff_dials (addr (dma), code);
+	     call ipc_$drain_chn (dma.dial_channel, code);
+	     call ipc_$delete_ev_chn (dma.dial_channel, code);
+	     dma.dial_channel = 0;
+	end;
+
+	call continue_to_signal_ (ignore_code);		/* in case this is called from a handler */
+
+	return;
+
+     end drop_device;
+%page;
+/* Close and detach the line to the remote system */
+
+close_and_detach:
+     procedure (P_iocb_ptr, P_send_hangup);
+
+dcl  P_iocb_ptr pointer parameter;
+dcl  P_send_hangup bit (1) aligned;
+
+	if P_iocb_ptr = null () then return;		/* may be used before anything's attached */
+
+	if P_send_hangup then do;			/* caller requested a hangup of the line */
+	     if static.in_dial_qualifier ^= "" then	/* ignore hangups */
+		call ipc_$decl_ev_call_chn (dma.dial_channel, nulle, null (), 1, code);
+	     else do;
+		hangup_info.entry = nulle;		/* ... prevent the hangup from causing a reinit */
+		hangup_info.data_ptr = null ();
+		hangup_info.priority = 20;
+		call iox_$control (P_iocb_ptr, "hangup_proc", addr (hangup_info), ignore_code);
+	     end;
+
+/* Wait for any line runout to arrive at the target before dropping the line */
+
+	     call timer_manager_$sleep (FIVE_SECONDS, RELATIVE_SECONDS);
+	     call iox_$control (P_iocb_ptr, "hangup", null (), ignore_code);
+	end;
+
+	call iox_$close (P_iocb_ptr, ignore_code);
+
+	call iox_$detach_iocb (P_iocb_ptr, ignore_code);
+	call iox_$destroy_iocb (P_iocb_ptr, ignore_code);
+	return;
+     end close_and_detach;
+
+/* May be invoked when a hangup occurs */
+
+nulle:
+     procedure ();
+
+	return;
+
+     end nulle;
+%page;
+/* Attach the line to the remote system */
+
+attach_line:
+     procedure ();
+
+dcl  attach_description character (512) varying;
+dcl  character_line character (local_icri.record_lth) unaligned based (local_icri.record_ptr);
+dcl  code fixed bin (35);
+dcl  error_message char (64);
+dcl  io_module char (32);
+dcl  no_dialed fixed bin;
+dcl  open_mode fixed binary;
+dcl  previous_attach_code fixed bin (35);
+dcl  prev_proto_error bit (1);
+dcl  sleep_time fixed bin (71);
+dcl  which_channel char (32);
+%skip (5);
+/* Attach a line with the target system.
+
+   Two forms of attachment are possible:
+
+   1. argument described attachment.
+   This attachment takes the attach description from the iod_tables
+   or the args file.  It describes the io module and the line information.
+
+   2. in-dial described attachment.
+   This attachment takes the attach description from the dial_manager
+   information returned when a dial-up for the dial-name occurs.
+   This permits attach_line to determine the io module and line information.
+
+   Attachment can be a simple line attachment, or can include a protocol
+   data handshake.
+
+   Error processing is such that only the first occurance of a particular error
+   is noted in the log, and then error retrying occurs.  This holds for
+   line attachment, opening and protocol handshake.  If a line error occurs,
+   the device is dropped and a re-attachment, opening and handshake is done.
+   This ensures a clean line attachment.  */
+
+
+/* If line was previously attached we will drop the device here and try
+   again. */
+
+	if ds_ptr -> driver_status.dev_out_iocbp ^= null () then call drop_device;
+						/* Ensure we are clean */
+	previous_attach_code = 0;
+	prev_proto_error = "0"b;			/* no handshake error outstanding */
+
+retry_attach:
+	sleep_time = FIVE_MINUTES;			/* default wait */
+
+/* If we are an in_dial, then setup the dial channel and wait for a
+   connection.  When a connection has occurred, we determine the
+   io module name, etc., and continue as if a suitable args input
+   had been given to us. */
+
+	on cleanup call drop_device;			/* we drop unattached */
+
+	if static.in_dial_qualifier ^= "" then do;
+	     call ipc_$create_ev_chn (dma.dial_channel, code);
+	     if code ^= 0 then do;
+		error_message = "couldn't create an event channel";
+		goto IN_DIAL_ERROR;
+	     end;
+
+	     dma.version = 1;
+	     dma.dial_qualifier = rtrim (static.in_dial_qualifier);
+
+	     call dial_manager_$allow_dials (addr (dma), code);
+
+	     if code ^= 0 then do;
+		error_message = "error from dial_manager_$allow_dials call";
+
+IN_DIAL_ERROR:
+		call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_,
+		     "Creating dial channel ^a for ^[input^;output^] driver to ^a ^a: ^a.", static.in_dial_qualifier,
+		     static.input_driver, static.foreign_system.name, FUNCTION_NAMES (static.function), error_message)
+		     ;
+		goto RETURN_FROM_INIT;
+	     end;
+
+	     event_wait_channel.channel_id = dma.dial_channel;
+	     call ipc_$block (addr (event_wait_channel), addr (ev_wait_info), code);
+
+/* We now have a connection.  Determine information about it, and formulate
+   the correct value for static.input_attach_description from the io_module
+   name and the line name.  */
+
+	     call convert_dial_message_$return_io_module (ev_wait_info.message, which_channel, io_module, no_dialed,
+		status_flags, code);
+	     if code ^= 0 then do;
+		error_message = "couldn't convert the dial message";
+		goto IN_DIAL_ERROR;
+	     end;
+
+	     if ^status_flags.dialed_up then do;
+		error_message = "have a connection but channel is not dialed up";
+		goto IN_DIAL_ERROR;
+	     end;
+
+	     static.input_attach_description = rtrim (io_module) || " " || rtrim (which_channel);
+	     call iodd_msg_ (NORMAL, MASTER, 0, "", "Dial Channel ^a connected from ^a.",
+		static.input_attach_description, static.foreign_system.name);
+	end;
+%page;
+/* Complete connection by attaching the line.  We have to determine the
+   information and connect a dial-out channel. */
+
+	if static.old_version then
+	     attach_description = "old_imft_io_ -direction ";
+	else attach_description = "imft_io_ -direction ";
+
+	if static.input_driver then do;
+	     attach_description = attach_description || " input ";
+	     open_mode = Stream_input;
+	end;
+	else do;
+	     attach_description = attach_description || " output ";
+	     open_mode = Stream_output;
+	end;
+
+	if static.single_switch then do;
+	     attach_description = attach_description || " -io_description ";
+	     attach_description = attach_description || requote_string_ (rtrim (static.input_attach_description));
+	end;
+
+	else do;
+	     attach_description = attach_description || " -input_description ";
+	     attach_description = attach_description || requote_string_ (rtrim (static.input_attach_description));
+
+	     attach_description = attach_description || " -output_description ";
+	     attach_description = attach_description || requote_string_ (rtrim (static.output_attach_description));
+	end;
+
+	if static.debug_mode then attach_description = attach_description || " -debug";
+	if static.copy_data then attach_description = attach_description || " -copy_data";
+
+	ds_ptr -> driver_status.dev_out_stream = get_switch_name ();
+
+	call iox_$attach_ioname ((ds_ptr -> driver_status.dev_out_stream), ds_ptr -> driver_status.dev_out_iocbp,
+	     (attach_description), code);
+	ds_ptr -> driver_status.dev_in_iocbp = ds_ptr -> driver_status.dev_out_iocbp;
+
+	if code ^= 0 then go to ACTION_ERROR;
+
+
+	call iox_$open (ds_ptr -> driver_status.dev_out_iocbp, open_mode, "0"b, code);
+	if code ^= 0 then
+	     go to ACTION_ERROR;
+	else previous_attach_code = 0;
+
+/* Start the line going if we have attached an in-dial line. */
+
+	if static.in_dial_qualifier ^= "" then
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "start", null (), code);
+
+	if static.out_dial_text = "" then call set_hangup_proc ();
+						/* enable handling of hangups */
+
+	call get_data_channel_names ();		/* determine names of channels forming the connection */
+
+/* Connection Protocol handshake. */
+
+	if static.in_dial_qualifier ^= "" then call put_chars ("IMFT TRANSPORT ESTABLISHED
+");
+	if static.out_dial_text = "" then return;	/* normal connection */
+%page;
+/* Handle connection protocol necessary for line attachment to a remote system.
+
+   This consists of waiting for the trigger_text, then emitting the dial_text
+   and completing the protocol. */
+
+	call ipc_$decl_ev_call_chn (dma.dial_channel,	/* ignore hangups */
+	     protocol_hangup, stat_p, 1, code);
+
+	call wait_for_trigger (rtrim (static.trigger_text));
+
+/* emit the dial text, and validate the dial connection */
+
+	call put_chars (rtrim (static.out_dial_text) || NL);
+	call get_line ();
+	if index (character_line, " dialed to ") = 0 then do;
+hangup_protocol:
+	     if ^prev_proto_error then
+		call iodd_msg_ (NORMAL, MASTER, 0, IMFT_DRIVER_,
+		     "Protocol error - received ""^a""^/driver will retry every ^i minute^[s^;^].", character_line,
+		     static.sleep_time, static.sleep_time > 1);
+
+	     sleep_time = static.sleep_time * ONE_MINUTE;
+	     prev_proto_error = "1"b;
+	     goto ACTION_RETRY;
+	end;
+	call wait_for_trigger ("IMFT TRANSPORT ESTABLISHED
+");
+	call set_hangup_proc;
+
+	return;
+
+/* Action errors are processed here for line errors, such as attach and open.
+   If error codes are the same as before then no message is emitted and a
+   silent retry is performed after a 5 minute wait. */
+
+ACTION_ERROR:
+	if ^static.automatic_operation | code ^= previous_attach_code then
+	     call iodd_msg_ (ERROR, MASTER, code, IMFT_DRIVER_,
+		"Attaching line for ^a ^a ^[input^;output^] driver^/^-attach description: ^a",
+		static.foreign_system.name, FUNCTION_NAMES (static.function), static.input_driver, attach_description)
+		;
+	prev_proto_error = "0"b;			/* no prev error */
+
+/* Entry here is from the protocol error.  We want to handle the normal
+   automatic_operation actions and retry the attach and handshake again. */
+
+ACTION_RETRY:
+	if static.automatic_operation			/* keep trying every 5 minutes, so operator */
+						/* doesn't have to do anything */
+	then do;
+	     previous_attach_code = code;
+	     call drop_device;
+	     call timer_manager_$sleep (sleep_time, RELATIVE_SECONDS);
+	     goto retry_attach;
+	end;
+
+	else go to RETURN_FROM_INIT;			/* NO RETRY */
+
+/* dummy procedure to handle line hangup during protocol handshaking. */
+
+protocol_hangup:
+	proc;
+	     goto hangup_protocol;
+	end protocol_hangup;
+
+/* Internal to attach_line: put and get characters at the transport level. */
+
+put_chars:
+	procedure (characters);
+
+dcl  characters character (*) parameter;
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;
+	     local_icri.record_ptr = addr (characters);
+	     local_icri.record_lth = length (characters);
+	     local_icri.record_max_lth = length (characters);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "put_transport_chars", addr (local_icri), code);
+	     if code ^= 0 then goto hangup_protocol;
+	     if static.debug_connect then call iodd_msg_ (NORMAL, MASTER, 0, "", "S-""^a""", rtrim (characters, "
+"));
+	     return;
+	end;
+
+get_line:
+	procedure ();
+
+	     local_icri.version = ICRI_VERSION_1;
+	     local_icri.timeout = FIVE_MINUTES;
+	     local_icri.record_ptr = addr (character_buffer);
+	     local_icri.record_lth = 0;
+	     local_icri.record_max_lth = length (character_buffer);
+
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "get_transport_line", addr (local_icri), code);
+	     if code ^= 0 then goto hangup_protocol;
+	     if static.debug_connect then call iodd_msg_ (NORMAL, MASTER, 0, "", "R-""^a""", rtrim (character_line, "
+"));
+	     return;
+	end;
+
+/* Wait for a protocol triggering string to be received. */
+
+wait_for_trigger:
+	proc (string);
+
+dcl  string char (*);
+
+	     do trigger_loop_count = 1 to MAX_TRIGGER_LOOP_COUNT;
+		call get_line;
+		if index (character_line, string) ^= 0 then return;
+						/* got it! */
+	     end;					/* didn't get satisfactory response from other end */
+	     call iodd_msg_ (ERROR, MASTER, error_table_$fatal_error, IMFT_DRIVER_,
+		"Dial-out protocol retry limit reached, attaching line for ^a ^a ^[input^;output^] driver^/^-attach description: ^a",
+		static.foreign_system.name, FUNCTION_NAMES (static.function), static.input_driver, attach_description)
+		;
+	     go to hangup_protocol;
+
+	end wait_for_trigger;
+
+/* Internal to attach_line: determine the name for the I/O switch */
+
+get_switch_name:
+	procedure () returns (character (32));
+
+	     attachment_count = attachment_count + 1;
+
+	     if attachment_count > 999 then		/* avoid conversion errors */
+		attachment_count = 1;
+
+	     if static.input_driver then
+		return ("input." || ltrim (convert (attachment_count_pic, attachment_count)));
+	     else return ("output." || ltrim (convert (attachment_count_pic, attachment_count)));
+
+	end get_switch_name;
+
+
+
+/* Internal to attach_line: set the device hangup procedure for the line */
+
+set_hangup_proc:
+	procedure ();
+
+	     if static.in_dial_qualifier ^= "" then
+		call ipc_$decl_ev_call_chn (dma.dial_channel, iodd_hangup_, stat_p, 1, code);
+	     else do;
+		hangup_info.entry = iodd_hangup_;
+		hangup_info.data_ptr = stat_p;
+		hangup_info.priority = 1;
+		call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "hangup_proc", addr (hangup_info), code);
+	     end;
+
+	     if code ^= 0 then
+		call iodd_msg_ (NORMAL, MASTER, code, IMFT_DRIVER_,
+		     "Warning: Could not establish handler for disconnection from ^a.", static.foreign_system.name);
+
+	     return;
+
+	end set_hangup_proc;
+
+/* Internal to attach_line: determine the names of the channels connected
+   used for data transmission.  These are used in various messages to notify
+   logs as to the lines attached for input and output.
+
+   We fill in the iodd_static.attach_name variable to enable the status
+   request response to indicate what line is currently attached.  Cleanup
+   code is necessary to restore the "*" string to this variable outside the
+   driver and any time the line is unattached. */
+
+get_data_channel_names:
+	procedure ();
+
+	     have_channel_names = "0"b;		/* assume failure */
+
+	     local_gcn.version = GET_CHANNEL_NAMES_VERSION_1;
+
+	     call iox_$control (ds_ptr -> driver_status.dev_out_iocbp, "get_channel_names", addr (local_gcn), code);
+
+	     if code = 0 then do;
+		have_channel_names = "1"b;
+		if static.input_driver then
+		     iodd_static.attach_name = local_gcn.input_channel;
+		else iodd_static.attach_name = local_gcn.output_channel;
+	     end;
+
+	     else if code ^= imft_et_$cant_get_channel_names then
+		call iodd_msg_ (NORMAL, MASTER, code, IMFT_DRIVER_,
+		     "Warning: Could not determine channel names for ^a ^a ^[input^;output^] driver.",
+		     static.foreign_system.name, FUNCTION_NAMES (static.function), static.input_driver);
+
+	     return;
+
+	end get_data_channel_names;
+
+     end attach_line;
+%page;
+/* Make sure request type name is valid in form and corresponds to foreign system name */
+
+validate_request_type:
+     procedure (devp);
+
+dcl  devp pointer parameter;
+dcl  req_type_site character (32);
+
+	if substr (devp -> driver_status.req_type_label, 1, 3) = "To_" then
+	     req_type_site = substr (before (devp -> driver_status.req_type_label, "."), 4);
+	else if substr (devp -> driver_status.req_type_label, 1, 5) = "From_" then
+	     req_type_site = substr (before (devp -> driver_status.req_type_label, "."), 6);
+	else do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_, "request type ""^a"" is not in correct format.",
+		devp -> driver_status.req_type_label);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	if req_type_site ^= static.foreign_system.name then do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		"Request type (^a) does not correspond to foreign system (^a).", devp -> driver_status.req_type_label,
+		static.foreign_system.name);
+	     go to RETURN_FROM_INIT;
+	end;
+     end validate_request_type;
+%page;
+/* Validates that a value is either "yes" or "no" and returns true or false accordingly */
+
+yes_no_p:
+     procedure (P_keyword, P_value) returns (bit (1) aligned);
+
+dcl  (P_keyword, P_value) character (*) parameter;
+
+	if P_value = "y" then P_value = "yes";
+	if P_value = "n" then P_value = "no";
+
+	if (P_value ^= "yes") & (P_value ^= "no") then do;
+	     call iodd_msg_ (ERROR, MASTER, 0, IMFT_DRIVER_,
+		"The value of the ""^a"" keyword must be ""yes"" or ""no""; not ""^a"".", P_keyword, P_value);
+	     go to RETURN_FROM_INIT;
+	end;
+
+	return (P_value = "yes");
+
+     end yes_no_p;
+%page;
+/* Parameters */
+
+dcl  P_stat_p pointer parameter;			/* init: -> iodd_static for this driver */
+
+dcl  P_source fixed binary parameter;			/* command: source of the command (master/slave) */
+dcl  P_state fixed binary parameter;			/* command: current state of driver (normal/quit/request) */
+dcl  P_arglist_ptr pointer parameter;			/* command: -> structure defining command and arguments */
+dcl  P_code fixed binary (35) parameter;		/* command: status code */
+
+dcl  P_condition_info_ptr pointer parameter;		/* default_handler: -> description of the condition */
+
+
+/* Remaining declarations */
+
+dcl  major_args character (major_args_lth) unaligned based (major_args_ptr);
+dcl  major_args_lth fixed binary (21);
+dcl  major_args_ptr pointer;
+
+dcl  major_args_path character (204) static;		/* need room for archive component */
+dcl  major_args_dirname character (168) static;
+dcl  (major_args_ename, major_args_component) character (32) static;
+dcl  major_args_bc fixed binary (24) static;
+
+dcl  system_area area based (system_area_ptr);
+dcl  system_area_ptr pointer static;
+
+dcl  1 arglist aligned based (arglist_ptr),		/* structure defining a command and it's arguments */
+       2 max_tokens fixed binary,			/* # of tokens allocated */
+       2 n_tokens fixed binary,			/* # of tokens in command line */
+       2 command character (64) varying,
+       2 arguments (arglist.n_tokens - 1) character (64) varying;
+dcl  arglist_ptr pointer;
+
+dcl  1 local_terminal_info aligned like terminal_info automatic;
+
+dcl  1 trsi aligned like tty_read_status_info;
+
+dcl  1 event_channel_list aligned based,		/* list of event channels associated with driver */
+       2 n_channels fixed binary,
+       2 channels (12) fixed binary (71);
+
+dcl  1 hangup_info aligned,				/* for "hangup_proc" control order */
+       2 entry entry () variable,
+       2 data_ptr pointer,
+       2 priority fixed binary;
+
+dcl  1 local_icri aligned like icri static;		/* for synchronization */
+
+dcl  1 local_gcn aligned like get_channel_names static;	/* to get input/output channel names */
+dcl  have_channel_names bit (1) aligned static;
+
+dcl  1 dma like dial_manager_arg static;
+dcl  1 ev_wait_info static like event_wait_info;
+
+dcl  1 status_flags aligned static,
+       (
+       2 dialed_up bit (1),
+       2 hung_up bit (1),
+       2 control bit (1),
+       2 pad bit (33)
+       ) unal;
+
+dcl  ds_ptr pointer static;				/* -> driver_status for this driver */
+dcl  devp pointer static;				/* -> driver_status for a minor device */
+dcl  rd_ptr pointer static;				/* -> request_descriptor of current request */
+dcl  p pointer;
+dcl  i fixed binary;
+
+dcl  max_access_class_string character (256) static;
+dcl  max_access_class_octal character (32) aligned static;
+dcl  min_access_class_string character (256) static;
+dcl  min_access_class_octal character (32) aligned static;
+dcl  (local_explicit_ceiling, foreign_explicit_ceiling) bit (72) aligned static;
+dcl  (local_explicit_floor, foreign_explicit_floor) bit (72) aligned static;
+dcl  (local_explicit_ceiling_given, local_explicit_floor_given) bit (1) aligned static;
+dcl  foreign_system_version float binary static;
+
+dcl  keyword_value character (32) static;
+
+dcl  (code, ignore_code, saved_code) fixed binary (35) static;
+dcl  my_ring fixed binary (3);
+
+dcl  test_initiate_entry entry () variable;
+
+dcl  character_buffer character (256) static;		/* for transport connection protocol */
+dcl  temp_attach_description character (256) static;
+dcl  trigger_loop_count fixed bin static;
+dcl  source fixed binary static;			/* source of the command being processed */
+dcl  value fixed binary (35) static;
+
+dcl  condition character (32) static;
+
+dcl  (input_buffer, output_buffer) character (2048) static; /* for reading/writing commands/replies */
+dcl  (saved_test_entry, send_logout_record) bit (1) aligned static;
+
+dcl  1 static aligned like imft_driver_info static;	/* complete description of this driver */
+dcl  1 static_fis_info aligned like fis_info static;	/* used by imft_find_input_switch_ */
+dcl  static_pause_time fixed binary (71) static;		/* # of seconds to pause between requests */
+
+dcl  attachment_count fixed binary static initial (0);
+dcl  attachment_count_pic picture "999" static;
+
+dcl  IMFT_DRIVER_ character (32) static options (constant) initial ("imft_driver_");
+dcl  CURRENT_IMFT_VERSION character (3) static options (constant) initial ("4.0");
+
+dcl  FIVE_MINUTES fixed binary static options (constant) initial (300);
+dcl  FIVE_SECONDS fixed binary (71) static options (constant) initial (5);
+dcl  MAX_TRIGGER_LOOP_COUNT fixed binary static options (constant) initial (20);
+dcl  NO_ERROR fixed binary (35) static options (constant) initial (0);
+dcl  ONE_MINUTE fixed binary static options (constant) initial (60);
+
+dcl  NL character (1) static options (constant) initial ("
+");
+dcl  WHITESPACE character (5) static options (constant) initial (" 	
+");						/* SP HT NL VT FF */
+
+dcl  INITIAL_IMFT_RATE fixed binary static options (constant) initial (4800);
+
+dcl  LISTEN_COMMAND_LEVEL fixed binary static options (constant) initial (1);
+						/* command entered from iodd_listen_ with a ready device */
+
+dcl  (
+     error_table_$ai_outside_common_range,
+     error_table_$action_not_performed,
+     error_table_$bad_conversion,
+     error_table_$fatal_error,
+     error_table_$inconsistent,
+     error_table_$noarg,
+     error_table_$unimplemented_version
+     ) fixed binary (35) external;
+
+dcl  (
+     imft_et_$cant_get_channel_names,
+     imft_et_$computed_ceiling_mismatch,
+     imft_et_$explicit_ceiling_mismatch,
+     imft_et_$explicit_floor_mismatch,
+     imft_et_$non_matching_ids,
+     imft_et_$non_matching_passwords,
+     imft_et_$non_matching_versions,
+     imft_et_$process_authorization_too_low,
+     imft_et_$reply_pending
+     ) fixed binary (35) external;
+
+dcl  add_char_offset_ entry (ptr, fixed bin (21)) returns (ptr) reducible;
+dcl  aim_check_$equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  aim_check_$greater entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  aim_check_$greater_or_equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  compute_common_aim_ceiling_ entry (pointer, bit (72) aligned, pointer, bit (72) aligned, fixed binary (35));
+dcl  continue_to_signal_ entry (fixed binary (35));
+dcl  convert_aim_attributes_ entry (bit (72) aligned, character (32) aligned);
+dcl  convert_authorization_$from_string entry (bit (72) aligned, character (*), fixed binary (35));
+dcl  convert_authorization_$to_string_short entry (bit (72) aligned, character (*), fixed binary (35));
+dcl  convert_dial_message_$return_io_module
+	entry (fixed bin (71), char (*), char (*), fixed bin, 1 aligned, 2 bit (1) unal, 2 bit (1) unal, 2 bit (1) unal,
+	2 bit (33) unal, fixed bin (35));
+dcl  cv_dec_check_ entry (character (*), fixed binary (35)) returns (fixed binary (35));
+dcl  dial_manager_$allow_dials entry (ptr, fixed bin (35));
+dcl  dial_manager_$shutoff_dials entry (ptr, fixed bin (35));
+dcl  expand_pathname_$component entry (character (*), character (*), character (*), character (*), fixed binary (35));
+dcl  date_time_$format entry (char (*), fixed bin (71), char (*), char (*)) returns (char (250) var);
+dcl  get_authorization_ entry () returns (bit (72) aligned);
+dcl  get_ring_ entry () returns (fixed bin (3));
+dcl  get_system_aim_attributes_ entry (pointer, character (8), pointer, fixed binary (35));
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  imft_convert_status_code_$decode entry (fixed binary (35)) returns (fixed binary (35));
+dcl  imft_convert_status_code_$encode entry (fixed binary (35)) returns (fixed binary (35));
+dcl  imft_pnt_interface_$get_system_password entry (character (*), character (8) aligned, fixed binary (35));
+dcl  imft_receive_object_ entry (pointer, pointer, fixed binary (35));
+dcl  imft_transmit_object_ entry (pointer, pointer, pointer, fixed binary (35));
+dcl  imft_transmit_object_$abort_running_request entry (character (*));
+dcl  initiate_file_$component
+	entry (character (*), character (*), character (*), bit (*), pointer, fixed binary (24), fixed binary (35));
+dcl  iodd_command_processor_ entry (fixed binary, fixed binary, character (*), fixed binary (35));
+dcl  iodd_hangup_ entry (ptr);
+dcl  iodd_listen_ entry (pointer);
+dcl  iodd_msg_ entry () options (variable);
+dcl  iodd_parse_$args entry (char (*) var, char (*)) returns (char (256) var);
+dcl  iodd_quit_handler_ entry ();
+dcl  iodd_quit_handler_$command_level entry ();
+dcl  iox_$attach_ioname entry (character (*), pointer, character (*), fixed binary (35));
+dcl  iox_$close entry (pointer, fixed binary (35));
+dcl  iox_$control entry (pointer, character (*), pointer, fixed binary (35));
+dcl  iox_$detach_iocb entry (pointer, fixed binary (35));
+dcl  iox_$destroy_iocb entry (ptr, fixed bin (35));
+dcl  iox_$open entry (pointer, fixed binary, bit (1) aligned, fixed binary (35));
+dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  ipc_$decl_ev_wait_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  pathname_$component entry (character (*), character (*), character (*)) returns (character (194));
+dcl  requote_string_ entry (character (*)) returns (character (*));
+dcl  system_privilege_$initiate entry ();
+dcl  terminate_file_ entry (pointer, fixed binary (24), bit (*), fixed binary (35));
+dcl  timer_manager_$sleep entry (fixed binary (71), bit (2));
+dcl  translate_aim_attributes_ entry (pointer, bit (72) aligned, pointer, bit (72) aligned, fixed binary (35));
+
+dcl  (cleanup, daemon_idle, daemon_logout, daemon_new_device, daemon_slave_logout, linkage_error, imft_debug_,
+     imft_remote_logout_, imft_resynchronize_driver_, no_coord, quit, re_init, resume) condition;
+
+dcl  (addr, before, clock, convert, currentsize, divide, index, length, ltrim, null, rtrim, substr) builtin;
+%page;
+%include access_mode_values;
+%page;
+%include aim_attributes;
+%page;
+%include condition_info;
+%page;
+%include dial_manager_arg;
+%page;
+%include driver_ptr_list;
+%page;
+%include driver_status;
+%page;
+%include event_wait_channel;
+%include event_wait_info;
+%page;
+%include "_imft_cri";
+%page;
+%include "_imft_driver_info";
+%page;
+%include "_imft_fis_info";
+%page;
+%include "_imft_ft_request";
+%page;
+%include "_imft_get_channel_names";
+%page;
+%include "_imft_std_commands";
+%page;
+%include iod_constants;
+%page;
+%include iod_tables_hdr;
+%page;
+%include iodd_msg_constants;
+%page;
+%include iodd_static;
+%page;
+%include iox_modes;
+%page;
+%include mseg_message_info;
+%page;
+%include queue_msg_hdr;
+%page;
+%include request_descriptor;
+%page;
+%include set_term_type_info;
+%include terminal_info;
+%page;
+%include terminate_file;
+%page;
+%include timer_manager_constants;
+%page;
+%include tty_read_status_info;
+
+     end imft_driver_;

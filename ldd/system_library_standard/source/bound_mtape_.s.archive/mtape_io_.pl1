@@ -1,0 +1,915 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-08-17,GWMay), approve(87-09-09,MECR0006),
+     audit(87-09-04,Farley), install(87-09-09,MR12.1-1101):
+     Added cleanup handlers and code check returns.
+  2) change(87-10-19,GWMay), approve(87-10-19,MCR7779), audit(87-11-02,Farley),
+     install(87-11-30,MR12.2-1006):
+     Formally install MECR0006.
+  3) change(88-06-28,Farley), approve(88-10-06,MCR7938),
+     audit(88-10-06,Fawcett), install(88-10-10,MR12.2-1152):
+     Modified buffer allocation to only allocate one I/O buffer when
+     reading in large records (> 4096 words).  Having more than one will
+     allow tape_ioi_ to attempt chained I/O, which can result in a hardware
+     channel error of "Incorrect DCW during list service"..
+                                                   END HISTORY COMMENTS */
+
+
+mtape_io_: procedure;
+
+/* format: style4 */
+
+/* *	This program is part of the mtape_ I/O module and as such is not
+   *	called directly by users, but through the iox_ I/O system.
+   *	This module implements the physical tape interface for the Per-Format
+   *	modules.
+   *
+   *	Modification History:
+   *
+   *	Created by J. A. Bush 10/05/82
+   *	Modified by J. A. Bush 12/01/83 for performance improvements
+*/
+
+/*		ARGUMENT DATA		*/
+
+dcl  arg_mtdp ptr;					/* Pointer to the mtape data structure */
+dcl  arg_code fixed bin (35);				/* Return error code */
+dcl  arg_lr_ptr ptr;				/* Pointer to current label record structure */
+dcl  arg_buf_size fixed bin (21);			/* Requested length of users buffer */
+dcl  arg_order char (*);				/* Control order mnemonic */
+dcl  arg_mode char (*);				/* Mode mnemonic for set_mode entry */
+dcl  arg_index fixed bin;				/* Mode index for set_mode entry */
+dcl  arg_repeat_cnt fixed bin;			/* Control order repeat count */
+dcl  arg_infop ptr;					/* Control order info pointer */
+dcl  arg_mode_ptr ptr;				/* Mode info ptr for set_mode entry */
+
+/*		AUTOMATIC DATA		*/
+
+dcl  (infop, mode_ptr) ptr;
+dcl  (label_len, act_length) fixed bin (21);
+dcl  (code, scode, unr_code) fixed bin (35);
+dcl  (oidx, rx, req_buffers, repeat_cnt, descrep_cnt, act_cnt, i, n_rdy_bufs, n_qed_bufs, alloc_tries) fixed bin;
+dcl  spec_status bit (36) aligned;
+dcl  order char (4);
+dcl  1 auto_ths like ths aligned;
+
+/*		CONSTANT DATA		*/
+
+dcl  LC char (26) int static options (constant) init
+	("abcdefghijklmnopqrstuvwxyz");
+dcl  UC char (26) int static options (constant) init
+	("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+dcl  HDW_MODE_STR (6) char (4) int static options (constant) init
+	("bin", "tap9", "bcd", "asc", "ebc", "a/e");
+dcl  WRITE_IO fixed bin int static options (constant) init (2);
+dcl  BYTES_PER_DCW fixed bin int static options (constant) init (4 * 4096);
+dcl  BYTES_PER_WORD fixed bin int static options (constant) init (4);
+dcl  LENGTH_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+dcl  ALIGN_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+dcl  RECOVERY_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+dcl  WAIT_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+dcl  (WAIT init ("1"b),				/* wait for order to complete */
+     NO_WAIT init ("0"b),				/* do not wait for order to complete */
+     FORWARD init ("1"b),				/* space files/blocks forward */
+     BACKWARD init ("0"b)				/* space files/blocks backward */
+     ) bit (1) aligned int static options (constant);
+
+dcl  order_mnemonics (0:22) char (4) static options (constant)
+	init ("bsf", "bsr", "fsf", "fsr", "eof", "ers", "dse", "rew", "run", "lod", "rqs",
+	"rss", "rqd", "rsd", "den", "per", "pro", "rsv", "rel", "rcr", "wcr", "rwnw", "runw");
+
+dcl  mode_mnemonics (0:6) char (8) static options (constant) init
+	("data", "length", "align", "recovery", "wait", "event", "cif");
+
+/*		EXTERNAL STATIC DATA	*/
+
+dcl  error_table_$end_of_info fixed bin (35) ext static;
+dcl  error_table_$eov_on_write fixed bin (35) ext static;
+dcl  error_table_$buffer_big fixed bin (35) ext static;
+dcl  error_table_$device_not_active fixed bin (35) ext static;
+dcl  error_table_$nine_mode_parity fixed bin (35) ext static;
+dcl  error_table_$positioned_on_bot fixed bin (35) ext static;
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  mtape_dev_attention_recovery condition;
+dcl  cleanup condition;
+
+/*		BUILTIN FUNCTIONS		*/
+
+dcl  (addr, copy, divide, hbound, lbound, mod, null, translate) builtin;
+
+/*		EXTERNAL ENTRIES		*/
+
+dcl  ascii_to_ebcdic_ entry (char (*), char (*));
+dcl  ebcdic_to_ascii_ entry (char (*), char (*));
+dcl  ascii_to_bcd_ entry (char (*), bit (*));
+dcl  bcd_to_ascii_ entry (bit (*), char (*));
+dcl  mtape_util_$error entry options (variable);
+dcl  mtape_mount_cntl_$mount entry (ptr, fixed bin (35));
+dcl  mtape_check_status_ entry (ptr, fixed bin (35));
+
+/*		BASED VARIABLES		*/
+
+dcl  based_label char (label_len) based (mtape_label_record.lab_ptr);
+dcl  based_bits bit (label_len * 6) based;
+dcl  based_area area based (mtape_data.areap);
+dcl  blk_pad char (mtape_data.remain) based (addr (tape_blk (mtape_data.processed + 1))) unaligned;
+%page;
+/* read_block - entry to read the next block from the tape */
+
+read_block: entry (arg_mtdp, arg_code);
+
+	call SETUP;				/* setup our enviornment */
+	call UNLOAD_LREC_CNT;			/* Update block/lrec history */
+	on mtape_dev_attention_recovery begin;		/* set up condition handler */
+	     call tape_ioi_$read (mtape_data.tioi_id, mtape_data.cur_buf_ptr, mtape_data.length, rx, code);
+	     call CHECK_RX;				/* go check result index */
+	     if code = 0 then do;			/* if no error.. */
+		call mtape_util_$error (mtdp, 0, "^[Device Attention^;Power Off^] recovery successful.",
+		     mtape_vol_set.dev_att_retry);
+		mtape_vol_set.pwr_off_retry, mtape_vol_set.dev_att_retry = "0"b; /* reset flags */
+	     end;
+	     go to continue_read;			/* take non-local goto to get out of condition */
+	end;
+	call tape_ioi_$read (mtape_data.tioi_id, mtape_data.cur_buf_ptr, mtape_data.length, rx, code);
+	call CHECK_RX;				/* go check result index */
+continue_read:					/* target of non-local goto */
+	if code = 0 then do;			/* if no error.. */
+	     if mtape_data.length > mtape_data.block_size then /* eliminate obvious padding */
+		mtape_data.length = mtape_data.block_size;
+	     mtape_data.position.phy_block = mtape_data.position.phy_block + 1; /* increment block number */
+	     mtape_data.processed = mtape_data.buffer_offset; /* prime buffer variables */
+	     mtape_data.log_record_ptr = addr (tape_blk (mtape_data.processed + 1));
+	     mtape_data.remain = mtape_data.length - mtape_data.processed;
+	end;
+
+	arg_code = code;				/* return error code */
+	return;
+%page;
+/* write_block - entry to write the current block to tape */
+
+write_block: entry (arg_mtdp, arg_code);
+
+	call SETUP;				/* setup our environment */
+	mtape_data.position.phy_block = mtape_data.position.phy_block + 1; /* increment block number */
+	call UNLOAD_LREC_CNT;			/* save block/log record history */
+	if mtape_data.hdw_mode = MTAPE_HWM_BIN then do;	/* if writing in binary, must pad mod 4 */
+	     mtape_data.remain = mod (mtape_data.processed, BYTES_PER_WORD);
+	     if mtape_data.remain ^= 0 then do;		/* Have to pad block? */
+		mtape_data.remain = BYTES_PER_WORD - mtape_data.remain; /* get bytes to add */
+		blk_pad = copy (mtape_data.padding_char, mtape_data.remain); /* yes, do it */
+		mtape_data.processed = mtape_data.processed + mtape_data.remain;
+	     end;
+	end;
+	if ^mtape_data.run then do;			/* if no I/O currently queued */
+	     mtape_data.buf_len (mtape_data.cur_buf_idx) = mtape_data.processed; /* copy length to be written */
+	     mtape_data.cur_buf_idx = mtape_data.cur_buf_idx + 1; /* increment buffer index */
+	     if mtape_data.cur_buf_idx > mtape_data.bufs_per_subset then do; /* its time to write the subset */
+		do i = lbound (mtape_data.buf_ptrs, 1) to mtape_data.bufs_per_subset; /* queue half of the buffers */
+
+		     call tape_ioi_$queue_write (mtape_data.tioi_id, mtape_data.buf_ptrs (i),
+			mtape_data.buf_len (i), code);
+		     if code ^= 0 then do;		/* error from queue_write */
+			call mtape_util_$error (mtdp, code, /* report it */
+			     "Error from tape_ioi_$queue_write (^run) queuing buffer ^p, length ^d",
+			     mtape_data.buf_ptrs (i), mtape_data.buf_len (i));
+			go to write_block_return;	/* return on error */
+		     end;
+		end;
+		call tape_ioi_$list_buffers (mtape_data.tioi_id, READY_STATE, mtape_data.buf_ptrs, n_rdy_bufs, code);
+		if code ^= 0 then do;		/* error from list_buffers */
+		     call mtape_util_$error (mtdp, code,/* report it */
+			"Error from tape_ioi_$list_buffers");
+		     go to write_block_return;
+		end;
+		mtape_data.run = "1"b;		/* We now have I/O going */
+		mtape_data.cur_buf_idx = lbound (mtape_data.buf_ptrs, 1);
+	     end;
+	     mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (mtape_data.cur_buf_idx); /* set for current buffer */
+	end;
+	else do;					/* buffers have been queued and are running */
+	     call tape_ioi_$queue_write (mtape_data.tioi_id, mtape_data.cur_buf_ptr, mtape_data.processed, code);
+	     if code ^= 0 then do;
+		call mtape_util_$error (mtdp, code,
+		     "Error from tape_ioi_$queue_write (run mode), queueing buffer at ^p, length ^d",
+		     mtape_data.cur_buf_ptr, mtape_data.processed);
+		go to write_block_return;
+	     end;
+	     call tape_ioi_$list_buffers (mtape_data.tioi_id, QUEUED_STATE, mtape_data.buf_ptrs, n_qed_bufs, code);
+	     if code ^= 0 then do;			/* error from list_buffers */
+		call mtape_util_$error (mtdp, code,	/* report it */
+		     "Error from tape_ioi_$list_buffers (QUEUED_STATE).");
+		go to write_block_return;
+	     end;
+	     if n_qed_bufs < mtape_data.nbufs then do;	/* all buffers not full? */
+		call tape_ioi_$list_buffers (mtape_data.tioi_id, READY_STATE, mtape_data.buf_ptrs, n_rdy_bufs, code);
+		if code ^= 0 then do;		/* error from list_buffers */
+		     call mtape_util_$error (mtdp, code,/* report it */
+			"Error from tape_ioi_$list_buffers (READY_STATE).");
+		     go to write_block_return;
+		end;
+	     end;
+	     else do;				/* all buffers full, check oldest */
+
+/* Establish condition handler for recovery of DEV ATTENTION and PWR OFF statuses */
+
+		on mtape_dev_attention_recovery go to feov_target; /* take non-local goto to flush out buffers */
+
+		call tape_ioi_$check_write (mtape_data.tioi_id, mtape_data.buf_ptrs (1), rx, code);
+		if rx ^= 0 then do;
+		     call CHECK_RX;
+		     go to write_block_return;
+		end;
+	     end;
+	     mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (1); /* let user fill this one */
+	end;
+	mtape_data.processed = mtape_data.buffer_offset;	/* prime buffer variables */
+	mtape_data.log_record_ptr = addr (tape_blk (mtape_data.processed + 1));
+	mtape_data.remain = mtape_data.buf_size - mtape_data.processed;
+	if mtape_data.force_end_of_volume then		/* if feov cntl op has been executed.. */
+	     go to feov_target;			/* take non-local goto to flush buffers entry */
+
+write_block_return:
+	arg_code = code;				/* return error code */
+	return;
+%page;
+/* flush_buffers - entry to queue up and wait for all buffers to be written out */
+
+flush_buffers: entry (arg_mtdp, arg_code);
+
+	call SETUP;				/* set up our environment */
+	if ^mtape_vol_set.volume_end then		/* if we havn't reached end of volume yet, */
+	     if mtape_data.nbufs > 0 then do;		/* and we have allocated buffers */
+		on mtape_dev_attention_recovery go to feov_target;
+feov_target:					/* target of non-local goto */
+						/* the recovery may fail so return here on nz code */
+
+		if code ^= 0 then
+		     go to flush_bufs_return;
+
+		if mtape_data.cur_buf_idx > lbound (mtape_data.buf_ptrs, 1) then /* if we have un-queued buffers */
+		     do i = lbound (mtape_data.buf_ptrs, 1) to mtape_data.cur_buf_idx - 1; /* do it now */
+		     call tape_ioi_$queue_write (mtape_data.tioi_id, all_buf_ptrs (i), all_buf_lens (i), code);
+		     if code ^= 0 then do;		/* error from queue_write */
+			call mtape_util_$error (mtdp, code, /* report it */
+			     "Error from tape_ioi_$queue_write (flush) queuing buffer ^p, length ^d",
+			     all_buf_ptrs (i), all_buf_lens (i));
+			go to flush_bufs_return;	/* return on error */
+		     end;
+		end;
+		rx, code = 0;
+		do while (code = 0 & rx = 0);		/* do until no more buffers */
+		     call tape_ioi_$check_write (mtape_data.tioi_id, null, rx, code);
+		end;
+		if code = error_table_$device_not_active then /* all I/O is finished */
+		     code, rx = 0;
+		else call CHECK_RX;			/* otherwise check the error */
+		if code = 0 then do;		/* if no error */
+		     mtape_data.run = "0"b;		/* I/O no longer in progress */
+		     if mtape_data.phy_block = 0 then	/* called to wrt blks after volume switch */
+			mtape_data.phy_block = mtape_data.cur_buf_idx - 1; /* set blocks written */
+		     call tape_ioi_$list_buffers (mtape_data.tioi_id,
+			READY_STATE, mtape_data.buf_ptrs, n_rdy_bufs, code);
+		     if code ^= 0 then do;		/* error from list_buffers */
+			call mtape_util_$error (mtdp, code, /* report it */
+			     "Error from tape_ioi_$list_buffers (flush)");
+			go to flush_bufs_return;
+		     end;
+		     mtape_data.cur_buf_idx = lbound (mtape_data.buf_ptrs, 1); /* reset buffer index */
+		     mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (1); /* let user fill this one */
+		     mtape_data.processed = mtape_data.buffer_offset; /* prime buffer variables */
+		     mtape_data.log_record_ptr = addr (tape_blk (mtape_data.processed + 1));
+		     mtape_data.remain = mtape_data.buf_size - mtape_data.processed;
+		     if mtape_vol_set.pwr_off_retry | mtape_vol_set.dev_att_retry then do;
+			call mtape_util_$error (mtdp, 0, "^[Device Attention^;Power Off^] recovery successful.",
+			     mtape_vol_set.dev_att_retry);
+			mtape_vol_set.pwr_off_retry, mtape_vol_set.dev_att_retry = "0"b; /* reset flags */
+		     end;
+		     if mtape_data.force_end_of_volume then do; /* but feov order executed */
+			mtape_data.force_end_of_volume = "0"b; /* reset flag */
+			rx = TAPE_IO_EOT;		/* simulate EOT */
+			call CHECK_RX;
+		     end;
+		end;
+	     end;
+flush_bufs_return:
+	arg_code = code;
+	return;
+%page;
+/* allocate_buffers - entry to allocate data buffers to read or write tape blocks from/to */
+
+allocate_buffers: entry (arg_mtdp, arg_buf_size, arg_code);
+
+	call SETUP;				/* set up our environment */
+	req_buffers = hbound (mtape_data.buf_ptrs, 1) * 2;/* request 2 subsets of max size */
+	if arg_buf_size > BYTES_PER_DCW then		/* if large records */
+	     if mtape_data.last_io ^= WRITE_IO then	/* and reading tape */
+		req_buffers = 1;			/* only ask for one */
+	code = error_table_$buffer_big;		/* set code for at least one loop */
+	do alloc_tries = 1 to 2 while (code = error_table_$buffer_big);
+	     call tape_ioi_$allocate_buffers (mtape_data.tioi_id, arg_buf_size, req_buffers,
+		act_length, mtape_data.nbufs, all_buf_ptrs, code);
+	     if code = error_table_$buffer_big then	/* if he can't fit req buffs */
+		req_buffers = 0;			/* let him decide */
+	end;
+	if code ^= 0 then				/* problem allocating buffers */
+	     go to allocate_buffers_return;		/* let caller handle it */
+	if act_length < arg_buf_size then do;		/* can't allow this */
+	     code = error_table_$buffer_big;
+	     go to allocate_buffers_return;
+	end;
+	mtape_data.buf_size = act_length;		/* save allocated buffer length */
+	mtape_data.bufs_per_subset = divide (mtape_data.nbufs, 2, 17, 0); /* subset is <= 1/2 of buffers */
+	if mtape_data.bufs_per_subset = 0 then		/* but we must have at least 1 buffer */
+	     mtape_data.bufs_per_subset = 1;
+	mtape_data.cur_buf_idx = lbound (mtape_data.buf_ptrs, 1);
+	mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (mtape_data.cur_buf_idx);
+	call set_mode (mtdp, "data", mtape_data.hdw_mode, null, code); /* set desired HW mode */
+	if code = 0 then
+	     call set_mode (mtdp, "length", mtape_data.length_mode, null, code); /* and length mode */
+allocate_buffers_return:
+	arg_code = code;				/* return error code */
+	return;
+%page;
+/* write_label - entry to copy contents of label record to an ioi_ buffer and initiate a sync write */
+
+write_label: entry (arg_mtdp, arg_lr_ptr, arg_code);
+
+	call SETUP;				/* set up our environment */
+	mtape_data.last_io = 0;			/* indicates not data I/O */
+	lr_ptr = arg_lr_ptr;
+
+	if mtape_data.lab_bufp = null then do;		/* first label I/O? */
+	     call ALLOCATE_LABEL_BUFFER (mtape_label_record.lab_length); /* yes, get one allocated */
+	     if code ^= 0 then			/* if fatal error.. */
+		go to write_label_return;		/* let caller handle it */
+	end;
+	label_len = mtape_label_record.lab_length;	/* copy length */
+	if mtape_label_record.conversion = MTAPE_CV_UC_ASCII | /* if label to be converted to upper case */
+	     mtape_label_record.conversion = MTAPE_CV_UC_EBCDIC then /* convert in place */
+	     based_label = translate (based_label, UC, LC);
+	on mtape_dev_attention_recovery go to wcopy_label_end;
+	go to wcopy_label (mtape_label_record.conversion);/* copy label and convert if neccessary */
+
+wcopy_label (1):					/* No conversion, copy as is */
+wcopy_label (4):					/* Convert to upper case ASCII */
+	mtape_data.lab_bufp -> based_label = based_label;
+	go to wcopy_label_end;
+wcopy_label (2):					/* Copy and convert to EBCDIC */
+wcopy_label (5):					/* Copy and convert to upper case EBCDIC */
+	call ascii_to_ebcdic_ (based_label, mtape_data.lab_bufp -> based_label);
+	go to wcopy_label_end;
+wcopy_label (3):					/* Copy and convert to BCD */
+	call ascii_to_bcd_ (based_label, mtape_data.lab_bufp -> based_bits);
+	label_len = divide (label_len * 6, 9, 21, 0);	/* recompute length */
+wcopy_label_end:
+	on mtape_dev_attention_recovery goto wcopy_label_retry;
+
+wcopy_label_retry:
+	call set_mode (mtdp, "data", mtape_label_record.mode, null, code); /* make sure we are writing in right mode */
+	if code ^= 0 then				/* if fatal error let user handle it */
+	     go to write_label_return;
+	call tape_ioi_$queue_write (mtape_data.tioi_id, mtape_data.lab_bufp, label_len, code);
+	if code = 0 then do;			/* if everything ok.. */
+	     call tape_ioi_$check_write (mtape_data.tioi_id, mtape_data.lab_bufp, rx, code);
+	     call CHECK_RX;				/* go check result index */
+	     if code = 0 then
+		mtape_data.phy_block = mtape_data.phy_block + 1; /* increment block number */
+	end;
+write_label_return:
+	arg_code = code;
+	return;					/* return to caller */
+%page;
+/* read_label - entry to initiate a sync read for a label record and put it into the indicated buffer,
+   converted if necessary */
+
+read_label: entry (arg_mtdp, arg_lr_ptr, arg_code);
+
+	call SETUP;				/* set up our environment */
+	mtape_data.last_io = 0;			/* indicates not data I/O */
+	lr_ptr = arg_lr_ptr;
+	if mtape_data.lab_bufp = null then do;		/* first label I/O? */
+	     call ALLOCATE_LABEL_BUFFER (mtape_label_record.lab_length); /* yes, get one allocated */
+	     if code ^= 0 then			/* if fatal error.. */
+		go to read_label_return;		/* let caller handle it */
+	end;
+	on mtape_dev_attention_recovery go to read_label_retry;
+read_label_retry:
+	call set_mode (mtdp, "data", mtape_label_record.mode, null, code); /* make sure we are reading in right mode */
+	if code ^= 0 then				/* if fatal error.. */
+	     go to read_label_return;			/* let caller handle it */
+	call tape_ioi_$queue_read (mtape_data.tioi_id, mtape_data.lab_bufp, code);
+	if code ^= 0 then				/* if fatal error.. */
+	     go to read_label_return;			/* let caller handle it */
+	call tape_ioi_$check_read (mtape_data.tioi_id, mtape_data.lab_bufp, label_len, rx, code);
+	call CHECK_RX;
+	if code ^= 0 then				/* if some error */
+	     go to read_label_return;			/* let caller handle it */
+	mtape_data.phy_block = mtape_data.phy_block + 1;	/* increment block number */
+	go to rcopy_label (mtape_label_record.conversion);/* convert label if necessary */
+
+rcopy_label (1):					/* No conversion */
+rcopy_label (4):					/* convert to upper case ASCII (write only) */
+	based_label = mtape_data.lab_bufp -> based_label; /* copy directly */
+	go to rcopy_label_end;
+rcopy_label (2):					/* convert EBCDIC to ASCII */
+rcopy_label (5):					/* convert to upper case ASCII (write only) */
+	call ebcdic_to_ascii_ (mtape_data.lab_bufp -> based_label, based_label);
+	go to rcopy_label_end;
+rcopy_label (3):					/* convert BCD to ASCII */
+	call bcd_to_ascii_ (mtape_data.lab_bufp -> based_bits, based_label);
+	label_len = divide (label_len * 9, 6, 21, 0);	/* adjust label length */
+rcopy_label_end:
+	mtape_label_record.lab_length = label_len;	/* set length of label */
+read_label_return:
+	arg_code = code;
+	return;
+%page;
+/* order - entry to issue tape control orders (e.g. positioning commands),
+   on behalf of the Per-Format modules */
+
+order: entry (arg_mtdp, arg_order, arg_repeat_cnt, arg_infop, arg_code);
+
+	call SETUP;				/* set up our environment */
+	order = arg_order;				/* copy the rest of the arguments */
+	repeat_cnt = arg_repeat_cnt;
+	infop = arg_infop;
+	do oidx = hbound (order_mnemonics, 1) to lbound (order_mnemonics, 1) by -1
+	     while (order_mnemonics (oidx) ^= arg_order); /* get the order index */
+	end;
+	go to PROC_ORDER (oidx);			/* and go process it */
+
+PROC_ORDER (-1):					/* unknown order */
+	code = error_table_$bad_arg;			/* set appropriate error code */
+	go to order_return;
+
+PROC_ORDER (0):					/* backspace file */
+	call SPACE_FILE (BACKWARD);			/* correct for position and do the order */
+	go to order_return;
+
+PROC_ORDER (1):					/* backspace record (block) */
+	call SPACE_BLOCK (BACKWARD);			/* correct for position and do the order */
+	go to order_return;
+
+PROC_ORDER (2):					/* forward space file */
+	call SPACE_FILE (FORWARD);			/* correct for position and do the order */
+	go to order_return;
+
+PROC_ORDER (3):					/* forward space record (block) */
+	call SPACE_BLOCK (FORWARD);			/* correct for position and do the order */
+	go to order_return;
+
+PROC_ORDER (4):					/* write end of file mark */
+	on mtape_dev_attention_recovery go to RETRY_WEOF; /* establis condition handler */
+	do while (repeat_cnt > 0);			/* write requested EOFs */
+	     call tape_ioi_$order (mtape_data.tioi_id, order, repeat_cnt, null, act_cnt, rx, code);
+	     mtape_data.phy_file = mtape_data.phy_file + act_cnt; /* increment file count */
+	     repeat_cnt = repeat_cnt - act_cnt;
+	     call CHECK_RX;				/* go check the result index */
+	     if code ^= 0 then			/* if error */
+		if code ^= error_table_$eov_on_write then /* if not EOT */
+		     go to order_return;		/* return the error */
+		else code = 0;			/* EOT is not error in this case */
+RETRY_WEOF:
+	end;
+	mtape_data.phy_block = 0;			/* reset block position to 0 */
+	go to order_return;
+
+PROC_ORDER (5):					/* erase */
+PROC_ORDER (6):					/* data security erase */
+	call RESOLVE_POSITION;			/* make sure we are positioned where we think we are */
+	if code = 0 then				/* if no error yet */
+	     call DO_ORDER (order, repeat_cnt);		/* do the requested order */
+	go to order_return;
+
+PROC_ORDER (7):					/* rewind */
+PROC_ORDER (8):					/* rewind unload */
+	call REWIND_PROC (order, WAIT);		/* do it all from this subroutine */
+	go to order_return;
+
+PROC_ORDER (21):					/* "rwnw", rewind no wait */
+	call REWIND_PROC ("rew", NO_WAIT);		/* do it all from this subroutine */
+	go to order_return;
+
+PROC_ORDER (22):					/* "runw", rewind unload no wait */
+	call REWIND_PROC ("run", NO_WAIT);		/* do it all from this subroutine */
+	go to order_return;
+
+PROC_ORDER (14):					/* set density */
+	call REWIND_PROC ("rew", WAIT);		/* rewind the tape first */
+	if code = 0 then				/* if no error on rewind.. */
+	     call DO_ORDER (order, repeat_cnt);		/* go do the density order */
+	go to order_return;
+
+/* The following control orders require no special action, except that the tape must be stopped first */
+
+PROC_ORDER (9):					/* load tape */
+PROC_ORDER (10):					/* request status */
+PROC_ORDER (11):					/* reset status */
+PROC_ORDER (12):					/* request device status */
+PROC_ORDER (13):					/* reset device status */
+PROC_ORDER (15):					/* set file protect */
+PROC_ORDER (16):					/* set file permit */
+PROC_ORDER (17):					/* reserve device */
+PROC_ORDER (18):					/* release device */
+PROC_ORDER (19):					/* read control registers */
+PROC_ORDER (20):					/* write control registers */
+	call STOP_TAPE;				/* stop the tape drive */
+	if code = 0 then				/* if no errors stopping the tape */
+	     call DO_ORDER (order, repeat_cnt);		/* then do the control order */
+
+order_return:
+	arg_code = code;
+	return;
+%page;
+/* set_mode - entry to allow PFMs to set tape_ioi_ modes */
+
+set_mode: entry (arg_mtdp, arg_mode, arg_index, arg_mode_ptr, arg_code);
+
+	call SETUP;				/* set up our enviornment */
+	mode_ptr = arg_mode_ptr;
+	arg_code = 0;
+	do oidx = hbound (mode_mnemonics, 1) to lbound (mode_mnemonics, 1) by -1
+	     while (mode_mnemonics (oidx) ^= arg_mode);	/* get the mode index */
+	end;
+	go to PROC_MODE (oidx);			/* go process correct mode */
+
+PROC_MODE (-1):					/* unknown mode */
+	arg_code = error_table_$bad_arg;
+	return;
+
+PROC_MODE (0):					/* set data mode */
+	mode_ptr = addr (HDW_MODE_STR (arg_index));	/* set desired data mode */
+	go to PROC_MODE_END;
+
+PROC_MODE (1):					/* set length mode */
+	mode_ptr = addr (LENGTH_MODES (arg_index));
+	go to PROC_MODE_END;
+
+PROC_MODE (2):					/* set alignment mode */
+	mode_ptr = addr (ALIGN_MODES (arg_index));
+	go to PROC_MODE_END;
+
+PROC_MODE (3):					/* set data recovery mode */
+	mode_ptr = addr (RECOVERY_MODES (arg_index));
+	go to PROC_MODE_END;
+
+PROC_MODE (4):					/* set wait mode */
+	mode_ptr = addr (WAIT_MODES (arg_index));
+	go to PROC_MODE_END;
+
+PROC_MODE (5):					/* set event channel, mode_ptr already set */
+PROC_MODE (6):					/* set recovery channel instruction field */
+PROC_MODE_END:
+	call tape_ioi_$set_mode (mtape_data.tioi_id, arg_mode, mode_ptr, arg_code); /* set the mode */
+	return;
+%page;
+/* stop_tape - entry to stop tape motion and syncronize position */
+
+stop_tape: entry (arg_mtdp, arg_code);
+
+	call SETUP;				/* set up our enviornment */
+	if mtape_data.nbufs > 0 & (mtape_file_info.position_within_file = AT_BOFD |
+	     mtape_file_info.position_within_file = AT_IFD) then do; /* don't bother if buffers not allocated */
+	     call STOP_TAPE;			/* stop the tape and get the last status */
+	     if ths.major = END_OF_FILE & descrep_cnt > 0 then do; /* if end of file status */
+		mtape_data.position.phy_file = mtape_data.position.phy_file + 1; /* increment file # */
+		mtape_data.position.phy_block = 0;	/* and zero out block number */
+		mtape_file_info.position_within_file = AT_BOFT;
+	     end;
+	     else mtape_data.position.phy_block = mtape_data.position.phy_block + descrep_cnt;
+	end;
+	return;
+%page;
+/* ALLOCATE_LABEL_BUFFER - internal procedure to allocate and reserve a sync buffer for reading and writing labels */
+
+ALLOCATE_LABEL_BUFFER: proc (buf_len);
+
+dcl  buf_len fixed bin;
+dcl  act_length fixed bin (21);
+dcl  act_number fixed bin;
+dcl  lbuf_arrayp (1) ptr;
+
+	call tape_ioi_$allocate_buffers (mtape_data.tioi_id, (buf_len), 1, act_length, act_number, lbuf_arrayp, code);
+	if code ^= 0 then return;			/* return on fatal error */
+	call tape_ioi_$reserve_buffer (mtape_data.tioi_id, lbuf_arrayp (1), code); /* reserve the buffer */
+	if code ^= 0 then return;			/* return on fatal error */
+	mtape_data.lab_bufp = lbuf_arrayp (1);		/* copy label buffer ptr */
+	mtape_data.lab_buf_len = buf_len;		/* set label buffer length */
+
+     end ALLOCATE_LABEL_BUFFER;
+%page;
+/* RESOLVE_POSITION - subroutine to correct position resulting from reading ahead/writing behind */
+
+RESOLVE_POSITION: proc;
+
+	if mtape_data.nbufs > 0 then do;		/* don't bother if buffers not allocated */
+	     call STOP_TAPE;			/* stop the tape and get the last status */
+	     if ths.major = END_OF_FILE then do;	/* if end of file status */
+		descrep_cnt = descrep_cnt - 1;	/* decrease descrepency count */
+		call DO_ORDER ("bsf", 1);		/* and backspace across file mark */
+	     end;
+	     if descrep_cnt > 0 then			/* if we are not already where we should be */
+		call DO_ORDER ("bsr", descrep_cnt);	/* backspace this many blocks */
+	end;
+
+     end RESOLVE_POSITION;
+%page;
+/* REWIND_PROC - subroutine to stop tape, rewind tape and wait for special */
+
+REWIND_PROC: proc (rew_order, wait);
+
+dcl  rew_order char (4);				/* either "rew" or "run" */
+dcl  wait bit (1) aligned;
+
+	mtape_data.phy_file, mtape_data.phy_block = 0;	/* reset position */
+	on mtape_dev_attention_recovery go to WAIT_FOR_REWIND; /* wait for special on recovery */
+
+	on cleanup begin;
+	     call tape_ioi_$order (mtape_data.tioi_id, "rdy", 0, addr (spec_status), act_cnt, rx, code);
+	     call CHECK_RX;				/* if already rewinding, wait until complete */
+	end;
+
+	call tape_ioi_$stop_tape (mtape_data.tioi_id, descrep_cnt, rx, code); /* stop the tape first */
+	call CHECK_RX;				/* check the result index */
+	if code ^= 0 then				/* if error */
+	     return;
+	call tape_ioi_$order (mtape_data.tioi_id, "rdy", 0, addr (spec_status), act_cnt, rx, code);
+	call CHECK_RX;				/* if already rewinding, wait until complete */
+	if code ^= 0 then				/* if error */
+	     return;
+	call tape_ioi_$order (mtape_data.tioi_id, rew_order, 0, null, act_cnt, rx, code); /* issue rewind order */
+	call CHECK_RX;				/* check the result index */
+	if code ^= 0 then				/* if error */
+	     return;
+	mtape_vol_set.volume_end = "0"b;		/* reset EOV flag in vol set structure */
+	if wait then do;				/* user wants to wait for rewind to complete */
+WAIT_FOR_REWIND:
+	     call tape_ioi_$order (mtape_data.tioi_id, "rdy", 0, addr (spec_status), act_cnt, rx, code);
+	     call CHECK_RX;				/* wait for special interrupt & check the result index */
+						/* set the density after rewind.    */
+	     if vs_ptr ^= null then do;
+		infop = addr (mtape_vol_set.volume_density);
+		call DO_ORDER ("den", 1);
+	     end;
+	end;
+	return;
+
+     end REWIND_PROC;
+%page;
+/* SPACE_FILE - subroutine to correct position when forward/backspacing files  */
+
+SPACE_FILE: proc (direction);
+
+dcl  direction bit (1) aligned;			/* "1"b => forward space; "0"b => backspace */
+
+	if mtape_data.nbufs > 0 then do;		/* don't bother if buffers not allocated */
+	     call STOP_TAPE;			/* stop the tape and get the last status */
+
+/* if EOF status & we were not already stopped, must correct for async position */
+
+	     if ths.major = END_OF_FILE & descrep_cnt > 0 then do;
+		if direction = FORWARD then		/* forward */
+		     repeat_cnt = repeat_cnt - 1;	/* decrease repeat count by 1 */
+		else repeat_cnt = repeat_cnt + 1;	/* backspacing, must backspace 1 more */
+
+	     end;
+	end;
+	mtape_data.position.phy_block = 0;		/* reset block position */
+
+/* Note that block position is undefined if backspacing files */
+
+	if repeat_cnt = 0 then do;			/* if position adjusted to 0 .. */
+	     mtape_data.position.phy_file = mtape_data.position.phy_file + 1; /* increment file position */
+	     return;				/* don't do the order, we are already where we should be */
+	end;
+
+	call DO_ORDER (order, repeat_cnt);		/* do the order */
+	if code = error_table_$end_of_info then code = 0; /* ignore EOF status */
+	if direction = FORWARD then			/* if spacing forward */
+	     mtape_data.position.phy_file = mtape_data.position.phy_file + act_cnt; /* add files spaced */
+	else mtape_data.position.phy_file = mtape_data.position.phy_file - act_cnt; /* back, subtract files spaced */
+
+     end SPACE_FILE;
+%page;
+/* SPACE_BLOCK - subroutine to correct position when forward/backspacing records (blocks)  */
+
+SPACE_BLOCK: proc (direction);
+
+dcl  direction bit (1) aligned;			/* "1"b => forward space; "0"b => backspace */
+
+	if mtape_data.nbufs > 0 then do;		/* don't bother if buffers not allocated */
+	     call STOP_TAPE;			/* stop the tape and get the last status */
+	     if ths.major = END_OF_FILE & descrep_cnt > 0 then do; /* if end of file status */
+		if direction = FORWARD then		/* forward spacing? */
+		     if repeat_cnt >= descrep_cnt then do; /* farther than we can go */
+			mtape_data.position.phy_block = 0; /* correct position */
+			mtape_data.position.phy_file = mtape_data.position.phy_file + 1;
+			code = error_table_$end_of_info; /* return EOF status to caller */
+			return;
+		     end;
+		call DO_ORDER ("bsf", 1);		/* must backspace across file mark */
+		descrep_cnt = descrep_cnt - 1;	/* correct descrepency count */
+	     end;
+	     if direction = FORWARD then		/* if forward spacing */
+		if descrep_cnt > repeat_cnt then do;	/* but actual position is beyond desired position */
+		     order = "bsr";			/* we will actually have to backspace */
+		     repeat_cnt = (descrep_cnt - repeat_cnt) + 1; /* this many blocks to get to desired position */
+		end;
+		else repeat_cnt = repeat_cnt - descrep_cnt; /* forward, desired position is beyond actual position */
+	     else repeat_cnt = repeat_cnt + descrep_cnt;	/* backward, adjust position */
+	end;
+	call DO_ORDER (order, repeat_cnt);		/* execute the control order */
+	if code = 0 then do;
+	     if direction = FORWARD then		/* spacing forward */
+		mtape_data.position.phy_block = mtape_data.position.phy_block + arg_repeat_cnt;
+	     else mtape_data.position.phy_block = mtape_data.position.phy_block - arg_repeat_cnt;
+	end;
+
+     end SPACE_BLOCK;
+%page;
+/* CHECK_RX - internal procedure to check the result index returned by tape_ioi_ and take appropriate action */
+
+CHECK_RX: proc;
+
+	if rx = TAPE_IO_SUCCESS then			/* if no problems */
+	     return;
+	mtape_data.run = "0"b;			/* anything else has stopped I/O */
+	go to RX_ACTION (rx);			/* otherwise take appropriate action */
+
+
+RX_ACTION (-1):					/* TAPE_IO_BLOCK, we should never have to go blocked */
+RX_ACTION (1):					/* TAPE_IO_USER_PROGRAM_ERROR */
+RX_ACTION (3):					/* TAPE_IO_RECOVERABLE_IO_ERROR, error code set */
+RX_ACTION (7):					/* TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT, will lose EOT stat */
+	return;
+
+RX_ACTION (4):					/* TAPE_IO_EOF, encountered EOF mark */
+	mtape_data.position.phy_file = mtape_data.position.phy_file + 1; /* increment file number */
+	mtape_data.position.phy_block = 0;		/* reset block number */
+	code = error_table_$end_of_info;		/* set appropriate error code */
+	return;
+
+RX_ACTION (5):					/* TAPE_IO_EOT, EOT foil detected */
+	mtape_vol_set.volume_end = "1"b;		/* set EOV flag in vol set structure */
+	call SYNC_POSITION;				/* correct block count */
+	code = error_table_$eov_on_write;		/* set appropriate error code */
+	return;
+
+RX_ACTION (6):					/* TAPE_IO_BOT, backspaced into BOT */
+	code = error_table_$positioned_on_bot;		/* set appropriate error code */
+	return;
+
+RX_ACTION (8):					/* TAPE_IO_CODE_ALERT */
+	code = error_table_$nine_mode_parity;		/* set appropriate error code */
+
+RX_ACTION (2):					/* TAPE_IO_UNRECOVERABLE_IO_ERROR, error code set */
+	unr_code = code;				/* save error code */
+	call SYNC_POSITION;				/* correct the block count */
+	if mtape_data.last_io = WRITE_IO then		/* if we are writing data */
+	     mtape_data.phy_block = mtape_data.phy_block - 1; /* subtract current buffer */
+	call mtape_check_status_ (mtdp, unr_code);	/* go check the error */
+	code = unr_code;				/* copy returned error code */
+
+     end CHECK_RX;
+%page;
+/* UNLOAD_LREC_CNT - internal procedure to increment the logical record round robin counter */
+
+UNLOAD_LREC_CNT: proc;
+
+	mtape_data.tot_lrec = mtape_data.tot_lrec + mtape_data.log_record; /* increment total */
+	mtape_data.blk_rrrc (mtape_data.blk_rrcx) = mtape_data.log_record; /* save lrecs in last block */
+	mtape_data.log_record = 0;			/* reset inter-block rec count */
+	mtape_data.blk_rrcx = mtape_data.blk_rrcx + 1;	/* increment index for next block */
+	if mtape_data.blk_rrcx > hbound (mtape_data.blk_rrrc, 1) then /* if at end of RRC */
+	     mtape_data.blk_rrcx = 0;			/* reset it to top of RRC */
+
+     end UNLOAD_LREC_CNT;
+
+/* GET_HDW_STATUS - internal procedure to get the current hardware status from tape_ioi_ */
+
+GET_HDW_STATUS: proc;
+
+	ths_ptr = addr (auto_ths);			/* set pointer to auto structure */
+	ths.version = THS_VERSION;			/* set version */
+	call tape_ioi_$hardware_status (mtape_data.tioi_id, ths_ptr, scode); /* get status */
+
+     end GET_HDW_STATUS;
+
+/* STOP_TAPE - subroutine to stop the tape and get the last hardware status */
+
+STOP_TAPE: proc;
+
+	code = 0;
+	call tape_ioi_$stop_tape (mtape_data.tioi_id, descrep_cnt, rx, code);
+	call CHECK_RX;				/* check result index */
+	call GET_HDW_STATUS;			/* get the current hardware status */
+
+     end STOP_TAPE;
+%page;
+/* DO_ORDER - subroutine to execute a control order */
+
+DO_ORDER: proc (order, arg_repeat_cnt);
+
+dcl  order char (4);
+dcl  (arg_repeat_cnt, repeat_cnt) fixed bin;
+
+	code = 0;
+	repeat_cnt = arg_repeat_cnt;
+
+/* establish conditon handler */
+
+	on mtape_dev_attention_recovery go to REPEAT_ORDER;
+
+	do while (repeat_cnt > 0 & code = 0);		/* do requested orders */
+
+	     call tape_ioi_$order (mtape_data.tioi_id, order, repeat_cnt,
+		infop, act_cnt, rx, code);
+	     repeat_cnt = repeat_cnt - act_cnt;
+	     call CHECK_RX;				/* go check the result index */
+REPEAT_ORDER:
+	end;
+
+	if code ^= 0 then do;
+	     if code = error_table_$end_of_info then
+		code = 0;
+	     else
+		call mtape_util_$error (mtdp, code,
+		     "While attempting a ^a control order.", order);
+	end;
+
+	return;
+
+     end DO_ORDER;
+
+/* SYNC_POSITION - internal procedure to syncronize the position after a write err */
+
+SYNC_POSITION: proc;
+
+dcl  susp_smple (1) ptr;
+dcl  n_susp_bufs fixed bin;
+
+	call tape_ioi_$list_buffers (mtape_data.tioi_id, SUSPENDED_STATE, susp_smple, n_susp_bufs, code);
+	if code ^= 0 then do;			/* error from list_buffers */
+	     call mtape_util_$error (mtdp, code,	/* report it */
+		"Error from tape_ioi_$list_buffers");
+	     return;
+	end;
+	mtape_data.position.phy_block = mtape_data.position.phy_block - n_susp_bufs;
+
+     end SYNC_POSITION;
+%page;
+/* SETUP - internal procedure to set up environment for the external entries */
+
+SETUP: proc;
+
+	mtdp = arg_mtdp;				/* get pointers to pertinent data */
+	vs_ptr = mtape_data.vs_current;
+	fi_ptr = mtape_data.fi_current;
+	if mtape_data.tioi_id = "0"b then do;		/* should only happen if "ring_in" order executed */
+	     call mtape_mount_cntl_$mount (mtdp, code);	/* get the volume mounted */
+	     if code ^= 0 then do;
+		call mtape_util_$error (mtdp, code,
+		     "^/Attempting to mount volume ^a following ""ring_in"" control operation",
+		     mtape_vol_set.volume_name);
+		go to ERROR_RETURN;			/* take non_local goto */
+	     end;
+	     arg_mtdp = mtdp;			/* reset callers control structure ptr */
+	     free mtape_data.cmtdp -> mtape_data in (based_area); /* free the old structure */
+	     mtape_data.cmtdp = null;
+	end;
+	rx, arg_code, code = 0;			/* and reset error codes */
+
+     end SETUP;
+
+ERROR_RETURN:					/* target of non-local gotos */
+	arg_code = code;				/* copy return code */
+	return;					/* return to caller */
+%page;
+%include mtape_data;
+%page;
+%include mtape_vol_set;
+%page;
+%include mtape_label_record;
+
+%include mtape_err_stats;
+%page;
+%include mtape_file_info;
+%page;
+%include mtape_constants;
+%page;
+%include tape_ioi_dcls;
+%page;
+%include tape_ioi_buffer_status;
+%page;
+%include tape_ioi_result_indexes;
+%include tape_ioi_hw_status;
+
+     end mtape_io_;

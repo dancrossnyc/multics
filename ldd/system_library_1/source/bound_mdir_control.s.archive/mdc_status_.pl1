@@ -1,0 +1,491 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* MDC_STATUS_: Procedure that performs status operations from MDCS */
+
+/* Written April 1976 by Larry Johnson */
+/* Modified September 1977 by Larry Johnson */
+
+mdc_status_: proc;
+
+/* Parameters */
+
+dcl  arg_volume char (*);				/* Name of volume in question */
+dcl  arg_argp ptr;					/* Pointer to argument structure */
+dcl  arg_volume_datap ptr;				/* Pointer to volume_data structure returned here */
+dcl  arg_code fixed bin (35);
+
+dcl 1 arg_names (msargs.names) aligned based (msargs.namesp),
+    2 person char (22) unal,
+    2 project char (9) unal;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  volume char (32);
+dcl  access bit (36) aligned;				/* Access to logical volume */
+dcl  person char (22);
+dcl  project char (9);
+dcl  last_ownerp ptr;
+dcl (p, q) ptr;
+
+dcl 1 auto_args like msargs aligned automatic;
+
+
+/* Things allocated in system free area */
+
+dcl  free_area_ptr ptr init (null);			/* Pointer to the area */
+dcl  free_area area based (free_area_ptr);
+dcl  pnamep ptr init (null);
+dcl 1 pname (msargs.nnames) based (pnamep),		/* List of names */
+    2 person char (22) unal,
+    2 project char (9) unal;
+
+dcl  oname_head ptr init (null);			/* Pointer to a list of owner structrutes */
+dcl  oname_tail ptr;
+dcl  onamep ptr;
+dcl 1 oname aligned based (onamep),			/* One of these allocated for each owner processed */
+    2 person char (22) unal,
+    2 project char (9) unal,
+    2 list_end ptr,
+    2 next ptr;
+
+
+/* External stuff */
+
+dcl  admin_gate_$decode_uidpath entry (dim (0:15) bit (36) aligned, char (*), char (*), fixed bin (35));
+dcl  mdc_lock_$set entry (fixed bin (35));
+dcl  mdc_lock_$reset entry;
+dcl  mdc_lock_$cleanup entry;
+dcl  mdcs_util_$find_mdcs entry (char (*), ptr, bit (36) aligned, fixed bin (35));
+dcl  mdcs_util_$term_mdcs entry (ptr);
+dcl  mdc_parse_acct_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  mdc_util_$find_matching_acctent entry (ptr, char (*), char (*), ptr);
+dcl  get_system_free_area_ entry returns (ptr);
+
+dcl  error_table_$mdc_exec_access ext fixed bin (35);
+dcl  error_table_$area_too_small ext fixed bin (35);
+dcl  error_table_$argerr ext fixed bin (35);
+dcl  error_table_$root ext fixed bin (35);
+
+dcl  cleanup condition;
+
+dcl (addr, null, ptr, rel, substr, addrel, size, string) builtin;
+
+%include mdc_status_args;
+
+%include mdc_status_info;
+
+%include mdcs;
+
+/* Entry to perform mdc_$status operation */
+
+list:	entry (arg_volume, arg_argp, arg_volume_datap, arg_code);
+
+	call copy_args;				/* Get argument list */
+
+	mdcsp = null;
+	on cleanup call clean_up;
+
+	call locate_vol;				/* Get mdcs pointer and check access */
+
+
+	call make_volume_data;
+
+	if ^msargs.exec then call get_user_info;	/* For non-privlidged user */
+	else call get_exec_info;			/* For volume executive */
+	arg_volume_datap = volume_datap;		/* Return the anser */
+
+	code = 0;
+term_return:
+	call mdcs_util_$term_mdcs (mdcsp);
+unlock_return:
+	call mdc_lock_$reset;
+return_code:
+	call free_storage;
+	arg_code = code;
+	return;
+
+/* This procedure does the work for a normal user call. */
+/* A user gets his quota account and a list of his directories */
+
+get_user_info: proc;
+
+	     call mdc_parse_acct_ ("", person, project, code); /* This is to see who I am */
+	     if code ^= 0 then go to term_return;
+	     call mdc_util_$find_matching_acctent (mdcsp, person, project, acctp); /* Find my account */
+	     if acctp ^= null then do;		/* There is one */
+		call make_account_data;
+		volume_data.accountp = account_datap;	/* Return pointer to caller */
+		if msargs.restrict then if acctent.restrict_path ^= "0"b then
+			call copy_restrict_path (account_data.restrictp, acctent.restrict_path);
+		     else call copy_restrict_path (account_data.restrictp, mdcs.default_path);
+	     end;
+
+	     call make_owner_data;			/* Get structure to head directory list */
+	     owner_data.person = person;
+	     owner_data.project = project;
+	     volume_data.ownerp = owner_datap;
+
+	     if ^msargs.dirs then return;
+
+	     p = null;
+	     mdirp = ptr (mdcsp, mdcs.dir_offset);	/* Head of directory list for volume */
+	     do while (rel (mdirp) ^= "0"b);		/* Scan list */
+		if mdirent.person = person & mdirent.project = project then do; /* Its mine */
+		     call make_dir_data;
+		     acctp = ptr (mdcsp, mdirent.quota_offset);
+		     dir_data.person = acctent.person;
+		     dir_data.project = acctent.project;
+		     dir_data.quota = mdirent.quota;
+		     call make_path_data (mdirent.uidpath);
+		     dir_data.pathp = path_datap;
+		     if p = null then owner_data.dirp = dir_datap; /* Thread on list */
+		     else p -> dir_data.next = dir_datap;
+		     p = dir_datap;
+		end;
+		mdirp = ptr (mdcsp, mdirent.next);
+	     end;
+	     return;
+
+	end get_user_info;
+
+/* Procedre to get data for a volumeexecutive call */
+
+get_exec_info: proc;
+
+	     if ^(msargs.account | msargs.owner) then msargs.account = "1"b;
+
+	     if msargs.account then call build_account_list;
+	     else call build_owner_list;
+	     if msargs.restrict then do;
+		call copy_restrict_path (volume_data.defaultp, mdcs.default_path);
+		call copy_restrict_path (volume_data.restrictp, mdcs.restrict_path);
+	     end;
+
+	end get_exec_info;
+
+build_account_list: proc;
+	     p = null;
+	     do acctp = ptr (mdcsp, mdcs.acct_offset) repeat (ptr (mdcsp, acctent.next)) while (rel (acctp) ^= "0"b);
+		if account_needed () then do;		/* Data requested here */
+		     call make_account_data;		/* Get place to stor data */
+		     if p = null then volume_data.accountp = account_datap; /* Chain it */
+		     else p -> account_data.next = account_datap;
+		     p = account_datap;		/* Remember end of list */
+		     q = null;
+		     do mdirp = ptr (mdcsp, mdcs.dir_offset) repeat (ptr (mdcsp, mdirent.next)) while (rel (mdirp) ^= "0"b);
+			if mdirent.quota_offset = rel (acctp) then do; /* If chaged to this account */
+			     call make_dir_data;
+			     if q = null then account_data.dirp = dir_datap; /* Chain it */
+			     else q -> dir_data.next = dir_datap;
+			     q = dir_datap;
+			     dir_data.person = mdirent.person;
+			     dir_data.project = mdirent.project;
+			     dir_data.quota = mdirent.quota;
+			     if msargs.backup then dir_data.backup = mdirent.backup;
+			     call make_path_data (mdirent.uidpath);
+			     dir_data.pathp = path_datap;
+			end;
+		     end;
+		end;
+	     end;
+	     return;
+
+	end build_account_list;
+
+account_needed: proc returns (bit (1));
+
+dcl  i fixed bin;
+
+	     if msargs.nnames = 0 then return ("1"b);
+
+	     do i = 1 to msargs.nnames;
+		if ((pname.person (i) = "") | (pname.person (i) = acctent.person)) &
+		((pname.project (i) = "") | (pname.project (i) = acctent.project)) then return ("1"b);
+	     end;
+	     return ("0"b);
+
+	end account_needed;
+
+build_owner_list: proc;
+
+	     p = null;
+	     last_ownerp = null;
+	     do mdirp = ptr (mdcsp, mdcs.dir_offset) repeat (ptr (mdcsp, mdirent.next)) while (rel (mdirp) ^= "0"b);
+		if owner_needed () then do;		/* Check of owner requested */
+		     call find_onamep;		/* Get pointer to structure for this owner */
+		     call make_dir_data;		/* Build entry for new directory */
+		     acctp = ptr (mdcsp, mdirent.quota_offset);
+		     dir_data.person = acctent.person;	/* Copy quota account name */
+		     dir_data.project = acctent.project;
+		     dir_data.quota = mdirent.quota;
+		     if msargs.backup then dir_data.backup = mdirent.backup;
+		     if oname.list_end = null then owner_data.dirp = dir_datap; /* First dir for owner */
+		     else oname.list_end -> dir_data.next = dir_datap;
+		     oname.list_end = dir_datap;
+		     call make_path_data (mdirent.uidpath);
+		     dir_data.pathp = path_datap;
+		end;
+	     end;
+
+	     return;
+
+	end build_owner_list;
+
+owner_needed: proc returns (bit (1));
+
+dcl  i fixed bin;
+
+	     if msargs.nnames = 0 then return ("1"b);
+	     do i = 1 to msargs.nnames;
+		if ((pname.person (i) = "") | (pname.person (i) = "*") | (pname.person (i) = mdirent.person)) &
+		((pname.project (i) = "") | (pname.project (i) = "*") | (pname.project (i) = mdirent.project)) then
+		     return ("1"b);
+	     end;
+	     return ("0"b);
+
+	end owner_needed;
+
+
+find_onamep: proc;
+
+	     owner_datap = null;
+	     do onamep = oname_head repeat (oname.next) while (onamep ^= null); /* Scan existing list */
+		if oname.person = mdirent.person & oname.project = mdirent.project then return;
+	     end;
+
+	     if free_area_ptr = null then free_area_ptr = get_system_free_area_ ();
+	     allocate oname in (free_area);
+	     oname.person = mdirent.person;
+	     oname.project = mdirent.project;
+	     oname.list_end = null;
+	     oname.next = null;
+	     if oname_head = null then oname_head = onamep; /* Thread on list */
+	     else oname_tail -> oname.next = onamep;
+	     oname_tail = onamep;
+	     call make_owner_data;			/* Build structure for caller */
+	     owner_data.person = mdirent.person;
+	     owner_data.project = mdirent.project;
+	     if last_ownerp = null then volume_data.ownerp = owner_datap; /* If first */
+	     else last_ownerp -> owner_data.next = owner_datap;
+	     last_ownerp = owner_datap;
+
+	     return;
+
+	end find_onamep;
+
+/* Copy arguments into stack */
+
+copy_args: proc;
+
+dcl  i fixed bin;
+
+	     arg_code = 0;
+	     arg_volume_datap = null;
+	     volume = arg_volume;
+	     argp = addr (auto_args);
+	     msargs.version = arg_argp -> msargs.version;
+	     if msargs.version ^= 1 then do;
+		code = error_table_$argerr;
+		go to return_code;
+	     end;
+	     msargs.output_size = arg_argp -> msargs.output_size;
+	     string (msargs.flags) = string (arg_argp -> msargs.flags);
+	     msargs.nnames = arg_argp -> msargs.nnames;
+	     msargs.namesp = arg_argp -> msargs.namesp;
+	     msargs.output_ptr = arg_argp -> msargs.output_ptr;
+	     if ^msargs.exec then do;			/* Ignore volume exec requests */
+		msargs.account = "0"b;
+		msargs.owner = "0"b;
+		msargs.backup = "0"b;
+		msargs.accounting = "0"b;
+	     end;
+	     if ^(msargs.account | msargs.owner) then msargs.nnames = 0;
+	     if msargs.nnames > 0 then do;
+		if free_area_ptr = null then free_area_ptr = get_system_free_area_ ();
+		on area begin;
+		     code = error_table_$area_too_small;
+		     go to return_code;
+		end;
+		allocate pname in (free_area);
+		do i = 1 to msargs.nnames;
+		     pname.person (i) = arg_names.person (i);
+		     pname.project (i) = arg_names.project (i);
+		end;
+	     end;
+	     return;
+
+	end copy_args;
+
+/* Procedure to find mdcs and check access */
+
+locate_vol: proc;
+
+	     call mdc_lock_$set (code);
+	     if code ^= 0 then go to return_code;
+	     call mdcs_util_$find_mdcs (volume, mdcsp, access, code);
+	     if code ^= 0 then go to unlock_return;
+	     if msargs.exec & ^substr (access, 2, 1) then do;
+		code = error_table_$mdc_exec_access;
+		go to term_return;
+	     end;
+	     return;
+
+	end locate_vol;
+
+/* Procedure to allocate an initialize a volume_data structire */
+
+make_volume_data: proc;
+
+	     call get_block (volume_datap, size (volume_data));
+
+	     volume_data.version = 1;
+	     volume_data.accountp = null;
+	     volume_data.ownerp = null;
+	     volume_data.defaultp = null;
+	     volume_data.restrictp = null;
+	     volume_data.backup = 0;
+	     return;
+
+	end make_volume_data;
+
+/* Procedure to allocate and initialize an account_data sructure */
+
+make_account_data: proc;
+
+	     call get_block (account_datap, size (account_data));
+
+	     account_data.next = null;
+	     account_data.person = acctent.person;	/* Copy data from acctent in mdcs */
+	     account_data.project = acctent.project;
+	     account_data.quota = acctent.quota;
+	     account_data.quota_used = acctent.quota_used;
+	     if msargs.backup then account_data.backup = acctent.backup;
+	     if msargs.accounting then account_data.trp = acctent.trp;
+	     account_data.dirp = null;
+	     account_data.restrictp = null;
+	     return;
+
+	end make_account_data;
+
+/* Procedure to allocate and initialize an owner_data structure */
+
+make_owner_data: proc;
+
+	     call get_block (owner_datap, size (owner_data));
+
+	     owner_data.next = null;
+	     owner_data.person = "";
+	     owner_data.project = "";
+	     owner_data.dirp = null;
+	     return;
+
+	end make_owner_data;
+
+/* Procedure to allocate and initialize a path_data structure */
+
+make_path_data: proc (up);
+
+dcl  up (0:15) bit (36) aligned;
+
+	     call get_block (path_datap, size (path_data));
+	     path_data.next = null;
+	     call admin_gate_$decode_uidpath (up, path_data.dir, path_data.ename, path_data.code);
+	     if path_data.code = error_table_$root then path_data.code = 0;
+	     return;
+
+	end make_path_data;
+
+/* Procedure to allocate and initialize a dir_data structure */
+
+make_dir_data: proc;
+
+	     call get_block (dir_datap, size (dir_data));
+	     dir_data.next = null;
+	     dir_data.pathp = null;
+	     dir_data.person = "";
+	     dir_data.project = "";
+	     dir_data.quota = 0;
+	     dir_data.backup = 0;
+	     return;
+
+	end make_dir_data;
+
+
+/* Procedure to get a block of words in the callers output area */
+
+get_block: proc (p, n);
+
+dcl  p ptr;					/* Returnd pointer to words gotten */
+dcl  n fixed bin (19);				/* Number of words needed */
+
+	     if substr (rel (msargs.output_ptr), 18, 1) then do; /* If at odd address */
+		msargs.output_ptr = addrel (msargs.output_ptr, 1);
+		msargs.output_size = msargs.output_size - 1;
+	     end;
+
+	     if n > msargs.output_size then do;
+		code = error_table_$area_too_small;
+		go to term_return;
+	     end;
+	     p = msargs.output_ptr;
+	     msargs.output_ptr = addrel (msargs.output_ptr, n);
+	     msargs.output_size = msargs.output_size - n;
+	     return;
+
+	end get_block;
+
+
+/* Procedure that copys a list of restricting pathnames */
+
+copy_restrict_path: proc (p, o);
+dcl  p ptr;
+dcl  o bit (18) aligned;
+dcl  q ptr init (null);
+
+	     do pathp = ptr (mdcsp, o) repeat (ptr (mdcsp, pathent.next)) while (rel (pathp) ^= "0"b);
+		call make_path_data (pathent.uidpath);
+		if q = null then p = path_datap;
+		else q -> path_data.next = path_datap;
+		q = path_datap;
+	     end;
+	     return;
+
+	end copy_restrict_path;
+
+/* Cleanup handler */
+
+clean_up:	proc;
+
+	     if mdcsp ^= null then call mdcs_util_$term_mdcs (mdcsp);
+	     call mdc_lock_$cleanup;
+	     call free_storage;
+	     return;
+
+	end clean_up;
+
+free_storage: proc;
+
+	     if pnamep ^= null then free pname;
+	     p = oname_head;
+	     do while (p ^= null);
+		onamep = p;
+		p = oname.next;
+		free oname;
+	     end;
+
+	     return;
+
+	end free_storage;
+
+     end mdc_status_;

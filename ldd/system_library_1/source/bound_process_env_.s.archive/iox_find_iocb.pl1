@@ -1,0 +1,591 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style2 */
+iox_find_iocb: proc();
+
+          return;					/* Not a legal entry. */
+
+/* Modified Benson I. Margulies 1981 03 07 for hashing. No previous journalization?! */
+/* Modified 11/82 by S. Krupp to initialize new variables in version 2 iocb. */
+/* Modified C. Spitzer not to fault when passed a null pointer.	       */
+/* Parameters. */
+
+	declare (
+	        P_iocb_name		 char (*),	/* Name of sought I/O control block. */
+	        P_iocb_ptr		 pointer,		/* Returned location of I/O control block. */
+	        P_code		 fixed bin (35),
+	        (P_iocb_ptr1, P_iocb_ptr2)
+				 pointer,		/* From and to locations for move_attach. */
+	        P_iocb_n		 fixed bin
+	        ) /* Number of sought I/O control block. */
+				 parameter;	/* Automatic. */
+
+	declare critical_op_in_progress
+				 bit (1);
+	declare hash_chain_anchor	 pointer based (ptr_to_hash_tbl_ptr);
+	declare ptr_to_hash_tbl_ptr	 pointer;
+	declare hash_ptr		 pointer;
+	declare hash_table_ptr	 pointer;
+	declare iocb_ptr		 pointer;
+	declare iocb_ptr1		 pointer;
+	declare iocb_ptr2		 pointer;
+	declare iocb_ptr3		 ptr;		/* Father IOCB ptr used by move_attach. */
+	declare just_looking	 bit (1);		/* "1"b if called "look_iocb" rather than "find_iocb". */
+	declare move_switch		 bit (1);		/* initialize_iocb works different for move_attach. */
+	declare name		 char (32) aligned; /* Local copy of sought name. */
+	declare syn_son		 ptr;		/* Place to save iocb.syn_son. */
+	declare (i, j)		 fixed;
+	declare mask		 bit (36) aligned;	/* Save existing IPS mask while inhibited. */
+
+/* External static. */
+
+	declare iox_$hash_table	 external static;
+	declare iox_$hash_table_ptr	 ptr external static;
+	declare iox_$hash_table_size	 fixed bin (35) aligned external static;
+	declare iox_$hash_hit_count	 fixed bin (35) external static;
+						/* meter hash hits when we make a new one in a chain */
+	declare iox_$n_standard_iocbs	 fixed bin external static;
+	declare iox_$standard_iocb_ptrs
+				 bit (36) aligned external static;
+
+/* external entries */
+
+	declare iox_$propagate	 external entry (pointer);
+	declare hash_index_		 entry (pointer, fixed bin (35) aligned, fixed bin (35) aligned,
+				 fixed bin (35) aligned) returns (fixed bin (35) aligned) reducible;
+
+	declare hcs_$set_ips_mask	 ext entry (bit (36) aligned, bit (36) aligned);
+	declare hcs_$reset_ips_mask	 ext entry (bit (36) aligned, bit (36) aligned);
+	declare iox_$err_no_operation  entry() options(variable);
+	declare iox_$err_not_attached	 ext entry options (variable);
+	declare iox_$err_not_open	 ext entry options (variable);
+	declare sub_err_		 ext entry options (variable);
+	declare terminate_process_	 ext entry (char (*), ptr);
+
+
+/* Error Table Codes */
+
+	declare (
+	        error_table_$unable_to_do_io,
+	        error_table_$not_a_valid_iocb,
+	        error_table_$no_iocb,
+	        error_table_$not_attached,
+	        error_table_$not_detached,
+	        error_table_$name_not_found
+	        )			 external static fixed bin (35);
+
+/* Based. */
+
+	declare hash_table		 dimension (iox_$hash_table_size) pointer based (hash_table_ptr);
+	declare system_free_area	 area based (stackbaseptr () -> stack_header.system_free_ptr);
+						/* get_system_free_area_ is not cheap */
+
+	declare any_other		 condition;
+
+/* Built-in. */
+
+	declare (addr, length, null, rank, rtrim, substr, stackbaseptr)
+				 builtin;
+%page;
+%include iocbx;
+%include stack_header;
+%page;
+/* iox_$find_iocb */
+
+find_iocb: entry (P_iocb_name, P_iocb_ptr, P_code);
+
+	just_looking = "0"b;			/* Remember "find", not "look", was called. */
+	go to join;				/* Go join common table search. */
+
+/* iox_$look_iocb */
+
+look_iocb:
+     entry (P_iocb_name, P_iocb_ptr, P_code);
+
+	just_looking = "1"b;			/* Remember "look", not "find", was called. */
+
+join:
+	call setup;
+	move_switch = "0"b;				/* this is not move_iocb */
+	name = P_iocb_name;				/* Copy name so no one changes it under us. */
+	P_iocb_ptr = null ();
+	iocb_ptr = null ();				/* Prepare to search IOCB table. */
+	on any_other call handler;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*									*/
+/* the original strategy of this program was as follows: All iocbs were allocated in	*/
+/* blocks of five. The blocks were chained, but the iocbs themselves were not. Destroyed	*/
+/* iocb's were not deallocated, but were left in place. Free or used iocbs were found by	*/
+/* a linear search down the blocks. Since no operation ever changed the threading of	*/
+/* blocks except to add a new one, this search could be made without masking off ips	*/
+/* signals. It had to be, because it could be long. A pseudo-clock, changed_at, was used	*/
+/* to detect modification during the search, which caused the search to be retried.	*/
+/*									*/
+/* The new scheme assumes that the area package is at least as good as managing iocb	*/
+/* sized blocks of stuff as hand code that chases a chain. Iocbs are individually	*/
+/* allocated with allocate statements, and freed when destroyed. Iocbs are found by way	*/
+/* of a hash table, with chains for the buckets. Because these chains can be changed by a */
+/* freed iocb, the search down one must take place with ips signals masked. It is not	*/
+/* expected that these chains will ever get long enough to make masking impractical. If	*/
+/* they do, the hash table can be enlarged, or the hash function improved.                */
+/******************************************************************************************/
+
+	call set_ips_mask;
+
+/* use based variable to avoid lots of subscripting */
+/* hash_chain_anchor is based on this pointer */
+	ptr_to_hash_tbl_ptr = addr (hash_table (hash_search (name)));
+
+	iocb_ptr = chase_chain (hash_chain_anchor, name);
+
+	if iocb_ptr = null ()			/* not in the chain */
+	then do;
+		if just_looking			/* do not create if not found */
+		then P_code = error_table_$no_iocb;
+		else do;
+			allocate iocb in (system_free_area) set (iocb_ptr);
+
+			call initialize_iocb_values (iocb_ptr, name);
+			call link_in_iocb (hash_chain_anchor, iocb_ptr, name);
+		     end;
+	     end;
+	call reset_ips_mask;
+	P_iocb_ptr = iocb_ptr;
+	return;
+%page;
+destroy_iocb:
+     entry (P_iocb_ptr, P_code);
+
+	iocb_ptr = P_iocb_ptr;
+	if iocb_ptr = null () then do;
+	     P_code = 0;				/* already gone */
+	     return;				/* nothing to do anymore */
+	     end;
+	call check_sentinel (iocb_ptr);
+	call setup;
+	on any_other call handler;
+	call set_ips_mask;
+
+	if iocb_ptr -> iocb.name = ""			/* freed but had another ptr */
+	then do;
+		P_code = 0;
+		P_iocb_ptr = null ();
+	     end;
+
+	else if iocb_ptr -> iocb.attach_descrip_ptr ^= null ()
+	then P_code = error_table_$not_detached;
+
+	else if iocb_ptr -> iocb.syn_son ^= null ()
+	then P_code = error_table_$not_detached;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*									*/
+/* There is a special case here for the iox_ variables. To prevent inconsistencies, we	*/
+/* must check if the iocb being destroyed is one of the standard iocbs. It so, we	*/
+/* must insure that the iox_ pointers are nulled as well.				*/
+/*									*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+	else do;					/* OK to destroy it. */
+		call check_standard_iocbs (iocb_ptr);
+		call flush_iocb (iocb_ptr);
+		P_iocb_ptr = null ();		/* Reset caller's IOCB pointer. */
+		P_code = 0;			/* No errors. */
+	     end;
+
+	call reset_ips_mask;
+	return;
+%page;
+find_iocb_n:
+     entry (P_iocb_n, P_iocb_ptr, P_code);
+	j = 0;					/* Count the non-null IOCBxs. */
+	call setup;
+	on any_other call handler;
+
+	do i = 1 to iox_$hash_table_size;		/* look at each hash bucket */
+	     if hash_table (i) ^= null ()
+	     then do;
+		     call set_ips_mask;
+		     do iocb_ptr = hash_table (i)
+			repeat iocb_ptr -> iocb.hash_chain_ptr /* and consider each in the chain */
+			while (iocb_ptr ^= null ());
+			j = j + 1;
+			if j = P_iocb_n
+			then do;
+				P_iocb_ptr = iocb_ptr;
+				call reset_ips_mask;
+				return;
+			     end;
+		     end;
+		     call reset_ips_mask;
+		end;
+	end;
+	P_iocb_ptr = null ();			/* Didn't find it. */
+	P_code = error_table_$no_iocb;
+	return;
+%page;
+move_attach:
+     entry (P_iocb_ptr1, P_iocb_ptr2, P_code);
+
+	move_switch = "1"b;
+	iocb_ptr1 = P_iocb_ptr1;
+	iocb_ptr2 = P_iocb_ptr2;
+	if iocb_ptr1 = null () | iocb_ptr2 = null ()
+	then do;
+		P_code = error_table_$no_iocb;
+		return;
+	     end;
+
+	call check_sentinel (iocb_ptr1);
+	call check_sentinel (iocb_ptr2);
+
+	if iocb_ptr1 = iocb_ptr2
+	then P_code = 0;
+
+	else if iocb_ptr1 -> iocb.attach_descrip_ptr = null ()
+	then /* Original block must be attached. */
+	     P_code = error_table_$not_attached;
+
+	else if iocb_ptr2 -> iocb.attach_descrip_ptr ^= null ()
+	then /* Target block must be detached. */
+	     P_code = error_table_$not_detached;
+
+	else do;
+		call setup;
+		on any_other call handler;
+		call set_ips_mask;
+
+/* Copy the IOCB. */
+
+		name = iocb_ptr2 -> iocb.name;	/* Save target's name. */
+		syn_son = iocb_ptr2 -> iocb.syn_son;	/* Save target's syn son. */
+		hash_ptr = iocb_ptr2 -> iocb.hash_chain_ptr;
+						/* Save hash chain ptr */
+
+		iocb_ptr2 -> iocb = iocb_ptr1 -> iocb;	/* Copy contents of block. */
+		iocb_ptr2 -> iocb.name = name;	/* Restore target's name. */
+		iocb_ptr2 -> iocb.syn_son = syn_son;	/* Restore target's syn son. */
+		iocb_ptr2 -> iocb.hash_chain_ptr = hash_ptr;
+						/* Restore hash chain */
+		if iocb_ptr1 -> iocb.actual_iocb_ptr = iocb_ptr1
+		then iocb_ptr2 -> iocb.actual_iocb_ptr = iocb_ptr2;
+						/* Reset actual_iocb_ptr. */
+
+/* Thread target block in place of the original block if syn'd. */
+
+		else do;
+			call set_critical;
+			iocb_ptr3 = iocb_ptr1 -> iocb.syn_father;
+			if iocb_ptr3 -> iocb.syn_son = iocb_ptr1
+			then iocb_ptr3 -> iocb.syn_son = iocb_ptr2;
+			else do;
+				do iocb_ptr3 = iocb_ptr3 -> iocb.syn_son
+				     repeat iocb_ptr3 -> iocb.syn_brother
+				     while (iocb_ptr3 -> iocb.syn_brother ^= iocb_ptr1);
+				end;
+				iocb_ptr3 -> iocb.syn_brother = iocb_ptr2;
+			     end;
+			call reset_critical;
+		     end;
+
+		call initialize_iocb_values (iocb_ptr1, iocb_ptr1 -> iocb.name);
+						/* Initialize original block to detached state, leaving hash chain alone. */
+		call iox_$propagate (iocb_ptr1);	/* Propagate detached state. */
+		call iox_$propagate (iocb_ptr2);	/* Propagate changes. */
+
+		call reset_ips_mask;
+		P_code = 0;
+	     end;
+	return;
+%page;
+/* Internal procedure to initialize an IOCB to the detached state. */
+
+initialize_iocb_values:
+     proc (iocb_ptr, iocb_name);
+	declare iocb_ptr		 ptr;
+	declare iocb_name		 char (32) aligned;
+
+	iocb_ptr -> iocb.version = iox_$iocb_version_sentinel;
+	iocb_ptr -> iocb.name = iocb_name;
+	iocb_ptr -> iocb.actual_iocb_ptr = iocb_ptr;
+	iocb_ptr -> iocb.attach_descrip_ptr, iocb_ptr -> iocb.attach_data_ptr, iocb_ptr -> iocb.open_descrip_ptr,
+	     iocb_ptr -> iocb.open_data_ptr = null ();
+	iocb_ptr -> iocb.event_channel = ""b;
+	iocb_ptr -> iocb.detach_iocb = iox_$err_not_attached;
+	iocb_ptr -> iocb.open = iox_$err_not_attached;
+	iocb_ptr -> iocb.close = iox_$err_not_open;
+	iocb_ptr -> iocb.get_line = iox_$err_not_open;
+	iocb_ptr -> iocb.get_chars = iox_$err_not_open;
+	iocb_ptr -> iocb.put_chars = iox_$err_not_open;
+	iocb_ptr -> iocb.modes = iox_$err_not_attached;
+	iocb_ptr -> iocb.position = iox_$err_not_open;
+	iocb_ptr -> iocb.control = iox_$err_not_attached;
+	iocb_ptr -> iocb.read_record = iox_$err_not_open;
+	iocb_ptr -> iocb.write_record = iox_$err_not_open;
+	iocb_ptr -> iocb.rewrite_record = iox_$err_not_open;
+	iocb_ptr -> iocb.delete_record = iox_$err_not_open;
+	iocb_ptr -> iocb.seek_key = iox_$err_not_open;
+	iocb_ptr -> iocb.read_key = iox_$err_not_open;
+	iocb_ptr -> iocb.read_length = iox_$err_not_open;
+	iocb_ptr -> iocb.open_file = iox_$err_no_operation;
+						/* New, version 2. */
+	iocb_ptr -> iocb.close_file = iox_$err_no_operation;   /* Version 2. */
+	iocb_ptr -> iocb.detach = iox_$err_no_operation;	/* Version 2. */
+	iocb_ptr -> iocb.ios_compatibility = null ();
+	iocb_ptr -> iocb.syn_inhibits = ""b;
+	iocb_ptr -> iocb.syn_father, iocb_ptr -> iocb.syn_brother = null;
+	if ^move_switch
+	then iocb_ptr -> iocb.syn_son = null;
+	/*** do not set hash ptr. It is set by link_in_iocb */
+
+     end initialize_iocb_values;
+
+link_in_iocb:
+     procedure (hash_chain_anchor, iocb_ptr, iocb_name);
+
+	declare hash_chain_anchor	 pointer;
+	declare iocb_ptr		 pointer;
+	declare iocb_name		 character (32) aligned;
+
+
+	if hash_chain_anchor = null ()
+	then do;					/* easy case */
+		iocb_ptr -> iocb.hash_chain_ptr = null ();
+		hash_chain_anchor = iocb_ptr;
+	     end;
+	else do;	/*** Thread into beginning. We are most likely to reference the one we just created. */
+		/*** Meter this as a hit, as well. */
+		call set_critical;
+		iocb_ptr -> iocb.hash_chain_ptr = hash_chain_anchor;
+		hash_chain_anchor = iocb_ptr;
+		call reset_critical;
+		iox_$hash_hit_count = iox_$hash_hit_count + 1;
+	     end;
+     end link_in_iocb;
+
+flush_iocb:
+     procedure (iocb_ptr);
+
+	declare iocb_ptr		 pointer;
+	declare hi		 fixed bin;
+	declare cp		 pointer;
+
+	hi = hash_search (iocb_ptr -> iocb.name);
+
+	if hash_table (hi) = null ()
+	then call iocb_missing_from_chain (iocb_ptr, hi, hash_table (hi));
+	if hash_table (hi) = iocb_ptr
+	then hash_table (hi) = hash_table (hi) -> iocb.hash_chain_ptr;
+	else do;					/* nontrivial, find the one to link out */
+		do cp = hash_table (hi) repeat cp -> iocb.hash_chain_ptr while (cp -> iocb.hash_chain_ptr ^= null ());
+		     if cp -> iocb.hash_chain_ptr = iocb_ptr
+		     then do;
+			     cp -> iocb.hash_chain_ptr = cp -> iocb.hash_chain_ptr -> iocb.hash_chain_ptr;
+			     goto linked_out;
+			end;			/* Copy chain pointer from defunkt IOCB to previous in chain */
+		end;
+
+		/*** if we got here, it was not in the right chain.
+		this is a really bad scene */
+
+		call iocb_missing_from_chain (iocb_ptr, hi, hash_table (hi));
+						/* this signals an error */
+linked_out:
+	     end;
+	iocb_ptr -> iocb.name = "";			/* sentinel to avoid freeing twice */
+	free iocb_ptr -> iocb;
+	return;
+     end flush_iocb;
+%page;
+/* Internal procedure to handle faults while IPS interrupts
+   are masked.  While not masked, any signals are simply
+   passed on up the stack to their normal handlers.  
+   If we are restarted then the mask will stay reset.
+*/
+
+handler:
+     procedure;
+
+	declare continue_to_signal_	 entry (fixed bin (35));
+
+	if mask ^= ""b
+	then do;
+		if critical_op_in_progress
+		then call terminate_this_process;
+		call reset_ips_mask;
+		call continue_to_signal_ (0);
+		return;
+	     end;
+	else call continue_to_signal_ (0);
+
+     end handler;
+
+chase_chain:
+     procedure (start_ptr, name) returns (pointer);
+
+	declare start_ptr		 pointer;
+	declare name		 character (32) aligned;
+	declare iocb_ptr		 pointer;
+	declare 1 IOCB		 aligned like iocb based (iocb_ptr);
+
+	do iocb_ptr = start_ptr repeat IOCB.hash_chain_ptr while (iocb_ptr ^= null ());
+
+	     if IOCB.name = name
+	     then return (iocb_ptr);
+	end;
+	return (null ());
+     end chase_chain;
+
+hash_search:
+     procedure (name) returns (fixed bin) reducible;
+
+	declare name		 character (32) aligned;
+	declare trimmed_length	 fixed bin (35);
+
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*									*/
+/* The exact hashing function to use here is a bother. Since IOCB names in use at the	*/
+/* same time tend to be the same length, and are often 15 or more characters, the	*/
+/* variation amongst the characters has an unfortunate habit of averaging out.		*/
+/* Especially because many start with something like MUMBLE!BBB. To counteract this	*/
+/* problem we use the "ring-number" argument of hash_index_, and give it the rank value	*/
+/* of the last character of the name. This is pretty independent of the other		*/
+/* characteristics of the string.						*/
+/*									*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+
+	trimmed_length = length (rtrim (name));
+
+	return (1
+	     + hash_index_ (addr (name), trimmed_length, rank (substr (name, trimmed_length, 1)), iox_$hash_table_size))
+	     ;
+     end hash_search;
+%page;
+is_standard_iocb_ptr:
+     procedure (iocb_ptr) returns (bit (1) aligned) reducible;
+
+	declare iocb_ptr		 pointer parameter;
+	declare px		 fixed bin;
+	declare standard_ptrs_ptr	 pointer;
+	declare standard_ptrs	 (iox_$n_standard_iocbs) pointer based (standard_ptrs_ptr);
+	declare kill_switch		 bit (1);
+
+	kill_switch = "0"b;
+	go to common;
+
+check_standard_iocbs:
+     entry (iocb_ptr);
+
+	kill_switch = "1"b;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*									*/
+/* The standard attachment iocb_ptrs stored in an array, so this code can properly find	*/
+/* them even if more are added later.						*/
+/*									*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+common:
+	standard_ptrs_ptr = addr (iox_$standard_iocb_ptrs);
+	do px = 1 to iox_$n_standard_iocbs;
+	     if iocb_ptr = standard_ptrs (px)
+	     then if kill_switch
+		then standard_ptrs (px) = null ();
+		else return ("1"b);
+	     else ;
+	end;
+
+	if ^kill_switch
+	then return ("0"b);
+	else return;
+     end is_standard_iocb_ptr;
+
+set_ips_mask:
+     procedure;
+	call hcs_$set_ips_mask (""b, mask);
+     end set_ips_mask;
+
+reset_ips_mask:
+     procedure;
+
+	if mask ^= ""b
+	then call hcs_$reset_ips_mask (mask, mask);
+     end reset_ips_mask;
+
+set_critical:
+     procedure;
+
+	critical_op_in_progress = "1"b;
+	return;
+
+reset_critical:
+     entry;
+
+	critical_op_in_progress = "0"b;
+     end set_critical;
+%page;
+iocb_missing_from_chain:
+     procedure (iocb_ptr, hash_index, hash_chain_anchor) options (non_quick);
+
+	declare iocb_ptr		 pointer;
+	declare hash_index		 fixed bin;
+	declare hash_chain_anchor	 pointer;
+
+	call sub_err_ (error_table_$name_not_found, "iox_", "s", null (), (0),
+	     "IOCB ^a (^p) missing from hash chain ^d (^p).", iocb_ptr -> iocb.name, iocb_ptr, hash_index,
+	     hash_chain_anchor);
+     end iocb_missing_from_chain;
+
+terminate_this_process:
+     procedure options (non_quick);
+
+	declare 1 ti		 aligned,
+		2 version		 fixed,
+		2 code		 fixed (35);
+
+	ti.version = 0;
+	ti.code = error_table_$unable_to_do_io;
+	call terminate_process_ ("fatal_error", addr (ti));
+
+     end terminate_this_process;
+
+setup:
+     procedure;
+
+	mask = ""b;
+	critical_op_in_progress = "0"b;
+	P_code = 0;
+	if iox_$hash_table_ptr = null ()
+	then iox_$hash_table_ptr = addr (iox_$hash_table);
+	hash_table_ptr = iox_$hash_table_ptr;
+     end setup;
+
+check_sentinel:
+     procedure (iocb_ptr);
+	declare iocb_ptr		 pointer;
+
+	if iocb_ptr -> iocb.version ^= iox_$iocb_version_sentinel
+	then do;
+		P_code = error_table_$not_a_valid_iocb;
+		go to main_block_return;
+	     end;
+     end check_sentinel;
+
+main_block_return:
+	return;
+
+     end iox_find_iocb;

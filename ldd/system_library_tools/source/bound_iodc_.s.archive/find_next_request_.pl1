@@ -1,0 +1,380 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+find_next_request_: proc (dev_class_index, descr_ptr) returns (bit (1) aligned);
+
+/* This is the io_coordinator procedure used for reading request messages
+   *  out of the IO daemon queues. It is normally the only procedure that
+   *  reads from message segments into request descriptors.
+   *
+   *  This procedure returns a bit(1) result indicating whether or not it actually
+   *  found a message in the queue(s).
+   */
+
+/* Coded August 1973 by Robert S. Coren */
+/* Modified for the Access Isolation Mechanism by J. Stern, 12/26/74 */
+/* Modified by J. Stern, 11/25/75 */
+/* Modified by J. C. Whitmore, 4/78, for max_queues per request type and new iod_tables format */
+/* Modified by J. C. Whitmore, 7/78, for priority requests in waiting list */
+/* Modified by J. C. Whitmore, 4/80, to mark the state of running requests */
+/* Modified by R. Kovalcik, 6/82, to handle defer_until_process_termination */
+/* Modified by R. Kovlacik, 1/83, to fix a problem in interaction between dupt and multiple printers */
+/* Modified by C. Marker, 02/23/85, to use message_segment_$read_message_index to support version 5 message segments */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-06-03,Brunelle), approve(88-06-03,MCR7911),
+     audit(88-10-17,Wallman), install(88-10-28,MR12.2-1199):
+     Upgraded to handle version 5 I/O daemon tables.
+                                                   END HISTORY COMMENTS */
+
+
+	dcl     dev_class_index	 fixed bin;	/* index of device class entry (INPUT) */
+	dcl     descr_ptr		 ptr;		/* pointer to request descriptor to be filled in (INPUT) */
+
+	dcl     code		 fixed bin (35);
+	dcl     err_len		 fixed bin;
+	dcl     err_mess		 char (200);
+	dcl     found		 bit (1) aligned;
+	dcl     (queue, q)		 fixed bin;	/* queue number variables */
+
+	dcl     last_id		 bit (72) aligned;
+	dcl     dcp		 ptr;
+	dcl     retp		 ptr;
+	dcl     q_idx		 fixed bin;
+
+	dcl     wlp		 ptr int static;	/* ptr to the waiting list */
+	dcl     dcx		 fixed bin;	/* device class table entry index */
+	dcl     i			 fixed bin;	/* loop variable */
+	dcl     auth		 bit (72) aligned;	/* used to hold the sender authorization of a message */
+	dcl     auth_string		 char (170);	/* char string version of "auth" */
+	dcl     message_len		 fixed bin (18);	/* bit length of based_message */
+	dcl     based_message	 bit (message_len) aligned based; /* a message read from a queue */
+	dcl     (x, y, z)		 fixed bin;	/* waiting list entry subscripts */
+
+	dcl     convert_authorization_$to_string_short entry (bit (72) aligned, char (*), fixed bin (35));
+	dcl     aim_check_$greater_or_equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+	dcl     free_oldest_request_$force entry;
+	dcl     ioa_$rsnnl		 entry options (variable);
+	dcl     iodc_message_	 entry (bit (3) aligned, fixed bin (35), char (*));
+	dcl     message_segment_$read_message_index entry (fixed bin, ptr, ptr, fixed bin (35));
+	dcl     message_segment_$update_message_index entry (fixed bin, fixed bin (18), bit (72) aligned, ptr, fixed bin (35));
+	dcl     set_lock_$lock	 entry (bit (36) aligned, fixed bin, fixed bin (35));
+	dcl     set_lock_$unlock	 entry (bit (36) aligned, fixed bin (35));
+
+	dcl     re_read		 bit (2) int static options (constant) init ("00"b); /* mseg code to read given msg id */
+	dcl     next_msg		 bit (2) int static options (constant) init ("01"b); /* mseg code to read next message forward */
+	dcl     priority		 fixed bin int static options (constant) init (2); /* state code for priority requests */
+	dcl     normal		 fixed bin int static options (constant) init (1); /* state code for normal priority */
+	dcl     unused		 fixed bin int static options (constant) init (0); /* state code for a free entry */
+
+	dcl     error_table_$bad_segment fixed bin (35) ext;
+	dcl     error_table_$invalid_lock_reset fixed bin (35) ext;
+	dcl     error_table_$no_message fixed bin (35) ext;
+	dcl     error_table_$notalloc	 fixed bin (35) ext;
+
+	dcl     (addr, unspec)	 builtin;
+%page;
+
+	dcx = dev_class_index;
+	dctep = addr (iodc_static.dctp -> dev_class_tab.entries (dcx)); /* get ptr to device class */
+	qgtep = addr (iodc_static.qgtp -> q_group_tab.entries (dcte.qgte_index)); /* get q group table entry ptr */
+	retp, mseg_message_info_ptr = descr_ptr;	/* this points to mseg return args and request desc */
+
+	do queue = 1 to qgte.max_queues;
+
+	     call read_one;				/* read a message from queue or list */
+	     if found then do;			/* got one */
+		     retp -> request_descriptor.q = q;	/* set source queue */
+		     retp -> request_descriptor.charge_q = queue; /* and charging queue */
+		     retp -> request_descriptor.dev_class_index = dcx;
+		     return ("1"b);
+		end;
+	end;
+
+/* no request found */
+
+	return ("0"b);
+
+
+read_one: proc;
+
+/* This subroutine first checks the waiting list of the target device class.
+   If the waiting list is non-empty, the first waiting request is reread.
+
+   Otherwise, the ID of the last read message from the current queue is
+   checked.  If zero, the first message is read from the queue.  
+   If non-zero, the next message is read.
+
+   If the authorization of the new message fits the target device
+   class access range and it should not be deferred for process termination,
+   the message is returned.  Otherwise it is appended to
+   the waiting list of some other device class and the entire above procedure
+   is repeated.
+*/
+
+	dcl     direction		 bit (2) aligned;	/* = 01 if reading ahead, 00 if rereading */
+	dcl     (bad, space)	 fixed bin;
+	dcl     dupt		 bit (1) aligned;	/* flag to note process is still around */
+	dcl     scan_wait		 bit (1) aligned;	/* flag to scan wait list */
+
+	found = "0"b;
+	scan_wait = (dcte.first_waiting (queue) ^= 0);
+	z = dcte.last_waiting (queue);		/* save stop marker */
+
+next:	if scan_wait then do;			/* loop through requests in waiting list */
+		x = dcte.first_waiting (queue);	/* get waiting list head index for this queue */
+		last_id = wlp -> waiting_list.ms_id (x);/* get message id of the request */
+		if wlp -> waiting_list.state (x) = priority then
+		     retp -> request_descriptor.priority_request = "1"b;
+		else retp -> request_descriptor.priority_request = ""b;
+		q = wlp -> waiting_list.orig_q (x);	/* could have come from another queue */
+		if wlp -> waiting_list.next (x) = 0 then /* no more requests in waiting list */
+		     dcte.last_waiting (queue),
+			dcte.first_waiting (queue) = 0;
+		else dcte.first_waiting (queue) = wlp -> waiting_list.next (x); /* advance the list */
+		dcte.n_waiting = dcte.n_waiting - 1;
+		if (x = z) | (dcte.first_waiting (queue) = 0) then scan_wait = "0"b; /* if we are done with this, note it */
+		call free_wle;			/* free the waiting list entry */
+		direction = re_read;
+	     end;
+
+	else do;					/* look through the queue */
+		q = queue;			/* read a fresh request from the current queue */
+		last_id = qgte.last_read (q);		/* prepare to read request after the last */
+		retp -> request_descriptor.priority_request = "0"b; /* this can't be priority */
+		direction = next_msg;
+	     end;
+
+	q_idx = qgte.mseg_index (q);			/* get message segment index for read call */
+	if q_idx = 0 then return;			/* if it was dropped forget it */
+
+	bad, space = 0;
+
+	unspec (mseg_message_info) = ""b;
+	mseg_message_info.version = MSEG_MESSAGE_INFO_V1;
+	mseg_message_info.ms_id = last_id;
+
+retry:	if last_id = "0"b				/* no previous message, read one first */
+	then mseg_message_info.message_code = MSEG_READ_FIRST;
+	else if direction = re_read then mseg_message_info.message_code = MSEG_READ_SPECIFIED;
+	else if direction = next_msg then mseg_message_info.message_code = MSEG_READ_AFTER_SPECIFIED;
+
+	call message_segment_$read_message_index (q_idx, iodc_static.req_seg_ptr, mseg_message_info_ptr, code);
+	if code = 0 then do;			/* fine */
+
+		dupt = "0"b;			/* prepare to check for defer_until process termination */
+		if mseg_message_info.ms_ptr -> queue_msg_hdr.defer_until_process_termination then do; /* check to see if defer_until_process_termination is requested */
+			call set_lock_$lock (mseg_message_info.ms_ptr -> queue_msg_hdr.dupt_lock, 1, code); /* test to see if the process is still around */
+			if (code ^= 0) & (code ^= error_table_$invalid_lock_reset) then dupt = "1"b; /* it is, defer request until later */
+			else call set_lock_$unlock (mseg_message_info.ms_ptr -> queue_msg_hdr.dupt_lock, code); /* else, unlock the lock for good measure */
+		     end;				/* end of DUPT processing */
+
+		if direction = re_read then do;	/* request is from wait list */
+			if ^dupt then do;		/* when request was from wait list and dupt is ok, we are done */
+				call mark_request (STATE_RUNNING, code);
+				if code ^= 0 then go to next;
+				found = "1"b;
+			     end;
+			else do;
+				call add_wle (dupt, dctep); /* otherwise, add it back to wait list! */
+				goto flush;	/* and try again */
+			     end;
+		     end;
+
+		else do;				/* else request is from queue, check authorization */
+			qgte.last_read (q) = mseg_message_info.ms_id; /* update last_read */
+			auth = mseg_message_info.sender_authorization;
+			do i = qgte.first_dev_class to qgte.last_dev_class; /* find dev class with right access range */
+			     dcp = addr (iodc_static.dctp -> dev_class_tab.entries (i));
+			     if aim_check_$greater_or_equal (auth, dcp -> dcte.min_access) then
+				if aim_check_$greater_or_equal (dcp -> dcte.max_access, auth) then /* range is right */
+				     if (dcx = i) & ^dupt then do; /* bingo, this is our device class and we aren't waitng for process termination */
+					     call mark_request (STATE_RUNNING, code);
+					     if code ^= 0 then go to next;
+					     found = "1"b;
+					     return;
+					end;
+				     else do;	/* request belongs to another dev class or is waiting process termination, add it to waiting list */
+					     call add_wle (dupt, dcp);
+					     go to flush; /* free this one and try the next one */
+					end;
+			end;
+
+/* come here if we fell through,  i.e. no device class had right access range for request */
+
+			auth_string = "";
+			call convert_authorization_$to_string_short (auth, auth_string, code);
+			call ioa_$rsnnl ("Request skipped for request type ^a.^/Unexpected access class: ^a",
+			     err_mess, err_len, qgte.name, auth_string);
+			call iodc_message_ ("101"b, 0, err_mess); /* tell the operator */
+flush:			message_len = mseg_message_info.ms_len;
+			free mseg_message_info.ms_ptr -> based_message in (req_area); /* free request */
+			go to next;
+		     end;
+
+	     end;
+	else if code = error_table_$no_message then
+	     /* this is okay too, but there's no message */
+	     if direction = re_read then go to next;	/* waiting request must have been cancelled */
+	     else return;				/* the queue is exhausted */
+
+	else do;					/* not so good */
+		if code = error_table_$bad_segment then
+		     if bad = 0 then do;		/* message seg. was just salvaged, try again */
+
+			     bad = 1;		/* once */
+			     call ioa_$rsnnl ("Requests may be lost from queue ^d of request type ""^a"".",
+				err_mess, err_len, q, qgte.name);
+			     call iodc_message_ ("101"b, code, err_mess);
+			     go to retry;
+			end;
+
+		if code = error_table_$notalloc then
+		     if space = 0 then do;		/* if we couldn't allocate try freeing one */
+
+			     space = 1;
+			     call free_oldest_request_$force;
+			     go to retry;
+			end;
+
+/* come here if an unrecoverable error occurred */
+/* report error and drop the offending queue */
+
+		call ioa_$rsnnl ("Dropping queue ^d of queue group ^a",
+		     err_mess, err_len, q, qgte.name);
+		call iodc_message_ ("101"b, code, err_mess); /* tell the operator */
+		qgte.mseg_index (q) = 0;		/* turn off the queue */
+
+	     end;
+
+	return;
+
+     end read_one;
+%page;
+
+add_wle: proc (dupt_flag, dc_ptr);
+
+	dcl     dupt_flag		 bit (1) aligned;
+	dcl     dc_ptr		 pointer;
+
+	call allocate_wle;				/* get a waiting list entry */
+	if y = 0 then do;				/* ugh, out of space */
+		call ioa_$rsnnl ("Waiting list full.  Request skipped from queue ^a_^d.ms",
+		     err_mess, err_len, qgte.name, q);
+		call iodc_message_ ("101"b, 0, err_mess); /* tell the operator */
+	     end;
+	else do;					/* chain request into waiting list */
+		wlp -> waiting_list.ms_id (y) = mseg_message_info.ms_id;
+		wlp -> waiting_list.state (y) = normal; /* normal waiting request */
+		wlp -> waiting_list.orig_q (y) = q;	/* queue it is from */
+		if dc_ptr -> dcte.last_waiting (q) > 0 then /* waiting list is not empty */
+		     wlp -> waiting_list.next (dc_ptr -> dcte.last_waiting (q)) = y;
+		else dc_ptr -> dcte.first_waiting (q) = y;
+		dc_ptr -> dcte.last_waiting (q) = y;
+		dc_ptr -> dcte.n_waiting = dc_ptr -> dcte.n_waiting + 1;
+		if dupt_flag then call mark_request (STATE_DUPT, (0));
+		else call mark_request (STATE_DEFERRED, (0));
+	     end;
+
+     end add_wle;
+%page;
+
+allocate_wle: proc;					/* procedure to allocate a waiting list entry */
+
+	y = wlp -> waiting_list.first_free;
+	if y > 0 then do;				/* take block from free list */
+		wlp -> waiting_list.first_free = wlp -> waiting_list.next (y); /* move free list head */
+		wlp -> waiting_list.next (y) = 0;	/* don't leave junk around */
+	     end;
+	else if wlp -> waiting_list.last_used = max_wl_size then y = 0; /* no more room */
+	else y, wlp -> waiting_list.last_used = wlp -> waiting_list.last_used + 1; /* raise high-water mark */
+	if y > 0 then do;				/* clear the new entry */
+		wlp -> waiting_list.state (y) = unused;
+		wlp -> waiting_list.next (y) = 0;
+		wlp -> waiting_list.orig_q (y) = 0;
+		wlp -> waiting_list.ms_id (y) = ""b;
+	     end;
+
+     end allocate_wle;
+%page;
+
+free_wle: proc;					/* procedure to free a waiting list entry */
+
+	if x = wlp -> waiting_list.last_used then do;	/* lower high-water mark */
+		wlp -> waiting_list.last_used = wlp -> waiting_list.last_used - 1;
+		wlp -> waiting_list.next (x) = 0;
+	     end;
+	else do;					/* add to head of free list */
+		wlp -> waiting_list.next (x) = wlp -> waiting_list.first_free;
+		wlp -> waiting_list.first_free = x;
+	     end;
+	wlp -> waiting_list.state (x) = unused;		/* mark it as free */
+	wlp -> waiting_list.ms_id (x) = ""b;
+
+     end free_wle;
+%page;
+
+mark_request: proc (new_state, code);
+
+	dcl     new_state		 fixed bin;
+	dcl     code		 fixed bin (35);
+	dcl     msg_p		 ptr;
+	dcl     msg_id		 bit (72) aligned;
+	dcl     msg_len		 fixed bin (18);
+	dcl     retry		 fixed bin;
+
+	msg_p = mseg_message_info.ms_ptr;		/* get ptr to msg text */
+	msg_p -> queue_msg_hdr.state = new_state;	/* tell user */
+	msg_id = mseg_message_info.ms_id;		/* get ready to re-write the message */
+	msg_len = mseg_message_info.ms_len;
+	retry = 0;
+update:	call message_segment_$update_message_index (q_idx, msg_len, msg_id, msg_p, code);
+	if code ^= 0 then /* normal test should be cheap */
+	     if code = error_table_$bad_segment		/* message seg was salvaged */
+	     then if retry = 0 then do;		/* try once more */
+			retry = 1;
+			go to update;
+		     end;
+
+     end mark_request;
+%page;
+
+init: entry (a_ptr);
+
+	dcl     a_ptr		 ptr;
+
+	stat_p = a_ptr;				/* get ptr to iodc_static */
+
+	wlp = iodc_static.wait_list_ptr;
+	wlp -> waiting_list.first_free,
+	     wlp -> waiting_list.last_used = 0;
+
+	do dcx = 1 to iodc_static.dctp -> dev_class_tab.n_classes; /* init per device class info */
+	     dctep = addr (iodc_static.dctp -> dev_class_tab.entries (dcx));
+	     dcte.n_waiting = 0;
+	     do q = 1 to 4;				/* clear waiting list indices for all possible queues */
+		dcte.first_waiting (q),
+		     dcte.last_waiting (q) = 0;
+	     end;
+	end;
+
+	return;
+%page; %include device_class;
+%page; %include iod_tables_hdr;
+%page; %include iodc_static;
+%page; %include iodc_wait_list;
+%page; %include mseg_message_info;
+%page; %include q_group_tab;
+%page; %include queue_msg_hdr;
+%page; %include request_descriptor;
+
+     end find_next_request_;

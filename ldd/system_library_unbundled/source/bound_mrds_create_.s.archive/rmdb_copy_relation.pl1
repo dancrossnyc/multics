@@ -1,0 +1,684 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1986 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: ^inddcls,^indattr,indnoniterend,^indnoniterdo,indend,tree,^case,insnl,comcol61,dclind5,declareind5,delnl */
+
+/*DESCRIPTION
+  This subroutine creates a file_model and data relation from the description
+  of an already present relation and a list of attributes to be deleted from
+  or added to that relation. (Note: the add is not implemented yet, it should
+  only be used by the restructure_relation operation of rmdb. */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-27,Spitzer), approve(86-01-27,MCR7311),
+     audit(86-09-15,Gilcrease), install(86-10-16,MR12.0-1187):
+     written
+  2) change(86-11-18,Blair), approve(86-11-18,PBF7311), audit(86-12-05,Dupuis),
+     install(86-12-09,MR12.0-1237):
+     Rework code so that the new relation (the one without the deleted domains)
+     is created correctly.  Be sure to close it before we start putting tuples
+     into it so that it will be up to date with index ids and all the
+     information we collect and put into the model *after* the relation is
+     first created and opened.
+  3) change(87-11-03,Blair), approve(87-11-03,MCR7792), audit(87-11-30,Dupuis),
+     install(87-12-07,MR12.2-1008):
+     Initialize mstxn_txn_id to 0 so that we won't get caught in the cleaner by
+     trying to delete a txn that doesn't exist.
+                                                   END HISTORY COMMENTS */
+
+rmdb_copy_relation:
+     proc (Idbm_ptr, Idb_path, Itemp_dir_path, Irmdb_relmgr_entries_ptr, Irelation_ptr, Oerror_message, Ocode);
+
+	dbm_ptr = Idbm_ptr;
+	db_path = Idb_path;
+	temp_dir_path = Itemp_dir_path;
+	rmdb_relmgr_entries_ptr = Irmdb_relmgr_entries_ptr;
+	relation_ptr = Irelation_ptr;
+
+	fm_ptr = relation.file_model_ptr;
+
+	delete_model_sw, delete_relation_sw = "0"b;
+	control_area_ptr, new_file_model_ptr = null;
+	new_file_info_ptr, last_file_info_ptr = null;
+	new_relation_id, old_relation_id = "0"b;
+	mstxn_txn_id = "0"b;
+
+	on cleanup call cleaner;
+	
+	create_relation_name = unique_chars_ ("0"b);
+	create_model_name = rtrim (create_relation_name) || ".m";
+
+	call make_area (control_area_ptr);
+
+/* Mark in file_model segment that the relation copy and file_model code are
+   not current. */
+	file_model.file_model_copy_good = "0"b;
+	file_model.relation_copy_good = "0"b;
+
+	call copy_file_model;			/* create and copy the file model information */
+	call transaction_in_progress;
+	if mstxn_transactions_needed
+	then do;
+	     on cleanup
+		begin;
+		call mstxn_cleanup;
+		call cleaner;
+		end;
+	     on any_other call mstxn_any_other;
+%include mrds_start_transaction;
+               if mstxn_code ^= 0
+               then call error (mstxn_code, "Could not start a transaction.");
+               end;
+
+	call create_relation;			/* create the empty data relation */
+	call copy_data;				/* copy the data from the old relation to the new */
+	if mstxn_transactions_needed 
+	then do;
+	     mftxn_code = 0;
+%include mrds_finish_transaction;
+               end;
+
+/* At this point we have esentially created the new relation. Mark the delete
+   switches so that the cleanup handler doesn't get rid of them. Now we must
+   copy the new model on the old, and the new data relation onto the old. If
+   either the system or process crash now, we can recover by attempting this
+   operation multiple times (rmdb_salvage_db does this when attempting the
+   undo request). */
+	delete_relation_sw, delete_model_sw = "0"b;
+	new_file_model_ptr -> file_model.relation_copy_good = "1"b;
+	new_file_model_ptr -> file_model.file_model_copy_good = "1"b;
+
+	call error (0, "");
+%page;
+/*DESCRIPTION
+  Create a non-freeing, non-zeroing extensible area to allocate structures in.
+  When we return and finish using these structures, we will simply throw away
+  the area. This subroutine is also used to reinitialize the area to empty so
+  that we may reuse it for other purposes. */
+
+make_area:
+     proc (area_ptr);
+
+dcl  area_ptr ptr parameter;
+
+	if area_ptr = null
+	then do;
+	     call mdbm_util_$get_temp_segment_path (temp_dir_path, myname, area_ptr, code);
+	     if code ^= 0
+	     then call error (code, "Cannot get a temp segment in the temp dir.");
+
+	     unspec (ai) = "0"b;
+	     ai.version = area_info_version_1;
+	     ai.extend = "1"b;
+	     ai.dont_free = "0"b;
+	     ai.no_freeing = "0"b;
+	     ai.owner = myname;
+	     ai.size = sys_info$max_seg_size;
+	     ai.areap = area_ptr;
+	     end;
+	else call release_area_ (area_ptr);
+
+	call define_area_ (addr (ai), code);
+	if code ^= 0
+	then call error (code, "Defining an area.");
+
+	return;
+     end make_area;
+%page;
+/*DESCRIPTION
+  Create the new relation from the description of the old minus the attributes
+  that are to be deleted. */
+
+create_relation:
+     proc;
+
+dcl  cr_loop fixed bin;
+
+/* initialize for calls to relation manager */
+	tva_number_of_vector_slots = 0;
+	tva_number_of_dimensions = rel_info.num_attr;
+	tva_maximum_dimension_name_length = 32;
+	allocate typed_vector_array in (control_area) set (typed_vector_array_ptr);
+
+	typed_vector_array.version = TYPED_VECTOR_ARRAY_VERSION_2;
+	typed_vector_array.number_of_dimensions = 0;
+
+	il_number_of_ids = rel_info.num_attr;
+	allocate id_list in (control_area) set (id_list_ptr);
+	id_list.number_of_ids = 0;
+	id_list.version = ID_LIST_VERSION_1;
+
+/* Set up the list of descriptors for the create relation operation. */
+	ai_ptr = ptr (new_file_model_ptr, rel_info.attr_ptr);
+	do cr_loop= 1 to tva_number_of_dimensions;
+	          
+	          if attr_info.key_attr then do;
+		     id_list.number_of_ids = id_list.number_of_ids + 1;
+		     id_list.id (id_list.number_of_ids) = attr_info.defn_order;
+		     end;
+		di_ptr = ptr (dbm_ptr, attr_info.domain_ptr);
+		typed_vector_array.number_of_dimensions = typed_vector_array.number_of_dimensions + 1;
+		typed_vector_array.dimension_table (typed_vector_array.number_of_dimensions).name = attr_info.name;
+		typed_vector_array.dimension_table (typed_vector_array.number_of_dimensions).descriptor_ptr =
+		     addr (domain_info.db_desc);
+		ai_ptr = ptr (new_file_model_ptr, attr_info.fwd_thread);
+	end;
+
+	if id_list.number_of_ids = 0
+	then call error (mrds_error_$no_primary_key, "For relation " || relation.name);
+	
+	allocate rel_creation_info in (control_area) set (rel_creation_info_ptr);
+	allocate file_create_info in (control_area) set (file_create_info_ptr);
+
+/* Initialize values for the create relation operation. */
+	rel_creation_info.version = REL_CREATION_INFO_VERSION_2;
+	rel_creation_info.esm_info_ptr = null;
+	rel_creation_info.cism_info_ptr = null;
+	rel_creation_info.file_create_info_ptr = file_create_info_ptr;
+	file_create_info.version = FILE_CREATE_INFO_VERSION_2;
+	file_create_info.ci_size_in_bytes = 4096;
+	file_create_info.blocking_factor = mrds_data_$relation_blocking_factor;
+	file_create_info.flags.protected = db_model.db_type_flags.transactions_needed;
+	file_create_info.flags.no_concurrency = ^db_model.db_type_flags.concurrency_on;
+	file_create_info.flags.no_rollback = ^db_model.db_type_flags.rollback_on;
+	file_create_info.flags.mbz_1 = "0"b;
+	file_create_info.ring_brackets (*) = 0;
+	file_create_info.mbz_2 = 0;
+	file_create_info.mbz_3 = "0"b;
+
+	call rmdb_relmgr_entries
+	     .
+	     create_relation (db_path, create_relation_name, rel_creation_info_ptr, typed_vector_array_ptr,
+	     new_relation_id, rel_info.id, code);
+	if code ^= 0
+	then call error (code, "While creating relation " || create_relation_name);
+
+	delete_relation_sw = "1"b;
+
+/* initialize values for create_index */
+	style = 1;
+	relation_index_flags_ptr = addr (flag_list);
+	flag_list = "0"b;
+	relation_index_flags.index_is_unique = "1"b;	/* for primary key */
+
+/* create the primary index for the relation */
+	call rmdb_relmgr_entries
+	     .create_index (new_relation_id, id_list_ptr, flag_list, style, rel_info.primary_key_index_id, code);
+	if code ^= 0
+	then call error (code, "While creating the primary index for" || create_relation_name);
+
+/* create the secondary indexes for the relation */
+	relation_index_flags.index_is_unique = "0"b;	/* index need not be unique for secondary index */
+	id_list.number_of_ids = 1;			/* secondary indices involve only one attribute */
+
+	ai_ptr = ptr (new_file_model_ptr, rel_info.attr_ptr);
+	do cr_loop = 1 to rel_info.num_attr;
+		if attr_info.index_attr
+		then do;
+		     id_list.id (1) = attr_info.defn_order;
+		     call rmdb_relmgr_entries
+			.create_index (new_relation_id, id_list_ptr, flag_list, style, attr_info.index_id, code);
+		     if code ^= 0
+		     then call error (code, "While creating secondary indices for " || create_relation_name);
+		     end;
+		ai_ptr = ptr (new_file_model_ptr, attr_info.fwd_thread);
+	     end;					/* do relation_idx */
+
+	return;
+     end create_relation;
+%page;
+/*DESCRIPTION
+  This subroutine copies the data from the relation MSF/DMF to a new file 
+  without the attributes that are to be deleted. */
+
+copy_data:
+     proc;
+
+dcl  based_bit36a bit (36) aligned based;
+dcl  descriptor bit (36) aligned;
+dcl  loop fixed bin (35);
+dcl  new_cursor_ptr ptr;
+dcl  old_cursor_ptr ptr;
+dcl  tuple_bit_length fixed bin (35);
+
+/* Open the relation that contains the data to copy from. */
+          call rmdb_relmgr_entries.close (new_relation_id,(0));
+	call rmdb_relmgr_entries.open (db_path, create_relation_name, new_relation_id, code);
+	
+	call rmdb_relmgr_entries.open (db_path, relation.name, old_relation_id, code);
+	if code ^= 0
+	then call error (code, "Unable to open data relation " || relation.name);
+
+/* Create cursors for both the from and to relations. These cursors are
+   allocated in an area that is to be released, so there is no need to clean up
+   and get rid of them. */
+	call rmdb_relmgr_entries.create_cursor (old_relation_id, control_area_ptr, old_cursor_ptr, code);
+	if code ^= 0
+	then call error (code, "Unable to create a cursor for relation " || relation.name);
+
+	call rmdb_relmgr_entries.create_cursor (new_relation_id, control_area_ptr, new_cursor_ptr, code);
+	if code ^= 0
+	then call error (code, "Unable to create a cursor for copy of relation " || relation.name);
+
+/* Create the select structure */
+	rss_number_of_and_groups = 0;
+	rss_maximum_number_of_constraints = 0;
+	allocate relation_search_specification in (control_area) set (relation_search_specification_ptr);
+
+	relation_search_specification.head.version = SPECIFICATION_VERSION_4;
+	relation_search_specification.head.type = ABSOLUTE_RELATION_SEARCH_SPECIFICATION_TYPE;
+
+	relation_search_specification.head.pad = "0"b;
+	relation_search_specification.head.subset_specification_ptr = null;
+
+	unspec(relation_search_specification.flags) = "0"b;
+
+	relation_search_specification.range.type = LOW_RANGE_TYPE;
+						/* all tuples */
+	relation_search_specification.range.size = mrds_data_$max_tids_returned_per_call;
+
+/* Populate the retrieval id list (the list of attributes to retrieve from the
+   old relation). Since we are omitting attributes, we only need to retrieve the
+   ones we are actually going to store. While we are building the id_list,
+   calculate the maximum size (in bits) of the tuple. */
+	il_number_of_ids = relation.attribute_count;
+	allocate id_list in (control_area) set (id_list_ptr);
+	id_list.version = ID_LIST_VERSION_1;
+	id_list.number_of_ids = 0;
+
+	tuple_bit_length = 0;
+	do loop = 1 to relation.attribute_count;
+	     if ^relation.attribute (loop).flags.delete
+	     then do;
+		id_list.number_of_ids = id_list.number_of_ids + 1;
+		id_list.id (id_list.number_of_ids) = loop;
+
+		di_ptr = ptr (dbm_ptr, relation.attribute (loop).domain_info_ptr);
+		descriptor = domain_info.db_desc;
+		if domain_info.db_desc_is_ptr
+		then descriptor = ptr (dbm_ptr, descriptor) -> based_bit36a;
+
+		tuple_bit_length = tuple_bit_length + mdbm_util_$get_data_bit_length (descriptor);
+		end;
+	     end;					/* do loop */
+
+	simple_typed_vector_ptr, element_id_list_ptr = null;
+
+/* create an element_id_list for the call to get_tuple_ids */
+	eil_number_of_elements = mrds_data_$max_tids_returned_per_call;
+	allocate element_id_list in (control_area) set (element_id_list_ptr);
+	element_id_list.version = ELEMENT_ID_LIST_VERSION_1;
+	
+/* Read all the data from the old relation data file and store it into the new
+   one. If we get a dup_store error, then deleting one or more of the attributes
+   would cause the primary key to be non-unique and is not allowed. */
+	code = 0;
+	do while (code = 0);     
+
+	     element_id_list.number_of_elements = 0;
+	     element_id_list.id (*) = "0"b;
+
+	     call rmdb_relmgr_entries
+		.
+		get_tuple_id (old_cursor_ptr, relation_search_specification_ptr, control_area_ptr,
+		element_id_list_ptr, code);
+
+	     if code = 0 & element_id_list.number_of_elements > 0
+		then do loop = 1 repeat loop + 1 while (loop <= element_id_list.number_of_elements & code = 0);
+		
+/* let the relmgr create the simple_typed vector and fill the value_ptrs and 
+   then we'll use the same one after the first time */
+
+		     if mstxn_transactions_needed
+		     then	call manage_transaction;
+
+			call rmdb_relmgr_entries
+			.
+			get_tuple_by_id (old_cursor_ptr, element_id_list.id (loop), id_list_ptr, control_area_ptr, simple_typed_vector_ptr, code);
+
+			if code = 0
+			then call rmdb_relmgr_entries.put_tuple (new_cursor_ptr, simple_typed_vector_ptr, element_id_list.id (loop), code);
+			if mstxn_transactions_needed
+		          then call manage_transaction;
+
+	     end;                  /* loop through all tuples in element_id_list */
+	     
+
+	     if code = 0
+	     then relation_search_specification.head.type = RELATIVE_RELATION_SEARCH_SPECIFICATION_TYPE;     
+
+	     end;              /* all tuples in the relation have been copied */
+
+	if code ^= dm_error_$no_tuple
+	then if code = dm_error_$key_duplication
+	     then call error (code,
+		     "Deleting key attributes from relation " || rtrim (relation.name)
+		     || " would cause primary keys to be non-unique.");
+	     else call error (code, "Deleting attributes from relation " || relation.name);
+	code = 0;
+
+/* Close both data files. */
+	call rmdb_relmgr_entries.close (new_relation_id, (0));
+	call rmdb_relmgr_entries.close (old_relation_id, (0));
+
+	new_relation_id, old_relation_id = "0"b;
+
+/* Mark in the file_model that the data relation is usable. */
+	file_model.relation_copy_good = "1"b;
+
+	return;
+     end copy_data;
+%page;
+/*DESCRIPTION
+  This subroutine creates an empty file_model segment, and populates it with
+  the attributes that are not deleted from the old file_model segment. */
+
+copy_file_model:
+     proc;
+
+dcl  1 adi like attr_def_info;
+dcl  add_name char (32);
+dcl  amount_to_pad fixed bin;
+dcl  WORD fixed bin internal static options (constant) init (36);
+     
+	call initiate_file_$create (db_path, create_model_name, RW_ACCESS, new_file_model_ptr, ("0"b), (0), code);
+	if code ^= 0
+	then call error (code, "While creating the file_model copy for relation " || relation.name);
+	
+	delete_model_sw = "1"b;			/* the model copy must be cleaned up if we abort */
+
+/* Add a name of <relation>.k to <unique>.m. This is the only indicator of what
+   the name of the relation is. The salvager is going to need this to complete
+   the copy operation. */
+	add_name = rtrim (relation.name) || ".k";
+	call hcs_$chname_file (db_path, create_model_name, "", add_name, code);
+	if code ^= 0
+	then do;
+	     if code = error_table_$namedup
+	     then do;
+		call hcs_$chname_file (db_path, add_name, add_name, "", (0));
+		call hcs_$chname_file (db_path, create_model_name, "", add_name, code);
+		end;
+	     if code ^= 0
+	     then call error (code, "Adding a name on model " || create_model_name);
+	     end;
+
+	new_file_model_ptr -> like_file_model = init_file_model;
+	new_file_model_ptr -> file_model.fm_area = empty ();
+	new_file_model_ptr -> file_model.changer_ptr = db_model.changer_ptr;
+	
+	allocate rel_info in (new_file_model_ptr -> file_model.fm_area) set (ri_ptr);
+
+	new_file_model_ptr -> file_model.rel_ptr = rel (ri_ptr);
+
+	rel_info = init_rel_info; 
+	rel_info.name = relation.name;
+	rel_info.changer_ptr = db_model.changer_ptr;
+		
+/* Create all the attr_info structures in the new file_model segment */
+	do relation_idx = 1 to relation.attribute_count;
+	     if ^relation.attribute (relation_idx).flags.delete
+	     then do;
+		ai_ptr = relation.attribute (relation_idx).attribute_info_ptr;
+		di_ptr = ptr (dbm_ptr, relation.attribute (relation_idx).domain_info_ptr);
+		adi.name = attr_info.name;
+		adi.primary_key = attr_info.key_attr;
+		adi.indexed = attr_info.index_attr;
+		adi.mbz = "0"b;
+
+		call rmdb_build_attr_info (dbm_ptr, addr (adi), new_file_model_ptr, di_ptr, error_message, code);
+		if code ^= 0
+		then call error (code, error_message);
+
+		end;
+	     end;					/* do relation_idx */
+
+/* we've built all the attr infos, but we still need to align varying data */
+          if rel_info.nvar_atts = 0 then;
+	else do;
+	     if mod (rel_info.var_offset-1, WORD) = 0 then
+		amount_to_pad = 0;
+	     else amount_to_pad = WORD - mod (rel_info.var_offset -1, WORD);
+
+	     rel_info.var_offset = rel_info.var_offset + amount_to_pad;
+	     rel_info.max_data_len = rel_info.max_data_len + amount_to_pad;
+	     end;
+
+	call adjust_bit_count_ (db_path, create_model_name, "0"b, new_model_bit_count, (0));
+
+/* Mark the fact that the file_model describing the new relation is ok to use. */
+	file_model.file_model_copy_good = "1"b;
+
+/* Create a file_info structure and add it to the end of the list of file_infos
+   in db_model (if we are operating on a MSF). We don't really want to do this
+   because we only have to undo it later, but vfile_relmgr_ requires that
+   all these structures be there. */
+
+	     do fi_ptr = ptr (dbm_ptr, db_model.file_ptr) repeat ptr (dbm_ptr, file_info.fwd_ptr)
+		while (rel (fi_ptr) ^= NULL_OFFSET);
+		last_file_info_ptr = fi_ptr;
+		end;
+
+	     allocate file_info in (dbm_area) set (new_file_info_ptr);
+	     relation.copy_file_model_ptr = new_file_info_ptr;
+	     new_file_info_ptr -> file_info.file_name = create_relation_name;
+	     new_file_info_ptr -> file_info.file_id = "000000000000000000000000000000000001"b;
+	     new_file_info_ptr -> file_info.fwd_ptr = NULL_OFFSET;
+	     new_file_model_ptr -> file_model.fi_ptr = rel (fi_ptr);
+	     
+	     if last_file_info_ptr = null
+	     then db_model.file_ptr = rel (new_file_info_ptr);
+	     else last_file_info_ptr -> file_info.fwd_ptr = rel (new_file_info_ptr);
+
+	return;
+     end copy_file_model;
+%page;
+/*DESCRIPTION
+  This subroutine ensures that no transaction is in progress, and sets a flag
+  bit for use later. */
+
+transaction_in_progress:
+     proc;
+
+	if db_model.db_type_flags.transactions_needed
+	then do;
+	     mstxn_transactions_needed = "1"b;
+	     call transaction_manager_$get_current_txn_id (mstxn_txn_id, mstxn_code);
+	     if mstxn_code = 0
+	     then do;
+		mstxn_txn_id = "0"b;
+		call error (error_table_$action_not_performed,
+		     "A transaction is in progress. Commit or abort the transaction and try the operation again.");
+		end;
+	     end;
+	else mstxn_transactions_needed = "0"b;
+
+	return;
+     end transaction_in_progress;
+
+/*DESCRIPTION
+     This routine takes care of starting and stopping new transactions as needed.
+*/
+
+manage_transaction:
+     proc ();
+     
+          call transaction_manager_$commit_txn (mstxn_txn_id, mftxn_code);
+	if mftxn_code ^= 0
+	then do;
+	     call transaction_manager_$abort_txn (mstxn_txn_id, mftxn_temp_code);
+	     if mftxn_temp_code ^= 0
+	     then call transaction_manager_$abandon_txn (mstxn_txn_id, mftxn_temp_code);
+	     call error (mftxn_temp_code, "Unable to finish a transaction.");
+	     end;
+	
+	mstxn_txn_id = "0"b;
+          call transaction_manager_$begin_txn (TM_NORMAL_MODE, 0, mstxn_txn_id, mstxn_code);
+	if mstxn_code ^= 0
+	then call error (mstxn_code, "Could not start a transaction.");
+
+	return;
+
+     end manage_transaction;
+%page;
+/*DESCRIPTION
+  Error handler and cleanup handler. This is the only way to exit these
+  subroutines.
+*/
+
+error:
+     proc (code, msg);
+
+dcl  code fixed bin (35) parameter;
+dcl  msg char (*) parameter;
+
+	Ocode = code;
+	if code = 0
+	then Oerror_message = "";
+	else Oerror_message = msg;
+	goto RETURN_TO_CALLER;
+     end error;
+
+RETURN_TO_CALLER:
+	call cleaner;
+	return;
+
+cleaner:
+     proc;
+
+dcl  id bit (36) aligned;
+dcl  p ptr;
+
+	do p = control_area_ptr;
+	     if p ^= null
+	     then do;
+		call release_area_ (p);
+		call mdbm_util_$free_temp_segment (myname, p, (0));
+		end;
+	     end;
+	do id = new_relation_id, old_relation_id;
+	     if id ^= "0"b
+	     then call rmdb_relmgr_entries.close (id, (0));
+	     end;
+
+	if mstxn_txn_id ^= "0"b
+	then do;
+	     call transaction_manager_$abort_txn (mstxn_txn_id, code);
+	     if code ^= 0
+	     then call transaction_manager_$abandon_txn (mstxn_txn_id, (0));
+	     end;
+
+	return;
+     end cleaner;
+
+restore_significant_data:
+     proc;
+	return;
+     end restore_significant_data;
+
+should_rollback:
+     proc returns (bit (1) aligned);
+	return ("0"b);
+     end should_rollback;
+%page;
+%include access_mode_values;
+%page;
+%include area_info;
+%page;
+%include dm_element_id_list;
+%page;
+%include dm_file_create_info;
+%page;
+%include dm_id_list;
+%page;
+%include dm_range_constants;
+%page;
+%include dm_rel_creation_info;
+%page;
+%include dm_relation_index_flags;
+%page;
+%include dm_relation_spec;
+%page;
+%include dm_specification_head;
+%page;
+%include vu_typed_vector;
+%page;
+%include mdbm_db_model;
+%page;
+%include mdbm_file_model;
+%page;
+%include mdbm_file_model_init;
+%page;
+%include rmdb_create_rel_info;
+%page;
+%include rmdb_crossref_info;
+%page;
+%include rmdb_relmgr_entries;
+%page;
+%include vu_typed_vector_array;
+%page;
+dcl  addr builtin;
+dcl  adjust_bit_count_ entry (char (168), char (32), bit (1) aligned, fixed bin (35), fixed bin (35));
+dcl  1 ai aligned like area_info;
+dcl  any_other condition;
+dcl  cleanup condition;
+dcl  code fixed bin (35);
+dcl  control_area area (sys_info$max_seg_size) based (control_area_ptr);
+dcl  control_area_ptr ptr;
+dcl  create_model_name char (32);
+dcl  create_relation_name char (30);
+dcl  db_path char (168);
+dcl  define_area_ entry (ptr, fixed bin (35));
+dcl  delete_model_sw bit (1) aligned;
+dcl  delete_relation_sw bit (1) aligned;
+dcl  dm_error_$key_duplication fixed bin (35) ext static;
+dcl  dm_error_$no_tuple fixed bin (35) ext static;
+dcl  empty builtin;
+dcl  error_message char (500);
+dcl  error_table_$action_not_performed fixed bin (35) ext static;
+dcl  error_table_$namedup fixed bin(35) ext static;
+dcl  fixed builtin;
+dcl  flag_list bit (36) aligned;
+dcl  hcs_$chname_file entry (char (*), char (*), char (*), char (*), fixed bin (35));
+dcl  Idb_path char (*) parameter;
+dcl  Idbm_ptr ptr parameter;
+dcl  initiate_file_$create entry (char (*), char (*), bit (*), ptr, bit (1) aligned, fixed bin (24), fixed bin (35));
+dcl  Irelation_ptr ptr parameter;
+dcl  Irmdb_relmgr_entries_ptr ptr parameter;
+dcl  Itemp_dir_path char (*) parameter;
+dcl  last_file_info_ptr ptr;
+dcl  mdbm_util_$get_data_bit_length entry (bit (36) aligned) returns (fixed bin (35));
+dcl  mdbm_util_$get_temp_segment_path entry (char (*), char (*), ptr, fixed bin (35));
+dcl  mdbm_util_$free_temp_segment entry (char (*), ptr, fixed bin (35));
+dcl  mod builtin;
+dcl  mrds_data_$max_tids_returned_per_call external static fixed bin (35);
+dcl  mrds_data_$relation_blocking_factor external static fixed bin (17);
+dcl  mrds_error_$no_primary_key fixed bin (35) ext static;
+dcl  myname char (32) int static options (constant) init ("rmdb_copy_relation");
+dcl  new_file_info_ptr ptr;
+dcl  new_file_model_ptr ptr;
+dcl  new_model_bit_count fixed bin (35);
+dcl  new_relation_id bit (36) aligned;
+dcl  null builtin;
+dcl  NULL_OFFSET bit (18) unaligned int static options (constant) init ((18)"1"b);
+dcl  Ocode fixed bin (35) parameter;
+dcl  Oerror_message char (*) parameter;
+dcl  old_relation_id bit (36) aligned;
+dcl  ptr builtin;
+dcl  rel builtin;
+dcl  relation_idx fixed bin;
+dcl  release_area_ entry (ptr);
+dcl  rmdb_build_attr_info entry (ptr, ptr, ptr, ptr, char (*), fixed bin (35));
+dcl  rtrim builtin;
+dcl  style fixed bin;
+dcl  sys_info$max_seg_size fixed bin (35) ext static;
+dcl  temp_dir_path char (168);
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+dcl  unspec builtin;
+
+     end rmdb_copy_relation;

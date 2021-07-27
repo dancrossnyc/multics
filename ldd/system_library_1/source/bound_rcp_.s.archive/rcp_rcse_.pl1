@@ -1,0 +1,275 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+rcp_rcse_:  procedure;
+
+/*	This program is an internal interface of RCP.
+*	Created on 11/20/74 by Bill Silver.
+*
+*	This program manages the entries in RCS.  It also keeps a list of
+*	the RCS entries used by this process.  There is a separate list for
+*	attachments and assignments.  This program has the following entries:
+*	     1.  get   -	Gets a free entry and assigns it to the calling process.
+*	     2.  free  -	Frees an entry and puts it back onto the free list.
+*	     3.  info  -	Returns the offset of the first entry and the total
+*			number of entries in the attach and assign lists.
+*/
+
+
+/*		ARGUMENT  DATA		*/
+
+dcl	arg_assign_off	bit(18);		/* (O) Offset of first entry in assign list. */
+dcl	arg_attach_off	bit(18);		/* (O) Offset of first entry in attach list. */
+dcl	arg_ecode		fixed bin(35);	/* (O) error_table_ code. */
+dcl	arg_num_assign	fixed bin;	/* (O) Number of assignment RCS entries. */
+dcl	arg_num_attach	fixed bin;	/* (O) Number of attachment RCS entries. */
+dcl	arg_rcse_ptr	ptr;		/* (I/O) Pointer to the RCSE we are dealing with. */
+
+
+/*		AUTOMATIC  DATA		*/
+
+dcl	ecode		fixed bin(35);	/* error_table_ code. */
+dcl	frcse_off		bit(18);		/* Offset of RCS entry being freed. */
+dcl	id_count		fixed bin;	/* Unique ID count. */
+dcl	rcse_off		bit(18);		/* Offset of specified RCS entry. */
+dcl	kind		fixed bin;	/* RCS entry kind. */
+dcl	trcse_ptr		ptr;		/* Pointer to template RCSE. */
+dcl	urcse_off		bit(18);		/* Offset of next entry on process list. */
+
+
+/*		BASED  DATA		*/
+
+dcl   1	trcse  like rcse  based(trcse_ptr)  aligned;  /* Used to copy template RCSE. */
+
+
+/*		INTERNAL STATIC DATA	** Used to keep per process RCP info. */
+
+dcl	attach_off	bit(18)		/* Top of attach RCS entry list for this process. */
+	internal static	init ("0"b);
+dcl	num_attach	fixed bin		/* Number of attach RCS entries for process. */
+	internal static	init(0);
+dcl	max_attach	fixed bin		/* Maximum number of attach entries allowed. */
+	internal static	init (16);
+
+dcl	assign_off	bit(18)		/* Top of assign list. */
+	internal static	init ("0"b);
+dcl	num_assign	fixed bin		/* Number of assign entries. */
+	internal static	init (0);
+dcl	max_assign	fixed bin		/* Max number of assign entries. */
+	internal static	init (16);
+
+
+/*		EXTERNAL ENTRIES CALLED	*/
+
+dcl	cleanup		condition;	/* Cleanup handler needed to reset lock. */
+
+dcl     (	addr, null, ptr, rel, string )  builtin;
+
+dcl     (	error_table_$bad_index,
+	error_table_$fatal_error,
+	error_table_$noalloc )  fixed bin(35)  external;
+
+dcl	clock_		entry  returns (fixed bin(71));
+dcl	rcp_lock_$lock	entry  (ptr, fixed bin(35));
+dcl	rcp_lock_$unlock	entry  (ptr);
+dcl	rcp_pointers_$com_seg  entry  returns (ptr);
+/*	*/
+%include rcp_com_seg;
+/*	*/
+get:  entry  (arg_rcse_ptr, arg_ecode);
+
+/*	This entry will get a free RCS entry and assign it to the calling process.
+*	It will initialize the fields in this entry that are common to all kinds
+*	of requests.  It will add this entry to the correct list of RCS entries
+*	maintained for this process.
+*/
+	trcse_ptr = arg_rcse_ptr;		/* Get pointer to template RCSE. */
+	rcs_ptr = rcp_pointers_$com_seg ();	/* Get pointer to base of RCS. */
+	rcse_ptr = null();			/* No entry assigned yet. */
+	lock_info_ptr = addr(rcs.lock_info);	/* Get pointer to lock structure. */
+	kind = trcse.kind;			/* Get kind of RCSE to be allocated. */
+
+	if   kind = 1			/* Has process RCS entry limit been reached? */
+	     then if   num_attach = max_attach
+		     then do;		/* Yes, too many attach RCS entries. */
+			arg_ecode = error_table_$noalloc;
+			return;
+		     end;
+		     else;
+	     else if   num_assign = max_assign
+		     then do;		/* Yes, too many assign RCS entries. */
+			arg_ecode = error_table_$noalloc;
+			return;
+		     end;
+
+	on   cleanup begin;			/* Must unlock RCS if trouble. */
+	     call rcp_lock_$unlock (lock_info_ptr);
+	end;
+
+	call rcp_lock_$lock (lock_info_ptr, ecode);
+	if   ecode ^= 0			/* Can't get entry if error in locking. */
+	     then goto GET_RETURN;
+
+	call GET_FREE_ENTRY;		/* Get pointer and offset of next free entry. */
+	if   ecode ^= 0			/* Did we get one? */
+	     then do;			/* No, unlock RCS. */
+		call rcp_lock_$unlock (lock_info_ptr);
+		goto GET_RETURN;
+	     end;
+
+	rcse = trcse;			/* Copy template RCSE into its real entry slot. */
+	rcse.free_off = "0"b;		/* Not on free list now. */
+	rcse.state = 1;			/* 1 => entry no longer free. */
+
+	id_count,				/* Get next unique ID index. */
+	rcs.id_count = rcs.id_count + 1;
+
+	call rcp_lock_$unlock (lock_info_ptr);
+	revert cleanup;
+
+	rcse.state_time = clock_();		/* Now fill in other RCS entry fields. */
+	addr(rcse.rcp_id)->based_rcp_id.id_count = id_count;
+	addr(rcse.rcp_id)->based_rcp_id.rcse_off = rcse_off;
+
+/*	Put this RCS entry at the top of the correct process entry list.
+*/
+	if   kind = 1			/* Which list should we add it to? */
+	     then do;			/* Attachment list. */
+		rcse.user_off = attach_off;	/* Link to previous first entry. */
+		attach_off = rcse_off;	/* Set up new first entry. */
+		num_attach = num_attach + 1;	/* Update count of attach RCS entries. */
+	     end;
+	     else do;			/* Assignment list. */
+		rcse.user_off = assign_off;	/* Link up the same way. */
+		assign_off = rcse_off;
+		num_assign = num_assign + 1;
+	     end;
+
+GET_RETURN:
+	arg_rcse_ptr = rcse_ptr;		/* Return arguments. */
+	arg_ecode = ecode;
+	return;
+/*	*/
+free:  entry  (arg_rcse_ptr, arg_ecode);
+
+/*	This entry will put the specified RCS entry back onto the free list.
+*	It will remove it from the correct RCP entries list maintained for
+*	the process.
+*/
+	rcse_ptr = arg_rcse_ptr;		/* Argument points to specified entry. */
+	kind = rcse.kind;			/* Get entry kind. */
+
+	rcs_ptr = ptr(rcse_ptr, "0"b);	/* Get pointer to base of RCS. */
+	lock_info_ptr = addr(rcs.lock_info);
+	frcse_off = rel(rcse_ptr);		/* Get offset of RCS entry to be freed. */
+	urcse_off = rcse.user_off;		/* Offset of next RCS entry on process list. */
+
+	on   cleanup begin;			/* Must unlock RCS if trouble. */
+	     call rcp_lock_$unlock (lock_info_ptr);
+	end;
+
+	call rcp_lock_$lock (lock_info_ptr, ecode);
+	if   ecode ^= 0			/* Can't free if there is an error in locking. */
+	     then goto FREE_RETURN;
+
+/*	Reset entry values and put it back on free list.
+*/
+	rcse.state = 0;			/* Entry free. */
+	rcse.kind = 0;			/* Free => no kind of RCS entry. */
+	rcse.free_off = rcs.first_free_off;	/* Get offset of next free entry. */
+	rcs.first_free_off = frcse_off;	/* Put on top of free list. */
+	rcse.process_id = "0"b;		/* Process no longer owns this entry. */
+
+	call rcp_lock_$unlock (lock_info_ptr);
+	revert cleanup;
+
+/*	Take this entry out of the process list that it is in.
+*/
+	if   kind = 1			/* Which list is it in? */
+	     then do;			/* Attach list. */
+		rcse_off = attach_off;	/* Get first attach RCS entry. */
+		num_attach = num_attach - 1;	/* Update count of attach RCS entries. */
+	     end;
+	     else do;			/* Assign list. */
+		rcse_off = assign_off;
+		num_assign = num_assign - 1;
+	     end;
+
+	if   rcse_off = frcse_off		/* Are we freeing first entry on list? */
+	     then do;			/* Yes, get new first entry. */
+		if   kind = 1		/* Again, decide which list. */
+		     then attach_off = urcse_off;
+		     else assign_off = urcse_off;
+		goto FREE_RETURN;
+	     end;
+
+	do   while (rcse_off ^= "0"b);	/* Not first entry.  Look through list. */
+	     rcse_ptr = ptr(rcs_ptr, rcse_off);	/* Get pointer to current entry. */
+	     if   rcse.user_off = frcse_off	/* Is next entry the one? */
+		then do;			/* Yes, update value in next user offset. */
+		     rcse.user_off = urcse_off;
+		     goto FREE_RETURN;
+		end;
+	     rcse_off = rcse.user_off;	/* No, get next entry in this list. */
+	end;
+
+	ecode = error_table_$bad_index;	/* Bad trouble, entry not on list. */
+
+FREE_RETURN:
+	arg_ecode = ecode;
+	return;
+/*	*/
+info:  entry  (arg_attach_off, arg_num_attach, arg_assign_off, arg_num_assign);
+
+/*	This entry is called to get the offsets of the first RCS entry
+*	on each of the process lists.  It will also return the number
+*	of each kind of RCS entries.
+*/
+	arg_attach_off = attach_off;		/* Just get them from internal static. */
+	arg_num_attach = num_attach;
+
+	arg_assign_off = assign_off;
+	arg_num_assign = num_assign;
+
+	return;
+
+
+
+
+
+GET_FREE_ENTRY:  procedure;
+
+/*	This procedure is called to get the pointer and offset of a free RCS entry.
+*	We will always get the first free entry.  If there are no free entries we
+*	will add a new entry to RCS.
+*/
+	rcse_off = rcs.first_free_off;	/* Get offset of first free entry. */
+	if   rcse_off ^= "0"b		/* Is there a free entry? */
+	     then do;			/* Yes. */
+		rcse_ptr = ptr(rcs_ptr,rcse_off);   /* Get pointer to this free entry. */
+		rcs.first_free_off = rcse.free_off; /* Get next first free entry. */
+		return;
+	     end;
+
+	if   rcs.num_entries = rcs.max_entries	/* No, is there room for another entry? */
+	     then do;			/* No, we cannot get a free entry. */
+		ecode = error_table_$fatal_error;
+		return;
+	     end;
+
+	rcs.num_entries = rcs.num_entries + 1;	/* Room for another entry. */
+	rcse_ptr = addr(rcs.entry(rcs.num_entries));
+	rcse_off = rel(rcse_ptr);		/* Get pointer and offset of new entry. */
+
+	end  GET_FREE_ENTRY;
+
+	end  rcp_rcse_;

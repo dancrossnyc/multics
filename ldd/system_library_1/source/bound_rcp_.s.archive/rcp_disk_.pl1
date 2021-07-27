@@ -1,0 +1,901 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+     audit(85-12-17,CLJones), install(86-03-21,MR12.0-1033):
+     Add code for no
+     PROTECT and OPR INT switches.
+  2) change(86-01-15,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-17,Farley), install(86-07-17,MR12.0-1097):
+     Add support for subvolumes and 512_WORD_IO.
+  3) change(86-09-26,Farley), approve(86-10-24,MCR7557),
+     audit(86-10-27,Fawcett), install(86-10-28,MR12.0-1200):
+     Added call to admin_gate_$ioi_set_ws_max, before calling ioi_$workspace.
+     This will allow proper workspace size setting when the workspace may be
+     currently smaller than required.
+                                                   END HISTORY COMMENTS */
+
+rcp_disk_:
+     procedure (arg_rcse_ptr, arg_ecode);
+
+/*	This program is an internal interface of RCP.
+   *	Created on 05/13/75 by Bill Silver.
+   *	Changed on 04/02/76 by Bill Silver for NSS.
+   *	Changed on 11/01/76 by Bill Silver to set mount timer.
+   *	Changed on 12/02/76 by Bernard Greenberg for label countervalidator.
+   *	Changed on 1/79 by R.J.C. Kissel to add disk label authentication.
+   *	Changed 3/79 by Michael R. Jordan for MR7.0R.
+   *	Changed 2/85 by Paul Farley to add code for no PROTECT and OPR INT switches.
+   *
+   *	This program is called to perform special disk attachment processing.
+*/
+
+/*		ARGUMENT  DATA		*/
+
+	dcl     arg_ecode		 fixed bin (35);	/* (O) Return error_table_ code. */
+	dcl     arg_rcse_ptr	 ptr;		/* (I) Pointer to attachment RCS entry. */
+
+
+/*		AUTOMATIC  DATA		*/
+
+	dcl     command		 bit (6);
+	dcl     device_off		 bit (18) aligned;	/* RCPD device entry offset. */
+	dcl     drive_num		 fixed bin;	/* Disk drive number. */
+	dcl     (ecode, scode)	 fixed bin (35);	/* error_table_ code. */
+	dcl     ioi_index		 fixed bin;	/* IOI internal device index. */
+	dcl     label_address	 fixed bin;
+	dcl     special_flag	 bit (1) aligned;	/* ON => special interrupt. */
+	dcl     special_status_word	 bit (36) aligned;	/* One word of special status. */
+	dcl     workspace_ptr	 ptr;		/* Pointer to our workspace. */
+	dcl     real_story		 char (160);
+	dcl     label_story		 char (160);
+	dcl     what_user_asked_for	 bit (1);
+	dcl     write_flag		 bit (1) aligned;
+	dcl     valid_reg		 bit (1);		/* Pack has valid registration */
+	dcl     ss_pack		 bit (1);		/* Pack is Storage System */
+	dcl     valid_copy		 bit (1);		/* Pack is provably copy of mounted vol */
+	dcl     (i, sector, record_factor, record_offset, cylinder, devadd, usable_sect_per_cyl, unused_sect_per_cyl) fixed bin (24); /* variables used to calculate label sector addresses */
+
+/*		BASED  DATA		*/
+
+	dcl     1 wspace		 based (workspace_ptr) aligned, /* Overlay of IOI workspace. */
+		2 idcw		 bit (36),	/* Disk IDCW. */
+		2 seek_dcw	 bit (36),	/* Used in label checking seek-read operation. */
+		2 read_idcw	 bit (36),
+		2 read_dcw	 bit (36),
+		2 seek_addr	 bit (36),	/* Specifies record to seek. */
+		2 state		 fixed bin,	/* Index that => current state of attachment. */
+		2 mount_state	 fixed bin,	/* Save state used to wait for mounts. */
+		2 retry_count	 fixed bin,	/* Number of REREADYs we have issued. */
+		2 protect_comment	 char (8),	/* Used in disk mount messages. */
+		2 flags,
+		( 3 waiting_for_operator_interrupt
+				 bit (1),		/* ON => interrupt must come from MPC button. */
+		  3 pad1		 bit (35)
+		  )		 unaligned,
+		2 pad_ptr		 ptr,		/* Pad so status queue starts at even offset. */
+		2 istatq		 like istat,	/* Our status queue - only 1 entry. */
+		2 fs_type_idx	 fixed bin,	/* index into fs_devtype arrays for this device */
+		2 n_label		 fixed bin,	/* number of labels */
+		2 cur_label	 fixed bin,	/* what label currently checking */
+		2 sv		 (3),		/* info on labels */
+		  3 pvname	 char (32),	/* pv_name found in label */
+		  3 story		 char (32),	/* Need this in wspace since it is used in different states. */
+
+		2 label_buffer	 (1024) bit (36);	/* Area where we read pack label. */
+
+
+/*		INTERNAL STATIC DATA	*/
+
+	dcl     max_num_retries	 fixed bin /* Number of times we will ready a disk drive. */ internal static init (5);
+
+	dcl     template_idcw	 bit (36) internal static init ("000000700201"b3);
+						/* Template of the IDCW we will use. */
+
+	dcl     set_standby_command	 bit (6) internal static init ("72"b3);
+	dcl     request_status_command
+				 bit (6) internal static init ("00"b3);
+	dcl     read_command	 bit (6) internal static init ("25"b3);
+	dcl     reset_status_command
+				 bit (6) internal static init ("40"b3);
+	dcl     LABEL_ADDRESS	 fixed bin (24) internal static init (0);
+
+/*		EXTERNAL ENTRIES CALLED	*/
+
+	dcl     (addr, bin, bit, divide, hbound, null, mod, rel, rtrim, size, substr)
+				 builtin;
+
+	dcl     (error_table_$bad_label, error_table_$device_attention, error_table_$invalid_state, error_table_$unable_to_do_io)
+				 fixed bin (35) external;
+
+	dcl     admin_gate_$ioi_set_ws_max
+				 entry (fixed bin, fixed bin (19), fixed bin (35));
+	dcl     admin_gate_$syserr	 entry options (variable);
+	dcl     countervalidate_label_
+				 entry (ptr, bit (1), bit (1), bit (1));
+	dcl     cv_dec_		 entry (char (*), fixed bin);
+	dcl     ioa_$rsnnl		 entry () options (variable);
+	dcl     ioi_$connect	 entry (fixed bin, fixed bin, fixed bin (35));
+	dcl     ioi_$get_special_status
+				 entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+	dcl     ioi_$set_status	 entry (fixed bin, fixed bin (18), fixed bin, fixed bin (35));
+	dcl     ioi_$workspace	 entry (fixed bin, ptr, fixed bin (19), fixed bin (35));
+	dcl     rcp_auto_register_	 entry (char (*), char (*), char (*), fixed bin (35));
+	dcl     rcp_ioi_attach_	 entry (ptr, fixed bin (35));
+	dcl     rcp_mount_timer_$reset
+				 entry (bit (18) aligned, fixed bin (35));
+	dcl     rcp_mount_timer_$set
+				 entry (bit (18) aligned, bit (1) aligned, fixed bin (35));
+						/* 	*/
+%include rcp_com_seg;
+
+%include rcp_resource_types;
+/* 	*/
+%include fs_dev_types;
+%include fs_vol_label;
+/* 	*/
+%include iom_pcw;
+%include iom_dcw;
+/* 	*/
+%include ioi_stat;
+/* 	*/
+%include iom_stat;
+/* 	*/
+/*	Begin special disk attachment processing.
+*/
+	rcse_ptr = arg_rcse_ptr;			/* Copy argument. */
+	workspace_ptr = rcse.workspace_ptr;		/* Get pointer to current workspace. */
+	ecode = 0;
+
+	if workspace_ptr ^= null ()			/* Have we set up a workspace yet? */
+	then do;					/* Yes. */
+		ioi_index = rcse.ioi_index;		/* Needed to call IOI. */
+		isp = addr (wspace.istatq);		/* Almost every state needs this pointer. */
+		goto DISK_STATE (wspace.state);	/* Go do next step in disk attachment. */
+	     end;
+
+
+/*	No workspace implies that this is the first call to rcp_$check_attach.
+   *	We must attach the disk drive in ring 0 via IOI.
+*/
+	call rcp_ioi_attach_ (rcse_ptr, ecode);
+	if ecode ^= 0				/* Any error at all? */
+	then do;					/* Yes, abort attachment. */
+		arg_ecode = ecode;
+		return;
+	     end;
+	ioi_index = rcse.ioi_index;			/* Get IOI index for this attachment. */
+
+/*	We have just attached the disk drive to IOI.  We must get an IOI workspace.
+   *	Then we will issue a set standby command in order to power down this drive.
+   *	For T&D attachments we don't want to do any of this special processing.
+*/
+	if rcse.flags.t_and_d			/* Is this a special T&D attachment? */
+	then do;					/* Yes, nothing to do. */
+		rcse.state = 4;			/* Tell caller that disk is ready for use. */
+		arg_ecode = 0;
+		return;
+	     end;
+
+	call admin_gate_$ioi_set_ws_max (ioi_index, size (wspace), ecode);
+	if ecode ^= 0
+	then do;
+		arg_ecode = ecode;
+		return;
+	     end;
+
+	call ioi_$workspace (ioi_index, workspace_ptr, size (wspace), ecode);
+	if ecode ^= 0
+	then do;
+		arg_ecode = ecode;
+		return;
+	     end;
+
+	rcse.workspace_ptr = workspace_ptr;		/* Save workspace pointer for this attachment. */
+	wspace.idcw = template_idcw;			/* Set up template IDCW. */
+	call cv_dec_ (substr (rcse.device_name, 6, 2), drive_num);
+	addr (wspace.idcw) -> idcw.device = bit (bin (drive_num, 6));
+	wspace.state,				/* Initialize the state variable that controls all. */ wspace.mount_state, wspace.retry_count = 0;
+						/* Initialize retry count. */
+	if rcse.flags.writing			/* Set up mount comment. */
+	then wspace.protect_comment = "without";
+	else wspace.protect_comment = "with";
+
+	isp = addr (wspace.istatq);			/* Call IOI to set up our status queue. */
+	call ioi_$set_status (ioi_index, bin (rel (isp), 18), 1, ecode);
+	if ecode ^= 0
+	then do;					/* Can't go on without a status queue. */
+		arg_ecode = ecode;
+		return;
+	     end;
+
+	if rcse.flags.preloaded | rcse.flags.not_removable_media
+	then do;					/* In these cases we do not want to unload the disk */
+		command = reset_status_command;
+		wspace.state = 3;
+		wspace.mount_state = 2;
+	     end;
+	else do;					/* UNLOAD the disk */
+		command = set_standby_command;
+		wspace.state = 1;
+	     end;
+
+/* find the device index from model number */
+	do wspace.fs_type_idx = 1 to hbound (MODELN, 1) while (rcse.model ^= MODELN (wspace.fs_type_idx));
+	end;
+	wspace.n_label = number_of_sv (wspace.fs_type_idx);
+	if wspace.n_label = 0 then wspace.n_label = 1;
+	wspace.cur_label = 0;
+	istat.completion.st = "0"b;			/* Try to put this disk drive in standby or reset status. */
+	addr (wspace.idcw) -> idcw.command = command;
+	call ioi_$connect (ioi_index, 0, ecode);
+	arg_ecode = ecode;
+	return;
+
+
+/*	Somehow or other we are trying to use the workspace out of sequence.
+*/
+DISK_STATE (0):					/* INVALID STATE */
+	arg_ecode = error_table_$invalid_state;
+	return;
+
+
+/*	The connect issued to perform the set standby has terminated.
+   *	We don't really care whether or not the set standby operation worked.
+   *	We will tell the operator to mount the disk volume being attached.
+   *	Then we will wait for any special interrupts generated by a set standby
+   *	or the mounting.
+*/
+DISK_STATE (1):					/* SET STANDBY TERMINATION */
+	if ^istat.completion.st			/* There should at least be some status. */
+	then return;				/* None, so ignore. */
+						/* REQUEST DISK MOUNT */
+	call admin_gate_$syserr (3, "RCP: Mount Pack ^a^[^s^; ^a protect^] on ^a for ^a", rcse.volume_name, rcse.flags.no_protect, wspace.protect_comment, rcse.device_name, rcse.group_id);
+	wspace.state = 2;				/* Wait for special for mount. */
+	wspace.mount_state = 2;			/* Remember state used to wait for mount. */
+	wspace.flags.waiting_for_operator_interrupt = "0"b;
+						/* Turn ON mount timer. */
+	device_off = rcse.device_off;			/* Need RCPD device entry offset. */
+	write_flag = rcse.flags.writing;		/* Pass on write flag. */
+	call rcp_mount_timer_$set (device_off, write_flag, ecode);
+	arg_ecode = ecode;
+	return;
+
+
+/*	We should come here because we have received a special interrupt.
+   *	We will check to see if it was generated by the disk mount.
+   *	If so bit # 36 should be ON.  If not we will wait for another special.
+*/
+DISK_STATE (2):					/* SPECIAL from MOUNT. */
+	call ioi_$get_special_status (ioi_index, special_flag, special_status_word, ecode);
+
+/*
+   Check for: an error return, not a special, the wrong special, or not a special from the MPC.
+*/
+
+	arg_ecode = ecode;
+
+	if ecode ^= 0 | ^special_flag
+	then return;				/* Not a special. */
+
+	else do;					/* A good special. */
+		if wspace.flags.waiting_for_operator_interrupt
+		then do;				/* Make sure it is from MPC butoon. */
+			if substr (special_status_word, 20, 1) ^= "1"b | substr (special_status_word, 13, 6) ^= "00"b3
+			then return;
+		     end;				/* Make sure it is from MPC button. */
+
+		else do;				/* Make sure it is from a device. */
+			if substr (special_status_word, 34, 3) ^= "001"b
+			then return;
+		     end;				/* Make sure it is from a device. */
+	     end;					/* A good special. */
+
+	istat.completion.st = "0"b;			/* DISK READY - check its current state. */
+	addr (wspace.idcw) -> idcw.command = request_status_command;
+	call ioi_$connect (ioi_index, 0, ecode);
+	wspace.state = 3;				/* Wait for request status to terminate. */
+
+	device_off = rcse.device_off;			/* Turn OFF mount timer. */
+	call rcp_mount_timer_$reset (device_off, scode);
+	if ecode = 0
+	then ecode = scode;
+
+	rcse.flags.disk_ss_pack = "0"b;
+	rcse.flags.disk_copy_of_ss_pack = "0"b;
+	rcse.flags.disk_io_pack = "0"b;
+	rcse.flags.disk_unregistered = "0"b;
+	rcse.flags.disk_unreadable = "0"b;
+	arg_ecode = ecode;
+	return;
+
+
+/*	Check the status from the request (or reset) status operation.  We must check that
+   *	write protect is set correctly.  If everything is OK we will indicate that
+   *	the attachment has been completed.
+*/
+DISK_STATE (3):					/* REQUEST (or RESET) STATUS TERMINATION. */
+	if ^istat.completion.st			/* Is there any status. */
+	then do;					/* No, ignore. */
+		arg_ecode = 0;
+		return;
+	     end;
+
+	if istat.level ^= 3				/* Is this a terminiate? */
+	then do;					/* No, something wrong. */
+		call REREADY_DISK ("0"b, "0"b);
+		arg_ecode = ecode;
+		return;
+	     end;
+
+	statp = addr (istat.iom_stat);		/* Get pointer to IOM status. */
+	if istat.completion.er			/* Test for error that is not an Attention with Protect. */
+	then if (status.major ^= "0010"b) | (status.sub ^= "000001"b)
+	     then do;				/* That is what we have. */
+		     call REREADY_DISK ("0"b, "0"b);
+		     arg_ecode = ecode;
+		     return;
+		end;
+
+/*	Now check that the write protect is set correctly.  If the user
+   *	wants to write then protect should be OFF and the major status should
+   *	be Ready and thus there should be no error.  If the user does not want
+   *	to write then protect should be ON and the status should be Device
+   *	Attention with Protect and there should be an error.
+*/
+	if rcse.flags.writing = istat.completion.er &
+	     ^rcse.flags.no_protect			/* device has protect sw. */
+	then do;					/* Protect is not set correctly. */
+		call REREADY_DISK ("0"b, "1"b);
+		arg_ecode = ecode;
+		return;
+	     end;
+
+/*	Set up channel program to read label  of pack.  We want to verify that this
+   *	pack is not a storage system pack.  Only users acting as system processes
+   *	may mount a storage system pack for user I/O.
+*/
+	idcwp = addr (wspace.idcw);			/* Set up a seek for the label record. */
+	idcw.command = seek_command (wspace.fs_type_idx); /* Get correct seek type for this dev */
+	idcw.control = "10"b;			/* Continue to next IDCW. */
+	idcw.count = "0"b;
+
+	wspace.seek_dcw = "0"b;			/* Set up seek DCW. */
+	dcwp = addr (wspace.seek_dcw);
+	dcw.address = rel (addr (wspace.seek_addr));
+	dcw.tally = bit (bin (1, 12));
+
+	wspace.read_idcw = "0"b;			/* Set up to read on record. */
+	idcwp = addr (wspace.read_idcw);
+	idcw.command = read_command;
+	idcw.device = addr (wspace.idcw) -> idcw.device;
+	idcw.code = "111"b;
+
+	wspace.read_dcw = "0"b;			/*  Set up read DCW. */
+	dcwp = addr (wspace.read_dcw);
+	dcw.address = rel (addr (wspace.label_buffer));
+	dcw.tally = bit (bin (size (label), 12), 12);
+
+
+
+LABEL_LOOP:
+	wspace.cur_label = wspace.cur_label + 1;
+	label_address = LABEL_ADDRESS;
+	if wspace.cur_label > 1 then do;
+
+		record_factor = (wspace.cur_label - 1) * rec_per_cyl (wspace.fs_type_idx);
+		record_offset = mod (label_address, rec_per_cyl (wspace.fs_type_idx));
+		devadd = ((label_address - record_offset) * wspace.n_label) +
+		     record_factor + record_offset;
+		sector = devadd * sect_per_rec (wspace.fs_type_idx); /* raw sector. */
+		usable_sect_per_cyl =
+		     divide (sect_per_cyl (wspace.fs_type_idx), sect_per_rec (wspace.fs_type_idx), 24, 0) *
+		     sect_per_rec (wspace.fs_type_idx);
+		unused_sect_per_cyl = sect_per_cyl (wspace.fs_type_idx) - usable_sect_per_cyl;
+		cylinder = divide (sector, usable_sect_per_cyl, 12, 0);
+		sector = sector + cylinder * unused_sect_per_cyl;
+	     end;
+	else sector = label_address;
+	wspace.seek_addr = bit (bin (sect_per_rec (wspace.fs_type_idx), 12), 12) ||
+	     bit (bin (sector, 24), 24);
+
+	istat.completion.st = "0"b;			/* Reset before connect.  */
+	call ioi_$connect (ioi_index, 0, ecode);
+	if ecode ^= 0
+	then do;					/* Bad error from IOI. */
+		arg_ecode = ecode;
+		return;
+	     end;
+
+	wspace.state = 4;
+	return;
+
+/*	Check the status from the seek and read request.
+*/
+DISK_STATE (4):					/* SEEK and READ TERMINATION */
+	if ^istat.completion.st			/* Did we get a real interrupt? */
+	then do;					/* No, ignore. */
+		arg_ecode = 0;
+		return;
+	     end;
+
+	if istat.level ^= 3				/* Is it a termination? */
+	then do;					/* No, must be an unwanted special. */
+		call REREADY_DISK ("0"b, "0"b);
+		arg_ecode = ecode;
+		return;
+	     end;
+
+/* Initialize for label checking. */
+	wspace.n_label = number_of_sv (wspace.fs_type_idx);
+	if wspace.n_label = 0 then wspace.n_label = 1;
+
+	labelp = addr (wspace.label_buffer);		/* Always need this whether the read was successful or not. */
+
+	statp = addr (istat.iom_stat);		/* Check termination status. */
+	if istat.completion.er			/* Did we get an error? */
+	then do;					/* An error reading the label. */
+		if rcse.flags.system
+		then do;				/* System processes get a chance to authenticate. */
+			label.pv_name = "";		/* Blank this for authentication message. */
+			sv (wspace.cur_label).pvname = label.pv_name;
+			wspace.sv (wspace.cur_label).story = "UnReaDable";
+			rcse.flags.disk_unreadable = "1"b;
+		     end;
+
+		else do;				/* Normal people don't. */
+			arg_ecode = error_table_$unable_to_do_io;
+			return;
+		     end;
+	     end;					/* An error reading the label. */
+
+	else do;					/* Check the label. */
+		sv (wspace.cur_label).pvname = label.pv_name;
+		call countervalidate_label_ (labelp, valid_reg, valid_copy, ss_pack);
+
+		if ss_pack
+		then do;				/* Some sort of known pack. */
+
+			if valid_copy
+			then do;
+				wspace.sv (wspace.cur_label).story = "copy of Storage System";
+				rcse.flags.disk_copy_of_ss_pack = "1"b;
+			     end;
+
+			else if valid_reg
+			then do;
+				wspace.sv (wspace.cur_label).story = "Storage System";
+				rcse.flags.disk_ss_pack = "1"b;
+			     end;
+
+			else do;
+				wspace.sv (wspace.cur_label).story = "UnReGistered";
+				rcse.flags.disk_unregistered = "1"b;
+			     end;
+
+			if ^rcse.flags.system
+			then do;			/* Normal people can't use these. */
+				call admin_gate_$syserr (0, "RCP: Rejected mount of ^a volume ^a for ^a.",
+				     wspace.sv (wspace.cur_label).story, wspace.sv (wspace.cur_label).pvname, rcse.group_id);
+				arg_ecode = error_table_$bad_label;
+				return;
+			     end;			/* Normal people can't use these. */
+		     end;				/* Some sort of known pack. */
+
+		else do;				/* An unknown pack. */
+			label.pv_name = "";		/* Blank this for authentication message. */
+			wspace.sv (wspace.cur_label).pvname = label.pv_name;
+			wspace.sv (wspace.cur_label).story = "IO";
+			rcse.flags.disk_io_pack = "1"b;
+		     end;				/* An unknown pack. */
+	     end;					/* Check the label. */
+
+/* Initialize for the authentication state. */
+
+	rcse.flags.have_auth = "0"b;
+	rcse.flags.need_auth = "0"b;
+	rcse.flags.auth_set = "0"b;
+
+/*
+   Everybody (except the Initializer) must get authenticated at this point.  User processes only get
+   here if the label was readable and not a registered or unregistered storage system pack.
+   System processes always get here with an appropriate story.
+*/
+
+	if rcse.group_id = "Initializer.SysDaemon.z"
+	then do;					/* Set flags so Initializer does'nt need authentication. */
+		rcse.flags.have_auth = "1"b;
+		rcse.flags.auth_set = "1"b;
+		rcse.flags.need_auth = "0"b;
+	     end;
+
+/* check for all labels read */
+
+	if wspace.cur_label < n_label then do;
+		wspace.state = 3;
+		goto LABEL_LOOP;
+	     end;
+
+DISK_STATE (5):					/* The authentication state. */
+	wspace.state = 5;
+
+	labelp = addr (wspace.label_buffer);		/* Always need this for messages. */
+
+	if rcse.flags.auth_set			/* Note that this will be false the first time. */
+	then do;					/* Check whether authenticated or not. */
+		if rcse.flags.have_auth
+		then do;				/* Everything is done. */
+			device_off = rcse.device_off;
+			call rcp_mount_timer_$reset (device_off, scode);
+						/* Turn OFF mount timer. */
+			do i = 1 to wspace.n_label;
+			     call admin_gate_$syserr (0, "RCP: Mounted ^a volume ^a on ^a^[^a^] for user I/O.",
+				wspace.sv (i).story, wspace.sv (i).pvname, rcse.device_name, (n_label > 1), substr (valid_sv_string, i, 1));
+			end;
+			call ioi_$set_status (ioi_index, 0, 0, ecode);
+			if ecode ^= 0
+			then do;			/* Bad error. */
+				arg_ecode = ecode;
+				return;
+			     end;			/* Bad error. */
+
+			if rcse.flags.must_auto_register
+			then do;			/* Register this disk_vol to this user. */
+				call rcp_auto_register_ (VOLUME_TYPE (DISK_VOL_VTYPEX), (rcse.volume_name), (rcse.group_id), ecode);
+				if ecode ^= 0	/* ERROR */
+				then do;
+					arg_ecode = ecode;
+					return;
+				     end;
+			     end;
+
+			rcse.state = 4;
+			wspace.state = 0;
+			arg_ecode = scode;		/* Not a fatal error. */
+			return;
+		     end;				/* Everything is done. */
+
+		else do;				/* Bad authentication. */
+			device_off = rcse.device_off;
+			call rcp_mount_timer_$reset (device_off, scode);
+						/* Turn OFF mount timer. */
+
+			call admin_gate_$syserr (3, "RCP: Authentication denied for ^a.", rcse.device_name);
+
+			if rcse.flags.not_removable_media
+			then do;			/* Nothing we can do about this. */
+				arg_ecode = error_table_$bad_label;
+				return;
+			     end;
+
+			else do;			/* Give the operator another chance. */
+				istat.completion.st = "0"b;
+				addr (wspace.idcw) -> idcw.command = set_standby_command;
+				call ioi_$connect (ioi_index, 0, ecode);
+						/* Ignore the code. */
+
+				wspace.retry_count = 0;
+						/* Start over. */
+				call REREADY_DISK ("1"b, "0"b);
+						/* Authentication denied. */
+				arg_ecode = ecode;
+				return;
+			     end;			/* Give the operator another chance. */
+		     end;				/* Denied authentication. */
+	     end;					/* Check whether authenticated or not. */
+
+	else do;					/* Tell operator to authenticate, type of pack is already set. */
+
+		if ^rcse.flags.need_auth
+		then do;				/* Authentication is needed. */
+			rcse.flags.need_auth = "1"b;
+			rcse.flags.auth_set = "0"b;
+			rcse.flags.have_auth = "0"b;
+
+			if wspace.n_label > 1 then do;
+				real_story = "";
+				what_user_asked_for = "0"b;
+				if rcse.flags.disk_ss_pack then do;
+					real_story = "a Storage System";
+					rcse.flags.disk_copy_of_ss_pack = "0"b;
+					rcse.flags.disk_io_pack = "0"b;
+					rcse.flags.disk_unregistered = "0"b;
+					rcse.flags.disk_unreadable = "0"b;
+				     end;
+				else if rcse.flags.disk_copy_of_ss_pack then do;
+					real_story = "a copy of Storage System";
+					rcse.flags.disk_io_pack = "0"b;
+					rcse.flags.disk_unregistered = "0"b;
+					rcse.flags.disk_unreadable = "0"b;
+				     end;
+				else if rcse.flags.disk_unregistered then do;
+					real_story = "an UnReGistered";
+					rcse.flags.disk_io_pack = "0"b;
+					rcse.flags.disk_unreadable = "0"b;
+				     end;
+				else if rcse.flags.disk_io_pack then do;
+					real_story = "an IO";
+					rcse.flags.disk_unreadable = "0"b;
+				     end;
+				else if rcse.flags.disk_unreadable then do;
+					real_story = "an UnReaDable label.";
+					call ioa_$rsnnl ("All ^d subvolume labels are unreadable.", label_story, (0), wspace.n_label);
+					goto TELL_STORY;
+				     end;
+
+				call ioa_$rsnnl ("^a label.", real_story, (0), rtrim (real_story));
+				label_story = "";
+				do i = 1 to wspace.n_label;
+				     call ioa_$rsnnl ("^a^x^[no label for^s^;^a on^] subvol ^a^[.^;,^]",
+					label_story, (0), rtrim (label_story), (wspace.sv (i).pvname = ""), wspace.sv (i).pvname,
+					valid_sv_array (i - 1), (i = wspace.n_label));
+				     if wspace.sv (i).pvname = rcse.volume_name
+				     then what_user_asked_for = "1"b;
+				end;
+TELL_STORY:
+				call admin_gate_$syserr (3, "RCP: Authenticate ^a for ^a.^/^8xRCP: It has ^a^/^8xRCP:^a^[^s^;^/^8xRCP: User requested volume ^a.^]^[
+RCP: WARNING!!  IF YOU AUTHENTICATE THIS REQUEST ^a WILL OWN VOLUME ^a!^]",
+				     rcse.device_name, rcse.group_id,
+				     real_story, label_story, what_user_asked_for, rcse.volume_name,
+				     rcse.flags.must_auto_register, rcse.group_id, rcse.volume_name);
+			     end;
+			else do;
+				call admin_gate_$syserr (3,
+				     "RCP: Authenticate ^a for ^a.^/^8xRCP: It has ^a label ^a.^[^s^;^/^8xRCP: User requested volume ^a.^]^[
+RCP: WARNING!!  IF YOU AUTHENTICATE THIS REQUEST ^a WILL OWN VOLUME ^a!^]",
+				     rcse.device_name, rcse.group_id, wspace.sv (1).story, wspace.sv (1).pvname,
+				     wspace.sv (1).pvname = rcse.volume_name, rcse.volume_name,
+				     rcse.flags.must_auto_register, rcse.group_id, wspace.sv (1).pvname);
+			     end;
+			device_off = rcse.device_off;
+			write_flag = rcse.flags.writing;
+			call rcp_mount_timer_$set (device_off, write_flag, scode);
+						/* Turn ON mount timer. */
+
+			arg_ecode = 0;		/* Ignore code from timer setting. */
+			return;
+		     end;				/* Authentication is needed. */
+
+		else do;				/* Ignore some spurious wakeups. */
+			arg_ecode = 0;
+			return;
+		     end;
+	     end;					/* Tell operator to authenticate. */
+						/* 	*/
+REREADY_DISK:
+     procedure (remount_flag, protect_flag);
+
+/*	This procedure is called to tell the operator to ready the disk again.
+   *	We will have to wait for the special again.
+*/
+	dcl     remount_flag	 bit (1);		/* ON => remount,  OFF => reready. */
+	dcl     protect_flag	 bit (1);		/* ON => protect wrong, OFF => protect ok. */
+
+	if wspace.retry_count = max_num_retries		/* Have we retried too many times. */
+	then do;					/* Yes, abort attachment. */
+		ecode = error_table_$device_attention;
+		return;
+	     end;
+	wspace.retry_count = wspace.retry_count + 1;
+
+	device_off = rcse.device_off;			/* Turn ON mount timer. */
+	write_flag = rcse.flags.writing;		/* Pass on write flag. */
+	call rcp_mount_timer_$set (device_off, write_flag, ecode);
+	if ecode ^= 0
+	then return;
+
+	if protect_flag & rcse.flags.opr_int_available
+	then do;					/* Must change protect switch on drive. */
+		call admin_gate_$syserr (3,
+		     "RCP: Turn protect switch ^[OFF^;ON^] on drive ^a and then push Operator Interrupt on MPC.",
+		     rcse.flags.writing, rcse.device_name);
+		wspace.state = wspace.mount_state;
+		wspace.flags.waiting_for_operator_interrupt = "1"b;
+	     end;					/* Must change protect switch on drive. */
+
+	else do;
+		if remount_flag			/* Remount or ready? */
+		then call admin_gate_$syserr (3, "RCP: Wrong pack (^a) mounted on ^a.  Mount pack ^a^[^s^; ^a protect^] on ^a",
+			label.pv_name, rcse.device_name, rcse.volume_name, rcse.flags.no_protect, wspace.protect_comment, rcse.device_name);
+		else call admin_gate_$syserr (3, "RCP: Reready ^a^[^s^; ^a protect^]", rcse.device_name, rcse.flags.no_protect, wspace.protect_comment);
+
+		wspace.state = wspace.mount_state;	/* Wait for special from mount again. */
+		wspace.flags.waiting_for_operator_interrupt = "0"b;
+	     end;
+
+     end REREADY_DISK;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   RCP: Mount Pack PACK with(out) protect on DRIVE for PERSON.PROJ.T
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The user PERSON.PROJ.T has requested the mounting of
+   the user I/O pack named PACK on disk drive DRIVE.
+
+   A:	Mount the pack and make it ready.
+   Set the PROTECT status as specified in the message.
+
+
+   Message:
+   RCP: Mount Pack PACK on DRIVE for PERSON.PROJ.T
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The user PERSON.PROJ.T has requested the mounting of
+   the user I/O pack named PACK on disk drive DRIVE.
+
+   A:	Mount the pack and make it ready.
+
+
+   Message:
+   RCP: Turn protect switch ON/OFF on drive DRIVE and then push Operator Interrupt on MPC
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The PROTECT status was wrong for DRIVE.
+
+   M:	Correct the PROTECT status and push the Operator Interrupt button on the MPC.
+
+
+   Message:
+   RCP: Reready DRIVE with(out) protect
+
+   S:	$beep
+
+   T:	$run
+
+   M:	DRIVE is not ready.
+
+
+   A:	Make the drive ready.
+
+
+   Message:
+   RCP: Reready DRIVE
+
+   S:	$beep
+
+   T:	$run
+
+   M:	DRIVE is not ready.
+
+
+   A:	Make the drive ready.
+
+
+   Message:
+   RCP: Rejected mount of LABEL_TYPE volume NAME for PERSON.PROJ.T
+
+   S:	$info
+
+   T:	$run
+
+   M:	A user has attempted to mount a storage-system format or unreadable (LABEL_TYPE)
+   disk pack for user I/O, without specifying the -sys parameter.
+   Because this might interfere with later storage system use of the pack
+   or compromise system security,
+   this action is not permitted.
+   The user's request is rejected.
+   This error could arise if an operator inadvertently mounted
+   the wrong pack.
+
+   A:	$ignore
+
+
+   Message:
+   RCP: Mounted LABEL_TYPE volume NAME on DRIVE for user I/O.
+
+   S:	$info
+
+   T:	$run
+
+   M:	A user has mounted LABEL_TYPE volume NAME as a user I/O disk on DRIVE.
+   The operator has authenticated the mount.
+
+   A:	$ignore
+
+
+   Message:
+   RCP: Authenticate DRIVE for PERSON.PROJ.T.
+.brf
+RCP: It has LABEL_TYPE label NAME.
+.brf;.unl 1
+(RCP: All N subvolume labels are unreadable.)
+.brf;.unl 1
+(RCP: VOL_NAME on subvol a, VOL_NAME on subvol b, VOL_NAME on subvol c.)
+.brf;.unl 1
+(RCP: User requested volume DIFFERENT_NAME.)
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The operator must verify that the correct pack is mounted on DRIVE.
+   If the DIFFERENT_NAME message indicates that the label on the
+   pack (NAME) is different from the user's request then special
+   instructions from the system administrator must be followed.
+
+   A:	If the pack is correct then use the "x auth" function to input the
+   DRIVE and the authentication code which matches LABEL_TYPE:  "ss"
+   for "Storage System" or "copy of Storage System"; "io" for "IO";
+   "urd" for "UnReaDable"; or "urg" for "UnReGistered".  If the wrong
+   pack is mounted then use the authentication code "no".
+
+
+   Message:
+   RCP: Authentication denied for DRIVE
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The operator has denied authentication for DRIVE.
+
+   A:	$ignore
+
+
+   Message:
+   RCP: Wrong pack (NAME) mounted on DRIVE. Mount pack PACK with(out) protect on DRIVE.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The operator has denied authentication for a removable disk pack (NAME)
+   on drive DRIVE.  The disk drive is put in standby.
+
+   A:	Mount the correct pack PACK with protect as specified and ready drive.
+
+
+   Message:
+   RCP: Wrong pack (NAME) mounted on DRIVE. Mount pack PACK on DRIVE.
+
+   S:	$beep
+
+   T:	$run
+
+   M:	The operator has denied authentication for a removable disk pack (NAME)
+   on drive DRIVE.  The disk drive is put in standby.
+
+   A:	Mount the correct pack PACK with protect as specified and ready drive.
+
+
+   Message:
+   RCP: WARNING!!  IF YOU AUTHENTICATE THIS REQUEST <USER> WILL OWN VOLUME <VOLUME>!
+
+   S:	$beep
+
+   T:	$run
+
+   M:	This is a warning to the operator.  He should be very careful to check the
+   physical label of the volume before authenticating this request.  As the message states,
+   if the request is autheticated, <VOLUME> will be registered and acquired to <USER>.
+
+   A:	Check the physical label of the disk pack.  If it is the property of
+   <USER>, authenticate the request.  If it is not the property of <USER> deny the
+   request by typing "x auth no".
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end rcp_disk_;

@@ -1,0 +1,289 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-27,Pierret), approve(86-02-27,MCR7340),
+     audit(86-04-28,Newcomb), install(86-05-06,MR12.0-1054):
+     Changed to execute file_mangaer_$post_transaction before unlocking locks.
+  2) change(86-04-22,Pierret), approve(86-04-22,MCR7340),
+     audit(86-04-28,Newcomb), install(86-05-06,MR12.0-1054):
+     Removed file_manager_$post_commit as it is not used (and does not even
+     exist!).
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,ifthenstmt,^indproc,^indcomtxt */
+/*---------------*/
+
+tm_abort: proc (A_txn_id, A_code);
+
+/* DESCRIPTION:
+
+   This procedure implements transaction_manager_$abort_txn
+   It rolls back the transaction by undoing all changes to protected files
+   made during the transaction, then writes an aborted mark and ends the
+   transaction.
+*/
+
+/* HISTORY:
+Written by Steve Herbst, 08/10/82.
+Modified:
+08/16/82 by Steve Herbst: Added call to bjm_$write_rolled_back_mark and
+	changed to use dm_data_$tm_tdt_ptr.
+08/23/82 by Steve Herbst: Removed call to bjm_$write_rolled_back_mark.
+08/27/82 by Steve Herbst: Added calls to flush the transaction.
+09/09/82 by Steve Herbst: Changed to eliminate locking.K 09/09/82 S. Herbst.
+09/21/82 by Steve Herbst: Added tm_$priv_abort.
+09/23/82 by Lindsey Spratt: Changed to use new lock_manager_ calling sequences.
+10/05/82 by Steve Herbst: Removed tm_$priv_abort again; will be done by
+	tm_$adjust_txn.
+10/14/82 by Steve Herbst: Changed pfm_ calling sequence and added check for
+	funny states.
+11/01/82 by Steve Herbst: Changed to turn on tm_tdt.error_sw for error states.
+11/05/82 by Steve Herbst: Changed to set tm_tdt.error_code on error return.
+11/05/82 by Steve Herbst: Changed to handle suspended transaction.
+01/11/83 by Steve Herbst: Changed to log error states.
+01/17/83 by Steve Herbst: Changed to complete previous error abort, and to
+	call tm_error_state.
+01/24/83 by Steve Herbst: Changed to work on user's own abandoned transaction.
+05/27/83 by Steve Herbst: Made to update checkpoint_id & rollback_count in
+	TDT entry.
+03/28/84 by Lee A. Newcomb:  changed tm_get_state_info call to be
+	  transaction_manager_$get_state_info.
+08/23/84 by Steve Herbst: Responded to auditing comments.
+01/29/85 by Steve Herbst: Changed to ignore dm_error_$file_was_deleted.
+02/07/85 by S. Cox: Added fm$post_transaction call (moved from lm_per_system_)
+04/23/85 by Matthew C. Pierret:  Switched order of calls to
+            file_manager_$post_transaction and lock_manager_$unlock_all so
+            that post_transaction operates under the safety of the locks
+            acquired by the transaction.
+*/
+%page;
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  A_txn_id bit (36) aligned parameter;
+dcl  A_code fixed bin (35) parameter;
+
+/* Constants */
+
+dcl  ME char (32) int static options (constant) init ("tm_abort");
+
+/* Based */
+
+/* Static */
+
+/* Automatic */
+
+dcl  person char (22);
+dcl  project char (9);
+dcl  op_name char (32);
+dcl  txn_id bit (36) aligned;
+dcl  txn_index fixed bin;
+dcl  (code, op_error_code) fixed bin (35);
+
+/* External */
+
+dcl  dm_data_$current_txn_id bit (36) aligned ext;
+dcl  dm_data_$current_txn_index fixed bin ext;
+dcl  dm_data_$my_process_id bit (36) ext;
+dcl  dm_data_$suspended_txn_index fixed bin ext;
+dcl  dm_data_$tm_tdt_ptr ptr ext;
+dcl  dm_error_$file_was_deleted fixed bin (35) ext;
+dcl  dm_error_$invalid_current_txn fixed bin (35) ext;
+dcl  dm_error_$no_current_transaction fixed bin (35) ext;
+dcl  dm_error_$not_own_transaction fixed bin (35) ext;
+dcl  dm_error_$transaction_not_current fixed bin (35) ext;
+dcl  dm_error_$transaction_suspended fixed bin (35) ext;
+dcl  error_table_$unimplemented_version fixed bin (35) ext;
+
+/* Entries */
+
+dcl  before_journal_manager_$flush_transaction entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  before_journal_manager_$rollback entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+dcl  before_journal_manager_$write_aborted_mark entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  dm_send_request_$adjust_txn entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  lock_manager_$unlock_all entry;
+dcl  file_manager_$flush_modified_ci entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  file_manager_$post_transaction entry ();
+dcl  tm_cleanup entry (ptr, fixed bin);
+dcl  tm_cleanup$restart_error entry (ptr, fixed bin);
+dcl  tm_error_state entry (fixed bin, fixed bin, fixed bin (35), char (*), char (*));
+dcl  transaction_manager_$get_state_info entry (fixed bin, char (*), fixed bin (35));
+dcl  user_info_ entry options (variable);
+
+/* Builtins */
+
+dcl  (rtrim, unspec) builtin;
+
+/* Conditions */
+
+dcl  cleanup condition;
+
+/* END OF DECLARATIONS */
+%page;
+	A_code = 0;
+
+	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+
+	if tm_tdt.version ^= TM_TDT_VERSION_3 then call ERROR_RETURN (error_table_$unimplemented_version);
+
+	if dm_data_$current_txn_index = 0 then
+	     if dm_data_$suspended_txn_index ^= 0 then call ERROR_RETURN (dm_error_$transaction_suspended);
+	     else call ERROR_RETURN (dm_error_$no_current_transaction);
+
+	txn_index = dm_data_$current_txn_index;
+
+	if txn_index < 1 | txn_index > tm_tdt.entry_count then
+	     call ERROR_RETURN (dm_error_$invalid_current_txn);
+
+	if tm_tdt.abandoned_sw (txn_index) then do;
+
+	     call user_info_ (person, project);
+	     if tm_tdt.owner_name (txn_index) = rtrim (person) || "." || project then do;
+						/* if txn is abandoned, let daemon adjust it */
+		call dm_send_request_$adjust_txn (tm_tdt.txn_id (txn_index), txn_index, 0);
+		return;
+	     end;
+	end;
+
+	if A_txn_id = "0"b | A_txn_id = tm_tdt.txn_id (txn_index) then
+	     txn_id = tm_tdt.txn_id (txn_index);
+	else call ERROR_RETURN (dm_error_$transaction_not_current);
+
+	if tm_tdt.process_id (txn_index) ^= dm_data_$my_process_id then
+	     call ERROR_RETURN (dm_error_$not_own_transaction);
+
+	if tm_tdt.state (txn_index) ^= TM_IN_PROGRESS_STATE then do;
+
+	     call transaction_manager_$get_state_info ((tm_tdt.state (txn_index)), op_name, op_error_code);
+	     if op_name = OP_NAME_ROLLBACK then
+
+		call CONVERT_ROLLBACK_TO_ABORT;
+
+	     else if op_name ^= OP_NAME_ABORT then call ERROR_RETURN (op_error_code);
+
+	     call tm_cleanup$restart_error (tm_tdt_ptr, txn_index); /* this call completes the abort */
+	     if tm_tdt.error_sw (txn_index) then
+		call ERROR_STATE ((tm_tdt.state (txn_index)), tm_tdt.error_code (txn_index), "tm_cleanup");
+	     return;
+	end;
+
+	on cleanup begin;
+	     call tm_cleanup (tm_tdt_ptr, txn_index);
+	end;
+
+	tm_tdt.state (txn_index) = TM_ABORT_FLUSHING_TXN_STATE;
+
+	call before_journal_manager_$flush_transaction (txn_id, txn_index, code);
+	if code ^= 0 then
+	     call ERROR_STATE (TM_ABORT_FLUSHING_TXN_ERROR, code,
+		"before_journal_manager_$flush_transaction");
+
+	tm_tdt.state (txn_index) = TM_ABORT_ROLLING_BACK_STATE;
+
+	call before_journal_manager_$rollback (txn_id, txn_index, 0, code);
+	if code ^= 0 then
+	     call ERROR_STATE (TM_ABORT_ROLLING_BACK_ERROR, code, "before_journal_manager_$rollback");
+
+	tm_tdt.checkpoint_id (txn_index) = 0;
+	tm_tdt.rollback_count (txn_index) = tm_tdt.rollback_count (txn_index) + 1;
+
+	tm_tdt.state (txn_index) = TM_ABORT_FLUSHING_CI_STATE;
+
+/* Make sure the file itself is really restored to how it was */
+
+	call file_manager_$flush_modified_ci (txn_id, txn_index, code);
+	if code ^= 0 & code ^= dm_error_$file_was_deleted then
+						/* previous abort may have deleted the file */
+	     call ERROR_STATE (TM_ABORT_FLUSHING_CI_ERROR, code, "file_manager_$flush_modified_ci");
+
+	tm_tdt.state (txn_index) = TM_ABORT_WRITING_MARK_STATE;
+
+	call before_journal_manager_$write_aborted_mark (txn_id, txn_index, code);
+	if code ^= 0 then
+	     call ERROR_STATE (TM_ABORT_WRITING_MARK_ERROR, code,
+		"before_journal_manager_$write_aborted_mark");
+
+	tm_tdt.state (txn_index) = TM_ABORT_UNLOCKING_STATE;
+
+	call file_manager_$post_transaction ();
+
+	call lock_manager_$unlock_all;
+
+	tm_tdt.state (txn_index) = TM_ABORT_METERING_STATE;
+
+/* Dump meters here */
+
+	dm_data_$current_txn_id = "0"b;
+	dm_data_$current_txn_index = 0;
+
+	tm_tdt.state (txn_index) = 0;			/* show intent to zero whole entry */
+	unspec (tm_tdt.transaction (txn_index)) = "0"b;	/* transaction is now gone */
+
+	A_txn_id = "0"b;				/* zero caller's arg */
+RETURN:
+	return;
+%page;
+CONVERT_ROLLBACK_TO_ABORT: proc;
+
+/* Maps rollback states to corresponding abort states, since both do the same calls.
+   However, it maps any state after TM_ROLLBACK_WRITING_MARK_STATE to TM_ABORT_WRITING_MARK_STATE
+   to make sure an abort mark is written. */
+
+dcl  error_sw bit (1);
+dcl  state fixed bin;
+
+	state = tm_tdt.state (txn_index);
+	if state > TM_ERROR_INCREMENT then do;
+	     error_sw = "1"b;
+	     state = state - TM_ERROR_INCREMENT;
+	end;
+
+	if state = TM_ROLLBACK_FLUSHING_TXN_STATE then state = TM_ABORT_FLUSHING_TXN_STATE;
+	else if state = TM_ROLLBACK_ROLLING_BACK_STATE then state = TM_ABORT_ROLLING_BACK_STATE;
+	else if state = TM_ROLLBACK_FLUSHING_CI_STATE then state = TM_ABORT_FLUSHING_CI_STATE;
+	else if state = TM_ROLLBACK_WRITING_MARK_STATE |
+	     state = TM_ROLLBACK_UNLOCKING_STATE |
+	     state = TM_ROLLBACK_METERING_STATE then state = TM_ABORT_WRITING_MARK_STATE;
+
+	if error_sw then state = state + TM_ERROR_INCREMENT;
+
+	tm_tdt.state (txn_index) = state;
+
+     end CONVERT_ROLLBACK_TO_ABORT;
+%page;
+ERROR_RETURN: proc (P_code);
+
+dcl  P_code fixed bin (35);
+
+	A_code = P_code;
+	go to RETURN;
+
+     end ERROR_RETURN;
+%page;
+ERROR_STATE: proc (P_state, P_code, P_name);
+
+dcl  P_state fixed bin;
+dcl  P_code fixed bin (35);
+dcl  P_name char (*);
+
+	call tm_error_state (txn_index, P_state, P_code, ME, P_name);
+
+	A_code = P_code;
+
+	go to RETURN;
+
+     end ERROR_STATE;
+%page;
+%include dm_tm_tdt;
+%page;
+%include dm_tm_states;
+
+
+     end tm_abort;

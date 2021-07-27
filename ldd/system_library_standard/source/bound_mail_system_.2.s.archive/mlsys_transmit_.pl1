@@ -1,0 +1,3259 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-03,Herbst), approve(86-06-03,MCR7432), audit(86-06-30,Wong),
+     install(86-06-30,MR12.0-1080):
+     Fixed to zero unused fields of mail_format structures.
+  2) change(89-08-11,Lee), approve(89-08-29,MCR8130),
+     audit(89-09-25,LZimmerman), install(89-10-02,MR12.3-1079):
+     phx18036 (Mail 450) - modified the deliver_message/redistribute_message
+     entries to set mailing list delivery codes to indicate non-delivery
+     rather than successful delivery if the delivery got aborted; reformatting.
+  3) change(91-10-25,Schroth), approve(91-11-28,MECR0015),
+     audit(91-11-25,WAAnderson), install(91-11-28,MR12.5-1001):
+     Correct MR12.4 source code corruption.
+  4) change(92-05-14,Schroth), approve(91-11-25,MCR8251),
+     audit(92-09-22,WAAnderson), install(92-09-24,MR12.5-1016):
+     Replace MECR0015: Correct MR12.4 source code corruption.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: off */
+
+/* Mail System Primitives which transmit a message to one or more recipients */
+
+/* Created:  July 1981 by G. Palter */
+/* Modified: 7 September 1982 by G. Palter to correctly reference error_table_$rqover and to fix the bug which causes
+      validate_address to return mlsys_et_$no_mailbox rather than mlsys_et_$no_a_permission if you have null access on a
+      mailbox */
+/* Recoded:  August 1983 by G. Palter to convert to new specification which includes adding separate entrypoints for each
+      of the transmission primitives (deliver, redistribute, copy, log, and save) */
+/* Modified: September 1983 by G. Palter to use the interim inter-system mailer (mlsys_mailer_) */
+/* Modified: March 1984 by G. Palter to fix the following mail system errors:
+      #0419 -- when the queue_mailing_lists delivery option is used, the mail system will ignore any mailing lists
+         specified rather than queuing the message for later delivery to said lists
+      #0420 -- when processing mailing lists, the mail system does not translate error_table_$no_component into
+         mlsys_et_$no_mailing_list
+      #0436 -- if a forum meeting is not found in the "forum" search list, the mail system will treat it as a version 1
+         forum in the working directory
+      #0438 -- the primitives which allow a user to replace the address list portions of a message
+         (eg: mail_system_$replace_from, mail_system_$replace_user_field) should not make the user's copy of the address
+         list read-only.  Instead, they should copy the user's list to allow the user to continue to modify the list if
+         desired for later additional use */
+
+/* format: on,style4,delnl,insnl,ifthenstmt,ifthen,^indcomtxt */
+
+
+mlsys_transmit_:
+     procedure ();
+
+	return;					/* not an entrypoint */
+
+
+/* Parameters */
+
+dcl  P_code fixed binary (35) parameter;
+
+dcl  P_message_ptr pointer parameter;			/* deliver_message: -> the new message to be delivered;
+						   redistribute_message: -> the in-mailbox message to be
+						      redistributed (with optional comment);
+						   copy_message, log_message, save_message: -> the
+						      new/in-mailbox message to be copied/logged/saved */
+
+dcl  P_recipients_info_ptr pointer parameter;		/* deliver_message, redistribute_message: -> the structure
+						         containing the lists of recipients for this
+						         operation; the results of the operation are also
+						         conveyed through this structure */
+dcl  P_deliver_options_ptr pointer parameter;		/* deliver_message, redistribute_message: -> the structure
+						      defining the options which control this operation (eg:
+						      delivery mode, queueing mode, etc.) */
+
+dcl  P_redistribution_comment character (*) parameter;	/* redistribute_message: an optional comment to be added to
+						      the message as it is redistributed */
+
+dcl  P_address_lists (*) pointer parameter;		/* eliminate_duplicate_addrs_*: -> the address lists from
+						      which all duplicate addresses are to be removed */
+
+dcl  P_mailbox_dirname character (*) parameter;		/* copy_message, save_message: absolute pathname of directory
+						      containing the target mailbox/savebox */
+dcl  P_mailbox_ename character (*) parameter;		/* copy_message, save_message: entryname of the
+						      mailbox/savebox; the caller need not supply the
+						      appropriate suffix */
+
+dcl  P_create_if_not_found bit (1) aligned parameter;	/* log_message, save_message: ON => try to create the
+						      logbox/savebox if it doesn't exist */
+
+dcl  P_address_ptr pointer parameter;			/* validate_address: -> the address to be validated */
+dcl  P_validate_mls_contents bit (1) aligned parameter;	/* validate_address: ON => cvalidate the contents of any
+						      mailing lists; OFF => simply validate the existence of
+						      the mailing list */
+/**** format: indcomtxt */
+
+
+/* Local copies of parameters */
+
+dcl  code fixed binary (35);
+
+dcl  users_area area based (users_area_ptr);
+dcl  users_area_ptr pointer;
+
+dcl  mailbox_dirname character (168);
+dcl  mailbox_ename character (32);
+dcl  create_if_not_found bit (1) aligned;
+
+/* Mail notification, allocated once */
+
+dcl  notification_initialized_sw bit (1) int static init ("0"b);
+dcl  1 NOTIFICATION_MAIL_FORMAT aligned like mail_format based (NOTIFICATION_MAIL_FORMAT_PTR);
+dcl  NOTIFICATION_MAIL_FORMAT_PTR ptr int static init (null);
+dcl  based_area area based (get_system_free_area_ ());
+dcl  NOTIFICATION_TEXT char (14) int static options (constant) init ("You have mail.");
+
+/* Definition of the saved message state */
+
+dcl  added_from_field bit (1) aligned;			/* ON => we added an address to an empty From field */
+dcl  added_reply_to_field bit (1) aligned;		/* ON => we added an address to an empty Reply-To field */
+dcl  added_envelope bit (1) aligned;			/* ON => we added a envelope to the message */
+dcl  added_redistribution bit (1) aligned;		/* ON => we added a redistribution to the message */
+
+dcl  deleted_last_delivery_fields bit (1) aligned;	/* ON => we deleted the last Delivery-Date and ... */
+dcl  last_date_time_delivered fixed binary (71);		/* ... Delivery-By fields from the message */
+dcl  last_delivered_by pointer;
+
+dcl  1 saved_message_data aligned,			/* data saved/restored directly from the message structure */
+       2 flags like message.flags,
+       2 header,
+         3 message_id bit (72),
+         3 access_class bit (72),
+         3 date_time_created fixed binary (71),
+         3 bcc pointer;
+
+
+/* Definition of a single recipient of a message */
+
+dcl  1 recipient aligned based (recipient_ptr),
+       2 address_ptr pointer,				/* -> the actual address */
+       2 type fixed binary,				/* type of recipient (mailbox/forum/network) */
+       2 flags,
+         3 top_level bit (1) unaligned,			/* ... ON => only recipient corresponding to an input addr */
+         3 duplicate bit (1) unaligned,			/* ... ON => this recipient duplicates a previous entry */
+         3 free_address bit (1) unaligned,		/* ... ON => free above address on cleanup */
+         3 to_queue bit (1) unaligned,			/* ... ON => queue the message for this recipient */
+         3 no_acknowledge bit (1) unaligned,		/* ... ON => don't ask this recipient for acknowledgement */
+         3 use_copy_without_bcc bit (1) unaligned,	/* ... ON => ommit bcc field when sending to this recipient */
+         3 fatal_error bit (1) unaligned,		/* ... ON => a fatal error was detected for this recipient */
+         3 transient_error bit (1) unaligned,		/* ... ON => a transient error was detected */
+         3 warning bit (1) unaligned,			/* ... ON => a warning is associated with this recipient */
+         3 pad bit (27) unaligned,
+       2 code fixed binary (35),			/* results of validation or transmission */
+       2 explanation character (128) varying,		/* reason why message had to be queued */
+       2 top_level_info,				/* identifies the input address that generated this ... */
+         3 list_idx fixed binary,			/* ... recipient */
+         3 address_idx fixed binary,
+       2 duplicate_idx fixed binary,			/* identifies the recipient for which this is a duplicate */
+       2 local_info,				/* used if the recipient is local */
+         3 mailbox_idx fixed binary,			/* ... identifies the mailbox (if a mailbox recipient) */
+         3 forum_idx fixed binary,			/* ... identifies the forum (if a forum recipient) */
+       2 foreign_info,				/* used if the recipient is on another computer */
+	/*** ... lengths of the following strings are the maximum accepted by the interim inter-system mailer */
+         3 foreign_address character (128) varying,	/* ... actual foreign address to be given to mlsys_mailer_ */
+         3 foreign_system character (40) varying;		/* ... actual foreign system to be given to mlsys_mailer_ */
+
+dcl  recipient_ptr pointer;
+
+
+/* Definition of the types of recipients */
+
+/* format: off */
+dcl (UNKNOWN_RECIPIENT	initial (0),		/* ... used for recipients with fatal errors */
+     MAILBOX_RECIPIENT	initial (1),		/* ... to a mailbox */
+     FORUM_RECIPIENT	initial (2),		/* ... to a forum meeting */
+     NETWORK_RECIPIENT	initial (3))		/* ... to a recipient somewhere on the network */
+	fixed binary static options (constant);
+/* format: on */
+
+
+/* List of all recipients for a delivery/redistribution operation */
+
+dcl  1 recipients_list aligned based (recipients_list_ptr),
+       2 recipients (n_recipients) like recipient;
+
+dcl  ism_recipient_idxs (n_recipients) fixed binary based (ism_recipient_idxs_ptr);
+
+dcl  (recipients_list_ptr, ism_recipient_idxs_ptr, initial_stack_extension, stack_truncation_ptr) pointer;
+dcl  (n_recipients_allocated, n_recipients, n_unique_recipients, n_failed_recipients, recipient_idx) fixed binary;
+dcl  recipient_size fixed binary;			/* size of a single recipient structure */
+
+
+/* List of mailing lists currently being expanded */
+
+dcl  1 mailing_list_data aligned based (mailing_list_data_ptr),
+       2 mls_ptr pointer,				/* -> the actual mailing list */
+       2 previous_data_ptr pointer;			/* -> the previous entry in the list */
+
+dcl  (current_mailing_list_data_ptr, mailing_list_data_ptr) pointer;
+
+
+/* Mailbox cache:  In order to improve the performance of callers of the log_message, save_message, and copy_message
+   entrypoints, these entrypoints never actually close their target mailboxes.  Instead, they maintain a cache of the most
+   recently used mailboxes in order to avoid the expense of opening/closing a mailbox.  Mailboxes are only closed by these
+   entrypoints when the cache is full and a mailbox not in the cache is referenced */
+
+dcl  1 transmit_cache aligned based (mlsys_data_$transmit_cache_ptr),
+       2 entries (0:15),
+         3 uid bit (36) aligned,			/* UID of the mailbox in this slot of the cache */
+         3 index fixed binary,			/* ring-1 identifier of the mailbox */
+         3 usage fixed binary,			/* used to find the least recently used entry in the cache */
+         3 pad bit (36);
+
+
+/* Remaining declarations */
+
+dcl  1 local_mep aligned like message_envelope_parameter;
+dcl  1 local_mrp aligned like message_redistribution_parameter;
+
+dcl  1 result aligned based (result_ptr) like recipients_result_list.results;
+dcl  result_ptr pointer;
+
+dcl  1 user_privileges aligned,
+       2 privileges unaligned like aim_template.privileges,
+       2 pad bit (18) unaligned;
+
+dcl  date_time_message_created fixed binary (71);
+
+dcl  (suppress_bcc_field_when_necessary, make_copies_with_bcc, make_copies_without_bcc) bit (1) aligned;
+dcl  (need_mailbox_message, need_forum_message, need_network_message) bit (1) aligned;
+
+dcl  (never_transmitted, have_result_code, part_of_this_address, partially_delivered, partially_queued) bit (1) aligned;
+dcl  delivery_aborted bit (1) aligned;			/* phx18036 RL: flag aborted deliveries */
+
+dcl  message_buffers (6) pointer;			/* -> the possible local encodings of the message */
+dcl  n_message_buffers_used fixed binary;
+
+dcl  last_temp_segment_ptr pointer;			/* -> last temporary segment grabbed by this module */
+dcl  last_temp_segment_used fixed binary (18);		/* # of words occupied in that segment */
+
+dcl  (mailbox_message_with_bcc_ptr, mailbox_message_without_bcc_ptr, forum_message_with_bcc_ptr,
+     forum_message_without_bcc_ptr, network_message_with_bcc_ptr, network_message_without_bcc_ptr) pointer;
+dcl  (mailbox_message_with_bcc_lth, mailbox_message_without_bcc_lth) fixed binary (24);
+dcl  (forum_message_with_bcc_lth, forum_message_without_bcc_lth, network_message_with_bcc_lth,
+     network_message_without_bcc_lth) fixed binary (21);
+
+dcl  (the_list_idx, the_address_idx, idx) fixed binary;
+
+dcl  1 other_recipient aligned based (other_recipient_ptr) like recipient;
+dcl  other_recipient_ptr pointer;
+dcl  (delete_this_address, continue) bit (1) aligned;
+dcl  (first_recipient_idx, other_recipient_idx) fixed binary;
+
+dcl  (mailbox_idx, target_mailbox_idx, forum_idx) fixed binary;
+dcl  mailbox_mode bit (36) aligned;
+dcl  address_pathname character (200);
+dcl  address_dirname character (168);
+dcl  (address_ename, address_component) character (32);
+dcl  address_route_ptr pointer;
+
+dcl  1 local_do aligned like deliver_options;		/* for copy/log/save ... */
+dcl  create_the_mailbox entry (character (*), character (*), fixed binary (35)) variable;
+dcl  (preserve_message_type, preserve_access_class, created) bit (1) aligned;
+dcl  (no_mailbox_code, mailbox_created_code) fixed binary (35);
+
+/* format: off */
+dcl (FULL_FORMATTING	     initial (1),		/* use the standard formatting procedure */
+     COPY_FORMATTING	     initial (2),		/* copy the in-mailbox canoncial text directly */
+     REDISTRIBUTION_FORMATTING     initial (3))		/* just format the redistribution */
+	fixed binary static options (constant);
+/* format: on */
+
+dcl  STACK_EXTENSION fixed binary (18) static options (constant) initial (1024);
+
+dcl  sys_info$max_seg_size fixed binary (19) external;
+
+/* format: off */
+dcl (error_table_$action_not_performed, error_table_$ai_restricted, error_table_$bad_subr_arg, error_table_$bigarg,
+     error_table_$entlong, error_table_$lock_wait_time_exceeded, error_table_$logical_volume_not_connected,
+     error_table_$logical_volume_not_defined, error_table_$messages_deferred, error_table_$messages_off,
+     error_table_$moderr, error_table_$no_append, error_table_$no_component, error_table_$no_info, error_table_$noentry,
+     error_table_$notalloc, error_table_$rqover, error_table_$smallarg, error_table_$unimplemented_version,
+     error_table_$wakeup_denied, forum_error_table_$meeting_bloat, forum_error_table_$not_in_search_list,
+     forum_error_table_$read_only, forum_error_table_$rqo, mlsys_et_$address_pathname_too_long_to_q,
+     mlsys_et_$cant_compute_route, mlsys_et_$cant_queue_mls_in_archive, mlsys_et_$duplicate_address,
+     mlsys_et_$empty_mailing_list, mlsys_et_$empty_message, mlsys_et_$errors_in_list_address,
+     mlsys_et_$foreign_address_too_long, mlsys_et_$forum_not_available, mlsys_et_$invalid_address,
+     mlsys_et_$ism_not_available, mlsys_et_$list_address_is_all_duplicates, mlsys_et_$logbox_created,
+     mlsys_et_$mailbox_full, mlsys_et_$message_delivered, mlsys_et_$message_not_sent, mlsys_et_$message_partially_sent,
+     mlsys_et_$message_queued, mlsys_et_$message_queued_and_delivered, mlsys_et_$message_too_large,
+     mlsys_et_$no_a_permission, mlsys_et_$no_forum_this_ring, mlsys_et_$no_logbox, mlsys_et_$no_mailbox,
+     mlsys_et_$no_mailing_list, mlsys_et_$no_recipients, mlsys_et_$no_savebox, mlsys_et_$rejected_by_foreign_system,
+     mlsys_et_$route_out_of_service, mlsys_et_$savebox_created, mlsys_et_$too_many_recipients,
+     mlsys_et_$unable_to_queue_mail, mlsys_et_$unknown_delivery_mode, mlsys_et_$unknown_queued_notify_mode,
+     mlsys_et_$unknown_queueing_mode)
+	fixed binary (35) external;
+/* format: on */
+
+dcl  aim_check_$equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  aim_check_$greater_or_equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  cu_$grow_stack_frame entry (fixed binary (18), pointer, fixed binary (35));
+dcl  cu_$shrink_stack_frame entry (pointer, fixed binary (35));
+dcl  forum_$close_forum entry (fixed binary, fixed binary (35));
+dcl  forum_$enter_trans
+	entry (fixed binary, character (*), fixed binary, character (*), bit (1) aligned, fixed binary,
+	fixed binary (35));
+dcl  forum_$open_forum entry (character (*), character (*), fixed binary, fixed binary (35));
+dcl  forum_$real_forum_limits
+	entry (fixed binary, fixed binary, fixed binary, fixed binary, fixed binary, fixed binary, bit (36) aligned,
+	fixed binary (35));
+dcl  get_authorization_ entry () returns (bit (72) aligned);
+dcl  get_privileges_ entry () returns (bit (36) aligned);
+dcl  get_ring_ entry () returns (fixed binary (3));
+dcl  get_system_free_area_ entry () returns (ptr);
+dcl  initiate_file_$component
+	entry (character (*), character (*), character (*), bit (*), pointer, fixed binary (24), fixed binary (35));
+dcl  mailbox_$close entry (fixed binary, fixed binary (35));
+dcl  mailbox_$get_mode_file entry (character (*), character (*), bit (36) aligned, fixed binary (35));
+dcl  mailbox_$get_mode_index entry (fixed binary, bit (36) aligned, fixed binary (35));
+dcl  mailbox_$get_uid_file entry (character (*), character (*), bit (36) aligned, fixed binary (35));
+dcl  mailbox_$get_uid_index entry (fixed binary, bit (36) aligned, fixed binary (35));
+dcl  mailbox_$open entry (character (*), character (*), fixed binary, fixed binary (35));
+dcl  mailbox_$wakeup_aim_add_index
+	entry (fixed binary, pointer, fixed binary (24), bit (36) aligned, bit (72) aligned, bit (72) aligned,
+	fixed binary (35));
+dcl  mlsys_address_list_mgr_$add_address entry (pointer, pointer, character (8), fixed binary (35));
+dcl  mlsys_address_list_mgr_$create_read_only_address_list entry (character (8), pointer, fixed binary (35));
+dcl  mlsys_address_list_mgr_$delete_address entry (pointer, fixed binary, fixed binary (35));
+dcl  mlsys_address_list_mgr_$free_address_list entry (pointer, fixed binary (35));
+dcl  mlsys_address_list_mgr_$increment_reference_count entry (pointer);
+dcl  mlsys_address_list_mgr_$merge_address_lists entry (pointer, pointer, bit (1) aligned, pointer, fixed binary (35));
+dcl  mlsys_address_list_mgr_$verify_address_list entry (pointer, fixed binary (35)) returns (bit (1) aligned);
+dcl  mlsys_address_list_mgr_$verify_writeable_address_list entry (pointer, fixed binary (35)) returns (bit (1) aligned);
+dcl  mlsys_address_mgr_$check_if_actually_local entry (pointer);
+dcl  mlsys_address_mgr_$compare_addresses entry (pointer, pointer, fixed binary (35)) returns (bit (1) aligned);
+dcl  mlsys_address_mgr_$decrement_reference_count entry (pointer);
+dcl  mlsys_address_mgr_$decrement_reference_count_no_free entry (pointer);
+dcl  mlsys_address_mgr_$expand_list_address entry (pointer, character (8), pointer, fixed binary (35));
+dcl  mlsys_address_mgr_$free_address entry (pointer, fixed binary (35));
+dcl  mlsys_address_mgr_$get_address_pathname
+	entry (pointer, character (*), character (*), character (*), fixed binary (35));
+dcl  mlsys_address_mgr_$get_address_string entry (pointer, character (*) varying, fixed binary (35));
+dcl  mlsys_address_mgr_$get_address_type entry (pointer, fixed binary, fixed binary (35));
+dcl  mlsys_address_mgr_$get_mail_table_address entry (pointer, pointer, fixed binary (35));
+dcl  mlsys_address_mgr_$increment_reference_count entry (pointer);
+dcl  mlsys_address_mgr_$verify_address entry (pointer, fixed binary (35)) returns (bit (1) aligned);
+dcl  mlsys_address_route_mgr_$compute_route entry (pointer, pointer, fixed binary (35));
+dcl  mlsys_address_route_mgr_$free_address_route entry (pointer);
+dcl  mlsys_format_$format_address_for_ism
+	entry (character (*) varying, pointer, character (*) varying, character (*) varying, fixed binary (35));
+dcl  mlsys_format_$format_canon_redistributed_msg
+	entry (pointer, pointer, pointer, pointer, fixed binary (19), fixed binary (19), fixed binary (35));
+dcl  mlsys_format_$format_message_for_forum
+	entry (pointer, pointer, fixed binary (21), fixed binary (21), fixed binary (35));
+dcl  mlsys_format_$format_message_for_mailbox
+	entry (pointer, pointer, fixed binary (19), fixed binary (19), fixed binary (35));
+dcl  mlsys_format_$format_message_for_rfc822_network
+	entry (pointer, pointer, fixed binary (21), fixed binary (21), fixed binary (35));
+dcl  mlsys_mailbox_mgr_$get_message_mf_if_canonical entry (pointer, pointer, pointer, fixed binary (35));
+dcl  mlsys_mailbox_utils_$create_logbox entry (fixed binary (35));
+dcl  mlsys_mailbox_utils_$create_savebox entry (character (*), character (*), fixed binary (35));
+dcl  mlsys_mailer_ entry (pointer, pointer, fixed binary (21));
+dcl  mlsys_message_id_mgr_$encode_local_id entry (fixed binary (71), bit (72) aligned);
+dcl  mlsys_message_mgr_$add_redistribution entry (pointer, pointer, fixed binary, fixed binary (35));
+dcl  mlsys_message_mgr_$delete_redistribution entry (pointer, fixed binary, fixed binary (35));
+dcl  mlsys_message_mgr_$replace_message_envelope entry (pointer, pointer, fixed binary (35));
+dcl  mlsys_message_mgr_$verify_im_message entry (pointer, pointer, fixed binary (35)) returns (bit (1) aligned);
+dcl  mlsys_message_mgr_$verify_message entry (pointer, fixed binary (71), fixed binary (35)) returns (bit (1) aligned);
+dcl  mlsys_message_mgr_$verify_new_message entry (pointer, fixed binary (71), fixed binary (35))
+	returns (bit (1) aligned);
+dcl  mlsys_misc_utils_$free_delivery_results entry (pointer, fixed binary (35));
+dcl  mlsys_psp_$forum_not_available entry () returns (bit (1) aligned);
+dcl  mlsys_psp_$ism_not_available entry () returns (bit (1) aligned);
+dcl  mlsys_storage_mgr_$get_temp_segment entry (pointer, fixed binary (35));
+dcl  mlsys_storage_mgr_$release_temp_segment entry (pointer, fixed binary (35));
+dcl  pathname_ entry (character (*), character (*)) returns (character (168));
+dcl  terminate_file_ entry (pointer, fixed binary (24), bit (*), fixed binary (35));
+
+dcl  (area, cleanup, record_quota_overflow) condition;
+
+dcl  (addr, addwordno, baseno, clock, currentsize, dimension, divide, hbound, index, lbound, length, mod, null, reverse,
+     rtrim, size, stackframeptr, string, substr, verify, wordno, unspec) builtin;
+%page;
+/* Transmits a new message to the specified list of recipients */
+
+deliver_message:
+     entry (P_message_ptr, P_recipients_info_ptr, P_deliver_options_ptr, P_code);
+
+	if ^mlsys_message_mgr_$verify_new_message (P_message_ptr, date_time_message_created, P_code) then return;
+	message_ptr = copy_ptr (P_message_ptr);
+
+	call verify_recipients_info_and_deliver_options (P_code);
+	if P_code ^= 0 then return;
+
+	call initialize_message_delivery ("1"b);	/* for cleanup handler ... */
+
+	on condition (cleanup)
+	     begin;
+	     call cleanup_message_delivery ();
+	     call mlsys_misc_utils_$free_delivery_results (recipients_info_ptr, (0));
+	end;
+
+	call complete_new_message ();			/* supply values for all necessary fields */
+
+	suppress_bcc_field_when_necessary = ^is_empty_list (saved_message_data.bcc);
+						/* no bcc field in copy to primary/secondary recipients */
+
+	go to TRANSMIT_MESSAGE;			/* get the work done */
+
+
+/* Redistributes an in-mailbox message to the specified list of recipients while optionally adding a comment */
+
+redistribute_message:
+     entry (P_message_ptr, P_redistribution_comment, P_recipients_info_ptr, P_deliver_options_ptr, P_code);
+
+	if ^mlsys_message_mgr_$verify_im_message (P_message_ptr, (null ()), P_code) then return;
+	message_ptr = copy_ptr (P_message_ptr);
+
+	call verify_recipients_info_and_deliver_options (P_code);
+	if P_code ^= 0 then return;
+
+	call initialize_message_delivery ("1"b);	/* for cleanup handler ... */
+
+	on condition (cleanup)
+	     begin;
+	     call cleanup_message_delivery ();
+	     call mlsys_misc_utils_$free_delivery_results (recipients_info_ptr, (0));
+	end;
+
+	message.access_class = get_authorization_ ();	/* redistribution changes the access class */
+
+	call add_redistribution ();			/* add a redistribution to the message */
+
+	suppress_bcc_field_when_necessary = "0"b;	/* always include the message's bcc field */
+%page;
+/* Common code for the deliver and redistribute operations */
+
+TRANSMIT_MESSAGE:
+	if ^aim_check_$greater_or_equal (message.access_class, get_authorization_ ()) then do;
+	     /*** Need ring-1 system privilege to send messages "down" */
+	     string (user_privileges) = get_privileges_ ();
+	     if ^user_privileges.ring1 then do;		/* ... all deliveries would fail so make it a global error */
+		P_code = error_table_$ai_restricted;
+		go to RETURN_FROM_TRANSMIT_WITH_FATAL_ERROR;
+	     end;
+	end;
+
+
+/* Build the list of recipients for this message and verify that mail can be delivered/queued for each recipient */
+
+	delivery_aborted = "1"b;			/* until proven otherwise */
+	never_transmitted = "1"b;			/* until proven otherwise */
+
+	need_mailbox_message,			/* haven't spotted any of these type of recipients yet */
+	     need_forum_message, need_network_message = "0"b;
+	make_copies_with_bcc,			/* haven't seen blind recipients yet */
+	     make_copies_without_bcc = "0"b;		/* also have't seen primary/secondary recipients yet */
+
+	do the_list_idx = 1 to recipients_info.n_lists;
+	     if ^is_empty_list (recipients_info.lists (the_list_idx).address_list_ptr) then do;
+		address_list_ptr = recipients_info.lists (the_list_idx).address_list_ptr;
+		do the_address_idx = 1 to address_list.n_addresses;
+		     call validate_or_expand_address (address_list.addresses (the_address_idx), "1"b, "0"b, "1"b,
+			"0"b);
+		end;
+	     end;
+	end;
+
+	if n_recipients = 0 then do;			/* all lists were empty or nothing but circular lists */
+	     P_code = mlsys_et_$no_recipients;
+	     go to RETURN_FROM_TRANSMIT_WITH_FATAL_ERROR;
+	end;
+
+	if baseno (recipients_list_ptr) = baseno (stackframeptr ()) then do;
+	     stack_truncation_ptr =			/* ... release the unused part of the stack extension */
+		addwordno (initial_stack_extension,
+		((n_recipients * recipient_size) + 16 - mod ((n_recipients * recipient_size), 16)));
+	     call cu_$shrink_stack_frame (stack_truncation_ptr, (0));
+	end;
+	else call cu_$shrink_stack_frame (initial_stack_extension, (0));
+						/* not enough room on the stack: free up the space */
+
+
+/* Mark duplicate recipients and then count the number of unique and/or failing recipients:  The number of failing
+   recipients may be increased later by transient errors which are transformed into fatal errors */
+
+	call mark_duplicate_recipients ();
+
+	n_unique_recipients, n_failed_recipients = 0;
+
+	do recipient_idx = 1 to n_recipients;
+	     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+	     if ^recipient.duplicate then do;		/* a unique recipient ... */
+		n_unique_recipients = n_unique_recipients + 1;
+		if recipient.fatal_error then n_failed_recipients = n_failed_recipients + 1;
+	     end;					/* ... don't count fatal errors more than once */
+	end;
+
+	if deliver_options.abort & (n_failed_recipients > 0) then go to SETUP_RESULTS_LISTS;
+						/* "stop" here if caller wants to abort on fatal errors */
+
+/* Prepare whatever copies of the message will be needed for delivery */
+
+	if need_mailbox_message & make_copies_with_bcc then do;
+	     /*** Need a copy for transmision to mailboxes */
+	     call prepare_message_for_mailbox ("1"b, mailbox_message_with_bcc_ptr, mailbox_message_with_bcc_lth, code);
+	     if code ^= 0 then do;
+		/*** Couldn't construct the message: mark this as a fatal error for all appropriate recipients */
+		do recipient_idx = 1 to n_recipients;
+		     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+		     if ^recipient.duplicate & ^recipient.fatal_error & (recipient.type = MAILBOX_RECIPIENT)
+			& ^recipient.use_copy_without_bcc then do;
+			n_failed_recipients = n_failed_recipients + 1;
+			recipient.fatal_error = "1"b;
+			recipient.code = code;
+			if recipient.mailbox_idx ^= 0 then do;
+			     call mailbox_$close (recipient.mailbox_idx, (0));
+			     recipient.mailbox_idx = 0;
+			end;
+		     end;
+		end;
+	     end;
+	end;
+
+	if need_mailbox_message & make_copies_without_bcc then
+	     if is_empty_list (saved_message_data.bcc) & make_copies_with_bcc then do;
+		/*** No bcc field: both copies are identical */
+		mailbox_message_without_bcc_ptr = mailbox_message_with_bcc_ptr;
+		mailbox_message_without_bcc_lth = mailbox_message_with_bcc_lth;
+	     end;
+	     else do;
+		/*** Need a copy without the bcc field for transmission to primary and secondary recipients */
+		call prepare_message_for_mailbox ("0"b, mailbox_message_without_bcc_ptr,
+		     mailbox_message_without_bcc_lth, code);
+		if code ^= 0 then do;
+		     do recipient_idx = 1 to n_recipients;
+			recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+			if ^recipient.duplicate & ^recipient.fatal_error & (recipient.type = MAILBOX_RECIPIENT)
+			     & recipient.use_copy_without_bcc then do;
+			     n_failed_recipients = n_failed_recipients + 1;
+			     recipient.fatal_error = "1"b;
+			     recipient.code = code;
+			     if recipient.mailbox_idx ^= 0 then do;
+				call mailbox_$close (recipient.mailbox_idx, (0));
+				recipient.mailbox_idx = 0;
+			     end;
+			end;
+		     end;
+		end;
+	     end;
+
+	if need_forum_message & make_copies_with_bcc then do;
+	     /*** Need a copy for transmission to forum meetings */
+	     call prepare_message_for_forum ("1"b, forum_message_with_bcc_ptr, forum_message_with_bcc_lth, code);
+	     if code ^= 0 then do;
+		do recipient_idx = 1 to n_recipients;
+		     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+		     if ^recipient.duplicate & ^recipient.fatal_error & (recipient.type = FORUM_RECIPIENT)
+			& ^recipient.use_copy_without_bcc then do;
+			n_failed_recipients = n_failed_recipients + 1;
+			recipient.fatal_error = "1"b;
+			recipient.code = code;
+			if recipient.forum_idx ^= 0 then do;
+			     call forum_$close_forum (recipient.forum_idx, (0));
+			     recipient.forum_idx = 0;
+			end;
+		     end;
+		end;
+	     end;
+	end;
+
+	if need_forum_message & make_copies_without_bcc then
+	     if is_empty_list (saved_message_data.bcc) & make_copies_with_bcc then do;
+		/*** No bcc field: both copies are identical */
+		forum_message_without_bcc_ptr = forum_message_with_bcc_ptr;
+		forum_message_without_bcc_lth = forum_message_with_bcc_lth;
+	     end;
+	     else do;
+		/*** Need a copy without the bcc field for transmission to primary and secondary recipients */
+		call prepare_message_for_forum ("0"b, forum_message_without_bcc_ptr, forum_message_without_bcc_lth,
+		     code);
+		if code ^= 0 then do;
+		     do recipient_idx = 1 to n_recipients;
+			recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+			if ^recipient.duplicate & ^recipient.fatal_error & (recipient.type = FORUM_RECIPIENT)
+			     & recipient.use_copy_without_bcc then do;
+			     n_failed_recipients = n_failed_recipients + 1;
+			     recipient.fatal_error = "1"b;
+			     recipient.code = code;
+			     if recipient.forum_idx ^= 0 then do;
+				call forum_$close_forum (recipient.forum_idx, (0));
+				recipient.forum_idx = 0;
+			     end;
+			end;
+		     end;
+		end;
+	     end;
+
+	if need_network_message & make_copies_with_bcc then do;
+	     /*** Need a copy for transmission to one or more networks */
+	     call prepare_message_for_network ("1"b, network_message_with_bcc_ptr, network_message_with_bcc_lth, code);
+	     if code ^= 0 then do;
+		do recipient_idx = 1 to n_recipients;
+		     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+		     if ^recipient.duplicate & ^recipient.fatal_error & (recipient.type = NETWORK_RECIPIENT)
+			& ^recipient.use_copy_without_bcc then do;
+			n_failed_recipients = n_failed_recipients + 1;
+			recipient.fatal_error = "1"b;
+			recipient.code = code;
+		     end;
+		end;
+	     end;
+	end;
+
+	if need_network_message & make_copies_without_bcc then
+	     if is_empty_list (saved_message_data.bcc) & make_copies_with_bcc then do;
+		/*** No bcc field: both copies are identical */
+		network_message_without_bcc_ptr = network_message_with_bcc_ptr;
+		network_message_without_bcc_lth = network_message_with_bcc_lth;
+	     end;
+	     else do;
+		/*** Need a copy without the bcc field for transmission to primary and secondary recipients */
+		call prepare_message_for_network ("0"b, network_message_without_bcc_ptr,
+		     network_message_without_bcc_lth, code);
+		if code ^= 0 then do;
+		     do recipient_idx = 1 to n_recipients;
+			recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+			if ^recipient.duplicate & ^recipient.fatal_error & (recipient.type = NETWORK_RECIPIENT)
+			     & recipient.use_copy_without_bcc then do;
+			     n_failed_recipients = n_failed_recipients + 1;
+			     recipient.fatal_error = "1"b;
+			     recipient.code = code;
+			end;
+		     end;
+		end;
+	     end;
+
+	if deliver_options.abort & (n_failed_recipients > 0) then go to SETUP_RESULTS_LISTS;
+						/* "stop" here if caller wants to abort on fatal errors */
+
+	delivery_aborted = "0"b;			/* wasn't aborted, attempting delivery now */
+
+/* All pre-delivery checks have been made: attempt local deliveries and convert transient errors into queuing requests if
+   appropriate */
+
+	do recipient_idx = 1 to n_recipients;
+	     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+
+	     if ^recipient.duplicate & ^recipient.fatal_error & ^recipient.to_queue then do;
+
+		if recipient.mailbox_idx ^= 0 then do;
+		     /*** Recipient goes to a mailbox */
+		     if recipient.use_copy_without_bcc then
+			call add_message_to_mailbox (recipient.mailbox_idx, mailbox_message_without_bcc_ptr,
+			     mailbox_message_without_bcc_lth, recipient.no_acknowledge, recipient.code);
+		     else call add_message_to_mailbox (recipient.mailbox_idx, mailbox_message_with_bcc_ptr,
+			     mailbox_message_with_bcc_lth, recipient.no_acknowledge, recipient.code);
+		     if recipient.code = 0 then	/* success */
+			recipient.code = mlsys_et_$message_delivered;
+		     else do;			/* some form of failure */
+			recipient.fatal_error, recipient.transient_error, recipient.warning = "0"b;
+			if (recipient.code = error_table_$lock_wait_time_exceeded)
+			     | (recipient.code = error_table_$rqover) | (recipient.code = mlsys_et_$mailbox_full)
+			     | (recipient.code = error_table_$logical_volume_not_defined)
+			     | (recipient.code = error_table_$logical_volume_not_connected) then
+			     recipient.transient_error = "1"b;
+			else if (deliver_options.delivery_mode = INTERACTIVE_DELIVERY)
+			     & ((recipient.code = error_table_$messages_off)
+			     | (recipient.code = error_table_$messages_deferred)
+			     | (recipient.code = error_table_$wakeup_denied)
+			     | (recipient.code = error_table_$no_info)) then
+			     recipient.warning = "1"b;
+			else do;
+			     recipient.fatal_error = "1"b;
+			     n_failed_recipients = n_failed_recipients + 1;
+			end;
+		     end;
+		end;
+
+		else if recipient.forum_idx ^= 0 then do;
+		     /*** Recipient goes to a forum meeting */
+		     if recipient.use_copy_without_bcc then
+			call add_message_to_forum (recipient.forum_idx, forum_message_without_bcc_ptr,
+			     forum_message_without_bcc_lth, recipient.code);
+		     else call add_message_to_forum (recipient.forum_idx, forum_message_with_bcc_ptr,
+			     forum_message_with_bcc_lth, recipient.code);
+		     if recipient.code = 0 then	/* success */
+			recipient.code = mlsys_et_$message_delivered;
+		     else do;			/* some form of failure */
+			recipient.fatal_error, recipient.transient_error, recipient.warning = "0"b;
+			if (recipient.code = error_table_$rqover)
+			     | (recipient.code = error_table_$logical_volume_not_defined)
+			     | (recipient.code = error_table_$logical_volume_not_connected)
+			     | (recipient.code = forum_error_table_$meeting_bloat) then
+			     recipient.transient_error = "1"b;
+			else do;
+			     recipient.fatal_error = "1"b;
+			     n_failed_recipients = n_failed_recipients + 1;
+			end;
+		     end;
+		end;
+
+		if recipient.transient_error then do;
+		     /*** A transient error occured ... */
+		     recipient.transient_error = "0"b;
+		     if mlsys_psp_$ism_not_available () then go to TREAT_TRANSIENT_LOCAL_ERROR_AS_FATAL;
+						/* no inter-system mailer to queue it: it's fatal, period */
+
+		     else if deliver_options.queueing_mode >= QUEUE_WHEN_NEEDED then do;
+			/*** ... and caller requests that they be queued instead of failing */
+			call mlsys_address_mgr_$get_address_pathname (recipient.address_ptr, address_dirname,
+			     address_ename, address_component, (0));
+			if address_component ^= "" then go to TREAT_TRANSIENT_LOCAL_ERROR_AS_FATAL;
+			address_pathname = pathname_ (address_dirname, address_ename);
+			recipient.foreign_address = rtrim (address_pathname);
+			if recipient.foreign_address ^= address_pathname then
+			     go to TREAT_TRANSIENT_LOCAL_ERROR_AS_FATAL;
+			recipient.to_queue = "1"b;
+			if recipient.code = error_table_$lock_wait_time_exceeded then
+			     recipient.explanation = "the mailbox is temporarily locked";
+			else if recipient.code = mlsys_et_$mailbox_full then
+			     recipient.explanation = "the mailbox is temporarily full";
+			else if recipient.code = error_table_$rqover then
+			     recipient.explanation = "of record quota overflow";
+			else if recipient.code = error_table_$logical_volume_not_defined then
+			     recipient.explanation = "its logical volume is not mounted";
+			else if recipient.code = error_table_$logical_volume_not_connected then
+			     recipient.explanation = "its logical volume is not attached";
+			else /*** if recipient.code = forum_error_table_$meeting_bloat then */
+			     recipient.explanation = "the meeting is temporarily full";
+			recipient.code = 0;		/* ... will be trying again shortly */
+		     end;
+
+		     else do;
+			/*** ... and caller requests that they be considered fatal */
+TREAT_TRANSIENT_LOCAL_ERROR_AS_FATAL:
+			recipient.fatal_error = "1"b;
+			n_failed_recipients = n_failed_recipients + 1;
+		     end;
+		end;
+
+		if ^recipient.fatal_error & (length (recipient.explanation) = 0) then never_transmitted = "0"b;
+	     end;					/* record if it's been sent */
+	end;
+
+
+/* Setup data required for use of the interim inter-system mailer */
+
+	mlsys_mailer_data_n_recipients = n_recipients;
+	if size (mlsys_mailer_data) <= STACK_EXTENSION then
+	     call cu_$grow_stack_frame (STACK_EXTENSION, mlsys_mailer_data_ptr, (0));
+	else do;					/* need a temporary segment */
+	     call mlsys_storage_mgr_$get_temp_segment (mlsys_mailer_data_ptr, code);
+	     if code ^= 0 then do;
+UNABLE_TO_GET_ISM_TEMP_SPACE:
+		do recipient_idx = 1 to n_recipients;
+		     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+		     if ^recipient.duplicate then	/* ... don't count it twice ... */
+			if recipient.code = 0 then do;/* ... not processed yet => it needed the mailer */
+			     recipient.fatal_error = "1"b;
+			     recipient.code = code;
+			     n_failed_recipients = n_failed_recipients + 1;
+			end;
+		end;
+		go to SETUP_RESULTS_LISTS;
+	     end;
+	end;
+
+	if size (ism_recipient_idxs) <= STACK_EXTENSION then
+	     call cu_$grow_stack_frame (STACK_EXTENSION, ism_recipient_idxs_ptr, (0));
+	else do;					/* need a temporary segment */
+	     call mlsys_storage_mgr_$get_temp_segment (ism_recipient_idxs_ptr, code);
+	     if code ^= 0 then go to UNABLE_TO_GET_ISM_TEMP_SPACE;
+	end;
+
+
+/* Attempt immediate foreign deliveries and convert transient errors into queueing requests if appropriate */
+
+	if need_network_message then do;		/* ... only if there are some foreign addresses */
+	     if make_copies_with_bcc then
+		call deliver_by_ism ("0"b, network_message_with_bcc_ptr, network_message_with_bcc_lth);
+	     if make_copies_without_bcc then
+		call deliver_by_ism ("1"b, network_message_without_bcc_ptr, network_message_without_bcc_lth);
+	end;
+
+
+/* Queue all appropriate recipients */
+
+	if need_mailbox_message then do;		/* mailbox recipients ... */
+	     if make_copies_with_bcc then
+		call queue_via_ism (MAILBOX_RECIPIENT, "0"b, addr (mailbox_message_with_bcc_ptr -> mail_format.text),
+		     length (mailbox_message_with_bcc_ptr -> mail_format.text));
+	     if make_copies_without_bcc then
+		call queue_via_ism (MAILBOX_RECIPIENT, "1"b,
+		     addr (mailbox_message_without_bcc_ptr -> mail_format.text),
+		     length (mailbox_message_without_bcc_ptr -> mail_format.text));
+	end;
+
+	if need_forum_message then do;		/* forum recipients ... */
+	     if make_copies_with_bcc then
+		call queue_via_ism (FORUM_RECIPIENT, "0"b, forum_message_with_bcc_ptr, forum_message_with_bcc_lth);
+	     if make_copies_without_bcc then
+		call queue_via_ism (FORUM_RECIPIENT, "1"b, forum_message_without_bcc_ptr,
+		     forum_message_without_bcc_lth);
+	end;
+
+	if need_network_message then do;		/* foreign recipients ... */
+	     if make_copies_with_bcc then
+		call queue_via_ism (NETWORK_RECIPIENT, "0"b, network_message_with_bcc_ptr,
+		     network_message_with_bcc_lth);
+	     if make_copies_without_bcc then
+		call queue_via_ism (NETWORK_RECIPIENT, "1"b, network_message_without_bcc_ptr,
+		     network_message_without_bcc_lth);
+	end;
+
+
+/* All deliveries and queueings have been completed: create the lists of results and fill them in */
+
+SETUP_RESULTS_LISTS:
+	recipients_info.n_recipients = n_recipients;	/* return global information */
+	recipients_info.n_unique_recipients = n_unique_recipients;
+	recipients_info.n_failed_recipients = n_failed_recipients;
+
+	on condition (area)
+	     begin;				/* can't allocate all the result lists: non-fatal error */
+	     go to RETURN_FROM_TRANSMIT;
+	end;
+
+
+	expanded_recipients_result_list_n_entries = 0;	/* no need to create this list yet */
+
+	do the_list_idx = 1 to recipients_info.n_lists;
+
+	     if ^is_empty_list (recipients_info.lists (the_list_idx).address_list_ptr) then do;
+		address_list_ptr = recipients_info.lists (the_list_idx).address_list_ptr;
+
+		recipients_result_list_n_addresses = address_list.n_addresses;
+		allocate recipients_result_list in (users_area) set (recipients_result_list_ptr);
+		recipients_info.lists (the_list_idx).recipients_result_list_ptr = recipients_result_list_ptr;
+
+		do the_address_idx = 1 to address_list.n_addresses;
+
+		     result_ptr = addr (recipients_result_list.results (the_address_idx));
+		     result.code, result.expanded_list_info, result.duplicate_info = 0;
+		     result.explanation = "";
+		     have_result_code = "0"b;
+
+		     /*** Check out all recipients until we've determined the result for this address */
+		     do recipient_idx = 1 to n_recipients while (^have_result_code);
+			recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+
+			if (recipient.list_idx = the_list_idx) & (recipient.address_idx = the_address_idx) then do;
+			     have_result_code = "1"b; /* ... stop the outer loop */
+
+			     if recipient.top_level then
+				/*** Address corresponds directly to this recipient: copy the result */
+				if recipient.duplicate then do;
+				     /*** ... it's a duplicate of a prior recipient */
+				     result.code = mlsys_et_$duplicate_address;
+				     result.list_idx =
+					recipients_list.recipients (recipient.duplicate_idx).list_idx;
+				     result.address_idx =
+					recipients_list.recipients (recipient.duplicate_idx).address_idx;
+				end;
+				else do;
+				     /*** ... not a duplicate: get the actual result data */
+				     result.code = recipient.code;
+				     result.explanation = recipient.explanation;
+				end;
+
+			     else do;
+				/*** Address corresponds to several recipients */
+				if recipient.duplicate then
+				     result.code = mlsys_et_$list_address_is_all_duplicates;
+				part_of_this_address = "1"b;
+				partially_delivered, partially_queued = "0"b;
+				do while (part_of_this_address & (recipient_idx <= n_recipients));
+				     if ^recipient.duplicate then do;
+					if result.code = mlsys_et_$list_address_is_all_duplicates then
+					     result.code = 0;
+					if recipient.fatal_error then
+					     result.code = mlsys_et_$errors_in_list_address;
+					else if recipient.code = mlsys_et_$message_queued then
+					     partially_queued = "1"b;
+					else partially_delivered = "1"b;
+					if recipient.fatal_error | recipient.warning
+					     | (length (recipient.explanation) > 0) then do;
+					     expanded_recipients_result_list_n_entries =
+						expanded_recipients_result_list_n_entries + 1;
+					     if result.first_entry_idx = 0 then
+						result.first_entry_idx =
+						     expanded_recipients_result_list_n_entries;
+					     result.n_entries = result.n_entries + 1;
+					end;
+				     end;
+				     recipient_idx = recipient_idx + 1;
+				     if recipient_idx <= n_recipients then do;
+					recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+					part_of_this_address =
+					     (recipient.list_idx = the_list_idx)
+					     & (recipient.address_idx = the_address_idx);
+				     end;
+				end;
+
+				if result.code = 0 then
+				     if delivery_aborted then result.code = mlsys_et_$message_not_sent;
+						/* phx18036 RL: indicate delivery aborted */
+				     else if partially_delivered & partially_queued then
+					result.code = mlsys_et_$message_queued_and_delivered;
+				     else if partially_delivered then result.code = mlsys_et_$message_delivered;
+				     else /*** if partially_queued then */
+					result.code = mlsys_et_$message_queued;
+			     end;
+			end;
+		     end;
+		end;
+	     end;
+	end;
+
+
+/* Construct the expanded recipients result list to contain details on any warning, fatal errors, or transient errors
+   resulting in queueing for all recipients which are the expansion of supplied list addresses */
+
+	if expanded_recipients_result_list_n_entries > 0 then do;
+
+	     allocate expanded_recipients_result_list in (users_area) set (expanded_recipients_result_list_ptr);
+	     recipients_info.expanded_recipients_result_list_ptr = expanded_recipients_result_list_ptr;
+
+	     idx = 0;				/* haven't put anything in the list yet */
+
+	     do recipient_idx = 1 to n_recipients;
+		recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+
+		if ^recipient.top_level then		/* a candidate */
+		     if recipient.warning | recipient.fatal_error | (length (recipient.explanation) > 0) then do;
+			idx = idx + 1;
+			expanded_recipients_result_list.entries (idx).address_ptr = recipient.address_ptr;
+			expanded_recipients_result_list.entries (idx).code = recipient.code;
+			expanded_recipients_result_list.entries (idx).list_idx = recipient.list_idx;
+			expanded_recipients_result_list.entries (idx).address_idx = recipient.address_idx;
+			expanded_recipients_result_list.entries (idx).explanation = recipient.explanation;
+			call mlsys_address_mgr_$decrement_reference_count_no_free (recipient.address_ptr);
+		     end;				/* ... prevent the address from being freed prematurely */
+	     end;
+	end;
+
+
+/* Control arrives here after successfull (or almost successfull) transmission */
+
+RETURN_FROM_TRANSMIT:
+	call cleanup_message_delivery ();		/* flush temporaries and restore original message state */
+
+	if recipients_info.n_failed_recipients = 0 then	/* complete success */
+	     P_code = 0;
+
+	else if never_transmitted then		/* never attempted a transmission */
+	     P_code = mlsys_et_$message_not_sent;
+
+	else P_code = mlsys_et_$message_partially_sent;
+
+	return;
+
+
+/* Control arrives here iff an error fatal to the entire transmission process is detected while validating/expanding
+   addresses:  The validate_or_expand_address internal procedure has already set P_code */
+
+RETURN_FROM_TRANSMIT_WITH_FATAL_ERROR:
+	call cleanup_message_delivery ();
+	if recipients_info_ptr ^= null () then call mlsys_misc_utils_$free_delivery_results (recipients_info_ptr, (0));
+
+	return;
+%page;
+/* Eliminates all duplicate addresses from the given address lists:  This function is implemented here rather than in
+   mlsys_address_list_mgr_ as this module is designed to open all mailboxes/forums in a given set of address lists only
+   once.  Thus, while it is still necessary to do O(N^2) comparisons (where N is the total number of addresses in the
+   lists), only O(N) mailbox/forum openings and closings are done; as the open/close operations are the majority of the
+   expense of address comparison, this reduction from O(N^2) to O(N) openings/closing represents a substantial performance
+   improvement over the previous version of this function in the mail system */
+
+eliminate_duplicate_addrs:				/* ... any types of address lists */
+     entry (P_address_lists, P_code);
+
+	do the_list_idx = lbound (P_address_lists, 1) to hbound (P_address_lists, 1);
+	     if P_address_lists (the_list_idx) ^= null () then
+		if ^mlsys_address_list_mgr_$verify_address_list (P_address_lists (the_list_idx), P_code) then return;
+	end;
+
+	go to ELIMINATE_DUPLICATE_ADDRS_COMMON;
+
+
+eliminate_duplicate_addrs_write:			/* ... writeable by the user: target of the user-ring gate */
+     entry (P_address_lists, P_code);
+
+	do the_list_idx = lbound (P_address_lists, 1) to hbound (P_address_lists, 1);
+	     if P_address_lists (the_list_idx) ^= null () then
+		if ^mlsys_address_list_mgr_$verify_writeable_address_list (P_address_lists (the_list_idx), P_code)
+		     then
+		     return;
+	end;
+
+
+ELIMINATE_DUPLICATE_ADDRS_COMMON:
+	message_ptr = null ();			/* no message here */
+
+	call initialize_message_delivery ("1"b);	/* for cleanup handler ... */
+	recipients_info_ptr = null ();		/* ... in case validate_or_expand_address gets fatal errors */
+
+	on condition (cleanup) call cleanup_message_delivery ();
+
+	deliver_options_ptr = addr (local_do);		/* for validate_or_expand_address */
+	local_do.delivery_mode = ORDINARY_DELIVERY;	/* ... don't want to check if we can send wakeups */
+	local_do.queueing_mode = NEVER_QUEUE;		/* ... insures we determine address routes immediately */
+	string (local_do.flags) = ""b;
+
+	suppress_bcc_field_when_necessary = "0"b;	/* no need to go to that extra overhead */
+
+
+/* Build the list of all addresses in the input address lists, open all referenced mailboxes/forums, and mark the
+   duplicate addresses for deletion */
+
+	do the_list_idx = lbound (P_address_lists, 1) to hbound (P_address_lists, 1);
+	     if ^is_empty_list (P_address_lists (the_list_idx)) then do;
+		address_list_ptr = P_address_lists (the_list_idx);
+		do the_address_idx = 1 to address_list.n_addresses;
+		     call validate_or_expand_address (address_list.addresses (the_address_idx), "1"b, "0"b, "0"b,
+			"0"b);
+		end;				/* don't need expansion of mailing lists ... */
+	     end;					/* ... in order to eliminate duplicates */
+	end;
+
+	if baseno (recipients_list_ptr) = baseno (stackframeptr ()) then do;
+	     stack_truncation_ptr =			/* ... release the unused part of the stack extension */
+		addwordno (initial_stack_extension,
+		((n_recipients * recipient_size) + 16 - mod ((n_recipients * recipient_size), 16)));
+	     call cu_$shrink_stack_frame (stack_truncation_ptr, (0));
+	end;
+	else call cu_$shrink_stack_frame (initial_stack_extension, (0));
+						/* not enough room on the stack: free up the space */
+
+	call mark_duplicate_recipients ();
+
+
+/* Eliminate the duplicate addresses from the input lists:  This operation is done while scanning the recipients_list
+   structure backwards because said structure contains the indeces of the addresses within the original lists.  If scanned
+   forward, as addresses were deleted, the subsequent indeces for that list would become invalid; by scanning backwards,
+   addresses are deleted from the end first and no indeces are invalidated */
+
+	do recipient_idx = n_recipients to 1 by -1;
+
+	     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+
+	     if recipient.duplicate then
+		if recipient.top_level then		/* input address is a duplicate */
+		     call mlsys_address_list_mgr_$delete_address (P_address_lists (recipient.list_idx),
+			recipient.address_idx, (0));
+
+		else do;
+		     /*** Input address is a named group with at least one duplicate ... */
+		     first_recipient_idx = 0;		/* find the first recipient in this list ... */
+		     do other_recipient_idx = (recipient_idx - 1) to 1 by -1 while (first_recipient_idx = 0);
+			other_recipient_ptr = addr (recipients_list.recipients (other_recipient_idx));
+			if (other_recipient.list_idx ^= recipient.list_idx)
+			     | (other_recipient.address_idx ^= recipient.address_idx) then
+			     first_recipient_idx = other_recipient_idx + 1;
+		     end;
+		     if first_recipient_idx = 0 then	/* ... the named group is the very first address */
+			first_recipient_idx = 1;
+		     delete_this_address = "1"b;	/* assume it's OK to delete it ... */
+		     continue = "1"b;		/* need do until ... */
+		     do other_recipient_idx = first_recipient_idx to n_recipients
+			while (delete_this_address & continue);
+			other_recipient_ptr = addr (recipients_list.recipients (other_recipient_idx));
+			if (other_recipient.list_idx = recipient.list_idx)
+			     & (other_recipient.address_idx = recipient.address_idx) then
+			     delete_this_address = other_recipient.duplicate;
+			else continue = "0"b;	/* ... reached first recipient not from this address */
+		     end;
+		     if delete_this_address then
+			call mlsys_address_list_mgr_$delete_address (P_address_lists (recipient.list_idx),
+			     recipient.address_idx, (0));
+		     recipient_idx = first_recipient_idx + 1;
+		end;				/* continue with first recipient before this list */
+	end;
+
+
+/* Cleanup */
+
+	call cleanup_message_delivery ();
+
+	P_code = 0;				/* success */
+
+	return;
+%page;
+/* Places a copy of the supplied message into the specified mailbox */
+
+copy_message:
+     entry (P_message_ptr, P_mailbox_dirname, P_mailbox_ename, P_code);
+
+	mailbox_dirname = P_mailbox_dirname;
+	call add_suffix (P_mailbox_ename, "mbx", mailbox_ename, P_code);
+	if P_code ^= 0 then return;
+
+	preserve_message_type = "1"b;			/* don't convert interactive messages into ordinary mail */
+	preserve_access_class = "1"b;			/* don't change the access class if possible */
+
+	create_if_not_found = "0"b;			/* the mailbox must exist */
+	no_mailbox_code = mlsys_et_$no_mailbox;
+
+	go to COPY_LOG_OR_SAVE_MESSAGE;
+
+
+/* Places a copy of the supplied message into the user's logbox which may optionally be created */
+
+log_message:
+     entry (P_message_ptr, P_create_if_not_found, P_code);
+
+	call mlsys_address_mgr_$get_address_pathname (mlsys_data_$user_logbox_address, mailbox_dirname, mailbox_ename,
+	     ((32)" "), (0));
+
+	preserve_message_type = "0"b;			/* no interactive messages in the logbox, please */
+	preserve_access_class = "0"b;			/* always change the message's access class */
+
+	create_if_not_found = P_create_if_not_found;
+	create_the_mailbox = mlsys_mailbox_utils_$create_logbox;
+	no_mailbox_code = mlsys_et_$no_logbox;
+	mailbox_created_code = mlsys_et_$logbox_created;
+
+	go to COPY_LOG_OR_SAVE_MESSAGE;
+
+
+/* Places a copy of the supplied message into the specified savebox which may optionally be created */
+
+save_message:
+     entry (P_message_ptr, P_mailbox_dirname, P_mailbox_ename, P_create_if_not_found, P_code);
+
+	mailbox_dirname = P_mailbox_dirname;
+	if index (reverse (rtrim (P_mailbox_ename)), reverse (".sv")) = 1 then
+	     mailbox_ename = substr (P_mailbox_ename, 1, (length (rtrim (P_mailbox_ename)) - length (".sv")));
+	else mailbox_ename = P_mailbox_ename;		/* already has right suffix or will be added shortly */
+	call add_suffix (mailbox_ename, "sv.mbx", mailbox_ename, P_code);
+	if P_code ^= 0 then return;			/* can't create proper pathname */
+
+	preserve_message_type = "0"b;			/* no interactive messages in the savebox, please */
+	preserve_access_class = "0"b;			/* always change the message's access class */
+
+	create_if_not_found = P_create_if_not_found;
+	create_the_mailbox = mlsys_mailbox_utils_$create_savebox;
+	no_mailbox_code = mlsys_et_$no_savebox;
+	mailbox_created_code = mlsys_et_$savebox_created;
+%page;
+/* Common code for the copy, log, and save operations */
+
+COPY_LOG_OR_SAVE_MESSAGE:
+	if ^mlsys_message_mgr_$verify_message (P_message_ptr, date_time_message_created, P_code) then return;
+
+	message_ptr = copy_ptr (P_message_ptr);
+
+	deliver_options_ptr = addr (local_do);		/* for add_message_to_mailbox ... */
+	local_do.recipient_notification = "0"b;
+	local_do.acknowledge = "0"b;
+
+	call initialize_message_delivery ("0"b);	/* for cleanup handler ... */
+
+	on condition (cleanup) call cleanup_message_delivery ();
+
+	if preserve_access_class then			/* don't change the message's access class if possible */
+	     if aim_check_$greater_or_equal (message.access_class, get_authorization_ ()) then
+		;				/* ... we can preserve it without privilege */
+	     else do;				/* ... check for ring-1 privilege */
+		string (user_privileges) = get_privileges_ ();
+		if user_privileges.ring1 then
+		     ;				/* ... we can preserve it because of ring-1 privilege */
+		else message.access_class = get_authorization_ ();
+	     end;
+	else message.access_class = get_authorization_ ();
+
+	if message.date_time_created = 0 then		/* a new message must be complete ... */
+	     call complete_new_message ();
+	else call delete_last_delivery_fields ();	/* an in-mailbox message is about to be redelivered */
+
+	if preserve_message_type then			/* don't convert interactive to ordinary ... */
+	     if message.interactive then		/* ... so be sure prepare_message sets the correct flags */
+		local_do.delivery_mode = INTERACTIVE_DELIVERY;
+	     else local_do.delivery_mode = ORDINARY_DELIVERY;
+	else local_do.delivery_mode = ORDINARY_DELIVERY;
+
+	call prepare_message_for_mailbox ("1"b, mailbox_message_with_bcc_ptr, mailbox_message_with_bcc_lth, code);
+	if code ^= 0 then go to RETURN_FROM_COPY_LOG_OR_SAVE_MESSAGE;
+
+	local_do.delivery_mode = ORDINARY_DELIVERY;	/* don't accidently send a wakeup if it's interactive */
+
+	created = "0"b;				/* until proven otherwise */
+
+	call lookup_or_open_mailbox (mailbox_dirname, mailbox_ename, target_mailbox_idx, code);
+
+	if code = error_table_$noentry then		/* not there: try to create it if requested ... */
+	     if create_if_not_found then do;
+		if create_the_mailbox = mlsys_mailbox_utils_$create_logbox then
+		     call mlsys_mailbox_utils_$create_logbox (code);
+		else call create_the_mailbox (mailbox_dirname, mailbox_ename, code);
+		if code = 0 then do;		/* ... success */
+		     created = "1"b;
+		     call lookup_or_open_mailbox (mailbox_dirname, mailbox_ename, target_mailbox_idx, code);
+		end;				/* ... this open shouldn't fail, but you never know */
+	     end;
+
+	if code ^= 0 then do;			/* couldn't open it ... */
+	     if code = error_table_$noentry then	/* ... map this code into one from mlsys_et_ */
+		code = no_mailbox_code;
+	     go to RETURN_FROM_COPY_LOG_OR_SAVE_MESSAGE;
+	end;
+
+	call mailbox_$get_mode_index (target_mailbox_idx, mailbox_mode, code);
+	if code ^= 0 then go to RETURN_FROM_COPY_LOG_OR_SAVE_MESSAGE;
+						/* shouldn't happen if we were able to open it */
+
+	if (mailbox_mode & A_MBX_ACCESS) ^= A_MBX_ACCESS then do;
+	     code = mlsys_et_$no_a_permission;		/* don't have access to add messsages */
+	     go to RETURN_FROM_COPY_LOG_OR_SAVE_MESSAGE;
+	end;
+
+	call add_message_to_mailbox (target_mailbox_idx, mailbox_message_with_bcc_ptr, mailbox_message_with_bcc_lth,
+	     "1"b, code);				/* internal procedure handles locking problems, etc. */
+
+
+RETURN_FROM_COPY_LOG_OR_SAVE_MESSAGE:
+	call cleanup_message_delivery ();		/* release temporaries and put message back as we found it */
+
+	if code = 0 then				/* check if we should inform use of message creation */
+	     if created then code = mailbox_created_code;
+
+	P_code = code;				/* let caller know what happened */
+
+	return;
+%page;
+/* Determines if mail can be successfully delivered to the supplied address */
+
+validate_address:
+     entry (P_address_ptr, P_validate_mls_contents, P_code);
+
+	if ^mlsys_address_mgr_$verify_address (P_address_ptr, P_code) then return;
+
+	message_ptr = null ();			/* no message here */
+
+	call initialize_message_delivery ("1"b);	/* for cleanup handler ... */
+	recipients_info_ptr = null ();		/* ... in case validate_or_expand_address gets fatal errors */
+
+	on condition (cleanup) call cleanup_message_delivery ();
+
+	deliver_options_ptr = addr (local_do);		/* for validate_or_expand_address */
+	local_do.delivery_mode = ORDINARY_DELIVERY;	/* ... don't want to check if we can send wakeups */
+	local_do.queueing_mode = NEVER_QUEUE;		/* ... insures we determine address routes immediately */
+	string (local_do.flags) = ""b;
+
+	suppress_bcc_field_when_necessary = "0"b;	/* always include the message's bcc field */
+
+	call validate_or_expand_address (P_address_ptr, "1"b, "0"b, P_validate_mls_contents, "1"b);
+
+	if n_recipients = 0 then			/* no corresponding recipients */
+	     P_code = mlsys_et_$no_recipients;
+	else if n_recipients = 1 then do;		/* single recipient */
+	     recipient_ptr = addr (recipients_list.recipients (1));
+	     if recipient.fatal_error then
+		P_code = recipient.code;
+	     else P_code = 0;			/* ... ignore warnings */
+	end;
+	else do;					/* multiple recipients: check for at least one fatal error */
+	     P_code = 0;
+	     do recipient_idx = 1 to n_recipients while (P_code = 0);
+		recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+		if recipient.fatal_error then P_code = mlsys_et_$errors_in_list_address;
+	     end;
+	end;
+
+	call cleanup_message_delivery ();
+
+	return;
+%page;
+/* Initialize the cache of recently used mailboxes */
+
+initialize_cache:
+     entry ();
+
+	allocate transmit_cache in (mlsys_area) set (mlsys_data_$transmit_cache_ptr);
+	unspec (transmit_cache) = ""b;
+
+	return;
+
+
+
+/* Searches the cache to see if the given mailbox is already open and, if not, opens it and places it in the cache */
+
+lookup_or_open_mailbox:
+     procedure (p_mailbox_dirname, p_mailbox_ename, p_mailbox_idx, p_code);
+
+dcl  (p_mailbox_dirname, p_mailbox_ename) character (*) parameter;
+dcl  p_mailbox_idx fixed binary parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  (mailbox_uid, cached_uid) bit (36) aligned;
+dcl  code fixed binary (35);
+dcl  (mailbox_idx, lru_usage, lru_idx, other_cache_idx, idx) fixed binary;
+
+
+	call mailbox_$get_uid_file (p_mailbox_dirname, p_mailbox_ename, mailbox_uid, code);
+	if code ^= 0 then call return_from_lookup (code); /* we won't be able to open it if we can't get the UID */
+
+
+/* Search the cache of recently used mailboxes for a match */
+
+	lru_usage = hbound (transmit_cache.entries, 1) + 1;
+
+	do idx = lbound (transmit_cache.entries, 1) to hbound (transmit_cache.entries, 1);
+
+	     if transmit_cache.entries (idx).uid = mailbox_uid then do;
+		/*** UIDs match: if the cache entry is still valid, we've found it */
+		call mailbox_$get_uid_index (transmit_cache.entries (idx).index, cached_uid, code);
+		if code ^= 0 then do;		/* ... cache slot is no longer valid */
+INVALIDATE_CACHE_ENTRY_AND_REOPEN:
+		     unspec (transmit_cache.entries (idx)) = ""b;
+		     lru_idx = idx;			/* ... we'll use this slot */
+		     go to OPEN_THE_MAILBOX;
+		end;
+		if cached_uid ^= transmit_cache.entries (idx).uid then go to INVALIDATE_CACHE_ENTRY_AND_REOPEN;
+		/*** Control arrives here iff we have a good match */
+		transmit_cache.entries (idx).usage = dimension (transmit_cache.entries, 1);
+		do other_cache_idx = (idx + 1) to hbound (transmit_cache.entries, 1);
+		     transmit_cache.entries (other_cache_idx).usage =
+			transmit_cache.entries (other_cache_idx).usage - 1;
+		end;
+		p_mailbox_idx = transmit_cache.entries (idx).index;
+		call return_from_lookup (0);		/* success */
+	     end;
+
+	     transmit_cache.entries (idx).usage = transmit_cache.entries (idx).usage - 1;
+						/* doesn't match: decrement the usage */
+
+	     if transmit_cache.entries (idx).usage < lru_usage then do;
+		lru_idx = idx;			/* least recently used that's been seen so far */
+		lru_usage = transmit_cache.entries (idx).usage;
+	     end;
+	end;
+
+
+/* Control arrives here iff we didn't find the mailbox in the cache:  open it and add it to the cache */
+
+OPEN_THE_MAILBOX:
+	call mailbox_$open (p_mailbox_dirname, p_mailbox_ename, mailbox_idx, code);
+	if code = error_table_$moderr then code = mlsys_et_$no_a_permission;
+	if code ^= 0 then call return_from_lookup (code); /* failure */
+
+	if transmit_cache.entries (lru_idx).uid ^= ""b then do;
+	     /*** Close the mailbox that was in this slot */
+	     call mailbox_$get_uid_index (transmit_cache.entries (lru_idx).index, cached_uid, code);
+	     if code = 0 then			/* ... but only if it's still the mailbox we think it is */
+		if cached_uid = transmit_cache.entries (lru_idx).uid then
+		     call mailbox_$close (transmit_cache.entries (lru_idx).index, (0));
+	end;
+
+	transmit_cache.entries (lru_idx).uid = mailbox_uid;
+	transmit_cache.entries (lru_idx).index = mailbox_idx;
+	transmit_cache.entries (lru_idx).usage = dimension (transmit_cache.entries, 1);
+
+	do other_cache_idx = (idx + 1) to hbound (transmit_cache.entries, 1);
+	     transmit_cache.entries (other_cache_idx).usage = transmit_cache.entries (other_cache_idx).usage - 1;
+	end;					/* decrement any reference counts missed above */
+
+	p_mailbox_idx = mailbox_idx;
+	p_code = 0;				/* success */
+
+RETURN_FROM_LOOKUP_OR_OPEN_MAILBOX:
+	return;
+
+
+
+/* Internal to lookup_or_open_mailbox: returns with the given error code */
+
+return_from_lookup:
+	procedure (p_return_code);
+
+dcl  p_return_code fixed binary (35) parameter;
+
+	     p_code = p_return_code;			/* set the output of lookup... */
+	     go to RETURN_FROM_LOOKUP_OR_OPEN_MAILBOX;
+
+	end return_from_lookup;
+
+     end lookup_or_open_mailbox;
+%page;
+/* Verify that the supplied recipients_info_list and deliver_options structures are valid */
+
+verify_recipients_info_and_deliver_options:
+     procedure (p_code);
+
+dcl  p_code fixed binary (35) parameter;
+dcl  (ignore, is_empty_message) bit (1) aligned;
+dcl  idx fixed binary;
+
+	recipients_info_ptr = P_recipients_info_ptr;
+	deliver_options_ptr = P_deliver_options_ptr;
+
+	if (recipients_info.version ^= RECIPIENTS_INFO_VERSION_2)
+	     | (deliver_options.version ^= DELIVER_OPTIONS_VERSION_2) then do;
+	     p_code = error_table_$unimplemented_version;
+	     return;
+	end;
+
+	if recipients_info.area_ptr = null () then do;	/* can't get system_free_area pointer of caller's ring */
+	     p_code = error_table_$bad_subr_arg;
+	     return;
+	end;
+
+	users_area_ptr = recipients_info.area_ptr;
+
+	if recipients_info.n_lists = 0 then do;		/* there have to be some recipients */
+	     p_code = error_table_$bad_subr_arg;
+	     return;
+	end;
+
+	p_code = 0;
+	do idx = 1 to recipients_info.n_lists while (p_code = 0);
+	     if recipients_info.lists (idx).address_list_ptr ^= null () then
+		ignore =
+		     mlsys_address_list_mgr_$verify_address_list (recipients_info.lists (idx).address_list_ptr,
+		     p_code);
+	end;
+	if p_code ^= 0 then return;			/* one of the lists of recipients is bad */
+
+	if (deliver_options.delivery_mode < ORDINARY_DELIVERY) | (deliver_options.delivery_mode > EXPRESS_DELIVERY)
+	then do;
+	     p_code = mlsys_et_$unknown_delivery_mode;
+	     return;
+	end;
+
+	if (deliver_options.queueing_mode < NEVER_QUEUE) | (deliver_options.queueing_mode > ALWAYS_QUEUE) then do;
+	     p_code = mlsys_et_$unknown_queueing_mode;
+	     return;
+	end;
+
+	if (deliver_options.queued_notification_mode < NEVER_NOTIFY)
+	     | (deliver_options.queued_notification_mode > ALWAYS_NOTIFY) then do;
+	     p_code = mlsys_et_$unknown_queued_notify_mode;
+	     return;
+	end;
+
+	if deliver_options.mbz ^= ""b then do;
+	     p_code = error_table_$bad_subr_arg;
+	     return;
+	end;
+
+	if ^deliver_options.send_if_empty then do;	/* check that there's a body */
+	     is_empty_message = "1"b;			/* ... assume it's empty 'till proven otherwise */
+	     do idx = 1 to message.n_body_sections while (is_empty_message);
+		message_body_section_ptr = addr (message.body.body_sections (idx));
+		if message_body_section.section_type = MESSAGE_PREFORMATTED_BODY_SECTION then
+		     is_empty_message = (verify (message_preformatted_body_section_text, WHITESPACE) = 0);
+		else /*** if message_body_section.section_type = MESSAGE_BIT_STRING_BODY_SECTION then */
+		     is_empty_message = (message_bit_string_body_section.bit_string_lth = 0);
+	     end;
+	     if is_empty_message then do;		/* the body is emtpy */
+		p_code = mlsys_et_$empty_message;
+		return;
+	     end;
+	end;
+
+	if mlsys_psp_$ism_not_available () then		/* no inter-system mailer ... */
+	     if deliver_options.queueing_mode = ALWAYS_QUEUE then do;
+		p_code = mlsys_et_$ism_not_available;	/* caller only wants queueing which isn't possible */
+		return;
+	     end;
+	     else do;				/* caller only wants queueing if needed: so never queue */
+		local_do = deliver_options;		/* ... caller's options are considered read-only */
+		local_do.queueing_mode = NEVER_QUEUE;
+		local_do.queue_mailing_lists = "0"b;
+		deliver_options_ptr = addr (local_do);	/* ... switch to our modified options */
+	     end;
+
+	recipients_info.n_recipients, recipients_info.n_unique_recipients, recipients_info.n_failed_recipients = 0;
+
+	recipients_info.expanded_recipients_result_list_ptr, recipients_info.lists (*).recipients_result_list_ptr =
+	     null ();
+
+	p_code = 0;				/* everything's OK */
+
+	return;
+
+     end verify_recipients_info_and_deliver_options;
+%page;
+/* Initializes the various data structures used to deliver a message */
+
+initialize_message_delivery:
+     procedure (p_start_recipients_list);
+
+dcl  p_start_recipients_list bit (1) aligned parameter;
+
+	call save_message_state ();			/* so that we can restore the message later */
+
+	if p_start_recipients_list then do;		/* caller needs a list of recipients: try using the stack */
+	     call cu_$grow_stack_frame (STACK_EXTENSION, initial_stack_extension, (0));
+	     recipients_list_ptr = initial_stack_extension;
+	     recipient_size = size (recipient) + mod (size (recipient), 2);
+	     n_recipients_allocated = divide (STACK_EXTENSION, recipient_size, 17, 0);
+	     n_recipients = 0;
+	end;
+	else recipients_list_ptr = null ();
+
+	current_mailing_list_data_ptr = null ();	/* not in the process of expanding a mailing list */
+
+	mlsys_mailer_data_ptr,			/* not processing inter-system mail yet */
+	     ism_recipient_idxs_ptr = null ();
+
+	n_message_buffers_used = 0;			/* no copies of the message yet */
+	last_temp_segment_ptr, message_buffers (*) = null ();
+
+	mailbox_idx = 0;				/* no mailbox open at this time */
+	forum_idx = 0;				/* no forum meeting either */
+
+	address_route_ptr = null ();			/* no address route from checking a foreign address */
+
+	return;
+
+     end initialize_message_delivery;
+%page;
+/* Releases interim data structures created during message delivery */
+
+cleanup_message_delivery:
+     procedure ();
+
+dcl  idx fixed binary;
+
+	if address_route_ptr ^= null () then call mlsys_address_route_mgr_$free_address_route (address_route_ptr);
+
+	if forum_idx ^= 0 then			/* close whatever's opened */
+	     call forum_$close_forum (forum_idx, (0));
+	forum_idx = 0;
+
+	if mailbox_idx ^= 0 then call mailbox_$close (mailbox_idx, (0));
+	mailbox_idx = 0;
+
+	if n_message_buffers_used > 0 then do;		/* get rid of any temporary segments */
+	     do idx = 1 to n_message_buffers_used;
+		if message_buffers (idx) ^= null () then
+		     if baseno (message_buffers (idx)) ^= baseno (stackframeptr ()) then
+			if wordno (message_buffers (idx)) = 0 then
+			     call mlsys_storage_mgr_$release_temp_segment (message_buffers (idx), (0));
+		message_buffers (idx) = null ();
+	     end;
+	end;
+	n_message_buffers_used = 0;
+
+	if mlsys_mailer_data_ptr ^= null () then
+	     if baseno (mlsys_mailer_data_ptr) ^= baseno (stackframeptr ()) then
+		call mlsys_storage_mgr_$release_temp_segment (mlsys_mailer_data_ptr, (0));
+	mlsys_mailer_data_ptr = null ();
+
+	if ism_recipient_idxs_ptr ^= null () then
+	     if baseno (ism_recipient_idxs_ptr) ^= baseno (stackframeptr ()) then
+		call mlsys_storage_mgr_$release_temp_segment (ism_recipient_idxs_ptr, (0));
+	ism_recipient_idxs_ptr = null ();
+
+	if current_mailing_list_data_ptr ^= null () then do;
+	     do mailing_list_data_ptr = current_mailing_list_data_ptr repeat (mailing_list_data.previous_data_ptr)
+		while (mailing_list_data_ptr ^= null ());
+		if mailing_list_data.mls_ptr ^= null () then
+		     call terminate_file_ (mailing_list_data.mls_ptr, 0, TERM_FILE_TERM, (0));
+	     end;
+	end;
+	current_mailing_list_data_ptr = null ();
+
+	if recipients_list_ptr ^= null () then do;
+	     do idx = 1 to n_recipients;		/* close any mailboxes/forums ... */
+		recipient_ptr = addr (recipients_list.recipients (idx));
+		if (recipient.address_ptr ^= null ()) & recipient.free_address then
+		     call mlsys_address_mgr_$decrement_reference_count (recipient.address_ptr);
+		if recipient.local_info.forum_idx ^= 0 then
+		     call forum_$close_forum (recipient.local_info.forum_idx, (0));
+		if recipient.local_info.mailbox_idx ^= 0 then
+		     call mailbox_$close (recipient.local_info.mailbox_idx, (0));
+		recipient.local_info.mailbox_idx, recipient.local_info.forum_idx = 0;
+	     end;
+	     if baseno (recipients_list_ptr) ^= baseno (stackframeptr ()) then
+		call mlsys_storage_mgr_$release_temp_segment (recipients_list_ptr, (0));
+	end;					/* ... flush the list of recipients itself if needed */
+	recipients_list_ptr = null ();
+
+	call restore_message_state ();		/* restore the message to its state on entry to this module */
+
+     end cleanup_message_delivery;
+%page;
+/* Saves the state of the message on entry to this module so that it can be restored on exit or cleanup */
+
+save_message_state:
+     procedure ();
+
+	if message_ptr = null () then return;
+
+	saved_message_data = message, by name;		/* copy data which we might have to change */
+
+	added_from_field,				/* we haven't added anything yet */
+	     added_reply_to_field, added_envelope, added_redistribution = "0"b;
+	deleted_last_delivery_fields = "0"b;		/* we haven't deleted anything either */
+
+	return;
+
+     end save_message_state;
+
+
+
+/* Restores the state of the message to what it was on entry to this module */
+
+restore_message_state:
+     procedure ();
+
+	if message_ptr = null () then return;
+
+	message = saved_message_data, by name;		/* restore the data added by a simple copy */
+
+	if added_from_field then			/* From field was empty: we added a single address ... */
+	     call mlsys_address_list_mgr_$delete_address (message.from, 1, (0));
+	added_from_field = "0"b;			/* don't do it again */
+
+	if added_reply_to_field then			/* From field was empty and we added a single address ... */
+	     call mlsys_address_list_mgr_$delete_address (message.reply_to, 1, (0));
+	added_reply_to_field = "0"b;
+
+	if added_envelope then do;			/* we had to add an envelope (new message only) ... */
+	     local_mep.version = MESSAGE_ENVELOPE_PARAMETER_VERSION_2;
+	     local_mep.date_time_mailed, local_mep.date_time_delivered = 0;
+	     local_mep.sender, local_mep.trace, local_mep.delivered_by, local_mep.acknowledge_to = null ();
+	     call mlsys_message_mgr_$replace_message_envelope (message_ptr, addr (local_mep), (0));
+	end;
+	added_envelope = "0"b;
+
+	if added_redistribution then			/* we added the last redistribution to the message */
+	     call mlsys_message_mgr_$delete_redistribution (message_ptr, message.n_redistributions, (0));
+	added_redistribution = "0"b;
+
+	if deleted_last_delivery_fields then		/* we deleted the last Delivery-Date and Delivery-By fields */
+	     call add_last_delivery_fields ();
+
+	return;
+
+     end restore_message_state;
+%page;
+/* Supplies appropriate values for those fields of a new message which may not have been set by the user (or which cannot
+   be set by the user (eg: Date)) */
+
+complete_new_message:
+     procedure ();
+
+dcl  users_address pointer;
+dcl  all_invalid bit (1) aligned;
+dcl  code fixed binary (35);
+dcl  (address_type, idx) fixed binary;
+
+	call mlsys_address_mgr_$get_address_type (mlsys_data_$user_mail_table_address, address_type, (0));
+	if address_type ^= MAIL_TABLE_ADDRESS then	/* ... mail table address isn't usable: anonymous user(?) */
+	     users_address = mlsys_data_$user_default_mailbox_address;
+	else do;					/* ... make sure mail table address can receive mail */
+	     call validate_address (mlsys_data_$user_mail_table_address, "0"b, code);
+	     if code = 0 then			/* ... and it can */
+		users_address = mlsys_data_$user_mail_table_address;
+	     else users_address = mlsys_data_$user_default_mailbox_address;
+	end;
+
+	message.date_time_created = date_time_message_created;
+						/* set date/time created to time the body was last updated */
+
+	call mlsys_message_id_mgr_$encode_local_id (message.date_time_created, message.message_id);
+
+	if is_empty_list (message.from) then do;	/* no From field: default to the user ... */
+	     if message.from = null () then do;
+		call mlsys_address_list_mgr_$create_read_only_address_list (ADDRESS_LIST_VERSION_2, message.from, (0))
+		     ;
+		call mlsys_address_list_mgr_$increment_reference_count (message.from);
+	     end;
+	     call mlsys_address_list_mgr_$add_address (message.from, users_address, ADDRESS_LIST_VERSION_2, (0));
+	     added_from_field = "1"b;
+	end;
+
+	else					/* From field supplied by the user ... */
+	     if is_empty_list (message.reply_to) then do; /* ... but no Reply-To field ... */
+	     all_invalid = "1"b;			/* ... so add one if all From addresses are invalid */
+	     do idx = 1 to message.from -> address_list.n_addresses while (all_invalid);
+		call validate_address (message.from -> address_list.addresses (idx), "0"b, code);
+		all_invalid = (code ^= 0);		/* ... stops at first valid address */
+	     end;
+	     if all_invalid then do;
+		if message.reply_to = null () then do;
+		     call mlsys_address_list_mgr_$create_read_only_address_list (ADDRESS_LIST_VERSION_2,
+			message.reply_to, (0));
+		     call mlsys_address_list_mgr_$increment_reference_count (message.reply_to);
+		end;
+		call mlsys_address_list_mgr_$add_address (message.reply_to, users_address, ADDRESS_LIST_VERSION_2,
+		     (0));
+		added_reply_to_field = "1"b;
+	     end;
+	end;
+
+	local_mep.version = MESSAGE_ENVELOPE_PARAMETER_VERSION_2;
+	local_mep.date_time_mailed = clock ();		/* Posted-Date is now */
+	local_mep.sender = users_address;		/* Sender is this user (formatting eliminates redundancies) */
+	local_mep.trace = null ();			/* local origin: no trace */
+	local_mep.date_time_delivered = 0;		/* Delivery-Date is set by receiving system ... */
+	local_mep.delivered_by = null ();		/* ... and the same goes for Delivery-By */
+	if deliver_options.acknowledge then		/* caller wants an acknowledgment ... */
+	     local_mep.acknowledge_to = users_address;	/* ... but can not yet specify to whom */
+	else local_mep.acknowledge_to = null ();
+	call mlsys_message_mgr_$replace_message_envelope (message_ptr, addr (local_mep), (0));
+	added_envelope = "1"b;			/* don't forget to get rid of it when we're done */
+
+	return;
+
+     end complete_new_message;
+%page;
+/* Adds the description of this redistribution to the message */
+
+add_redistribution:
+     procedure ();
+
+dcl  users_address pointer;
+dcl  (address_type, idx) fixed binary;
+
+	call mlsys_address_mgr_$get_address_type (mlsys_data_$user_mail_table_address, address_type, (0));
+	if address_type ^= MAIL_TABLE_ADDRESS then	/* ... mail table address isn't usable: anonymous user(?) */
+	     users_address = mlsys_data_$user_default_mailbox_address;
+	else do;					/* ... make sure mail table address can receive mail */
+	     call validate_address (mlsys_data_$user_mail_table_address, "0"b, code);
+	     if code = 0 then			/* ... and it can */
+		users_address = mlsys_data_$user_mail_table_address;
+	     else users_address = mlsys_data_$user_default_mailbox_address;
+	end;
+
+	local_mrp.version = MESSAGE_REDISTRIBUTION_PARAMETER_VERSION_2;
+
+	local_mrp.date_time_created = clock ();		/* Redistributed-Date is now */
+	call mlsys_message_id_mgr_$encode_local_id (local_mrp.date_time_created, local_mrp.message_id);
+
+	call mlsys_address_list_mgr_$create_read_only_address_list (ADDRESS_LIST_VERSION_2, local_mrp.from, (0));
+	call mlsys_address_list_mgr_$add_address (local_mrp.from, users_address, ADDRESS_LIST_VERSION_2, (0));
+						/* Redistributed-From is this user */
+
+	call mlsys_address_list_mgr_$create_read_only_address_list (ADDRESS_LIST_VERSION_2, local_mrp.to, (0));
+	do idx = 1 to recipients_info.n_lists;
+	     call mlsys_address_list_mgr_$merge_address_lists (recipients_info.lists (idx).address_list_ptr,
+		local_mrp.to, "1"b, local_mrp.to, (0));
+	end;
+
+	local_mrp.envelope.date_time_mailed = local_mrp.date_time_created;
+						/* Redistributed-Posted-Date is the same as above */
+	local_mrp.envelope.sender = null ();		/* Redistributed-Sender is the same as Redistributed-From */
+
+	local_mrp.envelope.trace = null ();		/* local origin: no trace */
+
+	local_mrp.date_time_delivered = 0;		/* Redistributed-Delivery-Date is set by receiving system */
+	local_mrp.delivered_by = null ();		/* ... and the same goes for Redistributed-Delivery-By */
+
+	if deliver_options.acknowledge then		/* caller wants an acknowledgment ... */
+	     local_mrp.acknowledge_to = users_address;	/* ... but can not yet specify to whom */
+	else local_mrp.acknowledge_to = null ();
+
+	if P_redistribution_comment ^= "" then do;	/* caller supplied a Redistributed-Comment field */
+	     local_mrp.comment.text_ptr = addr (P_redistribution_comment);
+	     local_mrp.comment.text_lth = length (P_redistribution_comment);
+	end;
+	else do;					/* no comment */
+	     local_mrp.comment.text_ptr = null ();
+	     local_mrp.comment.text_lth = 0;
+	end;
+	local_mrp.comment.multiline_text = "1"b;	/* don't really need to set this ... */
+
+	call mlsys_message_mgr_$add_redistribution (message_ptr, addr (local_mrp), (-1), (0));
+	call mlsys_address_list_mgr_$free_address_list (local_mrp.from, (0));
+	call mlsys_address_list_mgr_$free_address_list (local_mrp.to, (0));
+
+	added_redistribution = "1"b;			/* get rid of it when we're done */
+
+	return;
+
+     end add_redistribution;
+%page;
+/* Deletes the last Delivery-Date and Delivery-By fields from an in-mailbox message which is about to be logged, saved, or
+   copied:  These fields must be deleted as they will be overidden by the values obtained from the ring-1 mailbox
+   primitives after the message is retransmitted */
+
+delete_last_delivery_fields:
+     procedure ();
+
+	if message.n_redistributions = 0 then		/* last fields are in the envelope */
+	     message_envelope_ptr = addr (message.envelope);
+	else do;					/* last fields are in the last redistribution */
+	     message_redistribution_ptr =
+		addr (message_redistributions_list.redistributions (message.n_redistributions));
+	     message_envelope_ptr = addr (message_redistribution.envelope);
+	end;
+
+	last_delivered_by = message_envelope.delivered_by;/* save the current values ... */
+	last_date_time_delivered = message_envelope.date_time_delivered;
+
+	deleted_last_delivery_fields = "1"b;		/* now OK to restore in the cleanup handler */
+
+	message_envelope.delivered_by = null ();	/* delete the fields ... */
+	message_envelope.date_time_delivered = 0;
+
+	return;
+
+     end delete_last_delivery_fields;
+
+
+
+/* Adds the last Delivery-Date and Delivery-By fields back into the message */
+
+add_last_delivery_fields:
+     procedure ();
+
+	if message.n_redistributions = 0 then		/* last fields are in the envelope */
+	     message_envelope_ptr = addr (message.envelope);
+	else do;					/* last fields are in the last redistribution */
+	     message_redistribution_ptr =
+		addr (message_redistributions_list.redistributions (message.n_redistributions));
+	     message_envelope_ptr = addr (message_redistribution.envelope);
+	end;
+
+	message_envelope.delivered_by = last_delivered_by;/* restore the saved values ... */
+	message_envelope.date_time_delivered = last_date_time_delivered;
+
+	deleted_last_delivery_fields = "0"b;		/* no need to do it twice */
+
+	return;
+
+     end add_last_delivery_fields;
+%page;
+/* Validates that mail can be sent to the given address:  If the address is a mailing list or named group, the list will
+   be expanded and each address in the list will be validated/expanded */
+
+validate_or_expand_address:
+     procedure (p_address_ptr, p_top_level_address, p_exclude_bcc_field, p_expand_mailing_lists, p_validate_only);
+
+dcl  p_address_ptr pointer parameter;
+dcl  p_top_level_address bit (1) aligned parameter;
+dcl  p_exclude_bcc_field bit (1) aligned parameter;
+dcl  p_expand_mailing_lists bit (1) aligned parameter;
+dcl  p_validate_only bit (1) aligned parameter;
+
+dcl  1 local_mld aligned like mailing_list_data;
+
+dcl  (address_ptr, list_expansion_ptr, new_recipients_list_ptr) pointer;
+dcl  address_pathname character (200);
+dcl  address_dirname character (168);
+dcl  address_string character (128) varying;
+dcl  (address_ename, address_component) character (32);
+dcl  (mail_table_expansion, use_copy_without_bcc) bit (1) aligned;
+dcl  code fixed binary (35);
+dcl  (address_type, n_recipients_before_expansion, idx) fixed binary;
+
+
+	use_copy_without_bcc = "0"b;			/* only gets used before actual setting if invalid address */
+	mail_table_expansion = "0"b;			/* until proven otherwise */
+
+
+/* Get the type of address: insures that all local addresses are properly recognized and resolves mail table addresses to
+   the actual value in the mail table */
+
+	call mlsys_address_mgr_$check_if_actually_local (p_address_ptr);
+
+	call mlsys_address_mgr_$get_address_type (p_address_ptr, address_type, (0));
+
+	if address_type = MAIL_TABLE_ADDRESS then do;	/* look it up in the mail table right now */
+	     call mlsys_address_mgr_$get_mail_table_address (p_address_ptr, address_ptr, code);
+	     if code = 0 then do;			/* ... found it: get the actual address type */
+		call mlsys_address_mgr_$get_address_type (address_ptr, address_type, (0));
+		mail_table_expansion = "1"b;		/* ... and be sure the address gets freed on cleanup */
+	     end;
+	     else do;				/* ... couldn't find it */
+		call add_recipient (p_address_ptr, UNKNOWN_RECIPIENT);
+		recipient.fatal_error = "1"b;		/* ... record the exact problem (mte_not_found) */
+		recipient.code = code;
+		return;
+	     end;
+	end;
+
+	else address_ptr = p_address_ptr;
+
+	on condition (cleanup)
+	     begin;
+	     if mail_table_expansion & (address_ptr ^= null ()) then
+		call mlsys_address_mgr_$free_address (address_ptr, (0));
+	end;
+%page;
+/* If this is one of the addresses supplied by the caller and the bcc field should be suppressed for primary/secondary
+   recipients, determine whether this address or its expansion should have the bcc field suppressed */
+
+	if p_top_level_address & suppress_bcc_field_when_necessary then do;
+	     if ^is_empty_list (message.to) then do;
+		do idx = 1 to message.to -> address_list.n_addresses while (^use_copy_without_bcc);
+		     if mlsys_address_mgr_$compare_addresses (address_ptr, message.to -> address_list.addresses (idx),
+			(0)) then
+			use_copy_without_bcc = "1"b;
+		end;
+	     end;
+	     if ^use_copy_without_bcc & ^is_empty_list (message.cc) then do;
+		do idx = 1 to message.cc -> address_list.n_addresses while (^use_copy_without_bcc);
+		     if mlsys_address_mgr_$compare_addresses (address_ptr, message.cc -> address_list.addresses (idx),
+			(0)) then
+			use_copy_without_bcc = "1"b;
+		end;
+	     end;
+	     make_copies_with_bcc = make_copies_with_bcc | ^use_copy_without_bcc;
+	     make_copies_without_bcc = make_copies_without_bcc | use_copy_without_bcc;
+	end;
+
+	else if p_top_level_address then		/* always include the bcc field */
+	     make_copies_with_bcc = "1"b;
+
+	else use_copy_without_bcc = p_exclude_bcc_field;
+
+
+/* Now validate or expand the address as appropriate */
+
+	go to VALIDATE_OR_EXPAND_ADDRESS (address_type);
+
+
+
+/* Invalid address */
+
+VALIDATE_OR_EXPAND_ADDRESS (0):
+	call add_recipient (address_ptr, UNKNOWN_RECIPIENT);
+	recipient.fatal_error = "1"b;
+	recipient.code = mlsys_et_$invalid_address;
+	return;
+%page;
+/* Addresses which resolve to a mailbox */
+
+VALIDATE_OR_EXPAND_ADDRESS (1):			/* user mailbox address */
+VALIDATE_OR_EXPAND_ADDRESS (2):			/* logbox address */
+VALIDATE_OR_EXPAND_ADDRESS (3):			/* savebox address */
+VALIDATE_OR_EXPAND_ADDRESS (4):			/* mailbox address */
+	call add_recipient (address_ptr, MAILBOX_RECIPIENT);
+
+	if deliver_options.acknowledge then		/* never ask for an ACK is sending to ourself */
+	     if (address_type = LOGBOX_ADDRESS) | (address_type = SAVEBOX_ADDRESS) then
+		recipient.no_acknowledge = "1"b;
+	     else do;
+		recipient.no_acknowledge =
+		     mlsys_address_mgr_$compare_addresses (address_ptr, mlsys_data_$user_default_mailbox_address, (0))
+		     ;
+		if ^recipient.no_acknowledge then
+		     recipient.no_acknowledge =
+			mlsys_address_mgr_$compare_addresses (address_ptr, mlsys_data_$user_mail_table_address, (0))
+			;
+	     end;
+
+	call mlsys_address_mgr_$get_address_pathname (address_ptr, address_dirname, address_ename, ((32)" "), (0));
+						/* this call has to work */
+
+	if p_validate_only then do;
+	     /*** validate_address: Don't bother opening the mailbox; just check the user's access */
+	     call mailbox_$get_mode_file (address_dirname, address_ename, mailbox_mode, code);
+	     if code = error_table_$noentry then code = mlsys_et_$no_mailbox;
+	     if code = 0 then			/* ... got the access */
+		if (mailbox_mode & A_MBX_ACCESS) = A_MBX_ACCESS then
+		     ;				/* ... and it's OK */
+		else do;				/* ... can't append messages */
+		     recipient.fatal_error = "1"b;
+		     recipient.code = mlsys_et_$no_a_permission;
+		end;
+	     else if (code = error_table_$logical_volume_not_defined)
+		| (code = error_table_$logical_volume_not_connected) then
+		;				/* ... mailbox temporarily unavailable: assume it's OK */
+	     else do;				/* ... can't get the user's access */
+		recipient.fatal_error = "1"b;
+		recipient.code = code;
+	     end;
+	     return;
+	end;
+
+	call mailbox_$open (address_dirname, address_ename, mailbox_idx, code);
+	if code = error_table_$moderr then code = mlsys_et_$no_a_permission;
+	if code = error_table_$noentry then code = mlsys_et_$no_mailbox;
+
+	if code = 0 then do;
+	     /*** Mailbox exists and we have non-null access */
+	     call mailbox_$get_mode_index (mailbox_idx, mailbox_mode, (0));
+
+	     if (mailbox_mode & A_MBX_ACCESS) ^= A_MBX_ACCESS then do;
+		/*** ... but we don't have append permission */
+		recipient.fatal_error = "1"b;
+		recipient.code = mlsys_et_$no_a_permission;
+		call mailbox_$close (mailbox_idx, (0));
+		mailbox_idx = 0;
+	     end;
+
+	     else if deliver_options.delivery_mode = ORDINARY_DELIVERY then
+		/*** ... all we need for ordinary delivery is append permission */
+		recipient.local_info.mailbox_idx = mailbox_idx;
+
+	     else do;
+		/*** ... interactive/express delivery: check for appropriate access */
+		call send_test_message (mailbox_idx, code);
+		if code = 0 then			/* ... we can send the interactive message */
+		     recipient.local_info.mailbox_idx = mailbox_idx;
+		else do;				/* ... either fatal or a warning */
+		     recipient.code = code;
+		     if code = error_table_$ai_restricted then do;
+			/*** Only happens for writing "down" without privileges: fatal to entire operation */
+			P_code = error_table_$ai_restricted;
+			go to RETURN_FROM_TRANSMIT_WITH_FATAL_ERROR;
+		     end;				/* ... we should have got this sooner, but ... */
+		     if deliver_options.delivery_mode = INTERACTIVE_DELIVERY then
+			if (code = error_table_$messages_off) | (code = error_table_$messages_deferred)
+			     | (code = error_table_$wakeup_denied) then
+			     recipient.warning = "1"b;
+			else recipient.fatal_error = "1"b;
+		     else /*** if deliver_options.delivery_mode = EXPRESS_DELIVERY then */
+			recipient.fatal_error = "1"b;
+		     if recipient.fatal_error then do;	/* ... it was fatal: close the mailbox */
+			call mailbox_$close (mailbox_idx, (0));
+			mailbox_idx = 0;
+		     end;
+		     else recipient.local_info.mailbox_idx = mailbox_idx;
+		end;
+	     end;
+	end;
+
+	else if (code = error_table_$logical_volume_not_defined) | (code = error_table_$logical_volume_not_connected)
+	then do;
+	     /*** Mailbox is on a logical volume which isn't available right now: a transient error */
+	     if deliver_options.queueing_mode = ALWAYS_QUEUE then go to QUEUE_THE_MAILBOX;
+	     recipient.transient_error = "1"b;
+	     recipient.code = code;
+	end;
+
+	else do;
+	     /*** Mailbox doesn't exist or we have only null access */
+	     recipient.fatal_error = "1"b;
+	     recipient.code = code;
+	end;
+
+	mailbox_idx = 0;				/* don't let cleanup handler near it */
+
+	if (deliver_options.queueing_mode = ALWAYS_QUEUE) & (recipient.local_info.mailbox_idx ^= 0) then do;
+	     call mailbox_$close (recipient.local_info.mailbox_idx, (0));
+	     recipient.local_info.mailbox_idx = 0;	/* don't keep the mailbox open if we're going to queue it */
+QUEUE_THE_MAILBOX:					/* ... control arrives here from LV not being available */
+	     address_pathname = pathname_ (address_dirname, address_ename);
+	     recipient.foreign_address = rtrim (address_pathname);
+	     if recipient.foreign_address = address_pathname then
+		recipient.to_queue = "1"b;		/* ... pathname isn't too long for mlsys_mailer_ */
+	     else do;				/* ... sigh */
+		recipient.fatal_error = "1"b;
+		recipient.code = mlsys_et_$address_pathname_too_long_to_q;
+	     end;
+	end;
+
+	need_mailbox_message = need_mailbox_message | ^recipient.fatal_error;
+
+	return;
+%page;
+/* Forum meeting address */
+
+VALIDATE_OR_EXPAND_ADDRESS (5):
+	call add_recipient (address_ptr, FORUM_RECIPIENT);
+	recipient.no_acknowledge = "1"b;		/* ... not that we'll even try */
+
+	if mlsys_psp_$forum_not_available () then do;	/* Forum (a PSP) wasn't purchased by this site */
+	     recipient.fatal_error = "1"b;
+	     if get_ring_ () < mlsys_data_$lowest_forum_ring then
+		recipient.code = mlsys_et_$no_forum_this_ring;
+	     else recipient.code = mlsys_et_$forum_not_available;
+	     return;
+	end;
+
+	call mlsys_address_mgr_$get_address_pathname (address_ptr, address_dirname, address_ename, ((32)" "), (0));
+						/* this call has to work */
+	if address_dirname = "" then do;		/* a forum meeting which couldn't be found by search list */
+	     recipient.fatal_error = "1"b;
+	     recipient.code = forum_error_table_$not_in_search_list;
+	     return;
+	end;
+
+	call forum_$open_forum (address_dirname, address_ename, forum_idx, code);
+
+	if code = 0 then do;
+	     /*** Forum meeting exists and we are a participant */
+	     call forum_$real_forum_limits (forum_idx, ONLY_UNDELETED, (0), (0), (0), (0), forum_flags_word, (0));
+
+	     if forum_flags.read_only then do;
+		/*** ... but the user can't enter transactions */
+		recipient.fatal_error = "1"b;
+		recipient.code = forum_error_table_$read_only;
+		call forum_$close_forum (forum_idx, (0));
+		forum_idx = 0;
+	     end;
+
+	     else /*** ... user can enter the transaction: address is OK */
+		recipient.local_info.forum_idx = forum_idx;
+	end;
+
+	else if (code = error_table_$logical_volume_not_defined) | (code = error_table_$logical_volume_not_connected)
+	then do;
+	     /*** Forum is on a logical volume which isn't available right now: a transient error */
+	     if deliver_options.queueing_mode = ALWAYS_QUEUE then go to QUEUE_THE_FORUM;
+	     recipient.transient_error = "1"b;
+	     recipient.code = code;
+	end;
+
+	else do;
+	     /*** Forum doesn't exist or we aren't a participant */
+	     recipient.fatal_error = "1"b;
+	     recipient.code = code;
+	end;
+
+	forum_idx = 0;				/* don't let cleanup handler near it */
+
+	if (deliver_options.queueing_mode = ALWAYS_QUEUE) & (recipient.local_info.forum_idx ^= 0) then do;
+	     call forum_$close_forum (recipient.local_info.forum_idx, (0));
+	     recipient.local_info.forum_idx = 0;	/* don't keep the mailbox open if we're going to queue it */
+QUEUE_THE_FORUM:					/* ... control arrives here from LV not being available */
+	     address_pathname = pathname_ (address_dirname, address_ename);
+	     recipient.foreign_address = rtrim (address_pathname);
+	     if recipient.foreign_address = address_pathname then
+		recipient.to_queue = "1"b;		/* ... pathname isn't too long for mlsys_mailer_ */
+	     else do;				/* ... sigh */
+		recipient.fatal_error = "1"b;
+		recipient.code = mlsys_et_$address_pathname_too_long_to_q;
+	     end;
+	end;
+
+	need_forum_message = need_forum_message | ^recipient.fatal_error;
+
+	return;
+%page;
+/* Foreign address:  Computes the route to be used to deliver the message and then constructs the foreign "user name" and
+   the system name to be used when calling the interim inter-system mailer (mlsys_mailer_).  Unfortunately, mlsys_mailer_
+   imposes an arbitrary limit of 128 characters on the "user name" and 40 characters on the system name; these limits are
+   enforced here as mlsys_mailer_ doesn't even bother to check for truncated names */
+
+VALIDATE_OR_EXPAND_ADDRESS (6):
+	call add_recipient (address_ptr, NETWORK_RECIPIENT);
+	recipient.no_acknowledge = "1"b;		/* ... acknowledgements aren't supported across networks */
+
+	if mlsys_psp_$ism_not_available () then do;	/* no inter-system mailer on this site */
+	     recipient.fatal_error = "1"b;
+	     recipient.code = mlsys_et_$ism_not_available;
+	     return;
+	end;
+
+	address_route_ptr = null ();			/* for cleaning up */
+
+	call mlsys_address_route_mgr_$compute_route (address_ptr, address_route_ptr, code);
+
+	if code = 0 then do;
+	     /*** A possible route for sending mail to the foreign system has been determined ... */
+	     call mlsys_address_mgr_$get_address_string (address_ptr, address_string, code);
+
+	     if code = 0 then do;
+		/*** ... and the unquoted user name isn't too long: construct proper user and system names */
+		call mlsys_format_$format_address_for_ism (address_string, address_route_ptr,
+		     recipient.foreign_address, recipient.foreign_system, code);
+		if code ^= 0 then do;		/* ... user/system name is too long if properly formatted */
+		     recipient.fatal_error = "1"b;
+		     recipient.code = code;
+		end;
+	     end;
+
+	     else do;
+		/*** ... but the unquoted user name is too long */
+		recipient.fatal_error = "1"b;
+		recipient.code = mlsys_et_$foreign_address_too_long;
+	     end;
+	end;
+
+	else do;
+	     /*** Can't get there from here: the local system may not have the interim inter-system mailer */
+	     recipient.fatal_error = "1"b;
+	     recipient.code = code;
+	end;
+
+	if address_route_ptr ^= null () then call mlsys_address_route_mgr_$free_address_route (address_route_ptr);
+
+	recipient.to_queue = (deliver_options.queueing_mode >= ALWAYS_QUEUE_FOREIGN);
+	need_network_message = need_network_message | ^recipient.fatal_error;
+
+	return;
+
+
+/* Mail table address */
+
+VALIDATE_OR_EXPAND_ADDRESS (7):
+	return;					/* ... won't ever get here */
+%page;
+/* Mailing list address: check for recursive mailing lists before actually expanding the list */
+
+VALIDATE_OR_EXPAND_ADDRESS (8):
+	call add_recipient (address_ptr, NETWORK_RECIPIENT);
+	recipient.no_acknowledge = "1"b;		/* it won't really make any difference */
+	address_ptr = null ();			/* prevents cleanup handler from freeing this address */
+
+	list_expansion_ptr = null ();			/* for common exit code */
+
+	/*** Add another entry to the stack of mailing lists presently under expansion */
+	local_mld.previous_data_ptr = current_mailing_list_data_ptr;
+	local_mld.mls_ptr = null ();
+	current_mailing_list_data_ptr = addr (local_mld);
+
+	on condition (cleanup)
+	     begin;
+	     if local_mld.mls_ptr ^= null () then call terminate_file_ (local_mld.mls_ptr, 0, TERM_FILE_TERM, (0));
+	     if mail_table_expansion & (address_ptr ^= null ()) then
+		call mlsys_address_mgr_$free_address (address_ptr, (0));
+	end;
+
+	/*** Determine whether or not the mailing list actually exists */
+	call mlsys_address_mgr_$get_address_pathname (recipient.address_ptr, address_dirname, address_ename,
+	     address_component, (0));			/* this call has to work */
+
+	call initiate_file_$component (address_dirname, address_ename, address_component, R_ACCESS, local_mld.mls_ptr,
+	     (0), code);
+	if (code = error_table_$noentry) | (code = error_table_$no_component) then code = mlsys_et_$no_mailing_list;
+
+	if code = 0 then do;
+	     /*** Mailing list exists and user can access it: check for recursion */
+	     do mailing_list_data_ptr = local_mld.previous_data_ptr repeat (mailing_list_data.previous_data_ptr)
+		while (mailing_list_data_ptr ^= null ());
+		if local_mld.mls_ptr = mailing_list_data.mls_ptr then do;
+		     n_recipients = n_recipients - 1;	/* not to be expanded: be sure it's not counted */
+		     address_ptr = recipient.address_ptr;
+		     go to RETURN_FROM_EXPAND_LIST_ADDRESS;
+		end;
+	     end;
+	end;
+
+	else if (code = error_table_$logical_volume_not_defined) | (code = error_table_$logical_volume_not_connected)
+	then do;
+	     /*** Mailing list is on a logical volume which isn't available right now: a transient error */
+	     if deliver_options.queue_mailing_lists | (deliver_options.queueing_mode = ALWAYS_QUEUE) then
+		go to QUEUE_THE_MAILING_LIST;
+	     recipient.transient_error = "1"b;
+	     recipient.code = code;
+	     go to RETURN_FROM_EXPAND_LIST_ADDRESS;
+	end;
+
+	else do;
+	     /*** Mailing list doesn't exist or user can't access it */
+	     recipient.fatal_error = "1"b;		/* ... record the exact problem */
+	     recipient.code = code;
+	     go to RETURN_FROM_EXPAND_LIST_ADDRESS;
+	end;
+
+	/*** Control arrives here iff the mailing list exists and isn't part of a circular list */
+
+	if ^p_expand_mailing_lists then		/* just checking for its existence */
+	     go to RETURN_FROM_EXPAND_LIST_ADDRESS;
+
+	if deliver_options.queue_mailing_lists | (deliver_options.queueing_mode = ALWAYS_QUEUE) then do;
+	     /*** Mail will be queued for this list: won't bother to expand it */
+QUEUE_THE_MAILING_LIST:
+	     if mlsys_psp_$ism_not_available () then do;	/* no inter-system mailer to handle the queueing */
+		recipient.fatal_error = "1"b;
+		recipient.code = mlsys_et_$ism_not_available;
+	     end;
+	     else if address_component = "" then do;	/* the list is in a segment ... */
+		address_pathname = pathname_ (address_dirname, address_ename);
+		recipient.foreign_address = rtrim (address_pathname);
+		if recipient.foreign_address = address_pathname then do;
+		     need_network_message = "1"b;	/* ... so use the copy formatted for network transmission */
+		     recipient.to_queue = "1"b;
+		end;
+		else do;				/* ... but the pathname is too long for mlsys_mailer_ */
+		     recipient.fatal_error = "1"b;
+		     recipient.code = mlsys_et_$address_pathname_too_long_to_q;
+		end;
+	     end;
+	     else do;				/* the list is an archive component ... */
+		recipient.fatal_error = "1"b;		/* ... mlsys_mailer_ doesn't understand them yet */
+		recipient.code = mlsys_et_$cant_queue_mls_in_archive;
+	     end;
+	     go to RETURN_FROM_EXPAND_LIST_ADDRESS;
+	end;
+
+	go to EXPAND_LIST_ADDRESS;			/* expand the list */
+%page;
+/* Named group address */
+
+VALIDATE_OR_EXPAND_ADDRESS (9):
+	call add_recipient (address_ptr, NETWORK_RECIPIENT);
+	recipient.no_acknowledge = "1"b;		/* it won't really make any difference */
+	address_ptr = null ();			/* prevents cleanup handler from freeing this address */
+
+	local_mld.previous_data_ptr = current_mailing_list_data_ptr;
+	local_mld.mls_ptr = null ();			/* makes code shared with mailing lists work properly */
+
+
+/* Expand the contents of a mailing list of named group */
+
+EXPAND_LIST_ADDRESS:
+	list_expansion_ptr = null ();			/* for cleanup handler */
+
+	on condition (cleanup)
+	     begin;
+	     if local_mld.mls_ptr ^= null () then call terminate_file_ (local_mld.mls_ptr, 0, TERM_FILE_TERM, (0));
+	     if list_expansion_ptr ^= null () then
+		call mlsys_address_list_mgr_$free_address_list (list_expansion_ptr, (0));
+	     if mail_table_expansion & (address_ptr ^= null ()) then
+		call mlsys_address_mgr_$free_address (address_ptr, (0));
+	end;
+
+	call mlsys_address_mgr_$expand_list_address (recipient.address_ptr, ADDRESS_LIST_VERSION_2, list_expansion_ptr,
+	     code);
+	if code ^= 0 then do;			/* ... won't expand properly */
+	     recipient.fatal_error = "1"b;		/* ... record the exact problem */
+	     recipient.code = code;
+	     go to RETURN_FROM_EXPAND_LIST_ADDRESS;
+	end;
+
+	n_recipients = n_recipients - 1;		/* won't need the recipient for the list address itself */
+	address_ptr = recipient.address_ptr;		/* be sure that cleanup gets rid of this address now */
+
+	n_recipients_before_expansion = n_recipients;	/* in order to check for empty lists */
+
+	if ^is_empty_list (list_expansion_ptr) then do;
+	     do idx = 1 to list_expansion_ptr -> address_list.n_addresses;
+		call validate_or_expand_address (list_expansion_ptr -> address_list.addresses (idx), "0"b,
+		     use_copy_without_bcc, p_expand_mailing_lists, p_validate_only);
+	     end;
+	end;
+
+	if n_recipients = n_recipients_before_expansion then
+	     /*** Empty mailing list or named group: complain about empty top level mailing lists only */
+	     if (address_type = MAILING_LIST_ADDRESS) & p_top_level_address then do;
+		code = mlsys_et_$empty_mailing_list;
+		call add_recipient (address_ptr, NETWORK_RECIPIENT);
+		address_ptr = null ();		/* ... prevents cleanup from freeing this address */
+		recipient.fatal_error = "1"b;		/* ... record the exact problem */
+		recipient.code = code;
+	     end;
+
+RETURN_FROM_EXPAND_LIST_ADDRESS:
+	if list_expansion_ptr ^= null () then call mlsys_address_list_mgr_$free_address_list (list_expansion_ptr, (0));
+	if mail_table_expansion & (address_ptr ^= null ()) then call mlsys_address_mgr_$free_address (address_ptr, (0));
+
+	if local_mld.mls_ptr ^= null () then call terminate_file_ (local_mld.mls_ptr, 0, TERM_FILE_TERM, (0));
+	current_mailing_list_data_ptr = local_mld.previous_data_ptr;
+
+	return;
+%page;
+/* Internal to validate_or_expand_address: adds another address to the list of recipients */
+
+add_recipient:
+	procedure (p_address_ptr, p_recipient_type);
+
+dcl  p_address_ptr pointer parameter;
+dcl  p_recipient_type fixed binary parameter;
+
+	     if n_recipients = n_recipients_allocated then
+		/*** ... not enough room left in present list: switch to temporary segment if possible */
+		if baseno (recipients_list_ptr) = baseno (stackframeptr ()) then do;
+		     call mlsys_storage_mgr_$get_temp_segment (new_recipients_list_ptr, code);
+		     if code ^= 0 then do;		/* ... can't get a temporary segment for the list */
+			P_code = code;
+			go to RETURN_FROM_TRANSMIT_WITH_FATAL_ERROR;
+		     end;
+		     do idx = 1 to n_recipients;
+			new_recipients_list_ptr -> recipients_list.recipients (idx) =
+			     recipients_list.recipients (idx);
+		     end;
+		     recipients_list_ptr = new_recipients_list_ptr;
+		     n_recipients_allocated = divide (sys_info$max_seg_size, recipient_size, 18, 0);
+		end;
+		else do;				/* ... ran out of room in the temporary segment */
+		     P_code = mlsys_et_$too_many_recipients;
+		     go to RETURN_FROM_TRANSMIT_WITH_FATAL_ERROR;
+		end;
+
+	     n_recipients = n_recipients + 1;		/* must always count so mailing list validation will work */
+	     recipient_ptr = addr (recipients_list.recipients (n_recipients));
+
+	     recipient.address_ptr = p_address_ptr;
+	     if ^p_top_level_address then		/* need to hold on to it after its containing list is freed */
+		call mlsys_address_mgr_$increment_reference_count (recipient.address_ptr);
+
+	     string (recipient.flags) = ""b;
+	     recipient.top_level = p_top_level_address;
+	     recipient.free_address = ^p_top_level_address | mail_table_expansion;
+	     recipient.use_copy_without_bcc = use_copy_without_bcc;
+	     recipient.type = p_recipient_type;
+	     recipient.top_level_info.list_idx = the_list_idx;
+	     recipient.top_level_info.address_idx = the_address_idx;
+	     recipient.duplicate_idx = 0;
+	     recipient.local_info.mailbox_idx, recipient.local_info.forum_idx = 0;
+	     recipient.foreign_info.foreign_address, recipient.foreign_info.foreign_system = "";
+	     recipient.code = 0;			/* haven't actually tried to validate it yet */
+	     recipient.explanation = "";
+
+	     return;
+
+	end add_recipient;
+
+     end validate_or_expand_address;
+%page;
+/* Marks all duplicate recipients:  Care must be taken that a top-level recipient is never marked as the duplicate of an
+   expanded recipient; instead, the expanded recipient must be marked as the duplicate */
+
+mark_duplicate_recipients:
+     procedure ();
+
+dcl  1 other_recipient aligned based (other_recipient_ptr) like recipient;
+dcl  other_recipient_ptr pointer;
+dcl  (recipient_idx, other_recipient_idx, idx) fixed binary;
+
+
+	do recipient_idx = 1 to n_recipients;
+
+	     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+
+	     do other_recipient_idx = 1 to (recipient_idx - 1) while (^recipient.duplicate);
+		other_recipient_ptr = addr (recipients_list.recipients (other_recipient_idx));
+		if (other_recipient.mailbox_idx ^= 0) & (other_recipient.mailbox_idx = recipient.mailbox_idx) then do;
+MARK_RECIPIENT_AS_A_DUPLICATE:
+		     if recipient.top_level & ^other_recipient.top_level then do;
+			/*** Other recipient is part of a list expansion and we aren't: mark it as our duplicate */
+			do idx = 1 to (recipient_idx - 1);
+			     /*** ... change all duplicates of the other recipient to be our duplicates */
+			     if recipients_list.recipients (idx).duplicate_idx = other_recipient_idx then
+				recipients_list.recipients (idx).duplicate_idx = recipient_idx;
+			end;
+			other_recipient.duplicate = "1"b;
+			other_recipient.duplicate_idx = recipient_idx;
+		     end;
+		     else do;
+			/*** Either both recipients are top level, both are expansions, or we are an expansion and
+			     the other is top level:  We are marked as the duplicate */
+			recipient.duplicate = "1"b;
+			recipient.duplicate_idx = other_recipient_idx;
+		     end;
+		end;
+
+		else if (other_recipient.forum_idx ^= 0) & (other_recipient.forum_idx = recipient.forum_idx) then
+		     go to MARK_RECIPIENT_AS_A_DUPLICATE;
+
+		else if ((recipient.mailbox_idx = 0) & (other_recipient.mailbox_idx = 0))
+		     & ((recipient.forum_idx = 0) & (other_recipient.forum_idx = 0)) then
+		     if mlsys_address_mgr_$compare_addresses (other_recipient.address_ptr, recipient.address_ptr, (0))
+			then
+			go to MARK_RECIPIENT_AS_A_DUPLICATE;
+	     end;
+	end;
+
+	return;
+
+     end mark_duplicate_recipients;
+%page;
+/* Prepares a version of the message which is suitable for placement in a mailbox:  This edition always creates a
+   mail_format structure followed immediately by its corresponding mf_extension structure */
+
+prepare_message_for_mailbox:
+     procedure (p_include_bcc_field, p_mailbox_message_ptr, p_mailbox_message_lth, p_code);
+
+dcl  p_include_bcc_field bit (1) aligned parameter;
+dcl  p_mailbox_message_ptr pointer parameter;
+dcl  p_mailbox_message_lth fixed binary (24) parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  (original_mf_ptr, original_mf_extension_ptr, stack_truncation_ptr) pointer;
+dcl  code fixed binary (35);
+dcl  mailbox_message_lth fixed binary (19);
+dcl  (buffer_idx, formatting_mode) fixed binary;
+
+
+	if p_include_bcc_field then			/* insure that the original bcc is in the message ... */
+	     message.bcc = saved_message_data.bcc;
+	else message.bcc = null ();			/* bcc field not required */
+
+	n_message_buffers_used, buffer_idx = n_message_buffers_used + 1;
+	message_buffers (buffer_idx) = null ();
+
+	if message.bcc = saved_message_data.bcc then do;	/* check if we can bypass formatting ... */
+	     call mlsys_mailbox_mgr_$get_message_mf_if_canonical (message_ptr, original_mf_ptr,
+		original_mf_extension_ptr, code);
+	     if code = 0 then			/* ... a canonical in-mailbox message */
+		if added_redistribution then
+		     formatting_mode = REDISTRIBUTION_FORMATTING;
+		else formatting_mode = COPY_FORMATTING;
+	     else formatting_mode = FULL_FORMATTING;	/* ... non-canonical in-mailbox or a new message */
+	end;
+	else formatting_mode = FULL_FORMATTING;
+
+
+/* Try to create the message on the stack first */
+
+	call cu_$grow_stack_frame (STACK_EXTENSION, message_buffers (buffer_idx), (0));
+
+	mail_format_ptr = message_buffers (buffer_idx);
+
+	call format_the_message ((STACK_EXTENSION));
+
+	if code = 0 then do;			/* it fits */
+	     stack_truncation_ptr =
+		addwordno (message_buffers (buffer_idx), (mailbox_message_lth + 16 - mod (mailbox_message_lth, 16)));
+	     call cu_$shrink_stack_frame (stack_truncation_ptr, (0));
+	end;
+
+
+	else if code = error_table_$smallarg then do;
+
+	     call cu_$shrink_stack_frame (message_buffers (buffer_idx), (0));
+
+/* Message won't fit on the stack: try a temporary segment.  Try to use the remainder of any previously obtained temporary
+   segment first */
+
+	     if last_temp_segment_ptr ^= null () then	/* we already have a temporary segment ... */
+		if (last_temp_segment_used + STACK_EXTENSION) < sys_info$max_seg_size then do;
+		     message_buffers (buffer_idx) = addwordno (last_temp_segment_ptr, last_temp_segment_used);
+		     call format_the_message ((sys_info$max_seg_size - last_temp_segment_used));
+		     if code ^= 0 then
+			if code = error_table_$smallarg then
+			     go to USE_VIRGIN_TEMP_SEGMENT;
+			else call abort_prepare_message_for_mailbox (code);
+		end;
+
+		else go to USE_VIRGIN_TEMP_SEGMENT;	/* not enough room in last segment: get another one */
+
+	     else do;				/* first time we had to try a temporary segment */
+USE_VIRGIN_TEMP_SEGMENT:
+		call mlsys_storage_mgr_$get_temp_segment (last_temp_segment_ptr, code);
+		if code ^= 0 then call abort_prepare_message_for_mailbox (code);
+		last_temp_segment_used = 0;		/* ... the temporary segment is emtpy */
+		message_buffers (buffer_idx) = last_temp_segment_ptr;
+		call format_the_message (sys_info$max_seg_size);
+		if code ^= 0 then			/* ... any type of error is fatal here */
+		     if code = error_table_$smallarg then
+			call abort_prepare_message_for_mailbox (mlsys_et_$message_too_large);
+		     else call abort_prepare_message_for_mailbox (code);
+	     end;
+
+	     last_temp_segment_used = last_temp_segment_used + mailbox_message_lth + 16 - mod (mailbox_message_lth, 16);
+	end;
+
+	else call abort_prepare_message_for_mailbox (code);
+
+
+/* Complete construction of the mail_format structure and return it and return it and the mf_extension to the caller */
+
+	mail_format_ptr = message_buffers (buffer_idx);
+	mail_format.version = MAIL_FORMAT_VERSION_4;
+	mail_format.sent_from = "";
+	unspec (mail_format.switches) = "0"b;
+	if deliver_options.delivery_mode ^= ORDINARY_DELIVERY then mail_format.wakeup = "1"b;
+	mail_format.acknowledge = deliver_options.acknowledge;
+	mail_format.canonical = "1"b;
+
+	p_mailbox_message_ptr = message_buffers (buffer_idx);
+	p_mailbox_message_lth = 36 * mailbox_message_lth;
+	p_code = 0;				/* success */
+
+RETURN_FROM_PREPARE_MESSAGE_FOR_MAILBOX:
+	return;
+
+
+
+/* Internal to prepare_message_for_mailbox: aborts after a fatal error */
+
+abort_prepare_message_for_mailbox:
+	procedure (p_return_code);
+
+dcl  p_return_code fixed binary (35) parameter;
+
+	     p_code = p_return_code;
+	     go to RETURN_FROM_PREPARE_MESSAGE_FOR_MAILBOX;
+
+	end abort_prepare_message_for_mailbox;
+
+
+
+/* Internal to prepare_message_for_mailbox: actually formats the message */
+
+format_the_message:
+	procedure (p_buffer_size);
+
+dcl  p_buffer_size fixed binary (19) parameter;
+
+	     if formatting_mode = FULL_FORMATTING then
+		call mlsys_format_$format_message_for_mailbox (message_ptr, message_buffers (buffer_idx),
+		     p_buffer_size, mailbox_message_lth, code);
+
+	     else if formatting_mode = COPY_FORMATTING then do;
+		mailbox_message_lth =
+		     currentsize (original_mf_ptr -> mail_format)
+		     + currentsize (original_mf_extension_ptr -> mf_extension);
+		if mailbox_message_lth <= p_buffer_size then do;
+		     mail_format_ptr = message_buffers (buffer_idx);
+		     mf_extension_ptr = addwordno (mail_format_ptr, currentsize (original_mf_ptr -> mail_format));
+		     mail_format.header = original_mf_ptr -> mail_format.header;
+		     mail_format.text = original_mf_ptr -> mail_format.text;
+		     mf_extension.n_text_fragments = original_mf_extension_ptr -> mf_extension.n_text_fragments;
+		     mf_extension.text_fragments = original_mf_extension_ptr -> mf_extension.text_fragments;
+		     code = 0;
+		end;
+		else code = error_table_$smallarg;
+	     end;
+
+	     else /*** if formatting_mode = REDISTRIBUTION_FORMATTING then */
+		call mlsys_format_$format_canon_redistributed_msg (message_ptr, original_mf_ptr,
+		     original_mf_extension_ptr, message_buffers (buffer_idx), p_buffer_size, mailbox_message_lth,
+		     code);
+
+	     return;
+
+	end format_the_message;
+
+     end prepare_message_for_mailbox;
+%page;
+/* Adds the supplied message to the specified mailbox */
+
+add_message_to_mailbox:
+     procedure (p_mailbox_idx, p_mailbox_message_ptr, p_mailbox_message_lth, p_force_no_acknowledge, p_code);
+
+dcl  p_mailbox_idx fixed binary parameter;
+dcl  p_mailbox_message_ptr pointer parameter;
+dcl  p_mailbox_message_lth fixed binary (24) parameter;
+dcl  p_force_no_acknowledge bit (1) unaligned parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  1 mbx_add_options aligned,			/* control options to mailbox_$wakeup_aim_add_index */
+       2 normal_wakeup bit (1) unaligned,		/* ... ON => send a normal wakeup (needs "w" access) */
+       2 urgent_wakeup bit (1) unaligned,		/* ... ON => send an urgent wakeup (unused) */
+       2 always_add bit (1) unaligned,			/* ... ON => add message even if wakeup not sent */
+       2 never_add bit (1) unaligned,			/* ... ON => never add the message; just send a wakeup */
+       2 mbz bit (32) unaligned;
+
+dcl  code fixed binary (35);
+dcl  retry_count fixed binary;
+dcl  try_to_mail bit (1) aligned;
+
+	string (mbx_add_options) = ""b;
+	if deliver_options.delivery_mode = ORDINARY_DELIVERY then mbx_add_options.always_add = "1"b;
+	else if deliver_options.delivery_mode = INTERACTIVE_DELIVERY then
+	     mbx_add_options.normal_wakeup, mbx_add_options.always_add = "1"b;
+	else /*** if deliver_options.delivery_mode = EXPRESS_DELIVERY then */
+	     mbx_add_options.normal_wakeup = "1"b;
+
+	on condition (record_quota_overflow)
+	     begin;				/* no room in mailbox (sigh) */
+	     code = error_table_$rqover;
+	     go to MAILBOX_ADD_CALL_COMPLETED;
+	end;
+
+	retry_count = 0;
+	try_to_mail = "1"b;
+
+	p_mailbox_message_ptr -> mail_format.acknowledge =
+	     p_mailbox_message_ptr -> mail_format.acknowledge & ^p_force_no_acknowledge;
+
+	do while (try_to_mail);
+	     call mailbox_$wakeup_aim_add_index (p_mailbox_idx, p_mailbox_message_ptr, p_mailbox_message_lth,
+		string (mbx_add_options), message.access_class, ((72)"0"b), code);
+	     if code = error_table_$lock_wait_time_exceeded then do;
+		retry_count = retry_count + 1;
+		try_to_mail = (retry_count < mlsys_data_$max_lock_wait_retries);
+	     end;
+	     else try_to_mail = "0"b;			/* have our result */
+	end;
+
+MAILBOX_ADD_CALL_COMPLETED:
+	revert condition (record_quota_overflow);
+
+	p_mailbox_message_ptr -> mail_format.acknowledge = deliver_options.acknowledge;
+
+	if code = error_table_$no_append then code = mlsys_et_$no_a_permission;
+	if code = error_table_$bigarg then code = mlsys_et_$message_too_large;
+	if code = error_table_$notalloc then code = mlsys_et_$mailbox_full;
+	p_code = code;				/* save the code associated with the actual message */
+
+	if deliver_options.recipient_notification & (deliver_options.delivery_mode = ORDINARY_DELIVERY) & (code = 0)
+	then do;					/* send a notification if the mail was sent OK */
+	     if ^notification_initialized_sw then call initialize_notification ();
+	     on condition (record_quota_overflow) go to IGNORE_NOTIFICATION;
+	     string (mbx_add_options) = ""b;
+	     mbx_add_options.normal_wakeup = "1"b;	/* ... express message */
+	     call mailbox_$wakeup_aim_add_index (p_mailbox_idx, addr (NOTIFICATION_MAIL_FORMAT),
+		(36 * currentsize (NOTIFICATION_MAIL_FORMAT)), string (mbx_add_options), message.access_class,
+		((72)"0"b), (0));
+IGNORE_NOTIFICATION:
+	     revert condition (record_quota_overflow);
+	end;
+
+	return;
+
+     end add_message_to_mailbox;
+
+
+
+/* Sends a test message to the currently open mailbox:  A test message is used to determine whether an interactive can be
+   properly delivered to the given mailbox */
+
+send_test_message:
+     procedure (p_mailbox_idx, p_code);
+
+dcl  p_mailbox_idx fixed binary parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  1 mbx_add_options aligned,			/* control options to mailbox_$wakeup_aim_add_index */
+       2 normal_wakeup bit (1) unaligned,		/* ... ON => send a normal wakeup (needs "w" access) */
+       2 urgent_wakeup bit (1) unaligned,		/* ... ON => send an urgent wakeup (unused) */
+       2 always_add bit (1) unaligned,			/* ... ON => add message even if wakeup not sent */
+       2 never_add bit (1) unaligned,			/* ... ON => never add the message; just send a wakeup */
+       2 mbz bit (32) unaligned;
+
+	if ^notification_initialized_sw then call initialize_notification ();
+
+	string (mbx_add_options) = ""b;
+	mbx_add_options.normal_wakeup = "1"b;
+	mbx_add_options.never_add = "1"b;		/* just see if we can do it */
+
+	if deliver_options.delivery_mode = INTERACTIVE_DELIVERY then mbx_add_options.always_add = "1"b;
+
+	call mailbox_$wakeup_aim_add_index (p_mailbox_idx, addr (NOTIFICATION_MAIL_FORMAT), 0, string (mbx_add_options),
+	     message.access_class, ((72)"0"b), p_code);
+
+	if p_code = error_table_$no_append then p_code = mlsys_et_$no_a_permission;
+
+	return;
+
+     end send_test_message;
+%page;
+/* Prepares a version of the message which is suitable for placement in a forum meeting */
+
+prepare_message_for_forum:
+     procedure (p_include_bcc_field, p_forum_message_ptr, p_forum_message_lth, p_code);
+
+dcl  p_include_bcc_field bit (1) aligned parameter;
+dcl  p_forum_message_ptr pointer parameter;
+dcl  p_forum_message_lth fixed binary (21) parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  (forum_message_ptr, stack_truncation_ptr) pointer;
+dcl  code fixed binary (35);
+dcl  forum_message_lth fixed binary (21);
+dcl  forum_message_n_words fixed binary (18);
+dcl  buffer_idx fixed binary;
+
+
+	if p_include_bcc_field then			/* insure that the original bcc is in the message ... */
+	     message.bcc = saved_message_data.bcc;
+	else message.bcc = null ();			/* bcc field not required */
+
+	n_message_buffers_used, buffer_idx = n_message_buffers_used + 1;
+	message_buffers (buffer_idx) = null ();
+
+
+/* Try to create the message on the stack first */
+
+	call cu_$grow_stack_frame (STACK_EXTENSION, message_buffers (buffer_idx), (0));
+
+	forum_message_ptr = message_buffers (buffer_idx);
+
+	call mlsys_format_$format_message_for_forum (message_ptr, forum_message_ptr, (4 * STACK_EXTENSION),
+	     forum_message_lth, code);
+
+	if code = 0 then do;			/* it fits ... */
+	     forum_message_n_words = divide ((forum_message_lth + 3), 4, 18, 0);
+	     stack_truncation_ptr =
+		addwordno (message_buffers (buffer_idx),
+		(forum_message_n_words + 16 - mod (forum_message_n_words, 16)));
+	     call cu_$shrink_stack_frame (stack_truncation_ptr, (0));
+	end;
+
+
+	else if code = error_table_$smallarg then do;
+
+	     call cu_$shrink_stack_frame (message_buffers (buffer_idx), (0));
+
+/* Message won't fit on the stack: try a temporary segment.  Try to use the remainder of any previously obtained temporary
+   segment first */
+
+	     if last_temp_segment_ptr ^= null () then	/* we already have a temporary segment ... */
+		if (last_temp_segment_used + STACK_EXTENSION) < sys_info$max_seg_size then do;
+		     message_buffers (buffer_idx), forum_message_ptr =
+			addwordno (last_temp_segment_ptr, last_temp_segment_used);
+		     call mlsys_format_$format_message_for_forum (message_ptr, forum_message_ptr,
+			(4 * (sys_info$max_seg_size - last_temp_segment_used)), forum_message_lth, code);
+		     if code ^= 0 then
+			if code = error_table_$smallarg then
+			     go to USE_VIRGIN_TEMP_SEGMENT;
+			else call abort_prepare_message_for_forum (code);
+		end;
+
+		else go to USE_VIRGIN_TEMP_SEGMENT;	/* not enough room in last segment: get another one */
+
+	     else do;				/* first time we had to try a temporary segment */
+USE_VIRGIN_TEMP_SEGMENT:
+		call mlsys_storage_mgr_$get_temp_segment (last_temp_segment_ptr, code);
+		if code ^= 0 then call abort_prepare_message_for_forum (code);
+		last_temp_segment_used = 0;		/* ... the temporary segment is emtpy */
+		message_buffers (buffer_idx), forum_message_ptr = last_temp_segment_ptr;
+		call mlsys_format_$format_message_for_forum (message_ptr, forum_message_ptr,
+		     (4 * sys_info$max_seg_size), forum_message_lth, code);
+		if code ^= 0 then			/* ... any error here is fatal */
+		     if code = error_table_$smallarg then
+			call abort_prepare_message_for_forum (mlsys_et_$message_too_large);
+		     else call abort_prepare_message_for_forum (code);
+	     end;
+
+	     forum_message_n_words = divide ((forum_message_lth + 3), 4, 18, 0);
+	     last_temp_segment_used =
+		last_temp_segment_used + forum_message_n_words + 16 - mod (forum_message_n_words, 16);
+	end;
+
+	else call abort_prepare_message_for_forum (code);
+
+	p_forum_message_ptr = forum_message_ptr;
+	p_forum_message_lth = forum_message_lth;
+	p_code = 0;				/* success */
+
+RETURN_FROM_PREPARE_MESSAGE_FOR_FORUM:
+	return;
+
+
+
+/* Intneral to prepare_message_for_forum: aborts after a fatal error */
+
+abort_prepare_message_for_forum:
+	procedure (p_return_code);
+
+dcl  p_return_code fixed binary (35) parameter;
+
+	     p_code = p_return_code;
+	     go to RETURN_FROM_PREPARE_MESSAGE_FOR_FORUM;
+
+	end abort_prepare_message_for_forum;
+
+     end prepare_message_for_forum;
+%page;
+/* Adds the supplied message to the specified forum meeting */
+
+add_message_to_forum:
+     procedure (p_forum_idx, p_forum_message_ptr, p_forum_message_lth, p_code);
+
+dcl  p_forum_idx fixed binary parameter;
+dcl  p_forum_message_ptr pointer parameter;
+dcl  p_forum_message_lth fixed binary (21) parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  forum_message character (p_forum_message_lth) unaligned based (p_forum_message_ptr);
+dcl  code fixed binary (35);
+
+	on condition (record_quota_overflow)
+	     begin;				/* no room in forum (sigh) */
+	     code = error_table_$rqover;
+	     go to FORUM_ENTER_CALL_COMPLETED;
+	end;
+
+	call forum_$enter_trans (p_forum_idx, forum_message, 0, message_subject, "1"b, (0), code);
+
+FORUM_ENTER_CALL_COMPLETED:
+	if code = forum_error_table_$rqo then code = error_table_$rqover;
+
+	p_code = code;
+
+	return;
+
+     end add_message_to_forum;
+%page;
+/* Prepares a version of the message which is suitable for transmission across a network using DOD-standard RFC822 format:
+   In this release, only networks using this format are supported */
+
+prepare_message_for_network:
+     procedure (p_include_bcc_field, p_network_message_ptr, p_network_message_lth, p_code);
+
+dcl  p_include_bcc_field bit (1) aligned parameter;
+dcl  p_network_message_ptr pointer parameter;
+dcl  p_network_message_lth fixed binary (21) parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  (network_message_ptr, stack_truncation_ptr) pointer;
+dcl  code fixed binary (35);
+dcl  network_message_lth fixed binary (21);
+dcl  network_message_n_words fixed binary (18);
+dcl  buffer_idx fixed binary;
+
+
+	if p_include_bcc_field then			/* insure that the original bcc is in the message ... */
+	     message.bcc = saved_message_data.bcc;
+	else message.bcc = null ();			/* bcc field not required */
+
+	n_message_buffers_used, buffer_idx = n_message_buffers_used + 1;
+	message_buffers (buffer_idx) = null ();
+
+
+/* Try to create the message on the stack first */
+
+	call cu_$grow_stack_frame (STACK_EXTENSION, message_buffers (buffer_idx), (0));
+
+	network_message_ptr = message_buffers (buffer_idx);
+
+	call mlsys_format_$format_message_for_rfc822_network (message_ptr, network_message_ptr, (4 * STACK_EXTENSION),
+	     network_message_lth, code);
+
+	if code = 0 then do;			/* it fits ... */
+	     network_message_n_words = divide ((network_message_lth + 3), 4, 18, 0);
+	     stack_truncation_ptr =
+		addwordno (message_buffers (buffer_idx),
+		(network_message_n_words + 16 - mod (network_message_n_words, 16)));
+	     call cu_$shrink_stack_frame (stack_truncation_ptr, (0));
+	end;
+
+
+	else if code = error_table_$smallarg then do;
+
+	     call cu_$shrink_stack_frame (message_buffers (buffer_idx), (0));
+
+/* Message won't fit on the stack: try a temporary segment.  Try to use the remainder of any previously obtained temporary
+   segment first */
+
+	     if last_temp_segment_ptr ^= null () then	/* we already have a temporary segment ... */
+		if (last_temp_segment_used + STACK_EXTENSION) < sys_info$max_seg_size then do;
+		     message_buffers (buffer_idx), network_message_ptr =
+			addwordno (last_temp_segment_ptr, last_temp_segment_used);
+		     call mlsys_format_$format_message_for_rfc822_network (message_ptr, network_message_ptr,
+			(4 * (sys_info$max_seg_size - last_temp_segment_used)), network_message_lth, code);
+		     if code ^= 0 then
+			if code = error_table_$smallarg then
+			     go to USE_VIRGIN_TEMP_SEGMENT;
+			else call abort_prepare_message_for_network (code);
+		end;
+
+		else go to USE_VIRGIN_TEMP_SEGMENT;	/* not enough room in last segment: get another one */
+
+	     else do;				/* first time we had to try a temporary segment */
+USE_VIRGIN_TEMP_SEGMENT:
+		call mlsys_storage_mgr_$get_temp_segment (last_temp_segment_ptr, code);
+		if code ^= 0 then do;		/* ... can't get a temporary segment, sorry */
+		     p_code = code;
+		     return;
+		end;
+		last_temp_segment_used = 0;		/* ... the temporary segment is emtpy */
+		message_buffers (buffer_idx), network_message_ptr = last_temp_segment_ptr;
+		call mlsys_format_$format_message_for_rfc822_network (message_ptr, network_message_ptr,
+		     (4 * sys_info$max_seg_size), network_message_lth, code);
+		if code ^= 0 then			/* ... any error here is fatal */
+		     if code = error_table_$smallarg then
+			call abort_prepare_message_for_network (mlsys_et_$message_too_large);
+		     else call abort_prepare_message_for_network (code);
+	     end;
+
+	     network_message_n_words = divide ((network_message_lth + 3), 4, 18, 0);
+	     last_temp_segment_used =
+		last_temp_segment_used + network_message_n_words + 16 - mod (network_message_n_words, 16);
+	end;
+
+	else call abort_prepare_message_for_network (code);
+
+	p_network_message_ptr = network_message_ptr;
+	p_network_message_lth = network_message_lth;
+	p_code = 0;				/* success */
+
+RETURN_FROM_PREPARE_MESSAGE_FOR_NETWORK:
+	return;
+
+
+
+/* Intneral to prepare_message_for_network: aborts after a fatal error */
+
+abort_prepare_message_for_network:
+	procedure (p_return_code);
+
+dcl  p_return_code fixed binary (35) parameter;
+
+	     p_code = p_return_code;
+	     go to RETURN_FROM_PREPARE_MESSAGE_FOR_NETWORK;
+
+	end abort_prepare_message_for_network;
+
+     end prepare_message_for_network;
+%page;
+/* Attempts to deliver or queue mail using the interim inter-system mailer (mlsys_mailer_) */
+
+invoke_ism:
+     procedure ();
+
+	return;					/* not an entrypoint */
+
+dcl  p_recipient_type fixed binary parameter;
+dcl  p_use_copy_without_bcc bit (1) unaligned parameter;
+dcl  p_message_ptr pointer parameter;
+dcl  p_message_lth fixed binary (21) parameter;
+
+dcl  1 ism_recipient aligned based (ism_recipient_ptr) like mlsys_mailer_recipient;
+dcl  ism_recipient_ptr pointer;
+
+dcl  queued_only bit (1) aligned;
+dcl  saved_code fixed binary (35);
+dcl  (recipient_type, ism_recipient_idx, recipient_idx) fixed binary;
+
+
+deliver_by_ism:					/* immediate delivery: queue transient errors if requested */
+     entry (p_use_copy_without_bcc, p_message_ptr, p_message_lth);
+
+	recipient_type = NETWORK_RECIPIENT;		/* ... select only those foreign recipients ... */
+	queued_only = "0"b;				/* ... which aren't already marked as to be queued */
+	go to INVOKE_ISM_COMMON;
+
+
+queue_via_ism:					/* queue for later delivery */
+     entry (p_recipient_type, p_use_copy_without_bcc, p_message_ptr, p_message_lth);
+
+	recipient_type = p_recipient_type;		/* ... select only those appropriate recipients ... */
+	queued_only = "1"b;				/* ... which need to be queued */
+
+
+INVOKE_ISM_COMMON:
+	mlsys_mailer_data.version = MLSYS_MAILER_DATA_VERSION_1;
+	mlsys_mailer_data.source = mlsys_data_$user_id;
+	string (mlsys_mailer_data.header.flags) = ""b;
+	mlsys_mailer_data.send = (deliver_options.delivery_mode ^= ORDINARY_DELIVERY);
+	mlsys_mailer_data.mail = (deliver_options.delivery_mode = ORDINARY_DELIVERY);
+	mlsys_mailer_data.dont_queue = ^queued_only;	/* don't queue if trying to mail immediately */
+	mlsys_mailer_data.queue_only = queued_only;
+
+
+/* Build the list of recipients which match the selection criteria */
+
+	mlsys_mailer_data.total_recipients = 0;		/* no one yet */
+
+	do recipient_idx = 1 to n_recipients;
+
+	     recipient_ptr = addr (recipients_list.recipients (recipient_idx));
+
+	     if ^recipient.duplicate & ^recipient.fatal_error then
+		if (recipient.type = recipient_type) & (recipient.use_copy_without_bcc = p_use_copy_without_bcc)
+		     & (recipient.to_queue = queued_only) then do;
+		     mlsys_mailer_data.total_recipients = mlsys_mailer_data.total_recipients + 1;
+		     ism_recipient_idxs (mlsys_mailer_data.total_recipients) = recipient_idx;
+		     ism_recipient_ptr = addr (mlsys_mailer_data.recipients (mlsys_mailer_data.total_recipients));
+		     ism_recipient.user_name = recipient.foreign_address;
+		     ism_recipient.host_name = recipient.foreign_system;
+		     string (ism_recipient.flags) = ""b;/* ... might as well initialize everything */
+		     ism_recipient.code = 0;
+		     ism_recipient.result = "";
+		end;
+	end;
+
+	if mlsys_mailer_data.total_recipients = 0 then	/* nothing of interest for this particular call */
+	     return;
+
+
+/* Invoke mlsys_mailer_ while enforcing the temporary restriction that the acceess class of the mail must be equal to the
+   process authorization */
+
+	if aim_check_$equal (get_authorization_ (), message.access_class) then
+	     call mlsys_mailer_ (mlsys_mailer_data_ptr, p_message_ptr, p_message_lth);
+
+	else do;					/* can't send up, down, or sideways with mlsys_mailer_ */
+	     do ism_recipient_idx = 1 to mlsys_mailer_data.total_recipients;
+		ism_recipient_ptr = addr (mlsys_mailer_data.recipients (ism_recipient_idx));
+		ism_recipient.processed, ism_recipient.fatal_error = "1"b;
+		ism_recipient.code = error_table_$ai_restricted;
+	     end;
+	end;
+
+
+/* Analyze the results:  For immediate delivery, convert transient errors into queueing requests if appropriate */
+
+	do ism_recipient_idx = 1 to mlsys_mailer_data.total_recipients;
+
+	     ism_recipient_ptr = addr (mlsys_mailer_data.recipients (ism_recipient_idx));
+	     recipient_ptr = addr (recipients_list.recipients (ism_recipient_idxs (ism_recipient_idx)));
+
+	     if ism_recipient.delivered then recipient.code = mlsys_et_$message_delivered;
+
+	     else if ism_recipient.queued then recipient.code = mlsys_et_$message_queued;
+
+	     else if ism_recipient.expanded then recipient.code = mlsys_et_$message_queued_and_delivered;
+
+	     else if ism_recipient.fatal_error then do;
+		/*** Unable to deliver/queue the message ... */
+		recipient.fatal_error = "1"b;
+		n_failed_recipients = n_failed_recipients + 1;
+		if ism_recipient.code = error_table_$action_not_performed then
+		     /*** ... mlsys_mailer_ gave no specific reason: check the result text */
+		     if ism_recipient.result = "No known path" then code = mlsys_et_$cant_compute_route;
+		     else if ism_recipient.result = "Unable to deliver mail." then do;
+			recipient.fatal_error = "0"b; /* ... unknown failure: treat as transient */
+			n_failed_recipients = n_failed_recipients - 1;
+			recipient.transient_error = "1"b;
+			recipient.code = mlsys_et_$route_out_of_service;
+		     end;				/* ... as queueing just might work */
+		     else if (ism_recipient.result = "Unable to queue mail.")
+			| (ism_recipient.result = "Queueing message.") then
+			recipient.code = mlsys_et_$unable_to_queue_mail;
+		     else do;			/* ... anything else is from the foreign system */
+			recipient.code = mlsys_et_$rejected_by_foreign_system;
+			recipient.explanation = ism_recipient.result;
+		     end;
+		else /*** if ism_recipient.code ^= error_table_$action_not_performed then */
+		     recipient.code = ism_recipient.code;
+	     end;
+
+	     else do;
+		/*** Non-fatal error detected during immediate delivery */
+		recipient.transient_error = "1"b;	/* ... can only be that the route is temporarily blocked */
+		recipient.code = mlsys_et_$route_out_of_service;
+	     end;
+
+	     if recipient.transient_error then do;
+		/*** Transient error: either make it fatal or try to queue the message as requested by the caller */
+		recipient.transient_error = "0"b;
+		if queued_only then			/* ... but we already tried queueing it */
+		     recipient.fatal_error = "1"b;
+		else /*** if ^queued_only then */
+		     do;
+		     if deliver_options.queueing_mode >= QUEUE_FOREIGN_WHEN_NEEDED then do;
+			recipient.to_queue = "1"b;	/* ... queue it for delivery on the next pass */
+			recipient.code = 0;
+			recipient.explanation = "the route to the foreign system is temporarily out of service";
+		     end;
+		     else recipient.fatal_error = "1"b;
+		end;
+		if recipient.fatal_error then n_failed_recipients = n_failed_recipients + 1;
+	     end;
+
+	     if recipient.fatal_error & (length (recipient.explanation) > 0) then do;
+		/*** A fatal error while queuing after a transient error: make the transient fatal */
+		saved_code = recipient.code;		/* ... will need to know if we change it */
+		if recipient.explanation = "the route to the foreign system is temporarily out of service" then
+		     recipient.code = mlsys_et_$route_out_of_service;
+		else if recipient.explanation = "the mailbox is temporarily locked" then
+		     recipient.code = error_table_$lock_wait_time_exceeded;
+		else if recipient.explanation = "the mailbox is temporarily full" then
+		     recipient.code = mlsys_et_$mailbox_full;
+		else if recipient.explanation = "of record quota overflow" then recipient.code = error_table_$rqover;
+		else if recipient.explanation = "its logical volume is not mounted" then
+		     recipient.code = error_table_$logical_volume_not_defined;
+		else if recipient.explanation = "its logical volume is not attached" then
+		     recipient.code = error_table_$logical_volume_not_connected;
+		else /*** if recipient.explanation = "the meeting is temporarily full" then */
+		     recipient.code = forum_error_table_$meeting_bloat;
+		if recipient.code ^= saved_code then	/* ... we were able to get the old error back */
+		     recipient.explanation = "";
+	     end;
+
+	     if ^recipient.fatal_error & (length (recipient.explanation) = 0) then never_transmitted = "0"b;
+	end;
+
+	return;
+
+     end invoke_ism;
+%page;
+/* Adds the specified suffix to an entryname if possible */
+
+add_suffix:
+     procedure (p_ename, p_suffix, p_new_ename, p_code);
+
+dcl  (p_ename, p_suffix) character (*) parameter;
+dcl  p_new_ename character (32) parameter;
+dcl  p_code fixed binary (35) parameter;
+
+dcl  (trimmed_ename, trimmed_suffix) character (33) varying;
+
+	if length (rtrim (p_ename)) > length (p_new_ename) then do;
+	     p_code = error_table_$entlong;
+	     return;
+	end;
+
+	trimmed_ename = rtrim (p_ename);
+	trimmed_suffix = "." || rtrim (p_suffix);
+
+	if length (trimmed_ename) > length (trimmed_suffix) then
+						/* original name has room for the suffix */
+	     if substr (trimmed_ename, (length (trimmed_ename) - length (trimmed_suffix) + 1)) = trimmed_suffix then
+		;				/* proper suffix is already present */
+	     else trimmed_ename = trimmed_ename || trimmed_suffix;
+	else trimmed_ename = trimmed_ename || trimmed_suffix;
+
+	p_new_ename = trimmed_ename;			/* return it */
+
+	if length (trimmed_ename) <= length (p_new_ename) then
+	     p_code = 0;				/* it fit */
+	else p_code = error_table_$entlong;		/* sorry */
+
+	return;
+
+     end add_suffix;
+
+
+
+/* Returns "1"b if the given address list is empty */
+
+is_empty_list:
+     procedure (p_address_list_ptr) returns (bit (1) aligned);
+
+dcl  p_address_list_ptr pointer parameter;
+
+	if p_address_list_ptr = null () then
+	     return ("1"b);
+
+	else return (p_address_list_ptr -> address_list.n_addresses = 0);
+
+     end is_empty_list;
+%page;
+initialize_notification:
+     procedure ();
+
+	text_length = length (NOTIFICATION_TEXT);
+	allocate NOTIFICATION_MAIL_FORMAT in (based_area) set (NOTIFICATION_MAIL_FORMAT_PTR);
+	unspec (NOTIFICATION_MAIL_FORMAT.header) = "0"b;
+	NOTIFICATION_MAIL_FORMAT.version = MAIL_FORMAT_VERSION_4;
+	NOTIFICATION_MAIL_FORMAT.sent_from = "";
+	NOTIFICATION_MAIL_FORMAT.lines = 1;
+	NOTIFICATION_MAIL_FORMAT.text_len = length (NOTIFICATION_TEXT);
+	NOTIFICATION_MAIL_FORMAT.wakeup = "1"b;
+	NOTIFICATION_MAIL_FORMAT.notify = "1"b;
+	NOTIFICATION_MAIL_FORMAT.text = NOTIFICATION_TEXT;
+
+	notification_initialized_sw = "1"b;
+
+     end initialize_notification;
+%page;
+%include mlsys_copy_ptr;
+%page;
+%include mlsys_data;
+%page;
+%include mlsys_internal_data;
+%page;
+%include mlsys_deliver_info;
+%page;
+%include mlsys_message;
+%page;
+%include mlsys_address_types;
+%page;
+%include mlsys_address_list;
+%page;
+%include mlsys_mailbox_modes;
+%page;
+%include mail_format;
+%page;
+%include mlsys_mf_extension;
+%page;
+%include forum_user_trans;
+%page;
+%include forum_flags;
+%page;
+%include mlsys_mailer_data;
+%page;
+%include aim_template;
+%page;
+%include access_mode_values;
+%page;
+%include terminate_file;
+%page;
+/* Various whitespace constants are placed here as they generate so many blank pages ... */
+
+dcl  WHITESPACE character (5) static options (constant) initial (" 	
+");						/* space, horizontal tab, newline, vertical tab, formfeed */
+
+     end mlsys_transmit_;

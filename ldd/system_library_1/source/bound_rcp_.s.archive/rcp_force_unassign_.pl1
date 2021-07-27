@@ -1,0 +1,250 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+rcp_force_unassign_: procedure;
+
+/*	This program implements the rcp_sys_$unassign_device
+   *	and rcp_sys_$unassign_process entries.
+   *	Created on 12/09/74 by Bill Silver.
+   *      Modified 841009 to interface to rcp_control_ instead of
+   *         rcp_initializer_... -M. M. Pozzo
+   *
+   *	This program contains the following entry points:
+   *	     1.	unassign_device  -	Unassign a device regardless of process.
+   *	     2.	unassign_process -	Unassign all resources assigned to a process.
+*/
+
+/*		ARGUMENT  DATA		*/
+
+	dcl     arg_device_name	 char (*);	/* (I) Device name. */
+	dcl     arg_ecode		 fixed bin (35);	/* (O) error_table_ code. */
+	dcl     arg_process_id	 bit (36) aligned;	/* (I) Process ID. */
+
+
+/*		AUTOMATIC  DATA		*/
+
+	dcl     device_offset	 bit (18) aligned;
+	dcl     lock_flag		 bit (1) aligned;	/* ON => RCS locked. */
+	dcl     process_flag	 bit (1) aligned;	/* ON => using process ID. */
+	dcl     process_id		 bit (36) aligned;	/* Process ID. */
+	dcl     volume_offset	 bit (18) aligned;
+
+	dcl     operation		 bit (36) aligned;	/* Operation being requested of rcp_control_. */
+	dcl     device_name		 char (32);	/* Device name. */
+
+	dcl     caller_level	 fixed bin;	/* Caller's validation level. */
+	dcl     bump_message	 fixed bin (71);	/* Cell for device preempt message */
+	dcl     ecode		 fixed bin (35);	/* error_table_ code. */
+	dcl     error_count		 fixed bin (17);	/* error count for device attachments. */
+	dcl     i			 fixed bin;
+
+
+/*		CONSTANT DATA		*/
+
+	dcl     BUMP_MESSAGE	 char (8) static options (constant) init ("RCP_BUMP");
+
+/*		EXTERNAL ENTRIES CALLED	*/
+
+	dcl     cleanup		 condition;	/* Used to set up cleanup handler. */
+
+	dcl     (addr, rel, unspec)	 builtin;
+
+	dcl     error_table_$invalid_state fixed bin (35) external;
+	dcl     error_table_$force_unassign fixed bin (35) external;
+	dcl     error_table_$resource_unknown fixed bin (35) external;
+
+	dcl     access_operations_$rcp_unassign bit (36) aligned ext static;
+
+	dcl     cu_$level_get	 entry (fixed bin);
+	dcl     cu_$level_set	 entry (fixed bin);
+	dcl     get_ring_		 entry returns (fixed bin);
+	dcl     hcs_$wakeup		 entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+	dcl     rcp_control_	 entry (bit (36) aligned, bit (18) aligned, bit (18) aligned, char (*),
+				 fixed bin (17), bit (36) aligned, fixed bin (35));
+	dcl     rcp_detach_$force_detach entry (ptr);
+	dcl     rcp_lock_$lock	 entry (ptr, fixed bin (35));
+	dcl     rcp_lock_$unlock	 entry (ptr);
+	dcl     rcp_pointers_$com_seg	 entry returns (ptr);
+
+unassign_device: entry (arg_device_name, arg_ecode);
+
+/*	This entry point implements the rcp_sys_$unassign_device entry point.
+   *	We will call rcp_control_ to unassign the specified device.
+   *	If the device is attached we will detach it.  We will free any RCS
+   *	entries used by this device.
+*/
+	call SETUP;				/* Perform initialization. */
+	on cleanup begin;				/* Cleanup if any trouble. */
+		call CLEANUP;			/* Unlock lock and reset validation level. */
+	     end;
+	call cu_$level_set (get_ring_ ());		/* Set validation level to RCP level. */
+
+	device_name = arg_device_name;		/* Copy device name argument. */
+
+	call FREE_ENTRIES;				/* Clean up everything in RCS for device. */
+	if ecode ^= 0
+	then goto DEVICE_RETURN;
+
+	detailed_operation.force = "1"b;
+
+	call rcp_control_ (operation, volume_offset, device_offset,
+	     device_name, error_count, process_id, ecode);
+
+DEVICE_RETURN:
+	call cu_$level_set (caller_level);
+	arg_ecode = ecode;
+	return;
+
+/* 	*/
+unassign_process: entry (arg_process_id, arg_ecode);
+
+/*	This entry point implements the rcp_sys_$unassign_process entry point.
+   *	This entry point will call rcp_initializer_ to unassign everything that
+   *	is assigned to the specified process.  We will detach any attached
+   *	devices and free all RCS entries.
+*/
+	call SETUP;
+	on cleanup begin;
+		call CLEANUP;
+	     end;
+	call cu_$level_set (get_ring_ ());
+
+	process_id = arg_process_id;			/* Copy argument. */
+	process_flag = "1"b;			/* Using process ID not device name. */
+
+	call FREE_ENTRIES;				/* Clean up everything in RCS for process. */
+	if ecode ^= 0
+	then goto PROCESS_RETURN;
+
+	detailed_operation.process = "1"b;
+	call rcp_control_ (operation, volume_offset, device_offset,
+	     device_name, error_count, process_id, ecode);
+PROCESS_RETURN:
+	call cu_$level_set (caller_level);
+	arg_ecode = ecode;
+	return;
+
+/* 	*/
+FREE_ENTRIES: procedure;
+
+/*	This procedure will test all of the RCS entries.  It will
+   *	look for entries that it should make free.
+*/
+
+	lock_flag = "1"b;				/* RCS now locked. */
+	call rcp_lock_$lock (lock_info_ptr, ecode);
+	if ecode ^= 0				/* Any trouble locking RCS? */
+	then return;				/* Yes. */
+
+	do i = 1 to rcs.num_entries;			/* Look at all existing RCS entries. */
+	     rcse_ptr = addr (rcs.entry (i));		/* Get pointer to rcs entry. */
+	     call FREE_ENTRY;			/* See if we should free this entry. */
+	end;
+
+	call rcp_lock_$unlock (lock_info_ptr);
+	lock_flag = "0"b;				/* RCS no longer locked. */
+
+     end FREE_ENTRIES;
+
+/* 	*/
+FREE_ENTRY: procedure;
+
+/*	This procedure is called to see if we should free the specified RCS entry.
+   *	We will not free it if it is already free or if it does not match the
+   *	specified device name or process ID.  If this entry is an attachment entry
+   *	that has actually been attached then we will detach it.
+*/
+	if rcse.free_off ^= "0"b			/* Is entry free? */
+	then return;				/* Yes, nothing to do. */
+
+	if process_flag				/* Are we looking for process IDs? */
+	then if rcse.process_id ^= process_id
+	     then return;				/* Yes, but we didn't find one that matched. */
+	     else ;				/* Yes, and this one matches. */
+	else if rcse.device_name ^= device_name
+	then return;				/* No, device name, but no match. */
+
+	rcse.state = 0;				/* Put the device in an invalid state. */
+	if process_flag then
+	     rcse.ecode = error_table_$invalid_state;	/* Note the invalid state. */
+	else rcse.ecode = error_table_$force_unassign;
+
+	if rcse.kind = 1				/* If attachment we must detach. */
+	then call rcp_detach_$force_detach (rcse_ptr);
+
+/*	We have found an entry that we want to make free.  We cannot just call
+   *	rcp_rcse_$free because we already have RCS locked and because we are
+   *	probably not running in the process that had assigned this entry.
+   *	If we are deleting all entries of a process we will add this entry to
+   *	the free list since we can assume that process' own entry lists are
+   *	gone or are at least no longer valid.  However, if we are just deleting
+   *	an entry for some device it is possible that this entry is still on a
+   *	process list.  Changing the state of the entry is all that we should do.
+*/
+	if process_flag				/* Using a process ID? */
+	then do;					/* Yes, free entry ourselves. */
+		rcse.free_off = rcs.first_free_off;
+		rcse.process_id = "0"b;
+		rcse.state = 0;
+		rcs.first_free_off = rel (rcse_ptr);
+	     end;
+	else do;					/* Send wakeup to cause process attach to fail. */
+		unspec (bump_message) = unspec (BUMP_MESSAGE);
+		call hcs_$wakeup (rcse.process_id, rcse.event_id, bump_message, ecode);
+	     end;
+
+     end FREE_ENTRY;
+
+/* 	*/
+SETUP: procedure;
+
+/*	This procedure is called to set up the data we will need in
+   *	the cleanup handler.
+*/
+
+	device_offset = ""b;
+	process_flag = ""b;
+	process_id = ""b;
+	volume_offset = ""b;
+	device_name = "";
+	operation = access_operations_$rcp_unassign;
+	ops_ptr = addr (addr (operation) -> encoded_access_op.detailed_operation);
+	error_count = 0;
+
+	rcs_ptr = rcp_pointers_$com_seg ();
+	lock_info_ptr = addr (rcs.lock_info);		/* Needed to lock and unlock RCS. */
+	lock_flag = "0"b;				/* Lock not locked yet. */
+
+	call cu_$level_get (caller_level);		/* Get caller's validation level. */
+
+     end SETUP;
+
+CLEANUP: procedure;
+
+/*	This procedure is called from the cleanup handlers.
+   *	We must reset the validation level to the caller's level.
+   *	If we now have RCS locked we must unlock it.
+*/
+	if lock_flag				/* Is RCS locked? */
+	then call rcp_lock_$unlock (lock_info_ptr);
+
+	call cu_$level_set (caller_level);
+
+     end CLEANUP;
+
+%include rcp_com_seg;
+%page;
+%include access_audit_encoded_op;
+%page;
+%include rcp_ops;
+
+     end rcp_force_unassign_;

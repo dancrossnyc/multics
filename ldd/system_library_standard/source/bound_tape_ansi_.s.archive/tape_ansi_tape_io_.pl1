@@ -1,0 +1,967 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-08-18,GWMay), approve(), audit(), install():
+     old history comments:
+     Modified 9/79 by R.J.C. Kissel to handle 6250 bpi tapes
+     Modified 4/82 by J. A. Bush for block sizes > 8192 Bytes
+  2) change(86-08-18,GWMay), approve(86-09-09,MCR7536), audit(86-09-17,Dupuis),
+     install(86-09-24,MR12.0-1162):
+     Changed to look up the wait switch for a given drive using the cseg.vl
+     entry.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style3,ind3,dclind6,idind32 */
+tape_ansi_tape_io_:
+   proc;
+
+%include tape_ansi_cseg;
+
+dcl   (bP, CP)		        ptr,		/* parameters */
+      ccount		        fixed bin,		/* character count argument */
+      code		        fixed bin (35),	/* returned error code */
+      operation		        char (3);		/* order code */
+
+dcl   (
+      error_table_$tape_error,			/* error codes returned */
+      error_table_$nine_mode_parity,
+      error_table_$blank_tape,
+      error_table_$eov_on_write,
+      error_table_$positioned_on_bot,
+      error_table_$eof_record,
+      error_table_$fatal_error,
+      tape_status_$ready_at_bot,			/* error codes referenced */
+      tape_status_$subsystem_ready,
+      tape_status_$device_data_alert,
+      tape_status_$end_of_tape,
+      tape_status_$end_of_file,
+      tape_status_$command_reject,
+      tape_status_$mpc_device_data_alert,
+      tape_status_$blank_tape_on_read,
+      tape_status_$reject_at_bot
+      )			        fixed bin (35) ext;
+
+dcl   (addr, bin, divide, fixed, index, lbound, null, rel)
+			        builtin;
+
+
+dcl   ecode		        fixed bin (35) init (0),
+						/* automatic storage */
+      (synchro, loop_bit, reset_wait) bit (1),		/* internal logic switches */
+      (i, indx, errc)	        fixed bin;		/* temporary storage */
+dcl   drive_number		        fixed bin;		/* Set by setup. */
+
+dcl   (
+      tmodes		        (0:1) fixed bin (2) initial (0, 2),
+						/* internal static variables */
+      oplist		        (17) bit (6) aligned
+			        initial ("47"b3, "46"b3, "54"b3, "45"b3, "44"b3, "00"b3, "40"b3, "70"b3, "72"b3,
+			        "55"b3, "62"b3, "63"b3, "64"b3, "61"b3, "60"b3, "65"b3, "41"b3),
+						/* decimal orders */
+      codechart		        char (52) initial ("bsf bsr ers fsf fsr rqs rss rew run eof pro per sdn")
+      )			        internal static;
+
+dcl   1 internal_codes	        based (addr (oplist)),
+        2 (bsf, bsr, ers, fsf, fsr, rqs, rss, rew, run, eof, pro, per, s200, s556, s800, s1600, s6250)
+			        bit (6) aligned;
+
+dcl   tdcm_$tdcm_iocall	        ext entry (ptr, fixed bin (35)),
+      tdcm_$tdcm_set_signal	        ext entry (ptr, fixed bin (35)),
+      tdcm_$tdcm_reset_signal	        ext entry (ptr, fixed bin (35)),
+      tape_ansi_interpret_status_     ext entry (ptr),
+      ipc_$block		        ext entry (ptr, ptr, fixed bin (35));
+
+attach:
+   entry (CP);					/* attach entry - initializes tseg */
+      cP = CP;					/* copy pointer to cseg */
+      cseg.syncP = addr (tseg.buffer (4));
+      tseg.mode (4) = 2;				/* always 9 mode for synchronous (label) buffer */
+      do i = 1 to 4;				/* set tseg buffer pointers */
+         tseg.bufferptr (i) = fixed (rel (addr (tseg.buffer (i))));
+      end;
+      cseg.wait_switch (*) = "0"b;			/* not waiting for any wakeups */
+      return;
+
+open:
+   entry (CP);					/* open entry - initialize buffer management */
+      cP = CP;
+      free_list = 1;				/* initialize buffer indices */
+      busy_list = 0;
+      chain (1) = 2;				/* initialize free chain */
+      chain (2) = 3;
+      chain (3) = 0;
+      soft_status.nbuf = 0;				/* initialize software status */
+      do i = 1 to 3;				/* initialize IO buffer modes */
+         tseg.mode (i) = tmodes (cseg.mode);
+      end;
+      return;
+
+
+/*  This entry can return one of two codes:                      */
+/*                                                                 */
+/*  1) 0 - normal                                                  */
+/*  2) error_table_$fatal_error - processing cannot continue     */
+/*  Note that EOT on a write synchronize is suppressed.            */
+
+synchronize:
+close:
+   entry (CP, code);				/* synchronize entry - synchronize read/write */
+      call setup;
+      if code ^= 0
+      then return;
+      tseg.sync = 1;
+      if tseg.write_sw ^= 1
+      then
+         do;					/* check for read synchronization */
+	  if busy_list ^= 0
+	  then
+	     do;					/* if any buffers */
+	        tseg.command_count = 1;		/* must backspace one record */
+	        tseg.buffer_count = 0;		/* no buffers involved */
+	        tseg.command_queue (1) = bin (bsr);	/* set backspace record code */
+retry:
+	        call tdcm_$tdcm_iocall (addr (tseg), ecode);
+						/* do backspace */
+	        if ecode ^= 0
+	        then
+		 do;				/* error calling tdcm */
+		    code = error_table_$fatal_error;
+		    return;
+		 end;
+	        if tseg.completion_status ^= 1
+	        then
+		 do;				/* something unusual happened */
+		    if tseg.command_count = 1
+		    then go to retry;		/* previous read erroneous - retry bsr */
+		    hdw_status.bits = tseg.hardware_status || (36)"0"b;
+						/* pad to 72 bits */
+		    call tape_ansi_interpret_status_ (addr (hdw_status));
+						/* see what happened */
+		    if hdw_status.major ^= tape_status_$end_of_file
+		    then
+		       do;			/* error if ^ EOF */
+			code = error_table_$fatal_error;
+						/* set error code */
+			return;			/* exit */
+		       end;
+		 end;
+	        if free_list ^= 0
+	        then chain (busy_list) = free_list;
+	        free_list = busy_list;
+	        busy_list = 0;
+	     end;
+	  return;
+         end;
+
+      if busy_list = 0
+      then return;					/* write case */
+      synchro = "1"b;
+      tseg.command_count, tseg.buffer_count = 0;		/* set tseg */
+      indx = busy_list;
+      errc = 10;
+      loop_bit = "0"b;
+      go to synch_write;				/* join write code at iocall */
+
+
+/*  This entry returns one of two error codes:             */
+/*  1) 0 - normal                                            */
+/*  2) error_table_$fatal_error                              */
+
+get_buffer:
+   entry (CP, bP, code);				/* get_buffer entry - sets pointer to io_buffer */
+      cP = CP;					/* copy pointer */
+      bP = null;					/* null buffer pointer */
+      code = 0;					/* and zero rc */
+findfree:
+      if free_list ^= 0
+      then
+         do;					/* if there is a free bufer hand it to him */
+	  indx = free_list;				/* set index to free buffer */
+	  free_list = chain (indx);			/* and take it off free chain */
+	  chain (indx) = 0;				/* no successor */
+	  bP = addr (tseg.buffer (indx));		/* return address to buffer */
+	  return;
+         end;
+      if busy_list = 0
+      then
+         do;					/* check for all buffers allocated */
+	  code = error_table_$fatal_error;
+	  return;
+         end;
+      call synchronize (cP, code);			/* synchrionize the tape */
+      if code ^= 0
+      then return;					/* give up if error */
+      go to findfree;				/* check for buffer again */
+
+
+/*  This entry returns either 0 or error_table_$fatal_error  */
+
+release_buffer:
+   entry (CP, bP, code);				/* release_buffer entry - returns buffer to free pool */
+      cP = CP;					/* copy pointer */
+      code = 0;
+      do indx = 1 to 3;				/* search for buffer pointer match */
+         if bP = addr (cseg.buffer (indx))
+         then go to gotbuf;				/* look for match */
+      end;
+      code = error_table_$fatal_error;			/* no match found, return error code */
+      return;
+gotbuf:
+      chain (indx) = free_list;			/* put onto beginning of free list chain */
+      free_list = indx;
+      bP = null;					/* null out pointer */
+      return;
+
+
+/*  This entry returns one of five error codes:                         */
+/*  1) 0 - normal                                                       */
+/*  2) error_table_$eof_record  -  read end of file mark                */
+/*  3) error_table_$blank_tape  -  read blank tape, bad volume format   */
+/*  4) error_table_$tape_error - parity-type tape error               */
+/*  5) error_table_$fatal_error - cannot continue processing            */
+/*  Note that with tape_error, ccount and bP are valid		   */
+
+read:
+   entry (CP, bP, ccount, code);			/* returns one block */
+      bP = null;					/* initialize in case of error */
+      ccount = 0;					/* ditto */
+      call setup;					/* initialize */
+      if code ^= 0
+      then return;					/* trouble with rewind wait */
+
+read_ahead:
+      if free_list = 0
+      then
+         do;					/* check for free buffer */
+	  if busy_list ^= 0
+	  then
+	     do;					/* check for busy buffer  */
+	        errc = 25;				/* can't read ahead. initialize error retry count */
+	        tseg.command_count, tseg.buffer_count = 0;/* clear (tdcm will just wait) */
+	        go to await_tape;			/* call tdcm to wait or tape */
+	     end;					/* end of code for locked buffer */
+	  code = error_table_$fatal_error;		/* there are just no buffers left */
+	  return;					/* so return to the buffer hog with an error */
+         end;					/* end of code for no free buffer */
+      indx = free_list;				/* set index into first free buffer */
+      free_list = chain (indx);			/* reset free list start */
+      chain (indx) = 0;
+      if busy_list = 0
+      then busy_list = indx;
+      else chain (busy_list) = indx;
+      tseg.sync = 0;				/* read asynchronously */
+      errc = 25;					/* initialize in case of error */
+
+restart_read:
+      tseg.buffer_offset = indx - 1;			/* set tseg buffer pointer */
+      tseg.buffer_count = 1;				/* one buffer @ a time */
+      tseg.command_count = 0;				/* indicate reading */
+      tseg.write_sw = 0;				/* "" */
+      tseg.buffer_size (indx) = divide (cseg.buf_size, 4, 18, 0);
+
+await_tape:
+      call tdcm_$tdcm_iocall (addr (tseg), ecode);	/* call tdcm to do io */
+      if ecode ^= 0
+      then go to r_fatal;				/* error in call is fatal */
+
+      if tseg.completion_status = 0
+      then go to read_ahead;				/* not complete - read another record while waiting */
+      else bufct (busy_list) = tseg.buffer_size (busy_list);/* complete - set buffer size */
+
+      hdw_status.bits = tseg.hardware_status || (36)"0"b;	/* set hardware_status string */
+
+      if tseg.completion_status = 1
+      then
+         do;					/* read complete and valid */
+	  hdw_status.major = tape_status_$subsystem_ready;/* return minimal status information */
+	  hdw_status.no_minor = 0;			/* to avoid expense of interpretation call */
+return_data:
+	  bP = addr (cseg.buffer (busy_list));		/* return buffer pointer */
+	  ccount = bufct (busy_list) * 4;		/* and buffer count */
+	  busy_list = chain (busy_list);		/* unbusy buffer */
+	  return;
+         end;
+
+      call tape_ansi_interpret_status_ (addr (hdw_status)); /* ERROR or EVENT - see what happened */
+
+      if hdw_status.major = tape_status_$end_of_file
+      then
+         do;					/* EOF ? */
+	  code = error_table_$eof_record;
+	  go to r_exit;
+         end;
+
+      i = chain (busy_list);				/* error - free the last busied buffer */
+      if i ^= 0
+      then
+         do;
+	  chain (busy_list) = 0;
+	  chain (i) = free_list;
+	  free_list = i;
+         end;
+      indx = busy_list;
+
+      if hdw_status.minor (1) = tape_status_$blank_tape_on_read
+      then
+         do;					/* give up */
+	  code = error_table_$blank_tape;
+	  go to r_exit;
+         end;
+
+      if hdw_status.major = tape_status_$device_data_alert
+      then go to check_retry;				/* may be recoverable */
+      if hdw_status.major = tape_status_$mpc_device_data_alert
+      then
+         do;					/* ditto */
+check_retry:
+	  if errc = 0
+	  then
+	     do;					/* retries exhausted? */
+	        if bufct (busy_list) = 0
+	        then go to r_fatal;			/* no data at all - not a parity-type error */
+	        code = error_table_$tape_error;		/* data returned, albeit erroneously */
+	        go to return_data;
+	     end;
+	  else
+	     do;					/* retries not exhausted */
+	        errc = errc - 1;			/* decrement retry count */
+	        tseg.command_queue (1) = bin (bsr);	/* set backspace record order code */
+	        tseg.command_count = 1;		/* one order code to execute */
+	        tseg.buffer_count = 0;		/* no buffers to read */
+	        tseg.sync = 1;			/* retries are synchronous */
+	        call tdcm_$tdcm_iocall (addr (tseg), ecode);
+						/* call tdcm to backspace tape */
+	        if ecode ^= 0
+	        then go to bsr_error;
+	        if tseg.completion_status ^= 1
+	        then
+		 do;
+bsr_error:
+		    code = error_table_$fatal_error;
+		    go to r_exit;
+		 end;
+	        go to restart_read;			/* restart the read operation */
+	     end;
+         end;
+
+r_fatal:
+      code = error_table_$fatal_error;
+
+r_exit:
+      if chain (busy_list) = 0
+      then i = busy_list;				/* free the last busied buffer */
+      else i = chain (busy_list);
+      chain (i) = free_list;
+      free_list = busy_list;
+      busy_list = 0;
+      return;
+
+
+/*  This entry can return one of five error codes:                    */
+/*  1) 0 - normal                                                     */
+/*  2) error_table_$eof_record - read end of file mark                */
+/*  3) error_table_$blank_tape - read blank tape, bad vol format     */
+/*  4) error_table_$tape_error - unrecoverable tape error             */
+/*  5) error_table_$fatal_error - cannot continue processing          */
+
+sync_read:
+   entry (CP, ccount, code);				/* entry to read 1 block using syncP buffer */
+      ccount = 0;					/* initialize in case of error */
+      call setup;					/* initialize */
+      if code ^= 0
+      then return;					/* trouble with rewind */
+      call synchronize (cP, code);			/* synchronize IO */
+      if code ^= 0
+      then return;
+      tseg.write_sw = 0;				/* set write off, we're reading */
+      i = 1;					/* one order code for recovery */
+      errc = 25;					/* set read retry count */
+      go to sync_com;				/* join common erb code */
+
+
+/*  This entry can return one of four error codes:                    */
+/*  1) 0 - normal                                                     */
+/*  2) error_table_$eov_on_write - EOT detected                       */
+/*  3) error_table_$tape_error  -  unrecoverable tape error           */
+/*  4) error_table_$fatal_error - cannot continue processing          */
+
+sync_write:
+   entry (CP, ccount, code);				/* entry to write a block using syncP buffer */
+      call setup;					/* initialize */
+      if code ^= 0
+      then return;					/* trouble with rewind */
+      call synchronize (cP, code);			/* synchronize IO */
+      if code ^= 0
+      then return;
+      tseg.write_sw = 1;				/* set tseg write switch */
+      i = 2;					/* 2 order codes for recovery */
+      errc = 10;					/* set write retry count */
+      tseg.command_queue (2) = bin (ers);		/* set bin (ers) code */
+
+
+sync_com:
+      tseg.sync = 1;				/* synchronous operation */
+      tseg.command_queue (1) = bin (bsr);		/* set backspace record recovery op */
+      tseg.buffer_offset = 3;				/* buffer 4 is the recovery buffer */
+
+sync_restart:
+      if i = 2
+      then tseg.buffer_size (4) = ccount / 4;		/* set count for write */
+      else tseg.buffer_size (4) = divide (cseg.buf_size, 4, 18, 0);
+						/* read: try to get maximum */
+      tseg.command_count = 0;				/* we are reading or writing */
+      tseg.buffer_count = 1;				/* .... */
+      call tdcm_$tdcm_iocall (addr (tseg), ecode);	/* do io */
+
+      if ecode ^= 0
+      then
+         do;					/* error from tdcm */
+sync_fatal:
+	  code = error_table_$fatal_error;		/* set return code */
+	  return;					/* exit */
+         end;
+
+      hdw_status.bits = tseg.hardware_status || (36)"0"b;	/* get and pad hardware status */
+      call tape_ansi_interpret_status_ (addr (hdw_status)); /* interpret it */
+
+      if tseg.completion_status ^= 1
+      then
+         do;					/* something untoward happened */
+	  if hdw_status.major = tape_status_$end_of_file
+	  then
+	     do;					/* EOF detected */
+	        if i = 1
+	        then
+		 do;				/* on a read */
+		    code = error_table_$eof_record;	/* set return code */
+		    go to sync_return;
+		 end;
+	        else go to sync_error;		/* just shouldn't happen when writing */
+	     end;
+
+	  if hdw_status.major = tape_status_$subsystem_ready
+	  then
+	     do;					/* but no major status */
+	        code = error_table_$nine_mode_parity;	/* must be invalid 9 mode data */
+	        hdw_status.major = code;
+	        hdw_status.no_minor = 0;
+	        return;
+	     end;
+
+	  if hdw_status.no_minor = 1
+	  then
+	     do;					/* simple cases */
+	        if hdw_status.minor (1) = tape_status_$end_of_tape
+	        then
+		 do;				/* EOT detected */
+		    if i = 1
+		    then go to sync_error;		/* shouldn't happen on read */
+		    code = error_table_$eov_on_write;
+		    return;
+		 end;
+	        if hdw_status.minor (1) = tape_status_$blank_tape_on_read
+	        then
+		 do;				/* trouble */
+		    if i = 2
+		    then go to sync_error;		/* shouldn't happen on write */
+		    code = error_table_$blank_tape;
+		    return;
+		 end;
+	     end;
+
+	  if hdw_status.major = tape_status_$device_data_alert
+	  then go to sync_repos;			/* reposition */
+	  if hdw_status.major = tape_status_$mpc_device_data_alert
+	  then
+	     do;					/* reposition */
+sync_repos:
+	        tseg.command_count = i;		/* set count */
+	        tseg.buffer_count = 0;		/* and clear buffer count */
+	        errc = errc - 1;			/* decrement retry count */
+	        call tdcm_$tdcm_iocall (addr (tseg), ecode);
+						/* have tdcm reposition */
+	        if ecode ^= 0
+	        then go to sync_fatal;		/* call to tdcm failed */
+	        if tseg.completion_status = 2
+	        then
+		 do;				/* io failed */
+		    hdw_status.bits = tseg.hardware_status || (36)"0"b;
+						/* trouble - get status */
+		    call tape_ansi_interpret_status_ (addr (hdw_status));
+						/* interpret it */
+		    if hdw_status.no_minor = 1
+		    then
+		       do;			/* simple case ? */
+			if hdw_status.minor (1) = tape_status_$end_of_tape
+			then go to sync_test;	/* EOT ok */
+		       end;
+		    go to sync_error;		/* give up */
+		 end;
+sync_test:
+	        if errc >= 0
+	        then go to sync_restart;		/* retry if count not exhausted */
+	     end;					/* end of recovery loop */
+
+sync_error:
+	  code = error_table_$tape_error;		/* indicate trouble with tape */
+	  return;					/* exit */
+         end;
+
+sync_return:
+      if i = 1
+      then ccount = 4 * tseg.buffer_size (4);		/* return count if read */
+      return;					/* and return to caller */
+
+
+/*  This entry returns one of four error codes:                    */
+/*  1) 0 - normal                                                  */
+/*  2) error_table_$eov_on_write - EOT detected                    */
+/*  3) error_table_$tape_error - unrecoverable tape error          */
+/*  4) error_table_$fatal_error - cannot continue processing       */
+
+write:
+   entry (CP, bP, ccount, code);			/* write entry - stacks one write */
+      call setup;					/* initizlize */
+      if code ^= 0
+      then return;					/* trouble with rewind */
+      synchro = "0"b;				/* set flag - this is not a synchronize operation */
+      do indx = 1 to 3;				/* find buffer index */
+         if bP = addr (cseg.buffer (indx))
+         then go to gotbuf1;
+      end;
+      go to w_fatal;				/* invalid buffer */
+
+gotbuf1:
+      bufct (indx) = ccount / 4;			/* set count */
+      if busy_list = 0
+      then busy_list = indx;
+      else chain (busy_list) = indx;
+      chain (indx) = 0;
+      tseg.buffer_size (indx) = bufct (indx);		/* set tseg buffer size */
+
+rstrtw:
+      if ^synchro
+      then tseg.sync = 0;				/* write asynchronously if ^synchronize call */
+      loop_bit = "0"b;				/* restart (or start) afresh */
+      errc = 10;					/* initialize in case of error */
+
+rtryw:
+      tseg.write_sw = 1;
+      tseg.buffer_offset = indx - 1;			/* set tseg buffer index */
+      tseg.buffer_count = 1;				/* one buffer to deal with */
+      tseg.command_count = 0;				/* no order codes */
+
+synch_write:
+      call tdcm_$tdcm_iocall (addr (tseg), ecode);	/* call tseg to write buffer */
+
+      if ecode ^= 0
+      then
+         do;					/* call to tdcm failed */
+w_fatal:
+	  code = error_table_$fatal_error;		/* set error code */
+	  return;					/* give up */
+         end;
+
+      if tseg.completion_status = 1
+      then
+         do;					/* check for write completed */
+	  indx = chain (busy_list);
+	  chain (busy_list) = free_list;
+	  free_list = busy_list;
+	  busy_list = indx;
+         end;
+
+      else if tseg.completion_status = 0
+      then ;					/* operation not complete */
+
+      else
+         do;					/* error or event occurred */
+	  hdw_status.bits = tseg.hardware_status || (36)"0"b;
+						/* get hardware status and pad */
+	  call tape_ansi_interpret_status_ (addr (hdw_status));
+						/* interpret it */
+	  if hdw_status.no_minor = 1
+	  then
+	     do;					/* simple case? */
+	        if hdw_status.minor (1) = tape_status_$end_of_tape
+	        then
+		 do;				/* report it */
+		    code = error_table_$eov_on_write;	/* set error code */
+		    indx = chain (busy_list);		/* buffer _w_a_s written: get next in queue */
+		    chain (busy_list) = free_list;	/* fill the queue slot */
+		    free_list = busy_list;		/* the buffer written is now free */
+		    busy_list = indx;		/* buffer pulled from queue is now busy */
+		    if busy_list = 0
+		    then go to synch_check;		/* queue was empty - exit */
+		    tseg.sync = 1;			/* do this buffer synchronously */
+		    go to synch_write;		/* write it */
+		 end;
+	     end;
+
+	  if hdw_status.major = tape_status_$subsystem_ready
+	  then
+	     do;					/* but no major status */
+	        code = error_table_$nine_mode_parity;	/* must be invalid 9 mode data */
+	        hdw_status.major = code;
+	        hdw_status.no_minor = 0;
+	        go to w_error1;
+	     end;
+
+	  if hdw_status.major = tape_status_$device_data_alert
+	  then go to reposit;			/* reposition */
+	  if hdw_status.major = tape_status_$mpc_device_data_alert
+	  then
+	     do;					/* reposition */
+reposit:
+	        tseg.sync = 1;			/* retries synchronous */
+	        loop_bit = "1"b;			/* indicate retrying */
+	        errc = errc - 1;			/* decrement error retry count */
+	        tseg.command_queue (1) = bin (bsr);	/* set backspace code */
+	        tseg.command_queue (2) = bin (ers);	/* and erase code */
+	        tseg.command_count = 2;		/* 2 commands to execute */
+	        indx = busy_list;			/* retry first write */
+	        tseg.buffer_count = 0;		/* reset buffer count */
+	        call tdcm_$tdcm_iocall (addr (tseg), ecode);
+						/* call tdcm to backspace and erase */
+	        if ecode ^= 0
+	        then go to w_fatal;			/* tdcm call failed - give up */
+	        if tseg.completion_status = 2
+	        then
+		 do;				/* error occurred */
+		    hdw_status.bits = tseg.hardware_status || (36)"0"b;
+						/* trouble - get status */
+		    call tape_ansi_interpret_status_ (addr (hdw_status));
+						/* interpret it */
+		    if hdw_status.no_minor = 1
+		    then
+		       do;			/* simple case? */
+			if hdw_status.minor (1) = tape_status_$end_of_tape
+			then go to w_test;		/* EOT is reasonable */
+		       end;
+		    go to w_error;			/* anything else is error */
+		 end;
+w_test:
+	        if errc >= 0
+	        then go to rtryw;			/* retry write if error count not exhausted */
+	     end;
+
+w_error:
+	  code = error_table_$tape_error;
+w_error1:
+	  indx = busy_list;				/* report _a_l_l queued buffers */
+
+w_report:
+	  soft_status.nbuf = 0;			/* set suspended count */
+	  do while (indx ^= 0);			/* set up suspended buffer list */
+	     soft_status.nbuf = soft_status.nbuf + 1;
+	     soft_status.bufP (nbuf) = addr (tseg.buffer (indx));
+	     soft_status.count (nbuf) = bufct (indx) * 4; /* set buffer count */
+	     indx = chain (indx);			/* and go to next buffer */
+	  end;					/* end of code for setting up list of suspended buffers */
+	  busy_list = 0;
+	  go to synch_check;			/* return to caller */
+         end;
+
+      if loop_bit
+      then if busy_list ^= 0
+	 then
+	    do;					/* see if more buffers (first in error) */
+	       indx = busy_list;			/* index to suspended buffer */
+	       go to rstrtw;			/* restart write */
+	    end;					/* end of buffer error loop code */
+
+synch_check:
+      if ^synchro
+      then bP = null;				/* write entry: null buffer pointer */
+      else
+         do;					/* synchronize/close entry */
+	  if code = error_table_$eov_on_write
+	  then code = 0;				/* ignore EOT */
+	  else if code = error_table_$tape_error
+	  then code = error_table_$fatal_error;		/* treat as fatal */
+         end;
+      return;					/* return to caller */
+
+
+/*  The following codes may be returned:                             */
+/*  1) 0 - all orders             			         */
+/*  2) error_table_$fatal_error - all orders                         */
+/*  3) error_table_$positioned_on_bot - bsf, bsr                     */
+/*  4) error_table_$eov_on_write - ers, eof                          */
+/*  5) error_table_$eof_record - fsr, bsr                            */
+/*  6) error_table_$tape_error - all orders                          */
+
+order:
+   entry (CP, operation, ccount, code);			/* order entry - performs synchronous order calls */
+      call setup;					/* initialize */
+      if code ^= 0
+      then return;					/* trouble with rewind */
+
+      call synchronize (cP, code);			/* synchronize */
+      if code ^= 0
+      then return;					/* trouble with synch */
+      errc = 10;					/* set error retry count */
+      tseg.sync = 1;				/* synchronous for order codes */
+      tseg.buffer_count = 0;				/* indicate order code to tdcm */
+
+      i = index (codechart, operation);			/* pick up index for order code */
+      if i = 0
+      then
+         do;					/* illegal operation */
+	  code = error_table_$fatal_error;
+	  return;
+         end;
+      else if i = 49
+      then i = 13 + ccount;				/* set density index */
+      else i = i / 4 + 1;
+
+      if i = 8
+      then
+         do;					/* rewind */
+	  call tdcm_$tdcm_set_signal (addr (tseg), code); /* set signal */
+	  if code ^= 0
+	  then go to er_fatal;			/* troubles */
+	  cseg.wait_switch (drive_number) = "1"b;	/* set switch for rewind wait */
+         end;
+
+rtryo:
+      tseg.command_queue (1) = bin (oplist (i));		/* set operation code */
+      tseg.command_count = 1;				/* only one order code */
+      reset_wait = "0"b;				/* tdcm signal not to be reset */
+
+      call tdcm_$tdcm_iocall (addr (tseg), code);		/* have tdcm do my thing */
+      if code ^= 0
+      then
+         do;					/* did tdcm call fail? */
+er_fatal:
+	  reset_wait = "1"b;			/* reset tdcm signal if set */
+	  code = error_table_$fatal_error;		/* tdcm failure is fatal */
+	  go to wait_test;				/* check tdcm signal */
+         end;
+
+      hdw_status.bits = tseg.hardware_status || (36)"0"b;	/* pad hardware status to 72 bits */
+      call tape_ansi_interpret_status_ (addr (hdw_status)); /* generate error code structure from hdw status */
+
+      if i = 6
+      then return;					/* request status - exit because any result is ok */
+      if i = 7
+      then return;					/* reset status - ditto */
+
+      if tseg.completion_status = 1
+      then
+         do;					/* implies Subsystem Ready major status */
+	  if i = 4
+	  then go to er_notry;			/* forward file didn't get EOF: error */
+	  if i < 3
+	  then
+	     do;					/* bsf, bsr - are they at BOT? */
+	        if check (tape_status_$ready_at_bot)
+	        then
+		 do;				/* minor status shows tape at BOT */
+		    code = error_table_$positioned_on_bot;
+						/* not an error */
+		    return;
+		 end;
+	        else
+		 do;				/* not at BOT */
+		    if i = 1
+		    then code = error_table_$fatal_error;
+						/* bad if bsf */
+		    return;
+		 end;
+	     end;
+	  go to wait_test;				/* ok: check tdcm signal */
+         end;
+
+      if hdw_status.major = tape_status_$end_of_file
+      then
+         do;					/* End of File major status */
+	  go to eof (i);				/* perform appropriate action */
+eof (1):
+eof (4):
+	  return;					/* bsf/fsf - normal */
+eof (2):
+eof (5):
+	  code = error_table_$eof_record;		/* bsr/fsr - an event, not an error */
+	  return;					/* exit */
+eof (3):
+eof (10):						/* ers/eof - error, no retry */
+eof (8):
+eof (9):
+eof (11):
+	  go to er_notry;				/* rew/run/sdn - error, give up */
+         end;
+
+      if hdw_status.major = tape_status_$device_data_alert
+      then
+         do;					/* Device Data Alert major status */
+	  if hdw_status.no_minor = 1
+	  then
+	     do;					/* simple case ? */
+	        if hdw_status.minor (1) = tape_status_$end_of_tape
+	        then
+		 do;				/* EOT? */
+		    code = error_table_$eov_on_write;
+		    return;
+		 end;
+	     end;
+	  if i = 3
+	  then
+	     do;					/* multiple errors - erase case */
+	        tseg.command_queue (2) = bin (fsr);	/* recovery will forward space after backspace */
+	        go to er_retry;			/* retry with positioning */
+	     end;
+	  if i = 10
+	  then
+	     do;					/* write eof case */
+	        tseg.command_queue (2) = bin (ers);	/* set recovery code to erase bad tape mark */
+	        go to er_retry;			/* retry with positioning */
+	     end;
+	  go to er_notry;				/* give up */
+         end;
+
+      if hdw_status.major = tape_status_$mpc_device_data_alert
+      then
+         do;					/* MPC Device Data Alert major status */
+	  if i = 10
+	  then
+	     do;					/* write eof case */
+	        tseg.command_queue (2) = bin (ers);	/* erase the bad tape mark */
+	        go to er_retry;			/* retry it */
+	     end;
+	  go to er_notry;				/* give up on any other order */
+         end;
+
+      if hdw_status.major = tape_status_$command_reject
+      then
+         do;					/* Command Reject major status */
+	  if i < 3
+	  then
+	     do;					/* bsf or bsr cases */
+	        if check (tape_status_$reject_at_bot)
+	        then
+		 do;				/* was tape at BOT? */
+		    code = error_table_$positioned_on_bot;
+						/* set return code */
+		    return;			/* exit */
+		 end;
+	     end;					/* other bsf/bsr cases fall through */
+         end;					/* other orders fall through */
+
+
+/* Device Busy major status */
+/* MPC Device Attention major status */
+/* MPC Command Reject major status */
+/* Device Attention major status */
+
+er_notry:
+      reset_wait = "1"b;				/* reset tdcm signal if set */
+      code = error_table_$tape_error;
+
+wait_test:
+      if cseg.wait_switch (drive_number)
+      then if reset_wait
+	 then
+	    do;					/* rewind at bot or error */
+	       call tdcm_$tdcm_reset_signal (addr (tseg), 0);
+	       cseg.wait_switch (drive_number) = "0"b;
+	    end;
+      return;					/* return to caller */
+
+er_retry:
+      if errc > 0
+      then
+         do;					/* has retry count been exhausted? */
+	  tseg.command_queue (1) = bin (bsr);		/* set tdcm to backspace 1 record */
+	  tseg.command_count = 2;			/* error code has set tseg.command_queue (2) */
+	  call tdcm_$tdcm_iocall (addr (tseg), code);	/* do io */
+	  if code ^= 0
+	  then go to er_fatal;			/* tdcm failed - give up */
+	  if tseg.completion_status = 1
+	  then go to rtryo;				/* io was uneventful - retry order */
+	  hdw_status.bits = tseg.hardware_status || (36)"0"b;
+						/* trouble - get status */
+	  call tape_ansi_interpret_status_ (addr (hdw_status));
+						/* interpret it */
+	  if hdw_status.major = tape_status_$end_of_file
+	  then go to rtryo;				/* well, EOF is reasonable */
+	  if hdw_status.no_minor = 1
+	  then
+	     do;					/* simple case? */
+	        if hdw_status.minor (1) = tape_status_$end_of_tape
+	        then go to rtryo;			/* so is EOT */
+	     end;
+         end;
+      go to er_notry;				/* exhausted or non-reasonable */
+
+setup:
+   proc;						/* internal proc for call initialization */
+
+dcl   1 wait_list,					/* parameter lists for block */
+        2 n		        fixed bin,
+        2 chn		        fixed bin (71);
+
+dcl   1 message,
+        2 channel		        fixed bin (71),
+        2 mess		        fixed bin (71),
+        2 sender		        bit (36),
+        2 origin,
+	3 dev_sig		        bit (18) unal,
+	3 ring		        bit (18) unal,
+        2 channel_index	        fixed bin;
+
+
+      cP = CP;					/* copy pointer */
+      code = 0;					/* zero out rc */
+
+      do drive_number = lbound(cseg.vl, 1) to cseg.vcN
+         while (cseg.vl(drive_number).tape_drive ^= tseg.drive_name);
+         end;
+
+      if drive_number > cseg.vcN then do;
+         code = error_table_$fatal_error;
+         return;
+         end;
+
+      if cseg.wait_switch (drive_number)
+      then
+         do;					/* see if tape rewinding */
+	  cseg.wait_switch (drive_number) = "0"b;	/* clear switch */
+wait:
+	  wait_list.n = 1;				/* initialize arg for block */
+	  wait_list.chn = tseg.ev_chan;
+	  call ipc_$block (addr (wait_list), addr (message), code);
+						/* go blocked waiting for tape rewind */
+	  if code ^= 0
+	  then code = error_table_$fatal_error;
+	  call tdcm_$tdcm_reset_signal (addr (tseg), 0);	/* reset */
+         end;					/* end of code for rewind wait */
+      return;					/* return to main line */
+   end;						/* end of procedure setup */
+
+check:
+   procedure (min_code) returns (bit (1));		/* internal proc for status checking */
+
+dcl   min_code		        fixed bin (35),	/* minor status code to be checked */
+      ix			        fixed bin;		/* index into minor status code array */
+
+      do ix = 1 to hdw_status.no_minor;			/* check each element */
+         if min_code = hdw_status.minor (ix)
+         then return ("1"b);				/* got it */
+      end;
+      return ("0"b);				/* not there */
+
+   end check;
+
+   end tape_ansi_tape_io_;

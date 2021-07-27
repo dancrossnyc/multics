@@ -1,0 +1,614 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+
+/*  DESCRIPTION:
+    This is the inner-ring portion of fast locking. It is called when the
+    ruthlessly efficient user-ring routine code can not handle the
+    request in its entirety. This means the following:
+
+    1. The process could not lock the fast lock, and it is not locked
+       to this process.
+
+    2. The process has just unlocked the lock, but the notify switch
+       was set after the unlock (it is reset now).
+
+    The following entries are provided:
+
+      lock_fast
+
+      notify_unlock
+
+    Note that efficiency is not of particular import here.
+*/
+/* HISTORY:
+Written by J. Bongiovanni 06/15/82.
+Modified:
+83-04-24 by BIM: race when lock was unlocked just after failing
+      stac in TRY_TO_LOCK corrected.
+83-05-05 by BIM: logged all mylocks and timeouts.
+10/11/84 by Stanford S. Cox:  MAIN: Chg all int procs to have prefix var names
+      and use ER, chg to use dm_system_data_$lock_ips_mask.  MWB: Added
+      lock_list_meters_ptr to lm_fast_lock_list_ call.  NOTIFY: Same as MWB.
+      ER: Added for common return.  ELR: Renamed from LOG_ERROR.
+12/11/84 by Stanford S. Cox:  notify_unlock: Add version check of fast_lock_data
+      and lock_list_meters.
+02/15/85 by Stanford S. Cox:  RETURN: Added for guaranteed eligibility.
+03/01/85 by Lindsey L. Spratt:  Added SEND_WAKEUP internal proc to handle
+            calling hcs_$wakeup correctly.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+05/16/85 by S. Cox: NOTIFY: Chg to meter thread_outs instead of thread_ins.
+*/
+
+/* format: style3 */
+lm_fast_lock_$lock_fast:
+     proc (p_fast_lock_ptr, p_timeout, p_code);		/*  Parameter  */
+
+dcl	p_fast_lock_ptr	ptr;			/* Points to fast lock */
+dcl	p_timeout		fixed bin (71);		/* Wait increment in microseconds */
+dcl	p_code		fixed bin (35);		/* Status code */
+
+/*  Automatic  */
+
+dcl	code		fixed bin (35);
+dcl	done_try_loop	bit (1) aligned;
+dcl	owner_processid	bit (36) aligned;
+dcl	timeout_time	fixed bin (71);		/* Absolute timeout time */
+
+/*  Static  */
+
+dcl	fast_lock_channel_id
+			fixed bin (71) int static init (0);
+dcl	first_time	bit (1) aligned int static init ("1"b);
+dcl	ips_mask		bit (36) aligned int static init (""b);
+dcl	my_processid	bit (36) aligned int static init (""b);
+dcl	1 wait_list	aligned int static,
+	  2 nchan		fixed bin init (1),
+	  2 pad		fixed bin init (0),
+	  2 channel_id	(1) fixed bin (71) init (0);
+
+dcl	(
+	INVALID_RESET	fixed bin init (1),
+	VALID_LOCK	fixed bin init (0),
+	IPS_NAMES		(3) char (32) init ("alrm", "quit", "cput"),
+	MAX_WAIT_TIME	fixed bin (71) init (30000000),
+	ME		char (13) init ("lm_fast_lock_"),
+	MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+			fixed bin init (10),
+	YES		bit (1) aligned init ("1"b),
+	NO		bit (1) aligned init ("0"b),
+	ITT_OVERFLOW_WAIT_TIME
+			fixed bin (71) init (10000000 /* 10 seconds */),
+	RELATIVE_SECONDS	bit (2) init ("11"b)
+	)		internal static options (constant);
+
+/*  External  */
+
+dcl	dm_system_data_$lock_ips_mask
+			bit (36) aligned external;
+dcl	lm_data_$fast_lock_data_ptr
+			ptr external;
+dcl	lm_data_$lock_list_meters_ptr
+			ptr external;
+dcl	dm_error_$fast_lock_invalid_lock
+			fixed bin (35) external static;
+dcl	dm_error_$fast_lock_invalid_reset
+			fixed bin (35) external static;
+dcl	dm_error_$fast_lock_mylock
+			fixed bin (35) external static;
+dcl	dm_error_$fast_lock_no_free
+			fixed bin (35) external static;
+dcl	dm_error_$fast_lock_not_cleared
+			fixed bin (35) external;
+dcl	dm_error_$fast_lock_timeout
+			fixed bin (35) external static;
+dcl	(
+	error_table_$unimplemented_version,
+	error_table_$itt_overflow,
+	error_table_$process_unknown
+	)		fixed bin (35) ext static;
+
+/*  Entry  */
+
+dcl	cu_$caller_ptr	entry returns (pointer);
+dcl	dm_hcs_$guaranteed_eligibility_off
+			entry ();
+dcl	dm_hcs_$guaranteed_eligibility_on
+			entry ();
+dcl	dm_misc_util_$log	entry options (variable);
+dcl	create_ips_mask_	entry (ptr, fixed bin, bit (36) aligned);
+dcl	find_pathname_	entry (ptr, ptr, fixed bin (35));
+dcl	get_process_id_	entry () returns (bit (36));
+dcl	hcs_$get_alarm_timer
+			entry (fixed bin (71), fixed bin (71));
+dcl	hcs_$get_uid_seg	entry (ptr, bit (36) aligned, fixed bin (35));
+dcl	hcs_$reset_ips_mask entry (bit (36) aligned, bit (36) aligned);
+dcl	hcs_$set_alarm_timer
+			entry (fixed bin (71), fixed bin, fixed bin (71));
+dcl	hcs_$set_ips_mask	entry (bit (36) aligned, bit (36) aligned);
+dcl	hcs_$validate_processid
+			entry (bit (36) aligned, fixed bin (35));
+dcl	hcs_$wakeup	entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl	lm_init_fast_lock_	entry (ptr, fixed bin (35));
+dcl	ipc_$block	entry (ptr, ptr, fixed bin (35));
+dcl	ipc_$create_ev_chn	entry (fixed bin (71), fixed bin (35));
+dcl	ipc_$drain_chn	entry (fixed bin (71), fixed bin (35));
+dcl	lm_fast_lock_list_$thread_in
+			entry (ptr, ptr, ptr);
+dcl	lm_fast_lock_list_$thread_out_first
+			entry (ptr, ptr, ptr, ptr);
+dcl	timer_manager_$sleep
+			entry (fixed bin (71), bit (2));
+dcl	sub_err_		entry () options (variable);
+
+/*  Condition  */
+
+dcl	cleanup		condition;
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	bin		builtin;
+dcl	clock		builtin;
+dcl	divide		builtin;
+dcl	hbound		builtin;
+dcl	min		builtin;
+dcl	mod		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	rel		builtin;
+dcl	size		builtin;
+dcl	stac		builtin;
+dcl	stacq		builtin;
+dcl	string		builtin;
+dcl	substr		builtin;
+dcl	unspec		builtin;
+
+%page;
+	p_code = 0;
+	timeout_time = clock () + p_timeout;
+	fast_lock_ptr = p_fast_lock_ptr;
+
+
+	if first_time
+	then do;
+		call INIT ();
+		first_time = "0"b;
+	     end;
+
+	fast_lock_data_ptr = lm_data_$fast_lock_data_ptr;
+	call CHECK_VERSION (FAST_LOCK_DATA_VERSION_1, fast_lock_data.version, "fast_lock_data");
+	lock_list_meters_ptr = lm_data_$lock_list_meters_ptr;
+	if lock_list_meters_ptr ^= null ()
+	then call CHECK_VERSION (LOCK_LIST_METERS_VERSION_1, lock_list_meters.version, "lock_list_meters");
+
+/*  Validate that the fast lock itself is good */
+
+	call VALIDATE_FAST_LOCK (fast_lock_ptr, fast_lock_block_ptr);
+%page;
+/*  Main loop of fast locking.
+
+    1. Try to lock the lock. Return if successful.
+
+    2. Validate that the owner is an active process. Bust the lock to this
+       process if not.
+
+    3. Wait until notified, the user's time has expired, or our timeout
+       has expired.
+*/
+
+TRY_TO_LOCK:
+	do while ("1"b);
+	     done_try_loop = "0"b;
+	     code = 0;
+
+	     do while (^done_try_loop);
+		if stac (addr (fast_lock.lock_word), my_processid)
+		then call RETURN (VALID_LOCK);
+
+		owner_processid = fast_lock.lock_word;
+		if owner_processid = my_processid
+		then call ERROR_LOG_AND_RETURN (dm_error_$fast_lock_mylock, fast_lock_ptr, cu_$caller_ptr ());
+		else if owner_processid ^= ""b
+		then do;
+			call hcs_$validate_processid (owner_processid, code);
+			if code = 0
+			then done_try_loop = "1"b;
+			else do;
+				if stacq (fast_lock.lock_word, my_processid, owner_processid)
+				then call RETURN (INVALID_RESET);
+			     end;
+		     end;
+	     end;
+
+
+/*  Check for the user's timeout expiring  */
+
+	     if timeout_time < clock ()
+	     then call ERROR_LOG_AND_RETURN (dm_error_$fast_lock_timeout, fast_lock_ptr, cu_$caller_ptr ());
+%page;
+/*  Thread ourselves into the wait list, set the notify switch, and wait.  */
+
+	     call MAKE_WAIT_BLOCK (fast_lock_block_ptr);
+
+	     fast_lock.notify_sw = "1"b;
+
+	     call ipc_$drain_chn (fast_lock_channel_id, code);
+
+/* Try once more for the lock. We could get it because of a race.  */
+
+	     if stac (addr (fast_lock.lock_word), my_processid)
+	     then call RETURN (VALID_LOCK);
+
+/*  Now wait a bit. Notify to prevent congestion of wait blocks. */
+
+	     call BLOCK;
+
+	     call NOTIFY (fast_lock_block_ptr);
+
+	end TRY_TO_LOCK;
+
+MAIN_RETURN:
+	return;
+%skip;
+RETURN:
+     proc (r_p_status);
+
+dcl	r_p_status	fixed bin (17) parameter;
+
+	if r_p_status = INVALID_RESET
+	then p_code = dm_error_$fast_lock_invalid_reset;
+	else p_code = 0;
+	call dm_hcs_$guaranteed_eligibility_on ();
+	goto MAIN_RETURN;
+     end RETURN;
+%page;
+
+/*  notify_unlock -
+
+     Entry to notify all processes waiting for a lock. Called after the lock has
+     been unlocked.
+*/
+
+notify_unlock:
+     entry (p_fast_lock_ptr, p_code);
+
+	p_code = 0;
+	fast_lock_ptr = p_fast_lock_ptr;
+
+	call dm_hcs_$guaranteed_eligibility_off ();
+
+	if first_time
+	then do;
+		call INIT;
+		first_time = "0"b;
+	     end;
+
+	fast_lock_data_ptr = lm_data_$fast_lock_data_ptr;
+	call CHECK_VERSION (FAST_LOCK_DATA_VERSION_1, fast_lock_data.version, "fast_lock_data");
+	lock_list_meters_ptr = lm_data_$lock_list_meters_ptr;
+	if lock_list_meters_ptr ^= null ()
+	then call CHECK_VERSION (LOCK_LIST_METERS_VERSION_1, lock_list_meters.version, "lock_list_meters");
+
+/*  Validate that we've been passed a valid fast lock  */
+
+	call VALIDATE_FAST_LOCK (fast_lock_ptr, fast_lock_block_ptr);
+
+/*  Notify any process which is waiting  */
+
+	call NOTIFY (fast_lock_block_ptr);
+
+
+	goto MAIN_RETURN;
+%page;
+/*  Internal Procedure to wait until notified or until we time out.
+    We can time out if we hit the user's timeout time, or if we
+    hit our own. The latter is a safety valve - if we hit it, our
+    caller retries locking, possibly calling us again.
+*/
+
+BLOCK:
+     proc;
+
+
+dcl	1 b_event_info	aligned,
+	  2 channel_id	fixed bin (71),
+	  2 message	fixed bin (71),
+	  2 sender	bit (36) aligned,
+	  2 origin,
+	    3 dev_signal	bit (18) unaligned,
+	    3 ring	bit (18) unaligned,
+	  2 channel_index	fixed bin;
+dcl	b_saved_channel	fixed bin (71);
+dcl	b_saved_ips_mask	bit (36) aligned;
+dcl	b_saved_timer	fixed bin (71);
+dcl	b_wait_time	fixed bin (71);
+
+
+/*  Setup a cleanup handler to reset the IPS mask and ring-0 timer  */
+
+	b_saved_ips_mask = ""b;
+	b_saved_channel = -1;
+
+	on cleanup
+	     begin;
+		if substr (b_saved_ips_mask, 36, 1) = "1"b
+		then call hcs_$reset_ips_mask (b_saved_ips_mask, b_saved_ips_mask);
+		if b_saved_channel ^= -1
+		then call hcs_$set_alarm_timer (b_saved_timer, 2, b_saved_channel);
+	     end;
+
+
+/*  Determine the wait time  */
+
+	b_wait_time = min (clock () + MAX_WAIT_TIME, timeout_time);
+
+
+/*  Mask IPS Signals and set our own ring-0 timer  */
+
+	call hcs_$set_ips_mask (dm_system_data_$lock_ips_mask, b_saved_ips_mask);
+
+	call hcs_$get_alarm_timer (b_saved_timer, b_saved_channel);
+	call hcs_$set_alarm_timer (b_wait_time, 2, fast_lock_channel_id);
+
+/*  Wait for something  */
+
+	call ipc_$block (addr (wait_list), addr (b_event_info), code);
+
+/*  Restore the ring-0 timer and the IPS mask  */
+
+	call hcs_$set_alarm_timer (b_saved_timer, 2, b_saved_channel);
+	call hcs_$reset_ips_mask (b_saved_ips_mask, b_saved_ips_mask);
+
+
+     end BLOCK;
+%page;
+/*  Internal procedure to initialize static variables.  */
+
+INIT:
+     proc ();
+
+dcl	i_code		fixed bin (35);
+
+	my_processid = get_process_id_ ();
+
+	call ipc_$create_ev_chn (fast_lock_channel_id, i_code);
+	wait_list.channel_id (1) = fast_lock_channel_id;
+
+	call create_ips_mask_ (addr (IPS_NAMES), hbound (IPS_NAMES, 1), ips_mask);
+
+     end INIT;
+%page;
+/*  Internal Procedure to thread this process into the list of waiters
+    for this fast lock
+*/
+MAKE_WAIT_BLOCK:
+     proc (mw_p_fast_lock_block_ptr);
+
+dcl	mw_p_fast_lock_block_ptr
+			ptr;
+dcl	1 mw_fast_lock_block
+			aligned like fast_lock_block based (mw_p_fast_lock_block_ptr);
+
+dcl	mw_tfast_lock_wakeup_block_ptr
+			ptr;
+dcl	mw_tlock_list_block_ptr
+			ptr;
+dcl	1 mw_tfast_lock_wakeup_block
+			aligned like fast_lock_wakeup_block based (mw_tfast_lock_wakeup_block_ptr);
+dcl	1 mw_tlock_list_block
+			aligned like lock_list_block based (mw_tlock_list_block_ptr);
+
+
+	call lm_fast_lock_list_$thread_out_first (addr (fast_lock_data.free_list_head), fast_lock_data_ptr, null (),
+	     mw_tlock_list_block_ptr);
+	if mw_tlock_list_block_ptr = null ()
+	then call ERROR_RETURN (dm_error_$fast_lock_no_free);
+
+	mw_tfast_lock_wakeup_block_ptr = addr (mw_tlock_list_block.block_data);
+	mw_tfast_lock_wakeup_block.event_channel = fast_lock_channel_id;
+	mw_tfast_lock_wakeup_block.processid = my_processid;
+	mw_tfast_lock_wakeup_block.message = "WAIT";
+
+	call lm_fast_lock_list_$thread_in (addr (mw_fast_lock_block.list_head), lock_list_meters_ptr,
+	     mw_tlock_list_block_ptr);
+
+
+     end MAKE_WAIT_BLOCK;
+%page;
+/*  Internal Procedure to notify all processes waiting for a fast lock.
+    This is done one at a time to avoid races with other processes doing
+    the same thing.
+*/
+
+NOTIFY:
+     proc (nt_p_fast_lock_block_ptr);
+
+dcl	nt_p_fast_lock_block_ptr
+			ptr;
+dcl	1 nt_fast_lock_block
+			aligned like fast_lock_block based (nt_p_fast_lock_block_ptr);
+
+dcl	nt_done_notify	bit (1) aligned;
+dcl	nt_message_71	fixed bin (71);
+dcl	nt_message_8	char (8) aligned;
+dcl	nt_tfast_lock_wakeup_block_ptr
+			ptr;
+dcl	nt_tlock_list_block_ptr
+			ptr;
+
+dcl	1 nt_tfast_lock_wakeup_block
+			aligned like fast_lock_wakeup_block based (nt_tfast_lock_wakeup_block_ptr);
+dcl	1 nt_tlock_list_block
+			aligned like lock_list_block based (nt_tlock_list_block_ptr);
+
+	nt_done_notify = "0"b;
+
+	do while (^nt_done_notify);
+	     call lm_fast_lock_list_$thread_out_first (addr (nt_fast_lock_block.list_head), fast_lock_data_ptr,
+		lock_list_meters_ptr, nt_tlock_list_block_ptr);
+	     if nt_tlock_list_block_ptr = null ()
+	     then nt_done_notify = "1"b;
+	     else do;
+		     nt_tfast_lock_wakeup_block_ptr = addr (nt_tlock_list_block.block_data);
+		     if nt_tfast_lock_wakeup_block.processid ^= my_processid
+						/* Don't wakeup ourselves */
+		     then do;
+			     nt_message_8 = nt_tfast_lock_wakeup_block.message;
+			     unspec (nt_message_71) = unspec (nt_message_8);
+			     call SEND_WAKEUP ("fast_lock unlock notification",
+				nt_tfast_lock_wakeup_block.processid, nt_tfast_lock_wakeup_block.event_channel,
+				nt_message_71);
+			end;
+		     call lm_fast_lock_list_$thread_in (addr (fast_lock_data.free_list_head), null (),
+			nt_tlock_list_block_ptr);
+		end;
+	end;
+
+     end NOTIFY;
+
+%page;
+/*  Internal Procedure to validate a fast lock supplied by the outer ring.
+    If it is valid,  a pointer to the inner-ring block is returned. If it
+    has never been initialized, it is done now. Note that this initialization
+    (which is really binding to an inner-ring block) is done on demand, when
+    first some process waits for it.
+*/
+
+VALIDATE_FAST_LOCK:
+     proc (vf_p_fast_lock_ptr, vf_p_fast_lock_block_ptr);
+
+
+dcl	vf_p_fast_lock_ptr	ptr;
+dcl	vf_p_fast_lock_block_ptr
+			ptr;
+dcl	vf_code		fixed bin (35);
+
+dcl	1 vf_fast_lock	aligned like fast_lock based (vf_p_fast_lock_ptr);
+dcl	1 vf_fast_lock_block
+			aligned like fast_lock_block based (vf_p_fast_lock_block_ptr);
+
+dcl	vf_block_offset	bit (18) aligned;
+dcl	vf_listx		fixed bin;
+dcl	vf_rel_offset	fixed bin (18);
+dcl	vf_uid		bit (36) aligned;
+
+	if vf_fast_lock.offset = ""b			/* Not initialized yet */
+	then do;
+		call lm_init_fast_lock_ (vf_p_fast_lock_ptr, vf_code);
+		if vf_code ^= 0
+		then if vf_code ^= dm_error_$fast_lock_not_cleared
+		     then call ERROR_RETURN (vf_code);
+	     end;
+
+	lock_list_block_words = size (fast_lock_wakeup_block);
+	vf_block_offset = vf_fast_lock.offset;
+	vf_rel_offset = bin (vf_block_offset) - bin (rel (addr (fast_lock_data.list)));
+
+	if vf_rel_offset < 0
+	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+
+	if mod (vf_rel_offset, size (lock_list_block)) ^= 0
+	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+
+	vf_listx = divide (vf_rel_offset, size (lock_list_block), 17);
+	if vf_listx < 0 | vf_listx > fast_lock_data.n_list_entries
+	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+
+	vf_p_fast_lock_block_ptr = addr (ptr (fast_lock_data_ptr, vf_block_offset) -> lock_list_block.block_data);
+	if vf_fast_lock_block.offset ^= rel (vf_p_fast_lock_ptr)
+	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+
+	call hcs_$get_uid_seg (vf_p_fast_lock_ptr, vf_uid, code);
+	if code ^= 0 | vf_uid ^= vf_fast_lock_block.uid
+	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+
+
+     end VALIDATE_FAST_LOCK;
+
+ERROR_LOG_AND_RETURN:
+     procedure (el_p_code, el_p_lock_ptr, el_p_caller_ptr);
+
+declare	el_p_code		fixed bin (35);
+declare	el_p_lock_ptr	pointer;
+declare	el_p_caller_ptr	pointer;
+declare	1 el_lock_fpi	aligned like find_pathname_info;
+declare	el_code		fixed bin (35);
+
+	string (el_lock_fpi.strings) = "";
+
+	call dm_misc_util_$log (INFORM_SV, el_p_code, "lm_fast_lock_", "Fast lock error.");
+
+	call find_pathname_ (el_p_lock_ptr, addr (el_lock_fpi), el_code);
+	if el_code = 0
+	then call dm_misc_util_$log (INFORM_SV, "   On lock ^a.", string (el_lock_fpi.strings));
+	else call dm_misc_util_$log (INFORM_SV, "   On lock ^p.", el_p_lock_ptr);
+	call ERROR_RETURN (el_p_code);
+     end ERROR_LOG_AND_RETURN;
+%skip;
+ERROR_RETURN:
+     proc (er_p_code);
+
+dcl	er_p_code		fixed bin (35) parameter;
+
+	p_code = er_p_code;
+	goto MAIN_RETURN;
+     end ERROR_RETURN;
+%page;
+SEND_WAKEUP:
+     proc (sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, sw_p_message);
+dcl	sw_p_wakeup_description
+			char (*) parm;
+dcl	sw_p_process_id	bit (36) aligned parm;
+dcl	sw_p_ev_channel	fixed bin (71) parm;
+dcl	sw_p_message	fixed bin (71) parm;
+
+dcl	sw_code		fixed bin (35) init (0);
+dcl	sw_try_wakeup	bit (1) aligned init (YES);
+dcl	sw_wakeup_attempt_count
+			fixed bin init (0);
+
+	do sw_wakeup_attempt_count = 1 to MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS while (sw_try_wakeup = YES);
+	     call hcs_$wakeup (sw_p_process_id, sw_p_ev_channel, sw_p_message, sw_code);
+	     if sw_code = 0 | (sw_code = error_table_$process_unknown & sw_p_process_id ^= "0"b)
+						/* Probably a process_id for a now-dead process. */
+	     then sw_try_wakeup = NO;
+	     else if sw_code = error_table_$itt_overflow
+	     then call timer_manager_$sleep (ITT_OVERFLOW_WAIT_TIME, RELATIVE_SECONDS);
+	     else do;
+		     call dm_misc_util_$log (INFORM_SV, sw_code, ME,
+			"^/Unable to send a ^a for process ^w on event channel ^o.", sw_p_wakeup_description,
+			sw_p_process_id, sw_p_ev_channel);
+		     sw_try_wakeup = NO;
+		end;
+	end;
+	if sw_wakeup_attempt_count > MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+	then call dm_misc_util_$log (INFORM_SV, error_table_$itt_overflow, ME,
+		"^/Unable to send a ^a for process ^w on event channel ^w, after ^d attempts.",
+		sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS);
+     end SEND_WAKEUP;
+
+
+CHECK_VERSION:
+     proc (cv_p_expected_version, cv_p_received_version, cv_p_structure_name);
+
+dcl	cv_p_expected_version
+			char (8) aligned parameter;
+dcl	cv_p_received_version
+			char (8) aligned parameter;
+dcl	cv_p_structure_name char (32) aligned parameter;
+
+	if cv_p_expected_version ^= cv_p_received_version
+	then call sub_err_ (error_table_$unimplemented_version, ME, ACTION_CANT_RESTART, null (), 0,
+		"^/Expected version ^a of the ^a structure." || "^/Received version ^a instead.",
+		cv_p_expected_version, cv_p_structure_name, cv_p_received_version);
+     end CHECK_VERSION;
+%page;
+%include find_pathname_info;
+%include dm_fast_lock_strucs;
+%include dm_lock_list_strucs;
+%include dm_log_sv_codes;
+%include sub_err_flags;
+     end lm_fast_lock_$lock_fast;

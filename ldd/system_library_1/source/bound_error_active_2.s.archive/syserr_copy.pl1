@@ -1,0 +1,339 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+syserr_copy:
+     procedure ();
+
+/* *	SYSERR_COPY
+   *
+   *	This is the procedure in charge of all syserr log copying, both for the
+   *	daemon in ring zero, and for the process that is in charge of copying
+   *	messages out of the ring zero buffer into ring four.  Its major duties
+   *	are filling a paged log segment from the wired buffer, swapping log
+   *	segments and names (either when one fills or on demand), and copying
+   *	messages from ring zero out to ring four.
+   *
+   *	Modification history:
+   *	84-08-20, W. Olin Sibert: Initial coding, after syserr_copy_paged
+   *	84-10-02, WOS: Removed file system name changing to syserr_seg_manager
+   *	84-10-16, WOS: Implemented wakeup sending and threshold
+   * 	84-11-11, WOS: Added console recovery support
+   *	85-01-21, EJ Sharpe: copy process_id from wired log, convert binary
+   *		data_class to character string, change data class to char (16)
+   *	85-03-03, EJ Sharpe: format, fix an error message
+   *	85-03-25, EJ Sharpe: fix message documentation, sound beeper on "mostly full" msg
+*/
+
+declare  P_wlog_ptr pointer parameter;
+
+declare  sys_log_ptr pointer;
+declare  code fixed bin (35);
+declare  must_send_wakeup bit (1) aligned;
+
+declare  error_table_$log_segment_full fixed bin (35) external static;
+
+declare  ioa_$rsnnl entry options (variable);
+declare  lock$unlock_fast entry (pointer);
+declare  lock$lock_fast entry (pointer);
+declare  log_initialize_ entry (pointer, pointer, fixed bin (18), char (*), fixed bin (35));
+declare  log_segment_$create_message_number entry (pointer,
+	    fixed bin, fixed bin, char (16) varying, fixed bin (35), pointer, fixed bin (35));
+declare  log_segment_$finish_message entry (pointer, pointer, fixed bin (35));
+declare  pxss$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+declare  syserr entry options (variable);
+declare  syserr$error_code entry options (variable);
+
+declare  WHOAMI char (32) internal static options (constant) init ("syserr_copy");
+
+declare  (addr, addrel, clock, currentsize, hbound, mod, unspec, wordno) builtin;
+%page;
+
+syserr_copy$wired_log:				/* Called ONLY by syserr_logger_daemon */
+     entry (P_wlog_ptr);				/* Log is LOCKED on entry */
+
+	wlog_ptr = P_wlog_ptr;
+	syserr_log_data_ptr = addr (syserr_log_data$);
+
+	must_send_wakeup = "0"b;			/* Set if we hit a threshold */
+	call copy_messages ();
+
+	if must_send_wakeup then
+	     if (syserr_log_data.copy_channel ^= 0) then
+		call pxss$wakeup (syserr_log_data.copy_process_id, syserr_log_data.copy_channel, -1, (0));
+
+	return;
+
+
+
+syserr_copy$swap_logs:				/* called from syserr_seg_manager to perform */
+     entry ();					/* actual exchange of logs */
+
+	syserr_log_data_ptr = addr (syserr_log_data$);
+	call swap_logs (("0"b));			/* Swap if we can, ignore if we can't */
+	return;
+
+
+
+syserr_copy$lock:					/* Utility entrypoints for the rest of ring */
+     entry ();					/* zero syserr stuff (daemon and seg manager) */
+
+	syserr_log_data_ptr = addr (syserr_log_data$);
+	call lock_paged_log ();
+	return;
+
+
+
+syserr_copy$unlock:
+     entry ();
+
+	syserr_log_data_ptr = addr (syserr_log_data$);
+	call unlock_paged_log ();
+	return;
+%page;
+
+copy_messages:
+     procedure ();
+
+declare  drop_threshold fixed bin (18);
+declare  msg_idx fixed bin;
+declare  swap_successful bit (1) aligned;
+
+
+	if syserr_log_data.copy_disabled then do;	/* Nothing to do until this gets fixed */
+	     syserr_log_data.messages_lost = syserr_log_data.messages_lost + wlog.head.count;
+	     return;
+	end;
+
+	sys_log_ptr = syserr_log_data.log_ptr (syserr_log_data.live_log);
+	drop_threshold = 1024 * 10;			/* Ten pages in the new log before we cancel */
+						/* severity five messages. Really, this should */
+						/* be calculated from something, but this will */
+						/* have to do for now */
+
+/* THIS WILL ALL CHANGE WHEN THE COPY IS MADE DIRECTLY FROM ONE OF THE
+   MINI-LOGS IN THE WIRED BUFFER */
+
+	wmess_ptr = addr (wlog.buffer);		/* This is the first wired message */
+
+	do msg_idx = 1 to wlog.head.count;
+	     if (^create_syserr_message ()) then do;	/* If no room in this log, it's full. Try another. */
+		call swap_logs (swap_successful);	/* If we can't swap logs, either, thengive up */
+		if ^swap_successful then
+		     return;
+
+		if (^create_syserr_message ()) then	/* And, if the new empty log won't do, either, give up */
+		     return;			/* (even though should never happen) */
+	     end;
+
+	     if (syserr_log_data.swap_time ^= 0) then	/* Check to see whether we should give up severity 5 */
+		if ^syserr_log_data.drop_severity_5 then/* and be sure we haven't made the decision yet */
+		     if (wordno (log_message_ptr) > drop_threshold) then do;
+			call syserr (SYSERR_PRINT_WITH_ALARM,
+			     "^a: LOG partition mostly full. Severity 5 messages will be lost.", WHOAMI);
+			syserr_log_data.drop_severity_5 = "1"b;
+		     end;
+
+	     syserr_log_data.messages_copied = syserr_log_data.messages_copied + 1;
+
+	     wmess_ptr = addrel (wmess_ptr, currentsize (wmess)); /* Move on to the next message */
+	end;
+
+	return;
+     end copy_messages;
+%page;
+
+create_syserr_message:
+     procedure () returns (bit (1) aligned);
+
+declare  text_lth fixed bin;
+declare  data_lth fixed bin;
+declare  data_type fixed bin;
+declare  data_class char (16) varying;
+declare  data_buffer (data_lth) bit (36) aligned based;
+declare  message_offset fixed bin (18);
+
+
+	if syserr_log_data.drop_severity_5 then		/* Are we to give up this one? */
+	     if (mod (wmess.code, 10) = 5) then do;	/* Dispose of it */
+		syserr_log_data.messages_lost = syserr_log_data.messages_lost + 1;
+		return ("1"b);			/* And act like we succeeded */
+	     end;
+
+	text_lth = wmess.text_len;
+	data_lth = wmess.data_size;
+	data_type = wmess.data_code;
+	data_class = "";				/* init */
+
+	if (data_lth > 0) then do;
+	     if data_type < 1 | data_type > hbound (SB_char_data_classes, 1)
+	     then call ioa_$rsnnl ("syserr^d", data_class, (0), data_type);
+	     else data_class = SB_char_data_classes (data_type);
+	end;
+
+	call log_segment_$create_message_number (sys_log_ptr,
+	     text_lth, data_lth, data_class, wmess.seq_num, log_message_ptr, code);
+
+	if (code ^= 0) then do;			/* Failed to create. See why */
+	     if (code ^= error_table_$log_segment_full) then /* If not just plain full, fatal error */
+		call syserr$error_code (SYSERR_CRASH_SYSTEM, code, "^a: Cannot add message to paged syserr log ^p.", WHOAMI, sys_log_ptr);
+
+	     return ("0"b);				/* Return failure indicator, and try again */
+	end;
+
+	log_message.severity = wmess.code;		/* Copy the message */
+	log_message.time = wmess.time;
+	log_message.process_id = wmess.process_id;
+	log_message.text = wmess.text;
+
+	if (data_lth > 0) then do;
+	     unspec (addr (log_message.data (1)) -> data_buffer) = unspec (wmess.data);
+	end;
+
+	call log_segment_$finish_message (sys_log_ptr, log_message_ptr, (0));
+
+	message_offset = wordno (log_message_ptr);	/* See if we have more than enough pages stuck */
+	if (message_offset > (1024 * syserr_log_data.copy_threshold)) then
+	     must_send_wakeup = "1"b;			/* in ring zero, and notify AS if so */
+
+	if syserr_log_data.wakeup_on_printable then	/* Console recovery is in action-- send a wakeup */
+	     if write_flags (mod (wmess.code, 10)) then	/* if the message should have been printed */
+		must_send_wakeup = "1"b;
+
+	return ("1"b);
+     end create_syserr_message;
+%page;
+
+swap_logs:
+     procedure (P_success);
+
+declare  P_success bit (1) aligned parameter;
+
+declare  new_log fixed bin;
+declare  new_log_ptr pointer;
+declare  new_log_size fixed bin (18);
+declare  old_log_ptr pointer;
+declare  swap_time fixed bin (71);
+
+
+	must_send_wakeup = "1"b;			/* Any time we swap, or try to swap, while copying from */
+						/* the wired buffer, we want to send a wakeup to the AS */
+
+	if (syserr_log_data.swap_time ^= 0) then do;	/* A swap is *already* pending */
+	     call syserr (SYSERR_PRINT_WITH_ALARM, "^a: LOG partition full. Further copying temporarily disabled.", WHOAMI);
+	     syserr_log_data.copy_disabled = "1"b;
+	     P_success = "0"b;
+	     return;
+	end;
+
+	new_log = 3 - syserr_log_data.live_log;		/* Then swap: #1 => #2, #2 => #1 */
+
+	old_log_ptr = syserr_log_data.log_ptr (syserr_log_data.live_log);
+	new_log_ptr = syserr_log_data.log_ptr (new_log);
+	new_log_size = 1024 * syserr_log_data.log_size (new_log);
+
+	swap_time = clock ();
+	call log_initialize_ (old_log_ptr, new_log_ptr, new_log_size, "", (0));
+
+	syserr_log_data.live_log = new_log;		/* Once it's initialized, start using it */
+	sys_log_ptr = syserr_log_data.log_ptr (new_log);
+
+	syserr_log_data.swap_time = swap_time;		/* Remember when it happened (stays set until log copied) */
+
+	syserr_log_data.copy_disabled = "0"b;		/* We have a nice big empty place to put them again */
+	syserr_log_data.drop_severity_5 = "0"b;		/* so turn off both the throttles */
+
+	P_success = "1"b;
+	return;
+
+     end swap_logs;
+%page;
+
+lock_paged_log:
+     procedure ();
+
+	call lock$lock_fast (addr (syserr_log_data.lock));
+
+	return;
+     end lock_paged_log;
+
+
+
+unlock_paged_log:
+     procedure ();
+
+	call lock$unlock_fast (addr (syserr_log_data.lock));
+
+	return;
+     end unlock_paged_log;
+
+/* format: off */
+%page; %include log_message;
+%page; %include syserr_log_dcls;
+%page; %include syserr_actions;
+%page; %include syserr_data;
+%page; %include syserr_constants;
+%page; %include syserr_binary_def;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   syserr_copy: LOG partition mostly full. Severity 5 messages will be lost.
+
+   S:     $beep
+
+   T:     $run
+
+   M:     Both halves of the ring zero syserr log buffer are nearly full. This
+generally indicates that the Answering Service is not copying messages from
+ring zero into >sc1>syserr_log; there will have been a previous message left in
+the Answering Service log describing why.
+
+   A:     If the problem is correctable, copying from ring zero should
+be restarted (see the documentation for "syserr_log_man_: Automatic log
+copying disabled" for instructions); otherwise, messages will be lost.
+
+
+   Message:
+   syserr_copy: Cannot add message to paged syserr log PTR. ERROR-MESSAGE
+
+   S:     $crash
+
+   T:     $run
+
+   M:     $err
+This may indicate that the syserr log partition has been damaged.
+If this is the case, the LOG partition should be reinitialized using
+the BCE test_disk command. Some messages will be lost if this happens.
+
+   A:     Re-boot the system. Reinitialize the LOG partition if necessary.
+
+
+   Message:
+   syserr_copy: LOG partition full. Further copying temporarily disabled.
+
+   S:     $crash
+
+   T:     $run
+
+   M:     Both halves of the ring zero syserr log buffer are full. This
+generally indicates that the Answering Service is not copying messages from
+ring zero into >sc1>syserr_log; there will have been a previous message left in
+the Answering Service log describing why.
+
+   A:     If the problem is correctable, copying from ring zero should
+be restarted (see the documentation for "syserr_log_man_: Automatic log
+copying disabled" for instructions); otherwise, messages will be lost.
+
+
+   END MESSAGE DOCUMENTATION
+   */
+
+     end syserr_copy;

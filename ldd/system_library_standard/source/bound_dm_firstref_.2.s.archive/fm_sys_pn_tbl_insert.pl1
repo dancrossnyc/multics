@@ -1,0 +1,457 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+
+
+/* DESCRIPTION:
+
+         This routine inserts a pathname/uid pair into an entry of the System
+     Pathname  Table  (sys_pn_tbl).   It is assumed that the sys_pn_tbl is not
+     locked, and this routine will lock it while examining it.  In fact, an
+     error is signalled if the lock is already locked.  It is assumed
+     that the caller has set the validation level to the Data Management Ring.
+
+         Currently there is no mechanism for recovering from interuptions
+     while inserting an entry.  Ideally there should be, but since an
+     interuption immediately after this routine returns is really the same
+     as one occurring during this routine, there is no pressing need.
+     
+         Error handling is managed by two routines: ERROR_RETURN and LOG,
+     both of  which use the MAKE_MESSAGE function.  LOG simply logs an error
+     and returns to the main procedure.  LOG is used when an inconsistency is
+     found between the supplied and existing file_system_uid (a non-fatal 
+     error) and when an error occurs in the FINISH procedure.  Both of these
+     cases warrant reporting the unusual event while continuing to proceed.
+     ERROR_RETURN is used in all other cases.  It logs a message then signals
+     fm_sub_error_ via fm_error_util_$signal.  These errors are fatal errors.
+     FINISH is not called by ERROR_RETURN as in many other modules.  It is
+     invoked only by the cleanup handler when the stack is unwound.  
+     A possible scenario in which FINISH is invoked is as follows:
+       Invoke ERROR_RETURN, signal fm_sub_error_ via fm_error_util_signal,
+       before signal escapes to outer ring stak is unwound, setting off
+       cleanup on-unit, which calls FINISH.
+*/
+
+/* HISTORY:
+
+Written by Matthew, 06/26/84.
+Modified:
+10/29/84 by Matthew Pierret:  Cleaned up error messages. Answered audit 
+            comments. Added use of SPT_ENTRY_*_IN_USE constants.
+01/10/85 by Matthew C. Pierret:  Added ERROR_RETURN, LOG and MAKE_MESSAGE
+            routines for error handling.  Changed algorithm to not blow up if
+            an entry is found but the file system uid's do not match, rather
+            to log the event and continue looking for a suitable entry.  Also
+            changed to only check for file system uid mismatch if the entry is
+            not a new entry.
+03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+03/14/85 by Matthew C. Pierret:  Changed to only flush once as the first flush
+            does not really buy us anything.  Also changed to only unlock if
+            the lock was obtained successfully and validly, where it is
+            considered invalid to lock the table if the process already holds
+            that lock.  More specifically, the codes
+            dm_error_$invalid_lock_reset and 0 are valid codes returned from
+            lock_manager_$lock_fast.
+04/22/85 by Matthew C. Pierret:  Changed the loop which loops on sys_idx
+            looking for a matching uid to start from sys_idx + 1 so that if
+            the loop is executed again (happens if an entry has matching dm
+            file uid but not file system uids) the same entry is not found a
+            second time.
+04/23/85 by Matthew C. Pierret:  Changed to attempt to find an orphan entry if
+            the table is full.  An orphan entry is one which is in use but
+            refers to a non-existent file.  Such entries are the result of a
+            failure to run the post_transaction actions.  The sys_pn_tbl is
+            locked and unlocked around each entry while looking for an ibly
+            cause other transactions to timeout on the lock.
+04/30/85 by Matthew C. Pierret:  Changed to salvage sys_pn_tbl if it is full,
+            looking for an entry which describes a file which does not exist
+            and is not in the process of being deleted.
+*/
+
+/* format: style2,ind3 */
+%page;
+fm_sys_pn_tbl_insert:
+   proc (p_file_uid, p_file_path_name, p_component_0_seg_ptr, p_sys_pn_tbl_idx);
+
+/* START OF DECLARATIONS */
+/* Parameter */
+
+      dcl	    p_file_uid	       bit (36) aligned;	/*unique id of the file*/
+      dcl	    p_file_path_name       char (*);		/*full pathname of the file*/
+      dcl	    p_component_0_seg_ptr  ptr;		/*pointer to the first component of the file MSF*/
+      dcl	    p_sys_pn_tbl_idx       fixed bin;		/*new index into sys_pn_tbl, meant to be stored in file_access_info.pn_tbl_idx */
+
+/* Automatic */
+
+      dcl	    code		       fixed bin (35) init (0);
+      dcl	    component_0_seg_ptr    ptr init (null);
+      dcl	    component_0_seg_uid    bit (36) aligned init (""b);
+      dcl	    file_path_name	       char (168);
+      dcl	    file_uid	       bit (36) aligned init (""b);
+      dcl	    lock_code	       fixed bin (35) init (LOCK_OP_NOT_COMPLETE);
+      dcl	    lock_state	       fixed bin init (LOCK_ATTEMPTED);
+      dcl	    sys_idx	       fixed bin init (-1);
+      dcl	    sys_pn_tbl_idx	       fixed bin init (-1);
+      dcl	    unlock_code	       fixed bin (35) init (LOCK_OP_NOT_COMPLETE);
+
+/* Based */
+/* Builtin */
+
+      dcl	    (addr, hbound, lbound, length, min, null, substr, unspec)
+			       builtin;
+
+/* Condition */
+
+      dcl	    cleanup	       condition;
+
+/* Constant */
+
+      dcl	    MYNAME	       init ("fm_sys_pn_tbl_insert") char (32) varying internal static options (constant);
+      dcl	    (
+	    LOCK_WAIT_TIME	       init (1e9),
+	    LOCK_DONT_WAIT	       init (0)
+	    )		       fixed bin (71) internal static options (constant);
+      dcl	    (
+	    LOCK_ATTEMPTED	       init (1),
+	    UNLOCK_ATTEMPTED       init (0)
+	    )		       fixed bin internal static options (constant);
+      dcl	    LOCK_OP_NOT_COMPLETE   init (-1) fixed bin (35) internal static options (constant);
+
+/* Entry */
+
+      dcl	    cu_$arg_list_ptr       entry (ptr);
+      dcl	    cu_$arg_ptr_rel	       entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr);
+      dcl	    dm_misc_util_$log      entry options (variable);
+      dcl	    expand_pathname_       entry (char (*), char (*), char (*), fixed bin (35));
+      dcl	    fm_error_util_$signal  entry options (variable);
+      dcl	    fm_validate_$fm_validate_
+			       entry (char (*), char (*), fixed bin (35));
+      dcl	    hcs_$force_write       entry (ptr, bit (36), fixed bin (35));
+      dcl	    hcs_$get_uid_seg       entry (ptr, bit (36) aligned, fixed bin (35));
+      dcl	    ioa_$general_rs	       entry (ptr, fixed bin, fixed bin, char (*), fixed bin (21), bit (1) aligned,
+			       bit (1) aligned);
+      dcl	    lock_manager_$lock     entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+			       fixed bin (35));
+      dcl	    lock_manager_$lock_fast
+			       entry (ptr, fixed bin (71), fixed bin (35));
+      dcl	    lock_manager_$unlock_fast
+			       entry (ptr, fixed bin (35));
+
+/* External */
+
+      dcl	    dm_error_$fast_lock_invalid_reset
+			       fixed bin (35) ext;
+      dcl	    dm_error_$file_duplication
+			       fixed bin (35) ext;
+      dcl	    dm_error_$fm_sys_pn_tbl_full
+			       fixed bin (35) ext;
+      dcl	    error_table_$noentry   fixed bin (35) ext;
+
+/* END OF DECLARATIONS */
+%page;
+      p_sys_pn_tbl_idx = -1;
+
+      code = 0;
+      component_0_seg_ptr = p_component_0_seg_ptr;
+      file_uid = p_file_uid;
+      file_path_name = p_file_path_name;
+
+      call hcs_$get_uid_seg (component_0_seg_ptr, component_0_seg_uid, code);
+      if code ^= 0
+      then call ERROR_RETURN (code, "  Trying to get the Multics file system uid of ^a>0 (^p).", file_path_name,
+	      component_0_seg_ptr);
+
+      on cleanup call FINISH ();
+
+      call LOCK (lock_state, lock_code);
+
+      sys_pn_tbl_idx = -1;
+      sys_idx = lbound (sys_pn_tbl.e, 1) - 1;
+
+FIND_ENTRY_LOOP:
+      do while (sys_pn_tbl_idx = -1);
+
+         do sys_idx = sys_idx + 1 to sys_pn_tbl.h.last_entry
+	    while (sys_pn_tbl.e (sys_idx).file_uid ^= file_uid | sys_pn_tbl.e (sys_idx).in_use = SPT_ENTRY_NOT_IN_USE);
+						/* This loop stops when it */
+						/* finds matching uids in  */
+						/* an entry currently used */
+         end;
+
+         if sys_idx <= sys_pn_tbl.h.last_entry
+         then
+VERIFY_EXISTING_ENTRY:
+	  do;
+	     if sys_pn_tbl.e (sys_idx).file_system_uid = component_0_seg_uid
+	     then sys_pn_tbl_idx = sys_idx;
+	     else call LOG (dm_error_$file_duplication,
+		     "The new one is ^a.  The one already known in entry ^d is ^a.^/The new one will be put in another entry.",
+		     file_path_name, sys_idx, sys_pn_tbl.paths (sys_idx));
+	  end VERIFY_EXISTING_ENTRY;
+         else
+INSERT_NEW_ENTRY:
+	  do;
+	     do sys_idx = lbound (sys_pn_tbl.e, 1) to sys_pn_tbl.h.last_entry
+		while (sys_pn_tbl.e (sys_idx).in_use ^= SPT_ENTRY_NOT_IN_USE);
+	     end;
+
+	     if sys_idx > sys_pn_tbl.h.last_entry & sys_pn_tbl.h.last_entry = hbound (sys_pn_tbl.e, 1)
+	     then call SALVAGE_TABLE (sys_idx, lock_state, lock_code, unlock_code);
+
+	     if sys_idx > sys_pn_tbl.h.last_entry
+	     then sys_pn_tbl.h.last_entry = sys_idx;
+
+	     unspec (sys_pn_tbl.e (sys_idx)) = ""b;
+	     unspec (sys_pn_tbl.paths (sys_idx)) = ""b;
+
+	     sys_pn_tbl.paths (sys_idx) = file_path_name;
+	     sys_pn_tbl.e (sys_idx).file_uid = file_uid;
+	     sys_pn_tbl.e (sys_idx).file_system_uid = component_0_seg_uid;
+	     sys_pn_tbl.e (sys_idx).in_use = SPT_ENTRY_IN_USE;
+	     sys_pn_tbl_idx = sys_idx;
+	  end INSERT_NEW_ENTRY;
+      end FIND_ENTRY_LOOP;
+
+      sys_pn_tbl.e (sys_pn_tbl_idx).open_count = sys_pn_tbl.e (sys_pn_tbl_idx).open_count + 1;
+
+      if sys_pn_tbl.e (sys_pn_tbl_idx).open_count = 1
+      then
+         do;
+	  call hcs_$force_write (fm_data_$sys_pn_tbl_ptr, ""b, code);
+	  if code ^= 0
+	  then call ERROR_RETURN (code, "  Unable to force-write ^a (^p) after inserting file ^a in entry ^d.",
+		  fm_data_$sys_pn_tbl_name, fm_data_$sys_pn_tbl_ptr, file_path_name, sys_pn_tbl_idx);
+         end;
+
+      p_sys_pn_tbl_idx = sys_pn_tbl_idx;
+
+      call UNLOCK (lock_state, unlock_code);
+
+      return;
+%page;
+ERROR_RETURN:
+   proc options (variable);
+
+
+      dcl	    er_arg_list_ptr	       ptr;
+      dcl	    er_code	       fixed bin (35) based (er_code_ptr);
+      dcl	    er_code_ptr	       ptr;
+      dcl	    er_code_len	       fixed bin (21);
+
+      call cu_$arg_list_ptr (er_arg_list_ptr);
+      call cu_$arg_ptr_rel (1, er_code_ptr, er_code_len, (0), er_arg_list_ptr);
+      call fm_error_util_$signal (er_code, MYNAME, FM_ACTION_CANT_RESTART | FM_ACTION_LOG, LOG_SV,
+	 MAKE_MESSAGE (er_arg_list_ptr));
+
+/* fm_error_util_$signal never returns, however FINISH will be invoked when
+   the stack is unwound. */
+
+   end ERROR_RETURN;
+
+LOG:
+   proc options (variable);
+
+      dcl	    l_arg_list_ptr	       ptr;
+      dcl	    l_code	       fixed bin (35) based (l_code_ptr);
+      dcl	    l_code_ptr	       ptr;
+      dcl	    l_code_len	       fixed bin (21);
+
+      call cu_$arg_list_ptr (l_arg_list_ptr);
+      call cu_$arg_ptr_rel (1, l_code_ptr, l_code_len, (0), l_arg_list_ptr);
+      call dm_misc_util_$log (LOG_SV, l_code, MYNAME, MAKE_MESSAGE (l_arg_list_ptr));
+
+      return;
+
+   end LOG;
+
+MAKE_MESSAGE:
+   proc (mm_p_arg_list_ptr) returns (char (*));
+
+      dcl	    mm_p_arg_list_ptr      ptr;
+      dcl	    mm_message_len	       fixed bin (21);
+      dcl	    mm_message_buffer      char (1024);
+      dcl	    (DONT_PAD, NO_NEW_LINE)
+			       init ("0"b) bit (1) aligned;
+
+      call ioa_$general_rs (mm_p_arg_list_ptr, 2, 3, mm_message_buffer, mm_message_len, DONT_PAD, NO_NEW_LINE);
+
+      return (substr (mm_message_buffer, 1, min (length (mm_message_buffer), mm_message_len)));
+
+   end MAKE_MESSAGE;
+
+
+FINISH:
+   proc ();
+
+      if (lock_state = LOCK_ATTEMPTED & (lock_code = 0 | lock_code = dm_error_$fast_lock_invalid_reset))
+	 | (lock_state = UNLOCK_ATTEMPTED & unlock_code = -1)
+      then call UNLOCK (lock_state, unlock_code);
+
+   end FINISH;
+%page;
+LOCK:
+   proc (lk_p_lock_state, lk_p_lock_code);
+
+/* This routine locks the SPT.  Following a protocol used to always be
+   able to determine if the SPT is locked, it:
+     1) sets lk_p_lock_code to LOCK_OP_NOT_COMPLETE (-1)
+     2) sets lk_p_lock_state to LOCK_ATTEMPTED
+     3) calls lock_manager_$lock_fast with lk_p_lock_code as
+        the error code.
+   The parameters correspond with the global variables lock_code and
+   lock_state. This protocol (and a simlar one for unlocking) means 
+   that if lock_state is equal to LOCK_ATTEMPTED and lock_code is equal
+   to either 0 or dm_error_$fast_lock_invalid_reset, we have the lock. */
+
+      dcl	    lk_p_lock_state	       fixed bin parameter;
+      dcl	    lk_p_lock_code	       fixed bin (35) parameter;
+
+      lk_p_lock_code = LOCK_OP_NOT_COMPLETE;
+      lk_p_lock_state = LOCK_ATTEMPTED;
+      call lock_manager_$lock_fast (addr (sys_pn_tbl.h.lock), LOCK_WAIT_TIME, lk_p_lock_code);
+      if lk_p_lock_code ^= 0 & lk_p_lock_code ^= dm_error_$fast_lock_invalid_reset
+      then call ERROR_RETURN (lk_p_lock_code, " Unable to lock ^a.", fm_data_$sys_pn_tbl_name);
+      else return;
+
+   end LOCK;
+%skip (4);
+UNLOCK:
+   proc (u_p_lock_state, u_p_unlock_code);
+
+/* This routine unlocks the SPT.  Following a protocol used to always be
+   able to determine if the SPT is locked, it:
+     1) sets u_p_unlock_code to LOCK_OP_NOT_COMPLETE (-1)
+     2) sets u_p_lock_state to UNLOCK_ATTEMPTED
+     3) calls lock_manager_$unlock_fast with u_p_unlock_code as
+        the error code.
+   The parameters correspond with the global variables unlock_code and
+   lock_state. This protocol (and a simlar one for locking) means 
+   that if lock_state is equal to UNLOCK_ATTEMPTED and unlock_code is equal
+   to 0, we've unlocked the lock. */
+
+      dcl	    u_p_lock_state	       fixed bin parameter;
+      dcl	    u_p_unlock_code	       fixed bin (35) parameter;
+
+      u_p_unlock_code = LOCK_OP_NOT_COMPLETE;
+      u_p_lock_state = UNLOCK_ATTEMPTED;
+      call lock_manager_$unlock_fast (addr (sys_pn_tbl.h.lock), u_p_unlock_code);
+      if u_p_unlock_code ^= 0
+      then call ERROR_RETURN (u_p_unlock_code, " Unable to unlock ^a.", fm_data_$sys_pn_tbl_name);
+      else return;
+
+   end UNLOCK;
+%page;
+SALVAGE_TABLE:
+   proc (st_p_sys_idx, st_p_lock_state, st_p_lock_code, st_p_unlock_code);
+
+/* SALVAGE_TABLE walks through sys_pn_tbl verifying that each entry describes
+   a file which exists or one which is in the process of being deleted.  If
+   an entry fails verification, i.e., the file does not exist and no other
+   transaction has the file locked, the entry is claimed for use by this
+   transaction.  As SALVAGE_TABLE is called only when sys_pn_tbl is full,
+   if no salvagable entry is found, the table is really full. 
+
+   So as not to hold the sys_pn_tbl lock for too long, after looking at each
+   entry it is unlocked and locked again between entries. */
+
+      dcl	    (
+	    st_p_sys_idx	       fixed bin,
+	    st_p_lock_state	       fixed bin,
+	    st_p_lock_code	       fixed bin (35),
+	    st_p_unlock_code       fixed bin (35)
+	    )		       parameter;
+
+      dcl	    st_sys_idx	       fixed bin;
+
+      call LOG (dm_error_$fm_sys_pn_tbl_full, "Beginning salvage of ^a.", fm_data_$sys_pn_tbl_name);
+
+      st_p_sys_idx = -1;
+      st_sys_idx = lbound (sys_pn_tbl.e, 1);
+
+      call VALIDATE_ENTRY (st_sys_idx, st_p_lock_state, st_p_lock_code, st_p_unlock_code, st_p_sys_idx);
+
+      do st_sys_idx = st_sys_idx + 1 to sys_pn_tbl.h.last_entry while (st_p_sys_idx = -1);
+         call UNLOCK (st_p_lock_state, st_p_unlock_code);
+         call LOCK (st_p_lock_state, st_p_lock_code);
+         call VALIDATE_ENTRY (st_sys_idx, st_p_lock_state, st_p_lock_code, st_p_unlock_code, st_p_sys_idx);
+      end;
+
+      if st_p_sys_idx = -1
+      then
+         do;
+	  call UNLOCK (st_p_lock_state, st_p_unlock_code);
+	  call ERROR_RETURN (dm_error_$fm_sys_pn_tbl_full, "  No salvagable entries were found.");
+         end;
+      else return;
+
+   end SALVAGE_TABLE;
+%page;
+VALIDATE_ENTRY:
+   proc (ve_p_sys_idx, ve_p_lock_state, ve_p_lock_code, ve_p_unlock_code, ve_p_invalid_entry_idx);
+
+/* VALIDATE_ENTRY checks an entry in sys_pn_tbl to see if it contains an 
+   active file, one that either exists or is in the process of being deleted.
+   The validation is as follows:
+     1) If the pathname is invalid, the entry is invalid.
+     2) If the file exists, the entry is valid.
+     3) If the file does not exist, attempt to lock the file.
+        3.1) If the file is locked by another transaction, assume that
+             that transaction is in the process of deleting it, so
+             the entry is valid.
+        3.2) If the file is not locked, then no transaction is in the
+             process of deleting it, so the entry is invalid.  
+   An entry is indicated as valid by setting ve_p_invalid_entry_idx to -1,
+   as invalid by setting ve_p_invalid_entry_idx to ve_p_sys_idx.
+*/
+
+      dcl	    (
+	    ve_p_sys_idx	       fixed bin,
+	    ve_p_lock_state	       fixed bin,
+	    ve_p_lock_code	       fixed bin (35),
+	    ve_p_unlock_code       fixed bin (35),
+	    ve_p_invalid_entry_idx fixed bin
+	    )		       parameter;
+      dcl	    ve_code	       fixed bin (35) init (0);
+      dcl	    ve_dir	       char (168);
+      dcl	    ve_file	       char (32);
+
+      call expand_pathname_ ((sys_pn_tbl.paths (ve_p_sys_idx)), ve_dir, ve_file, ve_code);
+      if ve_code ^= 0
+      then
+         do;
+	  ve_p_invalid_entry_idx = ve_p_sys_idx;
+	  call LOG (0, "Salvaged ^a entry ^d with file ^a. The path is invalid.", fm_data_$sys_pn_tbl_name,
+	       ve_p_invalid_entry_idx, sys_pn_tbl.paths (ve_p_invalid_entry_idx));
+         end;
+      else
+         do;
+	  call fm_validate_$fm_validate_ (ve_dir, ve_file, ve_code);
+	  if ve_code ^= error_table_$noentry
+	  then ve_p_invalid_entry_idx = -1;
+	  else
+	     do;
+	        call lock_manager_$lock (sys_pn_tbl.e (ve_p_sys_idx).file_uid, LOCK_ENTIRE_FILE, LOCK_MODE_X,
+		   LOCK_DONT_WAIT, (0), ve_code);
+	        if ve_code = 0
+	        then
+		 do;
+		    ve_p_invalid_entry_idx = ve_p_sys_idx;
+		    call LOG (0, "Salvaged ^a entry ^d with file ^a. The file does not exist.",
+		         fm_data_$sys_pn_tbl_name, ve_p_invalid_entry_idx, sys_pn_tbl.paths (ve_p_invalid_entry_idx));
+		 end;
+	        else ve_p_invalid_entry_idx = -1;
+	     end;
+         end;
+   end VALIDATE_ENTRY;
+%page;
+%include dm_fm_sys_pn_tbl;
+%page;
+%include dm_fm_sub_error_flags;
+%page;
+%include dm_lock_modes;
+%page;
+%include dm_log_sv_codes;
+
+   end fm_sys_pn_tbl_insert;

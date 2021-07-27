@@ -1,0 +1,702 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* configure_test_cpu - procedure to do the physical work of CPU reconfiguration for ISOLTS. A primitive CPU
+   confidence test of the CPU is also accomplished to assure that the storage system will not be
+   compromised by user ring testing with ISOLTS
+
+   Initial coding by J. A. Bush - 10/78
+   Modified 9/16/80 by J. A. Bush for the DPS8/70M CPU
+   Modified 4/81 by J. A. Bush to correct bug in read switch code for DPS8/70M CPU
+   Modified October 1981 by J. Bongiovanni for set_procs_required
+   Modified 12/81 by J. A. Bush to correct bug in assigning SCU masks for SCUs with type codes > "0010"b
+   Modified 1/82 by J. A. Bush to report no response from RSW program, if inst. word 0 was not changed
+   Modified April 1982 by J. Bongiovanni for expanded SCS switch data/masks
+   Modified June 23, 1982 by J. A. Bush to clear cache while waiting for
+   a response from the cpu under test, due to the isolts_/Multics address mismatch
+   Modified Sept 21, 1983 by J. A. Bush to set scs$processor_data (tag).cache_size to ignore and
+   to reserve 128K for DPS8 cpus
+*/
+
+/* format: style4 */
+
+configure_test_cpu: proc (rcode);
+
+dcl  rcode fixed bin (35);				/* entry parameter */
+
+/* External entries */
+
+dcl  scr_util$assign_mask entry (fixed bin (3), fixed bin (3));
+dcl  scr_util$isolts_scu_p1 entry;
+dcl  scr_util$isolts_scu_p2 entry;
+dcl  scr_util$isolts_scu_p3 entry;
+dcl  scr_util$set_mask entry (fixed bin (3), fixed bin (3), bit (72) aligned);
+dcl  privileged_mode_ut$swap_sdw entry (ptr, ptr);
+dcl  privileged_mode_ut$smic_port entry (bit (36) aligned, fixed bin (5));
+dcl  privileged_mode_ut$cioc entry (ptr);
+dcl  privileged_mode_ut$clear_cache entry;
+dcl  privileged_mode_ut$wire_and_mask entry (fixed bin (71), ptr);
+dcl  privileged_mode_ut$unwire_unmask entry (fixed bin (71), ptr);
+dcl  wire_proc$wire_me entry;
+dcl  wire_proc$unwire_me entry;
+dcl  set_procs_required entry (bit (8) aligned, fixed bin (35));
+dcl  pc_abs$remove_core entry (fixed bin, fixed bin, fixed bin (35));
+dcl  freecore entry (fixed bin);
+dcl  syserr$error_code entry options (variable);
+
+/* External static */
+
+dcl  isolts_abs_seg$ fixed bin ext;			/* abs seg for isolts */
+dcl  fault_vector$ fixed bin ext;			/* fault vector segment */
+dcl  pds$processid bit (36) aligned ext;
+dcl  prds$processor_tag fixed bin (3) ext;
+dcl  prds$processor_pattern bit (8) aligned ext;
+
+/* Automatic */
+
+dcl  (icpu, iscu) fixed bin (5);			/* ISOLTS CPU and SCU tags */
+dcl  pdp ptr;					/* pointer to processor data for new CPU */
+dcl  cdp ptr;					/* pointer to controller data */
+dcl  old_pdp ptr;					/* pointer to processor data for CPU losing mask */
+dcl  ptp ptr;					/* temporary for wire_and_mask */
+dcl  mask_temp fixed bin (71);			/* temporary for wire_and_mask */
+dcl  int_vec_save (2) bit (36) aligned;			/* for saving interrupt vector */
+dcl  trouble_save (2) bit (36) aligned;			/* for saving trouble fault vector */
+dcl  startup_save (2) bit (36) aligned;			/* for saving startup fault vector */
+dcl  onc_save (2) bit (36) aligned;			/* for saving onc fault vector */
+dcl  lockup_save (2) bit (36) aligned;			/* for saving lockup fault vector */
+dcl  (i, j, k) fixed bin;				/* iteration variables */
+dcl  l fixed bin (18);				/* iteration variable for > 128k */
+dcl  abs_seg_p ptr;					/* pointer to abs_seg */
+dcl  pip ptr;					/* pointer to port info */
+dcl  switchp ptr;					/* pointer to switch readings */
+dcl  found bit (1);					/* useful flag */
+dcl  dps8 bit (1);					/* dps8 cpu flag */
+dcl  reconfig_err bit (1);				/* flag for error checking */
+dcl  remember (0:7) fixed bin;			/* base of controllers with vector template */
+dcl  base fixed bin;				/* base address of controller */
+dcl  size fixed bin;				/* size of a controller */
+dcl  req_mem fixed bin;				/* Memory to reserve for ring 4 testing */
+dcl  str_flt_operand bit (18);			/*  address that will generate store fault */
+dcl  tcode fixed bin (35);				/* temporary for error code */
+dcl  isolts_switch_mask (0:4) bit (36) aligned;		/* mask for checking switches */
+dcl  isolts_switch_template (0:4) bit (36) aligned;	/* template for checking switches */
+dcl  cpu_mask bit (8) aligned;			/* for set_procs_required */
+
+/* Structures and based variables */
+
+dcl  1 tsdw (0:7) aligned like sdw;			/* for saving abs_seg SDW's */
+dcl  1 tsdw1 aligned like sdw;			/* automatic copy of SDW */
+dcl  1 tsdw2 aligned like sdw;			/* safe storage for dedicated memory sdw */
+dcl  1 pi like rsw_1_3.port_info based (pip) unal;	/* port info */
+dcl  1 pdata like scs$processor_data based (pdp) aligned;	/* single element of processor data */
+dcl  1 cdata based (cdp) like scs$controller_data aligned;	/* single element of controller data */
+dcl  inst (0:262143) bit (36) based (abs_seg_p) aligned;	/* decicated memory as a 256k array */
+
+/* Constants */
+
+dcl  (trouble_fault init (31),			/* trouble fault number */
+     startup_fault init (0),				/* startup fault number */
+     store_fault init (1),				/* store fault number */
+     onc_fault init (11),				/* onc fault number */
+     lockup_fault init (7))				/* lockup fault number */
+	fixed bin (5) static options (constant);
+dcl  IGNORE_CACHE_SIZE fixed bin int static options (constant) init (7);
+dcl  LETTERS char (8) int static options (constant) init ("ABCDEFGH");
+dcl  cell12 bit (36) aligned static options (constant) init ("000040000000"b3);
+dcl  (addr, bin, bit, bool, fixed, hbound, rel, stac, stacq, string, substr) builtin;
+%page;
+	if scs$reconfig_lock ^= pds$processid | ^scs$processor_test_data.active then do; /* if not ISOLTS process */
+	     rcode = rcerr_isolts_not;		/* return error code */
+	     return;
+	end;
+	else rcode = 0;				/* otherwise return 0 */
+	reconfig_err = "0"b;			/* reset reconfiguration error flag */
+
+	iscu = scs$processor_test_data.scu_tag;		/* copy scu and cpu tags */
+	icpu = scs$processor_test_data.cpu_tag;
+	cdp = addr (scs$controller_data (iscu));	/* Get ptr to data for this SCU. */
+
+/* set up our read_switch template */
+
+	isolts_switch_template, isolts_switch_mask = "0"b;/* clear them first */
+	rswp = addr (isolts_switch_template (2));	/* set up rsw 2 first */
+	switchp = addr (isolts_switch_mask (2));
+	dps_rsw_2.fault_base = "0000010"b;		/* set up expected fault base */
+	switchp -> dps_rsw_2.fault_base = "1111111"b;	/* set up fault base mask */
+	dps_rsw_2.cpu_num = icpu;			/* set up expected cpu tag */
+	switchp -> dps_rsw_2.cpu_num = 7;		/* set up cpu tag mask */
+	if iscu < 4 then do;			/* pick rsw 1 if scu tags A, B, C, or D */
+	     i = 1;
+	     j = iscu;
+	     switchp -> dps8_rsw_2.interlace_info (iscu) = "1"b; /* check possible interlace onf dps8 cpu */
+	end;
+	else do;					/* pick rsw 3 if scu tags E, F, G, or H */
+	     i = 3;
+	     j = iscu - 4;
+	end;
+	rswp = addr (isolts_switch_template (i));	/* set up rsw 1 - 3 data */
+	pip = addr (rsw_1_3.port_info (j));		/* set template first */
+	pi.port_enable = "1"b;			/* port enable bit must be on */
+	rswp = addr (isolts_switch_mask (i));		/* set up mask for expected port info */
+	pip = addr (rsw_1_3.port_info (j));
+	pi.port_assignment = "7"b3;
+	pi.initialize_enable = "1"b;
+	pi.interlace_enable = "1"b;
+	rswp = addr (isolts_switch_mask (4));		/* set rsw 4 mask */
+	rsw_4.port_info (iscu).four = "1"b;
+	rsw_4.port_info (iscu).half = "1"b;
+	scs$processor_switch_data, scs$processor_switch_compare = "0"b; /* clear out switch data */
+	switchp = addr (scs$processor_switch_compare (1));/* set pointer */
+
+%page;
+/* Find online CPU with mask set in this SCU */
+
+	found = "0"b;
+	do i = 1 to 4 while (^found);
+	     if cdata.eima_data (i).mask_available then	/* if this mask available */
+		if cdata.eima_data (i).mask_assigned then do; /* if this mask assigned */
+		     do j = 0 to hbound (scs$processor_data, 1) while (^found);
+			pdp = addr (scs$processor_data (j));
+			if pdata.controller_port = cdata.eima_data (i).mask_assignment then
+			     if pdata.online then do; /* if mask assigned to this cpu and online */
+				found = "1"b;
+				scs$processor_test_data.mask_cpu = j;
+			     end;
+		     end;
+		end;
+		else if cdata.type >= "0010"b then do;	/* mask not assigned to online cpu but avail. */
+		     do j = 0 to hbound (scs$processor_data, 1) while (^found);
+			pdp = addr (scs$processor_data (j));
+			if pdata.online then do;	/* if this cpu is online, he is candidate for our mask cpu */
+			     found = "1"b;
+			     scs$processor_test_data.mask_cpu = j; /* save tag and assign mask to this cpu */
+			     call scr_util$assign_mask ((iscu), (pdata.controller_port));
+			end;
+		     end;
+		end;
+	end;
+	if ^found then do;				/* didn't find mask */
+	     rcode = rcerr_isolts_no_mask;
+	     return;
+	end;
+
+/* Force our process to run on the active CPU */
+
+	cpu_mask = "0"b;
+	substr (cpu_mask, scs$processor_test_data.mask_cpu + 1, 1) = "1"b;
+	call set_procs_required (cpu_mask, tcode);
+	if tcode ^= 0 then do;
+	     rcode = rcerr_sprq_failed;
+	     return;
+	end;
+
+/* safe store original config data for this SCU (to be restored later) and remove core in this SCU from paging pool */
+
+	scs$cfg_data_save = scs$cfg_data (iscu);
+	base = cdata.base;				/* set base and size values */
+	size = cdata.size;
+	call pc_abs$remove_core (base, size, tcode);
+	if tcode ^= 0 then do;			/* some problem get out */
+	     rcode = tcode;
+	     return;
+	end;
+	scs$processor_test_data.scu_state = "01"b;	/* change scu state */
+	call scr_util$isolts_scu_p1;			/* reconfig SCU */
+%page;
+
+/* Set scs$cpu_test_pattern to start interrupt level */
+
+	scs$cpu_test_pattern = scs$processor_start_pattern;
+
+/* Grab base 2k of all other non-bootload SCUs and pad with STA *, DIS pairs */
+
+	remember = 0;				/* clear remember array */
+	do i = 0 to hbound (scs$controller_data, 1);
+	     if scs$controller_data (i).online & i ^= iscu & i ^= scs$interrupt_controller then do; /* if online */
+		base = scs$controller_data (i).base;	/* and not bootload and not our SCU */
+		call pc_abs$remove_core (base, 2, tcode); /* remove the core */
+		if tcode = 0 then do;
+		     call pad_mem (base, 2);		/* if no problem pad mem with STA *,DIS pairs */
+		     remember (i) = base;		/* remember this scu */
+		     string (tsdw (i)) = string (tsdw1);
+		end;
+	     end;
+	end;
+
+/* pad lower 256k of selected SCU's memory with STA *, DIS pairs */
+
+	base = scs$controller_data (iscu).base;
+	if scs$controller_data (iscu).size < 256 then	/* protect against store faults */
+	     size = scs$controller_data (iscu).size;
+	else size = 256;
+	call pad_mem (base, size);
+	tsdw2 = tsdw1;				/* save sdw to our dedicated memory */
+
+/* Send connects to make all other processors suspend normal operation. */
+
+	call wire_proc$wire_me;			/* Take no interrupts or page faults here. */
+	call privileged_mode_ut$wire_and_mask (mask_temp, ptp);
+
+	do while (^stac (addr (scs$connect_lock), pds$processid));
+	end;					/* Lock up the connect lock. */
+
+	scs$processor_start_wait = scs$processor & ^prds$processor_pattern;
+						/* Stop all other processors. */
+	do i = 0 to 7;				/* Loop through all processors. */
+	     old_pdp = addr (scs$processor_data (i));	/* Get pointer to data for processor. */
+	     if (i ^= prds$processor_tag) & old_pdp -> pdata.online then
+		call privileged_mode_ut$cioc (old_pdp); /* Send connects to other processors. */
+	end;
+
+	do while (scs$processor_start_wait);		/* Wait for other processors to respond. */
+	end;
+
+/* Set up selected fault and interrupt vectors in system zero based memory */
+
+	fvp = addr (fault_vector$);			/* Get pointer to fault vector. */
+
+/* Set up STA *, DIS pair for CPU start interrupt. */
+	int_vec_save (1) = fv.ipair (scs$processor_start_int_no).scu;
+	int_vec_save (2) = fv.ipair (scs$processor_start_int_no).tra;
+	fv.ipair (scs$processor_start_int_no).scu = rel (addr (fv.ipair (scs$processor_start_int_no).scu))
+	     || "755200"b3;
+	fv.ipair (scs$processor_start_int_no).tra = rel (addr (fv.ipair (scs$processor_start_int_no).tra))
+	     || "616200"b3;
+
+/* Set up STA *, DIS pair for trouble fault. */
+	trouble_save (1) = fv.fpair (trouble_fault).scu;
+	trouble_save (2) = fv.fpair (trouble_fault).tra;
+	fv.fpair (trouble_fault).scu = rel (addr (fv.fpair (trouble_fault).scu)) || "755200"b3;
+	fv.fpair (trouble_fault).tra = rel (addr (fv.fpair (trouble_fault).tra)) || "616200"b3;
+
+/* Set up STA *, DIS pair for startup fault. */
+	startup_save (1) = fv.fpair (startup_fault).scu;
+	startup_save (2) = fv.fpair (startup_fault).tra;
+	fv.fpair (startup_fault).scu = rel (addr (fv.fpair (startup_fault).scu)) || "755200"b3;
+	fv.fpair (startup_fault).tra = rel (addr (fv.fpair (startup_fault).tra)) || "616200"b3;
+
+/* Set up STA *, DIS pair for onc fault. */
+	onc_save (1) = fv.fpair (onc_fault).scu;
+	onc_save (2) = fv.fpair (onc_fault).tra;
+	fv.fpair (onc_fault).scu = rel (addr (fv.fpair (onc_fault).scu)) || "755200"b3;
+	fv.fpair (onc_fault).tra = rel (addr (fv.fpair (onc_fault).tra)) || "616200"b3;
+
+/* Set up STA *, DIS pair for lockup fault */
+	lockup_save (1) = fv.fpair (lockup_fault).scu;
+	lockup_save (2) = fv.fpair (lockup_fault).tra;
+	fv.fpair (lockup_fault).scu = rel (addr (fv.fpair (lockup_fault).scu)) || "755200"b3;
+	fv.fpair (lockup_fault).tra = rel (addr (fv.fpair (lockup_fault).tra)) || "616200"b3;
+
+/* Send processor start interrupt, open processor's mask, and wait for it to respond. */
+
+	call int_test_cpu (tcode);
+
+/* delay until the STA * takes effect */
+
+	do i = 1 to 500 while (inst (0) = "000000755200"b3);
+	     call privileged_mode_ut$clear_cache;	/* Make sure cache gets updated */
+	end;
+
+/* if location 0 of our dedicated memory did not change then something is wrong */
+
+	if inst (0) = "000000755200"b3 then do;		/* failure */
+	     reconfig_err = "1"b;			/* set error flag */
+
+/* now check the bootload SCU to see if the switches were set wrong */
+
+	     if fv.ipair (scs$processor_start_int_no).scu ^= rel (addr (fv.ipair (scs$processor_start_int_no).scu))
+		|| "755200"b3 then do;
+		tcode = rcerr_isolts_wrong_scu;	/* answered on wrong scu */
+		switchp -> switch_w1.errtag = scs$interrupt_controller;
+	     end;
+	     else if fv.fpair (trouble_fault).scu ^= rel (addr (fv.fpair (trouble_fault).scu)) || "755200"b3 then do;
+		tcode = rcerr_isolts_wrong_scu_cell;	/* trouble fault on bootload scu */
+		switchp -> switch_w1.offset = rel (addr (fv.fpair (trouble_fault).scu));
+		switchp -> switch_w1.valid = "1"b;
+		switchp -> switch_w1.errtag = scs$interrupt_controller;
+	     end;
+	     else if fv.fpair (startup_fault).scu ^= rel (addr (fv.fpair (startup_fault).scu)) || "755200"b3 then do;
+		tcode = rcerr_isolts_wrong_scu_cell;	/* got startup fault on bootload scu */
+		switchp -> switch_w1.offset = rel (addr (fv.fpair (startup_fault).scu));
+		switchp -> switch_w1.valid = "1"b;
+		switchp -> switch_w1.errtag = scs$interrupt_controller;
+	     end;
+	     else if fv.fpair (onc_fault).scu ^= rel (addr (fv.fpair (onc_fault).scu)) || "755200"b3 then do;
+		tcode = rcerr_isolts_wrong_scu_cell;	/* onc fault on bootload scu */
+		switchp -> switch_w1.offset = rel (addr (fv.fpair (onc_fault).scu));
+		switchp -> switch_w1.valid = "1"b;
+		switchp -> switch_w1.errtag = scs$interrupt_controller;
+	     end;
+	     else if fv.fpair (lockup_fault).scu ^= rel (addr (fv.fpair (lockup_fault).scu)) || "755200"b3 then do;
+		tcode = rcerr_isolts_wrong_scu_cell;	/* lockup fault on bootload scu */
+		switchp -> switch_w1.offset = rel (addr (fv.fpair (lockup_fault).scu));
+		switchp -> switch_w1.valid = "1"b;
+		switchp -> switch_w1.errtag = scs$interrupt_controller;
+	     end;
+	end;
+
+/* restore system fault and int vectors */
+
+	fv.ipair (scs$processor_start_int_no).scu = int_vec_save (1);
+	fv.ipair (scs$processor_start_int_no).tra = int_vec_save (2);
+	fv.fpair (trouble_fault).scu = trouble_save (1);
+	fv.fpair (trouble_fault).tra = trouble_save (2);
+	fv.fpair (startup_fault).scu = startup_save (1);
+	fv.fpair (startup_fault).tra = startup_save (2);
+	fv.fpair (onc_fault).scu = onc_save (1);
+	fv.fpair (onc_fault).tra = onc_save (2);
+	fv.fpair (lockup_fault).scu = lockup_save (1);
+	fv.fpair (lockup_fault).tra = lockup_save (2);
+
+/* reset connect lock */
+
+	if ^stacq (scs$connect_lock, (36)"0"b, scs$connect_lock) then ; /* just reset lock, null then cluse */
+
+	call privileged_mode_ut$unwire_unmask (mask_temp, ptp);
+	call wire_proc$unwire_me;			/* Can unwire now. */
+
+/* if we had an error but did not find it above, check lower 2 k of all non-bootload scus */
+
+	if reconfig_err & tcode = 0 then do;		/* check lower 2k of other non-bootload scus */
+	     do i = 0 to 7 while (tcode = 0);		/* go through each scu if neccessary */
+		if remember (i) ^= 0 then do;		/* if we deallocated core from this SCU */
+		     call privileged_mode_ut$swap_sdw (abs_seg_p, addr (tsdw (i))); /* get correct sdw */
+		     if inst (0) ^= "000000755200"b3 then /* answered on wrong SCU */
+			tcode = rcerr_isolts_wrong_scu;
+
+		     else do k = 2 to 2046 by 2 while (tcode = 0);
+			if inst (k) ^= bit (bin (k, 18), 18) || "755200"b3 then do; /* found it */
+			     tcode = rcerr_isolts_wrong_scu_cell;
+			     switchp -> switch_w1.offset = bit (bin (k, 18), 18);
+			     switchp -> switch_w1.valid = "1"b;
+			end;
+		     end;
+		end;
+	     end;
+	     if tcode ^= 0 then			/* if we found error */
+		switchp -> switch_w1.errtag = i - 1;	/* set error tag */
+	end;
+
+/* Now give back the double pages we borrowed */
+
+	do i = 0 to hbound (scs$controller_data, 1);
+	     base = remember (i);
+	     if base > 0 then do;
+		call freecore (base);
+		call freecore (base + 1);
+	     end;
+	end;
+	call privileged_mode_ut$swap_sdw (abs_seg_p, addr (tsdw2)); /* restore sdw to our dedicated memory */
+
+/* if we had an error but did not find it above, check our dedicated memory */
+
+	if reconfig_err & tcode = 0 then
+	     call check_mem (0);			/* go check our dedicated memory */
+	if tcode ^= 0 then do;			/* if some problem above - get out */
+	     rcode = tcode;				/* copy error code */
+	     return;
+	end;
+
+/* Execute read switch program to determine if cpu is configured correctly */
+
+	inst (1) = "000001616200"b3;			/* set DIS instruction in loc 1 */
+
+	dps8 = "0"b;				/* reset dps8 indicator */
+	rswp = addr (scs$processor_switch_data (2));	/* preset rsw (2) ptr */
+	do i = 1 to 4 while (^dps8);			/* read each of 4 possible read switch types */
+	     do j = 1 to 2;				/* RSW first followed by STA */
+		if j = 1 then			/* if first iteration set up RSW */
+		     inst (0) = bit (bin (i, 18), 18) || "231200"b3; /* set RSW instruction */
+		else inst (0) = "000000755200"b3;	/* 2nd iteration, set STA * in loc 0 */
+		call int_test_cpu (tcode);		/* send interrupt */
+		do k = 1 to 500;			/* delay awhile */
+		end;
+		call privileged_mode_ut$clear_cache;	/* Make sure cache gets updated */
+		if j = 2 then			/* if second iteration */
+		     if inst (0) ^= "000000755200"b3 then do; /* if we didn't time out.... */
+			scs$processor_switch_data (i) = inst (0); /* copy rsw data out */
+			if i = 2 then		/* if rsw (2) complete, check cpu type */
+			     if dps8_rsw_2.cpu_type > 0 then /* If dps8 cpu */
+				dps8 = "1"b;	/* quit now */
+		     end;
+		     else do;			/* no response from cpu we are adding */
+			call check_mem (2);		/* go check if we answered on another int cell */
+			rcode = tcode;		/* copy error code */
+			scs$processor_switch_compare (2) = /* save RSW inst we were using */
+			     bit (bin (i, 18), 18) || "231200"b3;
+			return;			/* and let user report error */
+		     end;
+	     end;
+	end;
+	if dps8 then do;				/* set up for dps8 cpu */
+	     req_mem, scs$processor_test_data.req_mem = 128; /* reserve 128K for DPS8s */
+	     str_flt_operand = "400000"b3;		/* should take str flt at 128K */
+	     isolts_switch_template (1) = isolts_switch_template (1) | "002002002002"b3;
+	     isolts_switch_mask (1) = isolts_switch_mask (1) | "042042042042"b3;
+	     isolts_switch_template (3), isolts_switch_mask (3) = "0"b; /* No RSW (3) for dps8 */
+	end;
+	else do;					/* /* set up for L68 cpu */
+	     req_mem, scs$processor_test_data.req_mem = 64; /* reserve 64K for L68s */
+	     str_flt_operand = "200000"b3;		/* should take str flt at 64K */
+	     isolts_switch_template (1) = isolts_switch_template (1) | "001001001001"b3;
+	     isolts_switch_mask (1) = isolts_switch_mask (1) | "041041041041"b3;
+	     isolts_switch_template (3) = isolts_switch_template (3) | "001001001001"b3;
+	     isolts_switch_mask (3) = isolts_switch_mask (3) | "041041041041"b3;
+	end;
+
+/* Exclusive or the switches with our switch template and "and" the result with our mask */
+
+	scs$processor_switch_compare = (bool (scs$processor_switch_data, isolts_switch_template, "0110"b))
+	     & isolts_switch_mask;
+
+/* if any descrepencies exist return now */
+
+	found = "0"b;				/* reset error indicator */
+	do i = 1 to 4 while (^found);			/* go through each read switch data word */
+	     if scs$processor_switch_compare (i) ^= "0"b then do;
+		rcode = rcerr_isolts_bad_switches;
+		return;
+	     end;
+	     if i = 2 then				/* if rsw (2) */
+		if dps8 then			/* and a dps8 cpu... */
+		     found = "1"b;			/* that is it, exit */
+	end;
+	scs$processor_switch_compare = scs$processor_switch_data; /* return good switch readings to user */
+
+/* Check to see if a LDA instruction works correctly */
+
+	inst (2) = "0"b;				/* set cell 2 of our dedicated memory area to 0 */
+	inst (0) = "000002235200"b3;			/* set LDA 2 inst in loc 0 */
+	call int_test_cpu (tcode);			/* issue interrupt to test cpu */
+	do k = 1 to 500;				/* delay for awhile */
+	end;
+	inst (0) = "000000755200"b3;			/* set STA 0 in loc 0 */
+	call int_test_cpu (tcode);
+	do k = 1 to 500;				/* delay for awhile */
+	end;
+	call privileged_mode_ut$clear_cache;		/* Make sure cache gets updated */
+
+/* if the LDA worked correctly, location 0 should contain a value of 0 */
+
+	if inst (0) ^= "0"b then do;			/* LDA did not work correctly */
+	     rcode = rcerr_isolts_lda_fail;
+	     return;
+	end;
+
+/* Check to make sure that a LDA to an address >= <port_size> will generate a store fault */
+
+	inst (0) = "000002710000"b3;			/* must tra out of vector to avoid trb flt */
+	inst (2) = str_flt_operand || "235000"b3;	/* set lda to req_mem */
+	call int_test_cpu (tcode);			/* issue interrupt to test cpu */
+	do k = 1 to 500;				/* delay for awhile */
+	end;
+	call privileged_mode_ut$clear_cache;		/* Make sure cache gets updated */
+
+/* If the store fault vector equals zero then a store fault occurred */
+
+	if abs_seg_p -> fv.fpair (store_fault).scu = rel (addr (fv.fpair (store_fault).scu))
+	     || "755200"b3 then do;			/* failure */
+	     rcode = rcerr_isolts_no_str_flt;
+	     return;
+	end;
+
+/* Since we will be using a simulated IOM 0 terminate interrupt for ISOLTS testing
+   lets make sure that our test processor will answer it */
+
+	scs$cpu_test_pattern = cell12;		/* set test pattern for interrupt cell 12 */
+	call int_test_cpu (tcode);			/* execute simulated interrupt */
+	do k = 1 to 500;				/* delay for awhile */
+	end;
+	call privileged_mode_ut$clear_cache;		/* Make sure cache gets updated */
+	if abs_seg_p -> fv.ipair (12).scu = rel (addr (fv.ipair (12).scu))
+	     || "755200"b3 then do;			/* interrupt failed */
+	     rcode = rcerr_isolts_wrong_cell;
+	     switchp -> switch_w1.cell = 12;		/* set cell number */
+	     return;
+	end;
+
+/* Now we can return to the system all memory in our selected SCU above req_mem */
+
+	call scr_util$isolts_scu_p2;			/* re-enable original active ports */
+	call set_procs_required ("0"b, tcode);		/* reset proc required */
+
+	if scs$controller_data (iscu).size > req_mem then do; /* only give it back if it is there */
+	     base = scs$controller_data (iscu).base;	/* pick up system base and size of our SCU */
+	     size = scs$controller_data (iscu).size;
+	     do i = base + req_mem to size + base - 1;	/* give back each page */
+		call freecore (i);
+	     end;
+	end;
+
+/* Now set scu_state indicator to indicate that we only have lower memory now */
+
+	scs$processor_test_data.scu_state = "11"b;
+	scs$processor_data (icpu).cache_size = IGNORE_CACHE_SIZE; /* set so validate_cpu_card will ignore size */
+	return;					/* return to caller */
+
+%page;
+
+/* int_test_cpu - entry to set up conditions to issue a SMIC instruction to the CPU being tested with ISOLTS */
+
+int_test_cpu: entry (rcode);
+
+	if scs$reconfig_lock ^= pds$processid | ^scs$processor_test_data.active then do; /* if not ISOLTS process */
+	     rcode = rcerr_isolts_not;		/* return error code */
+	     return;
+	end;
+	else rcode = 0;				/* otherwise return 0 */
+
+	if scs$processor_test_data.scu_state = "11"b then do; /* if running on lower memory */
+	     cpu_mask = "0"b;
+	     substr (cpu_mask, scs$processor_test_data.mask_cpu + 1, 1) = "1"b;
+	     call set_procs_required (cpu_mask, rcode);	/* run on CPU with mask set */
+	     if rcode ^= 0 then do;
+		rcode = rcerr_sprq_failed;
+		return;
+	     end;
+	end;
+
+	call scr_util$set_mask ((scs$processor_test_data.scu_tag), /* mask to system level first */
+	     (scs$processor_data (scs$processor_test_data.cpu_tag).controller_port),
+	     "000000000017000000000017"b3 & scs$cpu_test_mask);
+
+	call privileged_mode_ut$smic_port (scs$cpu_test_pattern, (scs$processor_test_data.scu_tag)); /* do the SMIC */
+
+	call scr_util$set_mask ((scs$processor_test_data.scu_tag), /* open interrupts to test cpu */
+	     (scs$processor_data (scs$processor_test_data.cpu_tag).controller_port), scs$cpu_test_mask);
+
+	if scs$processor_test_data.scu_state = "11"b then /* if running on lower memory */
+	     call set_procs_required ("0"b, (0));	/* reset proc required */
+
+	return;
+
+%page;
+
+/* isolts_final - entry to remove SCU from ISOLTS test CPU depending on state of scs$processor_test_data.scu_state */
+
+isolts_final: entry;
+
+	i = fixed (scs$processor_test_data.scu_state, 2); /* convert scu_state to fixed bin */
+	if i = 0 then return;			/* if scu_state = "00"b - NOP */
+
+	iscu = scs$processor_test_data.scu_tag;		/* pick up scu_tag */
+	cdp = addr (scs$controller_data (iscu));
+
+	if i = 2 | i = 3 then do;			/* if either of these two states, we must restore SCU masks */
+	     cpu_mask = "0"b;
+	     substr (cpu_mask, scs$processor_test_data.mask_cpu + 1, 1) = "1"b;
+	     call set_procs_required (cpu_mask, tcode);
+	     if tcode ^= 0 then
+		call syserr$error_code (CRASH, tcode, "configure_test_cpu: Unable to run on CPU ^a",
+		     substr (LETTERS, scs$processor_test_data.mask_cpu + 1, 1));
+
+	     call scr_util$isolts_scu_p3;		/* go change masks */
+	     call set_procs_required ("0"b, (0));	/* reset cpu required */
+	end;
+
+	base = cdata.base;				/* pick up base address of controller */
+	if i = 1 | i = 2 then			/* if state is "01"b | "10"b */
+	     size = cdata.size;			/* restoe all of scus memory to system */
+	else size = scs$processor_test_data.req_mem;	/* if state is = "11"b then only req_mem needs to be restored */
+
+	do k = base to base + size - 1;		/* return memory to system */
+	     call freecore (k);
+	end;
+
+	scs$cpu_test_mask, scs$cpu_test_pattern = "0"b;	/* reset ISOLTS specific info */
+	scs$cfg_data_save = 0;
+
+	return;					/* return to caller */
+
+%page;
+
+/* pad_mem - subroutine to pad up to 256k of desired memory with sta *, dis * instructions */
+
+pad_mem: proc (base, pages);
+
+dcl  (base, pages) fixed bin;
+
+	abs_seg_p = addr (isolts_abs_seg$);		/* get ptr to isolts_abs_seg */
+	string (tsdw1) = "0"b;			/* clear out  sdw */
+	tsdw1.df = "1"b;
+	tsdw1.read = "1"b;
+	tsdw1.write = "1"b;
+	tsdw1.unpaged = "1"b;
+	tsdw1.add = bit (bin (base * 1024, 24), 24);
+	tsdw1.bound = bit (bin (((pages * 1024) / 16) - 1, 14), 14); /* set bounds to number of pages */
+	call privileged_mode_ut$swap_sdw (abs_seg_p, addr (tsdw1)); /* swap the sdw */
+
+	do l = 0 to pages * 1024 - 2 by 2;		/* iterate through desired memory */
+	     inst (l) = bit (l) || "755200"b3;
+	     inst (l + 1) = bit (l) || "616200"b3;
+	end;
+     end pad_mem;
+
+/* check_mem - subroutine to check if cpu answered on a different interrupt cell, than expected */
+
+check_mem: proc (si);
+
+dcl  si fixed bin;
+
+	found = "0"b;
+	do k = si to size - 2 by 2 while (^found);	/* check all of our memory */
+	     if inst (k) ^= bit (bin (k, 18)) || "755200"b3 then /* found error */
+		found = "1"b;
+	end;
+	if found then do;				/* if  we answered on wrong cell */
+	     tcode = rcerr_isolts_wrong_cell;
+	     switchp -> switch_w1.offset = bit (bin (k - 2, 18)); /* set offset */
+	     switchp -> switch_w1.valid = "1"b;
+	     switchp -> switch_w1.errtag = iscu;
+	end;
+	else tcode = rcerr_isolts_no_response;		/* if can't find no other reason */
+
+     end check_mem;
+%page;
+
+%include rcerr;
+
+%page;
+
+%include scs;
+%page;
+%include rsw;
+%page;
+
+%include sdw;
+
+%page;
+
+%include fault_vector;
+
+%include syserr_constants;
+
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   configure_test_cpu: Unable to run on CPU X ERRORMESSAGE
+
+   S: $crash
+
+   T: When ISOLTS is terminating
+
+   M: The system is attempting to restore the ISOLTS CPU to service.
+   In attempting to reassign its interrupt mask, it was unable
+   to run on that CPU.  This indicates hardware or software malfunction.
+
+   A: $recover
+
+   END MESSAGE DOCUMENTATION */
+
+     end configure_test_cpu;

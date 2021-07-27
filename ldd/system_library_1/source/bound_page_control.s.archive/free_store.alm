@@ -1,0 +1,637 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Bull Inc., 1987                *
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+" *                                                         *
+" ***********************************************************
+
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	free_store - disk address management routines
+"
+"	Entries
+"
+"
+"             withdraw     - allocate a disk address from stock/volmap
+"
+"	    withdraw_list_ext - allocate a bunch of disk addresses from
+"		         stock/volmap for a non-ALM-page-control caller
+"
+"	    deposit      - return an address to stock/volmap
+"
+"	    deposit_list - return a list of addresses to stock/volmap
+"
+"
+"	Rewritten for stock management by J. Bongiovanni, February 1982
+"	Modified July 1982, J. Bongiovanni, for scavenger
+"	Modified 831219, E. N. Kittlitz, withdraw_list_ext
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+	name	free_store
+
+	segdef	withdraw
+	segdef	withdraw_list_ext
+	segdef	deposit
+	segdef	deposit_list
+
+	equ	deposit_list_no_args,6
+	equ	deposit_list_argl_chars,8+8*deposit_list_no_args
+	even
+segno_offset_mask:
+	oct	077777000000
+	oct	777777000000
+strip_null_addr:
+	oct	377777777777
+"
+	include	add_type
+"
+	include	apte
+"
+	include	page_info
+"
+	include	pvte
+"
+	include	pxss_page_stack
+"
+	include	scavenger_data
+"
+	include	stack_frame
+"
+	include	stock_seg
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	withdraw
+"
+"	tsx7	free_store$withdraw
+"	<return if out-of-physical-volume>
+"	<return if must wait>
+"	<return if address allocated>
+"
+"	On entry,
+"	    PVTE index in pvtx
+"
+"	On exit,
+"	    if must wait, event in APTE
+"	    if address allocated, in devadd
+"
+"	Must be called with PTL held
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+withdraw:
+	tsx6	page_fault$savex		" Recursive use of x7
+	tsx6	setup			" Save/establish registers
+	lda	bp|pvte.pc_vacating_word
+	cana	pvte.pc_vacating,dl
+	tnz	withdraw_oopv
+
+withdraw_retry:
+	tsx7	stock$withdraw		" Attempt to withdraw from stock
+	tra	withdraw_out_of_stock	" Failed
+	als	18			" Succeed - address in AU
+	ora	add_type.disk,dl	
+	sta	devadd
+	tsx6	check_address_range		" Make sure it's in the paging region
+
+	lda	devadd
+	tsx6	withdraw_scav_check		" Check for conflict with online scavenge in progress
+	tra	withdraw_retry		" Conflict - grab another
+					" No conflict
+
+	tsx7	lock_volmap$lock_wired_nowait	" Lock volmap to check for threshold
+	tra	unsavex_2			" Couldn't get it - no problem
+
+	tsx7	stock$check_low_threshold	" Check stock to be replenished
+	tra	withdraw_unlocks		" Doesn't need to be or can't
+	sta	free_store_temp		" Volmap page number
+
+	tsx7	volmap_page$start_async_read	" Read in volmap page
+	tra	withdraw_in_mem		" Already in memory
+	tra	withdraw_unlocks		" Not in memory
+
+withdraw_in_mem:
+	lda	free_store_temp		" Volmap page number
+	tsx7	volmap$withdraw_from_volmap	" Volmap to stock
+
+	lda	free_store_temp		" Volmap page number
+	tsx7	volmap_page$start_async_write	" Write it back
+	tra	withdraw_unlocks		" Unlock and return
+	tra	page_error$volmap_async_error	" Not in memory
+
+withdraw_unlocks:
+	tsx7	lock_volmap$unlock_wired
+	tra	unsavex_2			" Return with devadd
+
+"
+withdraw_out_of_stock:
+	tsx7	lock_volmap$lock_wired_wait	" Try for lock, state idle
+	tra	unsavex_1			" Failed - wait for it
+
+	tsx7	stock$check_low_threshold	" Find volmap page for withdrawal
+	tra	withdraw_unlocks_oopv	" None left
+	sta	free_store_temp		" Volmap page number
+
+	tsx7	volmap_page$start_async_read	" Read in page
+	tra	withdraw_os_in_mem		" Already in memory
+	tra	withdraw_unlocks_waits	" Not yet - wait for it
+
+withdraw_os_in_mem:
+	lda	free_store_temp		" Volmap page
+	tsx7	volmap$withdraw_from_volmap	" Volmap to stock
+
+	lda	free_store_temp		" Volmap page
+	tsx7	volmap_page$start_async_write	" Write it back
+	tra	withdraw_unlocks_waits	" Can't go until it's done
+	tra	page_error$volmap_async_error	" Not in memory
+
+withdraw_unlocks_oopv:
+	tsx7	lock_volmap$unlock_wired
+	lda	bp|pvte.used_word		" Check for out of HC PART
+	cana	pvte.used,dl
+	tze	page_error$out_of_hc_part	" Indeed
+withdraw_oopv:
+	tra	unsavex			" Normal OOPV
+
+withdraw_unlocks_waits:
+	tsx7	lock_volmap$unlock_wired
+withdraw_unlocks_retry:
+	ldq	bp|pvte.volmap_idle_notify_word
+	lda	bp|pvte.volmap_idle_notify_word
+	ora	pvte.volmap_idle_notify,dl
+	stacq	bp|pvte.volmap_idle_notify_word
+	tnz	withdraw_unlocks_retry
+
+	eaa	bp|0			" PVTE offset
+	arl	18
+	ora	pvt$volmap_idle_wait_constant	" Wait event
+	eppap	pds$apt_ptr,*		" Stash in APTE ourselves, to
+	sta	ap|apte.wait_event		"  avoid race
+	tra	unsavex_1
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	withdraw_list_ext
+"
+"	call page$withdraw_list (pvtx, arrayp, offset, count, event, code);
+"
+"	Where
+"	    pvtx = index of PVTE
+"	    arrayp = ptr to array of addresses (lbound = 0)
+"	    offset = (input) first address of array to use
+"		  (output) next address of array to use
+"	    count = (input) number of pages to withdraw
+"		= (output) number of pages still to be withdrawn
+"	    event = non-zero => wait event
+"	    code  = non-zero if allocation cannot be performed
+"
+"	Must be called with PTL held
+"	This entry is designed to be called repeatedly until count = 0.
+"	If an out-of-volume condition arises, the caller should deposit
+"	all addresses after releasing the PTL.
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+withdraw_list_ext:
+	push
+	tsx6	page_fault$init_savex	" Recursive use of x7
+	stz	ap|10,*			" event = ""b
+	stz	ap|12,*			" code = 0
+	lda	ap|2,*			" PVTE index
+	sta	pvtx
+	lda	ap|8,*			" count
+	tmoz	withdraw_list_end		" silly person
+
+withdraw_list_loop:
+	tsx7	withdraw			" withdraw calls setup!
+	tra	withdraw_list_oopv		" foo
+	tra	withdraw_list_waits
+	eppap	sp|stack_frame.arg_ptr,*	" restore ap
+	epplb	ap|4,*			" pointer to arrayp
+	epplb	lb|0,*			" arrayp
+	lda	ap|6,*			" array offset
+	ldq	devadd			" this evening's guest star
+	stq	lb|0,al			" put it away
+	aos	ap|6,*			" bump array offset
+	lca	1,dl			" and lower count left
+	asa	ap|8,*
+	tpnz	withdraw_list_loop		" still more
+
+withdraw_list_end:
+	tsx6	meter
+	return
+
+withdraw_list_waits:
+	eppap	sp|stack_frame.arg_ptr,*	" restore ap
+	epplb	pds$apt_ptr,*		" return wait event
+	lda	lb|apte.wait_event
+	sta	ap|10,*
+	tra	withdraw_list_end
+
+withdraw_list_oopv:
+	eppap	sp|stack_frame.arg_ptr,*	" restore ap
+	lda	error_table_$log_vol_full	" close enough
+	sta	ap|12,*			" gimme a break
+	tra	withdraw_list_end
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	deposit
+"
+"	call page$deposit (pvtx, devadd, vtocx, pageno)
+"
+"	Where
+"	    pvtx = index of PVTE
+"	    devadd = address to deposit
+"	    vtocx = index of VTOCE (-1 if unknown)
+"	    pageno = page number within segment
+"
+"	NOTE: vtocx and pageno are used only by the scavenger
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+deposit:
+	push
+	tsx6	page_fault$init_savex	" Recursive use of x7
+	lda	ap|2,*			" PVTE index
+	sta	pvtx
+	tsx6	setup			" Establish registers
+
+	lda	bp|pvte.deposit_to_volmap_word " Slow deposit?
+	cana	pvte.deposit_to_volmap,dl
+	tnz	call_pl1_deposit		" Yes
+
+	tsx6	deposit_check_scav		" This volume being scavenged
+	tra	call_pl1_deposit		" Yes
+
+	lda	ap|4,*			" Record address
+	tsx7	deposit_try		" Attempt deposit to stock
+	tra	call_pl1_deposit		" Too much for me
+
+	tsx6	meter_deposit
+	return
+
+call_pl1_deposit:
+	call	pc_deposit$pc_deposit(ap|0)
+	tsx6	meter_deposit
+	return
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	deposit_list
+"
+"	call page$deposit_list (pvtx, arrayp, first, last, vtocx, pagenop)
+"
+"	Where
+"	    pvtx = index of PVTE
+"	    arrayp = ptr to array of addresses (lbound = 1)
+"	    first = first array element to be deposited
+"	    last = last array element to be deposited
+"	    vtocx = VTOCE index (-1 if unknown)
+"	    pagenop = ptr to array of page numbers within segment (lbound=1),
+"	              or null
+"
+"	NOTE: vtocx and pagenop are used only by the scavenger
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+deposit_list:
+	push
+	tsx6	page_fault$init_savex	" Recursive use of x7
+	lda	ap|2,*			" Index of PVTE
+	sta	pvtx	
+	tsx6	setup			" Establish registers
+
+	spriap	free_store_temp_1		" Save argument pointer
+	ldq	ap|6,*			" First element
+	stq	free_store_temp		" Save
+
+	lda	bp|pvte.deposit_to_volmap_word " Slow deposit?
+	cana	pvte.deposit_to_volmap,dl
+	tnz	call_pl1_deposit_list	" Yes
+
+	tsx6	deposit_check_scav		" Is this volume being scavenged
+	tra	call_pl1_deposit_list	" Yes
+
+deposit_list_loop:
+	eppap	free_store_temp_1,*		" Restore argument pointer
+	ldq	free_store_temp		" Next element
+	cmpq	ap|8,*			" Done last
+	tpnz	deposit_list_returns	" Yes
+	eppap	ap|4,*			" ap -> ptr -> array (1)
+	eppap	ap|0,*			" ap -> array (1)
+	lda	ap|-1,ql			" Next address
+	tsx7	deposit_try		" Attempt to deposit to stock
+	tra	call_pl1_deposit_list	" Call the big guy
+	aos	free_store_temp		" Bump to next array element
+	tra	deposit_list_loop
+
+call_pl1_deposit_list:
+	eppap	free_store_temp_1,*		" Restore argument pointer
+	ldx0	ap|0			" x0 = 2 * (# args)
+	cmpx0	2*deposit_list_no_args,du	" The right number?
+	tnz	page_error$invalid_deposit_list_args " No
+	mlr	(pr),(pr)			" Copy arg list
+	desc9a	ap|0,deposit_list_argl_chars
+	desc9a	arg,deposit_list_argl_chars
+	eppap	free_store_temp		" And change first
+	spriap	arg+6
+	stz	arg+1			" No descriptors
+	call	pc_deposit$deposit_list(arg)
+
+deposit_list_returns:
+	tsx6	meter_deposit
+
+	return
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	deposit_try - internal procedure to attempt a deposit to the
+"		stock
+"
+"	tsx7	deposit_try
+"	<return if fail>
+"	<return if succeed>
+"
+"	On entry,
+"	    bp -> PVTE
+"	    bb -> record stock
+"	    ab -> stock_seg$meters
+"	    Areg = disk address
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+deposit_try:
+	tsx6	page_fault$savex		" Recursive use of x7
+	ana	strip_null_addr		" Make address live
+	cana	add_type.disk,dl		" Is it a disk address
+	tze	page_error$deposit_invalid_addtype " No - bad news
+
+	tsx6	check_address_range		" Make sure it's in the paging region
+
+	arl	18			" Address to AL
+	tsx7	stock$deposit		" Attempt to deposit to stock
+	tra	page_fault$unsavex		" Failed
+	tra	page_fault$unsavex_1	" Succeeded
+
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	setup - internal procedure to save/establish registers
+"
+"	tsx6	setup
+"
+"	On entry,
+"	    pvtx contains index of PVTE
+"
+"	On return,
+"	    bp -> pvte
+"	    bb -> record stock
+"	    ab -> stock_seg$meters
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+setup:
+	stx2	savx2_3			"Save PC registers
+	sxl3	savx2_3
+	
+	inhibit	on	<+><+><+><+><+><+><+><+><+><+><+><+><+><+><+><+>
+
+	read_clock
+	sbaq	pds$cpu_time		" AQ = Total CPU Time
+	sbaq	pds$virtual_delta		" AQ = Total VCPU Time
+	staq	free_store_start_time	" Save for metering
+
+	inhibit	off	<-><-><-><-><-><-><-><-><-><-><-><-><-><-><-><->
+
+	eppbp	pvt$array			" PVTE array
+	ldq	pvte_size,dl
+	mpy	pvtx			" Offset of one beyond
+	eppbp	bp|-pvte_size,ql		" bp -> PVTE
+	spribp	free_store_temp_1
+
+	lprpbb	bp|pvte.volmap_stock_ptr	" bb -> record stock
+	lprpab	bb|record_stock.pvtep	" Check synchronization
+	epaq	ab|0			" PVTE ptr
+	eraq	free_store_temp_1		" Compare with other PVTE ptr
+	canaq	segno_offset_mask		" Interesting bits only
+	tnz	page_error$stock_out_of_synch	" Don't point to each other
+
+	epbpab	bb|0			" ab -> base of stock_seg
+	eppab	ab|stock_seg.meters		" ab -> meters
+	tra	0,x6
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	check_address_range - internal procedure to validate that an
+"	     address is within the paging region of the device
+"
+"	tsx6	check_address_range
+"
+"	On entry,
+"	    bp -> pvte
+"	    AU contains non-null address (AL is not relevant)
+"
+"	On return,
+"	    Areg is not changed
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+check_address_range:
+
+	sta	devadd			" For page_error
+
+	ldx0	bp|pvte.baseadd		" Begin of paging region
+	cmpx0	devadd			" Above beginning
+	tpnz	page_error$address_out_of_range " No
+	lxl0	bp|pvte.totrec		" Size of paging region
+	adlx0	bp|pvte.baseadd		" Address 1 beyond end of region
+	cmpx0	devadd			" Below end
+	tmoz	page_error$address_out_of_range " No
+
+	tra	0,x6			" Address within paging region
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	withdraw_scav_check - internal procedure to check for a conflict
+"	     in the address just withdrawn with a scavenge in progress.
+"	     A conflict exists if the address is marked as in-user or
+"	     conflict.
+"
+"	tsx6	withdraw_scav_check
+"	<return if conflict>
+"	<return if no scavenge or no conflict>
+"
+"	On entry,
+"	    bp -> PVTE
+"	    ab -> stock_seg$meters
+"	    AU contains non-null address
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+withdraw_scav_check:
+	lxl0	bp|pvte.scavenger_block_rel	" Scavenge in progress
+	tze	1,x6			" No
+	ldq	bp|pvte.scav_check_address_word
+	canq	pvte.scav_check_address,dl	" Does scavenger want us to check the address
+	tze	1,x6			" No
+
+	aos	ab|rsmeters.withdraw_check_scav " Meter
+	eppap	scavenger_data$+0,x0	" ap -> scavenger block
+	eax0	0,au			" Record address
+	sblx0	bp|pvte.baseadd		" Record address w/i paging region
+	eppap	ap|scavenger_block.records,x0	" ap -> record block for this record address
+
+withdraw_scav_lock:				" Lock record block
+	ldq	ap|0
+	lda	ap|0
+	canq	record_block.lock,dl	" Locked
+	tnz	withdraw_scav_lock		" Yes
+	ora	record_block.lock,dl
+	stacq	ap|0			" Try to lock
+	tnz	withdraw_scav_lock		" Failed
+
+	arl	record_block.state_shift	" Extract state of address
+	ana	record_block.state_mask,dl
+	tra	withdraw_check_state,al	" And do state-ly things
+
+withdraw_check_state:
+	tra	withdraw_unseen
+	tra	withdraw_free
+	tra	withdraw_in_use
+	tra	withdraw_conflict
+
+withdraw_unseen:
+withdraw_free:				" Mark in use to this vtocx, page number
+	stz	free_store_temp
+	lda	vtocx			" Faulting VTOCE index
+	ana	record_block.vtocx_mask,dl
+	als	record_block.vtocx_shift
+	orsa	free_store_temp
+	lda	pageno			" Faulting page number
+	ana	record_block.pageno_mask,dl
+	als	record_block.pageno_shift
+	orsa	free_store_temp
+	lda	STATE_IN_USE,dl
+	als	record_block.state_shift
+	ora	free_store_temp
+
+	ldq	ap|0
+	stacq	ap|0			" Unlock address
+	tnz	page_error$scav_stacq_fails
+	tra	1,x6
+
+withdraw_in_use:
+
+	lda	STATE_CONFLICT,dl		" Change state to conflict
+	ldq	record_block.state_mask,dl
+	als	record_block.state_shift
+	qls	record_block.state_shift
+	orq	record_block.lock,dl
+	erq	=-1			" Q has mask to reset state, lock
+	stq	free_store_temp
+	ldq	ap|0			" Pick up address block
+	ansq	free_store_temp		" Reset state, lock
+	ora	free_store_temp		" Address block with state, lock reset
+	ldq	ap|0
+	stacq	ap|0			" Unlock address block
+	tnz	page_error$scav_stacq_fails
+withdraw_conflict:
+	aos	ab|rsmeters.withdraw_conflict	" Meter
+	tra	0,x6
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	deposit_check_scav - Internal procedure to determine whether this
+"		           volume is being scavenged and addresses being
+"			 deposited need to be checked.
+"
+"	tsx6	deposit_check_scav
+"	<return if addresses must be checked>
+"	<return if address need not be checked>
+"
+"	On entry,
+"	    bp -> PVTE
+"
+"	
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+deposit_check_scav:
+	lxl0	bp|pvte.scavenger_block_rel	" Scavenge going on?
+	tze	1,x6			" No
+	ldq	bp|pvte.scav_check_address_word
+	canq	pvte.scav_check_address,dl	" Check addresses?
+	tze	1,x6			" No
+	tra	0,x6			" Yes
+
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	Returns to page control, restoring registers
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+
+unsavex:
+	tsx6	restore_regs
+	tra	page_fault$unsavex
+
+unsavex_1:
+	tsx6	restore_regs
+	tra	page_fault$unsavex_1
+
+unsavex_2:
+	tsx6	restore_regs
+	tra	page_fault$unsavex_2
+
+restore_regs:
+	ldx2	savx2_3
+	lxl3	savx2_3
+	eppbb	sst$
+	eppbp	bb|0,x2
+
+"	Fall through to meter
+
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+"
+"	meter CPU time
+"
+" " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+meter:
+	eax0	0			" Withdraw
+	tra	meter_common
+
+meter_deposit:
+	eax0	1			" Deposit
+
+	inhibit	on	<+><+><+><+><+><+><+><+><+><+><+><+><+><+><+><+>
+
+meter_common:
+	read_clock
+	sbaq	pds$cpu_time		" AQ = Total CPU time
+	sbaq	pds$virtual_delta		" AQ = Total VCPU time
+	sbaq	free_store_start_time	" AQ = VCPU in free_store
+	eax0	0,x0			" Withdraw
+	tnz	meter_deposit_exit		" No
+	adaq	ab|rsmeters.withdraw_time
+	staq	ab|rsmeters.withdraw_time
+	increment	ab|rsmeters.withdraw_calls
+	tra	0,x6
+
+meter_deposit_exit:
+	adaq	ab|rsmeters.deposit_time
+	staq	ab|rsmeters.deposit_time
+	increment	ab|rsmeters.deposit_calls
+	tra	0,x6
+
+	inhibit	off	<-><-><-><-><-><-><-><-><-><-><-><-><-><-><-><->
+
+	end

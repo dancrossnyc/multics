@@ -1,0 +1,868 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,indattr */
+
+load_mpc: proc;
+
+/* LOAD_MPC - A command to load firmware into an MPC */
+
+/* Written in 1975 by Larry Johnson */
+/* Installed as a tool in February 1980 */
+/* Modified May 1982 by Rich Coppola to add support of the EURC */
+/* Modified Sept 1982 by Rich Coppola to dc reset the EURC before running
+   self-test. */
+/* Modified June 1984 by Paul Farley to add calls to phcs_$ring_0_message
+   for informing the operator(and syserr log) that a MPC's state is changing.
+   This will include Suspending IO, Running tests, Loading firmware(and what
+   revision) and Resuming IO(or leaving IO suspended if error occurred).
+   This means the user will now be required to also have phcs_ access.
+   Changed the "special" code in run_dcw to allow for multiple specials,
+   where the ones after the first will be discarded and to allow for the
+   special to be before the terminate or visa-versa...
+   Also added code to allow for a 10 second retry period for power off faults.
+   Modified June 1985 by Paul Farley to extend POF retry to 20 seconds.
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+     audit(86-02-11,Coppola), install(86-03-21,MR12.0-1033):
+     Support IMU.
+  2) change(86-01-23,Farley), approve(86-03-03,MCR7360),
+     audit(86-07-11,Coppola), install(86-08-18,MR12.0-1096):
+     Changed to check DAU after firmware load to see if really operational. DAU
+     continues to do initialization after good FW load terminate, so OPI may
+     not be up yet.
+  3) change(86-08-14,Farley), approve(86-10-24,MCR7529),
+     audit(86-10-28,Fawcett), install(86-10-28,MR12.0-1200):
+     Extended post firmware load status test to ALL DISK MPCs, as it has been
+     found that they all have the timing window, but very small.
+     
+     Added one second pause time between ITR test pages, to give the IMU and
+     MPC time to bring OPI back up.
+  4) change(86-10-24,Farley), approve(86-10-24,MCR7545),
+     audit(86-10-28,Fawcett), install(86-10-28,MR12.0-1200):
+     Add a call to dc_reset after sucessfully running ITRs. The ITRs now leave
+     the MPC in a state where firmware does not operate properly after being
+     loaded unless the dc_reset is done.
+                                                   END HISTORY COMMENTS */
+
+/* Automatic storage */
+
+dcl  code		        fixed bin (35);		/* Standard system status code */
+dcl  arg_cnt	        fixed bin;			/* Count of command arguments */
+dcl  i		        fixed bin;			/* Indexes for loops */
+dcl  phcs_access	        fixed bin (5);		/* current access to phcs_ */
+dcl  execute	        bit (5) init ("00100"b);	/* mask for checking for execute permission */
+dcl  arg_ptr	        ptr;			/* Pointer to a command argument */
+dcl  arg_len	        fixed bin;			/* Length of that argument */
+dcl  arg		        char (arg_len) based (arg_ptr); /* The argument */
+dcl  firm_sw	        bit (1) init ("1"b);		/* "1"b if firmware is to be reloaded */
+dcl  itr_sw	        bit (1) init ("1"b);		/* "1"b if itrs are to be run */
+dcl  eurc_data_error        bit (1) init ("0"b);		/* "1"b if an error is detected in self-test data xfer */
+dcl  pcw_words	        bit (72) aligned;		/* This is a pcw */
+dcl  err_msg	        char (20) var init ("terminate"); /* For building error messages */
+dcl  msg_sw	        bit (1) init ("1"b);		/* This is reset if -brief is used */
+dcl  timer_sw	        bit (1) init ("0"b);		/* This is set if -time is requested */
+dcl  eurc_sw	        bit (1) init ("0"b);		/* MPC is an EURC */
+dcl  (start_time, end_time) fixed bin (52);		/* For measuring elapsed time */
+dcl  elapsed_time	        fixed bin (35);		/* End_time-start_time */
+dcl  stopped_io	        bit (1) init ("0"b);		/* This is set if I have suspended io */
+dcl  mpc_dead	        bit (1) init ("0"b);		/* Set while mpc has no firmware loaded */
+dcl  io_begun	        bit (1) init ("0"b);		/* Set when i/o started on mpc */
+dcl  buf_ptr	        ptr;			/* Pointer to workspace */
+dcl  fw_revision	        char (2);			/* Firmware revision */
+dcl  timer_channel	        fixed bin (71) init (-1);	/* Channel for timing operations */
+dcl  eurc_test	        char (14) init ("EURC Self-test");
+dcl  TEST_NAME	        char (32) var init ("");
+dcl  1 wait_list,					/* List of events to wait for */
+       2 nchan	        fixed bin,			/* 1 to wait for i/o event, 2 to wait for i/o or timer */
+       2 channel_id	        (2) fixed bin (71);		/* This is the list */
+dcl  special_status_flag    bit (1) aligned;		/* "1"b syas special status valid */
+dcl  special_status_word    bit (36) aligned;		/* a place to put special status */
+dcl  ioi_io_tm	        fixed bin (71);		/* time of IOI connect */
+dcl  RETRY_IO_LABEL	        label variable;		/* used to restart the I/O */
+dcl  seconds_from_last_io   fixed bin;
+
+
+dcl  1 auto_attach_mpc_data like attach_mpc_data aligned automatic;
+dcl  1 auto_event_wait_info aligned like event_wait_info automatic;
+
+/* Based */
+
+dcl  1 buf	        aligned based (buf_ptr),	/* The ioi workspace */
+       2 idcw	        bit (36),
+       2 dcw	        (2) bit (36),
+       2 port_mask	        bit (36),			/* Urmpc port mask for device firmware */
+       2 data	        (8192) bit (36);		/* Most that can be loaded with 2 DCW's */
+
+dcl  1 eurc_buf	        aligned based (buf_ptr),	/* The IOI buffer segment */
+       2 idcw1	        bit (36),			/* will be execute self-test */
+       2 dcw1	        bit (36),			/* Addr = control.dummy_data */
+       2 idcw2	        bit (36),			/* initiate data xfer idcw */
+       2 dcw2	        bit (36),			/* Addr = control.eurc_self_test_data */
+       2 control,
+         3 dummy_data       (2) bit (36),
+         3 eurc_self_test_data (40) bit (36);		/* Only need twenty words, but leave some room for a crazy EURC */
+
+dcl  eurc_test_data	        (6) bit (36) based (eurc_test_datap) aligned;
+dcl  eurc_test_datap        ptr;
+
+
+/* Static data */
+
+dcl  MAX_TIMEOUT	        fixed bin internal static options (constant) init (20);
+						/* Maximum length of time in seconds to wait for IO completion */
+dcl  ONE_SECOND	        fixed bin (71) internal static options (constant) init (1);
+dcl  TWO_SECOND	        fixed bin (71) internal static options (constant) init (2);
+dcl  eurc_check_data        (6) bit (36) internal static options (constant) init
+		        ("252525252525"b3,
+		        "525252525252"b3,
+		        "252525252525"b3,
+		        "525252525252"b3,
+		        "525252525252"b3,
+		        "252525252525"b3);
+dcl  name		        char (8) internal static options (constant) init ("load_mpc"); /* Name of this program */
+
+/* Entry constants and externals */
+
+dcl  attach_mpc_	        entry (ptr, fixed bin (35));
+dcl  cu_$arg_ptr	        entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  cu_$arg_count	        entry (fixed bin);
+dcl  com_err_	        entry options (variable);
+dcl  convert_ipc_code_      entry (fixed bin (35));
+dcl  detach_mpc_	        entry (ptr, fixed bin (35));
+dcl  hcs_$get_user_effmode  entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35));
+dcl  ioa_		        entry options (variable);
+dcl  ioi_$connect	        entry (fixed bin, fixed bin, fixed bin (35));
+dcl  ioi_$connect_pcw       entry (fixed bin, fixed bin, bit (36) aligned, fixed bin (35));
+dcl  ioi_$workspace	        entry (fixed bin, ptr, fixed bin (18), fixed bin (35));
+dcl  ioi_$release_devices   entry (fixed bin, fixed bin (35));
+dcl  ioi_$suspend_devices   entry (fixed bin, fixed bin (35));
+dcl  ioi_$get_special_status entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+dcl  ipc_$block	        entry (ptr, ptr, fixed bin (35));
+dcl  ipc_$create_ev_chn     entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$delete_ev_chn     entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$drain_chn	        entry (fixed bin (71), fixed bin (35));
+dcl  load_mpc_fw_info_      entry (ptr, char (*), bit (1), bit (1), ptr, fixed bin (35));
+dcl  parse_io_channel_name_ entry (char (*), fixed bin (3), fixed bin (6), fixed bin (35));
+dcl  release_temp_segment_  entry (char (*), pointer, fixed bin (35));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+
+dcl  error_table_$noarg     fixed bin (35) ext static;
+dcl  error_table_$request_not_recognized fixed bin (35) ext static;
+dcl  error_table_$badopt    fixed bin (35) ext static;
+dcl  error_table_$noentry   fixed bin (35) ext static;
+
+dcl  (addr, addrel, bin, bit, clock, float, hbound, min, null, rel, rtrim, size, string, substr, unspec, divide) builtin;
+
+dcl  cleanup	        condition;
+%page;
+/* Some initialization first */
+
+	call cu_$arg_count (arg_cnt);			/* This is a useful number */
+	if arg_cnt = 0 then do;
+	     call com_err_ (0, name, "Usage: ^a mpc_name {-chn -itr -firm -bf -time}", name);
+	     return;
+	end;
+
+	attach_mpc_datap = addr (auto_attach_mpc_data);
+	unspec (attach_mpc_data) = "0"b;
+	attach_mpc_data.version = attach_mpc_data_version_1;
+	attach_mpc_data.mpc_name = "";
+	attach_mpc_data.caller_name = name;
+	attach_mpc_data.bootload_channel = "1"b;	/* We always need a bootable channel! */
+	fw_revision = "";
+
+	event_wait_info_ptr = addr (auto_event_wait_info);
+	imp = addr (event_wait_info.message);
+	statp = addr (imess.status);
+	io_special_status_ptr = addr (special_status_word);
+	fwlistp = null ();
+
+	on cleanup call clean_up;			/* Setup cleanup handler */
+
+/* Scan arguments */
+
+	do i = 1 to arg_cnt;			/* Scan remaining arguments */
+	     call cu_$arg_ptr (i, arg_ptr, arg_len, code);
+	     if code ^= 0 then go to err_1;		/* This can't happen */
+	     if substr (arg, 1, 1) ^= "-" then do;	/* If not a control argument */
+		if attach_mpc_data.mpc_name = "" then attach_mpc_data.mpc_name = arg;
+		else do;
+req_err:		     call com_err_ (error_table_$request_not_recognized, name, "^a", arg);
+		     go to exit;
+		end;
+	     end;
+	     else if arg = "-channel" | arg = "-chn" then do;
+		i = i + 1;
+		call cu_$arg_ptr (i, arg_ptr, arg_len, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, name, "After -channel");
+		     go to exit;
+		end;
+		call parse_io_channel_name_ (arg, attach_mpc_data.iom, attach_mpc_data.channel, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, name, "^a", arg);
+		     go to exit;
+		end;
+		attach_mpc_data.channel_required = "1"b;
+	     end;
+	     else if arg = "-itr" then firm_sw = "0"b;	/* -itr means don't load firmware */
+	     else if arg = "-firm" then itr_sw = "0"b;	/* -firm means don't run itrs */
+	     else if arg = "-brief" | arg = "-bf" then msg_sw = "0"b; /* Quiet mode */
+	     else if arg = "-time" then timer_sw = "1"b;
+	     else if arg = "-revision" | arg = "-rv" | arg = "-rev" then do; /* Firmware revision */
+		i = i + 1;
+		call cu_$arg_ptr (i, arg_ptr, arg_len, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, name, "After -revision");
+		     go to exit;
+		end;
+		fw_revision = arg;
+	     end;
+	     else do;				/* Ran out of cases  */
+		call com_err_ (error_table_$badopt, name, "^a", arg);
+		go to exit;
+	     end;
+	end;
+
+	if attach_mpc_data.mpc_name = "" & ^attach_mpc_data.channel_required then do;
+	     call com_err_ (error_table_$noarg, name, "MPC name or channel ");
+	     go to exit;
+	end;
+
+	if ^(itr_sw | firm_sw) then itr_sw, firm_sw = "1"b; /* If -firm and -itr specified */
+%page;
+/* Check callers access to phcs_ for sending messages to the console
+   and syserr log. */
+
+	call hcs_$get_user_effmode (">system_library_1", "phcs_", "", -1, phcs_access, code);
+
+	if code ^= 0 then do;
+	     call com_err_ (code, name, "Cannot get effective access to >sl1>phcs_.");
+	     goto exit;
+	end;
+
+	if bit (phcs_access) & execute
+	then ;
+	else do;
+	     call com_err_ (code, name, "Improper access to >sl1>phcs_ gate.");
+	     goto exit;
+	end;
+
+/* Initialize event channels */
+
+	call ipc_$create_ev_chn (timer_channel, code);	/* Get timer channel */
+	if code ^= 0 then go to err_3;
+	wait_list.channel_id (2) = timer_channel;
+
+	attach_mpc_data.report = "1"b;
+	attach_mpc_data.channel_required = "1"b;	/* If not previously set, do it NOW! */
+
+	call attach_mpc_ (attach_mpc_datap, code);
+	if code ^= 0 then go to exit;
+	wait_list.channel_id (1) = attach_mpc_data.ioi_channel;
+
+	eurc_sw = "0"b;
+	if attach_mpc_data.type = "urp" then
+	     do i = 1 to hbound (eurc_model_numbers, 1) while (eurc_sw = "0"b);
+
+	     if attach_mpc_data.model = eurc_model_numbers (i) then
+		eurc_sw = "1"b;
+	end;
+
+	if eurc_sw then do;				/* perform basic option checks for EURC */
+	     if (firm_sw & ^itr_sw) then do;
+		call com_err_ (error_table_$badopt, name, "Cannot load FW in EURC.");
+		go to exit;
+	     end;
+	end;
+
+/* Figure out firmware requirements for this mpc */
+	if ^eurc_sw then do;
+	     call load_mpc_fw_info_ (attach_mpc_data.mpc_cardp, fw_revision, itr_sw, firm_sw, fwlistp, code);
+	     if code ^= 0 then go to exit;
+	end;
+
+/* Perform workspace initialization */
+
+	call ioi_$workspace (attach_mpc_data.ioi_index, buf_ptr, size (buf), code); /* Assign work area */
+	if code ^= 0 then do;
+	     call com_err_ (code, name, "Unable to set workspace size to ^d words.", size (buf));
+	     go to exit;
+	end;
+%page;
+/* First, suspend all io and do a do a dc reset of the mpc */
+
+	call ioi_$suspend_devices (attach_mpc_data.ioi_index, code); /* This waits for all i/o to finish */
+	if code ^= 0 then do;
+	     call com_err_ (code, name, "Unable to suspend I/O on ^a.", attach_mpc_data.mpc_name);
+	     go to exit;
+	end;
+
+	stopped_io = "1"b;				/* Remember that I did this */
+
+	call opr_notify ("Suspended I/O");		/* notify/log */
+
+	call dc_reset;				/* Using this routine */
+
+	if eurc_sw then do;
+	     firm_sw = "0"b;
+	     TEST_NAME = eurc_test;
+	     call make_eurc_dcw;
+	     if msg_sw then call ioa_ ("^a: Executing EURC self-test.", name);
+	     call opr_notify ("Executing EURC self-test");/* notify/log */
+	     call run_dcw ("0"b);
+						/* If we come back here all went well */
+						/* Now verify the self-test data */
+	     eurc_data_error = "0"b;
+	     eurc_test_datap = addr (eurc_self_test_data (15));
+	     if unspec (eurc_test_data) ^= unspec (eurc_check_data) then
+		do i = 1 to 6;
+		if eurc_test_data (i) ^= eurc_check_data (i) then do;
+		     call com_err_ (0, name, "Data from EURC is incorrect:,^/data was:^-^w^/should be:^-^w",
+			eurc_test_data (i), eurc_check_data (i));
+		     eurc_data_error = "1"b;
+		end;
+	     end;
+	     if ^eurc_data_error then mpc_dead = "0"b;
+	     go to exit;
+	end;
+
+	if itr_sw then do;
+	     call run_itrs;				/* Run itr's */
+	     call dc_reset;				/* itr's ran, reset mpc */
+	end;
+
+	if firm_sw then call load_firmware;		/* Load firmware */
+
+	if substr (attach_mpc_data.mpc_name, 1, 3) = "msp" & ^mpc_dead then do;
+						/* See if DISK MPC really ready */
+	     mpc_dead = "1"b;			/* mark as dead until IO is complete */
+	     call make_dcw ("00"b3, "02"b3, 0);		/* request-status */
+	     call run_dcw ("0"b);			/* execute */
+	     mpc_dead = "0"b;			/* MPC is OK */
+	end;
+
+exit:	call clean_up;
+
+
+	if io_begun & ^mpc_dead & ^msg_sw then		/* Print msg if brief mode and all worked ok */
+	     call ioa_ ("^a: Completed run of ^a.", name, attach_mpc_data.mpc_name);
+
+	return;					/* Command is done */
+%page;
+/* Run all its's */
+
+run_itrs: proc;
+
+dcl  i		        fixed bin;
+dcl  opr_not_notified       bit (1) init ("1"b);
+
+	do i = 1 to fwlist.n;
+	     fwep = addr (fwlist.entry (i));
+	     if fwe.type = FWE_TYPE_ITR then do;
+		unspec (buf.data) = unspec (control_store_overlay);
+		call make_dcw ("10"b3, "00"b3, fwe.cs_len); /* Build dcw list */
+		if msg_sw then call ioa_ ("^a: Running ^a.", name, fwe.name);
+		if opr_not_notified then do;
+		     call opr_notify ("Executing ITRs");/* notify/log */
+		     opr_not_notified = "0"b;
+		end;
+		TEST_NAME = fwe.name;
+		call run_dcw ("1"b);		/* Run it */
+		call pause (ONE_SECOND);
+	     end;
+	end;
+
+	return;
+
+     end run_itrs;
+%page;
+/* Procedure to restore the standard firmware to an mpc */
+
+load_firmware: proc;
+
+dcl  (cs_ok, rw_ok, df_ok)  bit (1) init ("0"b);		/* These bits are set as firmware components restored */
+dcl  fwx		        fixed bin;
+
+	do fwx = 1 to fwlist.n;
+	     fwep = addr (fwlist.entry (fwx));
+	     if fwe.type = FWE_TYPE_FW then go to got_firmware;
+	end;
+	call com_err_ (error_table_$noentry, name, "Firmware for ^a got lost somewhere.", attach_mpc_data.mpc_name);
+	go to exit;				/* Sorry */
+
+got_firmware:
+	call opr_notify ("Loading firmware, revision " || fw_revision); /* notify/log */
+	unspec (buf.data) = unspec (control_store_overlay);
+	call make_dcw ("10"b3, "00"b3, fwe.cs_len);	/* Build dcw list */
+	if msg_sw then call ioa_ ("^a: Loading ^a control store.", name, fwe.name);
+	TEST_NAME = fwe.name;
+	call run_dcw ("0"b);			/* Run it */
+	cs_ok = "1"b;				/* Control store overlay restored */
+
+	unspec (buf.data) = unspec (read_write_overlay);
+	call make_dcw ("11"b3, "00"b3, fwe.rw_len);	/* Build dcw list */
+	if msg_sw then call ioa_ ("^a: Loading ^a read/write.", name, fwe.name);
+	TEST_NAME = fwe.name;
+	call run_dcw ("0"b);			/* Run it */
+	rw_ok = "1"b;				/* Read write overlay restored */
+	if attach_mpc_data.type = "urp" then call dev_firm (df_ok); /* Reload device firmware */
+	else df_ok = "1"b;				/* If none, just set the flag */
+
+	mpc_dead = ^(rw_ok & cs_ok & df_ok);		/* If all restored, mpc not dead any more */
+
+	return;
+
+     end load_firmware;
+%page;
+/* Procedure to load special device firmware for urmpc */
+
+dev_firm: proc (load_ok);
+
+dcl  load_ok	        bit (1);			/* This is "1"b if this routine suceeds */
+
+dcl  i		        fixed bin;
+
+	load_ok = "1"b;				/* Assume this routine will work */
+
+	do i = 1 to fwlist.n;
+	     fwep = addr (fwlist.entry (i));
+	     if fwe.type = FWE_TYPE_DEV & fwe.port_mask ^= "0"b then do;
+		unspec (buf.data) = unspec (control_store_overlay);
+		buf.port_mask = "0"b;
+		substr (buf.port_mask, 2, 8) = fwe.port_mask;
+		call make_mask_dcw ("36"b3, "00"b3, fwe.cs_len);
+		idcwp = addr (buf.idcw);		/* Point at idcw */
+		idcw.device = "01"b3;		/* This is addressed to device 1 */
+		idcw.chan_cmd = "40"b3;
+		if msg_sw then call ioa_ ("^a: Loading ^a; ports: ^b", name,
+			fwe.name, fwe.port_mask);
+		TEST_NAME = fwe.name;
+		call run_dcw ("0"b);		/* Run it */
+	     end;
+	end;
+
+	return;
+
+     end dev_firm;
+%page;
+/* Procedure to build pcw and dcw list to load firmware */
+
+make_dcw: proc (op_code, channel_cmd, data_len);
+
+dcl  op_code	        bit (6);			/* The device command to use */
+dcl  channel_cmd	        bit (6);			/* The channel cmd to use */
+dcl  data_len	        fixed bin;			/* The length of the data */
+dcl  tally_len	        fixed bin;			/* The length of the data in the current DCW */
+dcl  data_loc	        fixed bin (18) uns;		/* Location of data */
+dcl  len		        fixed bin;
+
+	len = data_len;
+	data_loc = bin (rel (addr (buf.data)));
+
+join:	idcwp = addr (buf.idcw);			/* IDCW is built in first word of buffer */
+	string (idcw) = "0"b;			/* Reset it */
+	idcw.command = op_code;			/* Copy in opcode */
+	idcw.chan_cmd = channel_cmd;
+	idcw.code = "111"b;				/* This must be set to make an IDCW */
+
+	dcwp = addr (buf.dcw);			/* An IOTD will be built here */
+	string (dcw) = "0"b;
+	do while (len > 0);
+	     string (dcw) = "0"b;			/* Reset it first */
+	     dcw.address = bit (data_loc, 18);
+	     tally_len = min (len, 4096);
+	     len = len - tally_len;
+	     data_loc = data_loc + tally_len;
+	     if tally_len = 4096 then tally_len = 0;
+	     dcw.tally = bit (bin (tally_len, 12), 12);
+	     dcw.type = "01"b;
+	     if len > 0 then dcwp = addrel (dcwp, 1);
+	end;
+	dcw.type = "00"b;
+
+	return;
+%page;
+make_eurc_dcw: entry;
+
+/* Build dcw list to initiate EURC self-test */
+
+	idcwp = addr (eurc_buf.idcw1);		/* First IDCW */
+	eurc_buf.idcw1 = "0"b;
+	idcw.command = "31"b3;			/* Command is Set Diagnostic Mode */
+	idcw.code = "111"b;				/* This makes it an IDCW */
+	idcw.control = "10"b;			/* Set continue bit */
+	idcw.chan_cmd = "40"b3;			/* Indicate special controller command */
+	idcw.count = "22"b3;			/* Run self-test */
+	dcwp = addr (eurc_buf.dcw1);
+	eurc_buf.dcw1 = "0"b;
+	dcw.address = rel (addr (eurc_buf.control));	/* Get offset to control word */
+	dcw.tally = "000000000010"b;
+	idcwp = addr (eurc_buf.idcw2);		/* Set up Second IDCW */
+	eurc_buf.idcw2 = "0"b;
+	idcw.command = "06"b3;			/* Initiate read data xfer */
+	idcw.code = "111"b;				/* This makes it an IDCW */
+	idcw.chan_cmd = "40"b3;			/* Special controller command */
+	dcwp = addr (eurc_buf.dcw2);
+	eurc_buf.dcw2 = "0"b;
+	dcw.address = rel (addr (eurc_buf.eurc_self_test_data));
+	dcw.tally = "0024"b3;			/* need 20 words */
+
+/* Now fill in the data for the EURC */
+
+	unspec (eurc_buf.control) = "0"b;
+						/* zero it out first */
+						/* This is the TO EURC data, checked by the EURC */
+
+	eurc_buf.eurc_self_test_data (2) = "777777777777"b3;
+	eurc_buf.eurc_self_test_data (3) = "525252525252"b3;
+	eurc_buf.eurc_self_test_data (4) = "252525252525"b3;
+	eurc_buf.eurc_self_test_data (5) = "252525252525"b3;
+	eurc_buf.eurc_self_test_data (6) = "525252525252"b3;
+	eurc_buf.eurc_self_test_data (7) = "525252525252"b3;
+	eurc_buf.eurc_self_test_data (8) = "252525252525"b3;
+	eurc_buf.eurc_self_test_data (9) = "400400400400"b3;
+	eurc_buf.eurc_self_test_data (10) = "377377377377"b3;
+	eurc_buf.eurc_self_test_data (11) = "125125125125"b3;
+	eurc_buf.eurc_self_test_data (12) = "252252252252"b3;
+	eurc_buf.eurc_self_test_data (13) = "017017017017"b3;
+	eurc_buf.eurc_self_test_data (14) = "360360360360"b3;
+
+/* The next 6 words in the buffer will contain data FROM the EURC, they are already zeroed out */
+
+	return;
+
+%page;
+make_mask_dcw: entry (op_code, channel_cmd, data_len);	/* Include port mask */
+
+	len = data_len + 1;
+	data_loc = bin (rel (addr (buf.port_mask)));
+	go to join;
+
+     end make_dcw;
+%page;
+/* Procedure to run a dcw list and check status */
+
+run_dcw: proc (spec_sw);
+
+dcl  spec_sw	        bit (1);			/* Set if a special interrupt is expected */
+
+	RETRY_IO_LABEL = start_io;			/* used to retry POFs */
+	ioi_io_tm = clock ();			/* setup new time for POF retry */
+start_io: call ipc_$drain_chn (attach_mpc_data.ioi_channel, code); /* Be sure no events  */
+	if code ^= 0 then go to err_3;
+	call ioi_$connect (attach_mpc_data.ioi_index, 0, code); /* Attempt the connect */
+	if code ^= 0 then go to err_1;		/* If it failed, give up */
+	if timer_sw then start_time = clock ();		/* Record start time */
+	wait_list.nchan = 1;			/* Only waiting on 1 channel, for i/o */
+run_block: call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Now wait for something to happen */
+	if code ^= 0 then go to err_3;
+	if timer_sw then end_time = clock ();
+
+
+/* See what did happen and act accoridingly */
+
+	if imess.time_out then do;			/* If termination because of time out */
+time_err:	     call com_err_ (0, name, "Timeout running ^a while waiting for ^a",
+		TEST_NAME, err_msg);
+	     go to exit;
+	end;
+
+/* If special status expected when running ITRs, we get a terminate and then a special */
+/* ** BUT ** we could get several of the same specials(over different channels)
+   and the order of special/terminate may be different... */
+
+	if spec_sw then do;
+	     if imess.level = "3"b3 then do;		/* this must be from the command */
+		err_msg = "terminate";
+		call check_status;			/* verify good status */
+
+		err_msg = "special";		/* Special interupt expected now */
+		call timer_manager_$reset_alarm_wakeup (timer_channel); /* Remove outstanding alarm */
+		call ipc_$drain_chn (timer_channel, code); /* Reset timer channel */
+		if code ^= 0 then go to err_3;
+		call timer_manager_$alarm_wakeup (60, "11"b, timer_channel); /* Set 60 second timer */
+		wait_list.nchan = 2;		/* Waiting for i/o or timer event now */
+		call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for something to happen */
+		if code ^= 0 then go to err_3;
+		if timer_sw then end_time = clock ();	/* Record end time */
+		if event_wait_info.channel_id = timer_channel then go to time_err; /* If time out */
+		if imess.level ^= "7"b3 then go to wrong_stat;
+						/* check status */
+		call ioi_$get_special_status (attach_mpc_data.ioi_index,
+		     special_status_flag, special_status_word, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, name, "Atempting to get special status word.");
+		     go to exit;
+		end;
+		if ^(special_status_flag | io_special_status.t) then do;
+		     call com_err_ (0, name, "No special status recieved.");
+		     go to exit;
+		end;
+		if substr (special_status_word, 25, 1) = "0"b then do;
+						/* ITR had an error */
+		     call ioa_ ("^a: ^a Failed.", name, fwe.name);
+		     go to exit;
+		end;
+		return;
+
+	     end;
+	     else if imess.level = "7"b3 then do;	/* ITR complete */
+		err_msg = "special";
+						/* check status */
+		call ioi_$get_special_status (attach_mpc_data.ioi_index,
+		     special_status_flag, special_status_word, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, name, "Atempting to get special status word.");
+		     go to exit;
+		end;
+		if ^(special_status_flag | io_special_status.t) then do;
+		     call com_err_ (0, name, "No special status recieved.");
+		     go to exit;
+		end;
+		if substr (special_status_word, 25, 1) = "0"b then do;
+						/* ITR had an error */
+		     call ioa_ ("^a: ^a Failed.", name, fwe.name);
+		     go to exit;
+		end;
+		err_msg = "terminate";
+wait_for_term:
+		call timer_manager_$reset_alarm_wakeup (timer_channel); /* Remove outstanding alarm */
+		call ipc_$drain_chn (timer_channel, code); /* Reset timer channel */
+		if code ^= 0 then go to err_3;
+		call timer_manager_$alarm_wakeup (60, "11"b, timer_channel); /* Set 60 second timer */
+		wait_list.nchan = 2;		/* Waiting for i/o or timer event now */
+		call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for something to happen */
+		if code ^= 0 then go to err_3;
+		if timer_sw then end_time = clock ();	/* Record end time */
+		if event_wait_info.channel_id = timer_channel then go to time_err; /* If time out */
+		if imess.level = "7"b3 then go to wait_for_term; /* discard special */
+		call check_status;			/* verify good status */
+		return;
+
+	     end;
+	end;
+
+	err_msg = "termination";			/* Looking for termination now */
+
+	if imess.level ^= "3"b3 then do;		/* If not termination */
+wrong_stat:    call com_err_ (0, name, "Unexpected level ^.3b status when ^a expected running ^a",
+		imess.level, err_msg, TEST_NAME);
+	     go to exit;
+	end;
+
+	call check_status;
+						/* check for good status */
+
+	if timer_sw then do;			/* If time requested */
+	     elapsed_time = end_time - start_time;
+	     if elapsed_time < 1000 then call com_err_ (0, name, "time = ^d usec", elapsed_time);
+	     else if elapsed_time < 1000000 then call com_err_ (0, name, "time = ^.1f msec",
+		     float (elapsed_time) / 1000.);
+	     else call com_err_ (0, name, "time = ^.1f sec", float (elapsed_time) / 1.0e6);
+	end;
+
+	return;
+
+     end run_dcw;
+%page;
+
+/* Routine to  check IOM status for any error indications */
+check_status: proc;
+
+
+	if ^status.t then do;			/* If no status.. */
+	     call send_err ("IOM did not set status bit running ^a.",
+		(TEST_NAME));
+	     go to exit;
+	end;
+
+	if status.power then do;			/* If power off */
+	     seconds_from_last_io = divide (clock () - ioi_io_tm, 1000000, 17, 0);
+	     if seconds_from_last_io < MAX_TIMEOUT then do; /* try IO again? */
+		call pause (ONE_SECOND);		/* take small breather */
+		goto RETRY_IO_LABEL;		/* Try it again, Sam! */
+	     end;
+	     call send_err ("Power off error running ^a.", (TEST_NAME));
+	     go to exit;
+	end;
+
+	if status.major | status.sub | status.channel_stat | status.central_stat then do; /* If any other error */
+	     call com_err_ (0, name, "Bad status returned running ^a: major=^b sub=^b",
+		TEST_NAME, status.major, status.sub);
+	     if eurc_sw then if status.major = "12"b3 then
+		     call com_err_ (0, name, "^a failed. Fault Vector = ^2o",
+			eurc_test, status.sub);
+
+	     if status.channel_stat then call com_err_ (0, name, "IOM channel status=^b",
+		     status.channel_stat);
+	     if status.central_stat then call com_err_ (0, name, "IOM central status=^b",
+		     status.central_stat);
+	     go to exit;
+	end;
+	return;
+     end check_status;
+
+
+%page;
+/* Procedure to dc reset of an mpc by isuing a reset pcw */
+
+dc_reset: proc;
+
+	mpc_dead = "1"b;				/* This routine will almost certainly kill it */
+	io_begun = "1"b;				/* Real stuff is starting */
+
+	pcwp = addr (pcw_words);			/* Get PCW pointer */
+	string (pcw) = "0"b;			/* Reset it */
+	pcw.code = "111"b;				/* Set PCW code */
+	pcw.mask = "1"b;				/* Make it a reset PCW */
+	pcw.control = "11"b;
+
+	idcwp = addr (buf.idcw);
+	string (idcw) = "0"b;
+	idcw.code = "111"b;
+	idcw.chan_cmd = "000010"b;
+
+	ioi_io_tm = clock ();			/* remember time */
+	call ioi_$connect_pcw (attach_mpc_data.ioi_index, 0, substr (pcw_words, 1, 36), code); /* Do connect */
+	if code ^= 0 then go to err_1;
+	wait_list.nchan = 1;			/* Only waiting for io channel */
+	call ipc_$block (addr (wait_list), event_wait_info_ptr, code);
+	if code ^= 0 then go to err_3;
+	if imess.level ^= "3"b3 | ^imess.time_out then do;/* Ioi should set time out flag */
+	     call send_err ("Abnormal status resetting channel", "");
+	     go to exit;
+	end;
+
+/* Since time out was only simulated by ioi, a real delay must be done to allow the mpc to reset */
+
+	call timer_manager_$reset_alarm_wakeup (timer_channel); /* Be sure no alarm already set */
+	call ipc_$drain_chn (timer_channel, code);	/* In case event occured */
+	if code ^= 0 then go to err_3;
+	call timer_manager_$alarm_wakeup (1, "11"b, timer_channel); /* Set 1 second timer */
+	wait_list.channel_id (1) = timer_channel;	/* Must wait on timer channel */
+	call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for a second */
+	if code ^= 0 then go to err_3;
+	wait_list.channel_id (1) = attach_mpc_data.ioi_channel; /* Restore wait list */
+
+	return;
+
+     end dc_reset;
+%page;
+/* Various error messages */
+
+err_1:	call send_err ("", "");
+	go to exit;
+
+err_2:	call send_err ("^a", arg);
+	go to exit;
+
+err_3:	call convert_ipc_code_ (code);
+	go to err_1;
+
+
+
+/* Routine to send an error message */
+
+send_err: proc (arg1, arg2);
+
+dcl  (arg1, arg2)	        char (*);
+
+	call com_err_ (code, name, arg1, arg2);
+	return;
+
+     end send_err;
+
+/* Routine to notify system Operator of changes to the state of a MPC.. */
+
+opr_notify: proc (opr_mess);
+
+dcl  opr_mess	        char (*) parameter;
+dcl  phcs_$ring_0_message   entry (char (*));
+
+	call phcs_$ring_0_message (opr_mess || " for " ||
+	     rtrim (attach_mpc_data.mpc_name) || ".");
+	return;
+     end opr_notify;
+
+/* Routine to pause for N seconds */
+
+pause: proc (pause_time);
+dcl  pause_time	        fixed bin (71) parm;
+
+	call timer_manager_$reset_alarm_wakeup (timer_channel); /* Be sure no alarm already set */
+	call ipc_$drain_chn (timer_channel, code);	/* In case event occured */
+	call timer_manager_$alarm_wakeup (pause_time, "11"b, timer_channel); /* Set timer */
+	wait_list.channel_id (1) = timer_channel;	/* Must wait on timer channel */
+	wait_list.nchan = 1;
+	call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for a second */
+	wait_list.channel_id (1) = attach_mpc_data.ioi_channel; /* Restore wait list */
+	return;
+     end pause;
+%page;
+/* Cleanup handler */
+
+clean_up: proc;
+
+	if stopped_io then do;			/* If I suspended io on the mpc */
+	     if mpc_dead then do;
+		call opr_notify ("I/O not released, firmware not restored"); /* notify/log */
+		call com_err_ (0, name,
+		     "I/O not released on ^a controller because firmware not restored.", attach_mpc_data.mpc_name);
+	     end;
+	     else do;
+		call pause (TWO_SECOND);		/* short pause */
+		call ioi_$release_devices (attach_mpc_data.ioi_index, code);
+		stopped_io = "0"b;
+		call opr_notify ("I/O resumed");	/* notify/log */
+	     end;
+	end;
+	call detach_mpc_ (attach_mpc_datap, code);
+	if timer_channel ^= -1 then do;
+	     call timer_manager_$reset_alarm_wakeup (timer_channel);
+	     call ipc_$delete_ev_chn (timer_channel, code);
+	     timer_channel = -1;
+	end;
+
+	if fwlistp ^= null () then do;
+	     do i = 1 to fwlist.n;
+		fwep = addr (fwlist.entry (i));
+		if fwe.segp ^= null () then call release_temp_segment_ (name, fwe.segp, code);
+	     end;
+	     free fwlist;
+	end;
+
+	return;
+
+     end clean_up;
+%page;
+%include iom_pcw;
+%page;
+%include iom_dcw;
+%page;
+%include ioi_stat;
+%page;
+%include iom_stat;
+%page;
+%include event_wait_info;
+%page;
+%include attach_mpc_data;
+%page;
+%include load_mpc_info;
+%page;
+%include eurc_model_numbers;
+%page;
+%include io_special_status;
+
+
+     end load_mpc;

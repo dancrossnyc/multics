@@ -1,0 +1,370 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* Procedure to move a block of data
+
+   Modified:  3 January 1973 by BLW
+  Modified:  19 February 1973 by RAB
+ Modified:  12 June 1973 by RAB for EIS
+Modified:	21 December 1974 by RAB to fix bug 1277
+Modified:	22 January 1975 by RAB to fix bug 1314
+Modified:	22 July 1975 by RAB to fix bug 1388
+Modified:	9 February 1976 by RAB to fix 1462 & change ref cnt for dec
+Modified:	26 May 1976 by RAB to improve determination of reference.even for structures
+Modified:	5 July 1976 by RAB to fix 1504
+   Modified: 27 October 1977 by RAB to more efficiently move packed aggregates of words
+   Modified: 28 October 1977 by RAB to more efficiently move an aggregate when one is on even bound
+	and other is on unknown bound
+   Modified 781127 by PG to fix bug 1801 (setting even bit when it wasn't), introduced one year ago, and just found today!
+   Modified 781128 by RAB to remove PG's fix to 1801 and put it in get_array_size
+   Modified 790523 by RAB to fix 1820 & 1836 caused by assignment to complex
+	binary temp other than complex_flt_bin_1
+*/
+
+move_data: proc(pt);
+
+dcl	pt ptr;		/* points at an operator node */
+
+dcl	(p,q,q1,q2,p1,p2,s,arg(2)) ptr,
+	pd ptr defined(arg(1)),
+	ps ptr defined(arg(2)),
+	(adjust,atomic,big_length_hold,have_constant_length,sp_ok) bit(1) aligned,
+	base bit(3) aligned,
+	(case,i,n,amount) fixed bin,
+	macro fixed bin(15);
+
+dcl	(addr,addrel,bit,divide,fixed,mod,null,substr) builtin;
+
+dcl	base_man$store_ptr_to entry(ptr,ptr),
+	prepare_operand entry(ptr,fixed bin,bit(1) aligned) returns(ptr),
+	state_man$erase_reg entry(bit(19) aligned),
+	c_a entry(fixed bin,fixed bin) returns(ptr),
+	make_both_addressable entry(ptr,ptr,bit(1) aligned),
+	expmac$many entry(fixed bin(15),ptr,fixed bin),
+	expmac$one entry(fixed bin(15),ptr,fixed bin),
+	expmac$zero entry(fixed bin(15)),
+	adjust_ref_count entry(ptr,fixed bin),
+	generate_constant$real_fix_bin_1 entry(fixed bin) returns(ptr),
+	load entry(ptr,fixed bin),
+	compile_exp entry(ptr),
+	eval_exp entry(ptr,bit(1) aligned) returns(ptr),
+	long_op$two_eis entry(ptr,fixed bin,fixed bin(15),ptr),
+	expmac$two_eis entry(fixed bin(15),ptr,ptr),
+	expmac entry(fixed bin(15),ptr),
+	base_man$load_any_var_and_lock entry(fixed bin,ptr) returns(bit(3) aligned);
+
+dcl	double_data bit(24) int static init("010111110000000111111110"b);
+
+dcl	alters(0:1) bit(19) aligned static init("1"b,"11"b);
+
+dcl (	copy_mac		init(257),
+	set_bits		init(440),
+	move_words	init(481),
+	lda		init(1),
+	sta		init(4),
+	nop_mac		init(528),
+	move_3		init(568),
+	conv_mac(2)	init(515,26),	/* qls, dvfx1 */
+	copy_bits		init(476)) fixed bin(15) int static;
+
+dcl	table(0:1,0:1,3:6) fixed bin(15) int static
+	init(	/* odd, odd */	569, 570, 571, 0,
+		/* odd, even */	572, 573, 0, 0,
+		/* even, odd */	574, 575, 0, 0,
+		/* even, even */	576, 577, 578, 579);
+
+dcl	conv_factor(2) fixed bin int static
+	init(2,9);	/* bits, bits_per_char */
+
+dcl	fix_bin		fixed bin based;
+
+%include reference;
+%include symbol;
+%include array;
+%include nodes;
+%include bases;
+%include operator;
+%include op_codes;
+%include cgsystem;
+%include boundary;
+
+	adjust = "0"b;
+
+	p = pt;
+
+	pd = prepare_operand((p -> operand(1)),-1,atomic);
+	ps = prepare_operand((p -> operand(2)),-1,atomic);
+
+	have_constant_length = "0"b;
+	q = p -> operand(3);
+	if q -> node.type ^= operator_node
+	then if q -> reference.symbol -> symbol.constant
+	     then do;
+		have_constant_length = "1"b;
+		amount = q -> reference.symbol -> symbol.initial -> fix_bin;
+		end;
+
+	if p -> operator.op_code = copy_string
+	then do;
+
+	     /* we have copy_string, if the move cannot be done with
+	        words, go to str */
+
+	     if have_constant_length
+	     then if mod(amount,bits_per_word) = 0
+		 & ps -> reference.units = word_ & ^ ps -> reference.fo_in_qual
+		 & pd -> reference.units = word_ & ^ pd -> reference.fo_in_qual
+		then amount = divide(amount,bits_per_word,17,0);
+		else go to str;
+	     else go to str;
+	     end;
+
+	/* have copy words case */
+
+	if pd -> reference.temp_ref
+	     then pd -> reference.value_in.storage = "1"b;
+
+	if ps -> reference.varying_ref
+	then do;
+
+	     /* must adjust c_offset to move entire varying array */
+
+	     adjust = "1"b;
+	     ps -> reference.c_offset = ps -> reference.c_offset - 1;
+	     pd -> reference.c_offset = pd -> reference.c_offset - 1;
+	     end;
+
+	if have_constant_length
+	     then go to const;
+
+	/* have unknown amount of words to move */
+
+	case = 1;
+	call make_copy;
+
+	if adjust
+	     then call adjust_offset;
+
+	return;
+
+	/* have constant number of words to move, do it in-line using mlr instruction
+	   if more than 3 words (or word-pairs) have to be moved */
+
+const:	if amount > 6 then go to long;
+
+	call state_man$erase_reg((alters(fixed(amount > 1,1))));
+
+	call make_both_addressable(pd,ps,amount > 1);
+
+	do i = 1 to 2;
+	     if ^ arg(i) -> reference.even
+	     then do;
+		s = arg(i) -> reference.symbol;
+		if arg(i) -> reference.data_type > 0
+		then do;
+		     if substr(double_data,arg(i) -> reference.data_type,1)
+		     then if ^ s -> symbol.packed
+		     then arg(i) -> reference.even = "1"b;
+		     end;
+		else do;
+
+		     /* structure */
+
+		     if ^ arg(i) -> reference.array_ref & s -> symbol.array ^= null
+		     then if s -> symbol.array -> array.element_boundary > word_
+			then arg(i) -> reference.even = "1"b;
+			else;
+		     else if s -> symbol.boundary > word_
+			then arg(i) -> reference.even = "1"b;
+		     end;
+		end;
+	     end;
+
+	if amount <= 2
+	then do;
+	     if pd -> reference.temp_ref & ^ pd -> reference.aggregate
+	     then if pd -> reference.symbol -> symbol.decimal
+		 | pd -> reference.symbol -> symbol.complex	/* fixes 1820 & 1836 */
+		then pd -> reference.ref_count = pd -> reference.ref_count + 1;
+
+	     amount = amount - 1;
+	     call expmac$one((lda),ps,amount);
+	     call expmac$one((sta),pd,amount);
+	     goto done;
+	     end;
+
+	/* if an address is not known to be even, it may not necessarily be known
+	   to be odd, check to see if non-even addresses are really odd */
+
+	if ^ pd -> reference.even & ^ ps -> reference.even
+	 & (((pd -> address.base ^= sp & pd -> address.base ^= lp) | pd -> address.tag ^= "0"b)
+	  | ((ps -> address.base ^= sp & ps -> address.base ^= lp) | ps -> address.tag ^= "0"b))
+	then do;
+
+	     /* neither address is even and one is not known to be even or odd */
+
+	     if amount > 3 then goto long;
+
+	     macro = move_3;
+
+move:	     if pd -> reference.temp_ref & ^ pd -> reference.aggregate
+	     then if pd -> reference.long_ref
+		 | pd -> reference.symbol -> symbol.decimal
+		 | pd -> reference.symbol -> symbol.complex	/* fixes 1822 & 1836 */
+		then pd -> reference.ref_count = pd -> reference.ref_count + 1;
+
+	     call expmac$many(macro,addr(arg),2);
+done:	     pd -> reference.perm_address,
+	     ps -> reference.perm_address = "0"b;
+
+	     if adjust
+		then call adjust_offset;
+
+	     return;
+	     end;
+
+	/* either both addresses are known to be odd, or at least one address
+	   is known to be even, see if we have special sequence to move specified
+	   number of words */
+
+	if amount <= 6
+	then do;
+
+	     macro = table(fixed(pd -> reference.even,1),fixed(ps -> reference.even,1),amount);
+
+	     if macro ^= 0 then goto move;
+	     end;
+
+	/* we'll have to use an EIS instruction */
+
+/* Turn off perm address bits because we must make rands eis addressable */
+
+long:	pd -> reference.perm_address,
+	ps -> reference.perm_address = "0"b;
+
+/* Issue move macro */
+
+	n = chars_per_word * amount;
+issue_move_mac:
+	call long_op$two_eis(pd,n,(move_words),ps);
+
+	if adjust
+	     then call adjust_offset;
+
+	return;
+
+
+	/* have to do a string move */
+
+str:	q1 = pd;
+	q2 = ps;
+
+	if pd -> reference.temp_ref
+	     then pd -> reference.value_in.storage = "1"b;
+
+	if ps -> reference.symbol -> symbol.char
+	 | ps -> reference.symbol -> symbol.picture
+	 | ps -> reference.symbol -> symbol.decimal
+	then do;
+
+	     /* can use MLR for characters */
+
+	     q = p -> operand(3);
+
+	     /* q is in bits */
+
+	     if have_constant_length
+	     then do;
+		n = divide(amount,bits_per_char,17,0);
+		go to issue_move_mac;
+		end;
+
+	     case = 2;
+	     call make_copy;
+	     return;
+	     end;
+
+	p1 = p -> operand(3);
+	p1 = eval_exp(p1,"1"b);
+
+	p2 = q2 -> reference.length;
+	q2 -> reference.length = p1;
+
+	big_length_hold = q2 -> reference.big_length;
+	if p1 -> node.type = operator_node
+	     then p1 = p1 -> operand(1);
+	q2 -> reference.big_length = p1 -> reference.symbol -> symbol.c_dcl_size > max_p_xreg;
+
+	do i = 1 to 2;
+	     if arg(i) -> reference.units = character_
+	     then do;
+
+		/* since copy_bits is a CSL, we cannot allow character offset expr's */
+
+		if ^ arg(i) -> reference.shared
+		then arg(i) -> reference.ref_count = arg(i) -> reference.ref_count + 1;
+		base = base_man$load_any_var_and_lock(2,arg(i));
+		arg(i) -> reference.perm_address = "1"b;
+		end;
+	     end;
+
+	call expmac$two_eis((copy_bits),q1,q2);
+	q2 -> reference.length = p2;
+	q2 -> reference.big_length = big_length_hold;
+
+	q1 -> reference.perm_address,
+	q2 -> reference.perm_address = "0"b;
+
+	return;
+
+move_block: entry(dest,source,number);
+
+dcl	dest ptr,			/* points at ref of destination */
+	source ptr,		/* points at ref of source */
+	number fixed bin;		/* number of words to move */
+
+	pd = dest;
+	ps = source;
+	amount = number;
+
+	adjust = "0"b;
+
+	goto const;
+
+make_copy:     proc;
+
+	     /* does a copy_words or copy_string with an MLR instruction */
+
+	     /* first, load the length of the object to be moved */
+
+	     q = prepare_operand(q,1,atomic);
+	     if atomic then call load(q,0); else call compile_exp((p -> operand(3)));
+
+	     /* convert the length to characters */
+
+	     call expmac((conv_mac(case)),c_a((conv_factor(case)),case));
+
+	     /* finally, issue the copy macro (an MLR instruction) */
+
+	     call expmac$two_eis((copy_mac),pd,ps);
+
+	     end;
+
+
+adjust_offset:	proc;
+
+	     ps -> reference.c_offset = ps -> reference.c_offset + 1;
+	     pd -> reference.c_offset = pd -> reference.c_offset + 1;
+
+	     end;
+
+
+
+	end;

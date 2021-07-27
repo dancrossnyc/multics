@@ -1,0 +1,558 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+/* Write portion of the APL Device Interface Module.
+   Paul Green, July 1973 */
+/* Modified 740328 by PG to add features for net2741 device type */
+/* Modified 741101 by PG to emit final downshift upon write so [MqN] editing will work. */
+/* Modified 750320 by PG to get above fix to work correctly! */
+/* Modified 770407 by PG to get )TABS command to work properly (not all wired-in 10's had been parameterized!). */
+/* Modified 790411 by PG to fix 381 (was not padding backspace chars) */
+/* Modified 791017 by PG to "fix" bug 395 by moving write_buffer to the stack and enlarging it.
+   Modified 791220 by PG to improve fix to 381 by padding only first BS char in a sequence, to speed up
+	[MqN] style of editing on a TN300, and to fix bug 432 in which [MqN] editing failed with 4.00
+	editor because read_back_spaces returned wrong number of spaces (especially when tabs were
+	present, but also at other times). This also fixes bug 410, where overstruck characters get
+	converted to 3 spaces on input.
+   Modified 800128 by Warren Johnson to handle graphic mode.
+   Modified 800130 by PG to once and for all fix the **** fatal process error bug (443).
+   Modified 800131 by PG to fix bug in graphic mode.
+   Modified 800226 by PG to implement ^ll mode.
+   Discovered Modified 831107 by M. Pandolf in writing CR when whitespace
+	character is a CR instead of just setting column to 0
+*/
+
+/* format: style3 */
+apl_dim_write_:
+     procedure (P_sdb_ptr, P_data_ptr, P_data_offset, P_data_length, P_n_elements_transmitted, P_status);
+
+/* parameters */
+
+dcl	(P_data_offset, P_data_length, P_n_elements_transmitted)
+			fixed bin,
+	P_sdb_ptr		ptr,
+	P_data_ptr	ptr,
+	P_status		bit (72);
+
+/* automatic */
+
+dcl	data_ptr		ptr,
+	current_char	char (1);
+dcl	(n_delays, nl_addend, nl_multiplier, tab_addend, tab_multiplier)
+			fixed bin (21);
+dcl	(i, ini, wcol, seqi, ei, ereti, escape_index)
+			fixed bin (21),
+	(col, oldcol)	fixed bin (9),
+	initial_column	fixed bin (9),		/* column we are in before any output is done. */
+	(donesw, last_char_was_BS, whitesw)
+			bit (1) aligned,
+	(shift, mode)	bit (2),
+	(inchar, enchar, outchar, oldoutchar)
+			bit (9),
+	erets		(0:4) fixed bin,
+	error_mark_line	char (150),
+	(device_last_line_start, last_line_start, out_char)
+			fixed bin,
+	1 write_struc	aligned,
+	  2 write_buffer	dim (4096) bit (9) unal;
+
+/* based */
+
+dcl	based_string	dim (0:1044479) char (1) based,
+	data_string	char (P_data_length) based (data_ptr),
+	write_buffer_overlay
+			char (4096) aligned based (addr (write_struc));
+
+/* entries */
+
+dcl	iox_$put_chars	entry (ptr, ptr, fixed bin (21), fixed bin (35));
+
+/* builtins */
+
+dcl	(addr, addrel, binary, copy, divide, length, max, mod, substr, unspec)
+			builtin;
+
+/* include files */
+
+%include apl_dim_sdb;
+%include apl_dim_table;
+%include apl_characters;
+
+/* program */
+
+/* copy input parameters */
+
+	sdb_ptr = P_sdb_ptr;
+	data_ptr = addr (P_data_ptr -> based_string (P_data_offset));
+
+/* initialize output parameters */
+
+	P_n_elements_transmitted = 0;
+	P_status, status = ""b;
+
+/* get ptrs to conversion tables, and extract commonly used values */
+
+	device_ptr = device_info_ptr;
+	conversion_ptr = conv_tab_ptr;
+
+	nl_addend = device_info.pad_info (baud_rate).nl_addend;
+	nl_multiplier = device_info.pad_info (baud_rate).nl_multiplier;
+	tab_addend = device_info.pad_info (baud_rate).tab_addend;
+	tab_multiplier = device_info.pad_info (baud_rate).tab_multiplier;
+
+	initial_column, col = actcol;			/* get current column */
+	shift = actshift;				/* pick up shift */
+
+	if shift
+	then shift = "11"b;				/* undefined...will cause leading shift to be emitted */
+
+	ereti = 0;				/* init stack index for enter */
+	whitesw = "0"b;				/* currently not moving carriage */
+	last_char_was_BS = "0"b;			/* was no last char, couldn't have been BS */
+	last_line_start, ini = 1;			/* get starting offset */
+	donesw = "0"b;				/* not done */
+	device_last_line_start,			/* start of last output line... */
+	     out_char = 1;				/* where to store in output buffer */
+
+/* **************************** READ A CHARACTER ********************* */
+r (0):
+loop:
+	if ini > length (data_string)
+	then do;
+		donesw = "1"b;
+		goto asblack;			/* done except for positioning carriage */
+	     end;
+
+	current_char = substr (data_string, ini, 1);	/* get char to process */
+	unspec (inchar) = unspec (current_char);
+	ini = ini + 1;				/* get ready to get next char */
+
+/* ***********************JUST KEEP TRACK OF CARRIAGE POSITION FOR WHITE CHARACTERS ***************************** */
+	if (inchar & "400"b3)			/* if too big for table, assume black */
+	then go to asblack;
+
+	if ^red_mode
+	then if type (binary (inchar, 9)).red
+	     then if stream_data_block.graphic
+		then go to asblack;			/* keep in graphic mode */
+		else go to loop;			/* otherwise discard it */
+
+/* This red mode stuff may still not be right for graphic mode... */
+
+	if type (binary (inchar, 9)).white		/* carriage movement */
+	then do;
+		if whitesw = "0"b
+		then do;
+			wcol = col;		/* this is  first white after black so init wcol */
+			whitesw = "1"b;		/* note we are in white mode */
+		     end;
+		i = binary (type (binary (inchar, 9)).move, 3);
+						/* i is movement type */
+		if i = 0
+		then wcol = wcol + 1;		/* blank */
+		else if i = 5
+		then do;				/* nl */
+			whitesw = "0"b;		/* treat it as black */
+			oldcol = col;		/* save for delay comp */
+			outchar = out (10);		/* output nl */
+			erets (0) = 1;
+			goto enter;		/* set up return and 'call' enter */
+r (1):
+			n_delays = divide (nl_addend + oldcol * nl_multiplier, 512, 17, 0);
+			call enter_delays (n_delays);
+		     end;
+		else if i = 3			/* tab */
+		then if stream_data_block.tab_width < 2 /* turned off */
+		     then wcol = wcol + 1;
+		     else wcol = wcol + stream_data_block.tab_width - mod (wcol, stream_data_block.tab_width);
+		else if i = 2			/* bs */
+		then if wcol > 0			/* and not at left margin */
+		     then wcol = wcol - 1;		/* then back up */
+		     else ;			/* else stay at margin */
+		else if i = 4			/* cr */
+		then if wcol = 0 then do;
+		     if out_char > length (write_buffer_overlay)
+		     then call flush_output_buffer;
+		     write_buffer (out_char) = "015"b3;
+		     out_char = out_char + 1;
+		end;
+		else wcol = 0;
+		goto loop;
+	     end;
+	else do;					/* character is a printing character */
+
+/* ****************************** POSITION CARRIAGE ************************* */
+asblack:
+		if whitesw
+		then do;
+			whitesw = "0"b;		/* this is first black after white */
+			if max_col > 3		/* don't get stuck in a loop */
+			then do while (wcol > max_col);
+						/* reduce below limit */
+				oldcol = col;
+				outchar = out (10);
+				erets (0) = 2;
+				goto enter;	/* output nl */
+r (2):
+				n_delays = divide (nl_addend + oldcol * nl_multiplier, 512, 17, 0);
+				call enter_delays (n_delays);
+				outchar = escape_character_device;
+						/* output escape char */
+				erets (0) = 3;
+				goto enter;
+r (3):
+				outchar = out (99); /* output a 'c' */
+				erets (0) = 4;
+				goto enter;
+r (4):
+				wcol = wcol - max_col + col;
+						/* set up target column */
+			     end;
+			if wcol < col		/* backward motion required */
+			then do;
+				if wcol = 0	/* if going to left margin */
+				then if out (13) ^= "602"b3
+						/* and cr available */
+				     then do;	/* use cr */
+					     outchar = out (13);
+					     erets (0) = 9;
+					     go to enter;
+					end;
+				erets (0) = 5;	/* not going to col 0 or no cr available */
+				do i = 1 to col - wcol;
+				     outchar = out (8);
+				     goto enter;
+r (5):
+				end;
+			     end;
+			else do;
+
+/* if in tab mode & worth using tab(s) */
+				if tabm & ((wcol - col) > 2)
+				then do;
+					if mod (col, tab_width) >= (tab_width - 2)
+						/* if not enough spaces before tab */
+					then do;
+						erets (0) = 6;
+						/* blanks */
+						do i = 1 to tab_width - mod (col, tab_width);
+						     outchar = out (32);
+						     goto enter;
+r (6):
+						end;
+					     end;
+					erets (0) = 7;
+					do i = 1
+					     to divide (wcol, tab_width, 17, 0) - divide (col, tab_width, 17, 0);
+					     oldcol = col;
+					     outchar = out (9);
+						/* tab char */
+					     goto enter;
+r (7):
+					     n_delays =
+						divide (tab_addend + (col - oldcol) * tab_multiplier, 512, 17, 0);
+					     call enter_delays (n_delays);
+					end;
+				     end;
+				if wcol > col	/* if blanks needed */
+				then do;
+					erets (0) = 8;
+					do i = 1 to wcol - col;
+					     outchar = out (32);
+					     goto enter;
+r (8):
+					end;
+				     end;
+
+			     end;
+		     end;
+r (9):
+		if donesw
+		then do;				/* if really done */
+
+/* **************** TRANSMIT CONTENTS OF THE CONVERSION BUFFER & RETURN **************** */
+
+			if shift & "10"b
+			then do;			/* if in upper case, emit final downshift */
+				if out_char > length (write_buffer_overlay)
+				then call flush_output_buffer;
+
+				write_buffer (out_char) = device_info.lower_case;
+				out_char = out_char + 1;
+				shift = "01"b;	/* now in LC */
+			     end;
+
+			call flush_output_buffer;
+			P_n_elements_transmitted = ini - 1;
+
+			actcol = col;
+			actshift = shift;		/* save present shift state (not used, really) */
+
+			if stream_data_block.error_mark_column > 0
+			then do;
+				i = stream_data_block.error_mark_column;
+				stream_data_block.error_mark_column = 0;
+				substr (error_mark_line, 1, i - 1) = "";
+				substr (error_mark_line, i, 2) = QAndSign || QNewLine;
+				call iox_$put_chars (stream_data_block.iocb_ptr, addr (error_mark_line), i + 1,
+				     status_code);
+			     end;
+			return;
+		     end;
+
+/* **************************** ENTER THE CHARACTER ************************* */
+		erets (0) = 0;			/* place data char */
+
+		if inchar & "400"b3			/*  if too big */
+		then outchar = "602"b3;		/* make look like octal escape */
+		else outchar = out (binary (inchar, 9));
+
+/* If we are in graphic output mode, and we are outputting an ASCII control character, and the tables
+   say to discard (600) or escape (602) the character, then pass it on unmolested.  The purpose of
+   graphic output mode is to enable an APL program to do terminal control functions ("plot mode") itself. */
+
+		if stream_data_block.graphic
+		then if binary (inchar, 9) < 32	/* no problem with these, just send 'em out */
+		     then outchar = inchar;
+		     else if (outchar = "602"b3) | (outchar = "600"b3)
+		     then outchar = inchar;		/* don't mess up these, either */
+
+/*		go to enter;		*/
+	     end;
+
+enter:
+	mode = outchar;				/* get shift code */
+	enchar = outchar & "177"b3;
+	if mode = "11"b				/* special action */
+	then do;
+		if enchar = "001"b3			/* if mark error */
+		then do;
+			stream_data_block.error_mark_column = col + 1;
+		     end;
+		else if enchar = "002"b3		/* if escape */
+		then do;
+			ereti = ereti + 1;		/* set up recursion */
+			erets (ereti) = 10;
+			outchar = escape_character_device;
+						/* escape char */
+			goto enter;
+r (10):
+			erets (ereti) = 11;		/* set up return */
+			do escape_index = 1 to 9 by 3;/* pick off 3-bit bytes */
+			     outchar = out (binary (substr (inchar, escape_index, 3), 3) + 48);
+			     goto enter;
+r (11):
+			end;
+			ereti = ereti - 1;
+			go to r (erets (ereti));
+		     end;
+		else if enchar = "003"b3		/* Conditional New Line */
+		then do;
+			if col > 0
+			then do;
+				ereti = ereti + 1;
+				erets (ereti) = 16;
+				outchar = out (10); /* nl */
+				go to enter;
+r (16):
+				ereti = ereti - 1;
+			     end;
+			else last_line_start = last_line_start + 1;
+						/* <NL><CNL> case...skip over CNL */
+			go to r (erets (ereti));
+		     end;
+		seqi = binary (enchar, 9) - 8;	/* else it is a character sequence */
+		if seqi >= 0
+		then do;
+			ereti = ereti + 1;
+			erets (ereti) = 12;		/* save return */
+			sequence_ptr = addrel (sequence_table_ptr, seqi);
+						/* pointer to given sequence */
+			do seqi = 1 to sequence.size;
+			     outchar = sequence.characters (seqi);
+			     goto enter;
+r (12):
+			end;
+			ereti = ereti - 1;
+		     end;
+		go to r (erets (ereti));
+	     end;
+	ei = binary (conversions.device_move (binary (enchar, 9)), 6);
+						/* update col */
+	go to new_col (ei);
+
+new_col (0):					/* normal */
+	col = col + 1;
+	go to end_col;
+
+new_col (2):					/* backspace */
+	col = col - 1;
+	go to end_col;
+
+new_col (3):					/* tab */
+	if stream_data_block.tab_width < 2
+	then col = col + 1;
+	else col = col + stream_data_block.tab_width - mod (col, stream_data_block.tab_width);
+
+	if max_col > 0
+	then if col > max_col
+	     then if max_col < stream_data_block.tab_width/* hmm. shouldn't be permitted. */
+		then go to r (erets (ereti));
+	go to end_col;
+
+new_col (4):					/* carriage return */
+	initial_column, col = 0;
+	go to end_col;
+
+new_col (5):					/* new line */
+	stream_data_block.canonicalization_index = 1;	/* don't need this stuff anymore */
+	last_line_start = ini;
+	device_last_line_start = out_char + 1;
+	if mode & shift				/* KLUDGE: tables make NL lower-case, skip shift char */
+	then device_last_line_start = device_last_line_start + 1;
+
+	initial_column, col = 0;
+	actline = actline + 1;
+	go to end_col;
+
+new_col (6):					/* prefix */
+	col = col - 1;				/* prefix */
+	go to end_col;
+
+new_col (10):					/* 2 character sequences at device */
+	col = col + 2;
+
+new_col (1):
+new_col (7):
+new_col (8):
+new_col (9):
+end_col:
+	if max_col > 3				/* don't loop */
+	then if col > max_col			/* check for end of carriage */
+	     then if col > 3			/* don't loop */
+		then do;
+			oldoutchar = outchar;
+			outchar = out (10);		/* nl */
+			ereti = ereti + 1;
+			erets (ereti) = 13;
+			goto enter;
+r (13):
+			n_delays = divide (nl_addend + binary (max_col, 9) * nl_multiplier, 512, 17, 0);
+			call enter_delays (n_delays);
+			outchar = escape_character_device;
+						/* output escape char */
+			erets (ereti) = 14;
+			goto enter;
+r (14):
+			outchar = out (99);		/* output 'c' */
+			erets (ereti) = 15;
+			goto enter;
+r (15):
+			ereti = ereti - 1;		/* setup return */
+			outchar = oldoutchar;	/* put original character */
+			goto enter;
+		     end;
+
+	if mode & shift				/* if shift needed */
+	then do;
+		if out_char > length (write_buffer_overlay)
+		then call flush_output_buffer;
+
+		if mode & "01"b			/* if char must be upper case */
+		then write_buffer (out_char) = device_info.upper_case;
+		else write_buffer (out_char) = device_info.lower_case;
+		out_char = out_char + 1;
+		shift = ^mode;
+	     end;
+
+	if out_char > length (write_buffer_overlay)
+	then call flush_output_buffer;
+
+	write_buffer (out_char) = enchar;		/* store actual character */
+	out_char = out_char + 1;
+
+	if binary (conversions.device_move (binary (enchar, 7)), 6) = 2
+						/* BS */
+	then do;
+		n_delays = device_info.pad_info (baud_rate).bs_n_pads;
+		if n_delays > 0
+		then if ^last_char_was_BS		/* only pad first BS in a sequence */
+		     then call enter_delays (n_delays);
+
+		last_char_was_BS = "1"b;
+	     end;
+	else last_char_was_BS = "0"b;
+
+	go to r (erets (ereti));
+
+enter_delays:
+     procedure (P_n_delays);
+
+/* parameters */
+
+declare	P_n_delays	fixed bin (21);
+
+/* automatic */
+
+declare	padx		fixed bin (21);
+
+/* program */
+
+	if out_char + P_n_delays > length (write_buffer_overlay)
+	then call flush_output_buffer;
+
+	do padx = 1 to P_n_delays;
+	     write_buffer (out_char) = delay_character;
+	     out_char = out_char + 1;
+	end;
+
+     end enter_delays;
+
+flush_output_buffer:
+     procedure ();
+
+	call iox_$put_chars (stream_data_block.device_iocb_ptr, addr (write_buffer), out_char - 1, status_code);
+
+/* If sdb.read_back = read_back_output, and output does not end in new-line,
+   save the partial output line in the input buffer so that the input the user types
+   will be read back in and re-canonicalized.
+
+   If sdb.read_back = read_back_spaces, substitute spaces for the actual characters,
+   at the rate of one space per column of output, no matter how many characters it took.
+   Since spaces have been converted to tabs, and delay characters have been inserted, the
+   number of characters output is not relevant.
+
+   If sdb.read_back = read_back_input, skip this operation. */
+
+	if last_line_start < length (data_string)	/* if output does not end in NL */
+	then if read_back ^= read_back_input
+	     then do;
+		     if read_back = read_back_output
+		     then do;
+			     i = (out_char - 1) - device_last_line_start + 1;
+			     substr (canonicalization_buffer, canonicalization_index, i) =
+				substr (write_buffer_overlay, device_last_line_start, i);
+			end;
+		     else do;			/* read back spaces */
+			     i = col - initial_column;
+			     if i > 0
+			     then unspec (substr (canonicalization_buffer, canonicalization_index, i)) =
+				     copy (out (32), i);
+						/* "i" spaces */
+			end;
+		     canonicalization_index = max (1, canonicalization_index + i);
+						/* i can be negative */
+		end;
+
+	device_last_line_start, out_char = 1;
+	return;
+
+     end flush_output_buffer;
+
+     end /* apl_dim_write_ */;

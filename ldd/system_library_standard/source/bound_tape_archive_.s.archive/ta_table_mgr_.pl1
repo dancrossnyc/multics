@@ -1,0 +1,1454 @@
+/* ***********************************************************
+   *                                                         *
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+   *                                                         *
+   *                                                         *
+   *********************************************************** */
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ta_table_mgr_: proc;
+	return;
+
+/* This subroutine manages the online table for tape_archive.  It performs
+   operations on the header fields and other operations on the table proper
+   (as distinct from one particular entry-- other modules modify individual
+   entries.) It also does particular operations on entries when that operation
+   is simply a bookkeeping operation (e.g.  deleting a component is simply
+   setting a flag;  no tapes are mounted, and the file system is never
+   consulted..)
+
+   Written 05/09/77 by C. D. Tavares
+   Modified 09/24/79 by CDT to implement star convention entry, star
+   convention in cancel, new table version with longer volume names,
+   and to diddle n_queued_requests when canceling deletions.
+   Modified 09/03/80 by CDT for version 3, adding density field;
+   also added "alter density" operation.
+   Modified 09/21/80 by CDT to implement indivisible table update
+   strategy (setup_workspace, complete_table_op).
+   Modified 10/24/80 by CDT to add "alter module".
+   Last modified 83-03-16 by S. G. Harris (UNCA) for version 4.
+   Modified 7/83 by S. Krupp for conversion to mtape_.  This
+      involved:  addition of the volume_type alterspec and addition
+      of the -volume_type (-vt) control argument to the load_table key.
+
+*/
+
+%include tape_archive_table_dcl;
+%page;
+%include tape_archive_star;
+%page;
+%include query_info_;
+%page;
+create_table: entry (table_dir, table_name, table_ptr, code);
+
+dcl  table_dir char (*) parameter,
+     table_name char (*) parameter,
+     code fixed bin (35) parameter;
+
+/* STATIC */
+
+dcl  group_id char (32) static initial (""),
+     initialized bit (1) aligned static initial (""b);
+
+/* CONDITIONS */
+
+dcl  cleanup condition;
+
+/* ENTRIES */
+
+dcl (com_err_, com_err_$suppress_name) ext entry options (variable),
+     get_group_id_ ext entry returns (char (32)),
+     hcs_$truncate_seg entry (ptr, fixed bin (18), fixed bin (35)),
+     hcs_$set_bc_seg ext entry (pointer, fixed bin (24), fixed bin (35)),
+     hcs_$set_safety_sw_seg entry (pointer, bit (1), fixed bin (35)),
+     hcs_$make_seg ext entry (char (*), char (*), char (*), fixed bin, pointer, fixed bin (35)),
+     ioa_ ext entry options (variable),
+     set_lock_$lock ext entry (bit (36) aligned, fixed bin, fixed bin (35)),
+     set_lock_$unlock ext entry (bit (36) aligned, fixed bin (35));
+
+dcl  ta_upgrade_version_ ext entry (char (*), char (*), pointer, bit (1) aligned, fixed bin (35));
+
+
+	call ioa_ ("tape_archive:  Creating ^a>^a.", table_dir, table_name);
+
+	call hcs_$make_seg (table_dir, table_name, "", 1010b, table_ptr, code);
+	if code ^= 0 then do;			/* If we didn't flat out CREATE this one */
+create_err:    call com_err_ (code, "tape_archive", "Creating ^a>^a", table_dir, table_name);
+	     return;
+	end;
+
+	on cleanup call unlock_table (code);
+
+	call set_lock_$lock (tape_archive_table.lock, 0, code);
+	if code ^= 0 then goto create_err;
+
+	group_id = get_group_id_ ();
+	initialized = "1"b;
+	tape_archive_table.locker_id = group_id;
+	tape_archive_table.lock_reason = Modify;
+
+	tape_archive_table.version_number = tape_archive_version_4;
+	tape_archive_table.magic_constant = Magic_constant;
+	tape_archive_table.compaction_warning_threshold = 0.5e0;
+	tape_archive_table.auto_compaction_threshold = 1.0e0;
+	tape_archive_table.io_module_name = "tape_ansi_";
+	tape_archive_table.tape_info.density (*) = Default_density;
+	tape_archive_table.tape_info.active_set = 1;
+	tape_archive_table.tape_info.volume_id (*, *) = " ";
+
+	call hcs_$set_bc_seg (table_ptr, size (tape_archive_table) * 36, code);
+	call hcs_$set_safety_sw_seg (table_ptr, "1"b, code);
+
+	tape_archive_table.table_is_consistent = "1"b;
+
+	call set_lock_$unlock (tape_archive_table.lock, code);
+	return;
+%page;
+find_and_verify: entry (table_dir, table_name, table_ptr, w_permit, code);
+
+dcl  w_permit bit (1) aligned;
+
+/* ENTRIES */
+
+dcl  hcs_$fs_get_mode ext entry (pointer, fixed bin, fixed bin (35)),
+     hcs_$initiate ext entry (char (*), char (*), char (*), fixed bin, fixed bin, pointer, fixed bin (35));
+
+/* AUTOMATIC */
+
+dcl  mode fixed bin;
+
+/* EXTERNAL STATIC */
+
+dcl (error_table_$bad_segment,
+     error_table_$improper_data_format,
+     error_table_$moderr,
+     error_table_$too_many_args) external fixed bin (35) static;
+
+/* BUILTINS */
+
+dcl (bit, clock, currentsize, divide, float, hbound, lbound, length,
+     max, mod, null, pointer, substr) builtin;
+
+	w_permit = "1"b;				/* until we find out otherwise */
+
+	call hcs_$initiate (table_dir, table_name, "", 0, 0, table_ptr, code);
+	if table_ptr = null then return;		/* no error, maybe this invocation will create one */
+
+	if tape_archive_table.magic_constant ^= Magic_constant then do;
+	     code = error_table_$improper_data_format;
+	     call com_err_ (code, "tape_archive", "^a>^a is not a tape_archive table.",
+		table_dir, table_name);
+	     return;
+	end;
+
+	call hcs_$fs_get_mode (table_ptr, mode, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, "tape_archive", "^a>^a", table_dir, table_name);
+	     return;
+	end;
+
+	if mod (mode, 4) < 2 then w_permit = ""b;
+
+          if tape_archive_table.version_number ^= tape_archive_version_4
+          then do;
+               call ta_upgrade_version_ (table_dir, table_name, table_ptr, w_permit, code);
+	     if code ^= 0 then return;			/* message already printed */
+          end;
+
+	if w_permit then do;
+	     on cleanup call unlock_table (0);
+
+	     call lock_table (Examine, code);
+	     if code ^= 0 then return;
+	end;
+
+	if ^tape_archive_table.table_is_consistent then
+	     if ^w_permit then do;
+		code = error_table_$bad_segment;
+		call com_err_ (code, "tape_archive", "^a>^a", table_dir, table_name);
+		call com_err_$suppress_name (error_table_$moderr, "tape_archive", "Write permission needed to salvage this table.");
+	     end;
+	     else call complete_table_op (table_ptr);	/* salvage the table */
+
+	if w_permit then call unlock_table (0);
+	return;
+%page;
+find_component: entry (table_ptr, table_name, component_name, must_be_there, component_slot, request_slot, code);
+
+dcl  component_name char (*) parameter,
+     must_be_there bit (1) aligned parameter,
+     component_slot fixed bin parameter,
+     request_slot fixed bin parameter;
+
+/* EXTERNAL STATIC */
+
+dcl  error_table_$action_not_performed ext fixed bin (35) static;
+
+/* ENTRIES */
+
+dcl  sub_err_ ext entry options (variable);
+
+/* AUTOMATIC */
+
+dcl  words char (24);
+
+	code = error_table_$action_not_performed;	/* assume the worst */
+
+	do request_slot = 1 to tape_archive_table.n_request_slots
+		while (^request_queue (request_slot).valid
+		| (request_queue (request_slot).entry_name ^= component_name));
+	end;
+
+	if request_slot ^> tape_archive_table.n_request_slots then do;
+	     request_ptr = addr (request_queue (request_slot));
+	     if request.append then words = "appended to";
+	     else if request.replace then words = "replaced onto";
+	     else if request.extract then words = "extracted from";
+	     else call sub_err_ (code, "tape_archive", "s", null, 0,
+		"Valid request found with no request bits.");
+
+	     call com_err_ (code, "tape_archive",
+		"^/^5x^a is already scheduled to be ^a the volume set.",
+		component_name, words);
+	     return;
+	end;
+
+	do component_slot = tape_archive_table.n_component_slots to 1 by -1
+		while (component_table (component_slot).entry_name ^= component_name
+		| ^component_table (component_slot).valid);
+	end;
+
+	if component_slot = 0 then
+	     if must_be_there then do;
+		call com_err_ (code, "tape_archive", "^a not found in ^a.", component_name, table_name);
+		return;
+	     end;
+	     else;				/* no such component found, ok */
+
+	else if component_table (component_slot).date_time_deleted then do;
+	     call com_err_ (code, "tape_archive",
+		"^/^5x^a is already scheduled to be deleted from the volume set.",
+		component_name);
+
+	     return;
+	end;
+
+	do request_slot = 1 to tape_archive_table.n_request_slots
+		while (request_queue (request_slot).valid);
+	end;
+
+	code = 0;
+	return;
+%page;
+alter_attributes: entry (table_ptr, arg_array, table_name, code);
+
+/* This entry implements the "alter" key of tape_archive. */
+
+dcl  arg_array (*) char (168) parameter;
+
+/* AUTOMATIC */
+
+dcl  alter_module bit(1) aligned,
+     alter_vol_type bit(1) aligned,
+     alterspec char (32),
+     args_ok bit (1) aligned,
+     old_vol_idx fixed bin,
+     fixnum fixed bin,
+     floatnum float bin,
+    (old_volume_spec, new_volume_spec) char (8),
+     prev_retain_sw bit(1) aligned,
+     value_arg char (32),
+     which_set fixed bin;
+
+/* EXTERNAL STATIC */
+
+dcl (error_table_$noarg,
+     error_table_$badopt) ext fixed bin (35) static;
+
+/* CONSTANTS */
+
+dcl  known_alterspecs (7) char (32) static options (constant) initial
+    ("volume_type", "module", "warning_limit", "auto_limit", "compaction", "volume", "density");
+
+dcl  known_densities (3) fixed bin static options (constant) initial
+    (800, 1600, 6250);
+
+dcl  known_vol_types (2) char (4) var static options (constant) initial
+    ("ansi", "ibm");
+
+dcl  known_io_modules (2) char(10) var static options (constant) initial
+    ("tape_ansi_", "tape_ibm_");
+
+/* ENTRIES */
+
+dcl  cv_dec_check_ ext entry (char (*), fixed bin (35)) returns (fixed bin),
+     cv_float_ ext entry (char (*), fixed bin (35)) returns (float bin),
+     get_lock_id_ entry() returns(bit(36) aligned);
+
+	nargs = dim (arg_array, 1);
+	if nargs = 0 then do;
+	     code = error_table_$noarg;
+	     call com_err_ (code, "tape_archive", "Attributes to be altered.");
+	     return;
+	end;
+
+	on cleanup call unlock_table (code);
+
+	call lock_table (Modify, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, "tape_archive", "alter request not processed.");
+	     return;
+	end;
+
+	do i = 1 to nargs by 2;
+	     alterspec = arg_array (i);
+	     value_arg = alterspec;
+
+	     do j = lbound (known_alterspecs, 1) to hbound (known_alterspecs, 1)
+		     while (alterspec ^= known_alterspecs (j));
+	     end;
+
+	     if j > hbound (known_alterspecs, 1) then
+		call alter_err (error_table_$badopt, "^a", alterspec);
+
+	     if i+1 > nargs then
+		call alter_err (error_table_$noarg, "^a must be followed by another argument.", alterspec);
+
+	     value_arg = arg_array (i+1);
+
+	     goto alter (j);
+
+alter (1):					/* volume_type */
+
+               alter_vol_type = "1"b;
+	     alter_module = "0"b;
+	     goto ALTER_MOD_VOL;
+
+alter (2):					/* module */
+
+               alter_module = "1"b;
+	     alter_vol_type = "0"b;
+
+ALTER_MOD_VOL:
+
+	     prev_retain_sw = (tape_archive_table.mount_lock = get_lock_id_());
+
+	     if prev_retain_sw
+	     then call alter_err(0, "Cannot change this attribute while the volume set is retained: ^a", known_alterspecs(j));
+
+	     if tape_archive_table.n_component_slots > 0 then
+		call alter_err (error_table_$badopt,
+		"The tape archive must be empty if the ""^a"" attribute is to be changed.", known_alterspecs(j));
+
+               if alter_vol_type
+	     then do;
+	          do j = lbound (known_vol_types, 1) to hbound (known_vol_types, 1) while (value_arg ^= known_vol_types (j));
+	          end;
+
+	          if j > hbound (known_vol_types, 1)
+		then call alter_err (error_table_$badopt, """^a"" is not a valid volume type.", value_arg);
+	     end;
+	     else do;
+	          do j = lbound (known_io_modules, 1) to hbound (known_io_modules, 1) while (value_arg ^= known_io_modules (j));
+		end;
+
+		if j > hbound (known_io_modules, 1)
+		then call alter_err(error_table_$badopt, """^a"" is not a valid I/O module.", value_arg);
+	     end;
+
+	     if alter_vol_type
+	     then do;
+	          if value_arg = known_vol_types(1)
+		then tape_archive_table.io_module_name = known_io_modules(1);
+		else tape_archive_table.io_module_name = known_io_modules(2);
+	     end;
+	     else tape_archive_table.io_module_name = value_arg;
+
+	     goto alter_end;
+
+alter (3):					/* warning_limit */
+	     floatnum = cv_float_ (value_arg, code);
+	     if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+	     if (floatnum < 0 | floatnum > 1e0) then call alter_err (0, "^a not between 0 and 1.", value_arg);
+	     else tape_archive_table.compaction_warning_threshold = floatnum;
+	     call test_waste_thresholds (""b);
+	     goto alter_end;
+
+alter (4):					/* auto_limit */
+	     floatnum = cv_float_ (value_arg, code);
+	     if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+	     if (floatnum < 0e0 | floatnum > 1e0) then call alter_err (0, "^a not between 0 and 1.", value_arg);
+	     else tape_archive_table.auto_compaction_threshold = floatnum;
+	     call test_waste_thresholds (""b);
+	     goto alter_end;
+
+alter (5):					/* compaction */
+	     if value_arg = "on" then tape_archive_table.next_mount_type = Compact;
+	     else if value_arg = "off" then call compute_mount_type (-1, -1, tape_archive_table.next_mount_type);
+	     else call alter_err (error_table_$badopt, """^a"" not ""off"" or ""on"".", value_arg);
+	     goto alter_end;
+
+alter (6):					/* volume */
+
+	     old_vol_idx = -1;
+	     old_volume_spec, new_volume_spec = "";
+	     which_set = tape_archive_table.active_set;
+	     args_ok = ""b;
+
+	     do i = i+1 to nargs;
+
+		value_arg = arg_array (i);
+
+		if substr (value_arg, 1, 1) = "-" then do; /* control argument */
+		     if (value_arg = "-number" | value_arg = "-nb") then do;
+			if old_vol_idx ^= -1 then call alter_err (error_table_$badopt, "Old volume specification supplied more than once.", "");
+
+			i = i + 1;
+			value_arg = arg_array (i);
+			old_vol_idx = cv_dec_check_ (value_arg, code);
+			if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+			if old_vol_idx <= 0 then call alter_err (0, "^a negative or zero.", value_arg);
+		     end;
+
+		     else if value_arg = "-alternate" then
+			which_set = 3 - tape_archive_table.active_set;
+
+		     else call alter_err (error_table_$badopt, "^a", value_arg);
+		end;
+
+		else do;				/* volume specifications */
+		     if old_vol_idx = -1 then do;	/* is the first spec */
+			old_volume_spec = value_arg;
+			old_vol_idx = 0;
+		     end;
+
+		     else if args_ok then
+			call alter_err (error_table_$too_many_args, "for ^a.", alterspec);
+
+		     else do;
+			args_ok = "1"b;
+			new_volume_spec = value_arg;
+		     end;
+		end;
+	     end;
+
+               prev_retain_sw = (tape_archive_table.mount_lock = get_lock_id_());
+
+	     if prev_retain_sw
+	     then do;
+	          if ((tape_archive_table.highest_mount_type < Compact &
+		     which_set = tape_archive_table.active_set) |
+		    tape_archive_table.highest_mount_type = Compact)
+                    then call alter_err(0, "Cannot change this attribute while the volume set is retained: ^a", known_alterspecs(j));
+	     end;
+
+               if which_set = tape_archive_table.active_set
+	     then do;
+	          if tape_archive_table.n_component_slots > 0
+	          then call ioa_("tape_archive: Warning - changing the volume set at this time may damage the archive.");
+	     end;
+
+
+	     if ^ args_ok then call alter_err (error_table_$noarg, "Not enough arguments for ^a.", alterspec);
+
+	     if old_vol_idx > 0 then
+		if old_vol_idx > tape_archive_table.n_volumes_in_set (which_set) + 1 then
+		     call alter_err (0, "Request would not result in contiguous volumes.", "");
+
+		else;
+
+	     else if old_volume_spec = "" then
+		old_vol_idx = tape_archive_table.n_volumes_in_set (which_set) + 1;
+
+	     else do;
+		do old_vol_idx = 1 to tape_archive_table.n_volumes_in_set (which_set)
+			while (tape_archive_table.volume_set (which_set).volume_id (old_vol_idx) ^= old_volume_spec);
+		end;
+
+		if old_vol_idx > tape_archive_table.n_volumes_in_set (which_set) then call alter_err (0, "^a not in volume set.", old_volume_spec);
+	     end;
+
+	     call setup_workspace (table_ptr, 0, 0, workspace_ptr);
+	     tape_info_ptr = addr (workspace.tape_info_copy);
+
+	     based_tape_info.volume_set (which_set).volume_id (old_vol_idx) = new_volume_spec;
+	     if old_vol_idx = based_tape_info.n_volumes_in_set (which_set) + 1 then
+		based_tape_info.n_volumes_in_set (which_set) = old_vol_idx;
+
+	     if new_volume_spec = "" then do;
+
+		do old_vol_idx = old_vol_idx to based_tape_info.n_volumes_in_set (which_set) - 1;
+		     based_tape_info.volume_set (which_set).volume_id (old_vol_idx)
+			= based_tape_info.volume_set (which_set).volume_id (old_vol_idx+1);
+		end;
+
+		based_tape_info.n_volumes_in_set (which_set) = old_vol_idx - 1;
+
+	     end;
+
+	     call complete_table_op (table_ptr);
+
+	     goto alter_end;
+
+alter (7):					/* density */
+	     which_set = tape_archive_table.active_set;
+	     if i+2 <= nargs then
+		if arg_array (i+2) = "-alternate" then do;
+		     i = i + 1;
+		     which_set = 3 - tape_archive_table.active_set;
+		end;
+
+               prev_retain_sw = (tape_archive_table.mount_lock = get_lock_id_());
+
+	     if prev_retain_sw
+	     then do;
+	          if ((tape_archive_table.highest_mount_type < Compact &
+		     which_set = tape_archive_table.active_set) |
+		    tape_archive_table.highest_mount_type = Compact)
+                    then call alter_err(0, "Cannot change this attribute while the volume set is retained: ^a", known_alterspecs(j));
+	     end;
+
+	     fixnum = cv_dec_check_ (value_arg, code);
+	     if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+	     do j = 1 to hbound (known_densities, 1) while (known_densities (j) ^= fixnum);
+	     end;
+
+	     if j > hbound (known_densities, 1) then
+		call ioa_ ("tape_archive: Warning-- density ^d may be unacceptable to ^a.", fixnum, tape_archive_table.io_module_name);
+
+	     if tape_archive_table.last_tape_file_no > 0 then
+		if which_set = tape_archive_table.active_set then
+		     call ioa_ ("tape_archive: Warning-- density change of current volume set may be incompatible with existing recording density for ^a.", table_name);
+		else do;
+		     call ioa_ ("tape_archive: ^a has been scheduled for compaction due to density change.", table_name);
+		     tape_archive_table.next_mount_type = Compact;
+		end;
+
+               tape_archive_table.tape_info.density(which_set) = fixnum;
+
+	     goto alter_end;
+
+alter_end: end;
+
+	call unlock_table (code);
+	return;
+
+alter_err: proc (code, reason, value);
+
+dcl  code fixed bin (35) parameter,
+    (reason, value) char (*) parameter;
+
+	     call com_err_ (code, "tape_archive", reason, value);
+	     call unlock_table (0);
+	     goto returner;
+	end alter_err;
+
+returner:	return;
+%skip(5);
+compute_mount_type: proc (ignore_component, ignore_request, next_mount_type);
+
+dcl (ignore_component, ignore_request, next_mount_type) fixed bin parameter;
+
+dcl (i, k) fixed bin,
+    (component_ptr, request_ptr) pointer;
+
+	     k = None;
+
+	     do i = 1 to tape_archive_table.n_component_slots;
+		component_ptr = addr (component_table (i));
+		if ((i ^= ignore_component) & component_ptr -> component.valid) then
+		     if component_ptr -> component.date_time_deleted = (36)"1"b then k = max (k, Delete);
+		     else if component_ptr -> component.associated_request_index > 0 then do;
+			request_ptr = addr (request_queue (component_ptr -> component.associated_request_index));
+			if request_ptr -> request.extract then k = max (k, Read);
+			else do;
+			     k = max (k, Write);
+			     i = tape_archive_table.n_component_slots; /* no need to continue */
+			end;
+		     end;
+	     end;
+
+	     if k < Write then
+		do i = 1 to tape_archive_table.n_request_slots;
+		request_ptr = addr (request_queue (i));
+		if ((i ^= ignore_request) & request_ptr -> request.valid) then
+		     if request_ptr -> request.append then do;
+			k = Write;
+			i = tape_archive_table.n_request_slots;
+		     end;
+	     end;
+
+	     next_mount_type = k;
+	end compute_mount_type;
+%page;
+cancel_component: entry (table_ptr, arg_array, table_name, code);
+
+/* This entry implements the "cancel" key of tape_archive. */
+
+/* AUTOMATIC */
+
+dcl (i, j, k) fixed bin,
+     dtd_string char (24),
+     match bit (1) aligned,
+     nargs fixed bin;
+
+/* BUILTINS */
+
+dcl (addr, binary, dim, rel, size, string, unspec) builtin;
+
+/* EXTERNAL STATIC */
+
+dcl  error_table_$nomatch ext fixed bin (35) static;
+
+/* ENTRIES */
+
+dcl  check_star_name_$entry ext entry (char (*), fixed bin (35)),
+     date_time_$fstime ext entry (bit (36) aligned, char (*)),
+     command_query_ ext entry options (variable);
+
+/* AUTOMATIC */
+
+dcl  yes_or_no char (4) varying;
+
+	nargs = dim (arg_array, 1);
+
+	on cleanup call unlock_table (code);
+
+	call lock_table (Modify, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, "tape_archive", "cancel request not processed.");
+	     return;
+	end;
+
+	do i = 1 to nargs;
+	     call check_star_name_$entry (arg_array (i), code);
+	     if code = 0 then;
+	     else if code = 1 then;			/* is a discretionary starname */
+	     else if code = 2 then nargs = 0;		/* user said "**" or equivalent */
+	     else do;
+		call com_err_ (code, "tape_archive", "^a", arg_array (i));
+		call unlock_table (0);
+		return;
+	     end;
+	end;
+
+	query_info.version = query_info_version_5;
+	query_info.yes_or_no_sw = "1"b;
+
+	if nargs = 0 then do;
+	     call command_query_ (addr (query_info), yes_or_no, "tape_archive",
+		"Do you wish to cancel all pending requests in ^a??  ", table_name);
+	     if yes_or_no = "yes" then do;
+		do i = 1 to tape_archive_table.n_request_slots;
+		     if request_queue (i).valid then
+			call cancel_request (i);
+		end;
+
+		do i = 1 to tape_archive_table.n_component_slots;
+		     if component_table (i).valid then
+			if component_table (i).date_time_deleted = (36)"1"b then
+			     call cancel_deletion (i);
+		end;
+	     end;
+
+	end;
+
+	else begin;
+
+dcl  arg_used (nargs) bit (1) aligned automatic,
+     is_starname (nargs) bit (1) aligned automatic;
+
+
+dcl  already_hit (0:tape_archive_table.n_component_slots) bit (1) aligned automatic;
+
+	     unspec (arg_used), unspec (already_hit), unspec (is_starname) = ""b;
+
+	     do i = 1 to nargs;
+		call check_star_name_$entry (arg_array (i), code);
+		is_starname (i) = (code = 1);
+	     end;
+
+	     do j = 1 to tape_archive_table.n_request_slots;
+		match = ""b;
+
+		request_ptr = addr (tape_archive_table.request_queue (j));
+
+		if request.valid then do k = 1 to nargs;
+		     if is_starname (k) then do;
+			call match_star_name_ (request.entry_name, arg_array (k), code);
+			if code = 0 then match, arg_used (k) = "1"b;
+		     end;
+		     else if request.entry_name = arg_array (k) then
+			match, arg_used (k) = "1"b;
+		end;
+
+		if match then do;
+		     already_hit (request.existing_reference) = "1"b;
+		     call cancel_request (j);
+		end;
+	     end;
+
+	     do j = 1 to tape_archive_table.n_component_slots;
+		match = ""b;
+
+		component_ptr = addr (tape_archive_table.component_table (j));
+
+		if component.valid then do k = 1 to nargs;
+		     if is_starname (k) then do;
+			call match_star_name_ (component.entry_name, arg_array (k), code);
+			if code = 0 then match, arg_used (k) = "1"b;
+		     end;
+		     else if component.entry_name = arg_array (k) then
+			match, arg_used = "1"b;
+		end;
+
+		if match then
+		     if ^already_hit (j) then
+			call cancel_deletion (j);
+	     end;
+
+/* Check to see if the user is trying to cancel something that has already been processed as deleted.
+   If so, allow it, but warn him about what he is doing. */
+
+	     do i = 1 to nargs;
+		if (^arg_used (i) & ^is_starname (i)) then do;
+		     do j = tape_archive_table.n_component_slots to 1 by -1
+			     while (tape_archive_table.component_table.entry_name (j) ^= arg_array (i));
+		     end;
+
+		     if j > 0 then do;
+			component_ptr = addr (tape_archive_table.component_table (j));
+			call date_time_$fstime (component.date_time_deleted, dtd_string);
+
+			call command_query_ (addr (query_info), yes_or_no, "tape_archive",
+			     "Component ^a was already processed as deleted on ^a.^/^-^4xDo you wish to cancel its deletion?",
+			     component.entry_name, dtd_string);
+
+			if yes_or_no = "yes" then call cancel_deletion (j);
+			arg_used (i) = "1"b;
+		     end;
+		end;
+	     end;
+
+/* Complain about any we never found. */
+
+	     do i = 1 to nargs;
+		if arg_used (i) = ""b then do;
+		     if is_starname (i) then code = error_table_$nomatch;
+		     else code = 0;
+		     call com_err_ (code, "tape_archive", "^a^[^; not found^] in ^a", arg_array (i), is_starname (i), table_name);
+		end;
+	     end;
+	end;
+
+	call unlock_table (code);
+
+	return;
+%page;
+cancel_request_no: entry (table_ptr, request_slot, code);
+
+/* This entry is like cancel_component except that it is called at tape
+   processing time to remove both successful extractions and unsuccessful
+   operations of any type. */
+
+	call cancel_request (request_slot);
+	code = 0;
+	return;
+%skip(5);
+cancel_request: procedure (idx);
+
+dcl  idx fixed bin parameter;
+
+dcl (auto_request_no, auto_component_no) fixed bin;
+
+	     auto_request_no = idx;
+	     auto_component_no = request_queue (idx).existing_reference;
+
+	     call setup_workspace (table_ptr, auto_component_no, auto_request_no, workspace_ptr);
+
+	     request_ptr = addr (workspace_ptr -> workspace.request_copy);
+	     component_ptr = addr (workspace_ptr -> workspace.component_copy);
+
+	     if request.extract then
+		if request.delete then		/* successful extract/delete resets this */
+		     workspace_ptr -> workspace.dead_records = workspace_ptr -> workspace.dead_records - component.file_length;
+	     if request.append | request.replace then do;
+		workspace_ptr -> workspace.dead_records = workspace_ptr -> workspace.dead_records - component.file_length;
+		workspace_ptr -> workspace.total_records = workspace_ptr -> workspace.total_records - request.file_length;
+	     end;
+
+	     workspace_ptr -> workspace.n_queued_requests = workspace_ptr -> workspace.n_queued_requests - 1;
+
+	     workspace_ptr -> workspace.component_copy.associated_request_index = 0;
+
+	     if workspace_ptr -> workspace.next_mount_type ^= Compact then
+		call compute_mount_type (auto_component_no, auto_request_no, workspace_ptr -> workspace.next_mount_type);
+
+	     unspec (request_ptr -> request) = ""b;	/* wipe out request */
+
+	     call complete_table_op (table_ptr);
+
+	     return;
+
+cancel_deletion: entry (idx);
+
+	     auto_component_no = idx;
+
+	     component_ptr = addr (component_table (auto_component_no));
+
+	     if component.date_time_deleted = ""b then do;
+		call com_err_ (error_table_$action_not_performed, "tape_archive", "No requests pending for ^a.", component.entry_name);
+		return;
+	     end;
+
+	     call setup_workspace (table_ptr, auto_component_no, 0, workspace_ptr);
+	     component_ptr = addr (workspace_ptr -> workspace.component_copy);
+
+	     workspace_ptr -> workspace.dead_records = workspace_ptr -> workspace.dead_records - component.file_length;
+	     if component.valid then
+		workspace_ptr -> workspace.n_queued_requests = workspace_ptr -> workspace.n_queued_requests - 1;
+	     else workspace_ptr -> workspace.n_components = workspace_ptr -> workspace.n_components + 1;
+
+	     component.date_time_deleted = ""b;
+	     component.valid = "1"b;
+
+	     if workspace_ptr -> workspace.next_mount_type ^= Compact then
+		call compute_mount_type (auto_component_no, 0, workspace_ptr -> workspace.next_mount_type);
+
+	     call complete_table_op (table_ptr);
+
+	     return;
+	end cancel_request;
+%page;
+lock:	entry (table_ptr, table_name, lock_reason, code);
+
+dcl  lock_reason fixed bin;
+
+	call lock_table (lock_reason, code);
+	return;
+%skip(5);
+unlock:	entry (table_ptr, code);
+
+	call unlock_table (code);
+	return;
+%skip(5);
+lock_and_copy: entry (table_ptr, temp_table_ptr, table_name, lock_reason, code);
+
+/* PARAMETER */
+
+dcl  temp_table_ptr pointer parameter;
+
+/* ENTRIES */
+
+dcl  hcs_$get_uid_seg entry (ptr, bit (36) aligned, fixed bin (35));
+
+
+	call lock_table (lock_reason, code);
+	if code ^= 0 then return;
+
+	call copy_to_temp_table(table_ptr, temp_table_ptr, code);
+
+	return;
+%skip(5);
+copy_and_unlock: entry (temp_table_ptr, table_ptr, code);
+
+          call copy_to_perm(temp_table_ptr, table_ptr, code);
+	if code ^= 0 then return;
+
+	call unlock_table (code);
+
+	return;
+%page;
+copy_to_temp: entry(table_ptr, temp_table_ptr, code);
+
+          call copy_to_temp_table(table_ptr, temp_table_ptr, code);
+
+	return;
+
+
+copy_to_perm: entry(temp_table_ptr, table_ptr, code);
+
+          call copy_to_perm_table(temp_table_ptr, table_ptr, code);
+
+	return;
+%page;
+lock_table: proc (reason_arg, code);
+
+dcl  reason_arg fixed bin parameter,
+     code fixed bin (35) parameter;
+
+dcl (error_table_$lock_wait_time_exceeded,
+     error_table_$locked_by_this_process) external fixed bin (35) static;
+
+	     call set_lock_$lock (tape_archive_table.lock, 10, code);
+	     if code = error_table_$lock_wait_time_exceeded then do;
+						/* there is contention on this lock */
+		call com_err_ (code, "tape_archive", "^/^5x^a already locked by ^a for ^a.",
+		     table_name, tape_archive_table.locker_id, Lock_reasons (tape_archive_table.lock_reason));
+		return;
+	     end;
+
+	     else if code = error_table_$locked_by_this_process then do;
+						/* Mylock condiion shouldn't really occur unless the user */
+						/* quit out of tape_archive at a lower command level previously and */
+						/* never released */
+		call com_err_ (code, "tape_archive",
+		     "^/^5x^a still locked by a previous incomplete command invocation.",
+		     table_name);
+		return;
+	     end;
+
+	     else code = 0;
+
+	     if ^initialized then do;
+		group_id = get_group_id_ ();
+		initialized = "1"b;
+	     end;
+
+	     tape_archive_table.locker_id = group_id;
+	     tape_archive_table.lock_reason = reason_arg;
+	     return;
+
+unlock_table:  entry (code);
+
+	     if tape_archive_table.lock ^= ""b then
+		call set_lock_$unlock (tape_archive_table.lock, code);
+	     else code = 0;
+	     return;
+
+	end lock_table;
+%page;
+copy_to_temp_table: proc(table_ptr, temp_table_ptr, code);
+
+/* PARAMETER */
+
+dcl  code fixed bin(35);
+dcl  table_ptr ptr;
+dcl  temp_table_ptr ptr;
+
+/* AUTOMATIC */
+
+dcl  overlay_length fixed bin (18);
+
+/* BASED */
+
+dcl  overlay (overlay_length) bit (36) aligned based;
+
+/* ENTRIES */
+
+dcl  hcs_$get_uid_seg entry (ptr, bit (36) aligned, fixed bin (35));
+
+          code = 0;
+
+/* Update table uid -- load_table, copy, etc. may have changed it. */
+
+	call hcs_$get_uid_seg (table_ptr, table_ptr->tape_archive_table.perm_table_uid, code);
+	if code ^= 0 then tape_archive_table.perm_table_uid = "0"b; /* shouldn't happen -- but suppress table check */
+
+/* Now copy table. */
+
+	overlay_length = currentsize (table_ptr->tape_archive_table);
+	temp_table_ptr -> overlay = table_ptr -> overlay;
+
+	temp_table_ptr -> tape_archive_table.lock = ""b;	/* interactive mode hates mylocks */
+	temp_table_ptr -> tape_archive_table.lock_reason = 0;
+
+     end copy_to_temp_table;
+%skip(5);
+copy_to_perm_table: proc(temp_table_ptr, table_ptr, code);
+
+/* PARAMETER */
+
+dcl  code fixed bin(35);
+dcl  temp_table_ptr ptr;
+dcl  table_ptr ptr;
+
+/* AUTOMATIC */
+
+dcl  old_mask bit (36) aligned;
+dcl  overlay_length fixed bin(18);
+
+/* BASED */
+
+dcl  overlay(overlay_length) bit(36) aligned based;
+
+/* ENTRIES */
+
+dcl (hcs_$set_ips_mask, hcs_$reset_ips_mask) entry (bit (36) aligned, bit (36) aligned);
+
+
+          code = 0;
+
+	old_mask = ""b;
+	on cleanup begin;
+	     if old_mask ^= ""b then
+		call hcs_$reset_ips_mask ((old_mask), old_mask);
+	end;
+
+          overlay_length = currentsize(temp_table_ptr->tape_archive_table);
+
+	table_ptr -> tape_archive_table.recovery_info_offset = ""b;
+						/* if we blow up during copy, too bad */
+
+	call hcs_$set_ips_mask (""b, old_mask);
+
+/* OK, now run like hell. */
+
+	table_ptr -> tape_archive_table.table_is_consistent = ""b;
+
+          table_ptr->overlay = temp_table_ptr->overlay;
+
+	table_ptr->tape_archive_table.table_is_consistent = "1"b;
+
+/* Whew-- made it! */
+
+	call hcs_$set_bc_seg (table_ptr, length (unspec (table_ptr->tape_archive_table)), code);
+	call hcs_$truncate_seg (table_ptr, currentsize (table_ptr->tape_archive_table), code);
+
+	call hcs_$reset_ips_mask ((old_mask), old_mask);
+
+     end copy_to_perm_table;
+%page;
+check_compaction: entry (table_ptr, table_name, code);
+
+dcl  waste float bin;
+
+	code = 0;
+
+	if tape_archive_table.next_mount_type ^= Compact then call test_waste_thresholds ("1"b);
+	return;
+%skip(5);
+test_waste_thresholds: proc (lockit);
+
+dcl  lockit bit (1) aligned parameter;
+
+	     if tape_archive_table.total_records = 0 then waste = 0;
+	     else waste = float (tape_archive_table.dead_records) / float (tape_archive_table.total_records);
+
+	     if waste > tape_archive_table.auto_compaction_threshold then do;
+		if lockit then do;
+		     call lock_table (Modify, code);
+		     if code ^= 0 then return;
+		end;
+
+		tape_archive_table.next_mount_type = Compact;
+
+		if lockit then call unlock_table (code);
+
+		call ioa_ ("tape_archive:  ^a has been scheduled for compaction.", table_name);
+		return;
+	     end;
+
+	     if waste >= tape_archive_table.compaction_warning_threshold then
+		call ioa_ ("tape_archive: Waste factor of ^a is ^d%.", table_name, waste * 100);
+
+	     return;
+	end test_waste_thresholds;
+%page;
+finish_requests: entry (table_ptr, code);
+
+/* This entry cleans up the table just prior to putting it out to tape.
+   This operation is always performed on a temp copy of the table in the
+   process dir-- hence no locking or IPS masking is necessary or done. */
+
+/* AUTOMATIC */
+
+dcl  compacting bit (1) aligned,
+     cur_time bit (36) aligned,
+     last_new_idx fixed bin,
+     overlay_length fixed bin(18),
+     temp_ptr pointer;
+
+/* BASED */
+
+dcl  based_temp_ptr (1) pointer based (addr (temp_ptr));
+dcl  overlay(overlay_length) bit(36) aligned based;
+
+/* ENTRIES */
+
+dcl  get_temp_segments_ ext entry (char (*), pointer dimension (*), fixed bin (35)),
+     release_temp_segments_ ext entry (char (*), pointer dimension (*), fixed bin (35));
+
+	code = 0;
+	cur_time = substr (bit (clock ()), 20, 36);	/* standard file system time */
+
+	tape_archive_table.incomplete_write_op_last = ""b;
+
+	if tape_archive_table.next_mount_type = Read then do;
+	     tape_archive_table.next_mount_type = None;
+	     return;
+	end;
+
+	temp_ptr = null;
+	on cleanup begin;
+	     if temp_ptr ^= null then call release_temp_segments_ ("tape_archive", based_temp_ptr, code);
+	end;
+
+	call get_temp_segments_ ("tape_archive", based_temp_ptr, code);
+
+	last_new_idx = tape_archive_table.n_component_slots;
+
+	compacting = (tape_archive_table.next_mount_type = Compact);
+
+	if compacting then do;
+
+	     last_new_idx = 0;			/* start from beginning again */
+	     tape_archive_table.date_time_last_compacted = cur_time;
+	     tape_archive_table.total_records = 0;
+
+	     do i = 1 to tape_archive_table.n_component_slots;
+
+		component_ptr = addr (component_table (i));
+
+		if component.valid then
+		     if component.associated_request_index = 0 then do; /* extracts all removed by this point */
+			last_new_idx = last_new_idx + 1;
+			if last_new_idx ^= i then do;
+			     unspec (component_table (last_new_idx)) = unspec (component_table (i));
+			     component_table (last_new_idx).previous_instance_backchain = 0;
+			end;
+			tape_archive_table.total_records = tape_archive_table.total_records + component.file_length;
+		     end;
+	     end;
+
+	     tape_archive_table.n_components = last_new_idx;
+
+	     tape_archive_table.dead_records = 0;
+	     tape_archive_table.date_time_last_compacted = cur_time;
+	     tape_archive_table.last_table_no = 0;
+	     tape_archive_table.tape_info.active_set = 3 - tape_archive_table.tape_info.active_set;
+	end;
+
+	overlay_length = currentsize (tape_archive_table);
+	temp_ptr -> overlay = table_ptr -> overlay;	/* copy table to temp seg */
+
+	tape_archive_table.n_component_slots = last_new_idx;
+
+	call hcs_$truncate_seg (table_ptr, binary (rel (addr (tape_archive_table.request_queue))), code);
+	if code ^= 0 then goto release_and_return;
+
+	do i = 1 to tape_archive_table.n_request_slots;
+	     request_ptr = addr (temp_ptr -> tape_archive_table.request_queue (i));
+	     if request.valid then do;
+		last_new_idx = last_new_idx + 1;
+		tape_archive_table.n_component_slots = last_new_idx;
+		component_ptr = addr (tape_archive_table.component_table (last_new_idx));
+		string (request.requested_ops) = ""b;
+		unspec (component.entry_status_descriptor) = unspec (request.entry_status_descriptor);
+		component.associated_request_index = 0;
+
+		if request.existing_reference ^= 0 then /* This is a replacement, not an addition */
+		     if ^compacting then do;
+			component.previous_instance_backchain = request.existing_reference;
+			component_table (component.previous_instance_backchain).valid = ""b;
+		     end;
+		     else do;			/* compacting, old copy no longer there */
+			component.previous_instance_backchain = 0;
+			tape_archive_table.n_components = tape_archive_table.n_components + 1;
+		     end;
+		else tape_archive_table.n_components = tape_archive_table.n_components + 1;
+						/* addition, not replacement */
+	     end;
+	end;
+
+	if tape_archive_table.next_mount_type > Read then tape_archive_table.date_time_tape_modified = cur_time;
+	tape_archive_table.n_queued_requests, tape_archive_table.n_request_slots = 0;
+
+	tape_archive_table.next_mount_type = None;
+
+release_and_return:
+	call release_temp_segments_ ("tape_archive", based_temp_ptr, code);
+	return;
+%page;
+star_list: entry (table_ptr, a_starname, selector, a_ta_component_star_ptr, code);
+
+dcl  a_starname char (32) parameter,
+     selector fixed bin parameter,
+     a_ta_component_star_ptr pointer;
+
+dcl  match_star_name_ ext entry (char (*), char (*), fixed bin (35));
+
+dcl  sys_info$max_seg_size ext fixed bin (35) static;
+
+dcl  system_free_area area (sys_info$max_seg_size) based (system_free_ptr);
+
+dcl  system_free_ptr pointer static initial (null);
+
+dcl  get_system_free_area_ ext entry returns (pointer);
+
+	on cleanup call unlock_table (0);
+
+	call lock_table (Examine, code);
+	if code ^= 0 then return;
+
+	call star_list (a_starname, selector, a_ta_component_star_ptr, code);
+
+	if code ^= 0 then call unlock_table (0);
+	else call unlock_table (code);
+
+	return;
+%skip(5);
+star_list: proc (starname, selector, a_ta_component_star_ptr, code);
+
+dcl (starname char (32),
+     selector fixed bin,
+     a_ta_component_star_ptr pointer,
+     code fixed bin (35)) parameter;
+
+dcl  i fixed bin;
+
+dcl 1 select_table (tape_archive_table.n_component_slots + tape_archive_table.n_request_slots) aligned automatic like ta_component_star_info.entry;
+
+	     if system_free_ptr = null then
+		system_free_ptr = get_system_free_area_ ();
+
+	     a_ta_component_star_ptr, ta_component_star_ptr = null;
+
+	     ta_star_match_count = 0;
+
+	     if selector ^= Request then
+		do i = 1 to tape_archive_table.n_component_slots;
+
+		component_ptr = addr (tape_archive_table.component_table (i));
+
+		if component.valid then do;
+		     call match_star_name_ (component.entry_name, starname, code);
+		     if code = 0 then do;
+			ta_star_match_count = ta_star_match_count + 1;
+			select_table (ta_star_match_count).ename = component.entry_name;
+			select_table (ta_star_match_count).type = Component;
+			select_table (ta_star_match_count).table_idx = i;
+		     end;
+
+		     else if code = error_table_$nomatch then;
+
+		     else return;
+		end;
+	     end;
+
+	     if selector ^= Component then
+		do i = 1 to tape_archive_table.n_request_slots;
+
+		request_ptr = addr (tape_archive_table.request_queue (i));
+
+		if request.valid then do;
+		     call match_star_name_ (request.entry_name, starname, code);
+		     if code = 0 then do;
+			ta_star_match_count = ta_star_match_count + 1;
+			select_table (ta_star_match_count).ename = request.entry_name;
+			select_table (ta_star_match_count).type = Request;
+			select_table (ta_star_match_count).table_idx = i;
+		     end;
+
+		     else if code = error_table_$nomatch then;
+
+		     else return;
+		end;
+	     end;
+
+	     if ta_star_match_count = 0 then do;
+		code = error_table_$nomatch;
+		return;
+	     end;
+
+	     code = 0;
+
+	     on cleanup begin;
+		if ta_component_star_ptr ^= null then
+		     free ta_component_star_info in (system_free_area);
+	     end;
+
+	     allocate ta_component_star_info in (system_free_area);
+
+	     unspec (ta_component_star_info.entry) = unspec (select_table);
+	     a_ta_component_star_ptr = ta_component_star_ptr;
+
+	     return;
+
+	end star_list;
+%page;
+setup_workspace: entry (table_ptr, arg_component_no, arg_request_no, arg_workspace_ptr);
+
+dcl (arg_component_no, arg_request_no) fixed bin parameter,
+     arg_workspace_ptr pointer;
+
+	call setup_workspace (table_ptr, arg_component_no, arg_request_no, arg_workspace_ptr);
+	return;
+
+/* ------------------------------------------------------------ */
+
+setup_workspace: proc (table_ptr, arg_component_no, arg_request_no, workspace_ptr);
+
+/* This entry and entry complete_table_op implement the "indivisible" table
+   update strategy necessary to make sure that the table always remains
+   consistent.  Any tape_archive operation which has only to modify one item
+   in the table (e.g., "alter density") can do so without going through a
+   window where the table is inconsistent.  Thus it can operate on the table
+   data directly.  Any other operation, however (e.g., extract, which has to
+   set up a request queue entry and update several header variables such as
+   next_mount_type, n_queued_requests, etc.) must use these two entries.  The
+   strategy is to call setup_workspace, giving the component and request
+   number (if any) before starting the work.  All pertinent variables,
+   including the request, component, and header variables, are copied into the
+   workspace.  All changes are then made to the copies of the pertinent
+   information in the workspace.  Should the operation be aborted anywhere
+   during this time, the table remains consistent and the workspace is later
+   flushed.  When the new information is complete and consistent,
+   complete_table_op is called to put the information into place in an
+   indivisible fashion (exactly how is described in it's own header comment. */
+
+dcl (arg_component_no, arg_request_no) fixed bin parameter,
+    (table_ptr, workspace_ptr) pointer parameter;
+
+dcl  temp_offset fixed bin (18) automatic;
+
+/* First, clean up any old workspaces hanging around. */
+
+	     if table_ptr -> tape_archive_table.recovery_info_offset ^= ""b then do;
+		workspace_ptr = pointer (table_ptr, table_ptr -> tape_archive_table.recovery_info_offset);
+		if workspace_ptr -> workspace.workspace_id = Magic_workspace_constant then
+		     unspec (workspace_ptr -> workspace) = ""b;
+		table_ptr -> tape_archive_table.recovery_info_offset = ""b;
+	     end;
+
+/* Calculate a safe place to put the workspace.  Put it at the end of the
+   segment, leaving enough room for extra request structures to be added on
+   to the segment without clobbering our workspace. */
+
+	     temp_offset = currentsize (table_ptr -> tape_archive_table)
+		+ 3 * size (null -> request)		/* only 1 should really be needed */
+		+ 20;				/* for good luck */
+
+	     workspace_ptr = pointer (table_ptr, bit (temp_offset));
+
+	     unspec (workspace_ptr -> workspace) = ""b;
+	     workspace_ptr -> workspace.component_no = arg_component_no;
+	     workspace_ptr -> workspace.request_no = arg_request_no;
+	     workspace_ptr -> workspace.n_queued_requests = table_ptr -> tape_archive_table.n_queued_requests;
+	     workspace_ptr -> workspace.dead_records = table_ptr -> tape_archive_table.dead_records;
+	     workspace_ptr -> workspace.total_records = table_ptr -> tape_archive_table.total_records;
+	     workspace_ptr -> workspace.n_components = table_ptr -> tape_archive_table.n_components;
+	     workspace_ptr -> workspace.n_request_slots = table_ptr -> tape_archive_table.n_request_slots;
+	     workspace_ptr -> workspace.next_mount_type = table_ptr -> tape_archive_table.next_mount_type;
+	     unspec (workspace_ptr -> workspace.tape_info_copy) = unspec (table_ptr -> tape_archive_table.tape_info);
+	     if arg_component_no ^= 0 then
+		unspec (workspace_ptr -> workspace.component_copy)
+		= unspec (table_ptr -> tape_archive_table.component_table (arg_component_no));
+	     if arg_request_no ^= 0 then
+		unspec (workspace_ptr -> workspace.request_copy)
+		= unspec (table_ptr -> tape_archive_table.request_queue (arg_request_no));
+	     workspace_ptr -> workspace.workspace_id = Magic_workspace_constant;
+
+	     table_ptr -> tape_archive_table.recovery_info_offset = rel (workspace_ptr);
+	     return;
+
+	end setup_workspace;
+
+/* ------------------------------------------------------------ */
+%page;
+complete_table_op: entry (table_ptr);
+
+	call complete_table_op (table_ptr);
+	return;
+
+/* ------------------------------------------------------------ */
+
+complete_table_op: proc (table_ptr);
+
+/* This entry contracts to perform table updates of multiple, interdependent
+   values into the table indivisibly.  Once it turns off the bit
+   tape_archive_table.table_is_consistent, it is committed to finishing off
+   the operation described in the workspace.  Even if a fault, IPS signal, or
+   crash occurs in the middle of execution of this module, a future operation
+   on this table will see that bit off and will automatically re-attempt to
+   commit the values in the workspace back into the table.  Thus the
+   operation, while not structly "indivisible", is at least guaranteed of
+   consummation. */
+
+dcl  table_ptr pointer parameter;
+
+dcl  i fixed bin,
+    (request_ptr, component_ptr, workspace_ptr) pointer;
+
+/* First, a couple of "gullibility checks". */
+
+	     if table_ptr -> tape_archive_table.recovery_info_offset = ""b then do;
+		call sub_err_ (error_table_$bad_segment, "tape_archive", "c", null, 0,
+		     "Table workspace missing-- please notify system maintenance.");
+		return;
+	     end;
+
+	     workspace_ptr = pointer (table_ptr, table_ptr -> tape_archive_table.recovery_info_offset);
+	     if workspace_ptr -> workspace.workspace_id ^= Magic_workspace_constant then do;
+		call sub_err_ (error_table_$bad_segment, "tape_archive", "c", null, 0,
+		     "Table workspace has been damaged-- please notify system maintenance.");
+		return;
+	     end;
+
+	     if workspace_ptr -> workspace.component_no ^= 0 then
+		component_ptr =
+		addr (table_ptr -> tape_archive_table.component_table (workspace_ptr -> workspace.component_no));
+	     else component_ptr = null;
+	     if workspace_ptr -> workspace.request_no ^= 0 then
+		request_ptr =
+		addr (table_ptr -> tape_archive_table.request_queue (workspace_ptr -> workspace.request_no));
+	     else request_ptr = null;
+
+/* The order of the setting of the consistent bit, clearing of the workspace,
+   etc., is highly important to ensure repeatability without interference. */
+
+	     table_ptr -> tape_archive_table.table_is_consistent = ""b;
+
+	     table_ptr -> tape_archive_table.n_queued_requests = workspace_ptr -> workspace.n_queued_requests;
+	     table_ptr -> tape_archive_table.dead_records = workspace_ptr -> workspace.dead_records;
+	     table_ptr -> tape_archive_table.total_records = workspace_ptr -> workspace.total_records;
+	     table_ptr -> tape_archive_table.n_components = workspace_ptr -> workspace.n_components;
+	     table_ptr -> tape_archive_table.n_request_slots = workspace_ptr -> workspace.n_request_slots;
+	     table_ptr -> tape_archive_table.next_mount_type = workspace_ptr -> workspace.next_mount_type;
+	     unspec (table_ptr -> tape_archive_table.tape_info) = unspec (workspace_ptr -> workspace.tape_info_copy);
+	     if workspace_ptr -> workspace.component_no ^= 0 then
+		unspec (component_ptr -> component) = unspec (workspace_ptr -> workspace.component_copy);
+	     if workspace_ptr -> workspace.request_no ^= 0 then
+		unspec (request_ptr -> request) = unspec (workspace_ptr -> workspace.request_copy);
+
+/* See if we can truncate unused request queue entries. */
+
+	     if workspace_ptr -> workspace.request_copy.valid = ""b then
+		if workspace_ptr -> workspace.request_no >= table_ptr -> tape_archive_table.n_request_slots then do;
+		     do i = workspace_ptr -> workspace.request_no - 1 to 1 by -1
+			     while (table_ptr -> request_queue (i).valid = ""b);
+			unspec (table_ptr -> request_queue (i)) = ""b;
+		     end;
+
+		     if i ^< 0 then
+			table_ptr -> tape_archive_table.n_request_slots = i;
+		end;
+
+/* All is copied.  Shut off the "must salvage" indicator */
+
+	     table_ptr -> tape_archive_table.table_is_consistent = "1"b;
+
+/* Wipe out the workspace.  The order of these lines is significant in terms
+   of the cleanup we can do later if we happen to be interrupted here. */
+
+	     call hcs_$truncate_seg
+		(table_ptr, currentsize (table_ptr -> tape_archive_table),
+		0);
+	     table_ptr -> tape_archive_table.recovery_info_offset = ""b;
+
+	     call hcs_$set_bc_seg (table_ptr, length (unspec (table_ptr -> tape_archive_table)), 0);
+	     return;
+	end complete_table_op;
+
+/* ------------------------------------------------------------ */
+
+     end ta_table_mgr_;

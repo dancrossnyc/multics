@@ -1,0 +1,239 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style4,delnl,insnl,tree,ifthenstmt,indnoniterend */
+
+get_main:
+     procedure (Segp, Size, Tsdw);
+
+/* *	Subroutine to provide a wired, contiguous buffer/working segment for its caller.
+   *	If this subroutine is called before paging is enabled (or at least before init_sst
+   *	is called) the buffer/working segment will be allocated from the storage between
+   *	the perm-wired segments and the paged segments. Otherwise pc_abs is called to
+   *	find the necessary storage.
+   *
+   *	If the SLTE for the specified segment indicates it is paged, the storage is
+   *	acquired fron that just below the paged segments, otherwise the storage
+   *	just after the wired segments is used.
+   *
+   *	call get_main (Segp, size, Tsdw);
+   *
+   *	1. Segp	       is a pointer to the segment wanted. (Input)
+   *
+   *	2. size	       is the size of the segment wanted (in words)
+   *		       The parameter is returned as the next higher 0 mod 1024 value. (Input/Ouput)
+   *
+   *	3. Tsdw	       is a returned SDW for the segment. It is up to the caller to place
+   *		       this SDW in the descriptor segment. (Output)
+   *
+   *	Last Modified (date and reason):
+   *
+   *	01/27/76, S. Webber (Initial coding)
+   *	05/17/76, N. Morris for 28-5 compatibility
+   *	11/08/80, W. Olin Sibert, to zero storage before returning
+   August 1981	C. Hornig for new pc_abs.
+   *	04/04/81, W. Olin Sibert, to use sdw_util
+   *	September 1983, Keith Loepere, for paged wired segment.
+*/
+
+dcl  Segp pointer parameter;
+dcl  Size fixed bin (18) parameter;
+dcl  Memory_address fixed bin (26) parameter;
+dcl  Tsdw fixed bin (71) parameter;
+
+dcl  cl fixed bin (9);
+dcl  code fixed bin (35);
+dcl  ptp ptr;
+dcl  astep ptr;
+dcl  segno fixed bin (18);
+dcl  save_sdw fixed bin (71);				/* For keeping the SDW until we're done clearing the seg */
+dcl  memory_address fixed bin (26);
+dcl  page_no fixed bin;
+dcl  size fixed bin (18);
+dcl  size_mod_1024 fixed bin (18, -10);
+
+dcl  1 sdwi aligned like sdw_info automatic;
+
+dcl  dseg$ (0:1023) fixed bin (71) external static;
+dcl  int_unpaged_page_tables$ external static;
+dcl  slt$ fixed bin external static;
+dcl  unpaged_page_tables$ external static;
+
+dcl  absadr entry (ptr, fixed bin (35)) returns (fixed bin (26));
+dcl  make_sdw$unthreaded entry (fixed bin (18), fixed bin (71), ptr, ptr);
+dcl  ptw_util_$make_core entry (ptr, fixed bin (26));
+dcl  pc_abs$wire_abs_contig entry (ptr, fixed bin (9), fixed bin (9), fixed bin (35));
+dcl  privileged_mode_ut$swap_sdw entry (ptr, ptr);
+dcl  sdw_util_$construct entry (pointer, pointer);
+dcl  sdw_util_$set_access entry (pointer, bit (4) unaligned);
+dcl  syserr entry options (variable);
+dcl  syserr$error_code entry options (variable);
+
+dcl  (addr, addrel, baseno, bin, bit, divide, mod, null, string) builtin;
+
+
+	segno = bin (baseno (Segp), 18);
+	sltp = addr (slt$);
+	sltep = addr (slt.seg (segno));
+
+	size_mod_1024 = fixed (Size + 1023, 18, -10);
+	size = size_mod_1024;			/* variables have different precisions */
+
+	slte_uns.bit_count = size * 36;
+	cl = divide (size_mod_1024, 1024, 18, 0);
+	slte_uns.cur_length = cl;
+
+	if slt.free_core_start = 0 then do;		/* must call pc_contig */
+	     call make_sdw$unthreaded (segno, Tsdw, astep, ptp);
+	     call pc_abs$wire_abs_contig (astep, 0, cl, code);
+	     if code ^= 0
+	     then
+no_room:
+		do;
+		     namep = addrel (slt.name_seg_ptr, slte.names_ptr);
+		     call syserr$error_code (CRASH, code, "get_main: Insufficient storage available for ^a",
+			segnam.names (1).name);
+		end;
+
+	     call privileged_mode_ut$swap_sdw (Segp, addr (Tsdw));
+	     return;				/* All done for the after-init_sst case */
+	     end;
+
+/* Check for no more room */
+
+	if slt.free_core_size < size then do;
+	     code = 0;
+	     go to no_room;
+	     end;
+
+	if slte.paged
+	then memory_address = slt.free_core_start + slt.free_core_size - size;
+	else do;
+	     memory_address = slt.free_core_start;
+	     slt.free_core_start = slt.free_core_start + size;
+	     end;
+	slt.free_core_size = slt.free_core_size - size;
+
+generate:
+	if slte.paged
+	then upt_ptr = addr (int_unpaged_page_tables$);		/* seg will get real page table when make_segs_paged is run */
+	else upt_ptr = addr (unpaged_page_tables$);
+
+/* Now fill in SDW */
+
+	unspec (sdwi) = ""b;			/* Prepare to call sdw_util to build the SDW */
+	string (sdwi.access) = "1010"b;		/* Start out with RW access for clearing */
+	sdwi.size = size;				/* Segment is unpaged by default */
+
+	sdwi.flags.paged = "1"b;
+	upt_entry_ptr = ptr (upt_ptr, upt.current_length);
+	upt.current_length = upt.current_length + 2 + round (cl, -1);
+	if upt.current_length > upt.max_length then do;
+	     namep = addrel (slt.name_seg_ptr, slte.names_ptr);
+	     call syserr (CRASH, "get_main: not enough room to allocate unpaged page table for ^a.", segnam.names (1).name);
+	end;
+	upt_entry.size = cl;
+	upt_entry.segno = segno;
+	do page_no = 1 to cl;
+	     call ptw_util_$make_core (addr (upt_entry.ptws (page_no)), memory_address);
+	     memory_address = memory_address + 1024;
+	end;
+
+	sdwi.address = absadr (addr (upt_entry.ptws), (0));
+	call sdw_util_$construct (addr (Tsdw), addr (sdwi));
+						/* Make an SDW */
+
+	save_sdw = dseg$ (segno);			/* Save the current SDW for this segment */
+	call privileged_mode_ut$swap_sdw (Segp, addr (Tsdw));
+						/* and prepare to zero the segment */
+
+/* Even though memory is supposed to be clear, some of the "allocate-free"
+   tricks used for firmware may leave gruft around. */
+
+	begin;
+declare  segment_overlay (size) bit (36) aligned based (Segp);
+	     segment_overlay = ""b;
+	end;
+
+	call sdw_util_$set_access (addr (Tsdw), slte.access);
+						/* Set the real access */
+
+	call privileged_mode_ut$swap_sdw (Segp, addr (save_sdw));
+						/* and replace it with what was there before */
+
+	return;					/* Our caller will actually swap in the new SDW */
+						/* when it is needed; some callers require both for a while */
+%page;
+given_address: entry (Segp, Memory_address, Size, Tsdw);
+
+/* Construct a memory segment as above, but use callers memory address. */
+
+	segno = bin (baseno (Segp), 18);
+	sltp = addr (slt$);
+	sltep = addr (slt.seg (segno));
+
+	size_mod_1024 = fixed (Size + 1023, 18, -10);
+	size = size_mod_1024;			/* variables have different precisions */
+
+	slte_uns.bit_count = size * 36;
+	cl = divide (size_mod_1024, 1024, 18, 0);
+	slte_uns.cur_length = cl;
+
+	memory_address = Memory_address;
+	go to generate;
+/* format: off */
+%page; %include slt;
+%page; %include slte;
+%page; %include sdw_info;
+%page; %include syserr_constants;
+%page; %include unpaged_page_tables;
+
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   get_main: insufficient storage available for NAME
+
+   S:	$crash
+
+   T:	$init
+
+   M:	Insufficient wired memory
+   was available to create the segment NAME during initialization.
+   The system tape may be bad, or the configuration may be too small,
+   or the system parameters specified in the configuration deck may be
+   incorrect or inconsistent with the amount of main storage available.
+
+   A:	$recover
+   Check the configuration and the CONFIG deck.
+   $boot_tape
+
+   Message:
+   get_main: not enough room to allocate unpaged page table for NAME.
+
+   S: $crash
+
+   T: $init
+
+   M: Either the segment unpaged_page_tables or int_unpaged_page_tables
+   was not big enough so as to have the page table for segment NAME allocated
+   within it.  The system tape may be bad, or changes made to the mst require 
+   bigger unpaged page tables.
+
+   A: $recover
+   Try another tape.  If bigger unpaged page tables are in order, a change
+   must be made to bootload_equs.incl.alm and collection 0 recompiled.
+   $boot_tape
+
+   END MESSAGE DOCUMENTATION */
+
+     end get_main;

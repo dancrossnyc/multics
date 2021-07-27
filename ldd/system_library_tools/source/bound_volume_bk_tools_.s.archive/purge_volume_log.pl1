@@ -1,0 +1,635 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-26,GWMay), approve(86-02-27,MCR7368),
+     audit(86-03-28,Fawcett), install(86-03-31,MR12.0-1035):
+     added assignment statement for rpv_pvid. This was being dropped from the
+     original log when passed through this program.
+  2) change(88-03-01,GWMay), approve(89-10-03,MCR8135),
+     audit(89-10-04,Beattie), install(89-10-10,MR12.3-1103):
+     Redesigned purge selection loop to more accurately represent reload
+     groups per the documentation.  Prior to this change consolidated dumps
+     were not being freed and reload groups > 2 did not work.  Also changed
+     display of status messages to use ioa_ in place of com_err_.  Also
+     changed to unlock the volog when using -test.  Prior to this fix, vologs
+     are left locked by the -test control pass.
+  3) change(89-10-16,GWMay), approve(89-10-16,PBF8135),
+     audit(89-10-16,Beattie), install(89-10-18,MR12.3-1095):	
+     Fixed bug where one too many reload groups was retained.
+  4) change(89-10-26,GWMay), approve(89-10-26,MCR8135),
+     audit(89-10-26,Beattie), install(89-11-01,MR12.3-1103):	
+     Fixed bug where a dump volume was deleted from the volog but wasn't
+     getting posted for later purging from the pvologs and contents_name
+     segments.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+purge_volume_log: proc;
+
+/* This command tool allows the caller to purge/delete in a controlled maner dump volumes from a volume log. It
+   only deletes those dump volumes that have been superceeded by other dump volumes. In other words we delete incremental
+   dump volumes that have been superceeded by consolidated dump volumes and consolidated dump volumes that have been
+   superceeded by complete dump volumes. We take great care to preserve  reload groups, where a reload group is defined
+   as those dump volumes necessary to logically recreate a physical volume during a volume reload. */
+/* Status:
+     0) Created:	 Sometime in the past by D.R. Vinograd
+     1) Modified:	 12/13/82 by GA Texada to pretend -force if called as a subroutine.
+*/
+%page;
+/* set flags */
+    code = 0;
+    sub, force_mode, test_mode = "0"b;
+    error_rnt = com_err_;
+    manual_free = "1"b;
+    myname = "purge_volume_log";
+    pvlp, bvlp = null;
+    sys_dir = ">daemon_dir_dir>volume_backup";
+						/* pick up name of volume log */
+    call cu_$arg_ptr (1, argp, argl, code);
+    if code ^= 0 then do;
+argerr: call error_rnt (error_table_$noarg, myname, "
+Usage:   ^a pvname {-control_args}
+         control_args:   -auto   -test   -force   -working_dir,-wd",
+	 myname);
+        goto finish;
+      end;
+    if substr (arg, 1, 1) = "-" then goto argerr;
+    volog = arg;
+						/* pickup control args if any */
+    ac = 2;
+    call cu_$arg_count (narg);
+    do while (ac <= narg);
+      call cu_$arg_ptr (ac, argp, argl, code);
+      if code ^= 0 then do;
+	call error_rnt (code, myname, "Unable to access arg after ^a", arg);
+	goto finish;
+        end;
+      if arg = "-auto" then manual_free = "0"b;
+      else if arg = "-force" then force_mode = "1"b;
+      else if arg = "-test" then test_mode = "1"b;
+      else if arg = "-wd" | arg = "-working_dir" then sys_dir = get_wdir_ ();
+      else do;
+	call error_rnt (error_table_$badopt, myname, "^a", arg);
+	goto finish;
+        end;
+      ac = ac + 1;
+    end;
+
+common:
+    tp (*) = null;
+    new_pool_path = rtrim (sys_dir) || ">Volume_Dumper";
+    volog_dir = sys_dir;
+    pvolog_dir = rtrim (sys_dir) || ">pvolog";
+    contents_dir = rtrim (sys_dir) || ">contents";
+    on cleanup call finish_;
+    call find_volog_and_lock (volog);
+    if ^manual_free then do;
+        call manage_volume_pool_$set_pool_path (error_rnt, new_pool_path, vpp, code);
+        if code ^= 0 then do;
+	  call error_rnt (code, myname, "Unable to set new volume pool path");
+	  goto finish;
+	end;
+      end;
+    code = 0;
+    new_ent_cnt = 0;
+    call get_temp_segments_ (myname, tp, code);
+    if code ^= 0 then do;
+        call error_rnt (code, myname, "Unable to create temp segs");
+        goto finish;
+      end;
+    tbvlp = tp (1);
+    old_vlp = tp (2);
+    new_vlp = tp (3);
+    del_vlp = tp (4);
+						/* build name list of all dump volumes in log */
+    call build_volume_list (bvlp, old_vlp);
+						/*  initialize what will be new volume log */
+    reload_groups = backup_volume_log.reload_groups;
+    tbvlp -> backup_volume_log.header = backup_volume_log.header;
+    tbvlp -> backup_volume_log.info = backup_volume_log.info;
+    tbvlp -> backup_volume_log.version = backup_volume_log.version;
+    tbvlp -> backup_volume_log.lock = backup_volume_log.lock;
+    tbvlp -> backup_volume_log.pvname = backup_volume_log.pvname;
+    tbvlp -> backup_volume_log.pvid = backup_volume_log.pvid;
+    if backup_volume_log.version = backup_volume_log_version_2 |
+       backup_volume_log.version = backup_volume_log_version_3 then
+      tbvlp -> backup_volume_log.disk_type = backup_volume_log.disk_type;
+    tbvlp -> backup_volume_log.next = backup_volume_log.next;
+    tbvlp -> backup_volume_log.reload_groups = reload_groups;
+    tbvlp -> backup_volume_log.rpv_pvid = backup_volume_log.rpv_pvid;
+    tbvlp -> backup_volume_log.Nsaved_incr_sets = backup_volume_log.Nsaved_incr_sets;
+    tbvlp -> backup_volume_log.Nsaved_cons_sets = backup_volume_log.Nsaved_cons_sets;
+    
+/* Back scan the volume log to develop as many reload groups as are desired.
+   The basic scheme is to use incremental dump volumes until they are superceeded
+   by consolidated dump volumes and consolidated dump volumes until a complete dump volume is found. Care must
+   be taken for the case where the dumping process overlapped, as well as for the multi volume consolidated
+   or complete dump.  We also allow the caller to save very recent incremental dump volumes even though they may have
+   been superceeded by consolidated dump volumes.  */
+
+/* save count of number of log entries */
+
+    old_ent_cnt = backup_volume_log.next;
+    comp_count, cons_count = 0;
+    comp_cycle_uid, cons_cycle_uid = "0"b;
+    subsequent_dump_open_time = 0;
+						/* scan log entries not looked at */
+    do idx = old_ent_cnt to 1 by -1
+       while (comp_count <= reload_groups);
+      bvlep = addr (backup_volume_log.array (idx));
+						/* if compelete dump */
+      if bvle.dump_type = comp then do;
+         if comp_cycle_uid ^= bvle.cycle_uid then do;
+	  comp_count = comp_count + 1;
+	  if comp_count <= reload_groups then do;
+	     comp_cycle_uid = bvle.cycle_uid;
+	     subsequent_dump_open_time = open_time ();
+               call log_volume_entry (idx);
+	     end;
+	  end;
+         else
+            call log_volume_entry (idx);
+         end;
+						/* if consolidated dump */
+      else
+         if bvle.dump_type = cons & comp_count < reload_groups then do;
+	  if cons_cycle_uid ^= bvle.cycle_uid then do;
+	     cons_count = cons_count + 1;
+	     cons_cycle_uid = bvle.cycle_uid;
+	     if comp_count = 0 then
+	        subsequent_dump_open_time = open_time ();
+	     end;
+
+	  if subsequent_dump_open_time < bvle.close_time
+	     | backup_volume_log.Nsaved_cons_sets < 1
+	     | comp_count = 0
+	     | cons_count <= backup_volume_log.Nsaved_cons_sets then
+	     call log_volume_entry (idx);
+	  end;
+						/* if incremental dump */
+      else
+         if bvle.dump_type = incr & comp_count < reload_groups then do;
+            if subsequent_dump_open_time < bvle.close_time
+	     | backup_volume_log.Nsaved_incr_sets < 1
+	     | cons_count = 0
+	     | cons_count <= backup_volume_log.Nsaved_incr_sets then
+               call log_volume_entry (idx);
+	  end;
+    end;
+
+/* Compress the temp volume log such that there are no empty entries */
+
+    do bvlx = old_ent_cnt to 1 by -1;
+      do sortx = old_ent_cnt to 1 by -1;
+        if tbvlp -> backup_volume_log.array (sortx).cycle_uid = "0"b
+	   & (sortx + 1 <= hbound (backup_volume_log.array, 1)) then do;
+	  tbvlp -> backup_volume_log.array (sortx) =
+	       tbvlp -> backup_volume_log.array (sortx + 1);
+	  unspec (tbvlp -> backup_volume_log.array (sortx + 1)) = "0"b;
+	end;
+      end;
+    end;
+    tbvlp -> backup_volume_log.next = new_ent_cnt;
+    call build_volume_list (tbvlp, new_vlp);
+
+    call build_delete_list;
+
+    call process_delete_list;
+
+    if ^test_mode then do;
+        call hcs_$fs_move_seg (tbvlp, bvlp, 1, code);
+        if code ^= 0 then do;
+	  call error_rnt (code, myname, "Unable to replace volume log");
+	  goto finish;
+	end;
+      end;
+
+    call set_lock_$unlock (backup_volume_log.lock, code);
+    if code ^= 0 then do;
+        call error_rnt (code, myname, "Error unlocking volume log");
+        goto finish;
+      end;
+
+    if old_ent_cnt ^= new_ent_cnt then do;
+        call ioa_ ("^a: Volume log ^a ^[not ^]purged. Entry count ^[would have ^]changed from ^d to ^d",
+	   myname, volog_name, test_mode, test_mode, old_ent_cnt, new_ent_cnt);
+      end;
+finish:
+    if sub then a_code = code;
+    call finish_;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+purge_volume_log_: entry (a_sys_dir, a_volog, throw_away_value, a_manual_free, a_code);
+
+/* This entry provide a subroutine interface for use by the volume dumper */
+
+    sys_dir = a_sys_dir;
+    volog = a_volog;
+    sub, force_mode = "1"b;
+    test_mode = "0"b;
+    manual_free = a_manual_free;
+    myname = "purge_volume_log_";
+    error_rnt = dmpr_report_$error_output;
+    bvlp, pvlp = null;
+    goto common;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+log_volume_entry: proc (idx);
+dcl idx		     fixed bin;
+
+/* This proc records in the temp volume log the log entry found during the scan. */
+    if tbvlp -> backup_volume_log.array (idx).cycle_uid ^= "0"b then return;
+    tbvlp -> backup_volume_log.array (idx) = backup_volume_log.array (idx);
+    new_ent_cnt = new_ent_cnt + 1;
+    return;
+  end log_volume_entry;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+build_volume_list: proc (bvlp, vlp);
+
+/* This proc builds a list of the dump volumes contained in a volume log */
+
+dcl vlp		     ptr;
+dcl bvlp		     ptr;
+dcl (bvlx, vlx)	     fixed bin;
+    do bvlx = 1 to bvlp -> backup_volume_log.next;
+      bvlep = addr (bvlp -> backup_volume_log.array (bvlx));
+      do vlx = 1 to vlp -> vol_list.next while
+	 (bvle.volname ^= vlp -> vol_list.name (vlx));
+      end;
+      found = (vlx <= vlp -> vol_list.next);
+      if ^found then do;
+	vlp -> vol_list.next = vlp -> vol_list.next + 1;
+	vlp -> vol_list.name (vlp -> vol_list.next) = bvle.volname;
+	vlp -> vol_list.count (vlp -> vol_list.next) = 1;
+        end;
+      else vlp -> vol_list.count (vlx) = vlp -> vol_list (vlx).count + 1;
+    end;
+    return;
+  end build_volume_list;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+build_delete_list: proc;
+
+/* This proc compares the volume names in the new and old volume lists and takes the ones not in the new but in
+   the old and places them into the delete list. */
+
+dcl (nvlx, pvlx)	     fixed bin;
+dcl Sdelete              bit (1) aligned;
+dcl count                fixed bin;
+
+    do pvlx = 1 to old_vlp -> vol_list.next;
+      search_name = old_vlp -> vol_list.name (pvlx);
+      do nvlx = 1 to new_vlp -> vol_list.next while
+	 (search_name ^= new_vlp -> vol_list.name (nvlx));
+      end;
+
+      Sdelete = "1"b;
+      count = -1;
+      if (nvlx <= new_vlp -> vol_list.next) then do;
+         if (old_vlp -> vol_list.count (pvlx) = new_vlp -> vol_list.count (nvlx)) then
+            Sdelete = "0"b;
+         else
+            count = new_vlp -> vol_list.count (nvlx);
+      end;
+
+      if Sdelete then do;
+         del_vlp -> vol_list.next = del_vlp -> vol_list.next + 1;
+         del_vlp -> vol_list.name (del_vlp -> vol_list.next) = search_name;
+         del_vlp -> vol_list.count (del_vlp -> vol_list.next) = count;
+      end;
+    end;
+ 
+
+    return;
+  end build_delete_list;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+process_delete_list: proc;
+
+/* This proc goes through the delete list and for each dump volume it locates the output log associated with it.
+   It then removes the entry for this physical volume and decrements the in-use count.  If the output log has no
+   more enties then the dump volume is considered free and the output log and contents seg are deleted. The volume
+   is also marked as free in the dump volume pool. */
+dcl (dvlx, pvlx)	     fixed bin;
+dcl rebuild_failed	     bit (1);
+
+
+    do dvlx = 1 to del_vlp -> vol_list.next;
+      volname = del_vlp -> vol_list.name (dvlx);
+      count = del_vlp -> vol_list.count (dvlx);
+      call find_pvolog_and_lock (volname, pvlp);
+      if pvlp = null then do;
+	call ioa_ ("^a: ^a>^a.pvolog",
+	     myname, pvolog_dir, volname);
+	call ioa_ ("^a: Rebuilding ^a.pvolog", myname, volname);
+	call rebuild_pvolog_ (volog_dir, volname, error_rnt, pvlp, code);
+	rebuild_failed = (code ^= 0);
+	if rebuild_failed then
+	  call error_rnt (code, myname, "Rebuild of pvolog ^a.pvolog failed", volname);
+	if pvlp ^= null then call set_lock_$lock (pvolog.lock, lock_wait_time, code);
+        end;
+      if pvlp = null then do;
+	if ^rebuild_failed then goto next;		/* it was a null output log */
+	if force_mode then goto next;
+	else do;
+	    call error_rnt (0, myname,
+	         "Aborting purge because of missing output volume log ^a.pvolog", volname);
+	    goto finish;
+	  end;
+        end;
+      in_use = pvolog.in_use;
+      do pvlx = 1 to pvolog.next;
+        pvlep = addr (pvolog.array (pvlx));
+        if pvle.pvname = backup_volume_log.pvname then do;
+	  if ^test_mode then do;
+	      if count = -1 then do;
+		pvle.pvname = "";
+		pvle.invocation_count = 0;
+		in_use,
+		     pvolog.in_use = pvolog.in_use - 1;
+	        end;
+	      else pvle.invocation_count = count;
+	    end;
+	  else if count = -1 then in_use = in_use - 1;
+	end;
+      end;
+      if in_use <= 0 & ^test_mode then do;
+
+	call hcs_$delentry_seg (pvlp, code);
+	if code ^= 0 then
+	  call error_rnt (code, myname, "Unable to delete output log for volume ^a", volname);
+	else pvlp = null;
+
+	call delete_contents_segs (volname);
+	if ^manual_free then do;
+	    call manage_volume_pool_$free (vpp, error_rnt, volname, code);
+	    if code ^= 0 & code ^= error_table_$action_not_performed then
+	      call error_rnt (code, myname, "Unable to free volume ^a", volname);
+	    else call ioa_ ("^a: Output volume ^a is now available for use",
+		    myname, volname);
+	  end;
+        end;
+      else do;
+	call set_lock_$unlock (pvolog.lock, code);
+	if ^pvolog_known then do;
+	    call hcs_$terminate_noname (pvlp, ignore);
+	    pvlp = null;
+	  end;
+        end;
+next:
+    end;
+    code = 0;
+    return;
+  end process_delete_list;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+finish_: proc;
+						/* unlock, terminate, and release as required */
+    if bvlp ^= null then call set_lock_$unlock (backup_volume_log.lock, ignore);
+    if bvlp ^= null then
+      call adjust_bit_count_ (volog_dir, volog_name, "1"b, (0), ignore);
+    if bvlp ^= null & ^volog_known then do;
+        call hcs_$terminate_noname (bvlp, ignore);
+        bvlp = null;
+      end;
+    if tp (1) ^= null then call release_temp_segments_ (myname, tp, ignore);
+    if pvlp ^= null then call set_lock_$unlock (pvolog.lock, ignore);
+    if pvlp ^= null & ^pvolog_known then call hcs_$terminate_noname (pvlp, ignore);
+  end finish_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+find_volog_and_lock: proc (name);
+dcl name		     char (32);
+    call suffixed_name_$make (name, "volog", volog_name, code);
+    if code ^= 0 then do;
+        call error_rnt (code, myname, "Unable to create volog name from ^a", name);
+        goto finish;
+      end;
+
+/* and then ptr */
+    call hcs_$initiate (volog_dir, volog_name, "", 0, 0, bvlp, code);
+    if bvlp = null then do;
+        call error_rnt (code, myname, "Unable to locate volog ^a>^a", volog_dir, volog_name);
+        goto finish;
+      end;
+    volog_known = (code = error_table_$segknown);
+    call set_lock_$lock (backup_volume_log.lock, lock_wait_time, code);
+    if code ^= 0 then do;
+        if code = error_table_$invalid_lock_reset then code = 0;
+        if code ^= 0 then do;
+	  call error_rnt (code, myname, "Unable to lock volume log ^a", volog_name);
+	  goto finish;
+	end;
+      end;
+  end find_volog_and_lock;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+open_time: proc returns (fixed bin (71));
+dcl temp		     fixed bin (71);
+dcl jdx		     fixed bin;
+
+    do jdx = idx to 1 by -1;
+      if backup_volume_log.array (jdx).cycle_uid = bvle.cycle_uid then
+        temp = backup_volume_log.array (jdx).open_time;
+    end;
+    return (temp);
+
+  end open_time;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+delete_contents_segs: proc (volname);
+dcl seg_type	     char (32);
+dcl volname	     char (32);
+    do seg_type = "contents", "contents_names";
+      call suffixed_name_$make (volname, seg_type, ename, code);
+      if code ^= 0 then do;
+	call error_rnt (code, myname, "Unable to create ^a name from ^a", seg_type, volname);
+	return;
+        end;
+      if ^test_mode then do;
+	call delete_$path (contents_dir, ename, "100111"b, "", code);
+	if code ^= 0 & code ^= error_table_$noentry then
+	  call error_rnt (code, myname, "Unable to delete ^a>^a ", contents_dir, ename);
+        end;
+    end;
+  end delete_contents_segs;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+%page;
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+find_pvolog_and_lock: proc (volname, pvlp);
+dcl volname	     char (32);
+dcl pvlp		     ptr;
+    pvlp = null;
+    call suffixed_name_$make (volname, "pvolog", pvolog_name, code);
+    if code ^= 0 then do;
+        call error_rnt (code, myname, "Unable to construct pvolog name from ^a", volname);
+        return;
+      end;
+    call hcs_$initiate (pvolog_dir, pvolog_name, "", 0, 0, pvlp, code);
+    pvolog_known = (code = error_table_$segknown);
+    if pvlp = null then return;
+    call set_lock_$lock (pvolog.lock, lock_wait_time, code);
+    if code ^= 0 then do;
+        if code = error_table_$invalid_lock_reset then code = 0;
+        if code ^= 0 then do;
+	  call error_rnt (code, myname, "Unable to lock output volume log ^a", pvolog_name);
+	  goto finish;
+	end;
+      end;
+  end find_pvolog_and_lock;
+%page;
+
+
+dcl a_sys_dir	     char (*);
+dcl count		     fixed bin;
+dcl vpp		     ptr;
+dcl sortx		     fixed bin;
+dcl new_pool_path	     char (168);
+dcl bvlx		     fixed bin;
+dcl a_volog	     char (*);
+dcl force_mode	     bit (1);
+dcl narg		     fixed bin;
+dcl volog		     char (32);
+dcl volog_name	     char (32);
+dcl test_mode	     bit (1);
+dcl in_use	     fixed bin;
+dcl ac		     fixed bin;
+dcl pvolog_name	     char (32);
+dcl throw_away_value     fixed bin;
+dcl a_manual_free	     bit (1);
+dcl a_code	     fixed bin (35);
+dcl arg		     char (argl) based (argp);
+dcl myname	     char (32);
+dcl argl		     fixed bin;
+dcl argp		     ptr;
+dcl reload_groups	     fixed bin;
+dcl sub		     bit (1);
+dcl subsequent_dump_open_time
+		     fixed bin (71);
+dcl idx		     fixed bin;
+dcl comp_cycle_uid	     bit (36);
+dcl cons_cycle_uid	     bit (36);
+dcl comp_count	     fixed bin;
+dcl cons_count	     fixed bin;
+dcl tp		     (4) ptr;
+dcl found		     bit (1);
+dcl search_name	     char (32);
+dcl volname	     char (32);
+dcl ename		     char (32);
+dcl volog_dir	     char (168);
+dcl pvolog_dir	     char (168);
+dcl contents_dir	     char (168);
+dcl sys_dir	     char (168);
+
+dcl manual_free	     bit (1);
+dcl code		     fixed bin (35);
+dcl new_ent_cnt	     fixed bin;
+dcl old_ent_cnt	     fixed bin;
+dcl pvolog_known	     bit (1);
+dcl volog_known	     bit (1);
+dcl ignore	     fixed bin (35);
+dcl old_vlp	     ptr;
+dcl new_vlp	     ptr;
+dcl del_vlp	     ptr;
+dcl tbvlp		     ptr;
+
+dcl 1 vol_list	     aligned based,
+    2 next	     fixed bin,
+    2 array	     (1:1 refer (vol_list.next)),
+      3 count	     fixed bin,
+      3 name	     char (32);
+
+dcl lock_wait_time	     fixed bin static init (60) options (constant);
+
+dcl cleanup	     condition;
+
+dcl error_table_$badopt  ext fixed bin (35);
+dcl error_table_$noarg fixed bin(35) ext static;
+dcl error_table_$noentry ext fixed bin (35);
+dcl error_table_$action_not_performed ext fixed bin (35);
+dcl error_table_$segknown ext fixed bin (35);
+dcl error_table_$invalid_lock_reset fixed bin (35) ext;
+
+dcl delete_$path	     entry (char (*), char (*), bit (6), char (*), fixed bin (35));
+dcl ioa_		     entry () options (variable);
+dcl manage_volume_pool_$set_pool_path entry (entry options (variable), char (*), ptr, fixed bin (35));
+dcl get_wdir_	     entry returns (char (168));
+dcl rebuild_pvolog_	     entry (char (*), char (*), entry options (variable), ptr, fixed bin (35));
+dcl adjust_bit_count_    entry (char (*), char (*), bit (1), fixed bin, fixed bin (35));
+dcl manage_volume_pool_$free entry (ptr, entry options (variable), char (*), fixed bin (35));
+dcl cu_$arg_ptr	     entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl get_temp_segments_   entry (char (*), (*) ptr, fixed bin (35));
+dcl release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl com_err_	     entry options (variable);
+dcl error_rnt	     entry variable options (variable);
+dcl dmpr_report_$error_output entry options (variable);
+dcl suffixed_name_$make  entry (char (*), char (*), char (*), fixed bin (35));
+dcl hcs_$delentry_seg    entry (ptr, fixed bin (35));
+dcl hcs_$initiate	     entry (char (*), char (*), char (*), fixed bin, fixed bin, ptr, fixed bin (35));
+dcl hcs_$fs_move_seg     entry (ptr, ptr, fixed bin, fixed bin (35));
+dcl set_lock_$lock	     entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl set_lock_$unlock     entry (bit (36) aligned, fixed bin (35));
+dcl hcs_$terminate_noname entry (ptr, fixed bin (35));
+dcl cu_$arg_count	     entry (fixed bin);
+
+dcl (hbound, rtrim, substr, null, addr, unspec) builtin;
+%page;
+%include backup_volume_log;
+%include backup_pvol_info;
+%page;
+%include fs_vol_label;
+%page;
+%include backup_volume_header;
+%include backup_static_variables;
+%include pvolog;
+
+  end purge_volume_log;

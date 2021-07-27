@@ -1,0 +1,738 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        *********************************************************** */
+
+/*  Add_channel and delete_channel entries written 5/83 by S. Krupp. */
+/*  add_iom and delete_iom entries written 3/84 by Chris Jones */
+/*  Modifed August 1984 by Chris Jones to fix "change ctep" bug in ensure_rpv_path */
+/*  Modified November 1984 by M. Pandolf to call iom_switches$validate during IOM addition */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-11-17,Farley), approve(86-11-20,MECR0002),
+     audit(86-11-19,Fawcett), install(86-11-20,MR12.0-1222):
+     Added check to delete_channel for active device assignments that require
+     the channel. If one is found the operation is aborted.
+  2) change(86-12-19,Farley), approve(86-12-19,MCR7587),
+     audit(86-12-19,Fawcett), install(87-01-05,MR12.0-1253):
+     Formal installation to close out above MECR0002.
+  3) change(87-06-11,Lippard), approve(87-06-29,MCR7729),
+     audit(87-07-08,Farley), install(87-08-06,MR12.1-1063):
+     Modified cleanup handler to not unassign the channel from IOI if IOI
+     was using it when we were called.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+io_reconfig:
+     proc ();
+
+/* Parameter */
+
+dcl	p_chanid		   char (8) aligned;	/* (I) name of the channel in question */
+dcl	p_code		   fixed bin (35);		/* (O) standard system status code */
+dcl	p_tag		   fixed bin (3);		/* (I) IOM tag */
+
+/* Automatic */
+
+dcl	added		   bit (1) aligned;
+dcl	adding_channel	   bit (1) aligned init ("0"b);
+						/* Always init this. */
+dcl	base_chnl		   bit (1) aligned;
+dcl	chanid		   char (8) aligned;
+dcl	chnl_required	   bit (1) aligned;
+dcl	code		   fixed bin (35);
+dcl	cv_status_ptr	   ptr;
+dcl	deleting_channel	   bit (1) aligned init ("0"b);
+						/* Always init this. */
+dcl	device_active	   bit (1) aligned;
+dcl	dtx		   fixed bin;
+dcl	grp_chnl_active	   bit (1) aligned;
+dcl	iom_active	   bit (1) aligned;
+dcl	locked		   bit (1) aligned init ("0"b);
+dcl	rel_chnl_active	   bit (1) aligned;
+dcl	state_changed	   bit (1) aligned init ("0"b);
+dcl	tag		   fixed bin (3);
+dcl	temp_base_chnl_ptr	   ptr;
+dcl	usurped_channel	   bit (1) aligned;
+
+/* Builtin */
+
+dcl	(addr, bin, hbound, lbound, null, ptr, rel, substr, unspec)
+			   builtin;
+
+/* Condition */
+
+dcl	cleanup		   condition;
+
+/* Entries */
+
+dcl	config_$find_2	   entry (char (4) aligned, fixed bin, ptr);
+dcl	config_$update	   entry ();
+dcl	dctl$disk_inter	   entry (fixed bin (35), fixed bin (3), bit (36) aligned);
+dcl	disk_control$add_channel
+			   entry (fixed bin (8), fixed bin (35), bit (1) aligned);
+dcl	ioi_assignment$lock_for_reconfig
+			   entry;
+dcl	ioi_assignment$unlock_for_reconfig
+			   entry;
+dcl	ioi_masked$interrupt   entry (fixed bin (35), fixed bin (3), bit (36) aligned);
+dcl	ioi_usurp_channels$assign
+			   entry (ptr, fixed bin (35));
+dcl	ioi_usurp_channels$required
+			   entry (ptr, fixed bin (35));
+dcl	ioi_usurp_channels$unassign
+			   entry (ptr, fixed bin (35));
+dcl	iom_overhead$init	   entry (fixed bin (3), fixed bin (35));
+dcl	iom_overhead$release   entry (fixed bin (3), fixed bin (35));
+dcl	iom_switches$validate  entry (fixed bin (3), fixed bin (35));
+dcl	pxss$addevent	   entry (bit (36) aligned);
+dcl	pxss$wait		   entry ();
+dcl	scr_util$set_port_enable
+			   entry (fixed bin (3), bit (1) unal);
+dcl	syserr		   entry () options (variable);
+
+/* Static */
+
+dcl	(
+	error_table_$bad_channel,
+	error_table_$chnl_already_added,
+	error_table_$chnl_already_deleted,
+	error_table_$chnl_being_deleted,
+	error_table_$chnl_iom_active,
+	error_table_$chnl_iom_inactive,
+	error_table_$io_not_available,
+	error_table_$io_not_defined,
+	error_table_$iom_already_added,
+	error_table_$iom_already_deleted,
+	error_table_$no_base_chnl_active,
+	error_table_$rel_chnl_active,
+	error_table_$undeleted_device
+	)		   fixed bin (35) ext static;
+
+dcl	DUMMY_INDEX	   fixed bin (35) init (0) int static options (constant);
+
+delete_channel:
+     entry (p_chanid, p_code);
+
+	deleting_channel = "1"b;
+	usurped_channel = "0"b;
+	idp = addr (ioi_data$);
+	io_config_data_ptr = addr (io_config_data$);
+	io_config_channel_table_ptr = ptr (io_config_data_ptr, io_config_data.channel_table_offset);
+	io_config_iom_table_ptr = ptr (io_config_data_ptr, io_config_data.iom_table_offset);
+
+/* Look in ioi_data for required info. */
+
+	chanid = io_chnl_util$canonicalize_chanid (p_chanid);
+	call get_ctep (chanid, ctep, code);
+	call quit_if_error;
+
+	call get_gtep (ctep, gtep);
+
+	on cleanup call CLEANUP ();
+
+/* Lock for reconfiguration. */
+
+	call lock_for_reconfig;
+
+/* Make some checks on state of channel and then mark it as being deleted. */
+
+	if cte.deleted then
+	     call ABORT (error_table_$chnl_already_deleted);
+	else if cte.deleting then
+	     call ABORT (error_table_$chnl_being_deleted);
+
+	do dtx = 1 to ioi_data.ndt;			/* check if channel is required for an active device */
+	     dtep = addr (ioi_data.dt (dtx));
+	     if dte.in_use & ^dte.direct & dte.process_id ^= ""b then do;
+						/* if IOI is managing this device and it is assigned... */
+		if dte.channel_required = chanid then
+		     call ABORT (error_table_$io_not_available);
+	     end;
+	end;
+
+
+	state_changed = "1"b;
+	cte.deleting = "1"b;
+
+/* Get information relevant to deleting a channel. */
+
+	call get_chnl_del_info (gtep, ctep, base_chnl, rel_chnl_active, grp_chnl_active);
+	call get_device_info (gtep, ctep, device_active, chnl_required);
+
+/* Make sure it is legal to delete this channel.
+
+   Rules:  The channel must not be in use.  The channel may not be
+   the only logical channel that can reach an as yet undeleted
+   device. If the channel is a base channel, then all logical
+   channels on the same physical channel must have been
+   previously deleted.
+
+   Notes:  rel_chnl_active = true means that there are other active
+   channels that are on the same physical channel as chanid.
+
+   grp_chnl_active = true means that there are other active
+   channels in the same group as chanid, but they are not
+   on the same physical channel as chanid.
+
+   If chanid doesn't specify a base channel, then there is
+   always at least one channel around to handle active devices
+   if chanid is deleted.
+*/
+
+	if base_chnl then do;
+	     if rel_chnl_active then
+		call ABORT (error_table_$rel_chnl_active);
+	     if device_active & ^grp_chnl_active then
+		call ABORT (error_table_$undeleted_device);
+	end;
+
+/* If channel doesn't belong to ioi, try to get it. */
+
+	if gte.disk_data_subsystem_idx ^= 0 then do;	/* Have disk chnl.  Try to usurp it. */
+	     if ^cte.ioi_use then do;
+		call ioi_usurp_channels$required (ctep, code);
+		call quit_if_error;
+		usurped_channel = "1"b;
+	     end;
+	end;
+	else if ^cte.ioi_use then do;			/* Have non-ioi, non-disk type of chnl.  Try to grab it. */
+	     call io_manager$assign (cte.chx, chanid, io_manager$ignore_interrupt, DUMMY_INDEX, cv_status_ptr, code);
+	     call quit_if_error;
+	     cte.ioi_use = "1"b;
+	     usurped_channel = "1"b;
+	end;
+
+/* Wait for channel activity to clear. */
+
+	do while (cte.connected);
+	     call pxss$addevent (unspec (IO_CHANNEL_LOCK_TEMPLATE) || rel (ctep));
+	     call pxss$wait ();
+	end;
+
+/* Delete the channel. */
+
+	call io_manager$unassign_delete (cte.chx, code);
+	call quit_if_error;
+	cte.ioi_use = "0"b;
+	cte.deleted = "1"b;
+	cte.deleting = "0"b;
+	call ensure_rpv_path_in_toehold;
+	channel_table.channel_entry (cte.channel_table_idx).configured = "0"b;
+	iom_table.iom_entry (channel_table.channel_entry (cte.channel_table_idx).iom_idx).n_configured_channels =
+	     iom_table.iom_entry (channel_table.channel_entry (cte.channel_table_idx).iom_idx).n_configured_channels
+	     - 1;
+
+	if gte.disk_data_subsystem_idx ^= 0 then do;
+	     call ioi_usurp_channels$assign (gtep, code); /* make sure we still have enough */
+	     call quit_if_error;
+	end;
+
+	call unlock_for_reconfig;
+	call syserr (LOG, "RCF: Deleted channel ^a.", chanid);
+	p_code = 0;
+	return;
+
+add_channel:
+     entry (p_chanid, p_code);
+
+	adding_channel = "1"b;
+	idp = addr (ioi_data$);
+	io_config_data_ptr = addr (io_config_data$);
+	io_config_channel_table_ptr = ptr (io_config_data_ptr, io_config_data.channel_table_offset);
+	io_config_iom_table_ptr = ptr (io_config_data_ptr, io_config_data.iom_table_offset);
+
+/* Look in ioi_data for required info. */
+
+	chanid = io_chnl_util$canonicalize_chanid (p_chanid);
+	call get_ctep (chanid, ctep, code);
+	call quit_if_error;
+
+	call get_gtep (ctep, gtep);
+	call get_itep (ctep, itep);
+
+	on cleanup call CLEANUP ();
+
+/* Lock for reconfiguration. */
+
+	call lock_for_reconfig;
+
+/* Make some checks on state of channel. */
+
+	if ^cte.deleted then do;
+	     if (^cte.ioi_use) & (gte.disk_data_subsystem_idx ^= 0) then
+		call disk_control$add_channel ((gte.disk_data_subsystem_idx), (cte.disktab_ctx), added);
+	     if added then
+		goto DONE_ADDING;
+	     call ABORT (error_table_$chnl_already_added);
+	end;
+	else if cte.deleting then
+	     call ABORT (error_table_$chnl_being_deleted);
+
+/* Get information relevant to adding a channel. */
+
+	call get_chnl_add_info (ctep, itep, base_chnl, iom_active);
+
+/* Make sure it is legal to add this channel.
+
+   Rules:  The channel must be connected to an active iom.  If the channel
+   is not a base channel, its associated base channel must already
+   be active.
+*/
+
+	if ^iom_active then
+	     call ABORT (error_table_$chnl_iom_inactive);
+
+	if ^base_chnl then do;
+	     temp_base_chnl_ptr = ptr (ctep, cte.base_ctep);
+	     if temp_base_chnl_ptr -> cte.deleted then
+		call ABORT (error_table_$no_base_chnl_active);
+	end;
+
+/* If channel belonged to someone else originally, give it back. */
+
+	state_changed = "1"b;
+	if gte.disk_data_subsystem_idx ^= 0 then do;	/* Have disk chnl. */
+	     call io_manager$assign_add (cte.chx, chanid, dctl$disk_inter,
+		dskdcl_chans_per_subsys * gte.disk_data_subsystem_idx + cte.disktab_ctx - 1, cv_status_ptr, code);
+	     call quit_if_error;
+	     cte.statusp = cv_status_ptr;
+	     cte.deleted = "0"b;
+	     cte.ioi_use = "1"b;			/* so it will be given back */
+	     call ioi_usurp_channels$unassign (gtep, code);
+	     call quit_if_error;
+	end;
+	else if ^gte.mplex then do;			/* Have non-ioi, non-disk type of chnl. */
+	     call io_manager$assign_add (cte.chx, chanid, io_manager$ignore_interrupt, DUMMY_INDEX, cv_status_ptr, code)
+		;
+	     call quit_if_error;
+	     cte.deleted = "0"b;
+	     call io_manager$unassign (cte.chx, code);
+	     call quit_if_error;
+	end;
+	else do;
+	     call io_manager$assign_add (cte.chx, chanid, ioi_masked$interrupt, bin (rel (ctep)), cv_status_ptr, code);
+	     call quit_if_error;
+	     cte.deleted = "0"b;
+	     cte.ioi_use = "1"b;
+	end;
+
+	channel_table.channel_entry (cte.channel_table_idx).configured = "1"b;
+	iom_table.iom_entry (channel_table.channel_entry (cte.channel_table_idx).iom_idx).n_configured_channels =
+	     iom_table.iom_entry (channel_table.channel_entry (cte.channel_table_idx).iom_idx).n_configured_channels
+	     + 1;
+	call syserr (LOG, "RCF: Added channel ^a.", chanid);
+
+DONE_ADDING:
+	call unlock_for_reconfig;
+	p_code = 0;
+
+	return;
+
+ERROR_RETURN:
+	return;
+
+add_iom:
+     entry (p_tag, p_code);
+
+	call setup_and_find_iom_entry;
+	call lock_for_reconfig;
+	if iom_table.iom_entry (ite.iom_table_idx).configured then do;
+	     call unlock_for_reconfig;
+	     p_code = error_table_$iom_already_added;
+	     return;
+	end;
+	iom_data.per_iom (tag).on_line = "1"b;
+	call iom_overhead$init (tag, code);
+	if code ^= 0 then do;
+	     iom_data.per_iom (tag).on_line = "0"b;
+	     call unlock_for_reconfig;
+	     p_code = code;
+	     return;
+	end;
+	call scr_util$set_port_enable (iom_card.port, "1"b);
+						/* allow all SCUs at the IOM */
+
+	call iom_switches$validate (tag, code);
+	if code ^= 0 then
+	     call syserr (CRASH, "io_reconfig: Unable to validate switches for IOM ^a.", substr ("abcd", tag, 1));
+
+	ite.deleted = "0"b;
+	iom_table.iom_entry (ite.iom_table_idx).configured = "1"b;
+	iom_card.state = "on";
+	call config_$update;
+	call unlock_for_reconfig;
+	call syserr (ANNOUNCE, "RCF: Added IOM ^a.", substr ("abcd", tag, 1));
+	p_code = 0;
+	return;
+
+delete_iom:
+     entry (p_tag, p_code);
+
+	call setup_and_find_iom_entry;
+	call lock_for_reconfig;
+	if iom_table.iom_entry (ite.iom_table_idx).n_configured_channels ^= 0 then do;
+	     call unlock_for_reconfig;
+	     p_code = error_table_$chnl_iom_active;
+	     return;
+	end;
+	if ^iom_table.iom_entry (ite.iom_table_idx).configured then do;
+	     call unlock_for_reconfig;
+	     p_code = error_table_$iom_already_deleted;
+	     return;
+	end;
+
+	call iom_overhead$release (tag, code);
+	if code ^= 0 then do;
+	     call unlock_for_reconfig;
+	     p_code = code;
+	     return;
+	end;
+
+	call scr_util$set_port_enable (iom_card.port, "0"b);
+						/* disable all SCU's access to this IOM */
+	ite.deleted = "1"b;
+	iom_table.iom_entry (ite.iom_table_idx).configured = "0"b;
+	iom_data.per_iom (tag).on_line = "0"b;
+	iom_card.state = "off";
+	call config_$update;
+	call unlock_for_reconfig;
+	call syserr (ANNOUNCE, "RCF: Deleted IOM ^a.", substr ("abcd", tag, 1));
+	p_code = 0;
+	return;
+
+setup_and_find_iom_entry:
+     proc;
+
+dcl	itx		   fixed bin;
+
+	tag = p_tag;
+	iom_cardp = null ();
+	call config_$find_2 (IOM_CARD_WORD, (tag), iom_cardp);
+	if iom_cardp = null () then
+	     goto IOM_NOT_CONFIGURED;
+
+	idp = addr (ioi_data$);
+	iom_data_ptr = addr (iom_data$);
+	io_config_data_ptr = addr (io_config_data$);
+	io_config_iom_table_ptr = ptr (io_config_data_ptr, io_config_data.iom_table_offset);
+	do itx = lbound (ioi_data.it, 1) to hbound (ioi_data.it, 1);
+	     itep = addr (ioi_data.it (itx));
+	     if tag = ite.tag then
+		return;
+	end;
+
+IOM_NOT_CONFIGURED:
+	p_code = error_table_$io_not_defined;
+	goto ERROR_RETURN;
+
+     end setup_and_find_iom_entry;
+
+/* Procedure to ensure that the toehold has a non-deleted path to RPV when deleting a channel. */
+
+ensure_rpv_path_in_toehold:
+     proc;
+
+dcl	iomno		   fixed bin (3);
+dcl	channo		   fixed bin (7);
+dcl	iopx		   fixed bin;
+dcl	saved_ctep	   ptr;
+dcl	saved_iopx	   fixed bin;
+dcl	toehold_channel_left   bit (1) aligned;
+
+dcl	1 path_word	   aligned,
+	  2 port		   fixed bin (3) uns unal,
+	  2 iom		   fixed bin (15) uns unal,
+	  2 channel	   fixed bin unal;
+
+dcl	path_word_as_integer   fixed bin (35) based (addr (path_word));
+
+dcl	1 toehold$	   ext like toe_hold;
+
+	call io_chnl_util$name_to_iom (cte.chanid, iomno, channo, (0));
+
+	do iopx = lbound (toehold$.paths, 1) to hbound (toehold$.paths, 1);
+	     if (toehold$.paths (iopx).iom_number = iomno) & (toehold$.paths (iopx).channel_number = channo) then
+		goto FOUND_TOEHOLD_CHANNEL;
+	end;
+	return;					/* no problem since toehold doesn't use this channel */
+
+FOUND_TOEHOLD_CHANNEL:
+	saved_iopx = iopx;
+	toehold_channel_left = "0"b;
+	do iopx = lbound (toehold$.paths, 1) to hbound (toehold$.paths, 1) while (^toehold_channel_left);
+	     if iopx ^= saved_iopx then
+		if toehold$.paths (iopx).channel_number ^= 0 then
+		     toehold_channel_left = "1"b;
+	end;
+	if toehold_channel_left then do;
+	     call set_toehold_path (saved_iopx, 0);
+	     return;				/* not to worry */
+	end;
+
+/**** We must find another channel and put it in the toehold ****/
+
+	saved_ctep = ctep;
+	do ctep = ptr (ctep, ptr (ctep, cte.gtep) -> gte.ctep) repeat ptr (ctep, cte.next_ctep)
+	     while (cte.deleted | cte.deleting | (cte.base_ctep ^= rel (ctep)));
+	end;
+	call io_chnl_util$name_to_iom (cte.chanid, iomno, channo, (0));
+	call config_$find_2 (IOM_CARD_WORD, (iomno), iom_cardp);
+	path_word.port = iom_card.port;
+	path_word.iom = iomno;
+	path_word.channel = channo;
+	call set_toehold_path (saved_iopx, path_word_as_integer);
+	ctep = saved_ctep;
+	return;
+
+set_toehold_path:
+	proc (path_idx, path_word_value);
+
+dcl	path_idx		   fixed bin;
+dcl	path_word_value	   fixed bin (35);
+dcl	path_word_ptr	   ptr;
+
+dcl	path_word		   fixed bin (35) based (path_word_ptr);
+
+	     path_word_ptr = addr (toehold$.paths (path_idx).port_number);
+	     path_word = path_word_value;
+
+	end set_toehold_path;
+
+     end ensure_rpv_path_in_toehold;
+
+quit_if_error:
+     proc;
+
+	if code ^= 0 then
+	     call ABORT (code);
+
+     end quit_if_error;
+
+ABORT:
+     proc (a_code);
+
+dcl	a_code		   fixed bin (35);
+
+	call CLEANUP ();
+	p_code = a_code;
+	goto ERROR_RETURN;
+
+     end ABORT;
+
+
+CLEANUP:
+     proc ();
+
+	if (gtep ^= null ()) & (ctep ^= null ()) & (state_changed) then do;
+	     if deleting_channel then do;
+		if usurped_channel then do;
+		     if gte.disk_data_subsystem_idx > 0 then
+			call ioi_usurp_channels$unassign (gtep, (0));
+		     else if ^gte.mplex & cte.chx > 0 then do;
+			call io_manager$unassign (cte.chx, (0));
+			cte.ioi_use = "0"b;
+		     end;
+		end;
+		cte.deleted = "0"b;
+		cte.deleting = "0"b;
+	     end;
+	     else if adding_channel then do;
+		if gte.disk_data_subsystem_idx ^= 0 then
+		     call ioi_usurp_channels$assign (gtep, code);
+		else if ^gte.mplex & cte.chx > 0 then do;
+		     call io_manager$assign (cte.chx, chanid, io_manager$ignore_interrupt, DUMMY_INDEX, cv_status_ptr,
+			code);
+		     if code = 0 then
+			cte.statusp = cv_status_ptr;
+		end;
+		cte.deleted = "1"b;
+	     end;
+	end;
+	if locked then
+	     call ioi_assignment$unlock_for_reconfig;
+
+     end CLEANUP;
+
+lock_for_reconfig:
+     proc;
+
+	call ioi_assignment$lock_for_reconfig;
+	locked = "1"b;
+
+     end lock_for_reconfig;
+
+unlock_for_reconfig:
+     proc;
+
+	call ioi_assignment$unlock_for_reconfig;
+	locked = "0"b;
+
+     end unlock_for_reconfig;
+
+get_chnl_del_info:
+     proc (arg_gtep, arg_ctep, arg_base_chnl, arg_rel_chnl_active, arg_grp_chnl_active);
+
+/* Automatic */
+
+dcl	cptr		   ptr;
+dcl	ctx		   fixed bin;
+dcl	gptr		   ptr;
+dcl	my_base_rptr	   bit (18) aligned;
+
+/* Parameter */
+
+dcl	arg_base_chnl	   bit (1) aligned;
+dcl	arg_ctep		   ptr;
+dcl	arg_grp_chnl_active	   bit (1) aligned;
+dcl	arg_gtep		   ptr;
+dcl	arg_rel_chnl_active	   bit (1) aligned;
+
+	arg_rel_chnl_active, arg_grp_chnl_active = "0"b;
+	arg_base_chnl = (arg_ctep -> cte.base_ctep = rel (arg_ctep));
+
+	my_base_rptr = arg_ctep -> cte.base_ctep;
+	gptr = arg_gtep;
+
+	do ctx = 1 to ioi_data.nct;
+	     cptr = addr (ioi_data.ct (ctx));
+	     if ^(cptr -> cte.deleted | cptr = arg_ctep) then do;
+		if cptr -> cte.base_ctep = my_base_rptr then
+		     arg_rel_chnl_active = "1"b;
+		else if cptr -> cte.gtep = rel (gptr) then
+		     arg_grp_chnl_active = "1"b;
+	     end;
+	end;
+
+     end get_chnl_del_info;
+
+get_chnl_add_info:
+     proc (arg_ctep, arg_itep, arg_base_chnl, arg_iom_active);
+
+/* Parameter */
+
+dcl	arg_base_chnl	   bit (1) aligned;
+dcl	arg_ctep		   ptr;
+dcl	arg_iom_active	   bit (1) aligned;
+dcl	arg_itep		   ptr;
+
+	if ^arg_itep -> ite.deleted then
+	     arg_iom_active = "1"b;
+	else arg_iom_active = "0"b;
+
+	arg_base_chnl = (arg_ctep -> cte.base_ctep = rel (arg_ctep));
+
+     end get_chnl_add_info;
+
+get_device_info:
+     proc (arg_gtep, arg_ctep, arg_device_active, arg_chnl_required);
+
+/* Automatic */
+
+dcl	chanid		   char (8) aligned;
+dcl	done		   bit (1) aligned;
+dcl	dptr		   ptr;
+dcl	gptr		   ptr;
+dcl	initial_dtep	   bit (18);
+
+/* Parameter */
+
+dcl	arg_chnl_required	   bit (1) aligned;
+dcl	arg_ctep		   ptr;
+dcl	arg_device_active	   bit (1) aligned;
+dcl	arg_gtep		   ptr;
+
+	arg_device_active, arg_chnl_required = "0"b;
+	chanid = arg_ctep -> cte.chanid;
+	gptr = arg_gtep;
+
+	initial_dtep = gptr -> gte.dtep;
+	done = "0"b;
+	do dptr = ptr (arg_ctep, initial_dtep) repeat ptr (dptr, dptr -> dte.next_dtep) while (^done);
+	     if ^(dptr -> dte.deleted) then do;
+		arg_device_active = "1"b;
+		if dptr -> dte.channel_required = chanid then
+		     arg_chnl_required = "1"b;
+	     end;
+	     done = (dptr -> dte.next_dtep = initial_dtep);
+	end;
+
+     end get_device_info;
+
+get_ctep:
+     proc (arg_chanid, arg_ctep, arg_code);
+
+/* Automatic */
+
+dcl	i		   fixed bin;
+
+/* Parameter */
+
+dcl	arg_chanid	   char (8) aligned;
+dcl	arg_code		   fixed bin (35);
+dcl	arg_ctep		   ptr;
+
+	arg_ctep = null;
+	arg_code = 0;
+
+	do i = 1 to ioi_data.nct;
+	     if ioi_data.ct (i).chanid = arg_chanid then do;
+		arg_ctep = addr (ioi_data.ct (i));
+		return;
+	     end;
+	end;
+
+	arg_code = error_table_$bad_channel;
+
+     end get_ctep;
+
+
+get_gtep:
+     proc (arg_ctep, arg_gtep);
+
+/* Parameter */
+
+dcl	arg_ctep		   ptr;
+dcl	arg_gtep		   ptr;
+
+	arg_gtep = ptr (arg_ctep, arg_ctep -> cte.gtep);
+
+     end get_gtep;
+
+
+get_itep:
+     proc (arg_ctep, arg_itep);
+
+/* Parameter */
+
+dcl	arg_ctep		   ptr;
+dcl	arg_itep		   ptr;
+
+	arg_itep = ptr (arg_ctep, arg_ctep -> cte.itep);
+
+     end get_itep;
+
+%include config_iom_card;
+%page;
+%include dskdcl;
+%page;
+%include ioi_data;
+%page;
+%include io_config_data;
+%page;
+%include io_manager_dcls;
+%page;
+%include io_chnl_util_dcls;
+%page;
+%include iom_data;
+%page;
+%include syserr_constants;
+%page;
+%include toe_hold;
+
+     end io_reconfig;

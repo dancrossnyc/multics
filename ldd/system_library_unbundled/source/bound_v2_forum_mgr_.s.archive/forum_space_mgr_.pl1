@@ -1,0 +1,604 @@
+/****^  **************************************************************
+        *                                                            *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992      *
+        *                                                            *
+        * Copyright, (C) Massachusetts Institute of Technology, 1984 *
+        *                                                            *
+        ************************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-07-29,Pattin), approve(86-07-29,MCR7354),
+     audit(86-08-07,Margolin), install(86-08-16,MR12.0-1128):
+     Added $next and $previous, changed to use find_bit_ for effeciency in
+       searching seen maps.
+     Moved get_highest_seen from trans_mgr and rewrote it to be faster.
+     Fixed bug in block chaining (see find_block).
+  2) change(92-09-10,Zimmerman), approve(92-09-10,MCR8258),
+     audit(92-09-22,WAAnderson), install(92-09-28,MR12.5-1020):
+     Problem with current being set to deleted txn., or being set to -1.
+  3) change(92-10-02,Zimmerman), approve(92-10-02,PBF8258),
+     audit(92-10-09,WAAnderson), install(92-10-20,MR12.5-1030):
+     Post bug fix: correct error which caused ckm to incorrectly report seen
+     txns. as new.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style3,ifthen,ifthendo,ifthenstmt,^indnoniterdo,^inditerdo,idind30 */
+forum_space_mgr_$find_attendee:
+     proc (P_attendee_seg_ptr, P_attendee_name, P_attendee_ptr, P_status);
+
+/* Version 2 Forum -
+	This module contains procedures to find and allocate attendee
+   slots, transaction slots, and bit maps.
+
+   Jay Pattin 1/1/83
+   Modified 09/12/83 by Jeffrey I. Schiller. Bugfix to get_transaction_slot
+   Audit changes, J. Spencer Love 10/05/84 */
+
+declare	(P_attendee_name		char (*),
+	P_attendee_ptr		ptr,
+	P_attendee_seg_ptr		ptr,
+	P_bit_map_ptr		ptr,
+	P_check_new		bit (1) aligned,
+	P_first			fixed bin,
+	P_next_idx		fixed bin,
+	P_open_data_ptr		ptr,
+	P_prev_idx		fixed bin,
+	P_status			fixed bin (35),
+	P_transaction_ptr		ptr,
+	P_transaction_seg_ptr	ptr,
+	P_trans_idx		fixed bin)
+				parameter;
+
+declare	attendee_name		char (22),
+	attendee_offset		bit (18),
+	based_area_ptr		ptr,
+	based_area		area based (based_area_ptr),
+	based_bs			bit (bit_map.length) based,
+	egress			label variable,
+	first			fixed bin,
+	highest			fixed bin,
+	idx			fixed bin,
+	last_trans_ptr		ptr,
+	loop_counter		fixed bin,
+	MAX_ATTENDEES		fixed bin static options (constant) initial (6000),
+	me			char (16) static options (constant) init ("forum_space_mgr_"),
+	result			fixed bin,
+	old_attendee_ptr		ptr,
+	old_bit_map_ptr		ptr,
+	original_high		fixed bin,
+	p			ptr,
+	path			char (168),
+	seen_all			bit (1) aligned,
+	status			fixed bin (35),
+	trans_offset		bit (18),
+	trans_idx			fixed bin;
+
+declare	(addr, addrel, clock, copy, hbound, index, max, null, ptr, rel, size, substr)
+				builtin,
+	area			condition;
+
+declare	END_OF_SEG		bit (18) aligned static options (constant) init ("776000"b3);
+
+declare	(forum_et_$invalid_trans_idx,
+	forum_et_$meeting_bloat,
+	forum_et_$no_such_user,
+	forum_et_$no_transactions,
+	forum_et_$roster_full,
+	forum_et_$trans_reaped,
+	forum_et_$unexpected_fault)
+				fixed bin (35) external static;
+
+declare	forum_logger_		entry options (variable),
+	hcs_$fs_get_path_name	entry (ptr, char (*), fixed bin, char (*), fixed bin (35)),
+	find_bit_$last_on	entry (bit (*)) returns (fixed bin (24));
+declare	out_of_bounds		condition;
+%page;
+%include forum_structures;
+%page;
+%include forum_open_data;
+%page;
+/* forum_space_mgr_$find_attendee:
+     proc (P_attendee_seg_ptr, P_attendee_name, P_attendee_ptr, P_status); */
+
+	attendee_name = P_attendee_name;
+	attendee_seg_ptr = P_attendee_seg_ptr;
+
+	egress = GET_ATTENDEE_EXIT;
+
+	result = lookup_attendee ();
+
+	if result ^= 0 then do;
+	     P_status = forum_et_$no_such_user;
+	     P_attendee_ptr = null ();
+	end;
+	else do;
+	     P_attendee_ptr = attendee_ptr;
+	     P_status = 0;
+	end;
+	return;
+%page;
+forum_space_mgr_$get_attendee_slot:			/* allocate a new attendee_slot */
+     entry (P_attendee_seg_ptr, P_attendee_name, P_attendee_ptr, P_status);
+
+	egress = GET_ATTENDEE_EXIT;
+
+	attendee_name = P_attendee_name;
+	attendee_seg_ptr = P_attendee_seg_ptr;
+
+	if attendee_seg.first_attendee_offset = ""b then attendee_ptr = null ();
+	else do;
+	     result = lookup_attendee ();
+	     if result = 0 then do;
+		P_attendee_ptr = attendee_ptr;
+		P_status = 0;
+		return;
+	     end;
+	end;
+
+	old_attendee_ptr = attendee_ptr;
+	based_area_ptr = addr (attendee_seg.attendee_area);
+
+	on area call error (forum_et_$roster_full);
+	allocate attendee in (based_area);
+	revert area;
+
+	attendee_offset = rel (attendee_ptr);
+
+	attendee.version = ATTENDEE_VERSION_1;
+	attendee.attendee_uid = attendee_seg.attendee_count + 1;
+	attendee.person_id = attendee_name;
+
+	if attendee_seg.chairman_message ^= "" then
+	     attendee.flags.message_change_pending = "1"b;
+
+	if old_attendee_ptr = null () then attendee_seg.first_attendee_offset = attendee_offset;
+	else do;
+	     if result = 1 then old_attendee_ptr -> attendee.left_son_offset = attendee_offset;
+	     else old_attendee_ptr -> attendee.right_son_offset = attendee_offset;
+
+	     old_attendee_ptr = ptr (attendee_seg_ptr, attendee_seg.last_attendee_offset);
+	     old_attendee_ptr -> attendee.next_offset = attendee_offset;
+	end;
+
+	attendee_seg.last_attendee_offset = attendee_offset;
+	attendee_seg.attendee_count = attendee_seg.attendee_count + 1;
+
+	P_attendee_ptr = attendee_ptr;
+	P_status = 0;
+	return;
+
+GET_ATTENDEE_EXIT:
+	P_status = status;
+	P_attendee_ptr = null ();
+	return;
+%page;
+lookup_attendee:
+     proc () returns (fixed bin);			/* 0 - found, 1 - left, 2 - right */
+
+declare	attendee_count		fixed bin;
+
+	attendee_count = 0;
+	attendee_ptr = ptr (attendee_seg_ptr, attendee_seg.first_attendee_offset);
+
+	do attendee_ptr = attendee_ptr repeat p;
+	     attendee_count = attendee_count + 1;
+	     if attendee.version ^= ATTENDEE_VERSION_1 | attendee_count > MAX_ATTENDEES then do;
+		call hcs_$fs_get_path_name (attendee_seg_ptr, path, idx, "", (0));
+		call forum_logger_ (0, me, "Bad attendee thread at ^p in ^a.", attendee_ptr, substr (path, 1, idx));
+		call error (forum_et_$unexpected_fault);
+	     end;
+
+	     if attendee.person_id = attendee_name then return (0);
+
+	     if attendee_name > attendee.person_id then do;
+		if attendee.right_son_offset = ""b then return (2);
+		p = ptr (attendee_seg_ptr, attendee.right_son_offset);
+	     end;
+
+	     else do;
+		if attendee.left_son_offset = ""b then return (1);
+		p = ptr (attendee_seg_ptr, attendee.left_son_offset);
+	     end;
+	end;
+
+     end lookup_attendee;
+%page;
+forum_space_mgr_$find_transaction:
+     entry (P_transaction_seg_ptr, P_trans_idx, P_transaction_ptr, P_status);
+
+	egress = FIND_TRANS_EXIT;
+
+	trans_idx = P_trans_idx;
+	transaction_seg_ptr = P_transaction_seg_ptr;
+
+	call find_block ();
+
+	if transaction_block.offset (idx) = EXPUNGED then call error (forum_et_$trans_reaped);
+
+	transaction_ptr = ptr (transaction_seg_ptr, transaction_block.offset (idx));
+	on out_of_bounds goto hit_out_of_bounds;
+	if transaction.version ^= TRANSACTION_VERSION_1 | transaction.trans_idx ^= trans_idx then do;
+hit_out_of_bounds:
+	     revert out_of_bounds;
+	     call hcs_$fs_get_path_name (transaction_seg_ptr, path, idx, "", (0));
+	     call forum_logger_ (0, me, "Bad transaction thread at ^p (^d) in ^a.", transaction_ptr, trans_idx,
+		substr (path, 1, idx));
+	     call error (forum_et_$unexpected_fault);
+	end;
+	revert out_of_bounds;
+
+	P_transaction_ptr = transaction_ptr;
+	P_status = 0;
+	return;
+
+FIND_TRANS_EXIT:
+	P_transaction_ptr = null ();
+	P_status = status;
+	return;
+
+
+find_block:
+	procedure ();
+
+/* last_block_ptr used to correct bug in pre 2.13 forum */
+
+declare	last_block_ptr		pointer;
+
+	if trans_idx < 1 | trans_idx > transaction_seg.transaction_count then
+	     call error (forum_et_$invalid_trans_idx);
+
+	loop_counter = 0;
+	transaction_block_ptr = ptr (transaction_seg_ptr, transaction_seg.current_block_offset);
+
+	if transaction_block.next_block_offset ^= ""b then do;
+	     do while (transaction_block_ptr ^= null ());
+		last_block_ptr = transaction_block_ptr;
+		if transaction_block.prev_block_offset = ""b then transaction_block_ptr = null ();
+		else do;
+		     transaction_block_ptr = ptr (transaction_seg_ptr, transaction_block.prev_block_offset);
+		     transaction_block.next_block_offset = rel (last_block_ptr); 
+		end;
+	     end;
+
+	     transaction_block_ptr = ptr (transaction_seg_ptr, transaction_seg.current_block_offset);
+	     transaction_block.next_block_offset = ""b;
+	end;
+
+	do while (trans_idx < transaction_block.first_trans_idx);
+	     loop_counter = loop_counter + 1;
+	     if loop_counter > 100 /* infinity */ then call error (forum_et_$unexpected_fault);
+	     transaction_block_ptr = ptr (transaction_seg_ptr, transaction_block.prev_block_offset);
+	end;
+
+	idx = trans_idx - transaction_block.first_trans_idx + 1;
+     end find_block;
+%page;
+forum_space_mgr_$find_next_transaction:
+     entry (P_transaction_seg_ptr, P_trans_idx, P_next_idx, P_status);
+
+	egress = NEXT_TRANS_EXIT;
+	transaction_seg_ptr = P_transaction_seg_ptr;
+	trans_idx = P_trans_idx;
+
+	call find_block ();
+
+	do while (transaction_block_ptr ^= null ());
+	     do loop_counter = idx + 1 to transaction_block.last_trans_idx;
+		if transaction_block.offset (loop_counter) ^= EXPUNGED then do;
+		     P_next_idx = transaction_block.first_trans_idx + loop_counter - 1;
+		     P_status = 0;
+		     return;
+		end;
+	     end;
+	     idx = 0;
+	     if transaction_block.next_block_offset ^= ""b then
+		transaction_block_ptr = ptr (transaction_seg_ptr, transaction_block.next_block_offset);
+	     else transaction_block_ptr = null ();
+	end;
+
+	status = forum_et_$no_transactions;
+
+NEXT_TRANS_EXIT:
+	P_next_idx = 0;
+	P_status = status;
+	return;
+%page;
+forum_space_mgr_$find_prev_transaction:
+     entry (P_transaction_seg_ptr, P_trans_idx, P_prev_idx, P_status);
+
+	egress = PREV_TRANS_EXIT;
+	transaction_seg_ptr = P_transaction_seg_ptr;
+	trans_idx = P_trans_idx;
+
+	call find_block ();
+
+	do while (transaction_block_ptr ^= null ());
+	     do loop_counter = idx - 1 by -1 to 1;
+		if transaction_block.offset (loop_counter) ^= EXPUNGED then do;
+		     P_prev_idx = transaction_block.first_trans_idx + loop_counter - 1;
+		     P_status = 0;
+		     return;
+		end;
+	     end;
+	     if transaction_block.prev_block_offset ^= ""b then do;
+		transaction_block_ptr = ptr (transaction_seg_ptr, transaction_block.prev_block_offset);
+		idx = transaction_block.last_trans_idx + 1;
+	     end;
+	     else transaction_block_ptr = null ();
+	end;
+
+	status = forum_et_$no_transactions;
+
+PREV_TRANS_EXIT:
+	P_prev_idx = 0;
+	P_status = status;
+	return;
+%page;
+forum_space_mgr_$get_transaction_slot:
+     entry (P_transaction_seg_ptr, P_transaction_ptr, P_status);
+
+	egress = FIND_TRANS_EXIT;
+
+	transaction_seg_ptr = P_transaction_seg_ptr;
+
+	transaction_block_ptr = ptr (transaction_seg_ptr, transaction_seg.current_block_offset);
+	if transaction_seg.last_trans_offset = ""b then last_trans_ptr = null ();
+	else last_trans_ptr = ptr (transaction_seg_ptr, transaction_seg.last_trans_offset);
+	trans_idx = transaction_seg.transaction_count + 1;
+	if transaction_seg.first_trans_offset = ""b then do;
+	     transaction_seg.first_trans_offset = transaction_seg.free_space_offset;
+	     transaction_block.time = clock ();
+	end;
+
+	if trans_idx > transaction_seg.last_trans_in_block then call get_new_block ();
+
+	transaction_ptr = ptr (transaction_seg_ptr, transaction_seg.free_space_offset);
+	trans_offset = rel (addrel (transaction_ptr, size (transaction)));
+	if trans_offset >= END_OF_SEG then call error (forum_et_$meeting_bloat);
+
+	idx = trans_idx - transaction_block.first_trans_idx + 1;
+	transaction_seg.last_trans_offset, transaction_block.offset (idx) = transaction_seg.free_space_offset;
+	transaction_seg.free_space_offset = trans_offset;
+	
+	transaction.version = TRANSACTION_VERSION_1;
+	if last_trans_ptr = null () then
+	     transaction.prev_offset = ""b;
+	else transaction.prev_offset = rel (last_trans_ptr);
+	transaction.trans_idx = trans_idx;
+
+	if last_trans_ptr ^= null () then
+	     last_trans_ptr -> transaction.next_offset = rel (transaction_ptr);
+	transaction_seg.transaction_count = trans_idx;
+	transaction_block.last_trans_idx = idx;
+
+	P_transaction_ptr = transaction_ptr;
+	P_status = 0;
+	return;
+
+
+
+get_new_block:
+     proc ();
+
+declare	old_block_offset		bit (18);
+
+	old_block_offset = rel (transaction_block_ptr);
+
+	transaction_block.next_block_offset, transaction_seg.current_block_offset = transaction_seg.free_space_offset;
+	transaction_block_ptr = ptr (transaction_seg_ptr, transaction_seg.free_space_offset);
+	trans_offset = rel (addrel (transaction_block_ptr, size (transaction_block)));
+	if trans_offset >= END_OF_SEG then call error (forum_et_$meeting_bloat);
+
+	transaction_seg.free_space_offset = trans_offset;
+	transaction_seg.last_trans_in_block = transaction_seg.last_trans_in_block + hbound (transaction_block.transactions, 1);
+
+	transaction_block.first_trans_idx = trans_idx;
+	transaction_block.prev_block_offset = old_block_offset;
+	transaction_block.time = clock ();
+
+	return;
+     end get_new_block;
+%page;
+forum_space_mgr_$allocate_bit_map:
+     entry (P_open_data_ptr, P_attendee_ptr, P_first, P_bit_map_ptr, P_status);
+
+	egress = BIT_MAP_EXIT;
+
+	open_data_ptr = P_open_data_ptr;
+	attendee_ptr = P_attendee_ptr;
+	attendee_seg_ptr = open_data.attendee_seg_ptr;
+	transaction_seg_ptr = open_data.transaction_seg_ptr;
+
+	if transaction_seg.first_trans_offset = ""b then first = transaction_seg.transaction_count;
+	else first = max (P_first, ptr (transaction_seg_ptr, transaction_seg.first_trans_offset) -> transaction.trans_idx);
+
+	if attendee.bit_map_offset = ""b then old_bit_map_ptr = null ();
+	else old_bit_map_ptr = ptr (attendee_seg_ptr, attendee.bit_map_offset);
+	based_area_ptr = addr (attendee_seg.attendee_area);
+
+	alloc_bit_map_length = max (504, transaction_seg.transaction_count + 100 - first);
+	on area call error (forum_et_$roster_full);
+	allocate bit_map in (based_area);
+	revert area;
+
+	bit_map.attendee_uid = attendee.attendee_uid;
+	if old_bit_map_ptr ^= null () then do;
+	     if first < attendee.bit_map_first_trans then do;
+		idx = attendee.bit_map_first_trans - first;
+		substr (bit_map.map, 1, idx) = copy ("1"b, idx);
+		substr (bit_map.map, idx + 1) = old_bit_map_ptr -> bit_map.map;
+	     end;
+
+	     else if first = attendee.bit_map_first_trans then
+		bit_map.map = old_bit_map_ptr -> bit_map.map;
+
+	     else do;
+		idx = first - attendee.bit_map_first_trans + 1;
+		bit_map.map = substr (old_bit_map_ptr -> bit_map.map, idx, attendee.bit_map_length - idx + 1);
+	     end;
+
+	     free old_bit_map_ptr -> bit_map;
+	end;
+	else if ^attendee_seg.salvaging then call mark_expunged ();
+
+	attendee.bit_map_first_trans = first;
+	attendee.bit_map_offset = rel (bit_map_ptr);
+	attendee.bit_map_length = bit_map.length;
+
+	P_bit_map_ptr = bit_map_ptr;
+	P_status = 0;
+	return;
+
+BIT_MAP_EXIT:
+	P_status = status;
+	P_bit_map_ptr = null ();
+	if bit_map_ptr ^= null () then free bit_map;
+	return;
+
+mark_expunged:
+	procedure ();
+
+declare	idx			fixed bin,
+	status			fixed bin (35);
+
+	call forum_space_mgr_$find_transaction (transaction_seg_ptr, first, transaction_ptr, status);
+	if status ^= 0 then return;
+
+	do while ("1"b);
+	     idx = transaction.trans_idx;
+	     if transaction.next_offset = ""b then return;
+
+	     transaction_ptr = ptr (transaction_seg_ptr, transaction.next_offset);
+	     if transaction.trans_idx ^= idx + 1 then
+		substr (bit_map.map, idx - first + 2, transaction.trans_idx - idx - 1) =
+		     copy ("1"b, transaction.trans_idx - idx - 1);
+	end;
+     end mark_expunged;
+%page;
+forum_space_mgr_$get_highest_seen:
+     entry (P_attendee_ptr, P_transaction_seg_ptr, P_check_new, P_trans_idx, P_transaction_ptr, P_status);
+
+          dcl seen_last bit (1);
+     
+	attendee_ptr = P_attendee_ptr;
+	transaction_seg_ptr = P_transaction_seg_ptr;
+	egress = GET_HIGHEST_EXIT;
+	seen_last = "0"b;
+	
+
+	if attendee.bit_map_offset = ""b then do;
+	     P_trans_idx = 0;
+	     P_transaction_ptr = ptr (transaction_seg_ptr, transaction_seg.first_trans_offset);
+	     P_status = 0;
+	     return;
+	end;
+
+	bit_map_ptr = ptr (attendee_ptr, attendee.bit_map_offset);
+	seen_all = "0"b;
+
+/* NOTE: use based_bit to avoid having to call the alloc_bs operator.
+   Because bit_map.map is declared to be aligned, it owuld otherwise
+   have to be copied.  */
+
+	highest = find_bit_$last_on (addr (bit_map.map) -> based_bs) - 1;
+	idx = highest + attendee.bit_map_first_trans;
+	original_high = 0;
+
+	if idx = transaction_seg.transaction_count then
+	     if index (substr (bit_map.map, 1, transaction_seg.transaction_count - attendee.bit_map_first_trans + 1), "0"b) = 0 then
+		seen_all = "1"b;
+	     else
+		seen_last = "1"b;
+	     
+	else if idx > transaction_seg.transaction_count then do;
+	     call hcs_$fs_get_path_name (attendee_ptr, path, original_high, "", (0));
+	     call forum_logger_ (0, me, "Bit map too high. highest = ^d, first = ^d, count = ^d in ^a.", idx,
+		attendee.bit_map_first_trans, transaction_seg.transaction_count,
+		substr (path, 1, original_high));
+	     idx = transaction_seg.transaction_count;
+	     transaction_ptr = ptr (transaction_seg_ptr, transaction_seg.last_trans_offset);
+	     goto EXIT_LOOP;
+	end;
+
+	do while (idx > 0);				/* Find highest seen not by us */
+	     call forum_space_mgr_$find_transaction (transaction_seg_ptr, idx, transaction_ptr, status);
+	     if status = 0 then do; /* skip transactions entered by us. */
+		if seen_all | ^P_check_new | ((transaction.person_id ^= attendee.person_id) & ^transaction.deleted) then goto EXIT_LOOP;
+		if original_high = 0 then original_high = idx;	/* highest unexpunged we've seen */
+		idx = idx - 1;
+	     end;
+	     else if status = forum_et_$trans_reaped then do;
+		call forum_space_mgr_$find_prev_transaction (transaction_seg_ptr, idx, idx, status);
+		if status ^= 0 then
+		     if status ^= forum_et_$no_transactions then call error (status);
+		if idx < attendee.bit_map_first_trans then highest = -1;
+		else highest = idx - attendee.bit_map_first_trans + 1;
+	     end;
+	     else call error (status);
+
+	     if highest > 0 then do;
+		highest = find_bit_$last_on (substr (bit_map.map, 1, highest)) - 1;
+		idx = attendee.bit_map_first_trans + highest;
+	     end;
+	end;
+	
+/* Now scan forward until we come to a transaction that isn't ours */
+
+EXIT_LOOP:
+	if idx = 0 then do;
+	     if original_high = 0 then do;		/* No transactions seen */
+		P_trans_idx = 0;
+		if transaction_seg.first_trans_offset = ""b then P_transaction_ptr = null ();
+		else P_transaction_ptr = ptr (transaction_seg_ptr, transaction_seg.first_trans_offset);
+	     end;
+	     else do;
+		P_trans_idx = 0;		/* All were deleted or ours */
+		call forum_space_mgr_$find_transaction (transaction_seg_ptr, original_high,
+		     transaction_ptr, status);
+		if status ^= 0 then call error (status);
+
+		if transaction.next_offset = ""b then P_transaction_ptr = null ();
+		else P_transaction_ptr = ptr (transaction_seg_ptr, transaction.next_offset);
+	     end;
+	end;
+	else if (P_check_new & ^seen_last) then do;
+	     do while (transaction.next_offset ^= ""b);
+		transaction_ptr = ptr (transaction_seg_ptr, transaction.next_offset);
+		if (transaction.person_id ^= attendee.person_id & ^transaction.deleted) then goto FOUND_UNSEEN;
+	     end;
+	     
+	     transaction_ptr = null ();
+	     
+FOUND_UNSEEN:
+
+	     P_trans_idx = idx;
+	     P_transaction_ptr = transaction_ptr;
+	end;
+	
+	else do;
+	     P_trans_idx = idx;
+	     P_transaction_ptr = null ();
+	end;
+	P_status = 0;
+	return;
+
+GET_HIGHEST_EXIT:
+	P_status = status;
+	P_trans_idx = 0;
+	P_transaction_ptr = null ();
+	return;
+%page;
+error:
+     proc (P_status);     
+
+declare	P_status			fixed bin (35);
+
+	status = P_status;
+	goto egress;
+
+     end error;
+
+end forum_space_mgr_$find_attendee;

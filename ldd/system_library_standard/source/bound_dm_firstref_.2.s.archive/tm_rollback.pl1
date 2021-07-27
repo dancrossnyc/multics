@@ -1,0 +1,205 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+   *                                                         *
+   *********************************************************** */
+/* format: style4,ifthenstmt,^indproc,^indcomtxt */
+/*---------------*/
+
+tm_rollback: proc (A_txn_id, A_checkpoint, A_code);
+
+/* DESCRIPTION:
+
+   This procedure implements transaction_manager_$rollback_txn.
+   It calls bjm_$rollback, modifies the TDT entry, and writes a
+   rolled-back mark. This scenario is similar to an abort but leaves
+   the transaction in the IN-PROGRESS state.
+*/
+
+/* HISTORY:
+
+Written by Steve Herbst, 08/27/82.
+Modified:
+09/10/82 by Steve Herbst: Changed to eliminate locking.
+09/23/82 by Lindsey Spratt: Changed to use new lock_manager_ calling sequences.
+10/14/82 by Steve Herbst: Changed pfm_ calling sequence and added check for
+	funny states.
+11/01/82 by Steve Herbst: Changed to turn on txn's error_sw for error states.
+11/05/82 by Steve Herbst: Made to set tm_tdt.error_code on error return.
+11/05/82 by Steve Herbst: Changed to work on suspended transactions.
+01/12/83 by Steve Herbst: Made to log its errors.
+01/17/83 by Steve Herbst: Changed to complete previous error rollback, and to
+	call tm_error_state.
+05/27/83 by Steve Herbst: Made to update checkpoint_id & rollback_count in
+	TDT entry.
+03/28/84 by Lee A. Newcomb: Changed tm_get_state_info call to be
+	  transaction_manager_$get_state_info.
+10/18/84 by Steve Herbst: Changed in response to audit comments.
+01/29/85 by Steve Herbst: Fixed to ignore dm_error_$file_was_deleted.
+02/07/85 by S. Cox: Added fm_$post_transaction call (moved from lm_per_system_).
+02/12/85 by Stanford S. Cox:  Removed fm$post_transaction call.
+*/
+
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  A_txn_id bit (36) aligned parameter;
+dcl  A_checkpoint fixed bin parameter;
+dcl  A_code fixed bin (35) parameter;
+
+/* Constants */
+
+dcl  ME char (32) int static options (constant) init ("tm_rollback");
+
+/* Based */
+
+/* Static */
+
+/* Automatic */
+
+dcl  op_name char (32);
+dcl  txn_id bit (36) aligned;
+dcl  txn_index fixed bin;
+dcl  (code, op_error_code) fixed bin (35);
+
+/* External */
+
+dcl  dm_data_$current_txn_index fixed bin ext;
+dcl  dm_data_$my_process_id bit (36) ext;
+dcl  dm_data_$suspended_txn_index fixed bin ext;
+dcl  dm_data_$tm_tdt_ptr ptr external;
+dcl  dm_error_$file_was_deleted fixed bin (35) ext;
+dcl  dm_error_$invalid_current_txn fixed bin (35) ext;
+dcl  dm_error_$no_current_transaction fixed bin (35) ext;
+dcl  dm_error_$not_own_transaction fixed bin (35) ext;
+dcl  dm_error_$transaction_not_current fixed bin (35) ext;
+dcl  dm_error_$transaction_suspended fixed bin (35) ext;
+dcl  error_table_$unimplemented_version fixed bin (35) ext;
+
+/* Entries */
+
+dcl  before_journal_manager_$flush_transaction entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  before_journal_manager_$rollback entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+dcl  before_journal_manager_$write_rolled_back_mark entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+dcl  lock_manager_$unlock_to_checkpoint entry (fixed bin, fixed bin (35));
+dcl  lock_manager_$unlock_all entry;
+dcl  file_manager_$flush_modified_ci entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  tm_cleanup entry (ptr, fixed bin);
+dcl  tm_cleanup$restart_error entry (ptr, fixed bin);
+dcl  tm_error_state entry (fixed bin, fixed bin, fixed bin (35), char (*), char (*));
+dcl  transaction_manager_$get_state_info entry (fixed bin, char (*), fixed bin (35));
+
+/* Builtins */
+
+/* Conditions */
+
+dcl  cleanup condition;
+
+/* END OF DECLARATIONS */
+%page;
+	A_code = 0;
+
+	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+
+	if tm_tdt.version ^= TM_TDT_VERSION_3 then call ERROR_RETURN (error_table_$unimplemented_version);
+
+	if dm_data_$current_txn_index = 0 then
+	     if dm_data_$suspended_txn_index ^= 0 then call ERROR_RETURN (dm_error_$transaction_suspended);
+	     else call ERROR_RETURN (dm_error_$no_current_transaction);
+
+	txn_index = dm_data_$current_txn_index;
+
+	if txn_index < 1 | txn_index > tm_tdt.entry_count then call ERROR_RETURN (dm_error_$invalid_current_txn);
+
+	if A_txn_id = "0"b | A_txn_id = tm_tdt.txn_id (txn_index) then
+	     txn_id = tm_tdt.txn_id (txn_index);
+	else call ERROR_RETURN (dm_error_$transaction_not_current);
+
+	if tm_tdt.process_id (txn_index) ^= dm_data_$my_process_id then call ERROR_RETURN (dm_error_$not_own_transaction);
+
+	if tm_tdt.state (txn_index) ^= TM_IN_PROGRESS_STATE then do;
+
+	     call transaction_manager_$get_state_info ((tm_tdt.state (txn_index)), op_name, op_error_code);
+	     if op_name ^= OP_NAME_ROLLBACK then call ERROR_RETURN (op_error_code);
+
+	     call tm_cleanup$restart_error (tm_tdt_ptr, txn_index); /* finishes the commit if possible */
+	     if tm_tdt.error_sw (txn_index) then
+		call ERROR_STATE ((tm_tdt.state (txn_index)), tm_tdt.error_code (txn_index), "tm_cleanup");
+	     return;
+	end;
+
+	on cleanup begin;
+	     call tm_cleanup (tm_tdt_ptr, txn_index);
+	end;
+
+	tm_tdt.state (txn_index) = TM_ROLLBACK_FLUSHING_TXN_STATE;
+
+	call before_journal_manager_$flush_transaction (txn_id, txn_index, code);
+	if code ^= 0 then
+	     call ERROR_STATE (TM_ROLLBACK_FLUSHING_TXN_ERROR, code, "before_journal_manager_$flush_transaction");
+
+	tm_tdt.state (txn_index) = TM_ROLLBACK_ROLLING_BACK_STATE;
+
+	call before_journal_manager_$rollback (txn_id, txn_index, A_checkpoint, code);
+	if code ^= 0 then
+	     call ERROR_STATE (TM_ROLLBACK_ROLLING_BACK_ERROR, code, "before_journal_manager_$rollback");
+
+	tm_tdt.checkpoint_id (txn_index) = 0;
+	tm_tdt.rollback_count (txn_index) = tm_tdt.rollback_count (txn_index) + 1;
+
+	tm_tdt.state (txn_index) = TM_ROLLBACK_FLUSHING_CI_STATE;
+
+	call file_manager_$flush_modified_ci (txn_id, txn_index, code);
+	if code ^= 0 then				/* previous rollback may have deleted the file */
+	     if code = dm_error_$file_was_deleted then code = 0;
+	     else call ERROR_STATE (TM_ROLLBACK_FLUSHING_CI_ERROR, code, "file_manager_$flush_modified_ci");
+
+	tm_tdt.state (txn_index) = TM_ROLLBACK_WRITING_MARK_STATE;
+
+	call before_journal_manager_$write_rolled_back_mark (txn_id, txn_index, A_checkpoint, code);
+	if code ^= 0 then
+	     call ERROR_STATE (TM_ROLLBACK_WRITING_MARK_ERROR, code, "before_journal_manager_$write_rolled_back_mark");
+
+	tm_tdt.state (txn_index) = TM_ROLLBACK_UNLOCKING_STATE;
+
+	call lock_manager_$unlock_all;
+
+
+	tm_tdt.state (txn_index) = TM_ROLLBACK_METERING_STATE;
+
+/* Dump meters here */
+
+	tm_tdt.state (txn_index) = TM_IN_PROGRESS_STATE;	/* nothing to clean up now */
+RETURN:
+	return;
+%page;
+ERROR_RETURN: proc (P_code);
+
+dcl  P_code fixed bin (35);
+
+	A_code = P_code;
+	go to RETURN;
+
+     end ERROR_RETURN;
+%page;
+ERROR_STATE: proc (P_state, P_code, P_name);
+
+dcl  P_state fixed bin;
+dcl  P_code fixed bin (35);
+dcl  P_name char (*);
+
+	call tm_error_state (txn_index, P_state, P_code, ME, P_name);
+
+	A_code = P_code;
+
+	go to RETURN;
+
+     end ERROR_STATE;
+%page;
+%include dm_tm_tdt;
+%page;
+%include dm_tm_states;
+
+
+     end tm_rollback;

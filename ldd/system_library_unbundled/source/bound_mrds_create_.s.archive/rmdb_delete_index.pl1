@@ -1,0 +1,543 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(85-11-17,Dupuis), approve(85-12-16,MCR7314),
+     audit(86-02-04,Brunelle), install(86-02-05,MR12.0-1013):
+     This entry is being made to cover the change made on 85-05-06 by Thanh
+     Nguyen. (see mrds #136)
+  2) change(86-10-21,Blair), approve(86-10-21,PBF7311), audit(86-10-23,Dupuis),
+     install(86-10-23,MR12.0-1199):
+     If the code from relmgr_entries.delete_index indicates that the index
+     doesn't exist, reset the code so that we can continue and delete the index
+     entry from the model.  This might happen if a create_index got rolled
+     back, but the model wasn't updated to reflect the rollback.
+                                                   END HISTORY COMMENTS */
+
+rmdb_delete_index: proc (rdi_rmdb_ctl_ptr, rdi_db_abs_path, rdi_db_model_ptr, rdi_rel_name, rdi_attr_name, rdi_brief_flag,
+	rdi_error_message, rdi_code);
+
+/*
+                          BEGIN_DESCRIPTION
+   This module will change an indexed attribute in a relation into a
+   non-indexed attribute.
+
+   This process involves both updating the structures in  the  model
+   and deleting the old indices.
+
+   An  attempt  has  been  made   to   make   data   model   updates
+   uninterruptable by the user. To do this any quits signaled by the
+   user are delayed until the updates are complete.
+
+   It is not possible to recreate the deleted indices in  the  event
+   that  the  cleanup condition is signaled. Instead the database is
+   marked as inconsistent before the model is  updated  and  is  not
+   marked as consistent until the last tuple has been un-indexed.
+                          END_DESCRIPTION
+   NOTE:
+         Naming convention: because of the number of  internal  routines
+         and the need for descriptive names, variables declared  in  all
+         routines  (including the main entry) have prefixes that are the
+         initials  of  the  routine  name.  Global  variables   can   be
+         identified since they have a prefix different from that derived
+         from the routine name. Variables with the same name except  for
+         the  prefix mean the same thing. Variables without a prefix are
+         external to the module,  i.e.  entry  names,  external  static,
+         builtins,  conditions, etc. These variables are declared in the
+         main routine.
+   
+         In order to reduce the complexity of this module, none  of  the
+         internal  routines  have  an error code parameter. Instead they
+         set a global error code declared in the main routine, call  the
+         clean_up  routine,  and  perform  a non-local goto to leave the
+         module.
+   
+   Known Bugs:
+
+   Other Problems:
+
+
+
+
+                          HISTORY
+   82-05-20 Davids: Written
+
+   82-05-26 Davids: added rdi_db_model_ptr to the input parameters
+                    and removed code that initiated it.
+
+   82-06-10 Lackey: Changed RMDB_DEL_OP to RMDB_DEL_IDX_OP
+
+   82-06-23 Davids: changed all references of force to brief to
+                    reflect the control arg's name change.
+
+
+   82-07-01  Roger Lackey : Modified the calls to mu_db_inconsistent to use
+   mdbm_util_$inconsistent_* for binding.  
+
+   82-09-15  D. Woodka : Modified for DMS conversion. Replaced 
+   call to iox_$attach with a call to rmdb_relmgr_entries.open,
+   and calls to iox_$control (order delete_key) with a call to
+   rmdb_relmgr_entries.delete_index.
+
+   83-01-10 Davids: Modified to correct the sense of an if statement
+   that was causing relmgr_entries.delete_index not to be called.
+   Also added code dealing with transactions.
+
+   83-01-17 Davids: Code to report an error with finishing a transaction
+   and to correctly handle errors occuring in the clean_up procedure.
+
+   83-01-20 Davids: Removed declared but unused variables.
+
+   83-02-14 Davids: modified to use the new db_type_flags in the db_model
+   structure instead of the old numeric db_type.
+
+   83-05-24 Davids: Added code to set the version of the saved resultant to
+   RESTRUCT so that the saved resultant will not be used for an opening.
+*/
+
+/* PARAMETERS */
+
+	dcl     rdi_db_abs_path	 char (168);	/* (input) absolute path to the database directory */
+	dcl     rdi_db_model_ptr	 ptr;		/* (input) pointer to the database model */
+	dcl     rdi_rel_name	 char (*);	/* (input) name of the relation to be restructured */
+	dcl     rdi_attr_name	 char (*);	/* (input) name of the attribute to be un-indexed */
+	dcl     rdi_brief_flag	 bit (1);		/* (input) true ==> caller used brief ctl_arg */
+	dcl     rdi_error_message	 char (500);	/* (output) text of message in the event of an error */
+	dcl     rdi_code		 fixed bin (35);	/* (output) standard error code */
+
+/* AUTOMATIC */
+
+	dcl     rdi_attr_ptr	 ptr;		/* pointer to attr_info structure */
+	dcl     rdi_file_model_ptr	 ptr;		/* pointer to the file model that contains the relation */
+	dcl     rdi_index_id	 bit (36) aligned;	/* actual bits that identify which attr an index refers to */
+	dcl     rdi_nsecs		 fixed bin;	/* number of secondary indices
+						   in the relation being restructured */
+	dcl     rdi_number_of_varying_attrs fixed bin;	/* number of varying attrs in the relation being indexed */
+	dcl     rdi_quit_signaled	 bit (1);		/* true if the break key was hit */
+	dcl     rdi_rel_id		 bit (36) aligned;	/* bits that identify the relation */
+	dcl     rdi_rel_opening_id	 bit (36) aligned;	/* relation opening identifier */
+	dcl     rdi_rel_ptr		 ptr;		/* pointer to the rel_info structure */
+	dcl     rdi_rmdb_ctl_ptr	 ptr;
+	dcl     01 rdi_seek_head_info,		/* used in iox_$seek_head */
+		02 relation_type	 fixed bin init (0),/* equality */
+		02 n		 fixed bin init (3),/* 3 characters */
+		02 search_key	 char (256) init ("");
+
+/* BUILTINS */
+
+	dcl     addr		 builtin;
+	dcl     fixed		 builtin;
+	dcl     length		 builtin;
+	dcl     null		 builtin;
+	dcl     pointer		 builtin;
+	dcl     rel		 builtin;
+	dcl     rtrim		 builtin;
+
+/* BASED */
+
+	dcl     rdi_based_char8	 char (8) based;	/* overlay on the saved_res_version value */
+
+/* CONDITIONS */
+
+	dcl     any_other		 condition;
+	dcl     cleanup		 condition;
+	dcl     quit		 condition;
+
+/* ENTRIES */
+
+	dcl     hcs_$initiate	 entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+	dcl     ioa_$rs		 entry () options (variable);
+	dcl     mdbm_util_$inconsistent_reset entry (ptr);
+	dcl     mdbm_util_$inconsistent_set entry (ptr, char (*), char (*), char (*));
+	dcl     rmdb_add_rmdb_history	 entry (ptr, fixed bin, char (32), fixed bin, char (32), char (500), fixed bin (35));
+
+/* EXTERNAL STATIC */
+
+	dcl     dm_error_$collection_not_found fixed bin(35) ext static;
+	dcl     error_table_$action_not_performed fixed bin (35) ext static;
+	dcl     sys_info$max_seg_size	 fixed bin (35) ext static;
+
+/* INCLUDES */
+%page;
+%include mdbm_db_model;
+%page;
+%include mdbm_file_model;
+%page;
+%include rmdb_history_entry;
+%page;
+%include mrds_rmdb_ctl;
+
+
+/*
+   Initialize variables which may be referenced before they are  set
+   somewhere else, i.e. they are referenced in the cleanup handler
+*/
+
+
+	rdi_code = 0;
+	rdi_error_message = "";
+	rdi_quit_signaled = "0"b;
+	rdi_rel_opening_id = "0"b;
+	rmdb_ctl_ptr = rdi_rmdb_ctl_ptr;
+	mstxn_txn_id = "0"b;
+	mstxn_transactions_needed = "0"b;
+
+/*
+   If the database needs transactions and one is already in progress stop right now.
+*/
+	if rdi_db_model_ptr -> db_model.db_type_flags.transactions_needed
+	then do;
+		mstxn_transactions_needed = "1"b;
+		call transaction_manager_$get_current_txn_id (mstxn_txn_id, mstxn_code);
+		if mstxn_code ^= dm_error_$no_current_transaction
+		then do;
+			rdi_code = error_table_$action_not_performed;
+			rdi_error_message = "Indexes may not be deleted while a transaction is in proggress, " ||
+			     "commit or abort the current transaction and try again.";
+			goto exit_rmdb_delete_index;
+		     end;
+	     end;
+
+/*
+   Get pointers to the relation's file model, and extract  from  the
+   model the rel_id, index_id, and the rel_ptr and attr_ptr.
+*/
+
+	call initiate_models (rdi_db_abs_path, rdi_rel_name, rdi_file_model_ptr);
+
+	call get_relation_data (rdi_file_model_ptr, rdi_rel_ptr, rdi_rel_id, rdi_number_of_varying_attrs);
+
+	call get_attribute_data (rdi_file_model_ptr, rdi_rel_ptr, rdi_rel_name, rdi_attr_name,
+	     rdi_attr_ptr, rdi_index_id, rdi_nsecs);
+
+
+
+
+	on cleanup call mstxn_cleanup;
+
+	on any_other call mstxn_any_other;
+
+%include mrds_start_transaction;
+
+	if mstxn_code ^= 0
+	then do;
+		rdi_code = mstxn_code;
+		rdi_error_message = "Could not start a transaction";
+		goto exit_rmdb_delete_index;
+	     end;
+
+/*
+   Mark the database inconsistent, delay quit  handling  to  prevent
+   the database from being partially marked.
+*/
+
+	on quit rdi_quit_signaled = "1"b;
+	rmdb_ctl_ptr -> rmdb_ctl.saved_res_version_ptr -> rdi_based_char8 = "RESTRUCT";
+	call mdbm_util_$inconsistent_set (rdi_db_model_ptr, "delete_index",
+	     "Deleting the index " || rtrim (rdi_attr_name) || " from relation " || rtrim (rdi_rel_name),
+	     "delete_index " || rtrim (rdi_rel_name) || " " || rtrim (rdi_attr_name) || " -brief");
+	revert quit;
+	if rdi_quit_signaled
+	then do;
+		rdi_quit_signaled = "0"b;
+		signal quit;
+	     end;
+
+	on cleanup begin;
+
+		call mstxn_cleanup;
+		call clean_up (""b, "1"b);
+	     end;
+
+/*
+   Do the actual index deletion.
+
+   quit handlers  are  not  needed  since  vfile  assures  that  any
+   operation started is completed.
+*/
+
+	call rmdb_ctl.relmgr_entries.open (rdi_db_abs_path, rdi_rel_name, rdi_rel_opening_id, rdi_code);
+	if rdi_code ^= 0 then do;
+		rdi_error_message = "Error while opening the relation";
+		call restore_significant_data;
+		goto mftxn_exit;
+	     end;
+
+	call rmdb_ctl.relmgr_entries.delete_index (rdi_rel_opening_id, rdi_index_id, rdi_code);
+
+/* no index but still need to clean up the model */
+	if rdi_code = dm_error_$collection_not_found 
+          then rdi_code = 0;
+
+	mftxn_code = rdi_code;
+
+%include mrds_finish_transaction;
+
+	if mftxn_code ^= 0
+	then do;
+		rdi_error_message = "Could not finish the transaction";
+		call clean_up ("0"b, "1"b);
+		goto exit_rmdb_delete_index;
+	     end;
+
+	if rdi_code ^= 0 then do;
+		rdi_error_message = "Error while deleting the index";
+		call clean_up ("0"b, "1"b);
+		goto exit_rmdb_delete_index;
+	     end;
+
+/*
+   Update the model to reflect  that  the  attribute  is  no  longer
+   indexed and mark the database as consistent.
+*/
+	on quit rdi_quit_signaled = "1"b;
+	call update_model (rdi_db_model_ptr, rdi_rel_ptr, rdi_nsecs, rdi_attr_ptr);
+	call mdbm_util_$inconsistent_reset (rdi_db_model_ptr);
+	revert quit;
+	if rdi_quit_signaled
+	then do;
+		rdi_quit_signaled = "0"b;
+		signal quit;
+	     end;
+
+	call clean_up ("1"b, "0"b);
+
+exit_rmdb_delete_index:
+
+	return;
+
+should_rollback: proc () returns (bit (1));
+	return ("0"b);
+     end should_rollback;
+
+
+
+
+
+restore_significant_data: proc;
+
+	dcl     rsd_code		 fixed bin (35);
+
+
+	rdi_error_message = rtrim (rdi_error_message) || " Backout has occured.";
+
+	if rdi_rel_opening_id ^= "0"b
+	then call rmdb_ctl.relmgr_entries.close (rdi_rel_opening_id, rsd_code);
+	rdi_rel_opening_id = "0"b;
+
+	return;
+
+     end restore_significant_data;
+
+initiate_models: proc (im_db_abs_path, im_rel_name, im_file_model_ptr);
+
+/*
+   This routine initiates a pointer to the file_model  segment  that
+   contains the relation model. If the file model cannot be found it
+   indicates that the data base does not contain the relation.
+*/
+
+/* PARAMETERS */
+
+	dcl     im_db_abs_path	 char (168);	/* (input) absolute path to the database directory */
+	dcl     im_rel_name		 char (*);	/* (input) name of the relation to be restructured */
+	dcl     im_file_model_ptr	 ptr;		/* (output) pointer to the file model
+						   .        that contains the relation */
+
+
+	call hcs_$initiate (im_db_abs_path, rtrim (im_rel_name) || ".m", "", 0, 0, im_file_model_ptr, rdi_code);
+	if im_file_model_ptr = null ()
+	then do;
+		call ioa_$rs ("^/The relation ^a does not exist in the data base.",
+		     rdi_error_message, length (rdi_error_message), im_rel_name);
+		goto exit_rmdb_delete_index;
+	     end;
+	else rdi_code = 0;
+
+	return;
+
+     end initiate_models;
+
+get_relation_data: proc (grd_file_model_ptr, grd_rel_ptr, grd_rel_id, grd_number_of_varying_attrs);
+
+/*
+   This routine extracts information from the rel_info structure for
+   the relation that is to be restructured.
+*/
+
+/* PARAMETERS */
+
+	dcl     grd_file_model_ptr	 ptr;		/* (input) pointer to the file model that contains the relation */
+	dcl     grd_rel_ptr		 ptr;		/* (output) pointer to the rel_info structure */
+	dcl     grd_rel_id		 bit (36) aligned;	/* (output) bits that identify the relation */
+	dcl     grd_number_of_varying_attrs fixed bin;	/* (output) number of varying attrs in
+						   .        the relation being indexed */
+
+	grd_rel_ptr = pointer (grd_file_model_ptr, grd_file_model_ptr -> file_model.rel_ptr);
+
+	grd_rel_id = grd_rel_ptr -> rel_info.id;
+
+	grd_number_of_varying_attrs = grd_rel_ptr -> rel_info.nvar_atts;
+
+	return;
+
+     end get_relation_data;
+
+get_attribute_data: proc (gad_file_model_ptr, gad_rel_ptr, gad_rel_name,
+	gad_attr_name, gad_attr_ptr, gad_index_id, gad_nsecs);
+
+/*
+   This routine gets the information about  the  attribute  that  is
+   needed, i.e. its index_id and a pointer to its info structure. It
+   also counts the number of indexed attributes in the relation.
+*/
+
+/* PARAMETERS */
+
+	dcl     gad_file_model_ptr	 ptr;		/* (input) pointer to the file model that contains the relation */
+	dcl     gad_rel_ptr		 ptr;		/* (input) pointer to the rel_info structure */
+	dcl     gad_rel_name	 char (*);	/* (input) name of the relation to be restructured */
+	dcl     gad_attr_name	 char (*);	/* (input) name of the attribute to be un-indexed */
+	dcl     gad_attr_ptr	 ptr;		/* (output) pointer to attr_info structure */
+	dcl     gad_index_id	 bit (36) aligned;	/* (output) actual bits that identify
+						   .        which attr an index refers to */
+	dcl     gad_nsecs		 fixed bin;	/* (output) number of secondary indices
+						   .        in the relation being restructured */
+
+/* AUTOMATIC */
+
+	dcl     gad_i		 fixed bin;	/* loop index */
+	dcl     gad_local_attr_ptr	 ptr;		/* pointer to attr_info structure */
+
+	gad_attr_ptr = null ();
+	gad_nsecs = 0;
+
+	gad_local_attr_ptr = pointer (gad_file_model_ptr, gad_rel_ptr -> rel_info.attr_ptr);
+	do gad_i = 1 to gad_rel_ptr -> rel_info.num_attr;
+	     if gad_local_attr_ptr -> attr_info.name = gad_attr_name
+	     then gad_attr_ptr = gad_local_attr_ptr;
+
+	     if gad_local_attr_ptr -> attr_info.index_attr
+	     then gad_nsecs = gad_nsecs + 1;
+
+	     gad_local_attr_ptr = pointer (gad_file_model_ptr, gad_local_attr_ptr -> attr_info.fwd_thread);
+	end;
+
+	if gad_attr_ptr = null ()
+	then do;
+		rdi_code = error_table_$action_not_performed;
+		call ioa_$rs ("^/Relation ^a does not contain an attribute named ^a",
+		     rdi_error_message, length (rdi_error_message), gad_rel_name, gad_attr_name);
+		goto exit_rmdb_delete_index;
+	     end;
+
+	if ^gad_attr_ptr -> attr_info.index_attr
+	then do;
+		if rdi_brief_flag
+		then goto exit_rmdb_delete_index;
+		else do;
+			rdi_code = error_table_$action_not_performed;
+			call ioa_$rs ("^/Attribute ^a in relation ^a is not a secondary index",
+			     rdi_error_message, length (rdi_error_message), gad_attr_name, gad_rel_name);
+			goto exit_rmdb_delete_index;
+		     end;
+	     end;
+
+	gad_index_id = gad_attr_ptr -> attr_info.index_id;
+
+	return;
+
+     end get_attribute_data;
+
+update_model: proc (um_db_model_ptr, um_rel_ptr, um_nsecs, um_attr_ptr);
+
+/*
+   This procedure  updates  the  data  model  to  reflect  that  the
+   attribute  is  no  longer indexed, and if the last index is being
+   deleted that the relation is no longer indexed.
+*/
+
+/* PARAMETERS */
+
+	dcl     um_db_model_ptr	 ptr;		/* (input) pointer to the database model */
+	dcl     um_rel_ptr		 ptr;		/* (input) pointer to the rel_info structure */
+	dcl     um_nsecs		 fixed bin;	/* (input) number of secondary indices
+						   .       in the relation being restructured */
+	dcl     um_attr_ptr		 ptr;		/* (input) pointer to attr_info structure */
+
+
+	if um_nsecs = 1
+	then um_rel_ptr -> rel_info.indexed = "0"b;
+
+	um_attr_ptr -> attr_info.index_attr = "0"b;
+	um_attr_ptr -> attr_info.index_id = "0"b;
+
+	call rmdb_add_rmdb_history (um_db_model_ptr, RMDB_REL_TYPE, (um_rel_ptr -> rel_info.name),
+	     RMDB_DEL_IDX_OP, (um_attr_ptr -> attr_info.name), rdi_error_message, rdi_code);
+	if rdi_code ^= 0
+	then do;
+		call clean_up ("0"b, "1"b);
+		goto exit_rmdb_delete_index;
+	     end;
+
+	return;
+
+     end update_model;
+
+clean_up: proc (cu_set_code, cu_leave_db_inconsistent);
+
+/*
+   This procedure is called both during normal and error termination
+   and in the event that the cleanup condition is signaled.
+
+*/
+
+
+/* PARAMETERS */
+
+	dcl     cu_set_code		 bit (1);		/* (input) true ==> if error occurs during cleanup, global error
+						   .       code will be set to error */
+	dcl     cu_leave_db_inconsistent bit (1);	/* (input) true ==> the dba will not be queried if indexing is
+						   .       to continue and the message giving directions for
+						   .       how to make the db consistent will be concatinated
+						   .       to the returned error message */
+
+/* AUTOMATIC */
+
+	dcl     cu_code		 fixed bin (35);	/* internal error code */
+
+
+
+	if cu_leave_db_inconsistent
+	then rdi_error_message = rtrim (rdi_error_message) ||
+		"^/The data base is being left in an inconsistent state," ||
+		"^/to make the database consistent use the delete_index request" ||
+		"^/to finish deleting the partially deleted index.";
+
+	if rdi_rel_opening_id ^= "0"b then
+	     call rmdb_ctl.relmgr_entries.close (rdi_rel_opening_id, cu_code);
+	if cu_set_code
+	then do;
+		if cu_code ^= 0
+		then do;
+			rdi_code = cu_code;
+			if rdi_code = 0
+			then rdi_error_message = "^/The relation could not be closed.";
+			else rdi_error_message = rtrim (rdi_error_message) ||
+				"^/The relation could not be closed.";
+		     end;
+	     end;
+	else do;
+		if cu_code ^= 0
+		then rdi_error_message = rtrim (rdi_error_message) ||
+			"^/The relation could not be closed.";
+	     end;
+
+	return;
+
+     end clean_up;
+
+     end rmdb_delete_index;

@@ -1,0 +1,685 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+vtoce_stock_man$get_free_vtoce:
+     proc (Pvtep, Vtocx);
+
+/*  Procedure to manage the VTOCE stock.  All actions are done under the
+    protection of the per-volume VTOC Map lock.
+
+    Entries:
+
+    get_free_vtoce       - finds a free VTOCE, either from the stock or the
+		       VTOC Map. Fills the stock if appropriate.
+
+    return_free_vtoce    - returns a newly-freed VTOCE to the stock or the
+		       VTOC Map. Drains the stock a bit if appropriate.
+
+    return_if_not_free   - returns a VTOCE to the VTOC map unless it is
+		       already free. Used by the volume scavenger.
+
+    drain_stock_range    - drains a range of addresses from the stock.
+		       For rebuild_disk.
+
+    drain_stock          - shuts down the stock, updating all entries into
+		       the VTOC map. Called during volume demounting.
+
+    check_in_use         - checks whether a given VTOCE is in use. Used
+		       to defend against a race with the scavenger.
+
+    force_unlock         - unlocks the VTOC Map lock. Called when the lock
+		       is hold by a process which crawls out.
+
+    Note that we can be cavalier about inconsistencies in the VTOC Map,
+    since the VTOCE contains sufficient information (unique-id, specifically)
+    to prevent misuse.
+
+    Written March 1982 by J. Bongiovanni
+    Modified July 1982 by J. Bongiovanni for return_if_not_free
+    Modified November 1982 by J. Bongiovanni for check_in_use
+*/
+
+/*  Parameter  */
+
+	dcl     Low_vtocx		 fixed bin;	/* Low vtocx for range */
+	dcl     High_vtocx		 fixed bin;	/* High vtocx for range */
+	dcl     Pvtep		 ptr;		/* Pointer to PVTE */
+	dcl     Vtocx		 fixed bin;	/* VTOCE index of interest, or -1 */
+	dcl     Code		 fixed bin (35);	/* Error Code */
+
+/*  Automatic  */
+
+	dcl     bitx		 fixed bin;
+	dcl     code		 fixed bin (35);
+	dcl     last_index		 fixed bin;
+	dcl     deposited		 bit (1) aligned;
+	dcl     done_map		 bit (1);
+	dcl     dummy		 bit (1);
+	dcl     low_vtocx		 fixed bin;
+	dcl     high_vtocx		 fixed bin;
+	dcl     p99		 pic "99";
+	dcl     stockx		 fixed bin;
+	dcl     this_vtocx		 fixed bin;
+	dcl     vtocx		 fixed bin;
+	dcl     wordx		 fixed bin;
+
+/*  External  */
+
+	dcl     error_table_$invalid_vtocx fixed bin (35) external;
+	dcl     error_table_$vtoce_free fixed bin (35) external;
+	dcl     pds$processid	 bit (36) aligned external;
+	dcl     pvt$n_vtoc_map_locks	 fixed bin (35) external;
+	dcl     pvt$vtoc_map_lock_wait_constant bit (36) aligned external;
+	dcl     volmap_abs_seg$	 external;
+
+/*  Entry  */
+
+	dcl     pxss$addevent	 entry (bit (36) aligned);
+	dcl     pxss$delevent	 entry (bit (36) aligned);
+	dcl     pxss$notify		 entry (bit (36) aligned);
+	dcl     pxss$wait		 entry;
+	dcl     pmut$swap_sdw	 entry (ptr, ptr);
+	dcl     syserr		 entry options (variable);
+
+/*  Builtin  */
+
+	dcl     addr		 builtin;
+	dcl     convert		 builtin;
+	dcl     divide		 builtin;
+	dcl     index		 builtin;
+	dcl     mod		 builtin;
+	dcl     null		 builtin;
+	dcl     ptr		 builtin;
+	dcl     rel		 builtin;
+	dcl     stac		 builtin;
+	dcl     stacq		 builtin;
+	dcl     substr		 builtin;
+
+/*  Condition  */
+
+	dcl     any_other		 condition;
+%page;
+/*  get_free_vtoce -
+
+    Attempt to withdraw from stock. If this fails, attempt to withdraw 
+    from the VTOC Map (replenishing the stock to target at the same
+    time). A vtocx of -1 is returned if no free VTOCEs exist.
+*/
+
+	pvtep = Pvtep;
+
+	call SETUP_LOCK;
+
+	stock_seg.meters.get_free_vtoce_calls = stock_seg.meters.get_free_vtoce_calls + 1;
+
+	vtocx = -1;				/* Set none */
+
+	vtocx = WITHDRAW_FROM_STOCK ();		/* Try for stock withdrawal */
+
+	if vtocx = -1 & pvte.n_free_vtoce > 0 then do;	/* Failed, but some exist */
+
+
+		call SETUP_ABS_SEG;
+
+		last_index, wordx = vtoce_stock.search_index; /* Roving pointer */
+		done_map = "0"b;
+		do while (^done_map);
+
+BIT_MAP_RETRY:
+
+		     if vtoc_map.bit_map (wordx) ^= ""b then do; /* Some free here */
+			     bit_map_wordp = addr (vtoc_map.bit_map (wordx));
+			     if bit_map_word.bits ^= ""b then do; /* Avoid spurious damage */
+				     last_index = wordx; /* Roving pointer */
+				     bitx = index (bit_map_word.bits, "1"b);
+				     substr (bit_map_word.bits, bitx, 1) = "0"b; /* Mark as free */
+				     this_vtocx = 32 * wordx + bitx - 1;
+				     if vtocx = -1	/* Haven't gotten one to return yet */
+				     then vtocx = this_vtocx;
+				     else dummy = DEPOSIT_TO_STOCK (this_vtocx);
+				     if vtoce_stock.n_free_in_stock < vtoce_stock.target
+				     then goto BIT_MAP_RETRY;
+				end;
+			end;
+
+		     wordx = wordx + 1;
+		     if wordx >= vtoc_map.bit_map_n_words
+		     then wordx = 0;
+		     if (wordx = vtoce_stock.search_index) /* Wrapped */
+			| (vtoce_stock.n_free_in_stock >= vtoce_stock.target)
+			| (pvte.n_free_vtoce <= 0)
+		     then done_map = "1"b;
+
+
+		end;
+
+		vtoce_stock.search_index = last_index;	/* Set roving pointer */
+
+		call RESET_ABS_SEG;
+	     end;
+
+	if vtocx ^= -1 then pvte.n_free_vtoce = pvte.n_free_vtoce - 1;
+
+	call UNLOCK;
+
+	Vtocx = vtocx;
+
+	return;
+
+%page;
+/* return_free_vtoce -
+
+   Attempts to return a newly-freed VTOCE to the stock. If this fails,
+   it is returned to the VTOC Map (along with excess stock)
+*/
+
+return_free_vtoce:
+     entry (Pvtep, Vtocx);
+
+	pvtep = Pvtep;
+	vtocx = Vtocx;
+
+	call SETUP_LOCK;
+
+	stock_seg.meters.return_free_vtoce_call = stock_seg.meters.return_free_vtoce_call + 1;
+	deposited = "1"b;
+
+
+
+	if ^DEPOSIT_TO_STOCK (vtocx)
+	then do;					/* No room in stock */
+
+
+		call SETUP_ABS_SEG;
+		call DEPOSIT_TO_MAP (vtocx, "1"b, deposited);
+
+		if vtoce_stock.n_free_in_stock > vtoce_stock.target /* Excess in stock */
+		then do while (vtoce_stock.n_free_in_stock > vtoce_stock.target);
+			vtocx = WITHDRAW_FROM_STOCK ();
+			if vtocx ^= -1 then call DEPOSIT_TO_MAP (vtocx, "1"b, ("0"b));
+		     end;
+
+		call RESET_ABS_SEG;
+
+	     end;
+
+	if deposited then
+	     pvte.n_free_vtoce = pvte.n_free_vtoce + 1;
+
+	call UNLOCK;
+
+	return;
+
+%page;
+
+/* return_if_not_free -
+
+   returns a free VTOCE to the VTOC map, unless it is already free.
+   It must first check the stock, and then the VTOC map.*/
+
+return_if_not_free:
+     entry (Pvtep, Vtocx, Code);
+
+	pvtep = Pvtep;
+	vtocx = Vtocx;
+
+	call SETUP_LOCK;
+	code = error_table_$vtoce_free;
+
+	do stockx = 1 to vtoce_stock.n_in_stock;
+	     if vtoce_stock.stock (stockx) = vtocx
+	     then goto ALREADY_FREE;
+	end;
+
+	call SETUP_ABS_SEG;
+
+	call DEPOSIT_TO_MAP (vtocx, "0"b, deposited);
+	if deposited
+	then do;
+		pvte.n_free_vtoce = pvte.n_free_vtoce + 1;
+		code = 0;
+	     end;
+
+	call RESET_ABS_SEG;
+
+ALREADY_FREE:
+
+	call UNLOCK;
+
+	Code = code;
+
+	return;
+
+
+%page;
+
+/* check_in_use -
+
+   Checks whether a specified VTOCE is in-use (allocated) or free. If free,
+   a non-zero error code is returned.
+*/
+
+check_in_use:
+     entry (Pvtep, Vtocx, Code);
+
+	pvtep = Pvtep;
+	vtocx = Vtocx;
+
+	call SETUP_LOCK;
+	code = error_table_$vtoce_free;
+
+	do stockx = 1 to vtoce_stock.n_in_stock;
+	     if vtoce_stock.stock (stockx) = vtocx
+	     then goto CHECK_IS_FREE;
+	end;
+
+	call SETUP_ABS_SEG;
+
+	wordx = divide (vtocx, 32, 17);
+	bitx = mod (vtocx, 32) + 1;
+	if wordx < 0 | wordx >= vtoc_map.bit_map_n_words
+	then do;
+		code = error_table_$invalid_vtocx;
+		goto CHECK_RESET;
+	     end;
+	bit_map_wordp = addr (vtoc_map.bit_map (wordx));
+	if substr (bit_map_word.bits, bitx, 1) = "1"b
+	then goto CHECK_RESET;
+
+	code = 0;
+
+CHECK_RESET:
+	call RESET_ABS_SEG;
+
+CHECK_IS_FREE:
+
+	call UNLOCK;
+
+	Code = code;
+
+	return;
+
+
+%page;
+
+/* drain_stock_range -
+
+   Deposits any vtocx's within a specified range from the stock into
+   the VTOC Map.
+*/
+
+drain_stock_range:
+     entry (Pvtep, Low_vtocx, High_vtocx);
+
+	pvtep = Pvtep;
+	low_vtocx = Low_vtocx;
+	high_vtocx = High_vtocx;
+
+
+	call SETUP_LOCK;
+
+	call SETUP_ABS_SEG;
+
+	do stockx = 1 to vtoce_stock.n_in_stock;
+	     if vtoce_stock.stock (stockx) ^= -1
+	     then if vtoce_stock.stock (stockx) >= low_vtocx
+		     & vtoce_stock.stock (stockx) <= high_vtocx
+		then do;
+			vtocx = vtoce_stock.stock (stockx);
+			vtoce_stock.stock (stockx) = -1;
+			vtoce_stock.n_free_in_stock = vtoce_stock.n_free_in_stock - 1;
+			call DEPOSIT_TO_MAP (vtocx, "1"b, ("0"b));
+		     end;
+	end;
+
+	call RESET_ABS_SEG;
+
+	call UNLOCK;
+
+	return;
+
+
+%page;
+
+/* drain_stock - 
+
+   Shuts down the stock by setting the target to 0 and depositing any remaining 
+   VTOCEs into the VTOC Map
+   The caller must have setup volmap_abs_seg
+*/
+
+drain_stock:
+     entry (Pvtep);
+
+	pvtep = Pvtep;
+
+	call SETUP_LOCK;
+	vtoc_mapp = ptr (addr (volmap_abs_seg$), pvte.vtoc_map_offset);
+
+	vtoce_stock.target = 0;
+	do while (vtoce_stock.n_free_in_stock > 0);
+	     vtocx = WITHDRAW_FROM_STOCK ();
+	     call DEPOSIT_TO_MAP (vtocx, "1"b, ("0"b));
+	end;
+
+	call UNLOCK;
+
+	return;
+%page;
+/* force_unlock -
+
+   Unlocks the VTOC Map lock.
+*/
+
+force_unlock:
+     entry (Pvtep);
+
+	pvtep = Pvtep;
+
+	call UNLOCK;
+
+	return;
+%page;
+/* Internal Procedure to deposit a single VTOCE index to the stock,
+   returning an indication of success */
+
+DEPOSIT_TO_STOCK:
+     proc (vtocx) returns (bit (1) aligned);
+
+	dcl     vtocx		 fixed bin;
+
+	dcl     found_empty		 bit (1);
+
+
+
+	stock_seg.meters.deposit_vstock_calls = stock_seg.meters.deposit_vstock_calls + 1;
+
+	if vtoce_stock.n_free_in_stock >= vtoce_stock.n_in_stock
+	then do;					/* No room */
+		stock_seg.meters.deposit_vstock_fails = stock_seg.meters.deposit_vstock_fails + 1;
+		return ("0"b);
+	     end;
+
+
+	found_empty = "0"b;
+	do stockx = 1 to vtoce_stock.n_in_stock while (^found_empty);
+	     if vtoce_stock.stock (stockx) = -1
+	     then do;
+		     found_empty = "1"b;
+		     vtoce_stock.stock (stockx) = vtocx;
+		     vtoce_stock.n_free_in_stock = vtoce_stock.n_free_in_stock + 1;
+		end;
+	end;
+
+	if ^found_empty
+	then call syserr (CRASH, "vtoce_stock_man: VTOCE stock inconsistent on ^a_^a",
+		pvte.devname, convert (p99, pvte.logical_area_number));
+
+	return ("1"b);
+
+
+     end DEPOSIT_TO_STOCK;
+%page;
+/*  Internal Procedure to withdraw a single VTOCE index from the stock.
+    A vtocx of -1 is returned if this cannot be done.
+*/
+WITHDRAW_FROM_STOCK:
+     proc () returns (fixed bin);
+
+	dcl     stockx		 fixed bin;
+	dcl     vtocx		 fixed bin;
+
+	vtocx = -1;
+
+	stock_seg.meters.withdraw_vstock_calls = stock_seg.meters.withdraw_vstock_calls + 1;
+
+	if vtoce_stock.n_free_in_stock > 0
+	then do stockx = 1 to vtoce_stock.n_in_stock
+		while (vtocx = -1);
+		if vtoce_stock.stock (stockx) ^= -1 then do;
+			vtocx = vtoce_stock.stock (stockx);
+			vtoce_stock.stock (stockx) = -1;
+			vtoce_stock.n_free_in_stock = vtoce_stock.n_free_in_stock - 1;
+		     end;
+	     end;
+
+	if vtocx = -1
+	then stock_seg.meters.withdraw_vstock_fails = stock_seg.meters.withdraw_vstock_fails + 1;
+
+	return (vtocx);
+
+     end WITHDRAW_FROM_STOCK;
+%page;
+/*  Internal Procedure to deposit a VTOCE index to the VTOC Map  */
+
+DEPOSIT_TO_MAP:
+     proc (vtocx, complain, deposited);
+
+	dcl     vtocx		 fixed bin;
+	dcl     complain		 bit (1) aligned;
+	dcl     deposited		 bit (1) aligned;
+
+	dcl     bit_no		 fixed bin;
+	dcl     word_no		 fixed bin;
+
+	deposited = "1"b;
+
+	word_no = divide (vtocx, 32, 17);
+	bit_no = mod (vtocx, 32) + 1;
+
+	if word_no < 0 | word_no >= vtoc_map.bit_map_n_words
+	then do;
+		if complain then
+		     call syserr (ANNOUNCE, "vtoce_stock_man: Attempt to deposit invalid vtocx ^o on ^a_^a",
+			vtocx, pvte.devname, convert (p99, pvte.logical_area_number));
+		deposited = "0"b;
+	     end;
+	else do;
+		bit_map_wordp = addr (vtoc_map.bit_map (word_no));
+		if substr (bit_map_word.bits, bit_no, 1) = "1"b
+		then do;
+			if complain then do;
+				call syserr (ANNOUNCE, "vtoce_stock_man: Attempt to deposit free vtocx ^o on ^a_^a",
+				     vtocx, pvte.devname, convert (p99, pvte.logical_area_number));
+				pvte.vol_trouble_count = pvte.vol_trouble_count + 1;
+			     end;
+			deposited = "0"b;
+		     end;
+		else substr (bit_map_word.bits, bit_no, 1) = "1"b;
+	     end;
+
+	stock_seg.meters.deposit_vtoc_map = stock_seg.meters.deposit_vtoc_map + 1;
+
+     end DEPOSIT_TO_MAP;
+%page;
+/* Internal Procedure to setup pointers, validate that the PVTE and
+   the VTOCE stock are in sync, and lock the VTOC Map lock */
+
+SETUP_LOCK:
+     proc;
+
+	dcl     wait_event		 bit (36) aligned;
+
+
+	on any_other goto OUT_OF_SYNC;
+
+	vtoce_stockp = pvte.vtoc_map_stock_ptr;
+	if vtoce_stockp = null () then do;
+OUT_OF_SYNC:
+		revert any_other;
+		call syserr (CRASH, "vtoce_stock_man: PVTE and VTOCE stock out-of-synch on ^a_^a",
+		     pvte.devname, convert (p99, pvte.logical_area_number));
+	     end;
+
+	if vtoce_stock.pvtep ^= pvtep then goto OUT_OF_SYNC;
+
+	revert any_other;
+
+	if pvte.vtoc_map_lock = pds$processid
+	then call syserr (CRASH, "vtoce_stock_man: MYLOCK of VTOC Map Lock for ^a_^a",
+		pvte.devname, convert (p99, pvte.logical_area_number));
+
+	do while (^stac (addr (pvte.vtoc_map_lock), pds$processid));
+	     wait_event = substr (pvt$vtoc_map_lock_wait_constant, 1, 18)
+		|| rel (pvtep);
+	     call pxss$addevent (wait_event);
+	     pvte.vtoc_map_lock_notify = "1"b;
+	     if stac (addr (pvte.vtoc_map_lock), pds$processid) /* Watch for race */
+	     then do;
+		     call pxss$delevent ((""b));
+		     goto LOCK_GOT;
+		end;
+	     call pxss$wait;
+	end;
+
+LOCK_GOT:
+	pvt$n_vtoc_map_locks = pvt$n_vtoc_map_locks + 1;
+	stock_segp = addr (stock_seg$);
+	return;
+
+
+     end SETUP_LOCK;
+%page;
+/*  Internal Procedure to unlock the VTOC Map lock and notify, if necessary */
+
+UNLOCK:
+     proc;
+
+
+	dcl     wait_event		 bit (36) aligned;
+
+	if ^stacq (pvte.vtoc_map_lock, ""b, pds$processid)
+	then call syserr (CRASH, "vtoce_stock_man: STACQ fails for VTOC Map lock on ^a_^a",
+		pvte.devname, convert (p99, pvte.logical_area_number));
+
+	if pvte.vtoc_map_lock_notify then do;
+		pvte.vtoc_map_lock_notify = "0"b;
+		wait_event = substr (pvt$vtoc_map_lock_wait_constant, 1, 18) || rel (pvtep);
+		call pxss$notify (wait_event);
+	     end;
+
+     end UNLOCK;
+%page;
+/* Internal Procedure to setup volmap_abs_seg and vtoc_mapp */
+SETUP_ABS_SEG:
+     proc;
+
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (pvte.volmap_seg_sdw));
+	vtoc_mapp = ptr (addr (volmap_abs_seg$), pvte.vtoc_map_offset);
+
+
+
+     end SETUP_ABS_SEG;
+
+
+
+/* Internal Procedure to reset volmap_abs_seg  */
+
+RESET_ABS_SEG:
+     proc;
+
+	dcl     tsdw		 fixed bin (71);
+
+
+	tsdw = 0;
+	call pmut$swap_sdw (addr (volmap_abs_seg$), addr (tsdw));
+	vtoc_mapp = null ();
+
+
+     end RESET_ABS_SEG;
+
+
+
+
+%page; %include pvte;
+%page; %include stock_seg;
+%page; %include syserr_constants;
+%page; %include vtoc_map;
+%page;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   vtoce_stock_man: VTOCE stock inconsistent on dskX_NN
+
+   S:     $crash
+
+   T:	$run
+
+   M:	There is an internal inconsistency in the stock of free VTOCES
+   on the device indicated. This is probably a software malfunction.
+
+   A:     $recover
+
+   Message:
+   vtoce_stock_man: Attempt to deposit invalid vtocx YYYYYY on dskX_NN
+
+   S:     $info
+
+   T:	$run
+
+   M:     There was an attempt to return a free VTOCE to the pool of free
+   VTOCEs for the device indicated, but the index of the VTOCE was not
+   valid. This indicates possible damage to the device. Such damage can
+   be corrected by a physical volume salvage.
+
+   A:	$inform
+
+   Message:
+   vtoce_stock_man: Attempt to deposit free vtocx YYYYYY on dskX_NN
+
+   S:     $info
+
+   T:	$run
+
+   M:	A VTOCE was returned to the free pool of VTOCEs on the device indicated,
+   but the VTOCE was already marked as free. This indicates possible device
+   damage. This damage can be corrected by a physical volume salvage.
+
+   A:     $inform
+
+   Message:
+   vtoce_stock_man: PVTE and VTOCE stock out-of-synch on dskX_NN
+
+   S:     $crash
+
+   T:	$run
+
+   M:	There is an inconsistency between the Physical Volume Table
+   Entry and the VTOCE Stock for the device indicated. This is probably
+   a software error.
+
+   A:     $recover
+
+   Message:
+   vtoce_stock_man: MYLOCK of VTOC Map for dskX_NN
+
+   S:     $crash
+
+   T:	$run
+
+   M:     A process attempted to acquire a lock on the VTOC Map for the device
+   indicated while already owning the lock. This is probably a software error.
+
+   A:     $recover
+
+   Message:
+   vtoce_stock_man: STACQ fails for VTOC Map lock on dskX_NN
+
+   S:     $crash
+
+   T:	$run
+
+   M:	A process was unable to unlock the VTOC Map lock for the device
+   indicated. This is probably a hardware failure, either in the CPU or in 
+   main memory.
+
+   A:     $recover
+
+   END MESSAGE DOCUMENTATION */
+
+     end vtoce_stock_man$get_free_vtoce;

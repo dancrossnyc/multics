@@ -1,0 +1,456 @@
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+apl_domino_operator_:
+	procedure (operators_argument);
+
+/*
+ * this routine performs the monadic and dyadic domino (matrix-invert, least squares).
+ *
+ * written 73.9.11 by DAM based on a procedure by Max Smith
+ * completely rewritten 73.10.8 by DAM to use LU decomposition
+ * Modified 741015 by PG to reduce precision of subscripts to get better code.
+ * Modified 750326 by PG to fix bug 209 causing random WS FULL errors.
+ * Modified 760903 by PG to fix bug 227 causing domino to return incorrect numbers.
+ * Modified 760905 by PG to fix bug that caused dyadic usage to fail if the equations were permuted.
+ * Modified 770303 by PG to fix bug 269 (inverting singular matrices w/o error msg) by adding
+ *	code to scan the diagonal of U looking for zeroes.
+   Modified 771110 by PG to fix bug 293 by setting up our own underflow handler...since apl's
+	seems to be broken.
+   Modified 771130 by PG to remove our own underflow handler, now that apl's works again.
+   Modified 771205 by PG to permute AtA completely before performing decomposition, thus
+	fixing bug 294 causing Hilbert (and other ill-conditioned) matrices to fail.
+   Modified 771221 by PG to increase precision of result when A is square by not multiplying through by At.
+   Modified 790411 by William M. York to allocate temporaries on the APL value
+	stack instead of the Multics stack, avoiding storage conditions.
+   Modified 810125 by WMY to fix bug 481, the shape of the result is incorrect
+	when the operand is on the stack.
+
+   Modified 811211 by TO to correct pivoting algorithm.
+   Modified 811211 by TO to correct stack allocation problem.
+ */
+
+/* description of the algorithm
+
+    let A be the right operand, B be the left operand.
+    If used monadically, B is identity matrix of appropriate size
+    We solve
+	  T        T
+	(A A) X = A B	for X.
+
+    We check for singularity by enabling the overflow and zerodivide conditions, and by
+    checking the diagonal of the decomposition of AtA.
+    We do use "partial pivoting" and scaling.
+    The algorithm has not been particularly optimized for speed.
+    Much better code could be produced by zero-origin indexing.
+
+    The major variables are:
+
+	A	right operand
+	B	left operand
+	At	A-transpose, isub defined on A.
+	AtA	the computed product of At and A
+	AtB	the computed product of At and B
+	LU	the L-U triangular decomposition of AtA,[1]AtB
+	X	the answer
+	H	first part of rho A, kept in times-reduced form
+	U	last element of rho A
+	T	last part of rho B, in times-reduced form.  rho B is H|T.  T may be empty
+
+	Note this is a slight generalization of IBM's domino, in that
+	arrays of equations may be solved.
+
+	Note:  The APL/SV extensions to accept vectors as column matrices,
+	       and scalars as 1x1 matrices, have been included.
+
+   The reference for the algorithm implemented here is:
+	"Applied Linear Algebra," Ben Noble, Prentice Hall, 1969.
+   Pages 142ff describe the generalized inverse of a nonsquare matrix.
+   Pages 216ff describe the LU decomposition algorithm used here.
+
+   No library of books on computerized algorithms for matrix manipulation
+   would be complete without:
+	"Computer Solution of Linear Algebraic Systems," George Forsythe and Cleve B. Moler,
+	Prentice Hall, 1967.
+
+   This book has an excellent treatment of the computational
+   problems that occur, such as round-off, finite precision, and
+   treatment of nearly-singular matrices.
+
+*/
+
+/* automatic */
+
+declare
+    (H, T, U) fixed bin (17),		 	/* maximum number of elements/dimension is 2**17 */
+    (rhoH, rhoT) fixed bin,
+    rhoU fixed bin static init (1);
+
+dcl right_vb pointer,
+    right pointer,
+    left_vb pointer,
+    left pointer,
+    final_result_vb pointer,
+    final_result pointer,
+    end_of_operands pointer,
+    saved_stack_ptr pointer;
+
+dcl i fixed bin (21),
+    (colx, j, joinx, rowx) fixed bin (17),
+    data_elements fixed bin (17),
+    result_rhorho fixed bin,
+    n_words fixed bin (19),
+    monadic bit (1) aligned,
+
+    (z, zz) float,
+    pivot float,
+    the_max float,
+
+    pivot_row fixed bin (17),
+    pivot_col fixed bin (17);
+
+dcl A dim (H, U) float based (right),
+    B dim (H, T) float based (left),
+    AtA dim (U, U) float based (AtA_ptr),
+    AtB dim (U, T) float based (AtB_ptr),
+    LU dim (U, U+T) float based (LU_ptr),
+    X dim (U, T) float based (X_ptr),
+
+    permute dim (U) fixed bin (17) based (permute_ptr),
+
+    (AtA_ptr, AtB_ptr, LU_ptr, X_ptr, permute_ptr) pointer;
+
+/* external static */
+
+dcl (apl_error_table_$domain, apl_error_table_$length, apl_error_table_$rank) fixed bin (35) external;
+
+/* builtins */
+
+dcl (abs, addr, addrel, hbound, null, rel, size, string, substr) builtin;
+
+/* conditions */
+
+dcl (overflow, zerodivide) condition;
+
+/* include files */
+
+%include apl_number_data;
+%include apl_ws_info;
+%include apl_operators_argument;
+%include apl_bead_format;
+%include apl_value_bead;
+
+/* save stack height and pick up arguments.  determine whether monadic or dyadic */
+
+	right_vb = operands (2).value;
+	right = right_vb -> value_bead.data_pointer;
+	left_vb = operands (1).value;
+	if left_vb = null then monadic = "1"b;
+	else do;
+	   monadic = "0"b;		/* dyadic */
+	   left = left_vb -> value_bead.data_pointer;
+	   end;
+
+	if operands (2).on_stack then final_result_vb = right_vb;	/* where to leave result value_bead */
+	else if ^monadic & operands (1).on_stack then final_result_vb = left_vb;
+	else final_result_vb = value_stack_ptr;
+
+/* make checks for errors and compute the parameters H, T, and U from the arguments' rhos */
+
+	if ^ right_vb -> value_bead.data_type.numeric_value then go to domain_error_right;
+	rhoH = right_vb -> value_bead.rhorho - 1;
+	if rhoH < 0 then rhoH = 0;
+
+	if right_vb -> value_bead.rhorho > 1 then U = right_vb -> value_bead.rho (rhoH+1);
+	else if right_vb -> value_bead.rhorho = 1 then do;	/* accept vector as column matrix */
+		U = right_vb -> value_bead.rho (1);
+		H = 1;
+		go to special_H;
+		end;
+	else do;						/* accept scalar as 1x1 matrix */
+		U, H = 1;
+		go to special_H;
+		end;
+
+	H = right_vb -> value_bead.rho (1);
+	do i = 2 by 1 while (i <= rhoH);
+	   H = H * right_vb -> value_bead.rho (i);
+	   end;
+	if H > 131072 then go to domain_error_right;
+	if H < U then go to domain_error_right;
+
+special_H:
+	if ^monadic then do;	/* check left operand */
+
+	   if ^ left_vb -> value_bead.data_type.numeric_value then go to domain_error_left;
+	   if left_vb -> value_bead.rhorho = 0 then do;	/* APL/SV extension: accept scalar as 1-long vector here */
+	      if H ^= 1 then go to length_error;
+	      rhoT = 1;
+	      T = 1;
+	      go to special_T;
+	      end;
+	   if left_vb -> value_bead.rhorho < rhoH then go to rank_error_left;
+	   do i = 1 by 1 while (i <= rhoH);
+	      if left_vb -> value_bead.rho (i) ^= right_vb -> value_bead.rho (i)
+		then go to length_error;		/* both rhos must start with H */
+	      end;
+
+	   rhoT = 0;
+	   T = 1;
+	   do i = i by 1 while (i <= left_vb -> value_bead.rhorho);
+		T = T * left_vb -> value_bead.rho (i);
+		rhoT = rhoT + 1;
+		end;				/* picks up rest of rho of B in T */
+
+special_T:
+	   end;
+
+	if monadic then do;
+	   result_rhorho = right_vb -> value_bead.rhorho;		/* normally rhoU + rhoH */
+	   T = H;
+	   data_elements = U * H;
+	   end;
+	else do;
+	   result_rhorho = rhoU + rhoT;
+	   if left_vb -> value_bead.rhorho = 0 then result_rhorho = result_rhorho - 1;	/* fudge rank for scalar args */
+	   if right_vb -> value_bead.rhorho = 0 then result_rhorho = result_rhorho - 1;	/* .. */
+	   data_elements = U * T;
+	   end;
+
+/* prepare space in stack for result.  Don't write in it
+   yet since may overlay operands */
+
+	end_of_operands = ws_info.value_stack_ptr;	/* remember end of operand area */
+
+	ws_info.value_stack_ptr = final_result_vb;	/* pop operands */
+	number_of_dimensions = result_rhorho;
+	n_words = size (value_bead) + size (numeric_datum) + 1;
+	final_result_vb = apl_push_stack_ (n_words);
+	final_result = addr (final_result_vb -> value_bead.rho (result_rhorho+1));
+	if substr (rel (final_result), 18, 1) 	/* double word align these numbers */
+	then final_result = addrel (final_result, 1);
+
+
+/* begin block here to declare At, so it can be defined on A */
+
+begin;
+
+dcl    At dim (U, H) float defined (A (2sub, 1sub));
+
+/* Allocate temporary storage for computations */
+
+	saved_stack_ptr = ws_info.value_stack_ptr;
+
+	if rel (end_of_operands) > rel (ws_info.value_stack_ptr) then /* don't overlay operands */
+	     ws_info.value_stack_ptr = end_of_operands;
+
+	AtA_ptr = apl_push_stack_ (size (AtA));
+	AtB_ptr = apl_push_stack_ (size (AtB));
+	LU_ptr = apl_push_stack_ (size (LU));
+	X_ptr = apl_push_stack_ (size (X));
+	permute_ptr = apl_push_stack_ (size (permute));
+
+/* set up condition handlers to detect singularity */
+
+	on overflow, zerodivide go to singularity;
+
+/* compute AtB, using identity for B if monadic */
+
+	if ^monadic
+	then if H = U
+	     then do rowx = 1 to U;			/* dyadic, square case. */
+		     do colx = 1 to T;
+			AtB (rowx, colx) = B (rowx, colx);
+		     end;
+		end;
+	     else do rowx = 1 to U;			/* dyadic, nonsquare case. */
+		     do colx = 1 to T;
+			z = 0.0e0;
+			do joinx = 1 to H;
+			     z = z + At (rowx, joinx) * B (joinx, colx);
+			end;
+			AtB (rowx, colx) = z;
+		     end;
+		end;
+	else if H = U
+	     then do rowx = 1 to U;			/* monadic, square case */
+		     do colx = 1 to T;
+			if rowx = colx
+			then AtB (rowx, colx) = 1e0;
+			else AtB (rowx, colx) = 0e0;
+		     end;
+		end;
+	     else do rowx = 1 to U;			/* monadic, nonsquare case */
+		     do colx = 1 to T;
+			AtB (rowx, colx) = At (rowx, colx);
+		     end;
+		end;
+
+/* compute AtA */
+
+	if H = U
+	then do rowx = 1 to U;			/* square case */
+		do colx = 1 to U;
+		     AtA (rowx, colx) = A (rowx, colx);
+		end;
+	     end;
+	else do rowx = 1 to U;			/* nonsquare case */
+		do colx = 1 to U;
+		     z = 0.0e0;
+		     do joinx = 1 to H;
+			z = z + At (rowx, joinx) * A (joinx, colx);
+		     end;
+		     AtA (rowx, colx) = z;
+		end;
+	     end;
+
+/* 1) Initialize permute vector, which controls re-ordering of equations (rows) of AtA and AtB.
+   2) Scale AtA and AtB so that the largest element in any row is of magnitude 1. */
+
+	do rowx = 1 to U;
+	     permute (rowx) = rowx;
+
+	     the_max = abs (AtA (rowx, 1));
+	     do colx = 2 to U;
+		z = abs (AtA (rowx, colx));		/* assign to temp only to get better code */
+
+		if z > the_max
+		then the_max = z;
+	     end;
+
+	     do colx = 1 to T;
+		z = abs (AtB (rowx, colx));		/* .. */
+
+		if z > the_max
+		then the_max = z;
+	     end;
+
+	     AtA (rowx, *) = AtA (rowx, *) / the_max;
+	     AtB (rowx, *) = AtB (rowx, *) / the_max;
+	end;
+
+	do pivot_col = 1 to U;			/* translform one row of AtA to LU */
+	     do colx = 1 to U;
+		z = AtA (permute (colx), pivot_col);
+		do j = 1 by 1 while (j<colx & j<pivot_col);
+		     z = z-LU (permute (colx), j)*LU (permute (j), pivot_col);
+		end;
+		LU (permute (colx), pivot_col) = z;
+	     end;
+
+/*  search for the next pivot  */
+
+	     pivot = LU (permute (pivot_col), pivot_col);
+	     pivot_row = pivot_col;
+	     do j = pivot_col+1 by 1 while (j <= U);
+		if abs (LU (permute (j), pivot_col)) > abs (pivot) then do;
+		     pivot = (LU (permute (j), pivot_col));
+		     pivot_row = j;
+		end;
+	     end;
+
+/*  swap the indices  */
+
+	     i = permute (pivot_col);
+	     permute (pivot_col) = permute (pivot_row);
+	     permute (pivot_row) = i;
+
+/*  check singular matrix  */
+/*   If any of the diagonal elements of U are zero, AtA is singular.
+   (The product of the diagonal elements of U is the determinant). */
+
+	     if abs (pivot) < ws_info.integer_fuzz
+	     then go to domain_error_right;
+
+/*  transform the pivot column to LU */
+
+	     do j = pivot_col+1 by 1 while (j <= U);
+		LU (permute (j), pivot_col) = LU (permute (j), pivot_col)/pivot;
+	     end;
+
+/*  transform the pivot row of AtB to LU */
+
+	     do colx = U+1 to hbound (LU, 2);
+		z = AtB (permute (pivot_col), colx - U);
+		do j = 1 by 1 while (j < pivot_col);
+		     z = z - LU (permute (j), colx) * LU (permute (pivot_col), j);
+		end;
+		LU (permute (pivot_col), colx) = z;
+	     end;
+	end;
+
+	do rowx = U by -1 to 1;			/* compute answer by back substitution */
+	     do colx = 1 to T;			/* uses only the U portion of LU */
+		z = LU (permute (rowx), U+colx);
+		do j = rowx+1 to U;
+		     z = z - LU (permute (rowx), j) * X (j, colx);
+		end;
+		X (rowx, colx) = z / LU (permute (rowx), rowx);
+	     end;
+	end;
+
+/* iterative improvement */
+
+	/* TO BE SUPPLIED - requires proceduring of some of the above code. */
+
+end;	/* the begin block for At */
+
+
+/* fill rho vector of the result.  Careful inspection and consideration of all cases reveals
+	   that we will never over-write an operand's rho before we copy into result's rho! */
+
+	do i = result_rhorho by -1 to 2;
+	     if monadic
+	     then final_result_vb -> value_bead.rho (i) = right_vb -> value_bead.rho (i-1);
+	     else final_result_vb -> value_bead.rho (i) = left_vb -> value_bead.rho (rhoH+i-1);
+	end;
+
+	if result_rhorho >= 1			/* fudge for scalar arg */
+	then final_result_vb -> value_bead.rho (1) = U;
+
+	string (final_result_vb -> value_bead.type) = numeric_value_type;
+	final_result_vb -> value_bead.rhorho = result_rhorho;
+	final_result_vb -> value_bead.total_data_elements = data_elements;
+	final_result_vb -> value_bead.data_pointer = final_result;
+
+/* copy from automatic storage into APL stack (data_elements is still set) */
+
+	final_result -> numeric_datum (*) = addr (X) -> numeric_datum (*);
+
+	operators_argument.result = final_result_vb;
+
+	/* Free temporary storage. */
+   
+	ws_info.value_stack_ptr = saved_stack_ptr;
+   
+	return;
+
+/* error exits */
+
+domain_error_right:
+	operators_argument.where_error = operators_argument.where_error - 2;
+
+domain_error_left:
+	operators_argument.where_error = operators_argument.where_error + 1;
+
+singularity:
+	operators_argument.error_code = apl_error_table_$domain;
+	return;
+
+length_error:
+	operators_argument.error_code = apl_error_table_$length;
+	return;
+
+rank_error_left:
+	operators_argument.where_error = operators_argument.where_error + 1;
+	operators_argument.error_code = apl_error_table_$rank;
+	return;
+
+%include apl_push_stack_fcn;
+end; /* apl_domino_operator_ */

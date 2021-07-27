@@ -1,0 +1,1421 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1986 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-02,Elhard), approve(86-05-02,MCR7391),
+     audit(86-07-18,DGHowe), install(86-11-20,MR12.0-1222):
+     Rewritten to allow termination of multisegment files and to terminate all
+     components of object MSFs in appropriate circumstances.
+  2) change(86-06-24,DGHowe), approve(86-06-24,MCR7396),
+     audit(86-11-04,GDixon), install(86-11-20,MR12.0-1222):
+     set variable_node seg ptr to null when terminating references.
+  3) change(86-12-08,Elhard), approve(86-12-08,PBF7391),
+     audit(86-12-09,JRGray), install(86-12-10,MR12.0-1240):
+     Changed to trap segment faults while calculating link array size (by
+     referencing the object segment) and free the linkage and static sections
+     for faulted segments in the address space.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,insnl,ifthendo,indthenelse,^indnoniterdo,^inditerdo,indcom,^indthenbegin,^indprocbody,ind2,ll79,initcol0,dclind4,idind24,struclvlind1,comcol41 */
+
+term_:
+  proc (a_dname,			/** dirname of object   (in )	*/
+       a_ename,			/** entryname of object (in ) */
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_					*/
+  /***	Function:	this set of subroutines is used to terminate a	*/
+  /***		segment or MSF and clean up the environment by	*/
+  /***		unsnapping links that referenced it,   freeing	*/
+  /***		the linkage and static sections,   closing any	*/
+  /***		pl1 I/O file state blocks open for it, freeing	*/
+  /***		any fortran static VLA's,   and setting all of	*/
+  /***		the init_info pointers to null for any *system	*/
+  /***		that refer to the segments being terminated.	*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* constants */
+
+  dcl true		bit (1) static options (constant) init ("1"b);
+  dcl false		bit (1) static options (constant) init ("0"b);
+
+  /* parameters */
+
+  dcl a_dname		char (*) parameter;
+  dcl a_ename		char (*) parameter;
+  dcl a_refname		char (*) parameter;
+  dcl a_segp		ptr parameter;
+  dcl a_code		fixed bin (35) parameter;
+
+  /* procedures */
+
+  dcl find_command_$clear	entry;
+  dcl fortran_storage_manager_$free
+			entry (ptr);
+  dcl get_system_free_area_	entry () returns (ptr);
+  dcl hcs_$fs_get_path_name	entry (ptr, char (*), fixed bin, char (*),
+			fixed bin (35));
+  dcl hcs_$fs_get_seg_ptr	entry (char (*), ptr, fixed bin (35));
+  dcl hcs_$get_uid_seg	entry (ptr, bit (36) aligned, fixed bin (35));
+  dcl hcs_$high_low_seg_count entry (fixed bin (15), fixed bin (15));
+  dcl hcs_$initiate		entry (char (*), char (*), char (*),
+			fixed bin (1),
+			fixed bin (2), ptr, fixed bin (35));
+  dcl hcs_$initiate_count	entry (char (*), char (*), char (*),
+			fixed bin (24), fixed bin (2), ptr,
+			fixed bin (35));
+  dcl hcs_$status_minf	entry (char (*), char (*), fixed bin (1),
+			fixed bin (2), fixed bin (24), fixed bin (35));
+  dcl hcs_$terminate_name	entry (char (*), fixed bin (35));
+  dcl hcs_$terminate_noname	entry (ptr, fixed bin (35));
+  dcl hcs_$terminate_seg	entry (ptr, fixed bin (1), fixed bin (35));
+  dcl pathname_		entry (char (*), char (*)) returns (char (168));
+  dcl plio2_$close_in_this_static
+			entry (ptr, ptr, fixed bin (18));
+
+  /* external */
+
+  dcl error_table_$segknown	external fixed bin (35);
+  dcl error_table_$seg_unknown
+			external fixed bin (35);
+  dcl error_table_$invalidsegno
+			external fixed bin (35);
+  dcl error_table_$dirseg	external fixed bin (35);
+
+  dcl plio2_data_fsb_thread_	ptr external init (null);
+
+  /* based */
+
+  dcl 01 segment		(segment_count) aligned based (segsp),
+       02 textp		ptr,
+       02 flags		aligned,
+        03 separate_static	bit (1) unaligned,
+        03 mbz		bit (35) unaligned,
+       02 link_segno	fixed bin (18) unsigned unaligned,
+       02 link_start	fixed bin (18) unsigned unaligned,
+       02 link_end		fixed bin (18) unsigned unaligned,
+       02 stat_segno	fixed bin (18) unsigned unaligned,
+       02 stat_start	fixed bin (18) unsigned unaligned,
+       02 stat_end		fixed bin (18) unsigned unaligned;
+
+  /* automatic */
+
+  dcl segsp		ptr automatic;
+  dcl segment_count		fixed bin automatic;
+  dcl ec			fixed bin (35) automatic;
+
+  /* conditions */
+
+  dcl cleanup		condition;
+  dcl seg_fault_error	condition;
+
+  /* builtin */
+
+  dcl addwordno		builtin;
+  dcl baseptr		builtin;
+  dcl char		builtin;
+  dcl hbound		builtin;
+  dcl lbound		builtin;
+  dcl ltrim		builtin;
+  dcl min			builtin;
+  dcl null		builtin;
+  dcl segno		builtin;
+  dcl setwordno		builtin;
+  dcl size		builtin;
+  dcl stackbaseptr		builtin;
+  dcl string		builtin;
+  dcl substr		builtin;
+  dcl unspec		builtin;
+  dcl wordno		builtin;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_					*/
+  /***	Input:	dname, ename				*/
+  /***	Function:	terminates the object specified by dname and	*/
+  /***		ename.  If the object is a segment, any links to	*/
+  /***		it in other linkage sections are unsnapped,	*/
+  /***		its linkage and static sections are freed, and	*/
+  /***		any *system links which refer to the segment for	*/
+  /***		init_info have the init_info pointer set to null.	*/
+  /***		If the object is a MSF, this process is repeated	*/
+  /***		for each component.				*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call initiate_name (a_dname, a_ename, segsp, segment_count);
+  call find_command_$clear;
+  call unsnap_links (segsp, segment_count);
+  call terminate_segno (segsp, segment_count);
+
+  call exit (0);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+single_refname:
+  entry (a_refname,			/** name to terminate   (in )	*/
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$single_refname			*/
+  /***	Input:	refname					*/
+  /***	Function:	terminates a single reference name from a segment	*/
+  /***		or MSF and unsnaps any links which refer to that	*/
+  /***		file.  If the name was the last name on the	*/
+  /***		object, the object is terminated and the linkage	*/
+  /***		section(s) are freed.			*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call find_refname (a_refname, segsp, segment_count);
+  call find_command_$clear;
+  call unsnap_links (segsp, segment_count);
+  call terminate_single_refname (a_refname, segsp, segment_count);
+
+  call exit (0);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+refname:
+  entry (a_refname,			/** refname of segment  (in )	*/
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$refname				*/
+  /***	Input:	refname					*/
+  /***	Function:	terminates the segment or MSF which has the	*/
+  /***		reference name given, and unsnaps all links to	*/
+  /***		the it, frees the linkage/static section(s), and	*/
+  /***		fixes any *system init_info pointers which refer	*/
+  /***		to it.					*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call find_refname (a_refname, segsp, segment_count);
+  call find_command_$clear;
+  call unsnap_links (segsp, segment_count);
+  call terminate_segno (segsp, segment_count);
+
+  call exit (0);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+no_clear:
+  entry (a_refname,			/** name to terminate   (in )	*/
+       a_code);			/** error code	    (out)	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$no_clear				*/
+  /***	Input:	refname					*/
+  /***	Function:	This entrypoint is intended for use only by the	*/
+  /***		find_command_ subroutine. It terminates a segment	*/
+  /***		or MSF without clearing the find_command_ cache	*/
+  /***		(by calling find_command_$clear) allowing	*/
+  /***		find_command_ to maintain its cache properly.	*/
+  /***		It is otherwise identical to term_$single_refname	*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call find_refname (a_refname, segsp, segment_count);
+  call unsnap_links (segsp, segment_count);
+  call terminate_single_refname (a_refname, segsp, segment_count);
+
+  call exit (0);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+unsnap:
+  entry (a_segp,			/** segment pointer	    (in )	*/
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$unsnap				*/
+  /***	Input:	segp					*/
+  /***	Function:	unsnaps links to the segment specified by segp	*/
+  /***		and clears the find_command_ cache without	*/
+  /***		terminating the segment.			*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call get_segs (a_segp, segsp, segment_count);
+  call find_command_$clear;
+  call unsnap_links (segsp, segment_count);
+
+  call exit (0);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+nomakeunknown:
+  entry (a_segp,			/** segment pointer	    (in )	*/
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$nomakeunknown				*/
+  /***	Input:	segp					*/
+  /***	Function:	unsnaps all links, frees the linkage and static	*/
+  /***		section(s), clears the find_command_ cache, and	*/
+  /***		fixes any *system init_info references without	*/
+  /***		actually terminating the segment(s) given.	*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call get_segs (a_segp, segsp, segment_count);
+  call find_command_$clear;
+  call unsnap_links (segsp, segment_count);
+  call free_linkage (segsp, segment_count);
+
+  call exit (0);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+seg_ptr:
+  entry (a_segp,			/** segment pointer	    (in )	*/
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$seg_ptr				*/
+  /***	Input:	segp					*/
+  /***	Function:	terminates the segment/MSF specified by segp and	*/
+  /***		unsnaps any links, frees the linkage/static	*/
+  /***		section(s), fixes and *system init_info pointers	*/
+  /***		and clears the find_command_ cache.		*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+
+  on cleanup call clean_up (segsp, segment_count);
+
+  call get_segs (a_segp, segsp, segment_count);
+  call find_command_$clear;
+  call unsnap_links (segsp, segment_count);
+  call terminate_segno (segsp, segment_count);
+
+  call exit (0);
+
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+no_name:
+  entry (a_segp,			/** segment pointer	    (in )	*/
+       a_code);			/** error code	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	term_$no_name				*/
+  /***	Input:	segp					*/
+  /***	Function:	terminates the null reference name from the given	*/
+  /***		segment and decrements the reference count.	*/
+  /***	Output:	code					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  segsp = null;
+  call hcs_$terminate_noname (a_segp, ec);
+
+  call exit (ec);
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+initiate_name:
+  proc (dname,			/** dirname of target   (in )	*/
+       ename,			/** entryname of target (in ) */
+       segsp,			/** segments struc ptr  (out) */
+       seg_ct);			/** segment count	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	initiate_name				*/
+  /***	Input:	dname, ename				*/
+  /***	Function:	takes an input path given as dirname & entryname	*/
+  /***		and checks to insure that the target was known	*/
+  /***		and that it is either a segment or an object MSF.	*/
+  /***		The segs structure is allocated with pointers to	*/
+  /***		each of the segments to be terminated.		*/
+  /***	Output:	segsp, seg_ct				*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl dname		char (*) parameter;
+  dcl ename		char (*) parameter;
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* automatic */
+
+  dcl segp		ptr automatic;
+  dcl ec			fixed bin (35) automatic;
+  dcl dn			char (168) automatic;
+  dcl bc			fixed bin (24) automatic;
+
+  /* try to initiate the named segment */
+
+  call hcs_$initiate (dname, ename, "", 0, 0, segp, ec);
+
+  /* if it is a directory, we have some object MSF checks to perform */
+
+  if ec = error_table_$dirseg
+    then do;
+
+      /* see if it an MSF */
+
+      call hcs_$status_minf (dname, ename, 1, 0, bc, ec);
+      if bc > 0
+        then do;
+
+	/* try initiating component 0 */
+
+	dn = pathname_ (dname, ename);
+	call hcs_$initiate_count (dn, "0", "", bc, 0, segp, ec);
+
+	/* if it is not known, we return a code of	*/
+	/* error_table_$seg_unknown			*/
+
+	if segp = null
+	  then call exit (error_table_$dirseg);
+	else if ec ^= error_table_$segknown
+	  then do;
+
+	    /* terminate it, since it was unknown to begin with */
+
+	    call hcs_$terminate_noname (segp, 0);
+	    call exit (error_table_$seg_unknown);
+	  end;
+        end;
+    end;
+
+  /* if the target wasn't a directory, but was unknown as well, then	*/
+  /* we make it unknown again and return error_table_$seg_unknown	*/
+
+  else if ec ^= error_table_$segknown
+    then do;
+      if segp ^= null
+        then call hcs_$terminate_noname (segp, ec);
+      call exit (error_table_$seg_unknown);
+    end;
+
+  /* if it actually was known and valid, we go and get pointers and	*/
+  /* other info for each of the affected segments.		*/
+
+  call get_segs (segp, segsp, seg_ct);
+
+  end initiate_name;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+find_refname:
+  proc (refname,			/** reference name	    (in )	*/
+       segsp,			/** segments struc ptr  (out) */
+       seg_ct);			/** segment count	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	find_refname				*/
+  /***	Input:	refname					*/
+  /***	Function:	locates a segment by reference name and allocates	*/
+  /***		the list of all associated segments (in the case	*/
+  /***		of a object MSF).				*/
+  /***	Output:	segsp, seg_ct				*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl refname		char (*) parameter;
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* automatic */
+
+  dcl ec			fixed bin (35) automatic;
+  dcl segp		ptr automatic;
+
+  /* get the segment pointer associated with the refname given */
+
+  call hcs_$fs_get_seg_ptr (refname, segp, ec);
+  if segp = null
+    then call exit (ec);
+
+  /* get the required info about the segment and any associated	*/
+  /* segments if the target is a MSF component.			*/
+
+  call get_segs (segp, segsp, seg_ct);
+
+  end find_refname;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+get_segs:
+  proc (segp,			/** segment pointer	    (in )	*/
+       segsp,			/** segments struc ptr  (out) */
+       seg_ct);			/** segment count	    (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	get_segs					*/
+  /***	Input:	segp					*/
+  /***	Function:	determines if a given segment is an object MSF	*/
+  /***		component and if so, gets pointers to the other	*/
+  /***		components in the MSF and returns a structure	*/
+  /***		with those component pointers.		*/
+  /***	Output:	segsp, seg_ct				*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segp		ptr parameter;
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* based */
+
+  dcl 01 seg		(seg_ct) aligned like segment based (segsp);
+  dcl sys_area		area based (sys_areap);
+  dcl 01 lh		aligned like linkage_header based (lhp);
+  dcl 01 mm		aligned like msf_map based (mmp);
+  dcl 01 dh		aligned like definition_header based (dhp);
+
+  /* automatic */
+
+  dcl c			fixed bin automatic;
+  dcl compp		ptr automatic;
+  dcl dhp			ptr automatic;
+  dcl dname		char (168) automatic;
+  dcl dnl			fixed bin automatic;
+  dcl ename		char (32) automatic;
+  dcl i			fixed bin automatic;
+  dcl isp			ptr automatic;
+  dcl lhp			ptr automatic;
+  dcl mmp			ptr automatic;
+  dcl seg_tempp		ptr automatic;
+  dcl ss			bit (1) automatic;
+  dcl sys_areap		ptr automatic;
+
+  sys_areap = get_system_free_area_ ();
+
+  /* try to get the linkage/static pointers */
+
+  call get_lp (segno (segp), lhp, isp, ss);
+
+  if lhp = null
+    then do;
+
+      /* there is no linkage section.  just handle the one segment */
+
+      seg_ct = 1;
+      allocate seg in (sys_area);
+      unspec (seg (1)) = ""b;
+      seg (1).textp = segp;
+      return;
+    end;
+
+  dhp = lh.def_ptr;
+
+  on seg_fault_error
+    begin;
+
+    /* if we take a segment fault while trying to see if this is an	*/
+    /* object MSF, we have no way of telling, so we assume it is a	*/
+    /* single segment item and continue.			*/
+
+    seg_ct = 1;
+    goto SKIP;
+  end;
+
+  /* if the msf_map_relp value is nonzero, validate that it is a	*/
+  /* valid msf map.  if so take the seg count from there, otherwise	*/
+  /* assume 1.						*/
+
+  if dh.msf_map_relp ^= 0
+    then do;
+      mmp = addwordno (dhp, dh.msf_map_relp);
+      if mm.version ^= msf_map_version_1
+        then seg_ct = 1;
+        else seg_ct = mm.component_count;
+    end;
+    else seg_ct = 1;
+
+SKIP:
+  revert seg_fault_error;
+
+  /* only 1 segment, so get the info and return. */
+
+  if seg_ct = 1
+    then do;
+
+      /* the segment is not an MSF component, just handle the one segment */
+
+      allocate seg in (sys_area);
+      seg (1).textp = segp;
+      string (seg (1).flags) = ""b;
+      seg (1).flags.separate_static = ss;
+      seg (1).link_segno = segno (lhp);
+      seg (1).link_start = wordno (lhp);
+      seg (1).link_end = wordno (lhp) + lh.stats.block_length;
+      if isp ^= null
+        then do;
+	seg (1).stat_segno = segno (isp);
+	seg (1).stat_start = wordno (isp);
+	seg (1).stat_end = wordno (isp) + lh.stats.static_length;
+        end;
+      return;
+    end;
+
+  /* allocate the segs structure for seg_ct>1.  In order for clean_up
+     to work properly, seg.textp(*) must be initialized to null when
+     segsp is set.  The code below initializes the seg array before
+     setting segsp. */
+
+  allocate seg in (sys_area) set (seg_tempp);
+  unspec (seg_tempp -> seg) = ""b;
+  seg_tempp -> seg.textp (*) = null;
+  segsp = seg_tempp;
+
+  /* get the containing directory */
+
+  call hcs_$fs_get_path_name (segp, dname, dnl, ename, ec);
+  dname = substr (dname, 1, dnl);
+
+  /* get the information for the primary component */
+
+  seg (1).textp = segp;
+  string (seg (1).flags) = ""b;
+  seg (1).flags.separate_static = ss;
+  seg (1).link_segno = segno (lhp);
+  seg (1).link_start = wordno (lhp);
+  seg (1).link_end = wordno (lhp) + lh.stats.block_length;
+  if isp ^= null
+    then do;
+      seg (1).stat_segno = segno (isp);
+      seg (1).stat_start = wordno (isp);
+      seg (1).stat_end = wordno (isp) + lh.stats.static_length;
+    end;
+
+  i = 1;
+
+  /* pick up the information for the other MSF components */
+
+  do c = 0 to mm.component_count - 1;
+    if c ^= mm.my_component
+      then do;
+
+        i = i + 1;
+
+        /* initiate each component */
+
+        call hcs_$initiate (dname, ltrim (char (c)), "", 0, 0, compp, ec);
+        if compp = null
+	then call exit (ec);
+
+        /* get the linkage and static pointers */
+
+        call get_lp (segno (compp), lhp, isp, ss);
+        if lhp ^= null
+	then do;
+
+	  /* if there is a linkage section, copy the info */
+
+	  seg (i).textp = compp;
+	  string (seg (i).flags) = ""b;
+	  seg (i).flags.separate_static = ss;
+	  seg (i).link_segno = segno (lhp);
+	  seg (i).link_start = wordno (lhp);
+	  seg (i).link_end = wordno (lhp) + lh.stats.block_length;
+	  if isp ^= null
+	    then do;
+	      seg (i).stat_segno = segno (isp);
+	      seg (i).stat_start = wordno (isp);
+	      seg (i).stat_end = wordno (isp) + lh.stats.static_length;
+	    end;
+	end;
+	else do;
+
+	  /* if there is no linkage section, zero the values */
+
+	  unspec (seg (i)) = ""b;
+	  seg (i).textp = compp;
+	end;
+      end;
+  end;
+
+  end get_segs;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+clean_up:
+  proc (segsp,			/** segments struc ptr  (in )	*/
+       seg_ct);			/** segment count	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	clean_up					*/
+  /***	Input:	segsp, seg_ct				*/
+  /***	Function:	frees the segs structure.			*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* based */
+
+  dcl 01 seg		(seg_ct) aligned like segment based (segsp);
+  dcl sys_area		area based (sys_areap);
+
+  /* automatic */
+
+  dcl s			fixed bin automatic;
+  dcl sys_areap		ptr automatic;
+
+  /* if there is no structure allocated, just return */
+
+  if segsp = null
+    then return;
+
+  /* terminate segments we initiated that are not already terminated */
+
+  do s = 2 to seg_ct;
+    if seg (s).textp ^= null
+      then call hcs_$terminate_noname (seg (s).textp, 0);
+  end;
+
+  /* get the area pointer and free the structure */
+
+  sys_areap = get_system_free_area_ ();
+  free seg in (sys_area);
+
+  end clean_up;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+terminate_single_refname:
+  proc (refname,			/** refname to kill	    (in )	*/
+       segsp,			/** segments struc ptr  (in )	*/
+       seg_ct);			/** segment count	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	terminate_single_refname			*/
+  /***	Input:	refname, segsp, seg_ct			*/
+  /***	Function:	terminates the given name.  If the name was the	*/
+  /***		only name on the segment the segment is also	*/
+  /***		terminated.  In this case we free the linkage	*/
+  /***		sections and terminate any associated segments.	*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl refname		char (*) parameter;
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* based */
+
+  dcl 01 seg		(seg_ct) aligned like segment based (segsp);
+
+  /* automatic */
+
+  dcl actual_code		fixed bin (35) automatic;
+  dcl ec			fixed bin (35) automatic;
+  dcl s			fixed bin automatic;
+
+  /* terminate the name */
+
+  call hcs_$terminate_name (refname, ec);
+  if ec ^= 0
+    then call exit (ec);
+
+  /* reference the segment to see if it was terminated as well */
+
+  call hcs_$get_uid_seg (seg (1).textp, (""b), ec);
+  if ec = error_table_$invalidsegno
+    then do;
+
+      /* the segment was terminated, so we free the linkage and	*/
+      /* terminate any associated segments.			*/
+
+      call free_linkage (segsp, seg_ct);
+
+      actual_code = 0;
+
+      do s = 2 to seg_ct;
+        call hcs_$terminate_seg (seg (s).textp, 0b, ec);
+        if ec ^= 0
+	then actual_code = ec;
+	else seg (s).textp = null;
+      end;
+
+      if actual_code ^= 0
+        then call exit (actual_code);
+    end;
+
+  end terminate_single_refname;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+terminate_segno:
+  proc (segsp,			/** segments struc ptr  (in )	*/
+       seg_ct);			/** segment count	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	terminate_segno				*/
+  /***	Input:	segsp, seg_ct				*/
+  /***	Function:	terminates the segments identified by the segs	*/
+  /***		structure after freeing their linkage sections	*/
+  /***		and fixing any *system init_info references.	*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* based */
+
+  dcl 01 seg		(seg_ct) aligned like segment based (segsp);
+
+  /* automatic */
+
+  dcl actual_code		fixed bin (35) automatic;
+  dcl s			fixed bin automatic;
+  dcl ec			fixed bin (35) automatic;
+
+  /* free the linkage sections and clean up the environment */
+
+  call free_linkage (segsp, seg_ct);
+
+  /* actually terminate the segments */
+
+  actual_code = 0;
+
+  do s = 1 to seg_ct;
+    call hcs_$terminate_seg (seg (s).textp, 0b, ec);
+    if ec ^= 0
+      then actual_code = ec;
+      else seg (s).textp = null;
+  end;
+
+  if actual_code ^= 0
+    then call exit (actual_code);
+
+  end terminate_segno;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+unsnap_links:
+  proc (segsp,			/** segments struc ptr  (in )	*/
+       seg_ct);			/** segment count	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	unsnap_links				*/
+  /***	Input:	segsp, seg_ct				*/
+  /***	Function:	scans the linkage sections of each active segment	*/
+  /***		for links to any of the segments listed in the	*/
+  /***		segs structure and unsnaps them.		*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* based */
+
+  dcl 01 seg		(seg_ct) aligned like segment based (segsp);
+  dcl lk			ptr based (lkp);
+  dcl 01 vlh		aligned like virgin_linkage_header based (vlhp);
+  dcl 01 lh		aligned like linkage_header based (lhp);
+
+  /* automatic */
+
+  dcl c			fixed bin automatic;
+  dcl found		bit (1) automatic;
+  dcl hcsc		fixed bin (15) automatic;
+  dcl high_seg		fixed bin automatic;
+  dcl isp			ptr automatic;
+  dcl lhp			ptr automatic;
+  dcl lk_end		fixed bin automatic;
+  dcl lk_segno		fixed bin (18) unsigned automatic;
+  dcl lk_word		fixed bin (18) unsigned automatic;
+  dcl lkp			ptr automatic;
+  dcl low_seg		fixed bin automatic;
+  dcl nsegs		fixed bin (15) automatic;
+  dcl offset		fixed bin automatic;
+  dcl seg_no		fixed bin (18) automatic;
+  dcl trap_errors		bit (1) automatic;
+  dcl vlhp		ptr automatic;
+
+  trap_errors = false;
+
+  on seg_fault_error
+    begin;
+
+    /* we set up this handler here and enable and disable it using	*/
+    /* a flag for better efficiency.				*/
+
+    if trap_errors
+      then do;
+        found = true;
+        trap_errors = false;
+        goto UNSNAP;
+      end;
+      else do;
+        call free_faulted_linkage (segsp, seg_ct, seg_no);
+        goto SKIP;
+      end;
+  end;
+
+  call hcs_$high_low_seg_count (nsegs, hcsc);
+  low_seg = hcsc + 1;
+  high_seg = hcsc + nsegs;
+
+  /* for each initiated segment */
+
+  do seg_no = low_seg to high_seg;
+
+    /* try to get the linkage pointer */
+
+    call get_lp (seg_no, lhp, isp, ""b);
+
+    /* only check segments which have a linkage section */
+
+    if lhp ^= null
+      then do;
+
+        /* get the original linkage section pointer */
+
+        vlhp = lh.original_linkage_ptr;
+
+        /* calculate the size of the link array */
+
+        if vlh.defs_in_link = "20"b3
+	then lk_end = vlh.def_offset;
+	else lk_end = vlh.linkage_section_lng;
+
+        if vlh.first_ref_relp ^= 0
+	then lk_end = min (lk_end, vlh.first_ref_relp);
+
+        /* scan the link array of the current linkage section */
+
+        do offset = vlh.link_begin by 2 to lk_end - 2;
+
+	/* get a pointer to the link */
+
+	lkp = addwordno (lhp, offset);
+
+	/* we are only concerned with snapped links */
+
+	if lkp -> its_unsigned.its_mod = ITS_MODIFIER
+	  then do;
+	    found = false;
+
+	    /* trap seg fault errors when referencing the link and	*/
+	    /* unsnap the link if one occurs.			*/
+
+	    trap_errors = true;
+
+	    lk_segno = segno (lk);
+	    lk_word = wordno (lk);
+
+	    trap_errors = false;
+
+	    /* scan the segments for a match */
+
+	    do c = 1 to seg_ct while (^found);
+
+	      /* see if the link refers to the target segment */
+
+	      if lk_segno = segno (seg (c).textp)
+	        then found = true;
+
+	      /* or its linkage section */
+
+	      else if lk_segno = seg (c).link_segno &
+		 lk_word >= seg (c).link_start &
+		 lk_word <= seg (c).link_end
+	        then found = true;
+
+	      /* or its static section */
+
+	      else if lk_segno = seg (c).stat_segno &
+		 lk_word >= seg (c).stat_start &
+		 lk_word <= seg (c).stat_end
+	        then found = true;
+	    end;
+
+	    /* if it refers to one of the given segments, unsnap it */
+
+UNSNAP:
+	    if found
+	      then unspec (lk) = unspec (addwordno (vlhp, offset) -> lk);
+	  end;
+        end;
+      end;
+SKIP:
+  end;
+
+  end unsnap_links;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+free_linkage:
+  proc (segsp,			/** segments struc ptr  (in )	*/
+       seg_ct);			/** segment count	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	free_linkage				*/
+  /***	Input:	segsp, seg_ct				*/
+  /***	Function:	closes language I/O files, frees fortran internal	*/
+  /***		static LA's and VLA's, free's the linkage and	*/
+  /***		static sections, and nulls any references to the	*/
+  /***		segments in the init_info pointers of external	*/
+  /***		variable nodes.				*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+
+  /* based */
+
+  dcl linkage_section	(1:linkl) bit (36) aligned based (linkp);
+  dcl 01 seg		(seg_ct) aligned like segment based (segsp);
+  dcl static_section	(1:statl) bit (36) aligned based (statp);
+  dcl based_area		area based;
+
+  /* automatic */
+
+  dcl i			fixed bin automatic;
+  dcl isotp		ptr automatic;
+  dcl linkl		fixed bin (18) automatic;
+  dcl linkp		ptr automatic;
+  dcl lotp		ptr automatic;
+  dcl np			ptr automatic;
+  dcl s			fixed bin automatic;
+  dcl sb			ptr automatic;
+  dcl seg_no		fixed bin (18) unsigned automatic;
+  dcl statl		fixed bin (18) automatic;
+  dcl statp		ptr automatic;
+  dcl sys_infop		ptr automatic;
+
+  sb = stackbaseptr ();
+  lotp = sb -> stack_header.lot_ptr;
+  isotp = sb -> stack_header.isot_ptr;
+
+  /* free the linkage section for each segment with linkage */
+
+  do s = 1 to seg_ct;
+    if seg (s).link_segno ^= 0
+      then do;
+
+        /* get the pointers and lengths of the linkage and static	*/
+        /* sections (if there is a separate static section).	*/
+
+        seg_no = segno (seg (s).textp);
+        linkp = baseptr (seg (s).link_segno);
+        linkp = setwordno (linkp, seg (s).link_start);
+        linkl = seg (s).link_end - seg (s).link_start + 1;
+        if seg (s).stat_segno = 0
+	then do;
+	  statp = null;
+	  statl = 0;
+	end;
+	else do;
+	  statp = baseptr (seg (s).stat_segno);
+	  statp = setwordno (linkp, seg (s).stat_start);
+	  statl = seg (s).stat_end - seg (s).stat_start + 1;
+	end;
+
+        /* clean up pl1 I/O stuff from the static section before freeing */
+
+        if plio2_data_fsb_thread_ ^= null
+	then call plio2_$close_in_this_static (plio2_data_fsb_thread_,
+		statp, statl);
+
+        /* release any static VLAs */
+
+        if linkp -> linkage_header_flags.static_vlas
+	then call fortran_storage_manager_$free (linkp);
+
+        /* free the static section if it is separate */
+
+        if seg (s).flags.separate_static & statp ^= null
+	then free static_section
+		in (sb -> stack_header.combined_stat_ptr -> based_area);
+
+        /* clear the isot entry */
+
+        unspec (isotp -> isot.isp (seg_no)) = ""b;
+
+        /* free the linkage section */
+
+        free linkage_section in (sb -> stack_header.clr_ptr -> based_area);
+
+        /* set the lot entry to lot_fault */
+
+        unspec (lotp -> lot.lp (seg_no)) = lot_fault;
+      end;
+  end;
+
+  sys_infop = sb -> stack_header.sys_link_info_ptr;
+
+  if sys_infop ^= null
+    then do;
+
+      /* there are *system links, so search the table looking for	*/
+      /* init_info pointers which refer to the segment(s) being	*/
+      /* terminated, and set the init_info pointers to null.	*/
+
+      do i = lbound (sys_infop -> variable_table_header.hash_table, 1)
+	 to hbound (sys_infop -> variable_table_header.hash_table, 1);
+        do np = sys_infop -> variable_table_header.hash_table (i)
+	   repeat (np -> variable_node.forward_thread) while (np ^= null);
+
+	/* compare with each text pointer and null the ptr if it matches */
+
+	do s = 1 to seg_ct while (np -> variable_node.init_ptr ^= null);
+	  if segno (np -> variable_node.init_ptr) = segno (seg (s).textp)
+	    then do;
+	      np -> variable_node.init_ptr = null;
+	      np -> variable_node.seg_ptr = null;
+	    end;
+	end;
+        end;
+      end;
+    end;
+
+  end free_linkage;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+free_faulted_linkage:
+  proc (segsp,			/** segments pointer    (in )	*/
+       seg_ct,			/** segment count	    (in )	*/
+       seg_no);			/** segment number	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	free_faulted_linkage			*/
+  /***	Input:	segsp, seg_ct, seg_no			*/
+  /***	Function:	If a segment fault occurs during the unsnapping	*/
+  /***		of links, one of the following situations exists:	*/
+  /***		  - The link we are testing has an indirection	*/
+  /***		    tag, and one of the segments in the chain	*/
+  /***		    doesnt exist.  This is resolved by unsnapping	*/
+  /***		    the link.  This is done in the handler (in	*/
+  /***		    unsnap links).				*/
+  /***		  - We have take a segment fault on term_, on the	*/
+  /***		    stack, or the linkage area.  In any of these	*/
+  /***		    cases, we cant do anything anyway (and the	*/
+  /***		    process is probably about to die anyway) so	*/
+  /***		    we ignore them.				*/
+  /***		  - One of the segments in the address space has	*/
+  /***		    been deleted or is otherwise inaccessible but	*/
+  /***		    its linkage section still exists.  This is	*/
+  /***		    the case that this procedure handles. We deal	*/
+  /***		    with this case by freeing the linkage and	*/
+  /***		    static for the now-defunct segment, and	*/
+  /***		    clearing the lot and isot values.		*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segsp		ptr parameter;
+  dcl seg_ct		fixed bin parameter;
+  dcl seg_no		fixed bin (18) parameter;
+
+  /* based */
+
+  dcl based_area		area based;
+  dcl linkage_section	(linkl) bit (36) based (linkp);
+  dcl 01 segs		(seg_ct) aligned like segment based (segsp);
+  dcl static_section	(statl) bit (36) based (statp);
+
+  /* automatic */
+
+  dcl i			fixed bin automatic;
+  dcl isotp		ptr automatic;
+  dcl linkl		fixed bin (18) automatic;
+  dcl linkp		ptr automatic;
+  dcl lotp		ptr automatic;
+  dcl sb			ptr automatic;
+  dcl ss			bit (1) automatic;
+  dcl statl		fixed bin (18) automatic;
+  dcl statp		ptr automatic;
+
+  /* if the segment we faulted on is one of the ones we were going	*/
+  /* to terminate anyway, just skip this, as the linkage will be	*/
+  /* freed shortly.						*/
+
+  do i = 1 to seg_ct;
+    if seg_no = segno (segs (i).textp)
+      then return;
+  end;
+
+  /* find the stack header, lot and isot */
+
+  sb = stackbaseptr ();
+
+  lotp = sb -> stack_header.lot_ptr;
+  isotp = sb -> stack_header.isot_ptr;
+
+  /* get the linkage and static pointers and calculate the section lengths */
+
+  call get_lp (seg_no, linkp, statp, ss);
+
+  linkl = linkp -> linkage_header.block_length;
+  statl = linkp -> linkage_header.static_length;
+
+  /* clean up pl1 I/O stuff from the static section before freeing */
+
+  if plio2_data_fsb_thread_ ^= null
+    then call plio2_$close_in_this_static (plio2_data_fsb_thread_, statp,
+	    statl);
+
+  /* release any static VLAs */
+
+  if linkp -> linkage_header_flags.static_vlas
+    then call fortran_storage_manager_$free (linkp);
+
+  /* free the static section if we have a separate static section */
+
+  if ss & statp ^= null
+    then free static_section
+	    in (sb -> stack_header.combined_stat_ptr -> based_area);
+
+  /* and clear the isot entry */
+
+  unspec (isotp -> isot.isp (seg_no)) = ""b;
+
+  /* now free the linkage section and reset the lot entry to lot_fault */
+
+  free linkage_section in (sb -> stack_header.clr_ptr -> based_area);
+
+  unspec (lotp -> lot.lp (seg_no)) = lot_fault;
+
+  end free_faulted_linkage;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+get_lp:
+  proc (segno,			/** segment number	    (in )	*/
+       linkp,			/** linkage pointer	    (out) */
+       statp,			/** static pointer	    (out) */
+       sep_stat);			/** seperate static sw  (out) */
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	get_lp					*/
+  /***	Input:	segno					*/
+  /***	Function:	gets the linkage and static pointers for the	*/
+  /***		given segment out of the lot and determines if	*/
+  /***		there is a separate static section.		*/
+  /***	Output:	linkp, statp, sep_stat			*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl segno		fixed bin (18) parameter;
+  dcl linkp		ptr parameter;
+  dcl statp		ptr parameter;
+  dcl sep_stat		bit (1) parameter;
+
+  /* automatic */
+
+  dcl isotp		ptr automatic;
+  dcl lotp		ptr automatic;
+  dcl sb			ptr automatic;
+
+  sb = stackbaseptr ();
+  lotp = sb -> stack_header.lot_ptr;
+  isotp = sb -> stack_header.isot_ptr;
+
+  linkp = null;
+  statp = null;
+  sep_stat = false;
+
+  if segno > sb -> stack_header.cur_lot_size
+    then return;
+
+  if unspec (lotp -> lot.lp (segno)) ^= ""b &
+       unspec (lotp -> lot.lp (segno)) ^= lot_fault
+    then do;
+      linkp = lotp -> lot.lp (segno);
+      if isotp -> isot1 (segno).fault = "11"b
+        then sep_stat = true;
+      else if isotp -> isot.isp (segno) = linkp
+        then statp = addwordno (linkp, size (linkage_header));
+      else do;
+        sep_stat = true;
+        statp = isotp -> isot.isp (segno);
+      end;
+    end;
+
+  end get_lp;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+exit:
+  proc (ec);			/** error code	    (in )	*/
+
+  /*** ****************************************************************/
+  /***							*/
+  /***	Name:	exit					*/
+  /***	Input:	ec					*/
+  /***	Function:	returns from term_ setting the given error code	*/
+  /***	Output:	none					*/
+  /***							*/
+  /*** ****************************************************************/
+
+  /* parameters */
+
+  dcl ec			fixed bin (35) parameter;
+
+  a_code = ec;
+  goto EXIT;
+
+  end exit;
+
+EXIT:
+  call clean_up (segsp, segment_count);
+  return;
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+/****  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+%include definition_dcls;
+%include object_link_dcls;
+%include its;
+%include lot;
+%include stack_header;
+%include system_link_names;
+
+  end term_;

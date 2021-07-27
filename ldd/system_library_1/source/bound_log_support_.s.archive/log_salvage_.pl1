@@ -1,0 +1,979 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1985 *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,indattr */
+
+log_salvage_:
+     procedure (P_log_dname, P_log_ename, P_salvage_arg_ptr, P_salv_code);
+
+/* *	LOG_SALVAGE_
+   *
+   *	This user-ring program is responsible for ensuring the log
+   *	family is in a usable state.  System crashes at critical times
+   *	can cause a variety of disasters (mostly when an ESD is not
+   *	completed).  For instance, the "current" log segment may be
+   *	found out of service or uninitialized.
+   *
+   *	Here we check all segments in the primary log directory.  It
+   *	is assumed that all other history directories are OK.
+   *
+   *	NOTE: There is no attempt to lock other processes from modifying
+   *	the log.  This routine should be called only when some other means
+   *	has been employed to obtain exclusive access to the log.
+   *
+   *	Suggested usage:
+   *	     call log_write_$open (dir, name, "0"b, datap, code);
+   *	     if code ^= 0 then do;
+   *		unspec (salv_arg) = ""b;
+   *		salv_arg.version = LOG_SALVAGE_ARG_VERSION_1;
+   *		salv_arg.reporter_proc = print_errors;
+   *		call log_salvage_ (dir, name, addr(salv_arg), code);
+   *		if salv_code = 0
+   *		then call log_write_$open (dir, name, "0"b, datap, code);
+   *		if code ^= 0	(* still failing? *)
+   *		then call error (code);
+   *	     end;
+   *
+   *	Note that the call to log_write_ has the parameter which controls
+   *	log creation set to "0"b.  In cases where it is expected a log
+   *	segment already exists, it is best to leave possible re-creation
+   *	to log_salvage_.  The log_salvage_ routine will attempt to set the
+   *	proper sequence number in a newly created log segment; log_write_
+   *	will not.  This is because log_write_ does not have the facility
+   *	to interrogate the log history.
+   *
+   *	Modification History:
+   *	85-04-09, EJ Sharpe: initial coding
+*/
+%page;
+
+/* Parameters */
+
+declare  P_log_dname	  char (*) parameter;	/* Input: log dir path */
+declare  P_log_ename	  char (*) parameter;	/* Input: log family name */
+declare  P_salvage_arg_ptr	  pointer parameter;	/* Input: controls our behaviour */
+declare  P_salv_code	  fixed bin (35) parameter;	/* Output: 0 tells caller to retry open */
+
+
+/* Automatic */
+
+declare  log_dname		  char (168);		/* arg copy */
+declare  log_ename		  char (32);		/* arg copy */
+declare  1 auto_log_salvage_arg aligned like log_salvage_arg; /* arg copy */
+
+
+declare  bit_count		  fixed bin (24);		/* ignored */
+declare  code		  fixed bin (35);		/* the usual */
+declare  current_log_ptr	  pointer;		/* pointer to current (non-history) log seg */
+declare  done		  bit (1) aligned;		/* loop control */
+declare  error_found	  bit (1) aligned;		/* found some anomaly */
+declare  first_sequence_temp	  fixed bin (35);		/* temp value */
+declare  fix_applied	  bit (1) aligned;		/* changed something for the better */
+declare  i		  fixed bin;		/* loop control */
+declare  history_log_ptr	  pointer;		/* pointer to most recent usable history seg */
+declare  n_good_hist_segs	  fixed bin;		/* the number of usable history segs */
+declare  newest_hist_log_idx	  fixed bin;		/* index of most recent usable history seg */
+declare  next_older_log_idx	  fixed bin;		/* temp idx */
+declare  next_older_log_ptr	  pointer;		/* temp ptr */
+declare  oldest_hist_log_idx	  fixed bin;		/* index of oldest history log which is usable */
+declare  renamed_damaged_log	  bit (1) aligned;		/* set if current log seg damaged */
+declare  sequence_problem_detected bit (1) aligned;	/* found problem with history sequencing */
+
+
+/* Based */
+
+/* NOTE NOTE NOTE - The following structure is copied from log_segment_.  It
+   does not exist in an include file because log_segment_ is the only program
+   which is supposed to know this format.  */
+
+declare  sequence_info_ptr	  pointer;
+declare  1 sequence_info	  aligned based (sequence_info_ptr),
+	 2 pad		  bit (17) unal,
+	 2 number		  fixed bin (35) unal,	/* spans word boundary!!!!!!! */
+	 2 in_service	  bit (1) unal,
+	 2 words_used	  fixed bin (18) unsigned unal;
+
+
+/* External */
+
+declare  error_table_$action_not_performed fixed bin (35) external;
+declare  error_table_$bad_arg	  fixed bin (35) external;
+declare  error_table_$namedup	  fixed bin (35) external;
+declare  error_table_$noentry	  fixed bin (35) external;
+declare  error_table_$nomatch	  fixed bin (35) external;
+declare  error_table_$no_w_permission fixed bin (35) external;
+declare  error_table_$unexpected_condition fixed bin (35) external;
+declare  error_table_$unimplemented_version fixed bin (35) external;
+
+declare  log_data_$default_log_size fixed bin (35) external;
+
+declare  sys_info$first_reasonable_time fixed bin (71) external;
+
+
+/* Entries */
+
+declare  convert_status_code_	  entry (fixed bin (35), char (8) aligned, char (100) aligned);
+declare  cu_$arg_ptr	  entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+declare  cu_$level_get	  entry returns (fixed bin);
+declare  formline_		  entry options (variable);
+declare  get_group_id_	  entry () returns (char (32));
+declare  get_process_access_class_ entry () returns (bit (72) aligned);
+declare  get_system_free_area_  entry () returns (ptr);
+declare  hcs_$chname_file	  entry (char (*), char (*), char (*), char (*), fixed bin (35));
+declare  hcs_$chname_seg	  entry (ptr, char (*), char (*), fixed bin (35));
+declare  hcs_$get_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+declare  hcs_$list_acl	  entry (char (*), char (*), ptr, ptr, ptr, fixed bin, fixed bin (35));
+declare  hcs_$status_for_backup entry (char (*), char (*), pointer, fixed bin (35));
+declare  hcs_$status_long	  entry (char (*), char (*), fixed bin (1), ptr, ptr, fixed bin (35));
+declare  initiate_file_	  entry (char (*), char (*), bit (*), ptr, fixed bin (24), fixed bin (35));
+declare  ioa_$rsnpnnl	  entry () options (variable);
+declare  log_create_$new_segment entry (ptr, ptr, fixed bin (35));
+declare  log_list_history_$single_dir entry (char (*), char (*), ptr, fixed bin (35));
+declare  log_name_$name	  entry (char (*), fixed bin (71)) returns (char (32));
+declare  log_segment_$initialize_sequence entry (ptr, fixed bin (35), fixed bin (35));
+declare  log_segment_$place_in_service entry (ptr, fixed bin (35));
+declare  pathname_		  entry (char (*), char (*)) returns (char (168));
+declare  terminate_file_	  entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+declare  timer_manager_$sleep	  entry (fixed bin (71), bit (2));
+declare  unique_bits_	  entry () returns (bit (70));
+declare  unique_chars_	  entry (bit (*)) returns (char (15));
+
+
+/* Misc */
+
+declare  NUM_GOOD_HIST_DESIRED  fixed bin init (5) internal static options (constant);
+declare  ONE_SECOND		  fixed bin (71) init (1000000) internal static options (constant);
+declare  RELATIVE_MICROSECONDS  bit (2) init ("10"b) internal static options (constant);
+
+declare  any_other		  condition;
+declare  cleanup		  condition;
+declare  no_write_permission	  condition;
+declare  seg_fault_error	  condition;
+
+declare  abs		  builtin;
+declare  addr		  builtin;
+declare  clock		  builtin;
+declare  length		  builtin;
+declare  null		  builtin;
+declare  rtrim		  builtin;
+declare  size		  builtin;
+declare  substr		  builtin;
+%page;
+
+/* MAIN CODE */
+
+/* Here's the plan:
+
+   Somehow log_write_ has failed to open the log, or we're being called just to
+   check up on things.  We will deal only with the log segments in the primary
+   log directory.  We won't try going off to other directories in search of older
+   family members.
+
+   The first step will be to get a list of the history logs in the directory
+   (i.e.  those with the name LOGNAME.??????.????).  This list will be used to
+   look at the last few segments or back to salvage_args.from_time.  Each seg
+   will be initiated and its header inspected.  Any errors will be reported.  The
+   log_read_data structure will be used to keep track of those found "good" (the
+   "ptr" element will be set non-null).
+
+   The next step will be to check the good history segments for consistant
+   sequence numbers.  Any inconsistancies will be reported (a future enhancement
+   will be to automatically adjust the sequence numbers).
+
+   Finally, the current log segment "LOG_NAME" will be checked.  If we're
+   supposed to migrate segments to this log, this segment should not exist.
+   Otherwise, we have to make sure the segment is there and usable.  If there's
+   some problem the segment will be renamed to "LOG_NAME.!(unique)" and a new one
+   created.  Some checks are made to ensure the sequence numbers are consistant
+   between the current log segment and the history.
+*/
+
+/* Setup. */
+
+	error_found = "0"b;				/* this will get set if we find a proble, */
+	fix_applied = "0"b;				/* this will get set if we change something */
+
+	log_read_data_ptr = null ();
+	history_log_ptr = null ();
+	oldest_hist_log_idx = 0;
+	newest_hist_log_idx = 0;
+	current_log_ptr = null ();
+	renamed_damaged_log = "0"b;
+
+	/*** copy args */
+	log_dname = P_log_dname;
+	log_ename = P_log_ename;
+	log_salvage_arg_ptr = P_salvage_arg_ptr;
+	auto_log_salvage_arg = log_salvage_arg;
+	log_salvage_arg_ptr = addr (auto_log_salvage_arg);
+
+	if log_salvage_arg.version ^= LOG_SALVAGE_ARG_VERSION_1
+	then call Finished (error_table_$unimplemented_version);
+
+	if log_salvage_arg.from_time ^= 0
+	then if log_salvage_arg.from_time > clock ()
+		| log_salvage_arg.from_time < sys_info$first_reasonable_time
+	     then call Finished (error_table_$bad_arg);
+
+	on cleanup call Cleanup;
+
+
+/* Get a list of the history segments (in the primary log directory) for this
+   log. */
+
+	call log_list_history_$single_dir (log_dname, log_ename, log_read_data_ptr, code);
+	if code = error_table_$nomatch
+	then goto SKIP_HISTORY;
+	if code ^= 0 then do;
+	     call Report_Error (code, "Unable to list ""^a"" log segments in ^a.", log_ename, log_dname);
+	     call Finished (code);
+	end;
+
+
+/* Here we'll initiate the latest log history segments (excluding the damaged
+   ones).  The number of segments to initiate is determined by
+   log_salvage_arg.from_time (but at least one).  If zero, then we'll initiate
+   the last NUM_GOOD_HIST_DESIRED segments. */
+
+	n_good_hist_segs = 0;
+	done = "0"b;
+	do i = 1 to log_read_data.n_segments while (^done);
+	     call Initiate_History_Segment_and_Check (i); /* will remove damaged ones from list */
+	     if log_read_data.segments (i).ptr ^= null () /* will be null if seg is damaged in some way */
+	     then do;
+		n_good_hist_segs = n_good_hist_segs + 1;
+		if n_good_hist_segs = 1		/* first one? */
+		then newest_hist_log_idx = i;		/* remember it */
+		oldest_hist_log_idx = i;		/* and the  last one */
+	     end;
+	     if log_salvage_arg.from_time > 0
+	     then done = (log_read_data.segments (i).suffix_time <= log_salvage_arg.from_time);
+	     else done = n_good_hist_segs >= NUM_GOOD_HIST_DESIRED;
+	end;
+	if n_good_hist_segs = 0 then goto SKIP_HISTORY;
+
+
+/* At this point newest_hist_log_idx and oldest_hist_log_idx define the range
+   of log segments we're interested in investigating further.  There may be some
+   in-between that are damaged, so we have to be careful to make sure we have the
+   pointer.  */
+
+/* We'll check their sequence numbers to make sure they agree with the time
+   stamps on the segment names (i.e.  they must be ascending).  */
+
+	sequence_problem_detected = "0"b;
+	next_older_log_ptr = log_read_data.segments (oldest_hist_log_idx).ptr;
+	next_older_log_idx = oldest_hist_log_idx;
+	do i = (oldest_hist_log_idx - 1) to newest_hist_log_idx by -1;
+	     log_segment_ptr = log_read_data.segments (i).ptr;
+	     if log_segment_ptr ^= null ()
+	     then do;
+		if log_segment.first_sequence <= next_older_log_ptr -> log_segment.last_sequence then do;
+		     call Report_Error (0, "Sequence conflict in ""^a"" with ""^a"".",
+			log_read_data.segments (i).ename, log_read_data.segments (next_older_log_idx).ename);
+		     sequence_problem_detected = "1"b;
+		end;
+		next_older_log_ptr = log_segment_ptr;
+		next_older_log_idx = i;
+	     end;
+	end;
+
+
+	/*** The following is for future implementation; right now we'll have only the
+	     error messages, no fixes.
+
+	     if log_salvage_arg.flags.adjust_history_sequence & sequence_problem_detected
+	     then call Fix_History_Sequence;
+	*/
+
+
+/* OK, checking of the log history is done.  Now we deal with the current log
+   segment.  */
+
+SKIP_HISTORY:
+	call initiate_file_ (log_dname, log_ename, RW_ACCESS, current_log_ptr, bit_count, code);
+	if code = error_table_$noentry then do;
+	     if ^log_salvage_arg.flags.migrating
+	     then do;
+		call Create_New_Log_Seg (null ());	/* create a new one for 'em */
+		call Finished (0);
+	     end;
+	     else call Finished (0);			/* thats how it should be */
+	end;
+	else if code = 0 then do;
+	     if ^log_salvage_arg.flags.migrating
+	     then do;
+		if ^Check_Log_Segment (current_log_ptr, log_ename, "1"b)
+		then do;
+		     call Rename_as_Damaged (log_dname, log_ename);
+		     call Create_New_Log_Seg (current_log_ptr);
+		     call Finished (0);
+		end;
+	     end;
+	     else do;
+		call Report_Error (0, "Found history log without timestamp ""^a"".", log_ename);
+		if ^Check_Log_Segment (current_log_ptr, log_ename, "0"b)
+		then do;
+		     call Rename_as_Damaged (log_dname, log_ename);
+		     call Finished (0);
+		end;
+		else call Rename_for_Last_Message (current_log_ptr, log_ename); /* make it a history log segment */
+	     end;
+	end;
+	else do;					/* totally unexpected code, treat 'em as damaged */
+	     call Report_Error (code, "^a", pathname_ (log_dname, log_ename));
+	     call Rename_as_Damaged (log_dname, log_ename);
+	     if ^log_salvage_arg.flags.migrating
+	     then call Create_New_Log_Seg (null ());
+	     call Finished (0);
+	end;
+
+
+/* We end up here only if a current seg existed.  The last check is
+   to make sure the sequence succeeds the most recent history
+   segment.  */
+
+	if n_good_hist_segs = 0			/* but not if there was no history... */
+	then call Finished (0);
+
+	history_log_ptr = log_read_data.segments (newest_hist_log_idx).ptr;
+	if history_log_ptr ^= null ()			/* do we have at least one history seg? */
+	then do;
+	     if current_log_ptr -> log_segment.first_sequence ^= 0
+	     then first_sequence_temp = current_log_ptr -> log_segment.first_sequence;
+	     else do;
+						/* get first sequence number from the alloc info */
+		sequence_info_ptr = addr (current_log_ptr -> log_segment.alloc_info);
+		first_sequence_temp = sequence_info.number;
+	     end;
+	     if first_sequence_temp <= history_log_ptr -> log_segment.last_sequence
+	     then do;
+		call Report_Error (0, "Sequence conflict in ""^a"" with ""^a"".",
+		     log_ename, log_read_data.segments (newest_hist_log_idx).ename);
+		call Rename_as_Damaged (log_dname, log_ename);
+		if ^log_salvage_arg.migrating
+		then call Create_New_Log_Seg (current_log_ptr);
+		call Finished (0);
+	     end;
+	end;
+	else do;
+	     /*** We don't have any log history ptr, but we still want to
+		make sure the sequence numbers seem appropriate.  Thus,
+		if there was any history segment (damaged or inaccessable)
+		we'll make sure the present log does not start at the
+		beginning of the sequence.  log_segment_ starts all logs
+		at 1000000 (1 million), if this one starts there, and
+		there are history segs, the sequence was restarted somehow.
+		Unfortunately, there's no way to determine what the real
+		sequence numbers should be.  ***/
+	     if log_read_data.n_segments > 0 & log_segment.first_sequence < 1000001
+	     then do;
+		call Report_Error (0, "Sequence was restarted.");
+		call Finished (0);
+	     end;
+	end;
+
+	call Finished (0);
+%page;
+
+/* *
+   *	FINISHED
+   *
+   *	This is the exit procedure.  The cleanup procedure is called, and
+   *	a little editing is done on the returned code.  We want to be sure
+   *	to return 0 if we didn't encounter a fatal error AND we actually
+   *	were of some help.  If there was nothing we could do, we return
+   *	error_table_$action_not_performed.  This tell's our caller that
+   *	it is useless to retry the log_write_$open operation.
+   *
+*/
+
+Finished:
+     procedure (P_code);
+
+declare  P_code		  fixed bin (35) parameter;
+
+	call Cleanup;
+
+	if fix_applied
+	then P_salv_code = P_code;
+	else if P_code = 0
+	then P_salv_code = error_table_$action_not_performed;
+	else P_salv_code = P_code;
+
+	goto MAIN_RETURN;
+
+     end Finished;
+
+MAIN_RETURN:
+	return;
+%page;
+
+/* *
+   *	CLEANUP
+   *
+   *	Terminate any initiated segs, and free allocated storage.
+   *
+*/
+
+Cleanup:
+     procedure;
+
+declare  p		  pointer;		/* local scratch pointer */
+
+	if log_read_data_ptr ^= null
+	then do;
+	     do i = 1 to log_read_data.n_segments;
+		if log_read_data.segments (i).ptr ^= null ()
+		then do;
+		     p = log_read_data.segments (i).ptr;
+		     log_read_data.segments (i).ptr = null ();
+		     call terminate_file_ (p, 0, TERM_FILE_TERM, (0));
+		end;
+	     end;
+	     free log_read_data;
+	     log_read_data_ptr = null ();
+	end;
+
+	if current_log_ptr ^= null ()
+	then do;
+	     p = current_log_ptr;
+	     current_log_ptr = null ();
+	     call terminate_file_ (p, 0, TERM_FILE_TERM, (0));
+	end;
+
+     end Cleanup;
+%page;
+
+/* *
+   *	REPORT_ERROR
+   *	REPORT_FIX
+   *
+   *	This routine is called whenever there is anything to say.  The
+   *	reporter procedure specified in log_salvage_arg is used to
+   *	print (or whatever pleases it) the message.
+   *
+   *	Also, this is where flags are set indicating whether any errors
+   *	were detected, and whether any fixes were applied.
+   *
+*/
+
+Report_Error:
+     procedure options (variable);
+
+declare  arg_code		  fixed bin (35) based (argp);
+declare  argl		  fixed bin (21);		/* ignored */
+declare  argp		  pointer;
+
+declare  ecode		  fixed bin (35);
+declare  ignore_short_mess	  char (8) aligned;		/* ignored */
+declare  long_mess		  char (100) aligned;	/* expanded status code */
+
+declare  msg		  char (msg_len) based (msg_ptr);
+declare  msg_buff		  char (512);
+declare  msg_len		  fixed bin (21);
+declare  msg_ptr		  pointer;
+
+declare  complete_msg	  char (complete_msg_len) based (complete_msg_ptr);
+declare  complete_msg_buff	  char (614);		/* 102 chars bigger than msg_buff */
+declare  complete_msg_len	  fixed bin (21);
+declare  complete_msg_ptr	  pointer;
+
+	error_found = "1"b;				/* so we remember we found some anomaly */
+	goto REPORT_COMMON;
+
+Report_Fix:
+     entry options (variable);
+
+	fix_applied = "1"b;				/* so we remember we did something */
+
+REPORT_COMMON:
+
+	call cu_$arg_ptr (1, argp, argl, ecode);	/* get arg_code */
+	if ecode ^= 0
+	then call Finished (ecode);
+
+	ecode = arg_code;				/* copy our arg */
+
+	/*** first format the message passed to us */
+	msg_ptr = addr (msg_buff);
+	msg_len = size (msg_buff);
+	call formline_ (2, 3, addr (msg_buff), msg_len, 0 /* no pad */);
+
+	/*** second, expand the error code */
+	if ecode ^= 0
+	then do;
+	     call convert_status_code_ (ecode, ignore_short_mess, long_mess);
+	     complete_msg_ptr = addr (complete_msg_buff);
+	     complete_msg_len = length (complete_msg_buff);
+	     call ioa_$rsnpnnl ("^a  ^a", complete_msg_buff, complete_msg_len, long_mess, msg);
+	end;
+	else do;
+	     /*** This is all we have... */
+	     complete_msg_ptr = msg_ptr;
+	     complete_msg_len = msg_len;
+	end;
+
+	/*** finally, call the reporting procedure.
+	     This procedure will be responsible for adding the frosting on
+	     the messages (i.e. name of procedure generating the message,
+	     pathname of log we're salvaging, process group id, etc). */
+
+	on any_other call Finished (error_table_$unexpected_condition);
+	call log_salvage_arg.reporter_proc (complete_msg);
+
+	return;
+
+     end Report_Error;
+%page;
+
+/* *
+   *	INITIATE_HISTORY_SEGMENT_AND_CHECK
+   *
+   *	This routine initiates a log history segment.  The first attempt is
+   *	made requesting RW access.  If that fails, a second attempt is made
+   *	requesting only R access.  Having only R access becomes a problem
+   *	only if the service bit will need to be turned off (and, in the
+   *	future, if the sequence numbers need adjustment).  Any code in
+   *	log_salvage_ which tries to modify a history segment must be
+   *	prepared to take an access violation fault.
+   *
+*/
+
+Initiate_History_Segment_and_Check:
+     procedure (P_log_idx);
+
+declare  P_log_idx		  fixed bin;		/* index into log_read_data */
+
+declare  log_idx		  fixed bin;
+
+declare  ecode		  fixed bin (35);
+declare  log_ptr		  pointer;
+
+	log_idx = P_log_idx;
+	call initiate_file_ (log_dname, log_read_data.segments (log_idx).ename, RW_ACCESS, log_ptr, bit_count, ecode);
+	if ecode = error_table_$no_w_permission
+	then do;
+	     /*** We'll try it with just read access, the rest of
+		this routine can deal with access violation faults. */
+	     call initiate_file_ (log_dname, log_read_data.segments (log_idx).ename, R_ACCESS, log_ptr, bit_count, ecode);
+
+	     if ecode = 0				/* report an error in either case */
+	     then call Report_Error (error_table_$no_w_permission, "^a", log_read_data.segments (log_idx).ename);
+	     else call Report_Error (ecode, "^a", log_read_data.segments (log_idx).ename);
+	end;
+
+	if ^Check_Log_Segment (log_ptr, log_read_data.segments (log_idx).ename, "0"b)
+	then log_ptr = null ();			/* don't want to use this guy */
+
+	log_read_data.segments (log_idx).ptr = log_ptr;	/* it may still be null */
+
+	return;
+
+     end Initiate_History_Segment_and_Check;
+%page;
+
+/* *
+   *	CHECK_LOG_SEGMENT
+   *
+   *	This routine checks consistancy within a single log segment.
+   *	Sequence numbers and times in the header must be consistant
+   *	in respect to one another.  The service bit must be off for
+   *	history segs, on for the live seg (it is adjusted if necessary).
+   *	Also, the first message sentinel is checked.
+   *
+*/
+
+Check_Log_Segment:
+     procedure (P_log_ptr, P_log_name, P_current_log) returns (bit (1) aligned);
+
+declare  P_log_ptr		  pointer parameter;
+declare  P_log_name		  char (32) parameter;
+declare  P_current_log	  bit (1) aligned parameter;
+
+declare  lp		  pointer;
+declare  lname		  char (32);
+declare  current_log	  bit (1) aligned;
+
+
+	lp = P_log_ptr;
+	lname = P_log_name;
+	current_log = P_current_log;
+
+	on seg_fault_error begin;			/* watch out for damaged segs */
+	     call Report_Error (0, "Seg Fault Error while checking ^a.  Segment may be damaged.", lname);
+	     goto CHECK_LOG_SEG_EXIT;
+	end;
+
+	on any_other begin;
+	     call Report_Error (0, "Unexpected condition encountered while checking log segment ^a.", lname);
+	     goto CHECK_LOG_SEG_EXIT;
+	end;
+
+	if lp -> log_segment.version = LOG_SEGMENT_VERSION_1
+	then if lp -> log_segment.time_created > sys_info$first_reasonable_time
+		& lp -> log_segment.time_created <= clock ()
+	     then if lp -> log_segment.first_sequence <= lp -> log_segment.last_sequence
+		     & (lp -> log_segment.first_sequence >= 1000000 | lp -> log_segment.first_sequence = 0)
+		then if lp -> log_segment.first_time <= lp -> log_segment.last_time
+			& lp -> log_segment.last_time <= clock ()
+		     then return (Check_Alloc_Info_and_Messages ());
+
+	call Report_Error (0, "Internal header problem in seg ^a.", lname);
+CHECK_LOG_SEG_EXIT:
+	return ("0"b);
+
+
+
+Check_Alloc_Info_and_Messages:
+	procedure () returns (bit (1) aligned);
+
+declare  flip_service_bit	  bit (1) aligned;
+declare  service_bit	  bit (1) aligned;
+
+
+	     flip_service_bit = "0"b;
+	     sequence_info_ptr = addr (lp -> log_segment.alloc_info);
+	     service_bit = sequence_info.in_service;	/* compiler will have an easier time with it here */
+
+	     if current_log & ^service_bit		/* checking current seg? */
+	     then do;
+		call Report_Error (0, "Current log ^a found out of service.", lname);
+		flip_service_bit = "1"b;		/* will fix it if nothing else wrong */
+	     end;
+
+	     if ^current_log & service_bit		/* checking history seg? */
+	     then do;
+		call Report_Error (0, "History log ^a found in service.", lname);
+		flip_service_bit = "1"b;		/* will fix it if nothing else wrong */
+	     end;
+
+
+	     if abs (sequence_info.number - lp -> log_segment.last_sequence) > 3 & lp -> log_segment.first_sequence > 0
+	     then do;
+		call Report_Error (0, "Last sequence and ""real"" sequence disagree in ^a.", lname);
+		goto return_failure;
+	     end;
+
+	     if sequence_info.words_used > lp -> log_segment.max_size
+	     then do;
+		call Report_Error (0, "Words used inconsistant with max size in ^a.", lname);
+		goto return_failure;
+	     end;
+
+
+
+/* Check the first message. */
+
+	     if lp -> log_segment.first_sequence = 0	/* but not if there's none there */
+	     then goto return_success;
+
+	     log_message_ptr = addr (lp -> log_segment.data); /* get to first message */
+	     if log_message.sentinel ^= LOG_SEGMENT_NEW_MESSAGE
+		& log_message.sentinel ^= LOG_SEGMENT_COMPLETE_MESSAGE
+	     then do;
+		call Report_Error (0, "First message invalid in ^a.", lname);
+		goto return_failure;
+	     end;
+
+
+/* We might consider going through all the messages, but it seems a waste.  If
+   the first one is there intact, log_position_ will be able to handle any other
+   problem.  */
+
+
+return_success:
+	     if flip_service_bit
+	     then do;
+		on no_write_permission goto return_failure; /* may happen here */
+		sequence_info.in_service = ^service_bit;
+		revert no_write_permission;
+		call Report_Fix (0, "Service bit set ^[on^;off^] in ^a.", ^service_bit, lname);
+	     end;
+	     return ("1"b);
+
+return_failure:
+	     return ("0"b);
+
+	end Check_Alloc_Info_and_Messages;
+
+     end Check_Log_Segment;
+%page;
+
+/* *
+   *	CREATE_NEW_LOG_SEGMENT
+   *
+   *	This routine is invoked if there is no live log segment, or if
+   *	the live log segment has internal damages.  If the immediately
+   *	previous history segment is available, the sequence numbers
+   *	in the new segment may be set correctly.  However, if there
+   *	is no history, or it is damaged, an estimated sequence number
+   *	is calculated.
+   *
+   *	If some history segment is available, the access list and other
+   *	file system attributes are copied from that history segment to
+   *	the newly created segment.
+   *
+*/
+
+Create_New_Log_Seg:
+     procedure (P_old_log_ptr);
+
+declare  P_old_log_ptr	  pointer parameter;
+
+declare  old_logp		  pointer;
+
+declare  acl_ptr		  pointer;
+declare  acl_count		  fixed bin;
+declare  code		  fixed bin (35);
+declare  hist_log_name	  char (32);
+declare  max_len		  fixed bin (19);
+declare  n_logs_unseen	  fixed bin;
+declare  new_log_ptr	  pointer;
+declare  new_sequence	  fixed bin (35);
+declare  system_area	  area based (system_area_ptr);
+declare  system_area_ptr	  pointer;
+
+declare  1 auto_log_segment_info aligned like log_segment_info;
+declare  1 status		  aligned like status_branch;
+declare  1 sfb		  aligned like status_for_backup;
+
+
+	system_area_ptr = null ();
+	acl_ptr = null ();
+	acl_count = 0;
+	old_logp = P_old_log_ptr;
+
+	on cleanup call create_new_log_seg_cleanup ();
+	on any_other begin;
+	     call Report_Error (0, "Unexpected error while creating new log segment.");
+	     goto CREATE_NEW_LOG_SEG_EXIT;
+	end;
+
+/* This procedure mimicks the way log_write_ would create a new log segment.
+   That is, it attempts to set up the sequence such that it follows the history.
+   However, in this case the most recent history segment may not be available.
+   In that case we'll estimate what the next sequence number should be based upon
+   the number of history logs we can't see.  */
+
+	if log_read_data.n_segments = 0
+	then new_sequence = 1000000;			/* start it a a million */
+	else do;
+	     if n_good_hist_segs = 0
+	     then n_logs_unseen = log_read_data.n_segments; /* account for its possible sequence numbers */
+	     else n_logs_unseen = newest_hist_log_idx - 1;/* account for sequence
+						   numbers of history logs we can't look at */
+	     if renamed_damaged_log			/* was current log damaged? */
+	     then n_logs_unseen = n_logs_unseen + 1;	/* account for its sequence numbers too */
+
+	     if n_good_hist_segs = 0
+	     then					/* new sequence is based on number of logs in history */
+		new_sequence = 1000000 + (n_logs_unseen * 100000) + 1;
+	     else					/* new sequence is based on number of history logs we can't
+						   see and the last sequence number we can see. */
+		new_sequence = log_read_data.segments (newest_hist_log_idx).ptr ->
+		     log_segment.last_sequence + (n_logs_unseen * 100000) + 1;
+	end;
+
+	/*** set up default info about the new segment */
+	log_segment_info_ptr = addr (auto_log_segment_info);
+	log_segment_info.dname = log_dname;
+	log_segment_info.ename = log_ename;
+	log_segment_info.acl_ptr = null ();
+	log_segment_info.acl_count = 0;
+	log_segment_info.rings (*) = cu_$level_get ();
+	log_segment_info.max_length = log_data_$default_log_size;
+	log_segment_info.access_class = get_process_access_class_ ();
+	log_segment_info.multi_class = "0"b;
+	log_segment_info.effective_mode = RW_ACCESS;
+
+	/*** we may be able to get more precise info */
+	if newest_hist_log_idx ^= 0
+	then do;
+	     hist_log_name = log_read_data.segments (newest_hist_log_idx).ename;
+	     sfb.version = status_for_backup_version_2;
+	     call hcs_$status_for_backup (log_dname, hist_log_name, addr (sfb), code);
+	     if code = 0
+	     then do;
+		log_segment_info.multi_class = sfb.multiple_class;
+		log_segment_info.access_class = sfb.access_class;
+	     end;
+
+	     call hcs_$status_long (log_dname, hist_log_name, 1, addr (status), null (), code);
+	     if code = 0
+	     then do;
+		log_segment_info.effective_mode = substr (status.mode, 2, 3);
+		log_segment_info.rings (*) = status.ring_brackets (*);
+	     end;
+
+	     system_area_ptr = get_system_free_area_ ();
+	     call hcs_$list_acl (log_dname, hist_log_name, system_area_ptr, acl_ptr, null (), acl_count, code);
+	     if code = 0
+	     then do;
+		log_segment_info.acl_ptr = acl_ptr;
+		log_segment_info.acl_count = acl_count;
+	     end;
+
+	     call hcs_$get_max_length_seg (log_read_data.segments (newest_hist_log_idx).ptr, max_len, code);
+	     if code = 0
+	     then do;
+		log_segment_info.max_length = max_len;
+	     end;
+	end;
+
+	new_log_ptr = null ();
+	call log_create_$new_segment (log_segment_info_ptr, new_log_ptr, code);
+	if code ^= 0
+	then do;
+	     call Report_Error (code, "Unable to create new log segment.");
+	     call Finished (code);
+	end;
+	else do;
+	     call Report_Fix (0, "Created new log segment.");
+	     call log_segment_$initialize_sequence (new_log_ptr, new_sequence, code);
+	     if code ^= 0
+	     then call Report_Error (code, "Error initializing sequence in new log segment.");
+	     call log_segment_$place_in_service (new_log_ptr, code);
+	     if code ^= 0
+	     then call Report_Error (code, "Error placing new log segment in service.");
+	     call terminate_file_ (old_logp, 0, TERM_FILE_TERM, code);
+	     if code ^= 0
+	     then call Report_Error (code, "Error terminating old log pointer.");
+	     P_old_log_ptr = new_log_ptr;		/* change caller's pointer */
+	end;
+
+CREATE_NEW_LOG_SEG_EXIT:
+	call create_new_log_seg_cleanup ();
+
+	return;
+
+create_new_log_seg_cleanup:
+	procedure;
+
+declare  based_word		  bit (36) based;
+
+	     if acl_ptr ^= null ()
+	     then do;
+		/*** The runtime support for areas will know how
+		     much to actually free. ***/
+		free acl_ptr -> based_word in (system_area);
+	     end;
+
+	end create_new_log_seg_cleanup;
+
+     end Create_New_Log_Seg;
+%page;
+
+/* *
+   *	RENAME_AS_DAMAGED
+   *
+   *	This routine is invoked when the live log segment is found to
+   *	have internal inconsistancies or cannot be initiated.  It changes
+   *	the name to LOG_NAME.!(unique).  It happens that a unique character
+   *	string and the standard timestamp suffix ("YYYYMMDD.HHMMSS") are the
+   *	same length.  Thus, we need not worry about truncation of the name
+   *	and namedup errors.
+   *
+*/
+
+Rename_as_Damaged:
+     procedure (P_log_dir, P_log_name);
+
+declare  P_log_name		  char (32) parameter;
+declare  P_log_dir		  char (168) parameter;
+
+declare  lname		  char (32);
+declare  ldir		  char (168);
+
+declare  new_name		  char (32);
+declare  code		  fixed bin (35);
+
+	lname = P_log_name;
+	ldir = P_log_dir;
+	new_name = rtrim (P_log_name) || "." || unique_chars_ (unique_bits_ ());
+	call hcs_$chname_file (ldir, lname, lname, new_name, code);
+	if code = 0
+	then do;
+	     renamed_damaged_log = "1"b;
+	     call Report_Fix (0, "Changed name of damaged log segment ^a to ^a.", lname, new_name);
+	end;
+	else call Report_Error (code, "Unable to change name of damaged log segment ^a to ^a.", lname, new_name);
+
+	return;
+
+     end Rename_as_Damaged;
+%page;
+
+/* *
+   *	RENAME_FOR_LAST_MESSAGE
+   *
+   *	This routine is invoked when a live log segment is found in a
+   *	directory to which we are trying to perform a log migratation.
+   *	It places the standard timestamp suffix on the name of the log.
+   *
+*/
+
+Rename_for_Last_Message:
+     procedure (P_log_ptr, P_log_name);
+
+declare  P_log_name		  char (32) parameter;
+declare  P_log_ptr		  pointer parameter;
+
+declare  lname		  char (32);
+declare  log_ptr		  pointer;
+
+declare  name_time		  fixed bin (71);
+declare  new_name		  char (32);
+declare  code		  fixed bin (35);
+declare  i		  fixed bin;
+
+	lname = P_log_name;
+	log_ptr = P_log_ptr;
+
+	if log_ptr -> log_segment.last_time = 0
+	then name_time = clock ();
+	else name_time = log_ptr -> log_segment.last_time;
+
+	do i = 1 to 10;
+	     new_name = log_name_$name (lname, name_time);
+
+	     call hcs_$chname_seg (log_ptr, lname, new_name, code);
+	     if code = error_table_$namedup
+	     then do;
+		name_time = name_time + ONE_SECOND;
+		if name_time > clock ()
+		then call timer_manager_$sleep (ONE_SECOND, RELATIVE_MICROSECONDS);
+	     end;
+	     else if code = 0
+	     then do;
+		call Report_Fix (0, "Renamed log segment ^a to ^a.", lname, new_name);
+		return;
+	     end;
+	     else goto CANNOT_RENAME;			/* unexpected code */
+	end;
+
+CANNOT_RENAME:
+	call Report_Error (code, "Unable to rename log segment ^a to ^a.", lname, new_name);
+
+	return;
+
+     end Rename_for_Last_Message;
+
+/* format: off */
+%page; %include log_salvage_arg;
+%page; %include log_segment;
+%page; %include log_message;
+%page; %include log_read_data;
+%page; %include log_write_data;
+%page; %include access_mode_values;
+%page; %include terminate_file;
+%page; %include status_structures;
+%page; %include status_for_backup;
+%page; %include syserr_constants;
+
+     end log_salvage_;

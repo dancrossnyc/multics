@@ -1,0 +1,198 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+/* HARDWARE_FAULT - Handle Faults Caused by Hardware Malfeasance.
+   Modified from the program "parity_fault" 8/12/76 by Noel I. Morris
+   Modified 9/10/79 by J. A. Bush for cache parity diagnostic
+   Modified 29/08/80 by J. A. Bush for DPS8/70M CPU
+   Modified 84-05-04 by Keith Loepere to work during initialization.
+   Modified 85-02-25 by Keith Loepere to use ring zero get_pathname_.
+   Modified 85-02-25 by EJ Sharpe to use syserr_fault_msg.incl.pl1
+*/
+
+
+/* This module is called by the FIM to handle several types of faults.
+   These are as follows:
+
+   parity
+   op-not-complete
+   shutdown
+   startup
+
+   Each of these faults causes certain information to be logged
+   in the syserr log.
+
+   USAGE:
+   call hardware_fault (mcptr);
+
+   WHERE:
+   mcptr	= pointer to stored machine conditions
+
+*/
+
+hardware_fault: proc (mcp);
+
+dcl  fault_name char (32) aligned,			/* name of fault */
+     psrptr ptr,					/* pointer to faulting procedure */
+     psrname char (168) var,				/* full pathname of faulting procedure */
+     fault_index fixed bin (17),			/* SCT index of fault */
+     (base, top, i, j) fixed bin (18),
+     first_word fixed bin (35) aligned based,
+     code fixed bin (35);				/* error code */
+
+dcl  1 mmdam_struct aligned like mmdam_msg;
+
+dcl  (addr, baseptr, bin, segno, substr, unspec) builtin;
+
+dcl  pds$process_group_id char (32) aligned ext;
+dcl  sys_info$initialization_state fixed bin ext;
+
+dcl  syserr$binary entry options (variable),
+     pmut$check_parity_for_use entry (fixed bin (18), fixed bin (35)),
+     pc_abs$remove_core entry (fixed bin (18), fixed bin, fixed bin (35)),
+     cache_tester entry (ptr),
+     get_pathname_ entry (fixed bin (17), char (*) var, fixed bin (35));
+
+dcl  sys_info$page_size fixed bin (18) external static;
+dcl  sst$cmp pointer external;
+%page;
+
+	fault_index = bin (mc.fcode, 17);		/* Extract fault index */
+
+	if fault_index = parity_sct_index then do;	/* If parity fault ... */
+	     fregp = addr (mc.fault_reg);		/* Look at the fault register. */
+	     if fault_reg.cpar_dir then		/* Check for cache parity. */
+		fault_name = "cache dir parity";
+	     else if fault_reg.cpar_str then
+		fault_name = "cache store parity";
+	     else if fault_reg.cpar_ia then
+		fault_name = "cache store cycle illegal action";
+	     else if fault_reg.cpar_blk then
+		fault_name = "cache load parity";
+	     else					/* If not cache parity ... */
+		fault_name = "parity";
+	end;
+
+	else if fault_index = startup_sct_index then	/* If startup fault ... */
+	     fault_name = "startup";
+
+	else if fault_index = shutdown_sct_index then	/* If shutdown fault ... */
+	     fault_name = "shutdown";
+
+	else if fault_index = op_not_complete_sct_index then /* If op_not_complete fault ... */
+	     fault_name = "op_not_complete";
+
+	else if fault_index = other_command_sct_index then/* If command fault ... */
+	     fault_name = "command";
+
+	scup = addr (mc.scu);			/* Get pointer to SCU data. */
+
+	psrptr = baseptr (bin (scu.ppr.psr, 15));	/* Get pointer to faulting procedure. */
+	if sys_info$initialization_state < 2 then psrname = "";
+	else do;
+	     call get_pathname_ (segno (psrptr), psrname, code); /* Attempt to get path and name of faulting proc. */
+	     if code ^= 0 then psrname = "";
+
+	end;
+
+	call syserr$binary (ANNOUNCE, mcp, SB_hw_fault, SBL_hw_fault, "hardware_fault: ^a fault on CPU ^a by ^a^a.",
+	     fault_name, substr ("ABCDEFGH", bin (scu.cpu_no, 3) + 1, 1),
+	     pds$process_group_id, psrname);
+
+	mc.errcode = 1;				/* Set an error code for the FIM. */
+
+/* if a cache parity occurred, test cache and attempt diagnosis before turning */
+/* cache back on. the routine cache_tester does all the work */
+
+	if fault_index = parity_sct_index & (fault_reg.cpar_dir | fault_reg.cpar_str) then
+	     call cache_tester (mcp);			/* go check out cache */
+
+/* Special handling for memory parity fault. SCU data imprecise on where error is: so we scan all memory */
+/* Check all parity cases of note */
+
+	else if fault_index = parity_sct_index then do;
+	     do i = 0 to 7;
+		base = scs$controller_data (i).base;
+		top = base + scs$controller_data (i).size;
+		if scs$controller_data (i).online then do;
+		     do j = base to top - 1;
+			cmep = addr (sst$cmp -> cma (j));
+			if unspec (cmep -> first_word) ^= (36)"1"b then do; /* skip deleted */
+			     if cmep -> first_word ^= 0 | cme.ptwp then do; /* pageable? */
+				call pmut$check_parity_for_use (j, code);
+				if code ^= 0 then do;
+				     mmdam_struct.addr = j * sys_info$page_size;
+				     mmdam_struct.ctrltag = substr ("ABCDEFGH", i + 1, 1);
+				     call syserr$binary (BEEP, addr (mmdam_struct), SB_mmdam, SBL_mmdam,
+					"hardware_fault: Deleting frame at ^o from SCU ^a due to parity errors",
+					mmdam_struct.addr, mmdam_struct.ctrltag);
+				     call pc_abs$remove_core (j, 1, code);
+				end;
+			     end;
+			end;
+		     end;
+		end;
+	     end;
+	end;
+
+	return;					/* Return to caller. */
+
+/* format: off */
+%page; %include syserr_constants;
+%page; %include syserr_binary_def;
+%page; %include scs;
+%page; %include cmp;
+%page; %include fault_reg;
+%page; %include mc;
+%page; %include static_handlers;
+%page; %include syserr_fault_msg;/* not actually used, but this'll get it in the xref */
+%page; %include syserr_mmdam_msg;
+%page;
+/*	BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   hardware_fault: FFF fault on CPU CPUTAG by PROCESSNAME.
+
+   S: $info
+
+   T: $run
+
+   M: A fault indicating processor or main memory malfunction has
+   occurred on CPU CPUTAG. FFF is the name of the fault.  Complete
+   binary data about the fault is logged for automatic processing.
+
+   A: Contact Field engineering personnel.
+
+   Message:
+   hardware_fault: Deleting frame at WWW from SCU X due to parity errors
+
+   S:	$beep
+
+   T:	$run
+
+   M:	A parity error was detected at main storage address WWWW.
+   The main memory frame with the error was removed from service via delmain.
+   The user process encountering the parity fault cannot be restarted
+   at the point of error because the processor state is imprecise.
+   If the parity error
+   could have damaged user data, the damaged switch is set
+   on the segment, and the user is given the best
+   version we can come up with for the page.
+
+   A:	Contact Field Engineering personnel.
+   The memory page will remain out of service until
+   added back by addmain.
+
+   END MESSAGE DOCUMENTATION. */
+
+     end;

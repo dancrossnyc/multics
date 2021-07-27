@@ -1,0 +1,678 @@
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1987 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+/* TTY_SPACE_MAN: Entries for managing the ring-0 tty buffer */
+/* Written January 1978 by Larry Johnson to replace tty_free */
+/* Modified 8/25/78 by J. Stern for multiplexing changes */
+/* Modified March 1981 by Robert Coren to add get_perm_space entry */
+/* Modified April 1981 by Robert Coren to add switch_chain entry */
+/* Modified May 19, 1982 by Robert Coren to fix argument-copying bug in switch_chain entry */
+
+/* format: style4,delnl,insnl,^ifthendo */
+
+tty_space_man:
+     proc;
+
+/* Parameters */
+
+dcl  arg_devx fixed bin;				/* Index of lcte */
+dcl  arg_from_devx fixed bin;
+dcl  arg_to_devx fixed bin;
+dcl  arg_size fixed bin;				/* Size of buffer request */
+dcl  arg_output_flag bit (1);				/* On for output buffers */
+dcl  arg_from_type bit (1);				/* On if switching from output */
+dcl  arg_to_type bit (1);				/* On if switching to output */
+dcl  arg_blockp ptr;				/* Pointer to a buffer */
+dcl  arg_count fixed bin;				/* Length of a buffer chain */
+
+/* Automatic */
+
+dcl  output_flag bit (1);				/* Copy of arg_output_flag argument */
+dcl  perm bit (1);					/* on for get_perm_space entry */
+dcl  buffer_size fixed bin;
+dcl  count fixed bin;
+dcl  word_count fixed bin;
+dcl  i fixed bin;
+dcl  prev_blockp ptr;
+dcl  first_blockp ptr;
+dcl  devx fixed bin;				/* Copy of arg_devx */
+dcl  from_devx fixed bin;
+dcl  to_devx fixed bin;
+dcl  from_type bit (1);
+dcl  to_type bit (1);
+dcl  total_freed fixed bin;				/* Amount of space freed during call */
+dcl  wire_mask fixed bin (71);			/* For pmut$wire calls */
+dcl  wire_ptr ptr;					/* This too */
+dcl  enter_time fixed bin (71);			/* clock time at entry (for metering) */
+
+/* External */
+
+dcl  pds$processid bit (36) external;
+
+dcl  caller entry returns (ptr);
+dcl  mcs_trace entry options (variable);
+dcl  pmut$wire_and_mask entry (fixed bin (71), ptr);
+dcl  pmut$unwire_unmask entry (fixed bin (71), ptr);
+dcl  pxss$unique_ring_0_wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+dcl  syserr entry options (variable);
+
+/* Internal static */
+
+dcl  RESERVED_SPACE internal static options (constant) init (256);
+
+/* Builtins */
+
+dcl  (addr, addrel, baseno, bin, bit, clock, divide, mod, null, ptr, rel, stac, stacq, unspec) builtin;
+
+/* Entry to get a single buffer */
+
+get_buffer:
+     entry (arg_devx, arg_size, arg_output_flag, arg_blockp);
+
+	devx = arg_devx;
+	buffer_size = arg_size;
+	output_flag = arg_output_flag;
+	call setup;
+	tty_buf.alloc_calls = tty_buf.alloc_calls + 1;
+
+	call buffer_getter (buffer_size);		/* Allocate the buffer */
+	if blockp ^= null
+	then call update_lcte (buffer_size);		/* Fix wtcb if it worked */
+	call clean_up;
+	arg_blockp = blockp;
+	tty_buf.alloc_time = tty_buf.alloc_time + clock () - enter_time;
+	return;
+
+/* Entry to get a chain of buffers */
+
+get_chain:
+     entry (arg_devx, arg_size, arg_count, arg_output_flag, arg_blockp);
+
+	devx = arg_devx;
+	buffer_size = arg_size;
+	count = arg_count;
+	output_flag = arg_output_flag;
+	call setup;
+	tty_buf.alloc_calls = tty_buf.alloc_calls + 1;
+
+	first_blockp, prev_blockp = null;
+	do i = 1 to count;				/* Allocate number requested */
+	     call buffer_getter (buffer_size);
+	     if blockp = null
+	     then go to get_chain_failed;		/* Ran out of room */
+	     if i = 1
+	     then first_blockp = blockp;		/* Remember pointer to first block */
+	     else prev_blockp -> buffer.next = bin (rel (blockp));
+						/* And thread the rest */
+	     prev_blockp = blockp;
+	end;
+	call update_lcte (count * buffer_size);		/* Charge to device */
+	call clean_up;
+	arg_blockp = first_blockp;			/* Return pointer to first in chain */
+	tty_buf.alloc_time = tty_buf.alloc_time + clock () - enter_time;
+	return;
+
+get_chain_failed:					/* Not enough buffers */
+	blockp = first_blockp;
+	if blockp ^= null
+	then call chain_freer;			/* Release partial chain */
+	call clean_up;
+	arg_blockp = null;
+	tty_buf.alloc_time = tty_buf.alloc_time + clock () - enter_time;
+	return;
+
+/* Entry to free a single buffer */
+
+free_buffer:
+     entry (arg_devx, arg_output_flag, arg_blockp);
+
+	devx = arg_devx;
+	output_flag = arg_output_flag;
+	blockp = arg_blockp;
+	call setup;
+	tty_buf.free_calls = tty_buf.free_calls + 1;
+
+	call buffer_freer;				/* This does the work */
+	call update_lcte (-total_freed);
+	call clean_up;
+	arg_blockp = null;
+	tty_buf.free_time = tty_buf.free_time + clock () - enter_time;
+	return;
+
+/* Entry to free a buffer chain */
+
+free_chain:
+     entry (arg_devx, arg_output_flag, arg_blockp);
+
+	devx = arg_devx;
+	output_flag = arg_output_flag;
+	blockp = arg_blockp;
+	call setup;
+	tty_buf.free_calls = tty_buf.free_calls + 1;
+
+	call chain_freer;				/* This does the work */
+	call update_lcte (-total_freed);
+	call clean_up;
+	arg_blockp = null;
+	tty_buf.free_time = tty_buf.free_time + clock () - enter_time;
+	return;
+
+/* Entry to get space of arbitrary size */
+
+get_space:
+     entry (arg_size, arg_blockp);
+
+	perm = "0"b;
+	go to get_space_join;
+
+/* Entry to get permanent space of arbitrary size (used to allocate LCT); point
+   is to not count it against buffer pool for metering */
+get_perm_space:
+     entry (arg_size, arg_blockp);
+
+	perm = "1"b;
+get_space_join:
+	buffer_size = arg_size + mod (arg_size, 2);
+	call setup;
+	tty_buf.alloc_calls = tty_buf.alloc_calls + 1;
+
+	blockp = space_getter (buffer_size);
+	call clean_up;
+	arg_blockp = blockp;
+	tty_buf.alloc_time = tty_buf.alloc_time + clock () - enter_time;
+	if ^perm
+	then call update_control (buffer_size);
+	return;
+
+/* Entry to free space of arbitrary size */
+
+free_space:
+     entry (arg_size, arg_blockp);
+
+	buffer_size = arg_size + mod (arg_size, 2);	/* Make it even */
+	blockp = arg_blockp;
+	call setup;
+	tty_buf.free_calls = tty_buf.free_calls + 1;
+
+	call space_freer (blockp, buffer_size);
+	call clean_up;
+	arg_blockp = null;
+	tty_buf.free_time = tty_buf.free_time + clock () - enter_time;
+	call update_control (-buffer_size);
+	return;
+
+
+
+/* This entry is called when a process needs an interrupt when buffer space becomes available */
+
+needs_space:
+     entry (arg_devx);
+
+	devx = arg_devx;
+	call setup;
+
+	lctep = addr (lct.lcte_array (devx));
+	lcte.space_needed = "1"b;			/* Remember this process needs an interrupt */
+	tty_buf.space_needed = "1"b;			/* Remember that at least one process needs an interrupt */
+	tty_buf.space_needed_calls = tty_buf.space_needed_calls + 1;
+						/* Leave some evidence */
+	call clean_up;
+	return;
+
+/* Entry to update metering information if a multiplexer changes a chain from input to
+   output (or vice versa) and/or from one channel to another */
+
+switch_chain:
+     entry (arg_from_devx, arg_to_devx, arg_from_type, arg_to_type, arg_blockp);
+
+	from_devx = arg_from_devx;
+	to_devx = arg_to_devx;
+	from_type = arg_from_type;
+	to_type = arg_to_type;
+	blockp = arg_blockp;
+	call setup;
+	word_count = 0;
+	do while (blockp ^= null ());			/* ascertain the length of the chain */
+	     word_count = word_count + 16 * (buffer.size_code + 1);
+	     if buffer.next = 0
+	     then blockp = null ();
+	     else blockp = ptr (ttybp, buffer.next);
+	end;
+
+	devx = from_devx;				/* take it away from old one */
+	output_flag = from_type;
+	call update_lcte (-word_count);
+	devx = to_devx;				/* and give it to new one */
+	output_flag = to_type;
+	call update_lcte (word_count);
+	call clean_up;
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.space_man
+	     then call mcs_trace (from_devx, "switch_chain: ^d words to devx ^o by ^p", word_count, to_devx, caller ());
+
+	return;
+
+/* Procedure to allocate one buffer */
+
+buffer_getter:
+     proc (n);
+
+dcl  n fixed bin;					/* The size */
+
+	if tty_buf.bleft <= RESERVED_SPACE		/* always save some for critical functions */
+	then blockp = null;
+	else do;
+	     blockp = space_getter (n);		/* Get the space */
+	     if blockp = null
+	     then return;				/* Error */
+	     buffer.size_code = divide (n, 16, 17, 0) - 1;
+	end;
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.space_man
+	     then call mcs_trace (devx, "get_buffer: ^d words at ^p by ^p", n, blockp, caller ());
+
+	return;
+     end buffer_getter;
+
+/* Procedure to free a single buffer pointed to by blockp */
+
+buffer_freer:
+     proc;
+
+dcl  n fixed bin;
+
+	n = 16 * (buffer.size_code + 1);
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.space_man
+	     then call mcs_trace (devx, "free_buffer: ^d words at ^p by ^p", n, blockp, caller ());
+
+	call space_freer (blockp, n);
+	total_freed = total_freed + n;
+	return;
+
+     end buffer_freer;
+
+/* Procedure to free a buffer chain */
+
+chain_freer:
+     proc;
+
+dcl  next_rel bit (18);
+
+	if tty_buf.trace.enable
+	then if tty_buf.trace.space_man
+	     then call mcs_trace (devx, "free_chain: at ^p by ^p", blockp, caller ());
+
+	next_rel = rel (blockp);			/* Start non-zero */
+	do while (next_rel);			/* Loop to end of chain */
+	     next_rel = bit (bin (buffer.next, 18), 18);	/* Hold foward pointer */
+	     call buffer_freer;
+	     blockp = ptr (ttybp, next_rel);
+	end;
+	blockp = null;
+	return;
+
+     end chain_freer;
+
+/* Procedure to find a block of any size. It is extracted from the smallest free block which can hold it */
+
+space_getter:
+     proc (n) returns (ptr);
+
+dcl  n fixed bin;					/* The size in words */
+
+dcl  best_blockp ptr init (null);			/* Ptr to smallest free block large enough for request */
+dcl  best_block_size fixed bin init (0);		/* Size of that block */
+dcl  prev_best_blockp ptr init (null);			/* Block before best_blockp -> free_block */
+dcl  prev_blockp ptr init (null);			/* Block before current block during scan */
+dcl  next_rel bit (18);				/* For updating threading */
+dcl  p ptr;
+dcl  free_space (n) bit (36) aligned based (free_blockp);	/* The space finially allocated */
+dcl  nsteps fixed bin init (0);			/* Number of steps in free chain */
+
+	do free_blockp = ptr (ttybp, tty_buf.free) repeat (ptr (ttybp, free_block.next)) while (rel (free_blockp));
+						/* Check each free block */
+	     nsteps = nsteps + 1;
+	     if free_block.size = n
+	     then do;				/* Found block just right */
+		next_rel = free_block.next;		/* Will unthread whole block */
+		go to fit_found;
+	     end;
+	     if free_block.size > n
+	     then do;				/* This block is large enough */
+		if (best_block_size = 0) | (free_block.size < best_block_size)
+		then do;				/* If either the first block, or a better one */
+		     best_blockp = free_blockp;	/* Remember this block */
+		     best_block_size = free_block.size;
+		     prev_best_blockp = prev_blockp;	/* Remember preceding block */
+		end;
+	     end;
+	     prev_blockp = free_blockp;
+	end;
+
+	if best_block_size = 0
+	then do;					/* No space large enough */
+	     tty_buf.alloc_failures = tty_buf.alloc_failures + 1;
+	     return (null);
+	end;
+
+	free_blockp = best_blockp;			/* Block to use */
+	prev_blockp = prev_best_blockp;
+	p = addrel (free_blockp, n);			/* Get pointer to new free block */
+	next_rel = rel (p);
+	p -> free_block.next = free_block.next;
+	p -> free_block.size = free_block.size - n;
+fit_found:
+	if prev_blockp = null
+	then tty_buf.free = next_rel;			/* Have unthreaded from head */
+	else prev_blockp -> free_block.next = next_rel;	/* Unthreaded from middle */
+
+	unspec (free_space) = "0"b;			/* Clear the buffer */
+	tty_buf.bleft = tty_buf.bleft - n;		/* Total free space */
+	if tty_buf.minimum_free_space = 0 | tty_buf.bleft < tty_buf.minimum_free_space
+	then tty_buf.minimum_free_space = tty_buf.bleft;	/* metering */
+	tty_buf.total_alloc_steps = tty_buf.total_alloc_steps + nsteps;
+	return (free_blockp);			/* Return the answer */
+
+     end space_getter;
+
+/* Procedure to free space of arbitrary size */
+
+space_freer:
+     proc (p, n);
+
+dcl  p ptr;					/* Address of block to free */
+dcl  n fixed bin;					/* Word count */
+dcl  (prev_blockp, next_blockp) ptr;
+dcl  next_rel fixed bin (18);
+
+	if (baseno (p) ^= baseno (ttybp)) | (rel (p) < tty_buf.borig)
+	then call err (3);
+	free_blockp = p;
+	free_block.size = n;			/* Initialize free block */
+	free_block.next = "0"b;
+	prev_blockp = null;
+	do free_blockp = ptr (ttybp, tty_buf.free) repeat (ptr (ttybp, free_block.next)) while (rel (free_blockp));
+						/* Find spot in chain before this block */
+	     if rel (p) < rel (free_blockp)
+	     then go to found_hole;			/* Block goes before here */
+	     else if rel (p) = rel (free_blockp)
+	     then call err (4);
+	     prev_blockp = free_blockp;
+	end;
+
+/* Block goes at end */
+
+	free_blockp = p;
+	go to chain_back;
+
+/* Found hole in middle for this block */
+
+found_hole:
+	next_blockp = free_blockp;
+	free_blockp = p;
+	next_rel = bin (rel (free_blockp)) + free_block.size;
+						/* Word after current block */
+	if next_rel > bin (rel (next_blockp))
+	then call err (4);				/* Overlap */
+	else if next_rel = bin (rel (next_blockp))
+	then do;					/* Can combine with next */
+	     free_block.next = next_blockp -> free_block.next;
+	     free_block.size = free_block.size + next_blockp -> free_block.size;
+	end;
+	else free_block.next = rel (next_blockp);	/* Point current at next */
+
+/* Chain back to preceding block  */
+
+chain_back:
+	if prev_blockp = null
+	then tty_buf.free = rel (free_blockp);		/* This is first block */
+	else do;
+	     next_rel = bin (rel (prev_blockp)) + prev_blockp -> free_block.size;
+						/* Word after previous block */
+	     if next_rel > bin (rel (free_blockp))
+	     then call err (4);			/* Overlap */
+	     else if next_rel = bin (rel (free_blockp))
+	     then do;				/* Can combine */
+		prev_blockp -> free_block.next = free_block.next;
+		prev_blockp -> free_block.size = prev_blockp -> free_block.size + free_block.size;
+	     end;
+	     else prev_blockp -> free_block.next = rel (free_blockp);
+						/* Make previous point at this one */
+	end;
+
+	tty_buf.bleft = tty_buf.bleft + n;
+	if tty_buf.space_needed
+	then					/* Somebody needs space */
+	     if tty_buf.bleft >= abs_buf_limit
+	     then call interrupt_waiting_procs;
+	return;
+
+     end space_freer;
+
+/* Initialize by doing required masking and locking */
+
+setup:
+     proc;
+
+	ttybp = addr (tty_buf$);
+	lctp = tty_buf.lct_ptr;
+	call pmut$wire_and_mask (wire_mask, wire_ptr);
+	enter_time = clock ();
+	call lock;
+	total_freed = 0;
+	return;
+
+     end setup;
+
+/* Procedures that manage the tty_buffer lock word */
+
+lock:
+     proc;
+
+dcl  start_time fixed bin (71);
+
+	if tty_buf.slock = pds$processid
+	then call err (1);				/* Already locked to this process */
+	if ^stac (addr (tty_buf.slock), pds$processid)
+	then do;					/* Didn't lock at first attempt */
+	     start_time = clock ();			/* Record time we started to loop */
+	     tty_buf.space_lock_wait_count = tty_buf.space_lock_wait_count + 1;
+	     do while (^stac (addr (tty_buf.slock), pds$processid));
+	     end;
+	     tty_buf.space_lock_wait_time = tty_buf.space_lock_wait_time + clock () - start_time;
+	end;
+	tty_buf.space_lock_count = tty_buf.space_lock_count + 1;
+	return;
+
+unlock:
+     entry;
+
+	if ^stacq (tty_buf.slock, "0"b, pds$processid)
+	then call err (2);
+	return;
+
+     end lock;
+
+/* Unwire and unlock and unmask as required */
+
+clean_up:
+     proc;
+
+	call unlock;
+	call pmut$unwire_unmask (wire_mask, wire_ptr);
+	return;
+
+     end clean_up;
+
+/* Procedure to update a channels space usage counts */
+
+update_lcte:
+     proc (n);
+
+dcl  n fixed bin;					/* The increment (+ or -) */
+dcl  pc_devx fixed bin;
+
+	if devx < 1 | devx > lct.max_no_lctes
+	then return;
+	lctep = addr (lct.lcte_array (devx));
+	pc_devx = lcte.physical_channel_devx;
+	lctep = addr (lct.lcte_array (pc_devx));
+	if output_flag
+	then do;
+	     lcte.output_words = lcte.output_words + n;
+	     tty_buf.current_output_space = tty_buf.current_output_space + n;
+	     tty_buf.cumulative_output_space = tty_buf.cumulative_output_space + tty_buf.current_output_space;
+	     tty_buf.output_space_updates = tty_buf.output_space_updates + 1;
+	end;
+
+	else do;
+	     lcte.input_words = lcte.input_words + n;
+	     tty_buf.current_input_space = tty_buf.current_input_space + n;
+	     tty_buf.cumulative_input_space = tty_buf.cumulative_input_space + tty_buf.current_input_space;
+	     tty_buf.input_space_updates = tty_buf.input_space_updates + 1;
+	end;
+	return;
+
+     end update_lcte;
+
+
+/* Procedure to update control space usage counts (for metering) */
+
+update_control:
+     proc (n);
+
+dcl  n fixed bin;					/* The increment (+ or -) */
+
+	tty_buf.current_control_space = tty_buf.current_control_space + n;
+	tty_buf.cumulative_control_space = tty_buf.cumulative_control_space + tty_buf.current_control_space;
+	tty_buf.control_space_updates = tty_buf.control_space_updates + 1;
+     end update_control;
+
+/* Send an interrupt to all processes who are waiting for space to become free */
+
+interrupt_waiting_procs:
+     proc;
+
+dcl  i fixed bin;
+
+	do i = 1 to lct.max_no_lctes;
+	     lctep = addr (lct.lcte_array (i));
+	     if lcte.initialized
+	     then					/* this is a live lcte */
+		if lcte.space_needed
+		then do;
+		     lcte.space_needed = "0"b;
+		     call unlock;
+		     call channel_manager$interrupt (i, SPACE_AVAILABLE, ""b);
+		     call lock;
+		end;
+	end;
+
+	do i = 1 to lct.max_no_lctes;			/* Be sure no bits were set during our unlocks */
+	     lctep = addr (lct.lcte_array (i));
+	     if lcte.initialized
+	     then if lcte.space_needed
+		then return;			/* Leave global flag set */
+	end;
+
+	tty_buf.space_needed = "0"b;			/* All bits are truly off */
+	return;
+
+     end interrupt_waiting_procs;
+
+
+
+/* Crash the system on error in tty_buf */
+
+err:
+     proc (n);
+
+dcl  n fixed bin;
+
+call_syserr:
+	call syserr (1,
+	     "tty_space_man: ^[Lock already locked to process^;Lock not locked to process^;Adress not in buffer pool^;Tried to free space already free^]."
+	     , n);
+	go to call_syserr;
+
+     end err;
+
+%include tty_buf;
+
+%include tty_buffer_block;
+
+%include lct;
+
+%include channel_manager_dcls;
+
+%include mcs_interrupt_info;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   tty_space_man: Lock already locked to process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process that had the global tty_buf lock locked attempted to lock
+   it again.
+
+   A:	$inform
+
+
+   Message:
+   tty_space_man: Lock not locked to process.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	A process attempted to unlock the global tty_buf lock when that process
+   did not have it locked.
+
+   A:	$inform
+
+
+   Message:
+   tty_space_man: Address not in buffer pool.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	An attempt was made to free space at an address not included in the free
+   space pool of tty_buf.
+
+   A:	$inform
+
+
+   Message:
+   tty_space_man: Tried to free space already free.
+
+   S:	$crash
+
+   T:	$run
+
+   M:	An attempt was made to free space in tty_buf that was included in or
+   overlapped space that was already free.
+
+   A:	$inform
+
+   END MESSAGE DOCUMENTATION */
+
+     end tty_space_man;

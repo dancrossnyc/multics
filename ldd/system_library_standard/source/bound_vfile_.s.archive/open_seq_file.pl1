@@ -1,0 +1,1127 @@
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* Modified 8/8/74 to correct bug. Declared header size increased by four words
+   to retroactively justify declaration of first_record_pos as having vale 61.
+   New file version number is 1.1. Only difference is that initial_descriptor
+   now is (correctly) immediately before the first records descriptor. Version 1.0 files are ok except for
+   backspacing past beginning of segment, which was the bug */
+
+open_seq_file:
+     proc (iocb_ptr, fcb_ptr_arg, first_seg_ptr, is_new_file, mode, close_x, first_seg_bitcount, max_component_size, code);
+	call validate_initialize_file;
+	if code = 0
+	then do;					/* initialize cb, set iocb items */
+		call create_initialize_cb;
+		if first_seg_ptr -> header.version < current_version
+		then if mode > 4			/* OK to update file version */
+		     then if (first_seg_ptr -> header.version = 12)
+			     & ^iocb_ptr -> iocb.attach_data_ptr -> atb.inv_lock_reset
+			then call adjust_file_v12;	/* needs end_desc */
+			else do;			/* needs both end_pos and end_desc */
+				call adjust_file;	/* sets end_pos */
+				if code = 0
+				then first_seg_ptr -> header.version = current_version;
+						/* makes change */
+			     end;
+		     else end_not_valid =
+			     (iocb_ptr -> iocb.attach_data_ptr -> atb.inv_lock_reset
+			     | first_seg_ptr -> header.version ^= 12);
+		else do;				/* new version file */
+			end_not_valid = "0"b;	/* end_pos is valid */
+			if first_seg_ptr -> header.file_action ^= 0
+						/* not consistent */
+			then if first_seg_ptr -> header.file_action = must_rollback
+			     then if mode > 4
+				then do;
+					call save_position;
+					call rollback;
+					call restore_position;
+				     end;
+				else ;
+			     else if first_seg_ptr -> header.file_action = must_adjust
+			     then if mode > 4
+				then call adjust_file;
+						/* skips forward */
+				else seq_cb.end_not_valid = "1"b;
+			     else code = error_table_$bad_file;
+		     end;
+		if code = 0
+		then do;
+			call set_entries_and_positions;
+			if mode > 4		/* opening for modification */
+			then if seq_cb.checkpoint
+			     then first_seg_ptr -> header.file_action = must_rollback;
+			     else first_seg_ptr -> header.file_action = must_adjust;
+		     end;
+		else call free_cb_file (size (seq_cb), open_data_ptr);
+	     end;
+	return;					/* end of opening routine */
+
+control_seq_file:
+     entry (iocb_ptr, order, info_ptr, code);
+	code = 0;
+
+	if order = "read_position"
+	then do;
+		if end_not_valid			/* old version file -- must compute positions */
+		then call get_positions;
+		info.end_position = seq_cb.end_pos;
+		info.next_position = next_pos;
+		return;
+	     end;
+
+	if order = "record_status"
+	then do;
+		rs_info_ptr = info_ptr;
+		if (rs_info.version < rs_info_version_1) | (rs_info.version > rs_info_version_2)
+		then code = error_table_$unimplemented_version;
+		else if substr (string (rs_info.flags), 1, 6) ^= "0"b
+		then code = error_table_$bad_arg;	/* flags not supported for seq files */
+		else do;
+			if rs_info.locate_pos_sw
+			then if (rs_info.descriptor = 0) | (rs_info.record_length < 0)
+				| (^seq_cb.end_not_valid & (rs_info.record_length > seq_cb.end_pos))
+			     then do;
+				     code = error_table_$bad_arg;
+				     return;	/* abort */
+				end;
+			     else if seq_cb.opening_mode = 5
+						/* output */
+			     then do;
+				     code = error_table_$no_operation;
+				     return;
+				end;
+			     else do;		/* set position as indicated */
+				     if seq_cb.write_pos ^= beyond_limits
+						/* in write state */
+				     then call switch_to_read_state;
+				     call set_position (rs_info.descriptor);
+				     seq_cb.next_is_current = "1"b;
+				     seq_cb.next_pos = rs_info.record_length;
+				     seq_cb.current_record_ptr = null;
+				end;
+			call check_current;		/* current record position required */
+			if code = 0
+			then do;			/* fill in info structure */
+				dbytes = current_record_ptr -> descrip;
+				rs_info.record_length = d;
+				rs_info.record_ptr = addr (current_record_ptr -> record);
+						/* get pointer to record contents */
+				packed_curp = current_record_ptr;
+						/* get into packed format */
+				unspec (rs_info.descriptor) = unspec (packed_curp);
+				seq_desc.comp_num = component;
+				rs_info.max_rec_len = d;
+			     end;
+		     end;
+		return;				/* finished with record_status control order */
+	     end;
+
+	if (order = "checkpoint") & seq_cb.checkpoint & ^seq_cb.input_only
+	then do;					/* make note of present end of file position */
+		call checkpoint;
+		return;				/* end of file position now saved in file header */
+	     end;					/* end of checkpoint order */
+
+	if (order = "truncate") & ^input_only
+	then do;					/* truncate unless already at eof */
+		if read_pos ^= minus_one_pos		/* not in write state */
+		then if seq_cb.checkpoint & (seq_cb.next_pos < seq_cb.header_end_pos /* below checkpoint */)
+		     then do;			/* purely logical truncation */
+			     pos = seq_cb.read_pos;
+			     call set_end_desc;	/* note new eof location */
+			     seq_cb.end_pos = seq_cb.next_pos;
+			end;			/* logically current eof precedes rollback eof */
+		     else do;
+			     call truncate_file;
+			     return;
+			end;
+		seq_cb.current_record_ptr = null;
+		seq_cb.next_is_current = "1"b;
+		return;
+	     end;
+
+	if (order = "rollback") & ^input_only & seq_cb.checkpoint
+	then do;
+		call rollback;
+		return;
+	     end;
+
+	else if order = "error_status"
+	then do;
+		if error_info.version ^= 1
+		then code = error_table_$bad_arg;
+		else do;
+			error_info.type = error.type;
+			error_info.requested = error.requested;
+			error_info.received = error.received;
+		     end;
+		return;
+	     end;
+
+	else if order = "file_status"
+	then do;
+		call vfile_status_$seg (iocb_ptr, file_base_ptr, info_ptr, code);
+		return;
+	     end;
+
+	else if order = "io_call"
+	then call vfile_io_control (iocb_ptr, file_base_ptr, info_ptr, code);
+	else code = error_table_$no_operation;
+	return;					/* end of control routine */
+
+read_length_seq_file:
+     entry (iocb_ptr, rec_len, code);
+	call find_next_record;
+	if code = 0
+	then do;					/* record found */
+		rec_len = d;
+		current_record_ptr = addr (descrip);	/* becomes current record */
+		next_is_current = "1"b;		/* unstaggerred */
+	     end;
+	return;					/* end of read length routine */
+
+read_seq_file:
+     entry (iocb_ptr, buff_ptr, buff_len, rec_len, code);
+	call find_next_record;
+	if code = 0
+	then do;
+		rec_len = d;
+		if d > buff_len
+		then do;
+			code = error_table_$long_record;
+			d = buff_len;
+		     end;
+		if d > 0
+		then buffer = record;
+		current_record_ptr = addr (descrip);
+		next_pos = next_pos + 1;
+		next_is_current = "0"b;		/* staggerred */
+		read_pos = read_pos + 8 + rec_len;
+	     end;
+	return;					/* end read routine */
+
+position_seq_file:
+     entry (iocb_ptr, pos_type, skip, code);
+	code = 0;
+	pos = read_pos;
+	dbytes = descrip;
+	if pos_type = 0
+	then call position_skip;
+	else if pos_type = 1
+	then do;					/* position to eof */
+		if d ^= -1			/* not already at eof, therefore in read state */
+		then if seq_cb.write_pos = beyond_limits/* else must be checkpoint truncation case */
+		     then call position_eof;
+		read_pos = pos;
+	     end;
+	else if pos_type = -1
+	then do;					/* position to beginning */
+		call position_bof;
+		code = er_code;
+	     end;
+	else code = error_table_$bad_arg;
+	return;					/* end position routine */
+
+write_seq_file:
+     entry (iocb_ptr, buff_ptr, buff_len, code);
+	if buff_len < 0
+	then do;
+		code = error_table_$negative_nelem;
+		return;
+	     end;
+write:
+	pos = write_pos;
+	write_pos = write_pos + 8 + buff_len;
+	if write_pos > write_limit
+	then call write_exception;
+	else do;
+		code = 0;
+		d = buff_len;
+		addr (seg (write_pos)) -> descrip = minus_one_descrip;
+		trailer_descrip = dbytes;
+		record = buffer;
+		descrip = dbytes;
+		next_is_current = "0"b;		/* positions staggerred after write */
+		current_record_ptr = addr (descrip);
+		seq_cb.end_pos = seq_cb.end_pos + 1;
+		next_pos = seq_cb.end_pos;
+	     end;
+	return;					/* end write routine */
+
+rewrite_seq_file:
+     entry (iocb_ptr, buff_ptr, buff_len, code);
+	call check_current;				/* sets code */
+	if buff_len < 0
+	then code = error_table_$negative_nelem;
+	if code = 0				/* current record is defined */
+	then if seq_cb.checkpoint
+	     then do;
+		     if seq_cb.next_is_current
+		     then cur_pos = seq_cb.next_pos;
+		     else cur_pos = seq_cb.next_pos - 1;
+		     if cur_pos < seq_cb.header_end_pos
+		     then code = error_table_$no_operation;
+		     else call replace_record;
+		end;
+	     else call replace_record;
+	return;					/* end rewrite routine */
+
+delete_seq_file:
+     entry (iocb_ptr, code);
+	call check_current;
+	if code = 0				/* current record is defined */
+	then if seq_cb.checkpoint			/* may be a purely logical deletion or disallowed */
+	     then do;
+		     if seq_cb.next_is_current
+		     then cur_pos = seq_cb.next_pos;
+		     else cur_pos = seq_cb.next_pos - 1;
+		     if cur_pos < seq_cb.header_end_pos
+		     then if cur_pos < seq_cb.end_pos - 1
+						/* not supported */
+			then code = error_table_$no_operation;
+			else if cur_pos = seq_cb.end_pos - 1
+						/* new low pos */
+			then do;			/* adjust low end */
+				last_desc_ptr = current_record_ptr;
+				last_desc.compno = seq_cb.component;
+				go to set_positions;/* don't actually delete now */
+			     end;
+		end;
+	if code = 0
+	then do;
+		dbytes = current_record_ptr -> descrip;
+		d = -(deleted_size_bias + d);
+		current_record_ptr -> descrip = dbytes;
+set_positions:
+		current_record_ptr = null;
+		seq_cb.end_pos = seq_cb.end_pos - 1;	/* decrement count of records in file */
+		if ^next_is_current			/* next position moves back */
+		then do;
+			next_pos = next_pos - 1;	/* predecessor is deleted */
+			next_is_current = "1"b;	/* current becomes next */
+		     end;
+	     end;
+	return;					/* end delete routine */
+
+close_seq_file:
+     entry (iocb_ptr);
+	pos = write_pos;
+	if pos ^= beyond_limits
+	then call switch_to_read_state;
+	if ^seq_cb.input_only
+	then if (unspec (seq_cb.header_end_info) = unspec (seq_cb.checkpoint_data))
+	     then file_base_ptr -> header.file_action = 0;
+	     else if ^seq_cb.checkpoint
+	     then do;
+		     file_base_ptr -> header.checkpoint_data = seq_cb.checkpoint_data;
+		     file_base_ptr -> header.file_action = 0;
+		end;
+	call free_cb_file (size (seq_cb), open_data_ptr);
+	return;					/* end close routine */
+
+find_next_record:
+     proc;
+						/* If read pos designates a record, this procedure sets
+						   pos and d and returns with code = 0.  If read_pos
+						   designates eof, it sets current_record_ptr and code
+						   accordingly and returns.  In other cases it advances read_pos
+						   to the first undeleted record or eof, setting pos, d,
+						   and code accordingly. */
+
+	code = 0;
+	do while ("1"b);				/* may cross msf component boundaries */
+	     pos = read_pos;
+	     dbytes = descrip;
+	     if seq_cb.next_pos >= seq_cb.end_pos
+	     then d = -1;				/* as if eof marker encountered */
+	     if d >= 0
+	     then return;
+	     do while (d < -2);			/* skip deleted record */
+		pos = pos + 8 - d - deleted_size_bias;
+		dbytes = descrip;
+	     end;
+	     read_pos = pos;
+	     if d = -1				/* end of file, applies in read or write state */
+	     then do;
+		     if seq_cb.end_not_valid
+		     then do;			/* note that we have found eof */
+			     seq_cb.end_pos = seq_cb.next_pos;
+			     call set_end_desc;
+			end;
+		     code = error_table_$end_of_info;
+		end;
+	     else if d = -2
+	     then call next_seg_read;
+	     if code ^= 0
+	     then do;
+		     current_record_ptr = null;	/* current position is undefined */
+		     return;
+		end;
+	end;
+     end;						/* end find_next_record */
+
+position_skip:
+     proc;
+	next_is_current = "1"b;			/* positions always the same after a skip */
+	if skip > 0
+	then do;					/* forward skip */
+		count = skip;
+		do while (count > 0);
+		     seq_cb.current_record_ptr = null;
+		     call find_next_record;
+		     if code = 0
+		     then do;
+			     read_pos = read_pos + 8 + d;
+			     next_pos = next_pos + 1; /* bump next record position */
+			     count = count - 1;
+			end;
+		     else count = -count;
+		end;
+		if code ^= 0
+		then do;
+			error.type = skip_error;	/* for "error_status" control order */
+			error.requested = skip;
+			error.received = skip + count;
+		     end;
+	     end;
+	else if skip < 0
+	then do;					/* backwards skip */
+		if write_pos ^= beyond_limits
+		then call switch_to_read_state;
+		count = -skip;
+		call backspace;
+		read_pos = pos;
+		current_record_ptr = addr (descrip);
+		if code ^= 0			/* attempt to pass end of info */
+		then do;				/* save error info */
+			error.type = skip_error;
+			error.requested = skip;
+			error.received = skip - count;
+		     end;
+	     end;
+	else do;					/* don't move next position, just set current */
+		call find_next_record;
+		if code = 0			/* record found */
+		then current_record_ptr = addr (descrip);
+		else code = 0;			/* not error if at end of file */
+	     end;
+
+backspace:
+     proc;
+						/* This position backspaces over count records
+						   setting pos.  If there are less than count records
+						   code is set to end_of_info. */
+
+	do while (count > 0);
+	     pos = pos - 4;				/* locate trailer descrip, prev record */
+	     dbytes = descrip;
+	     if d >= 0				/* not beginning of segment */
+	     then do;
+		     pos = pos - 4 - d;		/* descrip for record */
+		     dbytes = descrip;
+		     if d >= 0			/* not deleted record */
+		     then do;			/* decrement count and next_pos */
+			     count = count - 1;
+			     next_pos = next_pos - 1;
+			end;
+		end;
+	     else if component = 0			/* beginning of file */
+	     then do;
+		     code = error_table_$end_of_info;
+		     pos = pos + 4;			/* reset to record descrip */
+		     dbytes = descrip;
+		     count = -count;
+		end;
+	     else do;				/* get preceding segment */
+		     next_comp = component - 1;
+		     call msf_manager_$get_ptr (fcb_ptr, next_comp, "0"b, next_seg_ptr, foo24, foo);
+		     if next_seg_ptr = null
+		     then do;
+			     code = error_table_$bad_file;
+			     pos = pos + 4;		/* reset to record descrip */
+			     dbytes = descrip;
+			     count = 0;
+			end;
+		     else do;
+			     pos = end_prev_seg;
+			     component = next_comp;
+			     seg_ptr = next_seg_ptr;
+			     dbytes = descrip;
+						/* Note count is not decremented.  All
+						   that has happened is to position to the
+						   final descriptor of the preceding segment.
+						   A record must still be backspaced over. */
+			end;
+		end;
+	end;
+     end;						/* end backspace */
+
+	dcl     count		 fixed bin;
+     end;						/* end position_skip */
+
+check_current:
+     proc;					/* routines sets code to indicate whether current rec found */
+	if current_record_ptr = null			/* may be valid if current is next */
+	then do;					/* set current to next */
+		call find_next_record;		/* sets code */
+		if code = 0			/* record found */
+		then current_record_ptr = addr (descrip);
+		else code = error_table_$no_record;
+	     end;
+	else code = 0;				/* current defined since non-null */
+     end check_current;
+
+position_eof:
+     proc;					/* called in read state */
+	if seq_cb.end_not_valid			/* must scan to find true eof */
+	then call set_end_pos;
+	current_record_ptr = null;
+	seq_cb.next_is_current = "1"b;
+	next_pos = seq_cb.end_pos;
+	if seq_cb.end_desc = 0			/* must be an old version file */
+	then do;					/* handle first positioning to eof as special case */
+		call find_eof_v12;			/* will set end_desc */
+		return;
+	     end;
+	call set_position (seq_cb.end_desc);
+	pos = seq_cb.read_pos;
+     end position_eof;
+
+set_position:
+     proc (descriptor);				/* sets position to location specified by descriptor */
+	seq_cb.read_pos = 4 * fixed (ds.wordno) + divide (fixed (ds.bitno, 6, 0), 9, 17, 0) + 1;
+						/* byte offset of descriptor */
+	if seq_cb.component ^= ds.compno
+	then do;					/* get another component */
+		seq_cb.component = ds.compno;
+		call msf_manager_$get_ptr (fcb_ptr, seq_cb.component, "0"b, seq_cb.seg_ptr, foo24, foo);
+	     end;
+	dcl     descriptor		 fixed (35);
+	dcl     1 ds		 based (addr (descriptor)),
+		2 bitno		 fixed (5) unal,
+		2 compno		 fixed (11) unal,
+		2 wordno		 bit (18) unal;
+     end set_position;
+
+position_bof:
+     proc;					/* sets position to beginning of file */
+	er_code = 0;
+	if component ^= 0
+	then call msf_manager_$get_ptr (fcb_ptr, 0, "0"b, next_seg_ptr, foo24, foo);
+	else next_seg_ptr = seg_ptr;
+	if next_seg_ptr = null
+	then er_code = error_table_$bad_file;
+	else do;
+		if write_pos ^= beyond_limits
+		then call switch_to_read_state;
+		seg_ptr = next_seg_ptr;
+		component = 0;
+		read_pos = first_record_pos;
+		next_is_current = "1"b;
+		next_pos = 0;			/* beginning of file */
+		pos = read_pos;			/* offset of first descriptor */
+		current_record_ptr = addr (descrip);
+	     end;
+     end position_bof;
+
+replace_record:
+     proc;					/* tries to insert new rec at current position */
+	dbytes = current_record_ptr -> descrip;
+	if buff_len = d
+	then do;
+		code = 0;
+		if d ^= 0
+		then current_record_ptr -> record = buffer;
+		if next_is_current			/* positions not staggerred */
+		then do;				/* advance next record position */
+			next_pos = next_pos + 1;
+			next_is_current = "0"b;
+			read_pos = read_pos + 8 + buff_len;
+						/* skip over the current record */
+		     end;
+	     end;
+	else if buff_len < d
+	then code = error_table_$short_record;
+	else code = error_table_$long_record;
+     end replace_record;
+
+checkpoint:
+     proc;					/* saves eof position in checkpoint data in file header */
+	if seq_cb.write_pos ^= beyond_limits		/* write state */
+	then do;					/* note eof position */
+		pos = seq_cb.write_pos;
+		call set_seg_end;
+	     end;					/* this already done if in read state */
+	file_base_ptr -> header.checkpoint_data = seq_cb.checkpoint_data;
+						/* atomically
+						   changes eof setting */
+	if seq_cb.header_end_pos >= seq_cb.end_pos	/* dispose of tail garbage */
+	then do;
+		call save_position;			/* must be able to leave user's pos unchanged */
+		call position_eof;			/* locate last descriptor */
+		call truncate_file;			/* zero tail contents */
+		call restore_position;		/* like when we started */
+	     end;
+	seq_cb.header_end_info = seq_cb.checkpoint_data;	/* if file is closed now
+						   the file_action can be cleared, since trunc is done and
+						   header end info is correct checkpoint value */
+     end checkpoint;
+
+save_position:
+     proc;					/* keeps track of file positions so they can be reset */
+	saved_seg_ptr = seg_ptr;
+	saved_comp = component;
+	saved_write_pos = write_pos;
+	saved_read_pos = read_pos;
+	saved_curr_ptr = current_record_ptr;
+	saved_next_curr = next_is_current;
+	saved_next_pos = seq_cb.next_pos;
+     end save_position;
+
+restore_position:
+     proc;
+	seg_ptr = saved_seg_ptr;
+	component = saved_comp;
+	write_pos = saved_write_pos;
+	read_pos = saved_read_pos;
+	current_record_ptr = saved_curr_ptr;
+	next_is_current = saved_next_curr;
+	seq_cb.next_pos = saved_next_pos;
+     end restore_position;
+
+switch_to_read_state:
+     proc;
+	pos = seq_cb.write_pos;
+	if seq_cb.checkpoint
+	then if seq_cb.end_pos <= seq_cb.header_end_pos	/* don't alter file yet */
+	     then call set_end_desc;			/* note eof location */
+	     else call set_seg_end;			/* mark the file as well */
+	else call set_seg_end;			/* change is immediate */
+	seq_cb.write_pos = beyond_limits;		/* read state */
+     end switch_to_read_state;
+
+set_seg_end:
+     proc;
+						/* This procedure sets the current segment's bit count and the
+						   end_seg field in the header.  It expects pos to be at the final
+						   descriptor. */
+
+	end_seg = pos;
+	call hcs_$set_bc_seg (seg_ptr, 9 * (pos + 3), foo);
+
+set_end_desc:
+     entry;					/* notes eof location */
+	last_desc_ptr = addr (descrip);		/* get packed ptr */
+	last_desc.compno = seq_cb.component;
+     end set_seg_end;
+
+write_exception:
+     proc;
+	if pos = beyond_limits			/* read state */
+	then do;
+		if append_sw
+		then if seq_cb.checkpoint		/* may not append if already has truncated */
+		     then if seq_cb.end_pos < seq_cb.header_end_pos
+			then go to no_op;		/* not supported at this time */
+			else call position_eof;
+		     else call position_eof;
+		else if updating
+		then do;				/* replace or insert next record */
+			if seq_cb.checkpoint
+			then if seq_cb.next_pos < seq_cb.header_end_pos
+			     then do;		/* dissallow this case, because it can't be rolled back */
+no_op:
+				     seq_cb.write_pos = pos;
+						/* initial state */
+				     code = error_table_$no_operation;
+				     return;	/* abort */
+				end;
+			call find_next_record;
+			if code = 0		/* not at end of file */
+			then do;			/* replace */
+				write_pos = beyond_limits;
+						/* leave file in read state */
+				current_record_ptr = addr (descrip);
+				next_is_current = "1"b;
+						/* will be changed by replacement */
+				call replace_record;/* lengths must match */
+				return;
+			     end;
+		     end;
+		else if seq_cb.checkpoint & (seq_cb.next_pos < seq_cb.header_end_pos)
+		then go to no_op;
+		else do;
+			call truncate_file;
+			go to write;
+		     end;
+		pos = seq_cb.read_pos;
+		seq_cb.read_pos = minus_one_pos;	/* switch to write state */
+		seq_cb.write_pos = pos;
+		go to write;			/* appends to eof */
+	     end;
+	else if buff_len > max_record_size
+	then do;
+		write_pos = pos;
+		code = error_table_$long_record;
+	     end;
+	else do;					/* end of segment case */
+		write_pos = pos;
+		if ssf_sw				/* no msf's allowed */
+		then do;				/* flag the error */
+			code = error_table_$file_is_full;
+			call set_seg_end;
+			return;
+		     end;
+		next_comp = component + 1;
+		if ^is_msf			/* first open msf */
+		then do;
+			call msf_manager_$open (substr (attach_descrip_string, 8, dname_len),
+			     substr (attach_descrip_string, 9 + dname_len, ename_len), fcb_ptr, code);
+			is_msf = "1"b;
+			atb.fcbp = fcb_ptr;
+		     end;
+		call msf_manager_$get_ptr (fcb_ptr, next_comp, "1"b, next_seg_ptr, foo24, code);
+		if next_seg_ptr ^= null
+		then do;
+			prev_seg_ptr = seg_ptr;	/* save ptr to base of seg */
+			code = 0;
+			call set_seg_end;
+			seg_ptr = next_seg_ptr;
+			component = next_comp;
+			header.version = 1;
+			end_prev_seg = pos;
+			minus_one = -1;
+			addr (seg (header_size + 1)) -> descrip = minus_one_descrip;
+						/* sets initial descriptor */
+			pos = first_record_pos;
+			call set_seg_end;
+			write_pos = first_record_pos;
+			descrip = minus_one_descrip;	/* first record descrip */
+			d = -2;
+			addr (prev_seg_ptr -> seg (end_prev_seg)) -> descrip = dbytes;
+			go to write;		/* add record to end of file */
+		     end;
+	     end;
+	dcl     prev_seg_ptr	 ptr;
+     end;						/* end write exception */
+
+next_seg_read:
+     proc;					/* called in read state when another seg exists */
+	next_comp = component + 1;
+	call msf_manager_$get_ptr (fcb_ptr, next_comp, "0"b, next_seg_ptr, foo24, foo);
+	if next_seg_ptr = null
+	then code = error_table_$bad_file;
+	else do;
+		component = next_comp;
+		seg_ptr = next_seg_ptr;
+		read_pos = first_record_pos;
+	     end;
+     end;						/* end next_seg_read */
+
+truncate_file:
+     proc;					/* sets end of file to next record position */
+	pos = read_pos;
+	read_pos = minus_one_pos;			/* first change to write state */
+	write_pos = pos;
+	seq_cb.current_record_ptr = null;
+	seq_cb.next_is_current = "1"b;
+	descrip = minus_one_descrip;
+	call set_seg_end;
+	seq_cb.end_pos = next_pos;
+	if ^is_msf				/* single segment */
+	then call hcs_$truncate_seg (seg_ptr, divide (pos + 6, 4, 18, 0), foo);
+	else call msf_manager_$adjust (fcb_ptr, component, 9 * (pos + 3), "010"b, foo);
+						/* truncate file */
+     end truncate_file;
+
+create_initialize_cb:
+     proc;
+	call alloc_cb_file (size (seq_cb), open_data_ptr);
+	fcb_ptr = fcb_ptr_arg;
+	seg_ptr = first_seg_ptr;
+	component = 0;
+	write_limit = 4 * max_component_size - 3;
+	max_record_size = 4 * max_component_size - header_size - 12;
+	beyond_limits = write_limit + 4;
+	write_pos = beyond_limits;			/* initialize to read state */
+	read_pos = first_record_pos;
+	next_is_current = "1"b;			/* positions initially not staggerred */
+	pos = read_pos;
+	current_record_ptr = null;
+	next_pos = 0;
+	file_base_ptr = seg_ptr;
+	seq_cb.checkpoint_data, seq_cb.header_end_info = file_base_ptr -> header.checkpoint_data;
+	append_sw = (iocb_ptr -> iocb.attach_data_ptr -> atb.appending) & (mode = 6 /* input_output */);
+	updating = (mode = 7 /* sequential_update */);
+	input_only = (mode = 4);
+	seq_cb.opening_mode = mode;
+	is_msf = atb.msf;				/* set if file is already an msf */
+	ssf_sw = atb.ssf;				/* -ssf option indicates no msf's allowed */
+	minus_one_word = -1;
+	seq_cb.checkpoint = atb.checkpoint_sw;
+     end;						/* end create_initialize_cb */
+
+set_entries_and_positions:
+     proc;					/* sets iocb entries for valid operations
+						   and positions to end of file in some output modes */
+	close_x = close_seq_file;
+	control = control_seq_file;			/* supported in all modes */
+
+	if mode = 4				/* input */
+	then do;
+		read_record = read_seq_file;
+		read_length = read_length_seq_file;
+		position = position_seq_file;
+	     end;
+
+	else if mode = 5				/* output */
+	then write_record = write_seq_file;
+
+	else if mode = 6				/* input_output */
+	then do;
+		read_record = read_seq_file;
+		read_length = read_length_seq_file;
+		position = position_seq_file;
+		write_record = write_seq_file;
+	     end;
+
+	else do;					/* update */
+		read_record = read_seq_file;
+		read_length = read_length_seq_file;
+		position = position_seq_file;
+		write_record = write_seq_file;
+		rewrite_record = rewrite_seq_file;
+		delete_record = delete_seq_file;
+	     end;
+
+	if (mode = 5) | ((mode = 6) & ^append_sw)	/* output or input-output */
+	then do;					/* change to write state */
+		call position_eof;
+		write_pos = pos;
+		read_pos = minus_one_pos;
+	     end;
+
+     end set_entries_and_positions;
+
+validate_initialize_file:
+     proc;
+	code = 0;
+	if is_new_file
+	then do;					/* initialize file */
+		first_seg_ptr -> end_prev_seg = 0;
+		first_seg_ptr -> minus_one = -1;
+		first_seg_ptr -> end_seg = first_record_pos;
+		first_seg_ptr -> header.checkpoint_data.end_desc = initial_end_desc;
+		addr (first_seg_ptr -> seg (header_size + 1)) -> descrip = addr (first_seg_ptr -> minus_one) -> descrip;
+
+/* this sets the initial descriptor */
+		addr (first_seg_ptr -> seg (first_record_pos)) -> descrip = addr (first_seg_ptr -> minus_one) -> descrip;
+						/* this set the eof descriptor */
+		call hcs_$set_bc_seg (first_seg_ptr, 9 * (header_size + 8), foo);
+		first_seg_ptr -> header.version = current_version;
+	     end;
+	else do;					/* validate header, init descriptor */
+		dbytes = addr (first_seg_ptr -> seg (header_size + 1)) -> descrip;
+		if ((first_seg_ptr -> header.version < 10) | (first_seg_ptr -> header.version > current_version))
+		     | (first_seg_ptr -> end_prev_seg ^= 0) | (first_seg_ptr -> minus_one ^= -1)
+		     | ((d ^= -1) & (first_seg_ptr -> header.version = 11))
+		then code = error_table_$bad_file;
+	     end;
+     end;						/* end validate_initialize_file */
+
+rollback:
+     proc;					/* restores eof according to checkpoint data */
+	if seq_cb.write_pos ^= beyond_limits
+	then call switch_to_read_state;
+	if seq_cb.end_pos >= seq_cb.header_end_pos	/* file was extended */
+	then do;					/* rollback requires truncation */
+		seq_cb.next_pos = seq_cb.header_end_pos;
+		call set_position (seq_cb.header_end_desc);
+		call truncate_file;			/* dispose of new stuff */
+		seq_cb.checkpoint_data = seq_cb.header_end_info;
+	     end;
+	else do;					/* un-truncate file */
+		seq_cb.checkpoint_data = seq_cb.header_end_info;
+		call position_eof;
+	     end;
+     end rollback;
+
+adjust_file:
+     proc;					/* truncates file after setting eof properly */
+	call save_position;
+	seq_cb.end_pos = infinity;			/* let find_next_rec scan for marker */
+	call set_end_pos;
+	call set_seg_end;
+	file_base_ptr -> header.checkpoint_data = seq_cb.checkpoint_data;
+	if ^is_msf				/* single segment */
+	then call hcs_$truncate_seg (seg_ptr, divide (pos + 6, 4, 18, 0), code);
+	else call msf_manager_$adjust (fcb_ptr, component, 9 * (pos + 3), "010"b, code);
+						/* truncate any garbage */
+	seq_cb.header_end_info = seq_cb.checkpoint_data;
+	call restore_position;
+     end adjust_file;				/* file properly adjusted to last rec */
+
+set_end_pos:
+     proc;					/* determines true record count */
+
+	do while (code = 0);			/* advance position to true eof */
+	     call find_next_record;			/* may advance file position */
+	     next_pos = next_pos + 1;
+	     read_pos = read_pos + 8 + d;		/* skips the record */
+	end;
+
+	seq_cb.end_pos = next_pos - 1;		/* true end of file position */
+	call set_end_desc;
+	end_not_valid = "0"b;			/* remember end pos is now correct */
+	code = 0;
+     end set_end_pos;
+
+find_eof_v12:
+     proc;					/* positions to end of file in version 12 or older files */
+	flag = "1"b;
+
+	do while (flag);
+	     pos = end_seg;
+	     dbytes = descrip;
+	     read_pos = pos;
+	     if d = -2				/* another segment exists */
+	     then do;
+		     call next_seg_read;
+		     if code ^= 0
+		     then flag = "0"b;		/* found file bad */
+		end;
+	     else flag = "0"b;			/* this is the last seg */
+	end;
+
+	call set_end_desc;
+	dcl     flag		 bit (1) aligned;
+     end find_eof_v12;
+
+adjust_file_v12:
+     proc;					/* converts version 12 to current */
+	call save_position;
+	call find_eof_v12;
+	first_seg_ptr -> header.checkpoint_data.end_desc = seq_cb.end_desc;
+	first_seg_ptr -> header.version = current_version;
+	call restore_position;
+     end adjust_file_v12;
+
+get_positions:
+     proc;					/* used on initial attempt to read positions in old version files */
+	call save_position;
+
+/* now find next and end positions */
+	ei_ptr = addr (ei_block);
+	ei_ptr -> error_info.version = 1;
+	call position_seq_file (iocb_ptr, 0, -infinity, foo);
+						/* will produce error */
+	call control_seq_file (iocb_ptr, "error_status", ei_ptr, foo);
+	next_pos = 0;
+	call set_end_pos;
+	next_pos = -ei_ptr -> error_info.received;
+
+	call restore_position;
+	dcl     ei_ptr		 ptr;
+	dcl     1 ei_block,
+		2 words		 (4) fixed;
+     end get_positions;
+
+	dcl     (addr, divide)	 builtin;
+	dcl     infinity		 static options (constant) internal fixed (34) init (17179870);
+	dcl     (vfile_io_control, vfile_status_$seg)
+				 entry (ptr, ptr, ptr, fixed (35));
+	dcl     order		 char (*);
+	dcl     info_ptr		 ptr;
+	dcl     alloc_cb_file	 entry (fixed bin, ptr);
+	dcl     buffer		 char (d) based (buff_ptr);
+	dcl     buff_ptr		 ptr;
+	dcl     buff_len		 fixed bin (21);
+	dcl     close_x		 entry;
+	dcl     code		 fixed bin (35);
+	dcl     1 error_info	 based (info_ptr),	/* used with "error_status" control order */
+		2 version		 fixed,		/* must =1 (Input) */
+		2 type		 fixed,		/* identifies type of error--only one currently exists */
+		2 requested	 fixed,		/* skip arg passed to vfile_ for positioning */
+		2 received	 fixed;		/* skips completed successfully */
+	dcl     skip_error		 fixed static options (constant) internal init (1);
+	dcl     1 complete_record	 based (addr (seg (pos))),
+		2 descrip		 char (4),	/* descriptor for record, actually
+						   an integer, = length of record normally, = -(header_size + length)
+						   for deleted record */
+		2 record		 char (d),
+		2 trailer_descrip	 char (4);	/* always = record length */
+	dcl     d			 fixed bin (21);	/* value of descriptor, length of record */
+	dcl     dbytes		 char (4) based (addr (d));
+						/* alias for assignment between d and descrip */
+	dcl     deleted_size_bias	 static options (constant) internal fixed bin (21) init (40);
+						/* this is added to the record size
+						   before commplementing it to get the descriptor for a deleted record. 40 is an arbitrary value >0. */
+	dcl     error_table_$bad_file	 external fixed bin (35);
+	dcl     error_table_$negative_nelem
+				 external fixed (35);
+	dcl     error_table_$file_busy external fixed (35);
+	dcl     error_table_$unimplemented_version
+				 external fixed (35);
+	dcl     error_table_$file_is_full
+				 static external fixed (35);
+	dcl     error_table_$no_operation
+				 external fixed (35);
+	dcl     error_table_$no_record external fixed bin (35);
+	dcl     error_table_$long_record
+				 external fixed bin (35);
+	dcl     error_table_$short_record
+				 external fixed bin (35);
+	dcl     error_table_$end_of_info
+				 external fixed bin (35);
+	dcl     error_table_$bad_arg	 external fixed bin (35);
+	dcl     free_cb_file	 entry (fixed bin, ptr);
+	dcl     fcb_ptr_arg		 ptr;
+	dcl     first_record_pos	 static options (constant) internal fixed bin init (61);
+						/* =header_size+4+1, 4 for initial descriptor */
+	dcl     first_seg_ptr	 ptr;
+	dcl     first_seg_bitcount	 fixed bin (24);
+	dcl     foo		 fixed bin (35);	/* used when status code is to
+						   be ignored */
+	dcl     foo24		 fixed bin (24);	/* used when bit count is to
+						   be ignored */
+	dcl     1 header		 based (seg_ptr),
+		2 common_header_words
+				 (4) fixed bin,
+		2 version_word	 aligned,
+		  3 file_action	 fixed (17) unal,
+		  3 version	 fixed (17) unal,
+		2 end_prev_seg	 fixed bin (21),	/* = 0 in first seg,
+						   otherwise = pos of final descrip in preceding
+						   segment */
+		2 end_seg		 fixed bin (21),	/* = pos of final
+						   descriptor in this segment except while
+						   in write state.  In write state indicates
+						   end of seg when write state entered */
+		2 minus_one	 fixed bin (21),	/* always -1 */
+		2 checkpoint_data,
+		  3 end_pos	 fixed (34),
+		  3 end_desc	 fixed (35),
+		2 reserved	 (4) fixed;
+	dcl     cur_pos		 fixed (34);
+	dcl     low_end_ptr		 ptr unal based (addr (seq_cb.low_end_desc));
+	dcl     1 low_ds_struct	 based (addr (seq_cb.low_end_desc)),
+		2 bitno		 bit (6) unal,
+		2 low_end_comp	 fixed (11) unal,
+		2 wordno		 bit (18) unal;
+	dcl     must_rollback	 static internal fixed options (constant) init (3);
+	dcl     must_adjust		 static internal fixed options (constant) init (2);
+	dcl     header_size		 static options (constant) internal fixed bin init (56);
+	dcl     checkpoint_info_words	 fixed (71);
+	dcl     1 checkpoint_info	 based (addr (checkpoint_info_words)) aligned,
+		2 end_pos		 fixed (34),
+		2 end_desc	 fixed (35);
+	dcl     hcs_$truncate_seg	 entry (ptr, fixed (18), fixed (35));
+	dcl     hcs_$terminate_noname	 entry (ptr, fixed (35));
+	dcl     msf_manager_$open	 entry (char (*), char (*), ptr, fixed (35));
+	dcl     hcs_$set_bc_seg	 entry (ptr,	/* pointer to seg, input */
+				 fixed bin (24),	/* bit count to be set */
+				 fixed bin (35));	/* status code */
+	dcl     iocb_ptr		 ptr;		/* for open and close entries this points to the actual iocb.
+						   For other entries the iocb may be attached as a syn */
+	dcl     is_new_file		 bit (1) aligned;
+	dcl     max_component_size	 fixed bin (19);
+	dcl     mode		 fixed bin;	/* 4, 5, 6, or 7 */
+	dcl     minus_one_pos	 static options (constant) internal fixed bin (21) init (29);
+						/* 4*common_header_size+13 = position of header.minus_one */
+	dcl     msf_manager_$adjust	 entry (ptr,	/* fcb_ptr */
+				 fixed bin,	/* component number of segment to be
+						   made last segment */
+				 fixed bin (24),	/* bit count for that seg */
+				 bit (3),		/* "010" = dont set bit counts, truncate
+						   segment, dont terminate components */
+				 fixed bin (35));	/* status code */
+	dcl     msf_manager_$get_ptr	 entry (ptr,	/* fcb_ptr */
+				 fixed bin,	/* component number of desired segment */
+				 bit (1),		/* create switch */
+				 ptr,		/* ptr to seg or null if error, output */
+				 fixed bin (24),	/* bitcount of segment, output */
+				 fixed bin (35));	/* status code */
+	dcl     next_comp		 fixed bin;
+	dcl     next_seg_ptr	 ptr;
+	dcl     null		 builtin;
+	dcl     rec_len		 fixed bin (21);
+	dcl     pos		 fixed bin (21);	/* position of next descriptor */
+	dcl     pos_type		 fixed bin;
+	dcl     seg		 (1048576) char (1) based (seg_ptr);
+	dcl     1 info		 based (info_ptr),	/* used for "read_position" order call */
+		2 next_position	 fixed (34),
+		2 end_position	 fixed (34);
+	dcl     1 seq_cb		 based (open_data_ptr),
+		2 seg_ptr		 ptr,		/* ptr to current seg */
+		2 fcb_ptr		 ptr,		/* ptr to msf control block */
+		2 component	 fixed bin,	/* component number of
+						   current seg */
+		2 write_limit	 fixed bin (21),	/* set at open to max seg size + 1 */
+		2 beyond_limits	 fixed bin (21),	/* set at open to write_limit + 4 */
+		2 max_record_size	 fixed bin (21),	/* set at open to 4*max_component_size-
+						   header_size-12(i.e. 3 desciptor words */
+		2 write_pos	 fixed bin (21),	/* in write state =
+						   pos of final descriptor, in read state =
+						   beyond limits */
+		2 read_pos	 fixed bin (21),	/* in read state =
+						   pos of next descriptor, in write state
+						   = minus_one_pos */
+		2 current_record_ptr ptr,
+		2 checkpoint_data,
+		  3 end_pos	 fixed (34),
+		  3 end_desc	 fixed (35),
+		2 next_pos	 fixed (34),	/* next record number */
+		2 next_is_current	 bit (1) aligned,	/* "0"b if positions staggerred */
+		2 updating	 bit (1) aligned,	/* set if mode=7 (sequential_update) */
+		2 append_sw	 bit (1) aligned,	/* set if mode=6 (seq in out) and -append attachment */
+		2 input_only	 bit (1) aligned,
+		2 ssf_sw		 bit (1) aligned,	/* -ssf option indicator */
+		2 is_msf		 bit (1) aligned,	/* set when msf is opened */
+		2 end_not_valid	 bit (1) aligned,	/* used with old version files */
+		2 error,				/* used by "error_status" control order */
+		  3 type		 fixed,
+		  3 requested	 fixed (34),
+		  3 received	 fixed (34),
+		2 minus_one_word	 fixed,
+		2 file_base_ptr	 ptr,
+		2 header_end_info,
+		  3 header_end_pos	 fixed (34),
+		  3 header_end_desc	 fixed (35),
+		2 checkpoint	 bit (1) aligned,	/* set if -checkpoint attachment */
+		2 opening_mode	 fixed;
+	dcl     packed_curp		 ptr unal;
+	dcl     minus_one_descrip	 char (4) based (addr (minus_one_word));
+	dcl     size		 builtin;
+	dcl     er_code		 fixed (35);
+	dcl     current_version	 fixed static options (constant) internal init (13);
+	dcl     initial_end_desc	 static fixed (35) internal options (constant) init (15);
+	dcl     1 last_desc		 based (addr (seq_cb.end_desc)),
+		2 bitno		 fixed (5) unal,
+		2 compno		 fixed (11) unal,
+		2 wordno		 bit (18) unal;
+	dcl     last_desc_ptr	 ptr unal based (addr (seq_cb.end_desc));
+	dcl     1 eof_data		 based (addr (eof_data_word)),
+		2 end_pos		 fixed (34),
+		2 end_desc	 fixed (35);
+	dcl     eof_data_word	 fixed (71) aligned;
+%include vf_attach_block;
+%include rs_info;
+	dcl     skip		 fixed (34);
+	dcl     (saved_seg_ptr, saved_curr_ptr)
+				 ptr;
+	dcl     saved_comp		 fixed;
+	dcl     saved_next_pos	 fixed (34);
+	dcl     (saved_read_pos, saved_write_pos)
+				 fixed (21);
+	dcl     saved_next_curr	 bit (1) aligned;
+%include iocbv;
+     end /* end of sequential file i-o program */;
