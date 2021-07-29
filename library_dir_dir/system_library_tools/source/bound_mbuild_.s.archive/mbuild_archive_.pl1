@@ -1,0 +1,963 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2019-08-17,GDixon), approve(2019-10-26,MCR10069),
+     audit(2020-01-20,Swenson), install(2020-01-20,MR12.6g-0035):
+     mbuild request:  archive_prep, arch
+  2) change(2020-10-23,GDixon), approve(2021-02-22,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+     In SARCH_UPDATE loop, do archive component deletions before add and
+     replace operations.  Space occupied by deleted source may be needed for
+     added source.
+  3) change(2021-02-14,GDixon), approve(2021-02-22,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+      A) By default, call archive_sort on each BOUNDOBJ archive being
+         modified.
+      B) Add -no_sort control argument to suppress this sorting.
+      C) Support new code parameter when calling mbuild_data_$get_Seg(...).
+                                                   END HISTORY COMMENTS */
+
+mbuild_archive_:
+     proc(AsciP, Abuild_dataP) returns (bit(1) aligned);
+
+  dcl  PROC char(15) int static options(constant) init("mbuild_archive_");
+
+     return (check_parms (mbuild_data_version_3));
+/* -------------------- */
+
+  dcl  delete_$path entry (char(*), char(*), bit(36) aligned, char(*), fixed bin(35));
+
+  dcl  mbuild_$banner entry options(variable);
+  dcl  mbuild_$request entry options(variable);
+
+  dcl  mbuild_data_$archive_prep_build_progress_update entry (ptr);
+  dcl  mbuild_data_$disconnect_Seg entry (ptr);
+  dcl  mbuild_data_$exists_Seg entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$get_build_progress entry (ptr) returns(bit(*) aligned);
+  dcl  mbuild_data_$get_Seg entry (ptr, char(*) var, char(*) var, char(*) var, char(*) var, char(*) var) returns(ptr);
+  dcl  mbuild_data_$replacing_identical_Seg entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$unknown_library_found entry (ptr, bit(1) aligned) returns(bit(1) aligned);
+
+  dcl  mbuild_info_find_$seg_type_for_seg_name entry (char(*) var) returns(ptr);
+  dcl  mbuild_info_find_$suffix_for_build_type entry (char(*)) returns(char(12) var);
+  dcl  mbuild_info_find_$suffix_by_type_ID entry (fixed bin) returns(char(12) var);
+
+  dcl  mbuild_library_$library_directories entry (char(*) var, (*) char(200) var, fixed bin, fixed bin(35));
+  dcl  mbuild_library_$replace_library_component entry (char(*) var, char(*) var, char(*) var) returns(char(32) var);
+     
+
+  dcl (error_table_$badopt,
+       mbuild_et_$archive_missing,
+       mbuild_et_$bind_fails,
+       mbuild_et_$bindfile_missing,
+       mbuild_et_$identical_segments,
+       mbuild_et_$no_object_arch,
+       mbuild_et_$no_Seg,
+       mbuild_et_$object_missing,
+       mbuild_et_$source_missing,
+       mbuild_et_$unexpected_event,
+       mbuild_et_$unsupported_operation
+        ) fixed bin(35) ext static;
+
+  dcl (addr, after, before, binary, char, dim, ltrim, null, string) builtin;
+
+%page;
+/* ======================================================================
+   REQUEST: archive_prep, arch
+
+    -- Prepare Seg(source_arch)'s being UPDATEd or ADDed.
+    -- Prepare equivalent Seg(object_arch)'s being UPDATEd or ADDed.
+        - Seg(object_arch)'s or their corresponding archives are not present.
+          Any archives to be UPDATEd must be copied into the install directory.
+	Any non-updated archives are used directly from the Multics library
+	location; they are not copied into the install directory.
+    -- Create Seg(object_arch) structures for archives not being modified, 
+       but which participate in the bind operation.  
+        - Set Seg.operation = "BIND-INPUT" for these unmodified archives.
+/* ====================================================================== */
+
+archive_prep_request:
+     entry(AsciP, Abuild_dataP);
+
+  dcl 1 C aligned,  
+      2 sciP ptr,
+      2 bindS aligned,
+        3 (listS,
+	 mapS,
+	 no_sortS
+	  ) bit(1) unaligned;
+
+     C.sciP = AsciP;
+     C.bindS = F;
+
+     call arg_setup (AsciP);				/* Get user-specified -Control_args		        */
+
+     if args_remain() then
+	call controlArgs(C);
+
+/* ----------------------------------------------------------------------
+    - Ensure install directory has been analyzed and compiled.
+    - Verify that UNKNOWN libraries have been replaced by target library name.
+   ---------------------------------------------------------------------- */
+
+     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+     if ^bld_progress.analyzedS then do;
+	call ssu_$abort_line (C.sciP, 0,
+	     "Obtain data for archive_prep task with request:  analyze  or  clean");
+	end;					/*  Need data from analyze to perform archive tasks.      */
+     if ^bld_progress.compiledS then do;
+	call ssu_$abort_line (C.sciP, 0,
+	     "Obtain data for archive_prep task with request:  compile");
+	end;					/*  Need data from compile to perform archive tasks.      */
+
+     if mbuild_data_$unknown_library_found (addr(bld), F) then do;
+	call ssu_$abort_line (C.sciP, 0, "Please resolve UNKNOWN library names before archiving.");
+	end;
+
+/* ----------------------------------------------------------------------
+    - For each BOUNDOBJ being built/installed:
+       - Prepare its source_arch(s) and object_arch(s) for installation.
+       - Bind the object_arch(s) into a Bound_obj.
+   ---------------------------------------------------------------------- */
+
+  dcl (lSuffix, oSuffix, sSuffix) char(12) var;
+     lSuffix = mbuild_info_find_$suffix_for_build_type ("listing");
+     oSuffix = mbuild_info_find_$suffix_for_build_type ("object_arch");
+     sSuffix = mbuild_info_find_$suffix_for_build_type ("source_arch");
+
+  dcl 1 BND aligned like BOUNDOBJ based (BNDp),
+       BNDp ptr;
+
+     do BNDp = Tlist_first_item (addr(bld.BOUNDOBJ_Tb))
+        repeat Tlist_next_item  (addr(BND.BOUNDOBJ_Td))  while (BNDp ^= null() );
+	if BND.sourceArchsN < 0 then			/* < 0 count of archives should be impossible!	        */
+	     call ssu_$print_message (C.sciP, mbuild_et_$unexpected_event, "Archive count ^d for BOUNDOBJ: ^a",
+		BND.sourceArchsN, BND.name);
+
+	else do;
+	     if BND.operation = "DELETE" then;		/* No need to update archives or bind if we're deleting   */
+						/*  a BOUNDOBJ and all its components.		        */
+
+	     else if BND.operation = "REPLACE" then do;	/* What does it mean to REPLACE an entire bound segment?  */
+						/*  Is it just a DELETE followed by an ADD?  	        */
+						/*  Or something else?			        */
+		call ssu_$print_message (bld.sciP, mbuild_et_$unsupported_operation, 
+		     "REPLACE for BOUNDOBJ: ^a", BND.name);
+		end;
+
+	     else do;				/* Handle BND.operation = ADD | UPDATE		        */
+		call prepare_archives (C, BNDp);
+		if  ^C.no_sortS  then
+		     call sort_archives (C, BNDp);
+		call bind_archives (C, BNDp);
+		end;
+	     end;
+	end;
+     call mbuild_data_$archive_prep_build_progress_update (addr(bld));
+     return;
+%page;
+/* ==========================================================================================
+   INPUTS:
+
+   The following diagram shows key structures that are present when the 
+   archive_prep request begins.
+
+  build_data elements   (before archive_prep)
+  - - - - - - - - - -
+
+      bindfile_Tb:                      \                        -pdm_Td
+                                       objectArchs_Tb          Seg(bindfile)
+                                       bindfileP - - - - - - - - BOUNDOBJp
+                                     BOUNDOBJ
+      BOUNDOBJ_Tb:                    -BOUNDOBJ_Td   
+                                       sourceArchsN
+                                       sourceArchs_Tb   
+                                      /
+                                archs_Td- - - - - - - - - archs_Td
+                              Seg(source_arch)          Seg(source_arch)
+   source_arch_Tb:             -pdm_Td                   -pdm_Td   
+                                inArch_Tb                 inArch_Tb   
+                               /                               \
+                        inArch_Td- - - - -inArch_Td           inArch_Td   
+                      Seg(source)       Seg(source)         Seg(source)
+        source_Tb:     -pdm_Td           -pdm_Td             -pdm_Td      
+                         COMPILEp           COMPILEp              COMPILEp
+                            \                    \                     \
+                             \  Seg(Unbound_obj)  \  Seg(Unbound_obj)   \  Seg(Unbound_obj)
+   Unbound_obj_Tb:            \  -pdm_Td           \  -pdm_Td            \  -pdm_Td      
+                               \  COMPILEp          \  COMPILEp           \  COMPILEp
+                                \   /                \   /                 \   /
+                                sP oP                sP oP                 sP oP
+                              COMPILE              COMPILE               COMPILE
+       COMPILE_Tb:             -COMPILE_Td          -COMPILE_Td           -COMPILE_Td            
+
+/* ========================================================================================== */
+%page;
+prepare_archives:					/* Handle BOUNDOBJ.operation = ADD & UPDATE	        */
+     proc (aC, aBOUNDOBJp);
+
+  dcl 1 aC aligned like C;
+
+  dcl  aBOUNDOBJp ptr,
+      1 aBOUNDOBJ aligned like BOUNDOBJ based (aBOUNDOBJp);
+
+/* ------------------------------------------------------------------------------------------
+  1) For each BOUNDOBJ:
+      - Add a Seg(object_arch) for each object archive.
+         a) Set operation = "UPDATE" for:
+	   - an object archive having a corresponding source archive attached 
+	     to the BOUNDOBJ (the source archive is being modified); or
+	   - the object archive containing any modified bindfile.
+         b) Set operation = "BIND-INPUT" for all other object archives.
+   ------------------------------------------------------------------------------------------ */
+
+  dcl  archive_handled (6) bit(1) aligned;		/* Support up to 6 source/object archives per BOUNDOBJ    */
+						/*  - 4 archives is max used by any current BOUNDOBJ now. */
+  dcl  archI_char char(12) var;			/* Archive sequence digit extracted from archive_name     */
+  dcl  archI fixed bin;				/*  - That digit converted to binary.		        */
+  dcl  NO_archI char(4) var int static options(constant) init("");
+
+  dcl 1 sArch aligned like Seg based (sArchP),
+       sArchP ptr;
+
+     if aBOUNDOBJ.sourceArchsN = 1 then			/* Handle most common case: 1 source/object archive       */
+						/*  - This count was set for existing bound object when   */
+						/*    BOUNDOBJ was found in the Multics Library; or was   */
+						/*    a count of archives in install dir for a BOUNDOBJ   */
+						/*    being ADDed.				        */
+	call add_object_arch (aBOUNDOBJp, NO_archI, aBOUNDOBJ.operation, 
+	     Tlist_first_item (addr(aBOUNDOBJ.sourceArchs_Tb)) );
+						/*  - oArch.sArchP -> Seg(source_arch) after this call.   */
+     else 
+MULTI_SOURCE_ARCHS:					/* Multi source/object archives case.		        */
+     do;  
+	archive_handled(*) = F;
+
+SOURCE_ARCH:
+	do sArchP = Tlist_first_item (addr(aBOUNDOBJ.sourceArchs_Tb))
+	     repeat Tlist_last_item  (addr(sArch.archs_Td))  while (sArchP ^= null() );
+						/* Only Seg(source_arch) being UPDATEd or ADDed are in    */
+						/*  this list.  They are NOT in archI order.	        */
+
+	     archI_char = after (before (sArch.name, sSuffix), ".");
+	     if verify(archI_char, "0123456789") ^= 0 then do;
+		call ssu_$print_message (aC.sciP, mbuild_et_$unexpected_event, 
+		     "Ignoring archive with improper archive number in: ^a ^a", sArch.type, sArch.name);
+		goto NEXT_SOURCE_ARCH;		/* Verify number field contains only digits.	        */
+		end;				/*  (Avoid a conversion error.)		        */
+
+	     archI = binary(archI_char);		/*  - get archive number:  _.I.s.archive	        */
+
+	     call add_object_arch (aBOUNDOBJp, "." || archI_char, sArch.operation, sArchP);
+						/*  - add an equivalent Seg(object_arch) to BOUNDOBJ      */
+						/*  - oArch.sArchP -> Seg(source_arch) after this call.   */
+	     archive_handled(archI) = T;		/*  - remember we've handled that Seg(object_arch)        */
+NEXT_SOURCE_ARCH:
+	     end SOURCE_ARCH;
+						/* Handle a new/changed bindfile.		        */
+	if  aBOUNDOBJ.bindfileP ^= null() & ^archive_handled(1)  then do;
+	     archive_handled(1) = T;			/* RULE: bindfile always stored in first archive.	        */
+	     call add_object_arch (aBOUNDOBJp, ".1", aBOUNDOBJ.operation, null() );
+	     end;
+
+	do archI = 1 to aBOUNDOBJ.sourceArchsN;		/* Mark other Seg(object_arch).operation = BIND-INPUT     */
+	     if ^archive_handled(archI) then do;
+		archI_char = ltrim(char(archI));
+		call add_object_arch (aBOUNDOBJp, "." || archI_char, "BIND-INPUT", null() );
+		end;
+	     end;
+
+	end MULTI_SOURCE_ARCHS;
+%page;
+/* ------------------------------------------------------------------------------------------
+  2) At this point, the Seg(source_arch) have no corresponding segment in the install dir,
+     unless: 
+      - the Seg(source_arch).operation = ADD:
+         - ADDing a new Seg(Bound_obj) to the library; or
+         - ADDing a new Seg(source_arch) to an existing bound segment.
+      - a prior archive_prep request has left source archive segments in the install dir.
+
+     For each Seg(source_arch).operation = "UPDATE":
+      - Call library_fetch for each missing Seg(source_arch), to bring it into the install dir.
+      - Update/add/delete Seg(source) components into each archive.
+
+     New/changed source files are not removed from the install dir as source archives are updated. 
+     (POLICY: segments in the original scan_Tb list are never deleted from the install dir.)
+
+     NOTE: Archives being ADDed are already present in install directory, containing their 
+	 ADDed components.  They are not modified by this request in any way.
+   ------------------------------------------------------------------------------------------ */
+
+  dcl 1 object aligned like Seg based(objectP),
+       objectP ptr;
+
+  dcl 1 source aligned like Seg based(sourceP),
+       sourceP ptr;
+
+  dcl 1 COMP aligned like COMPILE based (COMPp),
+       COMPp ptr;
+
+  dcl 1 delS aligned like delete_options;
+          string (delS) = F;
+	delS.segment, delS.raw = T;
+
+SARCH:
+     do sArchP = Tlist_first_item (addr(aBOUNDOBJ.sourceArchs_Tb))
+	repeat Tlist_last_item  (addr(sArch.archs_Td))  while (sArchP ^= null() );
+
+	if sArch.operation = "UPDATE" then 
+SARCH_UPDATE:
+	do;
+	     if  mbuild_data_$exists_Seg (addr(bld), sArchP)  then do;
+						/* Seg(source_arch) exists from earlier build attempt?    */
+		call delete_$path (bld.directory, (sArch.name), string(delS), "", code);
+		if code ^= 0 then			/*  - Delete it, so archive_prep can be done again.       */
+		     call ssu_$print_message (aC.sciP, code, "Deleting  ^a: ^a", sArch.type, sArch.name);
+		end;
+
+	     call mbuild_$request (aC.sciP, "^2/library_fetch ^a -lb ^a", T, sArch.name, sArch.library);
+	     if  ^mbuild_data_$exists_Seg (addr(bld), sArchP)  then do;
+		call ssu_$print_message (aC.sciP, mbuild_et_$archive_missing, "library_fetch failed for ^a: ^a",
+		     sArch.type, sArch.name);		/*  - Complain if library_fetch failed.		        */
+		goto NEXT_SARCH;
+		end;
+
+	     do sourceP = Tlist_first_item (addr(sArch.inArch_Tb))
+		 repeat Tlist_next_item  (addr(source.inArch_Td))  while (sourceP ^= null() );
+						/* Update source files in the source_arch for deletions   */
+		if source.operation = "DELETE" then
+		     call mbuild_$request (aC.sciP, "   archive d ^a ^a", T, sArch.name, source.name);
+
+		end;
+
+	     do sourceP = Tlist_first_item (addr(sArch.inArch_Tb))
+		 repeat Tlist_next_item  (addr(source.inArch_Td))  while (sourceP ^= null() );
+						/* Update source files in the source_arch: REPLACE/ADDs   */
+
+		if source.operation = "DELETE" then;	/* Skip "DELETE" operations in this loop.	        */
+						/*  - They are done in loop above.  Not skipping them     */
+						/*    causes code below to try to "ADD" those files.      */
+
+		else if  source.operation = "REPLACE" then do;
+		     if  mbuild_data_$replacing_identical_Seg (addr(bld), sourceP)  then 
+			call ssu_$print_message (aC.sciP, mbuild_et_$identical_segments,
+			     "^/^-Skipping REPLACE of source: ^a  IN: ^a", source.name, source.library);
+		     else goto SOURCE_ADD;
+		     end;
+
+		else do;				/* source.operation = "ADD"			        */
+SOURCE_ADD:	     if mbuild_data_$exists_Seg (addr(bld), sourceP) then
+			call mbuild_$request (aC.sciP, "   archive ^[u^;a^] ^a ^a", T, 
+			     source.operation = "REPLACE", sArch.name, source.name);
+		     else call ssu_$print_message (aC.sciP, mbuild_et_$source_missing, 
+			"Cannot update source_arch for file ^a: ^a", source.type, source.name);
+		     end;
+		end;
+	     end SARCH_UPDATE;
+
+NEXT_SARCH:
+	end SARCH;
+%page;
+/* ------------------------------------------------------------------------------------------
+  3) At this point, the Seg(object_arch) have no corresponding segment in the install directory.
+      - Call library_fetch for each Seg(object_arch).operation = "UPDATE" , to bring it 
+        into the install directory for updating.
+
+      - If any Seg(bindfile) is in the install directory, update it into its Seg(object_arch).  
+        The segment represented by Seg(bindfile) remains in the install directory.
+        (POLICY: segments in the original scan_Tb list are never deleted from the install dir.)
+
+      - Update/add/delete Seg(Unbound_obj) components in each Seg(object_arch) archive to be modified.
+        The archive command deletes segments represented by Seg(Unbound_obj) as they are updated 
+        into their object archive.  The Seg(Unbound_obj) structures are then disconnected.
+
+   ------------------------------------------------------------------------------------------ */
+
+  dcl  object_name char(32) var;
+  dcl  source_prefix char(32) var;
+  dcl  source_suffix char(12) var;
+
+  dcl 1 bindfile aligned like Seg based (bindfileP),
+       bindfileP ptr;
+
+     bindfileP = aBOUNDOBJ.bindfileP;			/* Reference Seg(bindfile) to be updated, if any.	        */
+
+OARCH:
+     do oArchP = Tlist_first_item (addr(aBOUNDOBJ.objectArchs_Tb))
+	repeat Tlist_last_item  (addr(oArch.archs_Td))  while (oArchP ^= null() );
+
+	if  oArch.operation = "UPDATE"  |
+	    oArch.operation = "ADD"  then		/* Skip Seg(object_arch).operation = BIND-INPUT 	        */
+OARCH_UPDATE_ADD:
+	do;
+	     if  mbuild_data_$exists_Seg (addr(bld), oArchP)  then do;
+						/* Seg(object_arch) exists from earlier build attempt?    */
+		call delete_$path (bld.directory, (oArch.name), string(delS), "", code);
+		if code ^= 0 then			/*  - Delete it, so archive_prep can be done again.       */
+		     call ssu_$print_message (aC.sciP, code, "Deleting  ^a: ^a", oArch.type, oArch.name);
+		end;				/* NOTE: Because we verified a compile request was done   */
+						/*   we can safely delete object archives that may hold   */
+						/*   an earlier version of an object seg being updated.   */
+						/*   Latest version now attached again to COMPILE struct. */
+
+	     if oArch.operation = "UPDATE" then do;
+		call mbuild_$request (aC.sciP, "^2/library_fetch ^a -lb ^a", T, oArch.name, oArch.library);
+		if  ^mbuild_data_$exists_Seg (addr(bld), oArchP)  then do;
+		     call ssu_$print_message (aC.sciP, mbuild_et_$archive_missing, "library_fetch failed for ^a: ^a",
+			oArch.type, oArch.name);
+		     goto NEXT_OARCH;
+		     end;
+		end;
+	     else if oArch.operation = "ADD" then do;
+		call mbuild_$banner (aC.sciP, "^2/Fabricating new ^a: ^a", T, oArch.type, oArch.name);
+		end;
+
+	     if bindfileP ^= null() then do;		/* Time to update the bindfile in this archive.	        */
+		if bindfile.archive_name = oArch.name then do;
+		     if bindfile.operation = "DELETE" then
+			call mbuild_$request (aC.sciP, "   archive d ^a ^a", T, oArch.name, bindfile.name);
+		     else do;			/* bindfile.operation = "REPLACE" or "ADD"	        */
+			if mbuild_data_$exists_Seg (addr(bld), bindfileP) then
+			     call mbuild_$request (aC.sciP, "   archive ^[u^;a^] ^a ^a", T, 
+				bindfile.operation = "REPLACE", oArch.name, bindfile.name);
+			else call ssu_$print_message (aC.sciP, mbuild_et_$bindfile_missing, 
+			     "Cannot update object_arch for file ^a: ^a", bindfile.type, bindfile.name);
+			end;
+		     end;
+		end;
+
+	     sArchP = oArch.sArchP;			/* Access object components to be updated via sources     */
+	     if sArchP = null() then			/*  REPLACE/ADDed in Seg(source_archive) and associated   */
+		goto NEXT_OARCH;			/*  COMPILE structure.			        */
+	     
+SOURCE_TO_OBJECT:
+	     do sourceP = Tlist_first_item (addr(sArch.inArch_Tb))
+		 repeat Tlist_next_item  (addr(source.inArch_Td))  while (sourceP ^= null() );
+
+		if source.operation = "DELETE" then do; /* For source.operation = "DELETE", there is no COMPILE   */
+		     segtP = source.seg_typeP;	/*  attached to source, and no Seg(Unbound_obj).name.     */
+						/*  Calculate object name that would have been produced   */
+						/*  by a compile (algorithm taken from mbuild_compile_).  */
+
+		     source_suffix = mbuild_info_find_$suffix_by_type_ID (segt.type_ID);
+		     source_prefix = reverse (after (reverse (source.name), reverse(source_suffix)));
+		     object_name = source_prefix || segt.object_suffix;
+
+		     call mbuild_$request (aC.sciP, "   archive d ^a ^a", T, oArch.name, object_name);
+		     end;
+		
+		else do;				/* source.operation = "REPLACE" or "ADD"	        */
+		     objectP = null();		/* Access Seg(Unbound_obj) structure via objectP ptr.     */
+		     if source.COMPILEp ^= null() then do;
+			COMPp = source.COMPILEp;
+			if COMPp ^= null() then
+			     objectP = COMP.objectP;
+			end;
+		     if objectP = null() then do;
+			call ssu_$print_message (aC.sciP, mbuild_et_$no_Seg, 
+			     "Cannot update object_arch with compile output of ^a: ^a", source.type, source.name);
+						/* Since Seg(Unbound_obj) does not exist, error message   */
+			goto NEXT_OARCH;		/*  must reference this failure via source file name.     */
+			end;
+
+		     if mbuild_data_$exists_Seg (addr(bld), objectP) then do;
+			call mbuild_$request (aC.sciP, "   archive ^[udf^;adf^] ^a ^a", T, 
+			     object.operation = "REPLACE", oArch.name, object.name);
+
+			if ^mbuild_data_$exists_Seg (addr(bld), objectP) then do;
+			     call mbuild_data_$disconnect_Seg (objectP);
+			     end;			/* object successfully deleted by archive udf/adf;        */
+						/*  so disconnect its Seg(Unbound_obj) structure.	        */
+			end;
+		     else do;
+			call ssu_$print_message (aC.sciP, mbuild_et_$object_missing, 
+			     "Cannot update object_arch for file ^a: ^a", object.type, object.name);
+			goto NEXT_OARCH;
+			end;
+		     end;
+
+		end SOURCE_TO_OBJECT;
+	     end OARCH_UPDATE_ADD;
+
+NEXT_OARCH:
+	end OARCH;
+
+     end prepare_archives;
+%page;
+add_object_arch:
+     proc (aBOUNDp, AarchNo, Aoperation, Asource_archP);
+
+  dcl  aBOUNDp ptr,
+      1 aBOUND aligned like BOUNDOBJ based (aBOUNDp);
+  dcl  AarchNo char(4) var;
+  dcl  Aoperation char(12) var;
+  dcl  Asource_archP ptr;
+
+  dcl  archive_name char(32) var;
+
+     archive_name = aBOUND.name || AarchNo || oSuffix;
+     oArchP = mbuild_data_$get_Seg (addr(bld), "object_arch", archive_name, 
+			      aBOUND.library || ".object", "UPDATE", no_containing_archive);
+     oArch.operation = Aoperation;
+     oArch.BOUNDOBJp = aBOUNDp;
+     if Asource_archP ^= null() then
+	oArch.sArchP = Asource_archP;
+     call Tlist_add_to_tail (addr(bld.object_arch_Tb), addr(oArch), addr(oArch.pdm_Td));
+     call Tlist_add_to_tail (addr(aBOUND.objectArchs_Tb), addr(oArch), addr(oArch.archs_Td));
+
+     end add_object_arch;
+
+%page;
+/* ------------------------------------------------------------------------------------------
+  At this point, parts of the internal representation relating to sort_archives are shown below.  
+
+  build_data elements   (after prepare_archives)
+  - - - - - - - - - -
+   object_arch_Tb:             -pdm_Td                  -pdm_Td                  -pdm_Td
+                              Seg(object_arch)         Seg(object_arch)         Seg(object_arch)
+                                operation=UPDATE         operation=UPDATE         operation=BIND-INPUT
+                                archs_Td- - - - - - - -  archs_Td- - - - - - - -  archs_Td
+                                       \          
+      bindfile_Tb:                      \                        -pdm_Td
+                                        objectArchs_Tb          Seg(bindfile)
+                                        bindfileP - - - - - - - - BOUNDOBJp
+                                      BOUNDOBJ
+      BOUNDOBJ_Tb:                     -BOUNDOBJ_Td   
+                                        sourceArchsN
+                                        sourceArchs_Tb   
+                                       /
+                                archs_Td- - - - - - - - - archs_Td
+                              Seg(source_arch)          Seg(source_arch)
+   source_arch_Tb:             -pdm_Td                   -pdm_Td
+                                inArch_Tb                 inArch_Tb   
+/* ------------------------------------------------------------------------------------------ */
+
+sort_archives:
+     proc (aC, aBNDp);
+
+  dcl 1 aC aligned like C;
+
+  dcl  aBNDp ptr,
+      1 aBND aligned like BND based (aBNDp);
+
+  dcl  oArch_paths (aBND.sourceArchsN) char(168) var,	/* Caller ensures sourceArchsN >= 1.  This is valid PL/I  */
+       sArch_paths (aBND.sourceArchsN) char(168) var,
+      (pathI, oPathN, sPathN) fixed bin;
+
+/* ----------------------------------------------------------------------
+    - Get pathname(s) for source_arch(s) and object_arch(s) being modified.
+       NOTE: If only the .bind file is being modified, it is possible 
+             that no source_arch(s) are being modified.
+   ---------------------------------------------------------------------- */
+
+     oPathN, sPathN = 0;
+     oArch_paths(*), sArch_paths(*) = "";     
+
+     do sArchP = Tlist_first_item (addr(aBND.sourceArchs_Tb))
+	repeat Tlist_next_item  (addr(sArch.archs_Td))  while ( sArchP ^= null() );
+	sPathN = sPathN + 1;			/* All source archives in this thread are being modified  */
+	sArch_paths(sPathN) = sArch.name;
+	end;
+     
+     do oArchP = Tlist_first_item (addr(aBND.objectArchs_Tb))
+	repeat Tlist_next_item  (addr(oArch.archs_Td))  while ( oArchP ^= null() );
+	if  oArch.operation ^= "BIND-INPUT"  then do;	/* If object archive is being modified, get its path      */
+	     oPathN = oPathN + 1;
+	     oArch_paths(oPathN) = oArch.name;
+	     end;
+	end;
+
+/* ----------------------------------------------------------------------
+    - Invoke archive_sort command (which is also a hidden mbuild request)
+      for each archive being modified: 
+        first source archive(s); 
+        then object archive(s).
+       NOTE: Sequence in which numbered archives are sorted is irrelevant 
+	   to sorting components of individual archives.
+   ---------------------------------------------------------------------- */
+     if  sPathN + oPathN > 0  then do;
+	call mbuild_$banner (aC.sciP, "^2/Sorting archives that were modified.", T);
+	do pathI = 1 to sPathN;
+	     call mbuild_$request (aC.sciP, "   archive_sort ^a", T, sArch_paths(pathI) );
+	     end;
+	do pathI = 1 to oPathN;
+	     call mbuild_$request (aC.sciP, "   archive_sort ^a", T, oArch_paths(pathI) );
+	     end;
+	end;
+
+     end sort_archives;
+%page;
+/* ------------------------------------------------------------------------------------------
+  At this point, parts of the internal representation relating to bind_archives are shown below.  
+
+  build_data elements   (after prepare_archives)
+  - - - - - - - - - -
+   object_arch_Tb:             -pdm_Td                  -pdm_Td                  -pdm_Td
+                              Seg(object_arch)         Seg(object_arch)         Seg(object_arch)
+                                operation=UPDATE         operation=UPDATE         operation=BIND-INPUT
+                                archs_Td- - - - - - - -  archs_Td- - - - - - - -  archs_Td
+                                       \          
+      bindfile_Tb:                      \                        -pdm_Td
+                                        objectArchs_Tb          Seg(bindfile)
+                                        bindfileP - - - - - - - - BOUNDOBJp
+                                      BOUNDOBJ
+      BOUNDOBJ_Tb:                     -BOUNDOBJ_Td   
+                                        sourceArchsN
+                                        sourceArchs_Tb   
+                                       /
+                                archs_Td- - - - - - - - - archs_Td
+                              Seg(source_arch)          Seg(source_arch)
+   source_arch_Tb:             -pdm_Td                   -pdm_Td
+                                inArch_Tb                 inArch_Tb   
+                               /                               \
+                        inArch_Td - - - - inArch_Td           inArch_Td   
+                      Seg(source)       Seg(source)         Seg(source)
+        source_Tb:     -pdm_Td           -pdm_Td             -pdm_Td      
+                        COMPILEp          COMPILEp            COMPILEp
+   Unbound_obj_Tb:          \   /               \   /               \   /
+                            sP oP               sP oP               sP oP
+                          COMPILE             COMPILE             COMPILE
+       COMPILE_Tb:         -COMPILE_Td         -COMPILE_Td         -COMPILE_Td   
+/* ------------------------------------------------------------------------------------------ */
+
+bind_archives:
+     proc (aC, aBNDp);
+
+  dcl 1 aC aligned like C;
+
+  dcl  aBNDp ptr,
+      1 aBND aligned like BND based (aBNDp);
+
+  dcl  map_list fixed bin(2) init(1);
+     if aC.listS then map_list = 3;
+     else if aC.mapS  then map_list = 2;
+
+  dcl  arch_paths (aBND.sourceArchsN) char(168) var;	/* Caller ensures sourceArchsN >= 1.  This is valid PL/I  */
+
+/* ----------------------------------------------------------------------
+    - Get pathname(s) for object_arch(s) input to the bind command.
+   ---------------------------------------------------------------------- */
+
+     if aBND.sourceArchsN = 1 then do;			/* BOUNDOBJ with one archive is simple.		        */
+	oArchP = Tlist_first_item (addr(aBND.objectArchs_Tb));
+	arch_paths(1) = oArch.name;
+	end;
+
+     else do;					/* BOUNDOBJ with several archives requires more prep.     */
+
+  dcl  lib_object_dir (2) char(200) var,
+       lib_pathsN fixed bin;
+  dcl  oArchN fixed bin,
+       oArchN_suffix char(20) var,
+       oArch_name char(32) var;
+
+	call mbuild_library_$library_directories (aBND.library || ".object", lib_object_dir, lib_pathsN, code);
+	if lib_pathsN ^= 1 then do;			/* - Get library directory path for BIND-INPUT archs      */
+	     call ssu_$print_message (aC.sciP, mbuild_et_$unexpected_event, "BOUNDOBJ: ^a  has inexact library: ^a", 
+		aBND.name, aBND.library);
+	     return;
+	     end;
+
+	do oArchN = 1 to aBND.sourceArchsN;		/* - For each Seg(object_arch)...		        */
+						/*   Process archs in numeric sequence, in case there is  */
+						/*    no Order statement in their bindfile.	        */
+						/* RULE: Order statement required, naming all components. */
+	     oArchN_suffix = "." || ltrim(char(oArchN)) || oSuffix;
+	     oArch_name = aBND.name || oArchN_suffix;	/*    - Construct object_arch name.		        */
+
+	     do oArchP = Tlist_first_item (addr(aBND.objectArchs_Tb))
+		repeat Tlist_next_item  (addr(oArch.archs_Td)) while ( oArchP ^= null() );
+		if oArch.name = oArch_name then	/*    - Find it in BOUNDOBJ's list of object_arch(s)      */
+		     goto FOUND_OARCH;
+		end;
+	     call ssu_$print_message (aC.sciP, mbuild_et_$no_object_arch, "Searching BOUNDOBJ: ^a  for object_arch: ^a",
+		aBND.name, oArch_name);		/* This should never happen!  Code flaw.	        */
+	     return;
+
+FOUND_OARCH:   if oArch.operation = "BIND-INPUT" then	/* Add library path  			        */
+		arch_paths(oArchN) = lib_object_dir(1) || ">" || oArch.name;
+	     else arch_paths(oArchN) = oArch.name;	/*  vs. path in wdir for archs being UPDATEd or ADDed     */
+	     end;
+	end;
+
+
+/* ----------------------------------------------------------------------
+    - Invoke bind command (which is also a hidden mbuild request).
+   ---------------------------------------------------------------------- */
+     call mbuild_$request (aC.sciP, "^2/ bind ^v( ^a^) ^[^; -map^; -list^]", T, dim(arch_paths,1), arch_paths, map_list);
+
+     
+/* ----------------------------------------------------------------------
+    - Check for bind outputs: Bound_obj, listing
+   ---------------------------------------------------------------------- */
+
+  dcl 1 iSeg aligned like Seg based (iSegP),		/* Seg structure for Bound_obj and listing segments.      */
+       iSegP ptr;
+
+     iSegP = attach_derived_Seg (aC, aBNDp, aBND.Bound_objP, aBND.name, aBND.library, aBND.operation);
+     if iSegP ^= null then do;
+	aBND.Bound_objP = iSegP;
+	iSeg.BOUNDOBJp = aBNDp;
+	call Tlist_add_to_tail (addr(bld.Bound_obj_Tb), iSegP, addr(iSeg.pdm_Td));
+	end;
+
+     iSegP = attach_derived_Seg (aC, aBNDp, aBND.listingP, aBND.name || lSuffix, aBND.library, aBND.operation);
+     if iSegP ^= null then do;
+	aBND.listingP = iSegP;
+	iSeg.BOUNDOBJp = aBNDp;
+	call Tlist_add_to_tail (addr(bld.listing_Tb), iSegP, addr(iSeg.pdm_Td));
+	end;
+
+     end bind_archives;
+%page;
+/* ------------------------------------------------------------------------------------------
+  At this point, parts of the internal representation relating to bind_archives are shown below.  
+
+  build_data elements   (after bind_archives)
+  - - - - - - - - - -
+   object_arch_Tb:        -pdm_Td                   -pdm_Td                  -pdm_Td
+                         Seg(object_arch)          Seg(object_arch)         Seg(object_arch)
+                                archs_Td- - - - - -  archs_Td- - - - - - - -  archs_Td
+                                       \   
+      bindfile_Tb:                      \                     -pdm_Td
+                                     objectArchs_Tbase       Seg(bindfile)
+                                     bindfileP - - - - - - - - BOUNDOBJp
+                                   BOUNDOBJ
+      BOUNDOBJ_Tb:                  -BOUNDOBJ_Tdata
+                                     sourceArchsN
+                                     bound_objP - - - - - - - -BOUNDOBJp
+                                     sourceArchs_Tb          Seg(Bound_obj)
+     Bound_obj_Tb:                                            -pdm_Td
+/* ------------------------------------------------------------------------------------------ */
+%page;
+attach_derived_Seg:
+     proc (aC, aBNDp, AitemP, Aname, Alibrary, Aoperation) returns(ptr);
+
+  dcl 1 aC aligned like C;
+  dcl  aBNDp ptr,
+      1 aBND aligned like BOUNDOBJ based (aBNDp);
+
+  dcl  AitemP ptr,					/* Element ptr within aBND to be updated.	        */
+       Aname char(32) var,				/* Name of expected segment.			        */
+       Alibrary char(32) var,				/* <lib-name> component of full library name.	        */
+       Aoperation char(12) var;			/* BOUNDOBJ.operation			        */
+
+  dcl 1 dSegt aligned like mbuild_info.seg_type_info based(dSegtP),
+       dSegtP ptr; 
+  dcl 1 dSeg aligned like Seg based (dSegP),
+       dSegP ptr;
+  dcl 1 d aligned like Seg.common;			/* Seg-like structure to pass to mbuild_data_$exists_Seg  */
+
+  dcl  revised_library char(32) var;			/* Change <lib-name>  to  <lib-name>.<dir-name>	        */
+  dcl  revised_operation char(12) var;			/* Change UPDATE  to  REPLACE			        */
+
+     dSegP = addr(d);				/* Get temporary storage for a Seg.header.	        */
+     dSeg.info = "";
+     dSeg.struct = "Seg";
+     dSeg.name = Aname;				/*  - Fill in name of segment we're looking for.	        */
+
+     dSegtP = mbuild_info_find_$seg_type_for_seg_name (dSeg.name);
+						/* Get Seg().name characteristics.		        */
+
+     if  mbuild_data_$exists_Seg (addr(bld), addr(dSeg)) then do;
+						/* Does this segment reside in install directory?	        */
+	if AitemP ^= null() then		
+	     if AitemP->Seg.name = dSeg.name then	/* Reuse Seg which existed before, was rebound.	        */
+	          return ( null() );			/*  - It's already linked to BOUNDOBJ.		        */
+	     else					/*  - How could there be a differently named segment?     */
+		call mbuild_data_$disconnect_Seg (AitemP);
+						/*    Get rid of this earlier Seg structure.	        */
+
+/* ----------------------------------------------------------------------
+    Get target library dir type.
+   ---------------------------------------------------------------------- */
+	revised_library = mbuild_library_$replace_library_component (Alibrary, "", dSegt.default_library);
+
+/* ----------------------------------------------------------------------
+    Get operation.
+    BOUNDOBJ's operation may be: ADD UPDATE DELETE
+     - DELETE case never gets to this point in code.
+     - Map BOUNDOBJ.operation = UPDATE  to  Seg(Bound_obj).operation = REPLACE
+   ---------------------------------------------------------------------- */
+	revised_operation = Aoperation;
+	if revised_operation = "UPDATE" then
+	     revised_operation = "REPLACE";
+
+/* ----------------------------------------------------------------------
+    Create Seg() structure for derived Seg(bound_obj) or Seg(listing).
+   ---------------------------------------------------------------------- */
+	dSegP = mbuild_data_$get_Seg (addr(bld), dSegt.mbuild_type, dSeg.name, 
+			          revised_library, revised_operation, no_containing_archive);
+	return (dSegP);
+	end;
+
+     else do;					/* Bind didn't produce seg?  Disconnect any Seg()	        */
+	if dSegt.build_paradigm = PDM_Bound_obj then
+	     call ssu_$print_message (aC.sciP, mbuild_et_$bind_fails, "BOUNDOBJ: ^a", aBND.name);
+	call mbuild_data_$disconnect_Seg (AitemP);
+	end;
+     return ( null() );
+
+     end attach_derived_Seg;
+%page;
+/* ======================================================================
+ 
+   ENTRYPOINT:  clean
+
+   Adds derived-content segments created by an archive_prep request to the
+   list of per-request Segs being built by the clean request,
+   containing Segs eligible for cleaning/removal.
+   ====================================================================== */
+
+clean:
+     entry (Abuild_dataP, Aclean_requestP);
+     
+  dcl  Aclean_requestP ptr;
+     
+     requestP = Aclean_requestP;
+     
+     do BOUNDOBJp = Tlist_first_item (addr(bld.BOUNDOBJ_Tb))
+             repeat Tlist_next_item  (addr(BOUNDOBJ.BOUNDOBJ_Td)) while (BOUNDOBJp ^= null() );
+	do SegP = BOUNDOBJ.Bound_objP, BOUNDOBJ.listingP;
+	     if  SegP ^= null()  then 
+		if  mbuild_data_$exists_Seg (addr(bld), SegP)  then
+		     call Tlist_add_to_tail (addr(request.request_Tb), addr(Seg), addr(Seg.request_Td));
+	     end;
+	do sArchP = Tlist_first_item (addr(BOUNDOBJ.sourceArchs_Tb))
+	     repeat Tlist_next_item  (addr(sArch.archs_Td)) while (sArchP ^= null() );
+	     if sArch.operation ^= "ADD" then do;
+		if  mbuild_data_$exists_Seg (addr(bld), sArchP)  then
+		     call Tlist_add_to_tail (addr(request.request_Tb), addr(sArch), addr(sArch.request_Td));
+		end;
+	     end;
+	do oArchP = Tlist_first_item (addr(BOUNDOBJ.objectArchs_Tb))
+	     repeat Tlist_next_item  (addr(oArch.archs_Td)) while (oArchP ^= null() );
+	     if  mbuild_data_$exists_Seg (addr(bld), oArchP)  then
+		call Tlist_add_to_tail (addr(request.request_Tb), addr(oArch), addr(oArch.request_Td));
+	     end;
+	end;
+
+     return;
+%page;
+/* ==========================================================================================
+
+   ENTRYPOINT:  prepared
+
+   Returns T if:  all archives needed for installation are present/updated in installation dir;
+                  all BOUNDOBJs are bound and ready for installation.
+
+       For BOUNDOBJ.operation = DELETE...
+        - does nothing.  The DELETE operation in build script triggers install_ec 
+           steps to actually delete all components of the bound segment.
+
+       For BOUNDOBJ.operation = UPDATE...
+        - fetches BOUNDOBJ.source_Arch_Tb  source archives to be updated;
+        - fetches BOUNDOBJ.object_Arch_Tb  object archives to be updated; 
+	 non-updated archives have .operation = BIND-INPUT
+	 and remain in library (not fetched);
+        - when binding succeeds:
+           - sets BOUNDOBJ.Bound_objP
+	 - if BOUNDOBJ.operation = UPDATE, sets Seg(Bound_obj).operation = REPLACE (needed by install_ec request)
+
+       For BOUNDOBJ.operation = ADD...
+        - source archive(s) populated with source components are original-content,
+	 supplied as input to the install dir.
+        - creates object archive(s) containing bindfile plus derived objects from
+	 compiling sources.
+        - sets BOUNDOBJ.Bound_objP when binding succeeds.
+
+     In either case, the prepped task is not complete if any of these 
+     pointer-chains ends in null() pointer or non-existing segments (except in DELETE cases).
+   ========================================================================================== */
+
+prepared:
+     entry (Abuild_dataP, Acompiled) returns (bit(1) aligned);
+
+  dcl  Acompiled bit(1) unal;
+
+  dcl  preppedS bit(1) aligned;
+
+     if  ^Acompiled  then				/* Must have compiler derived objects to archive/bind     */
+	return (F);
+
+     preppedS = ^Tlist_is_empty (addr(bld.BOUNDOBJ_Tb));
+     if  preppedS  then do;				/* If something in BOUNDOBJ_Tb list, check .Bound_objPs   */
+						/*  existence.  Actual segment must be in install dir.    */
+	do BOUNDOBJp = Tlist_first_item (addr(bld.BOUNDOBJ_Tb))
+                  repeat Tlist_next_item  (addr(BOUNDOBJ.BOUNDOBJ_Td))  while (BOUNDOBJp ^= null() );
+
+	     if  BOUNDOBJ.operation = "DELETE" then;	/*  - DELETE  bound seg: nothing to check	        */
+
+	     else do;                                	/*  - UPDATE/REPLACE or ADD: 			        */
+						/*     check bound archives and Bound_obj	        */
+	          if  BOUNDOBJ.Bound_objP = null()  then goto UNPREPPED;
+		SegP = BOUNDOBJ.Bound_objP;
+		if  ^mbuild_data_$exists_Seg (addr(bld), SegP)  then goto UNPREPPED;
+
+		do sArchP = Tlist_first_item (addr(BOUNDOBJ.sourceArchs_Tb))
+                         repeat Tlist_next_item  (addr(sArch.archs_Td))  while (sArchP ^= null() );
+		     if  ^mbuild_data_$exists_Seg (addr(bld), sArchP)  then
+			goto UNPREPPED;
+		     end;
+
+		do oArchP = Tlist_first_item (addr(BOUNDOBJ.objectArchs_Tb))
+                         repeat Tlist_next_item  (addr(oArch.archs_Td))  while (oArchP ^= null() );
+		     if  oArch.operation ^= "BIND-INPUT" then
+			if  ^mbuild_data_$exists_Seg (addr(bld), oArchP)  then
+			     goto UNPREPPED;
+		     end;
+		end;
+	     end;
+	end;
+     else preppedS = T;				/* No BOUNDOBJs?  Then no archives/Bound_obj to prepare.  */
+
+     return (preppedS);
+
+UNPREPPED:
+     return (F);
+
+%page;
+/* ------------------------------------------------------------
+ * Process print -control_arg arguments.
+ * ------------------------------------------------------------ */
+
+controlArgs:
+     proc (aC);
+
+  dcl 1 aC aligned like C;				/*  control arg specification data                   (in) */
+
+     do while (args_remain());
+	call ssu_$arg_ptr (aC.sciP, argI+1, argP, argL);	/* Conditionally read next arg to command/af/request      */
+					
+	if isControlArg(arg) then do;
+
+	     if       arg = "-ls"     | arg = "-list"    then aC.listS = T;
+	     else if                    arg = "-map"     then aC.mapS = T;
+	     else if  arg = "-ns"     | arg = "-no_sort" then aC.no_sortS = T;
+
+               else call ssu_$print_message (aC.sciP, error_table_$badopt, 
+		     "Ignoring unsupported control arg: ^a", arg);
+	     end;
+	
+	else do;					/* If arg not a -control_arg			        */
+	     call ssu_$print_message (aC.sciP, error_table_$badopt, 
+		"Ignoring unsupported operand: ^a", arg);
+	     end;
+
+	argI = argI + 1;				/* Record that we processed the arg just examined above.  */
+	end;
+
+     end controlArgs;
+%page;
+%include ssu_request_dcls_;
+%page;
+%include mbuild_request_parms_;
+%page;
+%include mbuild_info_;
+%page;
+%include mbuild_Tlist_;
+%page;
+%include mbuild_data_;
+%page;
+%include delete_options;
+
+     end mbuild_archive_;

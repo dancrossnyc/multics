@@ -1,0 +1,533 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(1986-01-01,GWMay), approve(), audit(), install():
+     old history comments.
+     Coded February 1969, R C Daley.
+     25 March 1970, R H Campbell.
+     9/77 by Noel I. Morris to use tape_mult_.
+     11/9/77 by Steve Herbst
+     Changed to call command_query_ for tape labels 02/28/80 S. Herbst
+     17 October 1980 by G. Palter to use preattached switches if requested.
+     Fixed to retry correctly after open fails 06/02/81 S. Herbst
+     84Feb01 by Art Beattie to allow longer tape labels to be used.
+     1984-03-25, BIM: Use async mode in tape_mult_
+     9 May 1985 by G. Palter to not try error_count/unmounts for preattached
+     switches.
+  2) change(1986-06-05,GWMay), approve(1986-07-07,MCR7445),
+     audit(1986-11-20,GDixon), install(1986-11-21,MR12.0-1223):
+     Moved call for "error_count" tally out of the write loop in wrbufout. The
+     result will be that the tape will continue to spin until the entire buffer
+     is emptied rather that synchonizing after each write. This should improve
+     dump time.
+     MCR7320 - added a command loop so that the operator may enter a new tape
+     label id after a bad mount.  This way if the wrong tape gets mounted, the
+     operator can deny the mount and give a correct tape id without stopping
+     the dump.
+  3) change(2018-08-21,Swenson), approve(2018-08-21,MCR10048),
+     audit(2018-08-22,GDixon), install(2018-08-27,MR12.6g-0015):
+     Added support for volume pools to hierarchy backup commands.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style2,idind30,indcomtxt */
+
+bk_output:
+     procedure;
+
+	dcl     uptr		        ptr;	/* ptr to user seg, or junk if we get a fault */
+	dcl     temp		        fixed bin,	/* Temporary storage. */
+	        code		        fixed bin (35),
+	        attach_descrip	        char (168),
+	        buffer		        pointer,	/* Pointer to output line buffer. */
+	        line		        character (132);
+						/* Output line buffer. */
+
+	dcl     answer		        char (64) aligned varying;
+          dcl     error_rnt                     entry variable options (variable);
+          dcl     requested                     char(32);
+          dcl     comment                       char(32);
+          dcl     volname                       char(32);
+          dcl     volume_pool_path              char(168);
+
+	dcl     (primary_dump_tape, secondary_dump_tape)
+				        static character (64),
+						/* Tape labels. */
+	        (iocbp1, iocbp2)	        ptr static,
+	        mounted		        static bit (1) initial (""b),
+						/* Flag to show tape mounted. */
+	        two_tapes		        bit (1) static,
+	        blanks		        char (4) static init (""),
+						/* To reset tape label */
+	        s			        character (1) static;
+						/* To make comments plural. */
+
+	dcl     1 header		        static,	/* Backup logical record header */
+		2 zz1		        character (32) initial (" z z z z z z z z z z z z z z z z"),
+		2 english		        character (56)
+				        initial ("This is the beginning of a backup logical record."),
+		2 zz2		        character (32) initial (" z z z z z z z z z z z z z z z z"),
+		2 hdrcnt		        fixed binary,
+		2 segcnt		        fixed binary;
+
+	dcl     end_of_tape_encountered       static options (constant) char (24) initial ("End of tape encountered.");
+
+	declare parse_tape_reel_name_	        entry (char (*), char (*)),
+	        backup_map_$error_line        entry options (variable),
+	        backup_map_$fs_error_line     entry (fixed bin (35), char (*), char (*), char (*)),
+	        (
+	        backup_map_$on_line,
+	        backup_map_$tapes
+	        )			        entry (pointer, fixed binary);
+
+%include iox_dcls;
+
+          dcl     com_err_                      entry options (variable);
+          dcl     sub_err_                      entry options (variable);
+	dcl     command_query_	        entry options (variable);
+          dcl     ioa_                          entry options (variable);
+	dcl     ioa_$rsnnl		        entry options (variable);
+          dcl     manage_volume_pool_$allocate entry (ptr, entry options (variable), char (*), char (*), char (*),
+                  fixed bin (35));
+          dcl     manage_volume_pool_$get_pool_path entry (ptr, entry, char(*), fixed bin(35));
+	dcl     error_table_$action_not_performed
+				        fixed bin (35) ext static,
+	        error_table_$dev_nt_assnd     fixed bin (35) ext static,
+	        error_table_$device_end       fixed bin (35) ext static;
+
+
+	dcl     (addr, addrel, divide, length, min, null, mod, rtrim, unspec)
+				        builtin;
+
+%include query_info;
+
+%include iox_modes;
+
+%include bk_ss_;
+
+%include backup_control;
+
+output_init:
+     entry (ntapes, wstat);				/* entry to initialize backup output procedure */
+	dcl     ntapes		        fixed bin;	/* 1 or 2 tapes */
+
+	if bk_ss_$no_output
+	then do;					/* No output */
+		wstat = 0;			/* Error code to zero */
+		go to exit;			/* Quit */
+	     end;
+
+	buffer = addr (line);			/* Set up pointer to output line buffer. */
+	if bk_ss_$preattached
+	then do;					/* caller has requested we use a specific I/O switch */
+		mounted = "1"b;			/* make sure I/O gets done */
+		two_tapes = "0"b;			/* act as if only a single tape is being made */
+		s = " ";
+		iocbp1 = bk_ss_$data_iocb;
+		wstat = 0;
+	     end;
+	else if mounted
+	then wstat = 0;				/* reset status code */
+	else do;					/* Mount a new set of tapes. */
+		if ntapes > 1 & ^bk_ss_$sub_entry
+		then do;				/* Decide how many tapes to use. */
+			two_tapes = "1"b;		/* Use two. */
+			s = "s";			/* Make comments plural. */
+		     end;
+		else if ntapes = 1
+		then do;
+			two_tapes = ""b;		/* Use one. */
+			s = " ";			/* Make comments singular. */
+		     end;
+		call mount (wstat);			/* mount first dump tape(s) */
+	     end;
+	if bk_ss_$mapsw
+	then /* Are we writing a map? */
+	     if wstat = 0
+	     then do;				/* Yes, did we succeed in attaching the tape(s)? */
+		     if two_tapes
+		     then /* Are we writing two tapes? */
+			call ioa_$rsnnl ("Primary tape label: ^a, secondary tape label: ^a.", line, temp,
+			     primary_dump_tape, secondary_dump_tape);
+		     else call ioa_$rsnnl ("Tape label: ^a.", line, temp, primary_dump_tape);
+		     call backup_map_$tapes (buffer, temp);
+						/* Write the comment in the map. */
+		end;
+	go to exit;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+output_finish:
+     entry;					/* to terminate backup dump */
+
+	if bk_ss_$no_output
+	then go to exit;				/* No output so quit. */
+
+	buffer = addr (line);			/* Set up pointer to output line buffer. */
+	if bk_ss_$preattached
+	then ;					/* nothing to do here */
+	else if bk_ss_$holdsw
+	then do;
+		call iox_$control (iocbp1, "error_count", addr (temp), code);
+		if code ^= 0
+		then do;				/* All OK? */
+flush_error:
+			call backup_map_$fs_error_line (code, "bk_output", "", "");
+unmo:
+			call unmount;		/* Unmount the tape anyway. */
+		     end;
+		if mounted
+		then if two_tapes
+		     then do;			/* Is the other tape mounted? */
+			     call iox_$control (iocbp2, "error_count", addr (temp), code);
+			     if code ^= 0
+			     then go to flush_error;	/* OK? */
+			end;
+	     end;
+	else call unmount;				/* unmount any reel(s) still mounted */
+	go to exit;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+wr_tape:
+     entry (lblptr, lblcnt, segptr, segcnt, wstat);	/* to write next backup record on tape */
+
+	dcl     lblptr		        pointer,	/* pointer to preamble area */
+	        lblcnt		        fixed binary,
+						/* length of preamble in words */
+	        segptr		        pointer,	/* pointer to segment (if any) */
+	        segcnt		        fixed binary,
+						/* length of segment (if any) in words */
+	        wstat		        fixed bin (35);
+						/* status code (returned) */
+
+	uptr = segptr;				/* copy this arg so we can mung it if err */
+	if bk_ss_$no_output
+	then do;					/* No output */
+		wstat = 0;			/* Zero error code */
+		go to exit;
+	     end;
+
+	if ^mounted
+	then do;
+		wstat = error_table_$dev_nt_assnd;
+		go to exit;
+	     end;
+	wstat = 0;
+	buffer = addr (line);			/* Set up pointer to output line buffer. */
+	header.hdrcnt = lblcnt;			/* pick up preamble length */
+	header.segcnt = segcnt;			/* and segment length */
+retry:
+	call wrout (addr (header), 32);		/* write out backup logical record header */
+	if code = error_table_$device_end
+	then go to enderr;				/* Check end of reel */
+	if code ^= 0
+	then go to tsterr;
+	temp = header.hdrcnt + 32 + 255;		/* adjust to write preamble thru next higher block */
+	temp = temp - mod (temp, 256) - 32;		/* 32 words are already written. */
+	call wrout (lblptr, temp);			/* write out preamble thru next higher 256-word block */
+	if code = error_table_$device_end
+	then go to enderr;				/* Check end of reel */
+	if code ^= 0
+	then go to tsterr;
+	if header.segcnt > 0
+	then do;					/* Is there any segment to write? */
+		temp = header.segcnt;
+		call wrbufout (uptr, temp);		/* write out segment thru next higher 256-word block */
+		if code = error_table_$device_end
+		then go to enderr;			/* Check end of reel */
+		if code ^= 0
+		then go to tsterr;
+	     end;
+exit:
+	return;					/* exit to caller */
+enderr:
+	call backup_map_$on_line (addr (end_of_tape_encountered), length (end_of_tape_encountered));
+	go to unm;				/* Go get new reel */
+tsterr:
+	call backup_map_$fs_error_line (code, "bk_output", "", "");
+
+unm:
+	if bk_ss_$preattached
+	then do;					/* preattached => not using tapes => can't unmount anything */
+		wstat = code;
+		go to exit;
+	     end;
+
+	call unmount;				/* unmount current tape(s) */
+	call output_init (-1, wstat);			/* mount next reel(s) */
+	if wstat = 0
+	then go to retry;
+	go to exit;				/* go to exit to caller on operator message */
+
+query_for_tape:
+	procedure (type, label, Squit_the_dump);
+	dcl     type		        character (*),
+						/* Type of tape (primary or secondary). */
+	        label		        character (64),
+						/* The label. */
+	        Squit_the_dump	        bit (1) aligned;
+	
+	     unspec (query_info) = "0"b;
+	     query_info.version = query_info_version_4;
+	     query_info.suppress_name_sw = "1"b;
+	     query_info.question_iocbp, query_info.answer_iocbp = null;
+	     call command_query_ (addr (query_info), answer, bk_ss_$myname, "Type ^a dump tape label:", type);
+	     label = answer;
+
+	     if label = "quit" | label = "q"
+		then Squit_the_dump = "1"b;
+
+	return;
+end query_for_tape;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+get_label:
+     procedure (type, label, Squit_the_dump);		/* Procedure to read label typed on console. */
+	dcl     type		        character (*),
+						/* Type of tape (primary or secondary). */
+	        label		        character (64),
+						/* The label. */
+	        Squit_the_dump	        bit (1) aligned;
+
+
+	Squit_the_dump = "0"b;
+
+          code = 0;
+          if bk_ss_$sub_entry then
+	     error_rnt = sub_err_;
+	else
+	     error_rnt = com_err_;
+
+	if bk_ss_$volume_pool_ptr = null () then
+	     call query_for_tape(type, label, Squit_the_dump);
+	else do;
+	     requested = "*";
+	     comment = bk_ss_$myname;
+	     volname = "";
+	     call manage_volume_pool_$get_pool_path(bk_ss_$volume_pool_ptr, error_rnt, volume_pool_path, code);
+	     if code ^= 0 then
+		volume_pool_path = "[unknown]";
+
+	     call manage_volume_pool_$allocate(bk_ss_$volume_pool_ptr, error_rnt, requested, comment, volname, code);
+	     if code ^= 0 then do;
+		call error_rnt(code, "bk_output", "Unable to allocate tape from volume pool ^a", volume_pool_path);
+		call query_for_tape(type, label, Squit_the_dump);
+		end;
+	     else
+		call ioa_ ("^a: Allocated tape ^a from volume pool ^a", bk_ss_$myname, volname, volume_pool_path);
+               label = volname;
+	end;
+
+	if ^Squit_the_dump then do;
+		if ^bk_ss_$debugsw
+		then /* caller wants privilege */
+		     label = rtrim (label) || ",sys";
+	end;
+	return;
+     end get_label;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+mount:
+     procedure (mount_status);			/* internal procedure to mount first or next reel(s) */
+	dcl     mount_status	        fixed bin (35);
+	dcl     Squit_the_dump	        bit (1) aligned;
+
+	mount_status = 0;
+	mounted = "0"b;
+	Squit_the_dump = "0"b;
+	iocbp1, iocbp2 = null;
+
+	do while (^mounted & ^Squit_the_dump);
+	     if bk_ss_$sub_entry
+	     then /* get first tape label from tape_entry */
+		call bk_ss_$control_ptr -> backup_control.tape_entry (primary_dump_tape);
+	     else /* else read it from the terminal */
+		call get_label ("primary", primary_dump_tape, Squit_the_dump);
+
+	     call mount_tape (Squit_the_dump, iocbp1, "bk_output_1", primary_dump_tape, mount_status);
+	end;					/* Do we need another tape? */
+	if two_tapes & mounted & mount_status = 0
+	then do;
+		mounted = "0"b;
+		do while (^mounted & ^Squit_the_dump);
+		     call get_label ("secondary", secondary_dump_tape, Squit_the_dump);
+
+		     call mount_tape (Squit_the_dump, iocbp2, "bk_output_2", secondary_dump_tape, mount_status);
+		end;
+	     end;
+	return;
+
+
+mount_tape:
+     proc (Squit, Piocb, switch_name, tape_id, code);
+
+	dcl     Squit		        bit (1) aligned,
+	        Piocb		        ptr,
+	        switch_name		        char (11),
+	        tape_id		        char (64),
+	        code		        fixed bin (35);
+
+	code = 0;
+
+	if Squit
+	then do;
+		code = error_table_$action_not_performed;
+		call backup_map_$error_line (code, "bk_output", "Aborted tape mount.");
+		if iocbp1 ^= null
+		then do;
+			call iox_$close (iocbp1, (0));
+			call iox_$detach_iocb (iocbp1, (0));
+		     end;
+		return;
+	     end;
+
+	call parse_tape_reel_name_ (tape_id, attach_descrip);
+	call iox_$attach_name (switch_name, Piocb, "tape_mult_ " || attach_descrip || " -write", null (), code);
+						/* null refptr to use user-supplied tape_mult_ */
+	if code ^= 0
+	then call backup_map_$fs_error_line (code, "bk_output", tape_id, "");
+	else do;
+		call iox_$open (Piocb, Stream_output, "0"b, code);
+		if code = 0
+		then mounted = "1"b;
+		else do;
+			call backup_map_$fs_error_line (code, "bk_output", tape_id, "");
+			code = 0;
+			call iox_$detach_iocb (Piocb, code);
+			if code ^= 0
+			then call backup_map_$fs_error_line (code, "bk_output", tape_id, "");
+		     end;
+	     end;
+	if code = 0
+	then call iox_$modes (Piocb, "async", (""), (0));
+
+	return;
+     end mount_tape;
+     end mount;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+wrbufout:
+     proc (wrptr, wrcnt);				/* internal proc to write user seg to tape */
+	dcl     wrptr		        ptr;
+	dcl     wrcnt		        fixed bin;
+	dcl     ttbuf		        (words_to_write) fixed bin (35) aligned based;
+	dcl     zzbuf		        (1024) fixed bin (35) aligned based;
+	dcl     xptr		        ptr;
+	dcl     words_to_go		        fixed bin;
+	dcl     words_to_write	        fixed bin;
+	dcl     save_err_label	        label;
+	dcl     EC		        fixed bin (35);
+						/* control order puts count of errors here */
+
+	save_err_label = bk_ss_$err_label;		/* remember err recovery location */
+	bk_ss_$err_label = wbo_clean;			/* and set up to recover here */
+
+	words_to_go = wrcnt;
+wbo_retry:					/* come here from wbo_clean */
+	xptr = wrptr;
+	do while (words_to_go > 0);
+
+	     words_to_write = min (1024, words_to_go);	/* one page at most */
+						/* then copy a page of users seg */
+	     if wrptr ^= bk_ss_$sp
+	     then do;				/* if not already recovering from an error */
+		     if words_to_write ^= 1024
+		     then /* if not copying whole page */
+			unspec (bk_ss_$sp -> zzbuf) = ""b;
+						/* clear the buffer */
+		     bk_ss_$error = 9;		/* then copy the user's page */
+		     bk_ss_$sp -> ttbuf = xptr -> ttbuf;/* if fault then will go to wbo_clean */
+		     bk_ss_$error = 0;		/* make faults fatal again */
+		end;
+
+	     words_to_write = 256 * divide (words_to_write + 255, 256, 17, 0);
+						/* write mod 256 */
+	     call iox_$put_chars (iocbp1, bk_ss_$sp, words_to_write * 4, code);
+	     if two_tapes & code = 0			/* two_tapes is only true when not preattached */
+	     then call iox_$put_chars (iocbp2, bk_ss_$sp, words_to_write * 4, code);
+	     if code ^= 0
+	     then go to wbo_ret;
+
+	     xptr = addrel (xptr, words_to_write);	/* step thru user's seg */
+	     words_to_go = words_to_go - words_to_write;	/* account for stuff just written */
+	end;
+
+wbo_ret:
+	if ^bk_ss_$preattached & (code = 0)		/* preattached => not using tapes => no error_count order */
+	then do;
+		call iox_$control (iocbp1, "error_count", addr (EC), code);
+
+		if two_tapes & code = 0
+		then call iox_$control (iocbp2, "error_count", addr (EC), code);
+	     end;
+
+	bk_ss_$err_label = save_err_label;		/* restore error recovery location */
+	return;					/* and return */
+
+wbo_clean:					/* This handles faults taken on user's seg */
+	unspec (bk_ss_$sp -> zzbuf) = ""b;		/* clear it */
+	wrptr = bk_ss_$sp;				/* Forget user seg, set flag thatwr're recovering */
+	bk_ss_$err_label = save_err_label;		/* We are no longer interested in faults */
+
+	go to wbo_retry;				/* Go write zeroes onto tape as needed */
+
+     end wrbufout;
+
+/* -------------------------------------------------------- */
+
+wrout:
+     procedure (wrptr, wrcnt);			/* internal procedure to write on current tape(s) */
+	dcl     wrptr		        pointer,	/* write workspace pointer */
+	        wrcnt		        fixed binary;
+						/* no. of words to write */
+	call iox_$put_chars (iocbp1, wrptr, wrcnt * 4, code);
+	if two_tapes
+	then if code = 0
+	     then /* Even if two don't bother if previous in error. */
+		call iox_$put_chars (iocbp2, wrptr, wrcnt * 4, code);
+						/* Write second tape. */
+     end wrout;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+unmount:
+     procedure;					/* internal procedure to unmount current reel(s) */
+	if ^mounted
+	then return;
+
+	call iox_$close (iocbp1, code);
+	if code ^= 0
+	then call backup_map_$fs_error_line (code, "bk_output", primary_dump_tape, "");
+	call iox_$detach_iocb (iocbp1, code);
+	if code ^= 0
+	then call backup_map_$fs_error_line (code, "bk_output", primary_dump_tape, "");
+	if two_tapes
+	then do;					/* Is another tape attached? */
+		call iox_$close (iocbp2, code);
+		if code ^= 0
+		then /* Give error comment if close not OK. */
+		     call backup_map_$fs_error_line (code, "bk_output", secondary_dump_tape, "");
+		call iox_$detach_iocb (iocbp2, code);
+		if code ^= 0
+		then /* Give error comment if detach not OK. */
+		     call backup_map_$fs_error_line (code, "bk_output", secondary_dump_tape, "");
+	     end;
+	call backup_map_$tapes (addr (blanks), 4);	/* Reset label info in map header */
+	mounted = "0"b;
+	iocbp1, iocbp2 = null;
+
+     end unmount;
+     end bk_output;

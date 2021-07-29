@@ -1,0 +1,1143 @@
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/****^  HISTORY COMMENTS:
+  1) change(1986-01-03,Spitzer), approve(1986-01-03,MCR7321),
+     audit(1986-01-06,Blair), install(1986-01-07,MR12.0-1005):
+     Add -from/-to and -match/-exclude control arguments.
+  2) change(1986-12-01,GWMay), approve(1986-12-01,MCR7575),
+     audit(1986-12-04,Lippard), install(1986-12-09,MR12.0-1238):
+     added -newline,-nl,-no_newline,-nnl and -requote_line, -rql control
+     arguments.
+  3) change(2020-05-09,GDixon), approve(2020-05-13,MCR10081),
+     audit(2020-06-08,Swenson):
+     Replace original code of the contents command/AF with a more modern
+     implementation which:
+      A) Uses ssu_ interface to permit easy integration with ssu_ subsystems,
+         and to simplify the code.
+      B) Adds support for signed numeric values in -from and -to bounds.
+      C) Adds -for and -no_error control arguments.
+      D) Adds a contains command/AF entrypoint which returns true if
+         contents would have printed any output; and false otherwise.
+      E) Adds ssu_contents_request and ssu_contains_request entrypoints
+         for possible use in future ssu_ subsystems.
+                                                   END HISTORY COMMENTS */
+
+contents: 
+     proc options(variable);
+						/* Automatic variables.			        */
+  dcl  PROC char(8) init("contents");			/*  Name of current command/AF or request/AR	        */
+
+  dcl  ignoreCode fixed bin(35);			/*  Multics status code: value is intentionally ignored   */
+
+						/* External subroutines.			        */
+  dcl  expand_pathname_$component entry (char(*), char(*), char(*), char(*), fixed bin(35)); 
+  dcl  initiate_file_$component entry (char(*), char(*), char(*), bit(*), ptr, fixed bin(24), fixed bin(35));
+  dcl  ioa_ entry() options(variable);
+  dcl  iox_$put_chars entry (ptr, ptr, fixed bin(21), fixed bin(35));
+  dcl  pathname_$component entry (char(*), char(*), char(*)) returns(char(194));
+  dcl  requote_string_ entry (char(*)) returns(char(*));
+  dcl  search_file_$silent entry (ptr, fixed bin(21), fixed bin(21), ptr, fixed bin(21), fixed bin(21), fixed bin(21),
+	fixed bin(21), fixed bin(35));
+  dcl  terminate_file_ entry (ptr, fixed bin(24), bit(*), fixed bin(35));
+
+						/* Constants				        */
+  dcl  NL char(1) int static options(constant) init("
+");						/*  newline				        */
+  dcl  SP char(1) int static options(constant) init(" ");	/*  space					        */
+  dcl  SP_HT char(2) int static options(constant) init(" 	");
+						/*  space horizontal-tab			        */
+
+						/* External variables and entrypoints		        */
+  dcl  iox_$user_output ptr ext static;
+
+  dcl (error_table_$badopt,
+       error_table_$bigarg,
+       error_table_$inconsistent,
+       error_table_$noarg,
+       error_table_$too_many_args
+       ) fixed bin(35) ext static;
+
+  dcl (addr, binary, dimension, length, maxlength, null, rtrim, search, string, verify) builtin;
+%page;
+						/* Use standard declarations for an ssu_-based command.   */
+						/*  This include file appears early in code to permit its */
+						/*  constants to appear as initial values in declarations.*/
+%include ssu_standalone_command_;			
+%page;
+/* ----------------------------------------------------------------------
+    Structure to hold contents/contains command arguments.
+ * ---------------------------------------------------------------------- */
+
+  dcl 1 BOUND aligned,				/* Template structure defining characteristics of	        */
+      2 type fixed bin(2),				/*  upper/lower bounds of -from/-to/-for line range.      */
+      2 lineN fixed bin(21),
+      2 strP ptr,
+      2 strL fixed bin(21);
+
+  dcl (BOUND_type_NUMBER_FOR   	init(-2),		/*  -for N  =>  -to +M  where M = N-1		        */
+       BOUND_type_UNSET 		init(-1),
+       BOUND_type_NUMBER		init( 0),		/*  -from  N  or  -to  N			        */
+       BOUND_type_SIGNED_NUMBER	init( 1),		/*  -from +N  or  -to +N   or    -from -N  or  -to -N     */
+       BOUND_type_STRING		init( 2),		/*  -from STRING           or    -to STRING	        */
+       BOUND_type_REGEX		init( 3)		/*  -from /REGEXP/	       or    -to /REGEXP/	        */
+       ) fixed bin(2) int static options(constant);
+
+  dcl 1 FILTER aligned,				/* Template structure defining characteristics of	        */
+      2 mode fixed bin(2),				/*  -match/-exclude line selectors.		        */
+      2 type fixed bin(2),
+      2 strP ptr,
+      2 strL fixed bin(21);
+
+  dcl (FILTER_mode_UNSET	init(0),
+       FILTER_mode_MATCH	init(1),			/*  -match				        */
+       FILTER_mode_EXCLUDE	init(2),			/*  -exclude				        */
+
+       FILTER_type_UNSET	init(0),
+       FILTER_type_STRING	init(1),			/*  -match STRING           or   -exclude STRING	        */
+       FILTER_type_REGEX	init(2)			/*  -match /REGEXP/	        or   -exclude /REGEXP/        */
+       ) fixed bin(2) int static options(constant);
+  dcl  MAX_FILTERS fixed bin  init(30) int static options(constant);
+
+  dcl 1 SPEC aligned,				/* Structure holding command/AF args and control_args     */
+      2 sciP ptr init( null() ),			/*  - ssu_ subsystem/standalone command instance pointer  */
+						/*     - null() initial value assumes command/AF entry.   */
+      2 entrypoint fixed bin(2),			/*  - indicator of entrypoint into this procedure.        */
+
+      2 file,					/* Segment/archive component to be examined.	        */
+        3 path char(194) unal,			/*     - absolute or relative path to seg/component       */
+        3 P ptr,					/*     - pointer to initiated seg/component.	        */
+        3 L fixed bin(21),				/*     - character length of initiated seg/component.     */
+
+      2 S aligned,					/* Control_args switch settings.		        */
+        3 (NL_to_SP,				/*  - morphing operations for contents command/AF/req/AR  */
+	 NL_to_QUOTE,				/*    set by: -no_newline/-newline/-requote	        */
+	 errorsS					/*  - set by: -errors/-no_errors		        */
+						/*    T: don't display errors about -from line not found, */
+						/*       or no lines found.			        */
+	 ) bit(1) unal,
+
+      2 db fixed bin,				/*  -debug: 1=SPEC display; 2=info about -from -N  -to -N */
+
+      2 range aligned,				/* Line range to be examined.			        */
+        3 (from, to) aligned like BOUND,		/*  -from/-to/-for  lower/upper bounds of line range.     */
+
+      2 filters aligned,				/* Filters for -match/-exclude of lines from line range.  */
+        3 fN fixed bin,				/*    - Number of f() array entries in use.	        */
+        3 fI fixed bin,				/*    - Index of current f() array entry being set/tested.*/
+        3 f (MAX_FILTERS) aligned like FILTER;		/*    - Array of -match/-exclude specifications.	        */
+
+						/* SPEC.entrypoint values			        */
+  dcl (EP_contains_cmd	init(0),			/*  - contains command/AF			        */
+       EP_contains_req	init(1),			/*  - contains request/AR (active request)	        */
+       EP_contents_cmd	init(2),			/*  - contents command/AF			        */
+       EP_contents_req	init(3)			/*  - contents request/AR			        */
+       ) fixed bin(2) int static options(constant);
+
+  dcl  file_str    char(SPEC.file.L)             based(SPEC.file.P),
+						/* String overlay of seg/component being examined	        */
+       from_str    char(SPEC.range.from.strL)    based(SPEC.range.from.strP),
+						/* Overlay of -from STRING  or  -from REGEXP operand      */
+       to_str      char(SPEC.range.to.strL)      based(SPEC.range.to.strP);
+						/* Overlay of -to STRING    or  -to REGEXP   operand      */
+
+  dcl  filter_mode fixed bin (2) aligned         based( addr(SPEC.filters.f(SPEC.filters.fI).mode) );
+						/* Current filter_mode			        */
+  dcl  filter_str  char(SPEC.filters.f(SPEC.filters.fI).strL) 
+				         based( SPEC.filters.f(SPEC.filters.fI).strP);
+						/* Current -match/-exclude STRING or -match/-ex REGEXP    */
+  dcl  filter_type fixed bin (2) aligned         based( addr(SPEC.filters.f(SPEC.filters.fI).type) );
+						/* Current filter_type			        */
+
+%page;
+/* ----------------------------------------------------------------------
+    Entrypoint setup.	
+   ---------------------------------------------------------------------- */
+
+     SPEC.entrypoint = EP_contents_cmd;			/* Procedure entrypoint for  contents  command/AF	        */
+     goto INITIALIZE_SPEC;
+
+     
+contains:
+     entry() options(variable);
+     
+     SPEC.entrypoint = EP_contains_cmd;			/* Entrypoint for  contains  command/AF		        */
+     PROC = "contains";
+     goto INITIALIZE_SPEC;
+
+     
+ssu_contents_request:				/* Entrypoint for  ssu_ contents requests/AR	        */
+     entry (sci_ptr, data_ptr);
+    
+  dcl (sci_ptr,					/* Declare standard ssu_ request/active request parms     */
+       data_ptr
+       ) ptr;
+						/*  - Record ssu_ control info ptr for subsystem 	        */
+     SPEC.sciP = sci_ptr;				/*    embedding this request/AR.		        */
+     SPEC.entrypoint = EP_contents_req;
+     
+     goto INITIALIZE_SPEC;
+     
+
+ssu_contains_request:				/* Entrypoint for  ssu_ contains requests/AR	        */
+     entry (sci_ptr, data_ptr);
+						/*  - Record ssu_ control info ptr for subsystem 	        */
+     SPEC.sciP = sci_ptr;				/*    embedding this request/AR.		        */
+     PROC = "contains";
+     SPEC.entrypoint = EP_contains_req;
+     
+     goto INITIALIZE_SPEC;
+
+%page;
+/* ----------------------------------------------------------------------
+    Initialize SPEC structure.
+   ---------------------------------------------------------------------- */
+
+INITIALIZE_SPEC:
+/*   SPEC.sciP = null();				/* Initialized in declaration above.		        */
+						/*  - but perhaps set at ssu_ request entrypoint above    */
+
+     SPEC.file.path = "";				/* No file to be examined is known as yet.	        */
+     SPEC.file.P = null();
+     SPEC.file.L = 0;
+
+     SPEC.db = 0;					/* -debug feature is OFF by default		        */
+
+     SPEC.S = F;					/* Set default output morphing modes, but...	        */
+     SPEC.S.errorsS = T;				/*  -errors by default (to select added error messages)   */
+     SPEC.S.NL_to_SP = (SPEC.entrypoint = EP_contents_cmd  |  SPEC.entrypoint = EP_contents_req);
+
+     SPEC.range.from.type  = BOUND_type_UNSET;		/* No -from control args yet.			        */
+     SPEC.range.from.lineN = 0;
+     SPEC.range.from.strP  = addr(SP);
+     SPEC.range.from.strL  = 0;
+
+     SPEC.range.to.type  = BOUND_type_UNSET;		/* No -to/-for control args yet.		        */
+     SPEC.range.to.lineN = 0;
+     SPEC.range.to.strP  = addr(SP);
+     SPEC.range.to.strL  = 0;
+
+     SPEC.filters.fN = 0;				/* NO -match/-exclude control args yet.		        */
+     SPEC.filters.fI = 0;
+     SPEC.filters.f(*).mode = FILTER_mode_UNSET;
+     SPEC.filters.f(*).type = FILTER_type_UNSET;
+     SPEC.filters.f(*).strP = addr(SP);
+     SPEC.filters.f(*).strL = 0;
+%page;
+/* ----------------------------------------------------------------------
+    Process command arguments using an ssu_ standalone invocation if
+    invoked as a command/AF; or sci_ptr if invoked as request/active_request.
+   ---------------------------------------------------------------------- */
+
+     isStandalone = ( SPEC.sciP = null() );		/* Establish cleanup on-unit for ssu_ standalone 	        */
+						/*  invocation, and for terminating any file made known   */
+     on cleanup call CONTENTS_cleanup_handler (addr(SPEC), isStandalone, SPEC.sciP);
+
+     if  isStandalone  then do;			/* Actually create an ssu_ standalone invocation for      */
+						/* contents/contains command/AF		        */
+  dcl  CONTENTS_VERSION char(1) int static options(constant) init("2");
+
+	call ssu_$standalone_invocation (SPEC.sciP, PROC, CONTENTS_VERSION, cu_$arg_list_ptr(), abort_to_EXIT, code);
+						/*  - abort_to_EXIT does non-local goto to implement      */
+	if code ^= 0 then goto EXIT;			/*    ssu_$abort_line calls.			        */
+	end;					/*    (See ssu_standalone_command.incl.pl1)	        */
+
+     call arg_setup (SPEC.sciP);			/* Setup command/request environment		        */
+     if args_remain() then
+	call controlArgs ();			/* Process command/request arguments.		        */
+
+     if  SPEC.db >= 1  then do;			/* If -debug 1 or 2, display SPEC structure which is      */
+						/*  somewhat complex to display via probe value request.  */
+  dcl  field char(12) var;
+	call ioa_ ("  -- SPEC.entrypoint:  " || 
+	     "^[contains ^[command^;active function^]^;contains ^[request^;active request^]" || 
+	     "^;contents ^[command^;active function^]^;contents ^[request^;active request^]^]",
+	     SPEC.entrypoint+1, ^isAF);
+	call ioa_ ("^-path:^- ^a", SPEC.file.path);
+	call ioa_ ("^-NL_to_SP:^- ^[T^;F^]^-.NL_to_QUOTE:^- ^[T^;F^]", SPEC.NL_to_SP, SPEC.NL_to_QUOTE);
+	call ioa_ ("^--^[no_^]errors", ^SPEC.errorsS);
+	call ioa_ ("^-db:^- ^d", SPEC.db);	
+	if  SPEC.from.type > BOUND_type_UNSET  then do;
+	     call ioa_ ("^-from:^- ^[^s^d^2s^;^[+^]^d^2s^;^2s^[""^a""^;^a^]^;^2s^[""/^a/""^;/^a/^]^]",
+	          SPEC.range.from.type+1, SPEC.from.lineN>=0, SPEC.from.lineN, search(from_str, SP_HT)>0, from_str);
+	     end;
+	if  SPEC.to.type = BOUND_type_NUMBER_FOR  then
+	     call ioa_ ("^-for:^- ^d", SPEC.to.lineN);
+	else if  SPEC.to.type > BOUND_type_UNSET  then
+	     call ioa_ ("^-to:^- ^[^s^d^2s^;^[+^]^d^2s^;^2s^[""^a""^;^a^]^;^2s^[""/^a/""^;/^a/^]^]",
+	          SPEC.range.to.type+1, SPEC.to.lineN>=0, SPEC.to.lineN, search(to_str, SP_HT)>0, to_str);
+	field = "filter:";
+	do SPEC.filters.fI = 1 to SPEC.filters.fN;
+	     if  filter_mode = FILTER_mode_MATCH  then
+		call ioa_ ("^-^a^- -match   ^[UNSET^2s^;^[""^a""^;^a^]^;^[""/^a/""^;/^a/^]^]",
+		     field, filter_type+1, search(filter_str, SP_HT)>0, filter_str);
+	     field = "";
+	     end;
+	do SPEC.filters.fI = 1 to SPEC.filters.fN;
+	     if  filter_mode = FILTER_mode_EXCLUDE  then
+		call ioa_ ("^-^a^- -exclude ^[UNSET^2s^;^[""^a""^;^a^]^;^[""/^a/""^;/^a/^]^]",
+		     field, filter_type+1, search(filter_str, SP_HT)>0, filter_str);
+	     field = "";
+	     end;
+	end;
+
+     if  SPEC.file.path = ""  then			/* Complain if no PATH argument given.		        */
+						/*   NOTE: calls to ssu_$abort_line do not return.        */
+	call ssu_$abort_line( SPEC.sciP, error_table_$noarg, 
+	     "^2/^[Syntax as ^[a command^;an active function^]^;Syntax^[^; as an active request^]^]:  " ||
+	     "^[[ ^]^a PATH ^[{^]-control_args^[}^]^[ ]^]",
+	     isStandalone, ^isAF, 
+	     isAF, PROC, PROC = "contents", PROC = "contents", isAF);
+	
+     if  PROC = "contains"  &  SPEC.filters.fN = 0  then	/* Complain if contains cmd/AF/req/AR given without       */
+						/*   -match/-exclude control arg(s).		        */
+	call ssu_$abort_line( SPEC.sciP, error_table_$inconsistent,
+	     "^/^-One or more -match and/or -exclude control arguments are required.");
+%page;
+/* ----------------------------------------------------------------------
+    Initiate the given segment/archive component.
+     - Support read-only examination of archive components in situ.
+   ---------------------------------------------------------------------- */
+
+  dcl  dir char(168) unal,
+       ent char(32) unal,
+       comp char(32) unal;
+
+     call expand_pathname_$component (SPEC.file.path, dir, ent, comp, code);
+     if  code ^= 0  then do;
+	call ssu_$abort_line( SPEC.sciP, code, "^a", SPEC.file.path );
+	return;
+	end;
+
+
+  dcl  bit_count fixed bin(24);
+
+     call initiate_file_$component (dir, ent, comp, R_ACCESS, SPEC.file.P, bit_count, code);
+     if  SPEC.file.P = null()  then 
+	call ssu_$abort_line( SPEC.sciP, code, "^a", pathname_$component (dir, ent, comp) );
+     
+     SPEC.file.L = divide( (bit_count + BITS_PER_CHAR - 1), BITS_PER_CHAR, 21, 0);
+     
+     if  SPEC.S.NL_to_SP  then
+	SPEC.file.L = length( rtrim( file_str, NL) );	/* strip trailing newlines			        */
+%page;
+
+/* ----------------------------------------------------------------------
+    Examine file lines.
+     - contents cmd/AF/req/AR prints/returns selected lines.
+     - contains cmd/AF/req/AR prints/returns "true" if any lines are selected;
+			prints/returns "false" otherwise.        
+   ---------------------------------------------------------------------- */
+
+  dcl  data_selectedS bit(1) aligned init(F);		/* T: some lines were output (or would have been output)  */
+  dcl  do_output bit(1) aligned int static options(constant) init(T);
+						/* Constant controls if lines are output or just counted  */
+
+     if  PROC = "contains"  then do;			/* contains cmd/AF/req/AR			        */
+						/*  - requires 1 or more -match/-exclude args so always   */
+						/*    call process_selection with NO OUTPUT.	        */
+	call process_selection( ^do_output, data_selectedS );
+	if  isAF  then				/*  - handle setting of AF/AR return value	        */
+	     if  data_selectedS  then
+	          af_ret = "true";
+	     else af_ret = "false";
+	else call ioa_("^[true^;false^]", data_selectedS);/*    or output of true/false			        */
+	end;
+
+     else do;					/* contents cmd/AF/req/AR			        */
+	if  SPEC.range.from.type ^= BOUND_type_UNSET |	/* If -from/-to/-for  or  -match/-exclude then...	        */
+	    SPEC.range.to.type   ^= BOUND_type_UNSET |
+	    SPEC.filters.fN > 0  then do;
+	     call process_selection( do_output, data_selectedS );
+	     end;					/*  - call process_selection with OUTPUT	        */
+	else call return_entire_segment( data_selectedS );/* Otherwise, just output the entire file	        */
+	end;
+
+/* ----------------------------------------------------------------------
+    Normal exit from the subsystem.
+ * ---------------------------------------------------------------------- */
+
+EXIT:						/* Label branched to by abort_to_EXIT subroutine.	        */
+						/*  (See ssu_standalone_command_.incl.pl1)	        */
+     call CONTENTS_cleanup_handler (addr(SPEC), isStandalone, SPEC.sciP);
+     return;					/* Normal return point.			        */
+
+
+/* ----------------------------------------------------------------------
+    cleanup on-unit for subsystem invocation.
+     - Terminate any file being examined.
+     - Call standalone_cleanup_handler to handle any ssu_ standalone 
+       invocation.  (See ssu_standalone_command_.incl.pl1)
+   ---------------------------------------------------------------------- */
+
+CONTENTS_cleanup_handler:
+     proc (AdataP, AisStandalone, AsciP);
+
+  dcl  AdataP ptr,
+      1 d aligned like SPEC based (AdataP);
+  dcl  AisStandalone bit(1) aligned;
+  dcl  AsciP ptr;
+
+     if  d.file.P ^= null()  then 
+	call terminate_file_ (d.file.P, 0, TERM_FILE_TERM, ignoreCode);
+     if  AisStandalone  then
+	call standalone_cleanup_handler (AisStandalone, AsciP);
+
+     end CONTENTS_cleanup_handler;
+%page;
+
+/* ----------------------------------------------------------------------
+    For contents cmd/AF/req/AR:
+     - print or return the entire file.
+   ---------------------------------------------------------------------- */
+
+return_entire_segment:
+     proc( Adata_selectedS );
+
+  dcl  Adata_selectedS bit(1) aligned;			/* T: if any data in segment is selected for output.      */
+
+  dcl  seg char(segL) based(segP),			/* Sliding overlay of unprocessed part of segment.        */
+       segL fixed bin(21),
+       segP ptr;
+  dcl  seg_arr (segL) char(1) based(segP);		/*  - Unprocessed part as an array of characters.	        */
+
+  dcl  line char(lineL) based(segP),			/*  - Line that begins the unprocessed part (w/o its NL)  */
+       lineL fixed bin(21);
+
+     if  SPEC.S.NL_to_SP  |  SPEC.S.NL_to_QUOTE  then do;	/* If morphing lines...			        */
+						/*  - Parse file into lines, to be individually quoted    */
+						/*    or space-separated.			        */
+
+	segP = addr(file_str);			/*  - overlay (rest of) file contents.		        */
+	segL = length(file_str);
+
+	do while (length(seg) > 0);			/*  - loop while there is data in rest of file.	        */
+	     lineL = index(seg, NL);			/*     - address next line in rest of file, except its NL.*/
+	     if  lineL > 0  then
+		lineL = lineL - length(NL);
+	     else lineL = length(seg);		/*       - case: last line of segment does not end in NL? */
+
+	     if  SPEC.S.NL_to_QUOTE  then		/*     - requote next line of file.		        */
+		call output( requote_string_(line), do_output, Adata_selectedS );
+	     else call output( line, do_output, Adata_selectedS );
+						/*     - or just output that line.		        */
+
+	     if  length(line) + length(NL) >= length(seg)  then
+		segL = 0;				/*  - Remove now-processed line from rest of file.        */
+	     else do;
+		segP = addr( seg_arr( length(line)+length(NL)+1 ) );
+		segL = segL - ( length(line)+length(NL) );
+		end;
+	     end;
+	end;
+     else call output( file_str, do_output, Adata_selectedS );
+						/* Not morphing?  Just output the entire segment.	        */
+
+     if  ^isAF  &  do_output  then			/* Output an extra NL to ensure partial last line does    */
+						/*  not intrude on the ready line following command.      */
+	call iox_$put_chars (iox_$user_output, addr(NL), length(NL), ignoreCode);
+
+     end return_entire_segment;
+%page;
+
+/* ------------------------------------------------------------
+    Add output to AF return string; or print it.
+     - Observe actually_outputS to control print/return of any line(s).
+       The side-effect (below) occurs even if print/return is suppressed.
+
+   SIDE EFFECT:				 
+     - Set data_was_outputS to record request for us to output line(s).
+   ------------------------------------------------------------ */     
+output:
+     proc( data, actually_outputS, data_was_outputS );
+     
+  dcl  data char(*);				/* Data to be output.  It could be:		        */
+						/*  - 1 line selected from file		        */
+						/*  - entire file				        */
+  dcl  actually_outputS bit(1) aligned;			/* T: print/return the matching line;		        */
+						/* F: just turn on data_was_outputS flag w/o line output  */
+  dcl  data_was_outputS bit(1) aligned;			/* T: some data was/would be output.		        */
+
+     data_was_outputS = T;				/* Record that data was selected for output.	        */
+     if  ^actually_outputS  then return;		/*  - Do nothing else for contains command/AF/req/AR      */
+
+
+  dcl  new_length fixed bin(21);
+
+     if  isAF  then do;				/* For AF/AR, append data to previous return arg.	        */
+	if  length(af_ret) ^= 0  then do;		/*  - add SP separating any previous output from this data*/
+	     if  SPEC.S.NL_to_SP  |  SPEC.S.NL_to_QUOTE  then do;
+		new_length = length(af_ret) + length(SP) + length(data);
+		af_ret = af_ret || SP || data;
+		end;
+	     else do;				/*  - return exact data, which includes NLs to separate   */
+						/*    lines from one another.			        */
+		new_length = length(af_ret) + length(data);
+		af_ret = af_ret || data;
+		end;
+	     end;
+	else do;					/*  - For first output, SP separation not needed.	        */
+	     new_length = length(data);		/*    Return exact data, which MAY include NLs.	        */
+	     af_ret = data;
+	     end;
+
+	if  new_length > maxlength(af_ret)  &  SPEC.errorsS  then
+	     call ssu_$abort_line( SPEC.sciP, 0, "Return string (^d characters) is too long.", new_length);
+						/*  - Report overflow of AF/AR return string, unless      */
+	end;					/*    some errors are being suppressed.		        */
+
+     else do;					/* For command/request, output the data.	        */
+	call iox_$put_chars (iox_$user_output, addr(data), length(data), ignoreCode);
+	if  SPEC.S.NL_to_SP  |  SPEC.S.NL_to_QUOTE  then  /*  - add a space after each line (if NLs not output)     */
+	     call iox_$put_chars (iox_$user_output, addr(SP), length(SP), ignoreCode);
+	end;
+
+     end output;
+%page;
+/* ----------------------------------------------------------------------
+    For contents cmd/AF/req/AR:
+     - print or return line(s) of segment within -from/-to/-for line range
+       that meet the -match/-exclude criteria.
+    For contains cmd/AF/req/AR:
+     - do the same selection based upon -from/-to/-for line range and
+       -match/exclude criteria, noting if lines would have been output.
+       Caller will then return true/false based upon this notation.
+   ---------------------------------------------------------------------- */
+
+process_selection:
+     proc ( AoutputS, Adata_selectedS );
+
+  dcl  AoutputS bit(1) aligned;			/* T: Actually output selected lines.		        */
+						/* F: Just note whether lines would have been output.     */
+  dcl  Adata_selectedS bit(1) aligned;			/* Set to T if any data would have been output	        */
+
+  dcl  seg char(segL) based(segP),			/* Sliding overlay of unprocessed part of segment.        */
+       segL fixed bin(21),
+       segP ptr;
+  dcl  seg_arr (segL) char(1) based(segP);		/*  - Unprocessed part as an array of characters.	        */
+
+  dcl  line char(lineL) based(segP),			/*  - Line that begins the unprocessed part.	        */
+       line_with_NL char(lineL+1) based(segP),
+       lineL fixed bin(21);
+
+  dcl  line_no fixed bin(21) init(0);			/* Current line number in the segment/component.	        */
+  dcl  line_beyond_end_of_file fixed bin(21);		/* Line number just beyond end of segment/component.      */
+
+
+/* ------------------------------------------------------------
+    Find end-of-file line count if negative range BOUNDs are used.
+   ------------------------------------------------------------ */
+
+     if  SPEC.range.from.lineN < 0  |  SPEC.range.to.lineN < 0  then do;
+						/* Is range a line-count from end of file?	        */
+						/*  - compute line_beyond_end_of_file		        */
+	segP = addr(file_str);			/*     - overlay (rest of) file contents.	        */
+	segL = length(file_str);
+
+	do while (length(seg) > 0);			/*     - loop while there is data in rest of file.        */
+	     lineL = index(seg, NL);			/*       - find next line in rest of file, except its NL. */
+	     if  lineL > 0  then
+		lineL = lineL - length(NL);
+	     else lineL = length(seg);		/*       - case: last line of segment does not end in NL? */
+
+	     line_no = line_no + 1;			/*     - increment line count.		        */
+
+	     if  length(line) + length(NL) >= length(seg)  then
+		segL = 0;				/*  - Remove now-processed line from rest of file.        */
+	     else do;
+		segP = addr(seg_arr( length(line)+length(NL)+1 ) );
+		segL = segL - ( length(line)+length(NL) );
+		end;
+	     end;
+
+	line_beyond_end_of_file = line_no + 1;		/*  - Add 1 to get line_no just beyond actual end-of-file */
+
+	if  SPEC.db >= 2  then			/*  - Display this value if -db 2 given.	        */
+	     call ioa_ ("  -- line_beyond_end_of_file: ^d", line_beyond_end_of_file);
+	end;
+%page;     
+/* ------------------------------------------------------------
+    Normalize:  -from -N  and/or  -to -N  
+	      adjust N to be an absolute line number by
+	      applying offset from line just beyond end of file.
+   ------------------------------------------------------------ */
+
+     if  SPEC.range.from.type = BOUND_type_SIGNED_NUMBER  & /* Normalize:  -from -N			        */
+         SPEC.range.from.lineN < 0  then do;
+	SPEC.range.from.lineN = line_beyond_end_of_file + SPEC.range.from.lineN;
+	SPEC.range.from.lineN = max(1, SPEC.range.from.lineN);
+						/*  - Ensure adjusted -from J is not less than line_no 1  */
+	SPEC.range.from.type = BOUND_type_NUMBER;	/*  - Adjustment  -from -N  =>  -from J  where J>0        */
+
+	if  SPEC.db >= 2  &  SPEC.from.type > BOUND_type_UNSET  then
+	     call ioa_ ("  -- -from:^- ^[^s^d^s^;^[+^]^d^s^;^s^s""^a""^;^s^s/^a/^]",
+	          SPEC.range.from.type+1, SPEC.from.lineN>0, SPEC.from.lineN, from_str);
+	end;
+
+     if  SPEC.range.to.type = BOUND_type_SIGNED_NUMBER  &	/* Normalize:  -to -N			        */
+         SPEC.range.to.lineN < 0  then do;
+	SPEC.range.to.lineN = line_beyond_end_of_file + SPEC.range.to.lineN;
+	SPEC.range.to.lineN = max(1, SPEC.range.to.lineN);
+						/*  - Ensure adjusted -to K is not less than line_no 1    */
+	SPEC.range.to.type = BOUND_type_NUMBER;		/*  - Adjustment  -to -N  =>  -to K  where K>0	        */
+
+	if  SPEC.db >= 2  &  SPEC.to.type > BOUND_type_UNSET  then
+	     call ioa_ ("  -- -to:^- ^[^s^d^s^;^[+^]^d^s^;^s^s""^a""^;^s^s/^a/^]",
+	          SPEC.range.to.type+1, SPEC.to.lineN>0, SPEC.to.lineN, to_str);
+	end;
+%page;     
+/* ------------------------------------------------------------
+    (Re-)start scanning lines of the file, looking for first 
+    line of the given line range.
+   ------------------------------------------------------------ */
+
+     line_no = 0;
+     
+     segP = addr(file_str);				/*     - overlay (rest of) file contents.	        */
+     segL = length(file_str);
+
+FIND_RANGE_START:
+     do while (length(seg) > 0);			/*     - loop while there is data in rest of file.        */
+	lineL = index(seg, NL);			/*       - find next line in rest of file, except its NL. */
+	if  lineL > 0  then
+	     lineL = lineL - length(NL);
+	else lineL = length(seg);			/*       - case: last line of segment does not end in NL? */
+
+	line_no = line_no + 1;			/*     - increment line count.		        */
+
+	goto FROM (SPEC.range.from.type);
+	
+FROM (BOUND_type_UNSET):				/* No -from specification?  			        */
+	goto RANGE_started;				/*   - start with line 1			        */
+
+FROM (BOUND_type_NUMBER):
+FROM (BOUND_type_SIGNED_NUMBER):
+	if  line_no = SPEC.range.from.lineN  then	/* -from J:  Is current line_no = J ?		        */
+     	     goto RANGE_started;
+	goto FROM_next_line;
+
+FROM (BOUND_type_STRING):				/* -from STRING:  Does current line contain STRING ?      */
+	if  index(line, from_str) > 0  then
+     	     goto RANGE_started;
+	goto FROM_next_line;
+
+FROM (BOUND_type_REGEX):				/* -from /REGEXP/:  Does current line match REGEXP ?      */
+	if  length(line) < length(seg) then do;		/*   - If line ends with NL, pass that NL to regex_search */
+	     if  regex_search( "-from", from_str, line_with_NL)  then
+		goto RANGE_started;
+	     end;
+	else if  regex_search( "-from", from_str, line)  then
+     	     goto RANGE_started;
+	goto FROM_next_line;
+
+FROM_next_line:
+	if  length(line) + length(NL) >= length(seg)  then
+	     segL = 0;				/*  - Remove now-processed line from rest of file.        */
+	else do;
+	     segP = addr(seg_arr( length(line)+length(NL)+1 ) );
+	     segL = segL - ( length(line)+length(NL) );
+	     end;
+	end FIND_RANGE_START;
+
+     if  SPEC.errorsS  then				/* Report an error if -from line was not found, unless..  */
+						/*  - errors are being suppressed.		        */
+	call ssu_$abort_line (SPEC.sciP, 0, "Line not found:  " ||
+	     "-from ^[^s^d^2s^;^[+^]^d^2s^;^2s^[""^a""^;^a^]^;^2s^[""/^a/""^;/^a/^]^]",
+	     SPEC.range.from.type+1, SPEC.from.lineN>=0, SPEC.from.lineN, search(from_str, SP_HT)>0, from_str);
+
+%page;
+/* ------------------------------------------------------------
+    Normalize:  -to +N  
+	      adjust N to be an absolute line number by computing
+	      N as an offset from starting line_no of line range.
+   ------------------------------------------------------------ */
+
+RANGE_started:					/* We now know the starting line of our line range.       */
+     if  SPEC.range.to.type = BOUND_type_SIGNED_NUMBER  &	/*  - Was -to +N given?			        */
+         SPEC.range.to.lineN >= 0  then do;		/*     - If so, relative line offset => absolute line no  */
+	SPEC.range.to.lineN = line_no + SPEC.range.to.lineN;
+	SPEC.range.to.type = BOUND_type_NUMBER;
+	end;
+     else if  SPEC.range.to.type = BOUND_type_NUMBER_FOR  then do;
+						/*  -for N : N >= 1, verified by controlArgs checks       */
+	SPEC.range.to.lineN = line_no + SPEC.range.to.lineN - 1;
+	SPEC.range.to.type = BOUND_type_NUMBER;
+	end;
+
+
+/* ------------------------------------------------------------
+    Constrain:  -to N  >=  1st line_no of line range.
+   ------------------------------------------------------------ */
+
+     if  SPEC.range.to.type = BOUND_type_NUMBER  then	/* Make sure end of range comes on/after start of range.  */
+	SPEC.range.to.lineN = max(line_no, SPEC.range.to.lineN);
+
+%page;
+/* ----------------------------------------------------------------------
+    STATE: Looking for lines to output.
+     - All -from ... constraints met.  
+        - We are now at start of line range.
+
+     - line_no set to 1st line of line range.
+        - segP points to that line, followed by rest of segment.
+        - lineL set to length of 1st line of range (excluding its NL).
+
+     - Numeric -to ... constraints (-to N,  -to +N,  -to -N) adjusted.
+        - We now know maximum line_no of last line in range (though
+	file might be shorter than this max line_no).
+
+    STEPS:
+     1) Filter lines (done in line_passes_filters procedure):
+         - If -match given, does current line match any of those control args?
+	  - If so, does current line match any -exclude control args?
+	     - If not, output that line.
+         - If -match NOT given, does current line match any -exclude control args?
+	  - If not, output that line.
+  
+     2) Test end-of-range constraints:
+         - Does current line match our -to constraints?
+	  - If so, end processing.
+	  - If not, move on to next line of range.
+   ---------------------------------------------------------------------- */
+
+SCAN_RANGE:
+     do while (length(seg) > 0);
+	if  length(line) < length(seg)  then do;	/* If line ends with NL, pass it to line_passes_filters   */
+	     if  line_passes_filters( line_with_NL )  then
+		goto PASS;
+	     end;
+	else if  line_passes_filters( line )  then do;
+PASS:	     if  SPEC.S.NL_to_QUOTE  then		/* -requote_line: use requote_string_ on line w/o NL      */
+		call output( requote_string_(line), AoutputS, Adata_selectedS );
+	     else if  SPEC.S.NL_to_SP  then		/* -nnl: output line with NL converted to SP?	        */
+		call output( line, AoutputS, Adata_selectedS );
+	     else if  length(line) < length(seg)  then	/* -nl: output line with its trailing NL character.       */
+		call output( line_with_NL, AoutputS, Adata_selectedS );
+	     else call output( line, AoutputS, Adata_selectedS );
+						/* -nl but final line does not end with NL character.     */
+	     end;
+
+	goto TO (SPEC.range.to.type);			/* Test end-of-range constraints.		        */
+
+TO (BOUND_type_UNSET):				/*  -to not given				        */
+	goto SCAN_next_line;
+
+TO (BOUND_type_NUMBER):				/*  -to N					        */
+TO (BOUND_type_SIGNED_NUMBER):			/*  -to +N  or  -to -N:  =>  -to K    above	        */
+TO (BOUND_type_NUMBER_FOR):				/*  -for N:              =>  -to N-1  above	        */
+	if  line_no = SPEC.range.to.lineN  then
+	     goto SCAN_ends;
+	goto SCAN_next_line;
+
+TO (BOUND_type_STRING):				/*  -to STRING				        */
+	if  index(line, to_str) > 0  then
+	     goto SCAN_ends;
+	goto SCAN_next_line;
+
+TO (BOUND_type_REGEX):				/*  -to /REGEXP/				        */
+	if  length(line) < length(seg) then do;		/*   - If line ends with NL, pass that NL to regex_search */
+	     if  regex_search( "-to", to_str, line_with_NL)  then
+		goto SCAN_ends;
+	     end;
+	else if  regex_search( "-to", to_str, line)  then
+	     goto SCAN_ends;
+	goto SCAN_next_line;
+
+SCAN_next_line:
+	if  length(line) + length(NL) >= length(seg)  then
+	     segL = 0;				/*  - Remove now-processed line from rest of file.        */
+	else do;
+	     segP = addr( seg_arr( length(line)+length(NL)+1 ) );
+	     segL = segL - ( length(line)+length(NL) );
+	     end;
+
+	lineL = index(seg, NL);			/*   - find next line in rest of file, except its NL.     */
+	if  lineL > 0  then
+	     lineL = lineL - length(NL);
+	else lineL = length(seg);			/*       - case: last line of segment does not end in NL? */
+
+	line_no = line_no + 1;			/*   - increment line count.			        */
+
+	end SCAN_RANGE;
+
+SCAN_ends:
+     if  Adata_selectedS  &  AoutputS  &  ^isAF  then	/* If data was/would be output, and is being output, and  */
+						/*   invoked as a command/request (not AF/AR), then...    */
+	call iox_$put_chars (iox_$user_output, addr(NL), length(NL), ignoreCode);
+						/*   output an extra NL to separate command output from   */
+						/*   ready line.				        */
+     return;
+
+     end process_selection;
+%page;
+/* ------------------------------------------------------------
+    Filter lines by applying -match and -exclude control arguments.
+     - If one or more -match control arguments are given, then:
+        - Does the line match any of the -match operands?
+        - If so, then:
+	 - Does the line match any -exclude operands?
+	    - If not, output that line.
+     - If zero -match control arguments were given, then:
+	 - Does the line match any -exclude operands?
+	    - If not, output that line.
+   ------------------------------------------------------------ */
+
+line_passes_filters:
+          proc (Aline) returns (bit (1) aligned);
+
+  dcl  Aline char(*);
+
+  dcl  match_test_foundS bit(1) aligned init(F);
+
+MATCH_TESTS:					/* First check -match specs against current line.	        */
+	do SPEC.filters.fI = 1 to SPEC.filters.fN;
+	     if  filter_mode = FILTER_mode_MATCH  then do;
+		goto DO_M (filter_type);
+		
+DO_M (FILTER_type_STRING):
+		match_test_foundS = T;
+		if  index(Aline, filter_str) > 0  then
+		     goto MATCHED_line_APPLY_EXCLUDES;
+		goto MATCH_next_test;
+		
+DO_M (FILTER_type_REGEX):
+		match_test_foundS = T;
+		if  regex_search ("-match", filter_str, Aline)  then
+		     goto MATCHED_line_APPLY_EXCLUDES;
+		goto MATCH_next_test;
+		
+		end;
+
+DO_M (FILTER_type_UNSET):
+MATCH_next_test:
+	     end MATCH_TESTS;
+
+	if  match_test_foundS  then			/* -match control args were given, but none matched Aline */
+	     return (F);
+	
+
+MATCHED_line_APPLY_EXCLUDES:				/* Second, check -exclude specs against current line.     */
+	do SPEC.filters.fI = 1 to SPEC.filters.fN;
+	     if  filter_mode = FILTER_mode_EXCLUDE  then do;
+		goto DO_E (filter_type);
+		
+DO_E (FILTER_type_STRING):
+		if  index(Aline, filter_str) > 0  then
+		     return (F);			/* -exclude STRING matches this line.  It fails filter.   */
+		goto EXCLUDE_next_test;
+		
+DO_E (FILTER_type_REGEX):
+		if  regex_search ("-match", filter_str, Aline)  then
+		     return (F);			/* -exclude /REGEXP/ matches this line.  It fails filter. */
+		goto EXCLUDE_next_test;
+		
+		end;
+
+DO_E (FILTER_type_UNSET):
+EXCLUDE_next_test:
+	     end MATCHED_line_APPLY_EXCLUDES;
+
+	return (T);				/* If no -exclude control arg matches Aline, it passes.   */
+
+	end line_passes_filters;
+%page;
+/* -----------------------------------------------------------------
+    Invoke qedx command's REGEXP search mechanism to compare line
+    contents with a given REGEXP value.
+   ----------------------------------------------------------------- */
+regex_search:
+	proc (Acontrol, Aregexp, Aline) returns (bit (1) aligned);
+
+dcl  Acontrol char(*) unal;				/* -match or -exclude control_ arg (for use in errors)    */
+dcl  Aregexp char (*) unal;				/* REGEXP value				        */
+dcl  Aline char(*) unal;				/* line to be compared with REGEXP.		        */
+						/*  NOTE: /...$/ only matches if Aline ends with NL char  */
+
+dcl  code fixed bin(35);
+dcl  error_table_$nomatch fixed bin (35) ext static;
+
+	call search_file_$silent (addr(Aregexp), 1, length(Aregexp), addr(Aline), 1, length(Aline), (0), (0), code);
+	if  code = 0  then				/* Aline contains string matching Aregexp	        */
+	     return (T);
+	else if  code = error_table_$nomatch  then;	/*  OR: does not contain a matching string	        */
+	else if  code ^= 0	then do;
+	     if  code = 2  then			/*  OR: Aregexp is not a valid regular expression	        */
+		call ssu_$abort_line( SPEC.sciP, 0, "Illegal regular expression: ^a /^a/", Acontrol, Aregexp);
+						/*  OR: some unexpected error occurred during search.     */
+	     else call ssu_$abort_line( SPEC.sciP, code, "Searching for: ^a /^a/", Acontrol, Aregexp);
+	     end;
+	return (F);				/* All the OR: ... cases above are search failures.       */
+     end regex_search;
+%page;
+/* ----------------------------------------------------------------------
+    Process contents/contains path argument and control args. 
+ * ---------------------------------------------------------------------- */
+
+controlArgs:
+     proc ();
+
+  dcl  DIGITS char(10) int static options(constant) init("0123456789");
+  dcl 1 OPERAND aligned,				/* If item T, next argument is operand of control_arg     */
+      2 (from,					/*  - NOTE:  operands can begin with - (like -from -5)    */
+         to,					/*           so must be processed before checking if      */
+         for,					/*           argument is a -control_arg.	        */
+         match,
+         exclude,
+         debug
+         ) bit(1) unal;
+     string(OPERAND) = F;
+
+ARGUMENT_LOOP:
+     do while (args_remain());
+	call ssu_$arg_ptr (SPEC.sciP, argI+1, argP, argL); /* Conditionally read next arg to command/af/request     */
+					
+	if       OPERAND.from    then  call set_range_bound( OPERAND.from,    "-from",             arg, SPEC.from    );
+	else if  OPERAND.to      then  call set_range_bound( OPERAND.to,      "-to",               arg, SPEC.to      );
+	else if  OPERAND.for     then  call set_range_bound( OPERAND.for,     "-for",              arg, SPEC.to      );
+	else if  OPERAND.match   then  call set_filter	 ( OPERAND.match,   FILTER_mode_MATCH,   arg, SPEC.filters );
+	else if  OPERAND.exclude then  call set_filter	 ( OPERAND.exclude, FILTER_mode_EXCLUDE, arg, SPEC.filters );
+
+	else if  OPERAND.debug  then do;
+	     OPERAND.debug = F;
+	     if  verify(arg, DIGITS) = 0  then
+		SPEC.db = binary(arg, 17, 0);
+               else call ssu_$print_message (SPEC.sciP, error_table_$badopt, "-debug ^a", arg);
+	     end;
+
+	else if  isControlArg(arg)  &  SPEC.entrypoint >= EP_contents_cmd  then do;
+						/* contents command/AF or request/AR: 11 control_args     */
+
+	     if       arg = "-nl"     | arg = "-newline"          then do; SPEC.S.NL_to_SP    = F;
+							       SPEC.S.NL_to_QUOTE = F; end;
+	     else if  arg = "-nnl"    | arg = "-no_newline"       then do; SPEC.S.NL_to_SP    = T;
+							       SPEC.S.NL_to_QUOTE = F; end;
+	     else if  arg = "-rql"    | arg = "-requote_line"     then do; SPEC.S.NL_to_SP    = F;
+							       SPEC.S.NL_to_QUOTE = T; end;
+
+	     else if  arg = "-fm"     | arg = "-from"             then     OPERAND.from    = T;
+	     else if		  arg = "-to"               then     OPERAND.to      = T;
+	     else if		  arg = "-for"              then     OPERAND.for     = T;
+
+	     else if		  arg = "-match"            then     OPERAND.match   = T;
+	     else if  arg = "-ex"     | arg = "-exclude"          then     OPERAND.exclude = T;
+
+	     else if  arg = "-err"    | arg = "-errors"           then     SPEC.errorsS = T;
+	     else if  arg = "-nerr"   | arg = "-no_errors"        then     SPEC.errorsS = F;
+
+	     else if  arg = "-db"     | arg = "-debug"            then     OPERAND.debug = T;
+
+               else call ssu_$print_message (SPEC.sciP, error_table_$badopt, 
+		     "Ignoring unsupported control arg: ^a", arg);
+	     end;
+	
+	else if  isControlArg(arg)  &  SPEC.entrypoint <= EP_contains_req  then do;
+						/* contains command/AF or request/AR: 8 control_args      */
+
+	     if       arg = "-fm"     | arg = "-from"             then     OPERAND.from    = T;
+	     else if		  arg = "-to"               then     OPERAND.to      = T;
+	     else if		  arg = "-for"              then     OPERAND.for     = T;
+
+	     else if     		  arg = "-match"            then     OPERAND.match   = T;
+	     else if  arg = "-ex"     | arg = "-exclude"          then     OPERAND.exclude = T;
+
+	     else if  arg = "-err"    | arg = "-errors"           then     SPEC.errorsS = T;
+	     else if  arg = "-nerr"   | arg = "-no_errors"        then     SPEC.errorsS = F;
+
+	     else if  arg = "-db"     | arg = "-debug"            then     OPERAND.debug = T;
+
+               else call ssu_$print_message (SPEC.sciP, error_table_$badopt, 
+		     "Ignoring unsupported control arg: ^a", arg);
+	     end;
+
+	else if  SPEC.file.path = ""  then do;		/* 1st non-control_arg/non-operand is file pathname.      */
+	     if  length(arg) > maxlength(SPEC.file.path)  then 
+		call ssu_$abort_line (SPEC.sciP, error_table_$bigarg, 
+		     "PATH argument is longer than ^d characters: ^a",
+		     maxlength(SPEC.file.path), arg);
+	     SPEC.file.path = arg;
+	     end;
+
+	else do;					/* Other non-control_arg/non-operand are errors.	        */
+	     call ssu_$print_message (SPEC.sciP, error_table_$badopt, 
+		"Ignoring unsupported operand: ^a", arg);
+	     end;
+
+	argI = argI + 1;				/* Record that we processed the arg just examined above.  */
+	end ARGUMENT_LOOP;
+%page;
+     call check_missing_operand( OPERAND.from,    "-from"     );
+     call check_missing_operand( OPERAND.to,      "-to"       );
+     call check_missing_operand( OPERAND.for,     "-for"      );
+     call check_missing_operand( OPERAND.match,   "-match"    );
+     call check_missing_operand( OPERAND.exclude, "-exclude"  );
+     call check_missing_operand( OPERAND.debug,   "-debug"    );
+
+     return;
+
+check_missing_operand:				/* Diagnose missing -control_arg operand	        */
+	proc (OPERAND_flag, CONTROL_arg);
+
+  dcl  OPERAND_flag bit(1) unal;
+  dcl  CONTROL_arg char(*) unal;
+
+	if  OPERAND_flag  then
+	     call ssu_$abort_line( SPEC.sciP, error_table_$noarg, "Operand of: ^a", CONTROL_arg);
+
+	end check_missing_operand;
+%page;
+
+set_range_bound:					/* Process operand of -from/-to/-for		        */
+	proc (OPERAND_flag, CONTROL_arg, Aarg, Abound);
+     
+  dcl  OPERAND_flag bit(1) unal;			/* OPERAND.xxx flag value (which this routine turns off)  */
+  dcl  CONTROL_arg char(*) unal;			/* Name of -control_arg			        */
+  dcl  Aarg char(*) unal;				/* Operand value.				        */
+  dcl 1 Abound aligned like BOUND;			/* Range start/end structure (a BOUND)		        */
+
+  dcl 1 arg_struc unal based(addr(Aarg)),		/* Declaration of a signed argument		        */
+      2 sign char(1),
+      2 rest char(length(Aarg)-1);
+  dcl  arg_arr (length(Aarg)) char(1) unal based(addr(Aarg));
+
+  dcl  bound_str char(Abound.strL) based(Abound.strP);
+
+  dcl  ignore_regex_resultS bit(1) aligned;
+
+  dcl  SIGNS  char( 2) int static options(constant) init("+-");
+  dcl  SLASH  char( 1) int static options(constant) init("/");
+  dcl  TEST_LINE char(19) int static options(constant) init("CONTENTS TEST LINE
+");
+
+	if  Abound.type ^= BOUND_type_UNSET  then do;	/* Diagnose multiple range bounds of same type.	        */
+	     call ssu_$print_message( SPEC.sciP, error_table_$inconsistent, 
+	          "Only one ^[^a^;^s-to or -for^] control_arg is allowed.", CONTROL_arg = "-from", CONTROL_arg);
+	     goto EXIT_bound;
+	     end;
+
+	if  length(Aarg) > 0  then			/* Check for unsigned numeric operand.		        */
+	if  verify(Aarg, DIGITS) = 0  then do;
+	     if  CONTROL_arg = "-for"  then
+		Abound.type = BOUND_type_NUMBER_FOR;
+	     else Abound.type = BOUND_type_NUMBER;
+	     Abound.lineN = bin(Aarg, 21, 0);
+	     if  Abound.lineN = 0  then goto BAD_bound;	/* -fm 0  or  -to 0  or  -for 0  is not valid.	        */
+	     goto EXIT_bound;
+	     end;
+
+	if  CONTROL_arg = "-for"  then goto BAD_bound;	/* -for +N  or  -for -N  is invalid.		        */
+						/*  and also  -for STRING  or  -for /REGEXP/	        */
+
+	if  length(Aarg) > 1  then			/* Check for signed numeric operand.		        */
+	if  verify(arg_struc.sign, SIGNS)  = 0  then
+	if  verify(arg_struc.rest, DIGITS) = 0  then do;
+	     Abound.type = BOUND_type_SIGNED_NUMBER;
+	     Abound.lineN = bin(Aarg, 21, 0);		
+	     if  Abound.lineN = 0  then do;
+		if  CONTROL_arg = "-to"  &  arg_struc.sign = "+"  then;
+						/* -to +0  is a valid range bound (a 1-line range         */
+						/*          consisting of just the -from line)	        */
+						/*         is equivalent to:  -for 1		        */
+		else goto BAD_bound;		/* -fm +0  -fm -0  or  -to -0  is not valid.	        */
+		end;
+	     goto EXIT_bound;
+	     end;
+
+	if  length(Aarg) > 2  then			/* Check for /REGEXP/ operand.		        */
+	if  arg_arr(1) = SLASH  then
+	if  arg_arr(length(Aarg)) = SLASH  then do;
+	     Abound.type = BOUND_type_REGEX;
+	     Abound.strP = addr(arg_arr(2));
+	     Abound.strL = dimension(arg_arr,1) - 2;
+	     if  Abound.strL = 0  then		/* -fm //  or  -to //  is not valid.		        */
+		goto BAD_bound;
+	     ignore_regex_resultS = regex_search( CONTROL_arg, bound_str, TEST_LINE );
+						/* Test validity of REGEXP string.  The subroutine issues */
+						/*  an ssu_$abort_line diagnostic if REGEXP is bad.       */
+	     goto EXIT_bound;
+	     end;
+
+	if  length(Aarg) > 0  then do;		/* Default is a non-empty STRING operand	        */
+	     Abound.type = BOUND_type_STRING;
+	     Abound.strP = addr(Aarg);
+	     Abound.strL = length(Aarg);
+	     goto EXIT_bound;
+	     end;
+	
+BAD_bound:
+	call ssu_$abort_line( SPEC.sciP, error_table_$badopt, "^a ^[^a^;""^a""^]", CONTROL_arg, 
+	     search(Aarg, SP_HT)=0, Aarg );
+
+EXIT_bound:
+	OPERAND_flag = F;				/* Record that operand has been found/processed.	        */
+	return;
+%page;
+
+set_filter:
+	entry (OPERAND_flag, FILTER_mode, Aarg, Afilters);
+	
+  dcl  FILTER_mode fixed bin(2);			/* A FILTER_mode_MATCH or FILTER_mode_EXCLUDE value       */
+  dcl  1 Afilters aligned,
+       2 fN fixed bin,				/* Number of f() array entries in use.		        */
+       2 fI fixed bin,				/* Index of current f() array entry being set/tested.     */
+       2 f (*) aligned like FILTER;
+	
+  dcl  fI fixed bin;
+
+  dcl  FILTER_arg char(8);
+
+	if  Afilters.fN >= dimension(Afilters.f,1)  then 
+	     call ssu_$abort_line( SPEC.sciP, error_table_$too_many_args,
+	          "Up to ^d -match and/or -exclude control arguments may be used.", dimension(Afilters.f,1) );
+
+
+	if  FILTER_mode = FILTER_mode_EXCLUDE  then	/* Get name of -control_arg for use in errors.	        */
+	     FILTER_arg = "-exclude";
+	else FILTER_arg = "-match";
+
+	Afilters.fN, Afilters.fI, fI = Afilters.fN + 1;	/* Address the next FILTER structure in our array.        */
+	Afilters.f(fI).mode = FILTER_mode;		/* Set its mode.				        */
+
+	if  length(Aarg) > 2  then			/* Check for /REGEXP/ operand.		        */
+	if  arg_arr(1) = SLASH  then
+	if  arg_arr(length(Aarg)) = SLASH  then do;
+	     Afilters.f(fI).type = FILTER_type_REGEX;
+	     Afilters.f(fI).strP = addr(arg_arr(2));
+	     Afilters.f(fI).strL = dimension(arg_arr,1) - 2;
+	     if  Afilters.f(fI).strL = 0  then		/* -match //  or  -exclude //  is not valid.	        */
+		goto BAD_filter;
+	     ignore_regex_resultS = regex_search( FILTER_arg, filter_str, TEST_LINE );
+						/* Test validity of REGEXP string.  The subroutine issues */
+						/*  an ssu_$abort_line diagnostic if REGEXP is bad.       */
+	     goto EXIT_filter;
+	     end;
+
+	Afilters.f(fI).type = FILTER_type_STRING;	/* Default is a STRING operand.		        */
+	Afilters.f(fI).strP = addr(Aarg);
+	Afilters.f(fI).strL = length(Aarg);
+	if  Afilters.f(fI).strL = 0  then		/* -match ""  or  -exclude ""  is not valid.	        */
+	     goto BAD_filter;
+	goto EXIT_filter;
+
+BAD_filter:
+	call ssu_$abort_line( SPEC.sciP, error_table_$badopt, "^a ""^a"" ", CONTROL_arg, Aarg);
+
+EXIT_filter:
+	OPERAND_flag = F;				/* Record that operand has been found/processed.	        */
+	return;
+
+	end set_range_bound;
+
+     end controlArgs;     
+%page;
+%include system_constants;
+%page;
+%include terminate_file;
+%include access_mode_values;
+
+     end contents;

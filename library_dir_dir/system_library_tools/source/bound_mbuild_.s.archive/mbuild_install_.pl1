@@ -1,0 +1,913 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2019-08-17,GDixon), approve(2019-10-26,MCR10069),
+     audit(2020-01-12,Swenson), install(2020-01-20,MR12.6g-0035):
+     mbuild request:  install_ec, inst
+  2) change(2020-07-06,GDixon), approve(2021-02-22,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+      A) Fix bug in error message about library name matching multiple paths.
+      B) For Seg with "target_only" paradigm, use seg_type.default_library
+         if build script does not specify a particular library directory.
+      C) Support new code parameter when calling mbuild_data_$get_Seg(...).
+      D) Check mbuild user's access to >t>installation_tools_ gate.  If no
+         access, use:  update_seg set_defaults -rb 4 5 5
+                                                   END HISTORY COMMENTS */
+
+mbuild_install_:
+     proc(AsciP, Abuild_dataP) returns (bit(1) aligned);
+
+  dcl  PROC char(15) int static options(constant) init("mbuild_install_");
+
+     return (check_parms (mbuild_data_version_3));
+/* -------------------- */
+
+  dcl (RE_Segs init("1"b), R_Segs init("0"b)) bit(1) aligned int static options(constant);
+
+  dcl  delete_$path entry (char(*), char(*), bit(36) aligned, char(*), fixed bin(35));
+  dcl  hcs_$initiate entry (char(*), char(*), char(*), fixed bin(1), fixed bin(2), ptr, fixed bin(35));
+
+  dcl  ioa_$ioa_switch entry() options(variable);
+  dcl  iox_$attach_ptr entry (ptr, char(*), ptr, fixed bin(35));
+  dcl  iox_$close entry (ptr, fixed bin(35));
+  dcl  iox_$destroy_iocb entry (ptr, fixed bin(35));
+  dcl  iox_$detach_iocb entry (ptr, fixed bin(35));
+  dcl  iox_$find_iocb entry (char(*), ptr, fixed bin(35));
+  dcl  iox_$open entry (ptr, fixed bin, bit(1) aligned, fixed bin(35));
+  dcl  iox_$put_chars entry (ptr, ptr, fixed bin(21), fixed bin(35));
+
+  dcl  mbuild_Tlist_$empty_request_list entry (ptr);
+  dcl  mbuild_Tlist_$find_mbuild_support entry (ptr, char(*) var) returns(ptr);
+
+  dcl  mbuild_data_$disconnect_Seg entry (ptr);
+  dcl  mbuild_data_$exists_Seg entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$get_Seg entry (ptr, char(*) var, char(*) var, char(*) var, char(*) var, char(*) var) returns(ptr);
+  dcl  mbuild_data_$get_build_progress entry (ptr) returns(bit(*) aligned);
+  dcl  mbuild_data_$install_ec_build_progress_update entry (ptr, fixed bin);
+  dcl  mbuild_data_$replacing_identical_Seg entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$unknown_library_found entry (ptr, bit(1) aligned) returns(bit(1) aligned);
+
+  dcl  mbuild_info_find_$suffix_for_build_type entry (char(*)) returns(char(12) var);
+
+  dcl  mbuild_library_$library_directories entry (char(*) var, (*) char(200) var, fixed bin, fixed bin(35));
+  dcl  mbuild_library_$replace_library_component entry (char(*) var, char(*) var, char(*) var) returns(char(32) var);
+  dcl  mbuild_library_$search entry (char(*) var, char(*) var, (*) char(200) var, fixed bin, fixed bin(35));
+
+  dcl  mbuild_set_$description entry (ptr) returns(char(*));
+
+  dcl (error_table_$badopt,
+       mbuild_et_$identical_segments,
+       mbuild_et_$inexact_library,
+       mbuild_et_$multiple_lib_paths,
+       mbuild_et_$object_missing,
+       mbuild_et_$not_installable,
+       mbuild_et_$segment_missing,
+       mbuild_et_$source_missing,
+       mbuild_et_$unexpected_event,
+       mbuild_et_$unsupported_operation
+        ) fixed bin(35) ext static;
+
+  dcl (addr, length, min, null, string, substr ) builtin;
+
+  dcl  cleanup  condition;
+%page;
+/* ======================================================================
+   REQUEST: install_ec, inst
+
+   Produces an installation exec_com that uses update_seg (us) to perform
+   the actual library update operations.
+
+    1) Create an exec_com: <install_dir_entryname>.mb.ec.  For example: MCR10056.mb.ec
+       Always use &version 2 exec_com language, specifying:  &trace &command off
+
+    2) The exec_com uses "us set_defaults" to set default values for
+          -set_log_dir, -acl and -rb 
+       used for the newly-created installation object segment.  The
+       -set_log_dir option is included only if that option was given in:
+          - the mbuild command line; 
+          - an mbuild request: set -log_dir 
+
+    3) The first "us initiate" creates the installation object segment.
+       This command includes a -log option, if the mbuild Description has been set
+       or read from a build script.  
+
+    4) The exec_com groups segments sharing the same defaults together, and 
+       includes a "us in" command at the start of each such group to adjust the
+       default ACL.  Use of defaults shortens subsequent us add/rp/dl commands.
+
+    5) Grouping also allows use of the -special_seg (-ss) control arg, to be 
+       placed on us add/rp/dl lines for segments targeted for execution dirs.
+
+    6) Full pathnames are used to specify target_seg (rather than active functions 
+       like [lds pn library.dir] to construct pathnames inside the exec_com.  
+       mbuild thus converts from the library names used in the build script to 
+       actual pathnames. 
+
+    7) Order of us add/rp/dl lines in the exec_com:
+        - First, files targeted for execution dirs.  These are the most important to a 
+	change, and best characterize the change set.  They include mbuild Bound_obj 
+	and Unbound_obj segments.  This also includes any	object_x_only paradigm segments.
+        - Second, source/object archives associated with Bound_obj segments; and 
+	standalone source file associated with Unbound_obj.  This also includes any
+	object_x_only paradigm segments.
+        - Third, Info segments.
+        - Fourth, Include segments.
+        - Fifth, any other original-content segment which mbuild knows how to install.
+        - Sixth, listing segments which are installed with the request: install_ec -list
+/* ====================================================================== */
+
+install_ec_request:
+     entry(AsciP, Abuild_dataP);
+
+     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+     if  ^bld_progress.preppedS  then			/* Require that archive_prep request has completed OK.    */
+						/*  Since archive_prep also requires that compile has     */
+						/*  completed, and says it has completed if there are no  */
+						/*  changes requiring archive_prep, this test includes    */
+						/*  a requirement that compile completed OK.	        */
+	call ssu_$abort_line (AsciP, mbuild_et_$not_installable, 
+	     "Before install_ec, please use requests:  compile  and  archive_prep");
+
+     if mbuild_data_$unknown_library_found (addr(bld), F) then do;
+	call ssu_$abort_line (AsciP, 0, "Please resolve UNKNOWN library names before using install_ec.");
+	end;
+
+%page;
+  dcl 1 C aligned,					/* Control args for this request.		        */
+      2 sciP ptr,
+      2 S aligned,
+        3 (listS
+	  ) bit(1) unaligned;
+
+     C.sciP = AsciP;
+     C.S = F;
+     call arg_setup (AsciP);				/* User asks for a format via -Control_args	        */
+     if args_remain() then
+	call controlArgs(C);
+
+  dcl  ec_name char(32) var;				/* Name of IOCB used to create Build_exec_com	        */
+     ec_name = bld.build_script_prefix || mbuild_info_find_$suffix_for_build_type("Build_exec_com");
+
+  dcl  ec_iocbP ptr;				/* IOCB used to write into the Build_exec_com file.       */
+     ec_iocbP = null();
+
+  dcl 1 req aligned like request;			/* List anchor for Segs being processed by this request   */
+     req.info = "";					/*  - Set its pre-use state.			        */
+     call Tlist_initialize (addr(req.request_Tb), addr(req));	
+
+     on cleanup call ec_janitor(ec_name, ec_iocbP, req);	/* If any ssu_$abort_line call reports failure,	        */
+						/*  this cleanup on-unit will close/detach/destroy IOCB   */
+						/*  as our request is aborted.  Also, any Segs in request */
+						/*  list are unthreaded.			        */
+
+/* ----------------------------------------------------------------------
+   Find Segs to be installed, add them to the request list; then call
+   us_commands_into which writes an update_seg command for each Seg
+   into the Build_exec_com.  
+
+   The first call to us_commands_into with a non-empty request list
+   attaches and opens the Build_exec_com file, and writes part (1)
+   of the file  (via open_ec subroutine).
+
+   The first through last calls to us_commands_into with a non-empty 
+   request list write part (2) of the file.
+
+   Note: The Build_exec_com contains update_seg (us) commands to 
+         install files into the Multics Library.  These commands are
+         divided into three parts, each with different types of
+         update_seg commands:
+
+    1) Setup:          creation of the us installation object (.io) file.
+
+    2) Install:        one or more groups of us add/replace/delete commands.
+
+    3) Documentation:  us print/list command that document the installation
+	 	   in an installation list (.li) (a.k.a.  Build_log) file,
+		   and in the system-wide LOG_DIR>Installations.log file
+   ---------------------------------------------------------------------- */
+%page;
+  dcl  errorsN fixed bin init(0);
+
+     requestP = request_init (req);			/* Bound_obj & Unbound_obj (executables)	        */
+     do BOUNDOBJp = Tlist_first_item (addr(bld.BOUNDOBJ_Tb))
+             repeat Tlist_next_item  (addr(BOUNDOBJ.BOUNDOBJ_Td))  while (BOUNDOBJp ^= null() );
+	if  BOUNDOBJ.operation = "DELETE"  then		/*  - DELETE, there are no Segs attached to BOUNDOBJ      */
+	     call append_Seg_to (request, BOUNDOBJp, errorsN);
+	else call append_Seg_to (request, BOUNDOBJ.Bound_objP, errorsN);
+	end;
+     do UNBOUNDOBJp = Tlist_first_item (addr(bld.UNBOUNDOBJ_Tb))
+               repeat Tlist_next_item  (addr(UNBOUNDOBJ.UNBOUNDOBJ_Td))  while (UNBOUNDOBJp ^= null() );
+	if  UNBOUNDOBJ.operation = "DELETE"  then	/*  - DELETE, there are no Segs attached to UNBOUNDOBJ    */
+	     call append_Seg_to (request, UNBOUNDOBJp, errorsN);
+	else do;
+	     if  UNBOUNDOBJ.sourceP ^= null()  then
+	     if  UNBOUNDOBJ.sourceP -> Seg.COMPILEp ^= null()  then
+		call append_Seg_to (request, UNBOUNDOBJ.sourceP -> Seg.COMPILEp -> COMPILE.objectP, errorsN);
+	     end;
+	end;
+     do SegP = Tlist_first_item (addr(bld.object_x_only_Tb))
+        repeat Tlist_next_item  (addr(Seg.pdm_Td))  while (SegP ^= null() );
+	call append_Seg_to (request, SegP, errorsN);
+	end;
+     call us_commands_into (ec_name, ec_iocbP, request, RE_Segs, "executable ---------", errorsN);
+
+     requestP = request_init (req);			/* source_arch/object_arch  &  source/Unbound_obj	        */
+     do BOUNDOBJp = Tlist_first_item (addr(bld.BOUNDOBJ_Tb))
+             repeat Tlist_next_item  (addr(BOUNDOBJ.BOUNDOBJ_Td))  while (BOUNDOBJp ^= null() );
+	if  BOUNDOBJ.operation = "DELETE"  then		/*  - DELETE, there are no Segs attached to BOUNDOBJ      */
+	     call append_Seg_to (request, BOUNDOBJp, errorsN);
+	else do;
+	     do sArchP = Tlist_first_item (addr(BOUNDOBJ.sourceArchs_Tb))
+		repeat Tlist_next_item  (addr(sArch.archs_Td))  while (sArchP ^= null() );
+		call append_Seg_to (request, sArchP, errorsN);
+		end;
+	     do oArchP = Tlist_first_item (addr(BOUNDOBJ.objectArchs_Tb))
+		repeat Tlist_next_item  (addr(oArch.archs_Td))  while (oArchP ^= null() );
+		if oArch.operation ^= "BIND-INPUT" then
+		     call append_Seg_to (request, oArchP, errorsN);
+		end;
+	     end;
+	end;
+     do UNBOUNDOBJp = Tlist_first_item (addr(bld.UNBOUNDOBJ_Tb))
+               repeat Tlist_next_item  (addr(UNBOUNDOBJ.UNBOUNDOBJ_Td))  while (UNBOUNDOBJp ^= null() );
+	if  UNBOUNDOBJ.operation = "DELETE"  then	/*  - DELETE, there are no Segs attached to UNBOUNDOBJ    */
+	     call append_Seg_to (request, UNBOUNDOBJp, errorsN);
+	else do;
+	     if  UNBOUNDOBJ.sourceP ^= null()  then do;
+		call append_Seg_to (request, UNBOUNDOBJ.sourceP, errorsN);
+		if  UNBOUNDOBJ.sourceP -> Seg.COMPILEp ^= null()  then
+		     call append_Seg_to (request, UNBOUNDOBJ.sourceP -> Seg.COMPILEp -> COMPILE.objectP, errorsN);
+		end;
+	     end;
+	end;
+     do SegP = Tlist_first_item (addr(bld.object_x_only_Tb))
+        repeat Tlist_next_item  (addr(Seg.pdm_Td))  while (SegP ^= null() );
+	call append_Seg_to (request, SegP, errorsN);
+	end;
+     call us_commands_into (ec_name, ec_iocbP, request, R_Segs,  "source, object -----", errorsN);
+
+     requestP = request_init (req);			/* Include				        */
+     do SegP = Tlist_first_item (addr(bld.target_only_Tb))
+        repeat Tlist_next_item  (addr(Seg.pdm_Td))  while (SegP ^= null() );
+	if  Seg.type = "Include"  then
+	     call append_Seg_to (request, SegP, errorsN);
+	end;
+     call us_commands_into (ec_name, ec_iocbP, request, R_Segs,  "Include ------------", errorsN);
+     
+     requestP = request_init (req);			/* Info					        */
+     do SegP = Tlist_first_item (addr(bld.target_only_Tb))
+        repeat Tlist_next_item  (addr(Seg.pdm_Td))  while (SegP ^= null() );
+	if  Seg.type = "Info"  then
+	     call append_Seg_to (request, SegP, errorsN);
+	end;
+     call us_commands_into (ec_name, ec_iocbP, request, R_Segs,  "Info ---------------", errorsN);
+     
+     requestP = request_init (req);			/* Other					        */
+     do SegP = Tlist_first_item (addr(bld.target_only_Tb))
+        repeat Tlist_next_item  (addr(Seg.pdm_Td))  while (SegP ^= null() );
+	if  ^(Seg.type = "Include" | Seg.type = "Info")  then
+	     call append_Seg_to (request, SegP, errorsN);
+	end;
+     call us_commands_into (ec_name, ec_iocbP, request, R_Segs,  "Other --------------", errorsN);
+     
+     requestP = request_init (req);			/* listing				        */
+     if  C.listS  then do;
+	do SegP = Tlist_first_item (addr(bld.listing_Tb))
+	   repeat Tlist_next_item  (addr(Seg.pdm_Td))  while (SegP ^= null() );
+	     call append_Seg_to (request, SegP, errorsN);
+	     end;
+	end;
+     call us_commands_into (ec_name, ec_iocbP, request, R_Segs,  "listing ------------", errorsN);
+%page;
+/* ----------------------------------------------------------------------
+   After the above code writes parts (1) and (2) of the Build_exec_com file,
+   call close_ec, to write part (3) and close/detach the file.
+
+    - Unlike the cleanup on-unit, close_ec reports any errors encountered 
+      while closing the file.
+   ---------------------------------------------------------------------- */
+
+     call close_ec (ec_iocbP, ec_name, errorsN);		/* Close the Build_exec_com created above.	        */
+     requestP = request_init (req);			/* Empty the request list before returning.	        */
+						/*  Otherwise, the Seg.request_Td data will be pointing   */
+						/*  to a non-existent anchor when req variable is	        */
+						/*  removed from the stack.			        */
+     call mbuild_data_$install_ec_build_progress_update (addr(bld), errorsN);
+     return;
+
+
+
+ec_janitor:					/* cleanup on-unit for the install_ec request.	        */
+     proc (Aec_name, AiocbP, Areq);
+
+  dcl  Aec_name char(32) var;
+  dcl  AiocbP ptr;
+  dcl 1 Areq aligned like request;
+
+  dcl  code fixed bin(35);
+  dcl 1 delS aligned like delete_options;
+
+     if AiocbP ^= null() then do;			/* Must close/detach/destroy IOCB if request aborts.      */
+	call iox_$close (AiocbP, code);
+	call iox_$detach_iocb (AiocbP, code);
+	call iox_$destroy_iocb (AiocbP, code);
+	AiocbP = null();
+
+          string (delS) = F;				/* Since we're aborting creation of file, delete any      */
+          delS.segment, delS.raw = T;			/*  partially-created file.			        */
+	call delete_$path (bld.directory, (Aec_name), string(delS), "", code);
+	end;
+
+     if Areq.name ^= "" then				/* Empty Areq.request_Tb of its Segs if request aborts.   */
+	call mbuild_Tlist_$empty_request_list (addr(Areq));
+						/*  Otherwise, the Seg.request_Td data will be pointing   */
+						/*  to a non-existent anchor, when Areq is removed        */
+						/*  from the stack.				        */
+     end ec_janitor;
+%page;
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  append_Seg_to
+
+   Given a pointer to a Seg structure:
+    - if the pointer is non-null, then add it to the tail of the request 
+      threaded list.
+   ---------------------------------------------------------------------- */
+append_Seg_to:
+     proc (Arequest, ASegP, AerrorsN);
+
+  dcl 1 Arequest aligned like request;
+  dcl  ASegP ptr;
+  dcl  AerrorsN fixed bin;
+
+  dcl 1 ASeg aligned like Seg based(ASegP);
+
+     if ASegP ^= null()  then do;
+	if ASeg.operation = "DELETE" then
+	     call Tlist_add_to_tail (addr(Arequest.request_Tb), addr(ASeg), addr(ASeg.request_Td));
+
+	else if  mbuild_data_$exists_Seg  (addr(bld), ASegP)  then
+	     call Tlist_add_to_tail (addr(Arequest.request_Tb), addr(ASeg), addr(ASeg.request_Td));
+
+	else do;
+	     call ssu_$print_message (C.sciP, mbuild_et_$segment_missing, "Cannot install ^a: ^a", ASeg.type, ASeg.name);
+	     AerrorsN = AerrorsN + 1;
+	     end;
+	end;
+
+     end append_Seg_to;
+
+
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  request_init
+
+   Given a threaded list anchor:
+    - if the request structure has not yet been fully initialized:
+       - initialize it now.
+    - otherwise, empty the list of current Seg membership so a new set of
+      member Segs may be added.
+   ---------------------------------------------------------------------- */
+request_init:					/* Initialize per-request threaded list.	        */
+     proc (Arequest) returns (ptr);			/*  - per-request threaded lists are valid only during    */
+						/*    execution of that one request.  At end of request,  */
+  dcl 1 Arequest aligned like request;			/*    the list must be emptied.		        */
+
+     if Arequest.name = "" then do;
+	Arequest.info = "";
+	Arequest.struct = "req";
+	Arequest.name = ssu_$get_request_name(C.sciP);
+	call Tlist_initialize (addr(Arequest.request_Tb), addr(Arequest));	
+	end;
+     else call mbuild_Tlist_$empty_request_list (addr(Arequest));
+     return ( addr(Arequest) );
+
+     end request_init;
+
+
+
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  us_commands_into
+
+   Given request list anchor:
+    - Check whether request list is empty.  If not:
+       - Check all REPLACE/UPDATE operations to verify that new segs differs 
+         from existing target segment in the library.
+          - If same content, then remove that request from the request list.
+    - Check whether request list is now empty.  If so: return.
+
+    - Open the Build_exec_com (if not already open).
+    - Write an update_seg initiate line characterizing items to be 
+      installed as executable (Are_SegS=T) or non-executable (Are_SegS=F).
+    - Walk the request list, examining Seg().operation.
+       - For ADD or REPLACE (most common case), output an update_seg
+         command to install that item.
+
+       - DELETE is harder, because it may involve one of the relationship
+         structures (BOUNDOBJ or UNBOUNDOBJ).  Since there are no real 
+         segments in the install directory relating to the item being 
+         deleted, all data from deletes comes from a Build_script file.
+         That file refers to Bound_obj and Unbound_obj items to be deleted. 
+         The read request converts those to BOUNDOBJ and UNBOUNDOBJ relationship 
+         structures, respectively.
+	- For Seg: issue us command to delete Seg.name in (Seg.library).
+	- For UNBOUNDOBJ:
+	   - For executables, issue an update_seg command to
+	     delete the Unbound_obj installed in (UNBOUNDOBJ.library).execution 
+	     dir.
+	   - For non-executables:
+	      - look in (UNBOUNDOBJ.library).source for: (UNBOUNDOBJ.name).*  
+	        If one file matches, issue an us_command_delete_path for 
+	        that one file.
+	      - Issue an us command to delete UNBOUNDOBJ.name in 
+	        (UNBOUNDOBJ.library).object dir.
+	- For BOUNDOBJ:
+	   - For executables, issue an update_seg command to
+	     delete the Bound_obj installed in (BOUNDOBJ.library).execution 
+	     dir.
+	   - For non-executables:
+	      - look in (BOUNDOBJ.library).source for (BOUNDOBJ.name).**.archive
+	        and issue us_command_delete_path for each matching source_arch.
+	      - look in (BOUNDOBJ.library).object for (BOUNDOBJ.name).**.archive
+	        and issue us_command_delete_path for each matching object_arch.
+   ---------------------------------------------------------------------- */
+
+us_commands_into:
+     proc (Aec_name, AiocbP, Areq, Are_SegS, Atitle, AerrorsN);
+
+  dcl  Aec_name char(32) var;
+  dcl  AiocbP ptr;
+  dcl 1 Areq aligned like request;
+  dcl  Are_SegS bit(1) aligned;
+  dcl  Atitle char(*);
+  dcl  AerrorsN fixed bin;
+
+  dcl  full_library char(32) var;
+  dcl  lib_dir char(7) aligned;
+  dcl  paths (20) char(200) var,
+      (pathI, pathsN) fixed bin;
+  dcl  starname char(32) var;
+
+     if  ^Tlist_is_empty (addr(Areq.request_Tb))  then do;
+	do SegP = Tlist_first_item (addr(Areq.request_Tb))
+             repeat Tlist_next_item  (addr(Seg.request_Td))  while (SegP ^= null() );
+	     
+	     if  Seg.operation = "REPLACE" & Seg.struct = "Seg"  then do;
+CHECK_IDENTICAL_SEGS:
+		if  mbuild_data_$replacing_identical_Seg (addr(bld), SegP)  then do;
+		     call ssu_$print_message (C.sciP, mbuild_et_$identical_segments,
+			"^/^-Skipping REPLACE of Seg(^a): ^a  IN: ^a", Seg.type, Seg.name, Seg.library);
+		     call Tlist_remove (addr(Seg.request_Td));
+		     end;
+		end;
+	     else if  Seg.operation = "UPDATE" & (Seg.type = "source_arch" | Seg.type = "object_arch")  then 
+		goto CHECK_IDENTICAL_SEGS;
+	     end;
+	end;
+
+     if  ^Tlist_is_empty (addr(Areq.request_Tb))  then do;
+	if  AiocbP = null()  then
+	     call open_ec (AiocbP, Aec_name);		/* Create/open the Build_exec_com attached to ec_iocbP    */
+
+	call ioa_$ioa_switch (AiocbP, 
+	       "&-"     ||
+	     "^/us in ^32t -acl ^[re^;r ^] *.*.*  ^61t &- -------- ^a", Are_SegS, Atitle);
+
+	do SegP = Tlist_first_item (addr(Areq.request_Tb))
+             repeat Tlist_next_item  (addr(Seg.request_Td))  while (SegP ^= null() );
+	     
+	     if  (Seg.operation = "ADD" | Seg.operation = "REPLACE") & Seg.struct = "Seg"  then do;
+		segtP = Seg.seg_typeP;		/* Address Seg build_type info.                           */
+		
+		if  Are_SegS & segt.build_paradigm = PDM_Unbound_obj & 
+		     index(Seg.library, ".object") > 0 then do;
+						/* For UNBOUNDOBJ, their Unbound_obj has LIB.object       */
+						/*   Change to LIB.execution.			        */
+		     full_library = mbuild_library_$replace_library_component (Seg.library, "", "execution");
+		     call us_command (AiocbP, full_library, SegP, Seg.name, Are_SegS, AerrorsN);
+		     end;
+		else if  ^Are_SegS & segt.build_paradigm = PDM_object_x_only &
+		     index(Seg.library, ".execution") > 0  then do;
+						/* For object_x_only Segs, their target dir defaults to   */
+						/*  .execution; for the >ldd copy, change to .object      */
+		     full_library = mbuild_library_$replace_library_component (Seg.library, "", "object");
+		     call us_command (AiocbP, full_library, SegP, Seg.name, Are_SegS, AerrorsN);		      
+		     end;
+		else if  ^Are_SegS & segt.build_paradigm = PDM_target_only &
+		     index(Seg.library, ".") = 0  then do;
+						/* For target_only Segs, use paradigm-specific target dir */
+		     full_library = mbuild_library_$replace_library_component (Seg.library, "", segt.default_library);
+		     call us_command (AiocbP, full_library, SegP, Seg.name, Are_SegS, AerrorsN);		      
+		     end;
+		else call us_command (AiocbP, Seg.library, SegP, Seg.name, Are_SegS, AerrorsN);
+		end;
+	     
+	     else if  Seg.operation = "UPDATE" & (Seg.type = "source_arch" | Seg.type = "object_arch")  then do;
+		call us_command (AiocbP, Seg.library, SegP, Seg.name, Are_SegS, AerrorsN);
+		end;
+
+	     else if  Seg.operation = "DELETE" & Seg.struct = "UBND"  then do;
+		UNBOUNDOBJp = SegP;
+		
+		if Are_SegS then
+		     call us_command (AiocbP, UNBOUNDOBJ.library || ".execution", UNBOUNDOBJp, 
+		          UNBOUNDOBJ.name, Are_SegS, AerrorsN);
+		else do;
+		     full_library = UNBOUNDOBJ.library || ".source";
+		     starname = UNBOUNDOBJ.name || ".*";
+		     call mbuild_library_$search (full_library, starname, paths, pathsN, code);
+		     if  pathsN = 1  then
+			call us_command_delete_path (AiocbP, paths(1), Are_SegS);
+		     else if pathsN = 0 then do;
+			call ssu_$print_message (C.sciP, mbuild_et_$source_missing, 
+			     "Deleting UNBOUNDOBJ: ^a  from library: ^a", starname, full_library);
+			AerrorsN = AerrorsN + 1;
+			end;
+		     else do;
+			call ssu_$print_message (C.sciP, mbuild_et_$multiple_lib_paths,
+			     "Deleting UNBOUNDOBJ: ^a  from library: ^a^/^-^v(^a ^)", 
+			     starname, full_library, pathsN, paths);
+			AerrorsN = AerrorsN + 1;
+			end;
+
+		     full_library = UNBOUNDOBJ.library || ".object";
+		     call us_command (AiocbP, full_library, UNBOUNDOBJp, UNBOUNDOBJ.name, Are_SegS, AerrorsN);
+		     end;
+		end;
+	     
+	     else if  Seg.operation = "DELETE" & Seg.struct = "BND"  then do;
+		BOUNDOBJp = SegP;
+
+		if Are_SegS then
+		     call us_command (AiocbP, BOUNDOBJ.library || ".execution", BOUNDOBJp, 
+		          BOUNDOBJ.name, Are_SegS, AerrorsN);
+
+		else do;				/* Easiest to search for source/object_archs	        */
+		     do lib_dir = ".source", ".object";
+			full_library = BOUNDOBJ.library || lib_dir;
+			starname = BOUNDOBJ.name || ".**.archive";
+			call mbuild_library_$search (full_library, starname, paths, pathsN, code);
+			if pathsN >= 1 then do;
+			     do pathI = 1 to pathsN;
+				call us_command_delete_path (AiocbP, paths(pathI), Are_SegS);
+				end;
+			     end;
+			else if lib_dir = ".source" then do;
+			     call ssu_$print_message (C.sciP, mbuild_et_$source_missing,
+			          "DELETE for source_arch: ^a  from library: ^a", starname, full_library);
+			     AerrorsN = AerrorsN + 1;
+			     end;
+			else do;
+			     call ssu_$print_message (C.sciP, mbuild_et_$object_missing,
+			          "DELETE for object_arch: ^a  from library: ^a", starname, full_library);
+			     AerrorsN = AerrorsN + 1;
+			     end;
+			end;
+		     end;
+		end;
+
+	     else if  Seg.operation = "DELETE" & Seg.struct = "Seg"  then do;
+		segtP = Seg.seg_typeP;		/* Address Seg build_type info.                           */
+		if  ^Are_SegS & segt.build_paradigm = PDM_object_x_only &
+		     index(Seg.library, ".execution") > 0  then do;
+						/* For object_x_only Segs, their target dir defaults to   */
+						/*  .execution; for the >ldd copy, change to .object      */
+		     full_library = mbuild_library_$replace_library_component (Seg.library, "", "object");
+		     call us_command (AiocbP, full_library, SegP, Seg.name, Are_SegS, AerrorsN);		      
+		     end;
+		else call us_command (AiocbP, Seg.library, SegP, Seg.name, Are_SegS, AerrorsN);
+		end;
+
+	     else if  Seg.operation = "DELETE"  then do;
+		call ssu_$print_message (C.sciP, mbuild_et_$unexpected_event, 
+		     "DELETE with request struct: ^a  for ^a: ^a", Seg.struct, Seg.type, Seg.name);
+		AerrorsN = AerrorsN + 1;
+		end;
+	     
+	     else do;
+		call ssu_$print_message (C.sciP, mbuild_et_$unsupported_operation,
+		     "us_command with operation: ^a  for ^a ^a: ^a", Seg.operation, Seg.struct, Seg.type, Seg.name);
+		AerrorsN = AerrorsN + 1;
+		end;
+	     end;
+
+	end;
+
+     end us_commands_into;
+%page;
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  us_command
+
+     Writes an update_seg command to add, rp, or dl  a segment (ASeg).
+
+   1) Convert library.dir into absolute path of library directory.
+   2) Are_SegS argument specifies whether ASeg is an executable segment.
+       - Executable segments are designated as special-segments (-ss) in
+         update_seg commands.
+   3) ASeg.type = source_arch | object_arch means ASeg is source/object 
+      archive.  us -ac control arg requests putting component names on the
+      new archive when it replaces the old target, or new seg is added.
+   ---------------------------------------------------------------------- */
+
+us_command:
+     proc (AiocbP, Alibrary, ASegP, Aname, Are_SegS, AerrorsN);
+     
+  dcl  AiocbP ptr;
+  dcl  Alibrary char(32) var;
+  dcl  ASegP ptr;
+  dcl  Aname char(32) var;
+  dcl  Are_SegS bit(1) aligned;
+  dcl  AerrorsN fixed bin;
+     
+  dcl 1 ASeg aligned like Seg based (ASegP);
+
+  dcl  code fixed bin(35);
+
+  dcl  lib_dirs (20) char(200) var,
+       lib_dirsN fixed bin;
+
+  dcl  RE_SegS bit(1) aligned;
+     RE_SegS = Are_SegS;
+     if  index(Aname,".") > 0  then
+	RE_SegS = F;
+
+     call mbuild_library_$library_directories (Alibrary,  lib_dirs, lib_dirsN, code);
+     if lib_dirsN ^= 1 then do;		/* - Get library directory for target segment	        */
+	call ssu_$print_message (C.sciP, mbuild_et_$inexact_library, 
+	     "^a: ^a  library: ^a^[ (^a)^;^s^]^/^-matches ^d paths: ^v( ^a^)", 
+	     Seg.type, Seg.name, Seg.library, Seg.library ^= Alibrary, Alibrary, lib_dirsN, lib_dirsN, lib_dirs(*));
+	AerrorsN = AerrorsN + 1;
+	end;
+
+     else if ASeg.operation = "DELETE" then
+	call ioa_$ioa_switch (AiocbP, 
+	     "us dl  ^32x ^a>^a ^[-ss ^]", 
+	     lib_dirs(1), 
+	     Aname,
+	     RE_SegS);
+
+     else call ioa_$ioa_switch (AiocbP, 
+	     "us ^[add^;rp ^] ^32a ^a>== ^[-ss ^]^[-ac ^]", 
+	     Seg.operation = "ADD",
+	     Aname,
+	     lib_dirs(1), 
+	     RE_SegS,
+	     Seg.type = "source_arch" | Seg.type = "object_arch");
+
+     end us_command;
+
+
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  us_command_delete_path
+
+     Writes an update_seg command to  dl  a given path.
+
+   When deleting a Bound_obj or Unbound_obj, it may have many components
+   for which Seg structures have not been created.  The caller has located
+   those component pathnames.  A us dl command is written for one of those
+   paths.
+   ---------------------------------------------------------------------- */
+
+us_command_delete_path:
+     proc (AiocbP, Apath, Are_SegS);
+
+  dcl  AiocbP ptr;
+  dcl  Apath char(*) var;
+  dcl  Are_SegS bit(1) aligned;
+     
+     call ioa_$ioa_switch (AiocbP, 
+	"us dl  ^32x ^a ^[-ss ^]", 
+	Apath,
+	Are_SegS);
+
+     end us_command_delete_path;
+%page;
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  open_ec
+
+     Attaches and opens the Build_exec_com file, and writes the setup
+     commands.
+
+   The Build_exec_com contains update_seg (us) commands to install files
+   into the Multics Library.  These include:
+    - setup commands:    creation of the us installation object (.io) file.
+    - install commands:  us add/replace/delete commands.
+    - doc commands:      us print/list command that document the installation
+		     in an installation list (.li) (a.k.a.  Build_log) file,
+		     and in the system-wide LOG_DIR>Installations.log file
+   ---------------------------------------------------------------------- */
+
+open_ec:						/* If file exists already, it will be truncated.	        */
+     proc (AiocbP, Aec_name);
+
+  dcl  AiocbP ptr;
+  dcl  Aec_name char(32) var;
+
+  dcl  switch_name char(32);
+     switch_name = bld.build_script_prefix || "_output";
+
+     call iox_$find_iocb (switch_name, AiocbP, code);
+     if code ^= 0 then
+	call ssu_$abort_line (bld.sciP, code, "Finding IOCB: ^a", switch_name);
+
+  dcl  attach_desc char(50);
+  
+     attach_desc = "vfile_ " || Aec_name || " -ssf";
+
+     call iox_$attach_ptr (AiocbP, attach_desc, null(), code);
+     if code ^= 0 then
+	call ssu_$abort_line (bld.sciP, code, "Attaching Seg(Build_exec_com): ^a", Aec_name);
+
+     call iox_$open (AiocbP, Stream_output, "0"b, code);
+     if code ^= 0 then
+	call ssu_$abort_line (bld.sciP, code, 
+	     "Opening for ^a Seg(Build_exec_com): ^a", iox_modes(Stream_output), Aec_name);
+
+     call ioa_$ioa_switch (ec_iocbP, "&version 2^/&trace &command off");
+
+  dcl  io_file_name char(50) var init (bld.build_script_prefix || mbuild_info_find_$suffix_for_build_type ("Build_io"));
+
+  dcl  io_il_starname char(50) var;
+     io_il_starname = substr (io_file_name, 1, length(io_file_name)-1) || "?";
+						/* Starname matching both Build_io and Build_log file     */
+  dcl  rb_write char(1),
+       seg_ptr ptr;					/* Can mbuild user access installation_tools_ gate?       */
+     call hcs_$initiate (">tools", "installation_tools_", "installation_tools_", 0, 0, seg_ptr, code);
+     if  seg_ptr = null()  then
+	rb_write = "4";				/*  - No.  Use -rb 4 5 5			        */
+     else rb_write = "1";				/*  - Yes. Use -rb 1 5 5			        */
+
+     call ioa_$ioa_switch (ec_iocbP, 
+	    "&-"                                               ||
+            "^/delete ^a -brief -query_all"                      ||
+	  "^/us sd -set_log_dir ""^a"" ^32t -acl re *.*.*  -rb ^a 5 5 ^61t &- ---- ^a ----", 
+	io_il_starname, bld.log_directory, rb_write, "set global defaults");
+
+     call ioa_$ioa_switch (ec_iocbP, 
+	    "&-"                                               ||
+	"^[^/&attach &trim off^]"		               || 
+	  "^/us in ^a^[ -log -no_fill"                         ||
+	  "^/^a"				               ||
+	  "^/."				               || 
+	  "^/&detach^]",
+	bld_progress.describedS,
+	io_file_name, 
+	bld_progress.describedS, mbuild_set_$description (addr(bld)) );
+
+     end open_ec;
+
+
+/* ----------------------------------------------------------------------
+   SUBROUTINE:  close_ec
+
+     Write the doc commands, then closes and detaches the Build_exec_com
+     IOCB.
+
+   The Build_exec_com contains update_seg (us) commands to install files
+   into the Multics Library.  These include:
+    - setup commands:    creation of the us installation object (.io) file.
+    - install commands:  us add/replace/delete commands.
+    - doc commands:      us print/list command that document the installation
+		     in an installation list (.li) (a.k.a.  Build_log) file,
+		     and in the system-wide LOG_DIR>Installations.log file
+   ---------------------------------------------------------------------- */
+
+close_ec:
+     proc (AiocbP, Aec_name, AerrorsN);
+
+  dcl  AiocbP ptr;
+  dcl  Aec_name char(32) var;
+  dcl  AerrorsN fixed bin;
+  
+  dcl  code fixed bin(35);
+  dcl 1 delS aligned like delete_options;
+
+     if AiocbP = null() then return;			/* Do nothing if file never opened.		        */
+
+     call ioa_$ioa_switch (AiocbP,			/* Write final us commands to the file.		        */
+            "&-"     ||
+	"^/us ls"  ||
+	"^/us pr"  );
+
+     call iox_$close (AiocbP, code);			/* Close the file, which sets its bit count.	        */
+     if code ^= 0 then
+	call ssu_$print_message (bld.sciP, code, "Closing Seg(Build_exec_com): ^a", Aec_name);
+
+     call iox_$detach_iocb (AiocbP, code);		/* Detach the file.				        */
+     if code ^= 0 then
+	call ssu_$print_message (bld.sciP, code, "Detaching Seg(Build_exec_com): ^a", Aec_name);
+
+     call iox_$destroy_iocb (AiocbP, code);		/* Destroy IOCB dedicated to creation of this .io segment */
+
+     if errorsN > 0 then do;				/* If unexpected errors seen, delete the Build_exec_com.  */
+	string (delS) = F;				/*  Progress then reports install_ec not complete.        */
+	delS.force, delS.segment, delS.raw = T;
+
+	call delete_$path (bld.directory, (Aec_name), string(delS), "", code);
+	if code ^= 0 then
+	     call ssu_$print_message (AsciP, code, "Deleting  ^a: ^a", "Build_exec_com", Aec_name);
+	end;
+
+     else do;
+	SegP = mbuild_data_$get_Seg (addr(bld), "Build_exec_com", Aec_name, 
+			         not_stored_in_library, no_library_operation, no_containing_archive);
+	   					/* Add the just-created build script segment to mbuild    */
+						/*  data.  This includes:			        */
+						/*   - Seg_Tb thread (added by get_Seg call)	        */
+						/*   - scan_Tb scan/read thread 		        */
+						/*     (as if script was there before the scan request).  */
+						/*   - mbuild_support_Tb per-paradigm thread 	        */
+						/*     (as if script were there before analyze request).  */
+
+	call mbuild_data_$disconnect_Seg (SegP);	/* In case Seg existed from earlier install_ec request.   */
+						/*  Don't want it appearing in lists more than once.      */
+
+	call Tlist_add_to_tail (addr(bld.scan_Tb), SegP, addr(Seg.scan_Td));
+	call Tlist_add_to_tail (addr(bld.mbuild_support_Tb), SegP, addr(Seg.pdm_Td));
+	end;
+
+     end close_ec;
+%page;
+/* ------------------------------------------------------------
+   ENTRYPOINT:  clean
+
+   mbuild_install_ creates no derived-content segments.  This
+   entrypoint is called by the request:  clean -all  
+   to identify mbuild_support segments not present when a 
+   build operation first starts:
+    - Build_exec_com
+   and segments associated with the update_seg command:  
+    - Build_io
+    - Build_log
+   ------------------------------------------------------------ */
+
+clean:
+     entry (Abuild_dataP, Aclean_requestP);
+     
+  dcl  Aclean_requestP ptr;
+
+     requestP = Aclean_requestP;
+     
+     do SegP = Tlist_first_item (addr(bld.mbuild_support_Tb)) 
+        repeat Tlist_next_item  (addr(Seg.pdm_Td)) while (SegP ^= null() );
+	if Seg.type ^= "Build_script" then
+	     if  mbuild_data_$exists_Seg (addr(bld), SegP)  then 
+	          call Tlist_add_to_tail (addr(request.request_Tb), addr(Seg), addr(Seg.request_Td));
+	end;
+     return;
+%page;
+/* ------------------------------------------------------------
+   ENTRYPOINT:  exists_Build_exec_com
+
+   Returns T if creation of install_ec is complete.
+   ------------------------------------------------------------ */
+
+exists_Build_exec_com:
+     entry (Abuild_dataP) returns(bit(1) aligned);
+     
+     SegP = mbuild_Tlist_$find_mbuild_support (addr(bld), "Build_exec_com");
+     if SegP ^= null() then
+	return ( mbuild_data_$exists_Seg (addr(bld), SegP) );
+     else return (F);
+%page;
+/* ------------------------------------------------------------
+   Process print -control_arg arguments.
+   ------------------------------------------------------------ */
+
+controlArgs:
+     proc (aC);
+
+  dcl 1 aC aligned like C;				/*  control arg specification data                   (in) */
+
+     do while (args_remain());
+	call ssu_$arg_ptr (aC.sciP, argI+1, argP, argL);	/* Conditionally read next arg to command/af/request      */
+					
+	if isControlArg(arg) then do;
+
+	     if       arg = "-ls"     | arg = "-list"    then aC.listS = T;
+
+               else call ssu_$print_message (aC.sciP, error_table_$badopt, 
+		     "Ignoring unsupported control arg: ^a", arg);
+	     end;
+	
+	else do;					/* If arg not a -control_arg			        */
+	     call ssu_$print_message (aC.sciP, error_table_$badopt, 
+		"Ignoring unsupported operand: ^a", arg);
+	     end;
+
+	argI = argI + 1;				/* Record that we processed the arg just examined above.  */
+	end;
+
+     end controlArgs;
+%page;
+%include iox_modes;
+%include delete_options;
+%page;
+%include ssu_request_dcls_;
+%page;
+%include mbuild_request_parms_;
+%page;
+%include mbuild_info_;
+%page;
+%include mbuild_Tlist_;
+%page;
+%include mbuild_data_;
+
+     end mbuild_install_;

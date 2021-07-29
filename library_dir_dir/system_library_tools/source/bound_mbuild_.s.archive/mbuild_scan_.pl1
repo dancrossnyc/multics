@@ -1,0 +1,369 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2019-08-17,GDixon), approve(2019-10-23,MCR10069),
+     audit(2020-01-20,Swenson), install(2020-01-20,MR12.6g-0035):
+     mbuild request:  scan, sc
+  2) change(2020-01-25,GDixon), approve(2020-01-25,MCR10079),
+     audit(2020-02-02,Swenson), install(2020-02-02,MR12.6g-0045):
+      A) Change scan request to prompt installer to read the build_script
+         segment if one is found in the installation directory. [Ticket196]
+      B) Add -query (default) and -no_query control arguments to control
+         this read action.
+      C) Correct primary name for Seg(build_script) to match the shortest
+         name on the installation directory.  In dir with names list and ls,
+         the build_script would be the ls.mb segment.
+      D) Correct scan's algorithm for identifying intermediate file's in a
+         2-step translation process (e.g., .cds -> .pl1 -> object_seg).
+  3) change(2020-08-29,GDixon), approve(2021-02-22,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+      A) Support new code parameter when calling mbuild_data_$scan_Tb_insert(...).
+      B) Support new prev_SegP parameter when calling mbuild_Tlist_$find_Seg(...).
+      C) Support new code parameter when calling mbuild_data_$get_Seg(...).
+                                                   END HISTORY COMMENTS */
+
+mbuild_scan_:
+     proc (AsciP, Abuild_dataP) returns (bit(1) aligned);
+
+  dcl  PROC char(12) int static options(constant) init("mbuild_scan_");
+
+     return (check_parms (mbuild_data_version_3));
+/* -------------------- */
+
+  dcl  command_query_$yes_no entry() options(variable);
+  dcl  hcs_$star_ entry (char(*), char(*), fixed bin(2), ptr, fixed bin, ptr, ptr, fixed bin(35));
+
+  dcl  mbuild_Tlist_$find_Seg entry (ptr, char(*) var, char(*) var, ptr) returns(ptr);
+
+  dcl  mbuild_data_$derived_Seg entry (ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$get_build_progress entry (ptr) returns(bit(*) aligned);
+  dcl  mbuild_data_$get_Seg entry (ptr, char(*) var, char(*) var, char(*) var, char(*) var, char(*) var) returns(ptr);
+  dcl  mbuild_data_$initialize_build_lists entry (ptr);
+  dcl  mbuild_data_$scan_Tb_insert entry (ptr, ptr, fixed bin(35));
+
+  dcl  mbuild_info_find_$prefix_for_build_type entry (char(*)) returns(char(12) var);
+  dcl  mbuild_info_find_$seg_type_for_seg_name entry (char(*) var) returns(ptr);
+  dcl  mbuild_info_find_$suffix_by_type_ID entry (fixed bin) returns(char(12) var);
+  dcl  mbuild_info_find_$suffix_for_build_type entry (char(*)) returns(char(12) var);
+
+  dcl  mbuild_library_$archive_table entry (char(*), char(*) var, char(*) var, (*) char(32) var, fixed bin,
+	fixed bin(35));
+
+  dcl  translator_temp_$allocate entry (ptr, fixed bin) returns(ptr);
+
+
+  dcl  error_table_$badopt fixed bin(35) ext static;
+
+  dcl  mbuild_et_$derived_segment fixed bin(35) ext static;
+
+  dcl (addr, hbound, index, lbound, length, null, reverse, rtrim, sum) builtin;
+
+  dcl (cleanup) condition;
+%page;
+/* ================================================================================
+   REQUEST:  scan
+
+    - List segments (and dirs, which will be ignored) in the install directory.
+    - For each segment, create a Seg structure which is:
+       - added to tail of Seg_Tb list (by mbuild_data_$get_Seg);
+       - inserted at an appropriate point into the scan_Tb list.
+       - extra names on a seg are captured: Seg->add_nameP -> nm_data
+
+    Output:  build_data.scan_Tb: list of Seg structures found by scan request.		        
+	   The Seg.type has not been assigned.
+
+                Seg()     Seg()       Seg()     Seg()      Seg()
+     scan_Tb:    -scan_Td  -scan_Td    -scan_Td  -scan_Td   -scan_Td
+/* ================================================================================ */
+
+scan_request:
+     entry(AsciP, Abuild_dataP);
+
+  dcl 1 C aligned,
+      2 sciP ptr,
+      2 S,
+        3 (queryS					/* T: -query control argument given                       */
+           ) bit(1) aligned;
+
+     C.sciP = AsciP;
+     C.S = F;
+     C.queryS = T;
+
+     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+
+     if bld_progress.scannedS then do;			/* Discard all prior data about install directory.        */
+	call mbuild_data_$initialize_build_lists (addr(bld));
+	end;
+
+     call arg_setup (AsciP);                                /* User chooses whether to read any build_script with     */
+						/*  -query or -no_query control argument.	        */
+
+     if args_remain() then
+          call controlArgs(C);
+
+
+  dcl  no_earlier_scan_or_read_requestS bit(1) aligned;     /* T: first scan or read in this invocation of mbuild.    */
+
+     no_earlier_scan_or_read_requestS = (bld.scan_Tb_via_request = "");
+
+     bld.scan_Tb_via_request = ssu_$get_request_name (bld.sciP);
+						/* Remember we are now about to do a scan request.        */
+     
+
+     star_entry_ptr, star_names_ptr = null();		/* Prepare to cleanup storage allocated by hcs_$star_     */
+     on cleanup call scan_directory_janitor();
+
+     call hcs_$star_ (bld.directory, "**", star_BRANCHES_ONLY, bld.ssu_areaP, 
+	star_entry_count, star_entry_ptr, star_names_ptr, code);
+     if code ^= 0 then do;
+	call ssu_$abort_line (AsciP, code, "Looking for branches matching ** in build directory.");
+	return;
+	end;
+%page;
+
+  dcl (entI, nmFirstI, nmI, nmJ, nmLastI) fixed bin;
+  dcl  long_name char(32) var;			/* Longest of names on the segment.		        */
+  dcl  prefix_Bound_obj char(12) var;
+  dcl  scriptEntryname char(32) var;
+  dcl  suffix_Info char(12) var;
+  dcl  suffix_Build_script char(12) var;
+
+     prefix_Bound_obj    = mbuild_info_find_$prefix_for_build_type("Bound_obj");    /* = "bound_"		        */
+     suffix_Build_script = mbuild_info_find_$suffix_for_build_type("Build_script"); /* = ".mb"		        */
+     scriptEntryname     = bld.build_script_prefix || suffix_Build_script;
+     suffix_Info	     = mbuild_info_find_$suffix_for_build_type("Info");         /* = ".info"		        */
+
+STAR_BRANCHES:					/* Walk array of branches returned by hcs_$star_	        */
+     do entI = lbound(star_entries,1) to hbound(star_entries,1);
+						/*  - For each segment...			        */
+	if star_entries(entI).type = star_SEGMENT then do;
+	     nmFirstI = star_entries(entI).nindex;
+	     nmLastI  = (nmFirstI - 1) + star_entries(entI).nnames;
+	     long_name = "";
+
+          /* RULE: Seg().name: always use longest entryname; except use first name for .info, its more meaningful.    */
+          /* RULE: Seg().name: always use longest entryname; except use first name if it begins bound_	        */
+          /* RULE: Seg().name: always use longest entryname; except use <build_script_prefix>.mb on build_script files*/
+	     if index (reverse (rtrim (star_names(nmFirstI))), reverse (suffix_Info)) = 1 then
+		long_name = rtrim (star_names(nmFirstI));
+	     else if index (star_names(nmFirstI), prefix_Bound_obj) = 1  then
+		long_name = rtrim (star_names(nmFirstI));
+	     else if index (reverse (rtrim (star_names(nmFirstI))), reverse (suffix_Build_script)) = 1 then do;
+		long_name = rtrim (star_names(nmFirstI));
+		do nmI = nmFirstI+1 to nmLastI;
+		     if star_names(nmI) = scriptEntryname then
+			long_name = scriptEntryname;
+		     end;
+		end;
+	     else do nmI = nmFirstI to nmLastI;		
+		if length(rtrim(star_names(nmI))) > length(long_name) then
+		     long_name = rtrim(star_names(nmI));
+		end;
+
+	     SegP =				/* Get a Seg representing segment at tail of bld.Seg_Tb   */
+		mbuild_data_$get_Seg (addr(bld), unknown_type, long_name, 
+		                      unknown_library, unknown_operation, unknown_archive_name);
+						/*  - All we know is longest name on segment.	        */
+	     if SegP ^= null() then do;
+		if mbuild_data_$derived_Seg (SegP) then do;
+						/* Analysis ignores paradigms for most derived objects.   */
+						/*  So should we, by not placing segment on scan_Tb list. */
+		     call ssu_$print_message (AsciP, mbuild_et_$derived_segment, 
+			" ^15a  ^a", Seg.type || ":", Seg.name);
+		     goto NEXT_STAR_BRANCH;
+		     end;
+
+		call mbuild_data_$scan_Tb_insert (addr(bld), SegP, ignore_code);
+						/* Add structure to list of scanned input Segs.	        */
+
+		nm_dataN = star_entries(entI).nnames - 1;
+		if nm_dataN > 0 then do;		/* Get a structure to hold the alternate names on seg.    */
+		     nm_dataP = translator_temp_$allocate (bld.areaP, size(nm_data));
+		     nm_data.N = nm_dataN;
+		     nmJ = 1;
+		     do nmI = nmFirstI to nmLastI;	/* Save all names except longest one (stored in Seg)      */
+			nm_data.names(nmJ) = rtrim(star_names(nmI));
+			if nm_data.names(nmJ) ^= Seg.name then 
+			     nmJ = nmJ + 1;
+			end;
+		     Seg.name_addP = nm_dataP;
+		     end;
+		end;
+	     end;
+NEXT_STAR_BRANCH:
+	end STAR_BRANCHES;
+
+     call scan_directory_janitor();
+%page;
+/* ----------------------------------------------------------------------
+   Walk the scan_Tb list, looking for Seg(source).operation = ADD.  See
+   if it was produced (as an intermediate source) by a similarly-named
+   Seg(source) (or Seg(source_arch).operation = ADD archive component).  
+   If so:
+    - report 1st Seg(source) as derived object which was produced by 
+      compiler of 2nd Seg(source);
+    - remove 1st Seg(source) from scan_Td list.
+   ---------------------------------------------------------------------- */
+
+  dcl compiler char(32) var;
+
+     do SegP = Tlist_first_item (addr(bld.scan_Tb))
+        repeat Tlist_next_item  (addr(Seg.scan_Td))  while (SegP ^= null() );
+	if  Seg.type = "source" & Seg.operation = "ADD"  then do;
+	     compiler = INTERMEDIATE_Seg_compiler (SegP);
+	     if  compiler ^= ""  then do;
+		call ssu_$print_message (AsciP, mbuild_et_$derived_segment, 
+		     " ^15a  ^a ^- (produced by: ^a)", Seg.type || ":", Seg.name, compiler);
+		Seg.produced_by_compiler = compiler;
+		call Tlist_remove (addr(Seg.scan_Td));
+		end;
+	     end;
+	end;
+
+
+/* ----------------------------------------------------------------------
+   If scan found a build_script file in the installation directory, then:
+    - if no earlier scan or read request has been executed, then:
+      - Prompt installer to read in contents of this segment following 
+        this scan operation.
+   ---------------------------------------------------------------------- */
+
+  dcl  ignore_code fixed bin(35);
+  dcl  read_request_line char(4) int static options(constant) init("read");
+  dcl  yesS bit(1) aligned;
+
+     if  C.queryS & no_earlier_scan_or_read_requestS  then do;
+	SegP = mbuild_Tlist_$find_Seg (Abuild_dataP, scriptEntryname, "", null() );
+	if SegP ^= null then do;
+	     call command_query_$yes_no (yesS, 0, ssu_$get_subsystem_and_request_name(bld.sciP), 
+		"Read into ^s^a the existing build_script found in installation directory?", 
+		"Do you want to read the ^a file?", 
+		Seg.name,  ssu_$get_subsystem_name(bld.sciP));
+	     if yesS then
+		call ssu_$execute_line (bld.sciP, addr(read_request_line), length(read_request_line), ignore_code);
+	     end;
+	end;
+
+     return;
+%page;
+
+INTERMEDIATE_Seg_compiler:
+     proc (ASegP) returns (char(32) var);
+
+  dcl  ASegP ptr,					/* Pointer to candidate INTERMEDIATE Seg	        */
+      1 ASeg aligned like Seg based(ASegP);
+
+  dcl  BSegP ptr,
+      1 BSeg aligned like Seg based(BSegP);
+
+  dcl  cI fixed bin;
+
+  dcl  code fixed bin(35);
+
+  dcl  compNames (20) char(32) var,
+       compNamesN fixed bin;
+
+  dcl  sPrefix char(32) var;
+  dcl  sSuffix char(12) var;
+
+     if  ASeg.seg_typeP = null()  then return ("");
+     segtP = ASeg.seg_typeP;
+     sSuffix = mbuild_info_find_$suffix_by_type_ID (segt.type_ID);
+     sPrefix = reverse (after (reverse (ASeg.name), reverse(sSuffix)));
+
+     do BSegP = Tlist_first_item (addr(bld.scan_Tb))
+         repeat Tlist_next_item  (addr(BSeg.scan_Td))  while (BSegP ^= null() );
+	if  BSegP = ASegP  then;			/* Skip over our candidate in the scan_Tb list.	        */
+	else if  length(BSeg.name) <= length(sPrefix) + 1  then;
+						/* Skip over segments whose names are shorter then prefix */
+	else if  index(BSeg.name, sPrefix) = 1 & substr(BSeg.name, length(sPrefix)+1, 1) = "."  then do;
+	     if  BSeg.seg_typeP ^= null then do;	/* Another similarly-named segment!		        */
+		segtP = BSeg.seg_typeP;
+		if  segt.mbuild_type = "source"  &  segt.intermediate_suffix = sSuffix  then
+		     return (segt.compiler);
+		end;
+	     end;
+	else if  BSeg.type = "source_arch" & BSeg.operation = "ADD"  then do;
+						/* A source archive being added.		        */
+	     call mbuild_library_$archive_table (bld.directory, BSeg.name, sPrefix || ".*", 
+		compNames, compNamesN, code);
+	     if code = 0  then do;
+		do cI = 1 to compNamesN;
+		     segtP = mbuild_info_find_$seg_type_for_seg_name (compNames(cI));
+						/* Get Multics Libraries segment type.		        */
+		     if segtP ^= null() then do;
+			if  segt.mbuild_type = "source"  &  segt.intermediate_suffix = sSuffix  then
+			     return (segt.compiler);
+			end;
+		     end;
+		end;
+	     end;
+	end;
+     return ("");
+
+     end INTERMEDIATE_Seg_compiler;
+
+
+scan_directory_janitor:
+          proc ();
+
+	if star_names_ptr ^= null then		/* star_names must be freed first, because its extent     */
+	     free star_names;			/*  depends upon data returned in star_entries array.     */
+	if star_entry_ptr ^= null then
+	     free star_entries;
+
+	end scan_directory_janitor;
+%page;
+/* ======================================================================
+   ENTRYPOINT:  found_segments
+
+   Returns true if most recent  scan or read  request found segments in
+   the install directory.
+/* ====================================================================== */
+
+found_segments:
+     entry (Abuild_dataP) returns (bit(1) aligned);
+
+     return ( ^Tlist_is_empty (addr(bld.scan_Tb)) );
+
+%page;
+/* ------------------------------------------------------------
+   ROUTINE:  controlArgs
+
+   Process scan -control_arg arguments.
+   ------------------------------------------------------------ */
+
+controlArgs:
+     proc (c);
+
+  dcl 1 c aligned like C;                                   /*  control arg specification data                   (in) */
+
+     do while (args_remain());
+          call ssu_$arg_ptr (c.sciP, argI+1, argP, argL);   /* Conditionally read next arg to command/af/request      */
+                                                  
+          if isControlArg(arg) then do;
+
+               if       arg = "-qy"     | arg = "-query"            then     c.queryS = T;
+               else if  arg = "-nqy"    | arg = "-no_query"         then     c.queryS = F;
+
+               else call ssu_$print_message (c.sciP, error_table_$badopt, 
+                    "Ignoring unsupported control arg: ^a", arg);
+               end;
+          
+          argI = argI + 1;                                  /* Record that we processed the arg just examined above.  */
+          end;
+
+     end controlArgs;
+%page;
+%include ssu_request_dcls_;
+%page;
+%include mbuild_request_parms_;
+%page;
+%include mbuild_Tlist_;
+%page;
+%include mbuild_info_;
+%page;
+%include mbuild_data_;
+%page;
+%include star_structures;
+
+     end mbuild_scan_;

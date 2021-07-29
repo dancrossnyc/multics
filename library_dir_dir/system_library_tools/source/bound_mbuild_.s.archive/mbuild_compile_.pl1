@@ -1,0 +1,693 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2019-08-17,GDixon), approve(2019-10-25,MCR10069),
+     audit(2020-01-20,Swenson), install(2020-01-20,MR12.6g-0035):
+     mbuild request:  compile, comp
+  2) change(2021-02-17,GDixon), approve(2021-02-22,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+      A) Support new code parameter when calling mbuild_data_$get_Seg(...).
+                                                   END HISTORY COMMENTS */
+
+mbuild_compile_:
+     proc (AsciP, Abuild_dataP) returns (bit(1) aligned);
+
+  dcl  PROC char(15) int static options(constant) init("mbuild_compile_");
+
+     return (check_parms (mbuild_data_version_3));
+/* -------------------- */
+
+  dcl  delete_$path entry (char(*), char(*), bit(36) aligned, char(*), fixed bin(35));
+  dcl  hcs_$status_minf entry (char(*), char(*), fixed bin(1), fixed bin(2), fixed bin(24), fixed bin(35));
+
+  dcl  mbuild_$request entry options(variable);
+
+  dcl  mbuild_Tlist_$empty_request_list entry (ptr);
+  dcl  mbuild_Tlist_$find_request entry (ptr, char(*) var, char(*) var) returns(ptr);
+
+  dcl  mbuild_clean_$delete_Seg entry (ptr, ptr, ptr);
+
+  dcl  mbuild_data_$compile_build_progress_update entry (ptr);
+  dcl  mbuild_data_$disconnect_Seg entry (ptr);
+  dcl  mbuild_data_$exists_component entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$exists_Seg entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$get_build_progress entry (ptr) returns(bit(*) aligned);
+  dcl  mbuild_data_$get_Seg entry (ptr, char(*) var, char(*) var, char(*) var, char(*) var, char(*) var) returns(ptr);
+  dcl  mbuild_data_$unknown_library_found entry (ptr, bit(1) aligned) returns(bit(1) aligned);
+
+  dcl  mbuild_library_$replace_library_component entry (char(*) var, char(*) var, char(*) var) returns(char(32) var);
+
+  dcl  mbuild_info_find_$seg_type_for_seg_name entry (char(*) var) returns(ptr);
+  dcl  mbuild_info_find_$suffix_by_type_ID entry (fixed bin) returns(char(12) var);
+  dcl  mbuild_info_find_$suffix_for_build_type entry (char(*)) returns(char(12) var);
+
+  dcl (addr, length, maxlength, null, reverse, string) builtin;
+
+  dcl  cleanup condition;
+
+  dcl (error_table_$badopt,
+       error_table_$bigarg,
+       error_table_$noentry,
+       mbuild_et_$archive_component_missing,
+       mbuild_et_$archive_x_fails,
+       mbuild_et_$archive_names_differ,
+       mbuild_et_$compile_fails,
+       mbuild_et_$no_COMPILE,
+       mbuild_et_$seg_type_missing,
+       mbuild_et_$source_missing,
+       mbuild_et_$unexpected_event 
+        )fixed bin(35) ext static;
+
+%page;
+/* ======================================================================
+   REQUEST:  compile {-list|-ls} {-table|-tb}
+		compile all segments.  If -list and/or -table are
+                    given, they are passed to the compiler, in addition
+                    to any options specified in mbuild_info_ or the build
+                    script.
+           
+             compile SOURCE_NAME.LANG_SUFFIX  {-list|-ls} {-table|-tb}
+                    compile just the given source file.  Only one 
+                    SOURCE_NAME may be given per request.
+
+   Compile original-content segments (represented by Seg(source) in the
+   diagrams) using compiler and options from  mbuild_info_ (defaults), 
+   or as modified in a build script which has been read in and analyzed.
+
+   If compiled Seg(Unbound_obj) is tied (via COMPILE and Seg(source) structures) to an
+   UNBOUNDOBJ where: UNBOUNDOBJ.add_nameP ^= null or UNBOUNDOBJ.delete_nameP ^= null
+      - For each name in UNBOUNDOBJ.add_nameP list, issue command: 
+         add_name Seg(Unbound_obj).name <add-seg-name> -bf
+      - For each name in UNBOUNDOBJ.delete_nameP list, issue command: 
+         delete_name  <del-seg-name> -bf
+
+   REQUIREMENTS/ASSUMPTIONS for compilations:
+    - Original content segments themselves reside in the install directory:
+       - as standalone source files (for an existing Bound_obj or Unbound_obj
+         being UPDATEd).
+       - inside a source_arch archive (for a new Bound_obj being ADDed).
+
+    - Include files used by these source files are:
+       - available in >ldd>include; 
+           OR
+       - are standalone files in the install directory;
+           OR
+       - Either:
+          - if using a private library descriptor, its include directory must be
+            present in translator search paths.
+             OR
+	- if NOT using a private library descriptor but are installing into
+	  multics_libraries_, then private library's include directory must NOT
+	  be present in translator search paths.
+
+    - All compilers specified in mbuild_info_.cds have been added as
+      hidden requests of mbuild; and may therefore be invoked as requests
+      via ssu_$execute_line.
+       - All multi-step compilers (e.g., cds, reductions, pl1_macro) invoke
+         the 2nd-step compiler themselves.  Some leave intermediate source
+         or object files; others remove those intermediates.
+    
+   INPUTS:
+    - source_Tb thread populated with original content Seg(source) structures.
+    - COMPILE_Tb thread populated with COMPILE relationship structures.
+    - Other derived-content segments may be present from an earlier compile
+      request: Seg(Unbound_obj), Seg(listing), or intermediate Seg(source).
+      If so, mbuild deletes them before starting the compile.
+
+   OUTPUTS: are as shown below. At the end of each compilation, the request looks
+      for each expected output file.  If present, a matching Seg structure is
+      fitted into the mbuild database; if absent, any previous matching Seg is
+      unthreaded from the lists below; the Seg structure is preserved on the 
+      Seg_Tb thread, and may be reused to track a later compile request.
+			          
+
+  build_data Tbases   (compile REQUEST)
+  - - - - - - - - - 
+                       Seg(source)        Seg(source)           Seg(source)
+        source_Tb:      -pdm_Td            -pdm_Td               -pdm_Td      
+                         COMPILEp           COMPILEp              COMPILEp
+                            \                    \                     \
+                             \  Seg(Unbound_obj)  \  Seg(Unbound_obj)   \  Seg(Unbound_obj)
+   Unbound_obj_Tb:            \  -pdm_Td           \  -pdm_Td            \  -pdm_Td      
+                               \  COMPILEp          \  COMPILEp           \  COMPILEp
+                                \   /                \   /                 \   /
+                                sP oP                sP oP                 sP oP
+                              COMPILE              COMPILE               COMPILE
+       COMPILE_Tb:             -COMPILE_Td          -COMPILE_Td           -COMPILE_Td            
+                                lP                                         iP
+                                 |                                          |
+                               COMPILEp                                     |
+                             Seg(listing)                                   |
+       listing_Tb:            -pdm_Td                                     COMPILEp
+                                                                        Seg(source)
+  INTERMEDIATE_Tb:                                                       -INTERMEDIATE_Td   
+/* ========================================================================================== */
+
+compile_request:
+     entry(AsciP, Abuild_dataP);
+
+  dcl 1 C aligned,
+      2 sciP ptr,
+      2 seg_name char(32) var,
+      2 S,
+        3 operationS aligned,
+	4 (listS,
+	   tableS
+             ) bit(1) unaligned;
+
+     C.sciP = AsciP;
+     C.seg_name = "";
+     C.S = F;
+
+     call arg_setup (AsciP);
+
+     if args_remain() then				/* Get listing or symbol table via -Control_args	        */
+	call controlArgs(C);
+
+/* ----------------------------------------------------------------------
+    - Ensure install directory has been analyzed, and all libraries are known.
+   ---------------------------------------------------------------------- */
+
+     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+     if ^bld_progress.analyzedS then do;
+	call ssu_$abort_line (AsciP, 0,
+	     "Please obtain data for compile task with request:  analyze  or  clean");
+	end;					/*  Need data from analyze to perform compile tasks.      */
+
+     if mbuild_data_$unknown_library_found (addr(bld), F) then do;
+	call ssu_$abort_line (AsciP, 0, "Please resolve UNKNOWN library names before compiling.");
+	end;
+
+/* ----------------------------------------------------------------------
+    - Create a list of original content Segs from thread:  COMPILE_Tb 
+   ---------------------------------------------------------------------- */
+
+  dcl 1 req aligned like request;			/* Provide storage for request structure.	        */
+     requestP = addr(req);				/*  - per-request threaded lists are valid only during    */
+     request.info = "";				/*    execution of that one request.  At end of request,  */
+     request.struct = "req";				/*    the list must be emptied.		        */
+     request.name = ssu_$get_request_name(C.sciP);
+     call Tlist_initialize (addr(request.request_Tb), addr(request));
+						/* request_Tb is a list for COMPILE structures.	        */
+
+     on cleanup call compile_janitor(addr(request));
+
+     do COMPILEp = Tlist_first_item (addr(bld.COMPILE_Tb)) 
+            repeat Tlist_next_item  (addr(COMPILE.COMPILE_Td)) while (COMPILEp ^= null() );
+	if  COMPILE.sourceP ^= null()  then 
+	     call Tlist_add_to_tail (addr(request.request_Tb), addr(COMPILE), addr(COMPILE.request_Td));
+	end;
+
+     if  Tlist_is_empty (addr(request.request_Tb))  then return;
+						/* Nothing to compile!			        */
+
+/* ----------------------------------------------------------------------
+    - Do requested compilations.
+   ---------------------------------------------------------------------- */
+
+     if C.seg_name ^= "" then do;			/* Compile one segment.			        */
+	COMPILEp = mbuild_Tlist_$find_request (addr(request), C.seg_name, "");
+	if COMPILEp = null then 
+	     call ssu_$abort_line (C.sciP, mbuild_et_$no_COMPILE, " ^a", C.seg_name);
+	call do_compile(COMPILEp, C);
+	end;
+     else do;					/* Compile all segments.			        */
+	do COMPILEp = Tlist_first_item (addr(request.request_Tb))
+                 repeat Tlist_next_item  (addr(COMPILE.request_Td))  while (COMPILEp ^= null() );
+	     call do_compile (COMPILEp, C);
+	     end;
+	end;
+
+     call compile_janitor (addr(request));
+
+/* ----------------------------------------------------------------------
+    - Report status of compile request to mbuild_data_.
+   ---------------------------------------------------------------------- */
+
+     call mbuild_data_$compile_build_progress_update (addr(bld));
+     return;
+
+compile_janitor:
+     proc (ArequestP);
+
+  dcl  ArequestP ptr;
+  dcl 1 Arequest aligned like request based(ArequestP);
+
+     call mbuild_Tlist_$empty_request_list (ArequestP);
+
+     end compile_janitor;
+%page;
+/* ----------------------------------------------------------------------
+    - Compile one source file.
+   ---------------------------------------------------------------------- */
+do_compile:
+     proc (aCOMPp, c);
+
+  dcl  aCOMPp ptr,
+      1 aCOMP aligned like COMPILE based (aCOMPp);
+  dcl 1 c aligned like C;
+     
+  dcl 1 source aligned like Seg based (sourceP),
+       sourceP ptr;
+     
+  dcl 1 UNB aligned like UNBOUNDOBJ based (UNBp),
+       UNBp ptr;
+
+  dcl  doing_compileS bit(1) aligned;
+
+     doing_compileS = T;
+     if aCOMPp = null() then return;			/* No COMPILE relationship struct.  SHOULD NEVER HAPPEN   */
+
+     sourceP = aCOMP.sourceP;
+     if sourceP = null() then do;
+	call ssu_$print_message (c.sciP, mbuild_et_$unexpected_event, "^a: ^a has null sourceP", "COMPILE", source.name);
+	return;
+	end;
+
+     if source.seg_typeP = null() then do;
+	call ssu_$print_message (c.sciP, mbuild_et_$seg_type_missing, "^a: ^a", source.type, source.name);
+	return;
+	end;
+     segtP = source.seg_typeP;
+
+/* ----------------------------------------------------------------------
+    - Make sure source file exists in install directory.
+   ---------------------------------------------------------------------- */
+  dcl 1 sArch aligned like Seg based (sArchP),
+       sArchP ptr;
+
+  dcl (source_extractedS, source_compiles_in_archiveS) bit(1) aligned;
+
+     source_extractedS, source_compiles_in_archiveS = F;
+
+     if ^mbuild_data_$exists_Seg (addr(bld), sourceP) then do;
+						/* File represented by Seg(source) not in build dir.      */
+	sArchP = Tlist_holder (addr(source.inArch_Td));
+	if sArchP = null() then do;			/*  - and it's not part of Seg(source_arch) being ADDed.  */
+	     call ssu_$print_message (c.sciP, mbuild_et_$source_missing, 
+	          "Missing source file corresponding to ^a: ^a", source.type, source.name);
+	     return;
+	     end;
+	if sArch.operation ^= "ADD" then do;		/*  - its Seg(source_arch) struct exists, 	        */
+						/*    but is not being ADDed...		        */
+	     call ssu_$print_message (c.sciP, mbuild_et_$source_missing,
+	          "Missing source file corresponding to ^a: ^a", source.type, source.name);
+	     return;
+	     end;
+	if source.archive_name ^= sArch.name then do;	/*  - its Seg(source_arch) is being ADDed...	        */
+						/*     - make sure archive names agree...	        */
+	     call ssu_$print_message (c.sciP, mbuild_et_$archive_names_differ, 
+		"Ignoring Seg(^a): ^a  with .archive_name: ^a^/^-Seg(^a).name: ^a",
+		source.type, source.name, source.archive_name, sArch.type, sArch.name);
+	     return;
+	     end;
+	if ^mbuild_data_$exists_component (addr(bld), sourceP)  then do;
+						/*  - is Seg(source) a component of Seg(source_arch)?     */
+	     call ssu_$print_message (c.sciP, mbuild_et_$archive_component_missing,
+		"^a: ^a  in  ^a: ^a", source.type, source.name, sArch.type, source.archive_name );
+	     return;
+	     end;
+	
+	if segt.compiler = "pl1" | segt.compiler = "alm" then
+	     source_compiles_in_archiveS = T;
+	else do;					/* Must extract source file from archive to compile it.   */
+	     call mbuild_$request (c.sciP, "archive x ^a ^a", F, source.archive_name, source.name);
+						/*  - Seg(source) is a component.  Extract it!	        */
+	     if ^mbuild_data_$exists_Seg (addr(bld), sourceP) then do;
+		call ssu_$print_message (c.sciP, mbuild_et_$archive_x_fails, 
+		     "^a: ^a  from  ^a: ^a", source.type, source.name, sArch.type, source.archive_name );
+		return;
+		end;
+	     source_extractedS = T;
+	     end;
+	end;
+
+/* ----------------------------------------------------------------------
+    - Remove any derived-content segments related to this COMPILE left over
+      from a prior compile task.
+   ---------------------------------------------------------------------- */
+
+     do SegP = COMPILE.objectP, COMPILE.INTERMEDIATEp, COMPILE.listingP;
+	if SegP ^= null() then
+	     call mbuild_clean_$delete_Seg (c.sciP, addr(bld), addr(Seg));
+	end;
+
+/* ----------------------------------------------------------------------
+    - Analyze does not connect a name on an existing Bound_obj to 
+      COMPILE.objectP.  So there may be a name conflict between bound_xxx_ 
+      created by a prior compile attempt and the unbound_obj compiled from
+      this source.  Delete any segment holding the name of this compilation
+      object.
+   ---------------------------------------------------------------------- */
+
+  dcl  NO_CHASE fixed bin(1) int static options(constant) init(0);
+  dcl  SEGMENT fixed bin int static options(constant) init(1);
+  dcl  bitCount fixed bin(24);
+  dcl  entryType fixed bin(2);
+
+  dcl  sPrefix char(32) var;
+  dcl  sSuffix char(12) var;
+
+     sSuffix = mbuild_info_find_$suffix_by_type_ID (segt.type_ID);
+     sPrefix = reverse (after (reverse (source.name), reverse(sSuffix)));
+
+  dcl 1 delS aligned like delete_options;
+     call hcs_$status_minf (bld.directory, sPrefix || segt.object_suffix, NO_CHASE, entryType, bitCount, code);
+     if  code = 0  &  entryType = SEGMENT  then do;
+	string (delS) = F;
+	delS.segment, delS.raw = T;
+	call delete_$path (bld.directory, sPrefix || segt.object_suffix, string(delS), "", code);
+	if  code ^= 0 & code ^= error_table_$noentry  then
+	     call ssu_$print_message (c.sciP, code, "Deleting  ^a: ^a", "Unbound_obj", sPrefix || segt.object_suffix);
+	end;
+
+
+/* ----------------------------------------------------------------------
+    - Compile source file, using source-specific compile options, plus
+      any requested by installer for this request.
+   ---------------------------------------------------------------------- */
+
+  dcl  source_tableS bit(1) aligned;
+
+     source_tableS = F;
+     if      source.compiler = "pl1"  then
+	source_tableS = c.tableS;
+     else if source.compiler = "rdc"  | source.compiler = "reductions" then
+	source_tableS = c.tableS;
+
+     call mbuild_$request (c.sciP, "^2/^a ^[^a::^;^s^]^a ^a^[ -table^;^]^[ -list^;^]", T,
+	source.compiler, source_compiles_in_archiveS, source.archive_name, 
+	source.name, source.compile_options, source_tableS, c.listS);
+     
+     if source_extractedS then do;			/* Delete source segment if was extracted from archive.   */
+	string (delS) = F;
+	delS.segment, delS.raw = T;
+	call delete_$path (bld.directory, (source.name), string(delS), "", code);
+	if  code ^= 0 & code ^= error_table_$noentry  then
+	     call ssu_$print_message (c.sciP, code, "Deleting  ^a: ^a", source.type, source.name);
+	end;
+     goto ANALYZE_COMPILE;
+%page;
+/* ----------------------------------------------------------------------
+    SUBROUTINE:  analyze_compile,  an entrypoint of do_compile
+
+    - Analyze one source file compilation (perhaps well after the fact).
+   ---------------------------------------------------------------------- */
+analyze_compile:
+     entry (aCOMPp, c);
+
+     doing_compileS = F;
+     if aCOMPp = null() then return;			/* No COMPILE relationship struct.  SHOULD NEVER HAPPEN   */
+     sourceP = aCOMP.sourceP;
+     if source.seg_typeP = null() then
+	return;
+     segtP = source.seg_typeP;
+
+     sSuffix = mbuild_info_find_$suffix_by_type_ID (segt.type_ID);
+     sPrefix = reverse (after (reverse (source.name), reverse(sSuffix)));
+
+/* ----------------------------------------------------------------------
+    - Check for compilation outputs: Unbound_obj, listing, intermediate source.
+   ---------------------------------------------------------------------- */
+
+  dcl 1 iSeg aligned like Seg based (iSegP),		/* Seg structure for intermediate, listing,	        */
+       iSegP ptr;                            		/*  and Unbound_obj type segments.		        */
+
+ANALYZE_COMPILE:
+     iSegP = attach_derived_Seg (c, aCOMPp, aCOMP.objectP, sPrefix || segt.object_suffix, 
+			   source.library, source.operation, unknown_archive_name, doing_compileS);
+     if iSegP ^= null then do;
+	aCOMP.objectP = iSegP;
+	iSeg.COMPILEp = aCOMPp;
+	call Tlist_add_to_tail (addr(bld.Unbound_obj_Tb), iSegP, addr(iSeg.pdm_Td));
+
+	if  doing_compileS & source.UNBOUNDOBJp ^= null  then do;
+						/* If source produces a single UNBOUNDOBJ: 	        */
+	     UNBp = source.UNBOUNDOBJp;		/*  - add/delete names on the Unbound_obj segment.        */
+	     if  UNB.name_addP ^= null()  then do;
+		call mbuild_$request (c.sciP, "add_name ^a ^( ^a^) -bf", T, iSeg.name, 
+		     UNB.name_addP->nm_data.names(*) );
+		end;
+	     if  UNB.name_deleteP ^= null()  then do;
+		call mbuild_$request (c.sciP, "delete_name ^a ^( ^a^) -bf", T, iSeg.name, 
+		     UNB.name_deleteP->nm_data.names(*) );
+		end;
+	     end;
+	end;
+
+
+  dcl lSuffix char(12) var;
+     lSuffix = mbuild_info_find_$suffix_for_build_type ("listing");
+     
+     iSegP = attach_derived_Seg (c, aCOMPp, aCOMP.listingP, sPrefix || lSuffix, 
+			   source.library, source.operation, no_containing_archive, doing_compileS);
+     if iSegP ^= null then do;
+	aCOMP.listingP = iSegP;
+	iSeg.COMPILEp = aCOMPp;
+	call Tlist_add_to_tail (addr(bld.listing_Tb), iSegP, addr(iSeg.pdm_Td));
+	end;
+     
+     if segt.intermediate_suffix ^= "" then do;
+	iSegP = attach_derived_Seg (c, aCOMPp, aCOMP.INTERMEDIATEp, sPrefix || segt.intermediate_suffix, 
+			        source.library, source.operation, no_containing_archive, doing_compileS);
+	if iSegP ^= null then do;
+	     aCOMP.INTERMEDIATEp = iSegP;
+	     iSeg.COMPILEp = aCOMPp;
+	     iSeg.produced_by_compiler = source.compiler;
+	     call Tlist_add_to_tail (addr(bld.INTERMEDIATE_Tb), iSegP, addr(iSeg.INTERMEDIATE_Td));
+	     end;
+	end;
+
+     end do_compile;
+%page;
+attach_derived_Seg:
+     proc (aC, aCOMPp, Acompile_itemP, Aname, Asource_library, Asource_operation, Aarch_name, Adoing_compileS) returns(ptr);
+
+  dcl 1 aC aligned like C;
+  dcl  aCOMPp ptr,
+      1 aCOMP aligned like COMPILE based (aCOMPp);
+
+  dcl  Acompile_itemP ptr,
+       Aname char(32) var,
+       Asource_library char(32) var,
+       Asource_operation char(12) var,
+       Aarch_name char(32) var,			/* Expected name of archive where derived obj installed   */
+       Adoing_compileS bit(1) aligned;
+
+  dcl 1 dSegt aligned like mbuild_info.seg_type_info based(dSegtP),
+       dSegtP ptr; 
+  dcl 1 dSeg aligned like Seg based (dSegP),
+       dSegP ptr;
+  dcl 1 d aligned like Seg.common;			/* Seg-like structure to pass to mbuild_data_$exists_Seg  */
+
+  dcl  revised_library char(32) var;
+  
+     dSegP = addr(d);
+     dSeg.info = "";
+     dSeg.struct = "Seg";
+     dSeg.name = Aname;
+
+     dSegtP = mbuild_info_find_$seg_type_for_seg_name (dSeg.name);
+						/* Get Seg() characteristics.			        */
+
+     if  mbuild_data_$exists_Seg (addr(bld), addr(dSeg)) then do;
+	if Acompile_itemP ^= null() then		
+	     if Acompile_itemP->Seg.name = dSeg.name then /* Reuse Seg which existed before, was recompiled.        */
+	          return ( null() );
+	     else					/*  - How could there be a differently named segment?     */
+		call mbuild_data_$disconnect_Seg (Acompile_itemP);
+						/*    Get rid of this earlier Seg structure.	        */
+
+
+/* ----------------------------------------------------------------------
+    Get target library dir type.
+    For an Unbound_obj:
+     - If target is UNBOUNDOBJ, the Seg(Unbound_obj) gets installed 
+       in both object and execution directories.
+     - If target is BOUNDOBJ, the Seg(Unbound_obj) gets installed 
+       only as a Seg(object_arch) component.
+    For now, use "object" dir type for both cases.
+   ---------------------------------------------------------------------- */
+	if dSegt.default_library = "execution" then
+	     revised_library = mbuild_library_$replace_library_component (Asource_library, "", "object");
+	else revised_library = mbuild_library_$replace_library_component (Asource_library, "", dSegt.default_library);
+
+/* ----------------------------------------------------------------------
+    Create or reuse Seg(...) structure.
+   ---------------------------------------------------------------------- */
+	dSegP = mbuild_data_$get_Seg (addr(bld), dSegt.mbuild_type, dSeg.name, 
+			          revised_library, Asource_operation, Aarch_name);
+	return (dSegP);
+	end;
+
+     else do;					/* Compilation didn't produce seg?  Disconnect any Seg()  */
+	if  dSegt.build_paradigm = PDM_Unbound_obj & Adoing_compileS  then
+	     call ssu_$print_message (aC.sciP, mbuild_et_$compile_fails, "COMPILE: ^a", aCOMP.name);
+	call mbuild_data_$disconnect_Seg (Acompile_itemP);
+	end;
+     return ( null() );
+
+     end attach_derived_Seg;
+%page;
+/* ======================================================================
+ 
+   ENTRYPOINT:  analyze_compilation
+
+   Reconnects derived-content segments created by a compile request to the
+   input COMPILE structure built when re-entering mbuild and doing a new
+   analyze request.
+   ====================================================================== */
+
+analyze_compilation:
+     entry (Abuild_dataP, aCOMPILEp);
+     
+  dcl  aCOMPILEp ptr;				/* Pointer to a COMPILE structure.		        */
+
+     C.sciP = bld.sciP;
+     C.seg_name = "";
+     C.S = F;
+
+     call analyze_compile (aCOMPILEp, C);
+     return;
+
+/* ======================================================================
+ 
+   ENTRYPOINT:  clean
+
+   Adds derived-content segments created by a compile request to the
+   list of per-request Segs being built by the clean request,
+   containing Segs eligible for cleaning/removal.
+   ====================================================================== */
+
+clean:
+     entry (Abuild_dataP, Aclean_requestP);
+     
+  dcl  Aclean_requestP ptr;
+
+     requestP = Aclean_requestP;
+     
+     do COMPILEp = Tlist_first_item (addr(bld.COMPILE_Tb)) 
+            repeat Tlist_next_item  (addr(COMPILE.COMPILE_Td)) while (COMPILEp ^= null() );
+	do SegP = COMPILE.INTERMEDIATEp, COMPILE.objectP, COMPILE.listingP;
+	     if  SegP ^= null()  then 
+		if  mbuild_data_$exists_Seg (addr(bld), SegP)  then 
+		     call Tlist_add_to_tail (addr(request.request_Tb), addr(Seg), addr(Seg.request_Td));
+	     end;
+	end;
+     return;
+%page;
+/* ======================================================================
+ 
+   ENTRYPOINT:  exist_all_Unbound_obj
+
+   Returns true if every COMPILE.objectP is populated.
+
+   Notes:
+    - Only mbuild_compile_ sets COMPILE.objectP -> Seg(Unbound_obj)
+       - This is only done when the derived object exists in install dir.
+       - Make sure all these .objectP are non-null.  
+
+    - .objectP can be null:
+        - when initialized as COMPILE structure is created;
+        - when compile fails and is set to null();
+        - when Seg(Unbound_obj) is updated into a Seg(object_arch) via
+            archive ud Seg(object_arch)
+          The Seg(Unbound_obj) is disconnected because the actual segment
+	no longer exists in install dir.
+      In any of these cases, the compile task is not complete.
+
+    For UNBOUNDOBJ.operation = ADD|REPLACE...
+     - Sets UNBOUNDOBJ.sourceP->source.COMPILEp->COMPILE.objectP->Seg(Unbound_obj)
+	   when compile for an unbound object is complete.
+     - Adds/deletes names on Seg(Unbound_obj) per UNBOUNDOBJ.names_addP and .names_deleteP
+
+    For UNBOUNDOBJ.operation = DELETE...
+     - does nothing.
+
+   ====================================================================== */
+
+exist_all_Unbound_obj:
+     entry (Abuild_dataP, AanalyzedS) returns (bit(1) aligned);
+
+  dcl  AanalyzedS bit(1) unaligned;
+
+  dcl  objects_existS bit(1) aligned;
+
+     objects_existS = ^Tlist_is_empty (addr(bld.COMPILE_Tb));
+						/* .compiledS starts T, if COMPILE structures created.    */
+     if  objects_existS  then do;
+	do COMPILEp = Tlist_first_item (addr(bld.COMPILE_Tb))
+	       repeat Tlist_next_item  (addr(COMPILE.COMPILE_Td))  while ( COMPILEp ^= null() );
+	     if  COMPILE.objectP = null()  then goto OBJECT_MISSING;
+	     SegP = COMPILE.objectP;
+	     if  ^mbuild_data_$exists_Seg (addr(bld), SegP)  then goto OBJECT_MISSING;
+						/*  - but set F if any Unbound_obj from compile task is   */
+	     end;					/*    missing.				        */
+
+	objects_existS = ^Tlist_is_empty (addr(bld.UNBOUNDOBJ_Tb));
+	if  objects_existS  then do;			/* If something in UNBOUNDOBJ_Tb list, check .objectPs    */
+						/*  existence.  Actual segment must be in install dir.    */
+	     do UNBOUNDOBJp = Tlist_first_item (addr(bld.UNBOUNDOBJ_Tb))
+		     repeat Tlist_next_item  (addr(UNBOUNDOBJ.UNBOUNDOBJ_Td))  while (UNBOUNDOBJp ^= null() );
+		if  UNBOUNDOBJ.sourceP = null()  then goto OBJECT_MISSING;
+		SegP = UNBOUNDOBJ.sourceP;
+		if  Seg.COMPILEp = null()  then goto OBJECT_MISSING;
+		COMPILEp = Seg.COMPILEp;
+		if  COMPILE.objectP = null()  then goto OBJECT_MISSING;
+		end;				/* Existence of actual segment checked in above loop.     */
+	     end;
+	else  objects_existS = T;			/* If no UNBOUNDOBJs were found by analyze, then T.       */
+	end;
+
+     else objects_existS = AanalyzedS;			/*  Return T if analyze created no COMPILE structures.    */
+     return ( objects_existS );
+
+OBJECT_MISSING:
+     return (F);
+%page;
+/* ------------------------------------------------------------
+ * Process print -control_arg arguments.
+ * ------------------------------------------------------------ */
+
+controlArgs:
+     proc (c);
+
+  dcl 1 c aligned like C;				/*  control arg specification data                   (in) */
+
+     do while (args_remain());
+	call ssu_$arg_ptr (c.sciP, argI+1, argP, argL);	/* Conditionally read next arg to command/af/request      */
+					
+	if isControlArg(arg) then do;
+
+	     if       arg = "-ls"     | arg = "-list"    then c.listS = T;
+	     else if  arg = "-tb"     | arg = "-table"   then c.tableS = T;
+
+               else call ssu_$print_message (c.sciP, error_table_$badopt, 
+		"Ignoring unsupported control arg: ^a", arg);
+	     end;
+	
+	else do;					/* If arg not a -control_arg			        */
+	     c.seg_name = arg;
+	     if length(arg) > maxlength(c.seg_name) then
+		call ssu_$print_message (c.sciP, error_table_$bigarg, "^a may not be longer than ^d characters.",
+		     arg, maxlength(c.seg_name));
+	     end;
+
+	argI = argI + 1;				/* Record that we processed the arg just examined above.  */
+	end;
+
+     end controlArgs;
+
+%page;
+%include ssu_request_dcls_;
+%page;
+%include mbuild_request_parms_;
+%page;
+%include mbuild_info_;
+%page;
+%include mbuild_Tlist_;
+%page;
+%include mbuild_data_;
+%page;
+%include delete_options;
+
+     end mbuild_compile_;

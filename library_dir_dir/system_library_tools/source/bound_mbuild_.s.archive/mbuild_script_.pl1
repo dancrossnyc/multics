@@ -1,0 +1,555 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2019-08-17,GDixon), approve(2019-10-25,MCR10069),
+     audit(2020-01-20,Swenson), install(2020-01-20,MR12.6g-0035):
+     mbuild requests:  save, sv  and  read, rd
+  2) change(2020-01-26,GDixon), approve(2020-01-26,MCR10079),
+     audit(2020-02-02,Swenson), install(2020-02-02,MR12.6g-0045):
+      A) To save request, add:  -descriptor and -all control arguments.
+         -descriptor selectively saves just the current description to a
+         new or existing build script file.  -all saves description plus
+         all analysis data for the installation directory.
+  3) change(2020-08-29,GDixon), approve(2021-02-22,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+      A) Add Alines_preceding_script parameter to permit correct
+         line numbers in error messages.
+      B) Changed for revised calling sequence of: mbuild_data_$get_Seg.
+      C) Emit blank line between parse messages and error returned by parse.
+                                                   END HISTORY COMMENTS */
+
+mbuild_script_:
+     proc (AsciP, Abuild_dataP) returns (bit(1) aligned);
+
+  dcl  PROC char(14) int static options(constant) init("mbuild_script_");
+
+     return (check_parms (mbuild_data_version_3));
+/* -------------------- */
+
+  dcl  NL char(1) int static options(constant) init("
+");
+  dcl  UNSET fixed bin int static options(constant) init(0);
+  dcl  whitespace char(3) int static options(constant) init("
+	 ");					/* NL HT SP				        */
+
+  dcl  initiate_file_ entry (char(*), char(*), bit(*), ptr, fixed bin(24), fixed bin(35));
+  dcl  initiate_file_$create entry (char(*), char(*), bit(*), ptr, bit(1) aligned, fixed bin(24), fixed bin(35));
+  dcl  ioa_ entry() options(variable);
+  dcl  ioa_$rs entry() options(variable);
+
+  dcl  mbuild_$banner entry  options(variable);
+  dcl  mbuild_$request entry options(variable);
+
+  dcl  mbuild_data_$get_build_progress entry (ptr) returns(bit(*) aligned);
+  dcl  mbuild_data_$get_Seg entry (ptr, char(*) var, char(*) var, char(*) var, char(*) var, char(*) var) returns(ptr);
+  dcl  mbuild_data_$mbuild_support_Seg entry (ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$reset_build_lists entry (ptr);
+
+  dcl  mbuild_script_parse_ entry (ptr, ptr, fixed bin(21), fixed bin, fixed bin, fixed bin(35));
+
+  dcl  mbuild_info_find_$suffix_for_build_type entry (char(*)) returns(char(12) var);
+
+  dcl  mbuild_set_$description entry (ptr) returns(char(*));
+  dcl  mbuild_set_$description_stored entry (ptr) returns(bit(1) aligned);
+  dcl  mbuild_set_$release_description entry (ptr);
+  dcl  mbuild_set_$store_description entry (ptr, char(*) var);
+
+  dcl  terminate_file_ entry (ptr, fixed bin(24), bit(*), fixed bin(35));
+
+  dcl (addr, addrel, length, null, pointer, reverse, size, string, verify) builtin;
+  dcl  cleanup condition;
+
+  dcl (error_table_$badarg,
+       mbuild_et_$bad_build_script,
+       mbuild_et_$not_saveable) fixed bin(35) ext static;
+     
+
+%page;
+/* ======================================================================
+ *
+ *  REQUEST:  read, rd
+ *
+ *  Read the perhaps-edited list of segments found in the install directory,
+ *  which was saved in a file:  <install-dir-entryname>.mb
+ *  by an earlier request:      save
+ *
+ * ====================================================================== */
+
+read_request:
+     entry (AsciP, Abuild_dataP);
+
+  dcl 1 C aligned,
+      2 sciP ptr,
+      2 debug_operand fixed bin,			/* = 0: no debug  				        */
+						/*   1: trace reductions as they match input tokens       */
+						/*   2: show input tokens, then trace reductions	        */
+      2 S,
+        3 operationS aligned,
+	4 (descS					/* -desc: only read description from build script.        */
+             ) bit(1) unaligned,
+        3 displayS aligned,
+          4 (briefS,				/* -brief: don't report error if no build script found.   */
+	   printS,				/* -print: print data after read of build script.         */
+	   bannerS,				/* -banner: display a banner if build script found by a   */
+						/*          read request.  Use by mbuild.pl1	        */
+	   debugS					/* -debug DEBUG_VALUE			        */
+	   ) bit(1) unaligned;
+
+     C.sciP = AsciP;
+     C.debug_operand = UNSET;				/* -debug off by default			        */
+     C.S = F;
+     C.printS = T;
+
+     call arg_setup (AsciP);				/* User asks for a format via -Control_args	        */
+
+     if args_remain() then
+	call read_controlArgs(C);
+
+/* ----------------------------------------------------------------------
+    Bring build script segment into memory.
+   ---------------------------------------------------------------------- */
+
+  dcl  scriptBC fixed bin(24);
+  dcl  scriptEntryname char(32);
+
+  dcl  script char(scriptL) based(scriptP),		/* Build script 				        */
+       script_array (scriptL) char(1) based(scriptP),
+       scriptL fixed bin(21),
+       scriptP ptr;
+
+     scriptEntryname = bld.build_script_prefix || mbuild_info_find_$suffix_for_build_type ("Build_script");
+     scriptP = null();
+     on cleanup call terminate_file_ (scriptP, 0, TERM_FILE_TERM, code);
+     
+
+     call initiate_file_ (bld.directory, scriptEntryname, R_ACCESS, scriptP, scriptBC, code);
+     if code ^= 0 then do;				/* Complain if build script does not exist.	        */
+	if C.briefS then				/*  read -bf: Don't complain if script not present        */
+	     return;
+	else call ssu_$abort_line (AsciP, code, "Reading build script: ^a", scriptEntryname);     
+	end;
+     scriptL = divide(scriptBC, BITS_PER_CHAR, 21);
+
+
+     if  C.descS  then				/* If only reading Description value, just release        */
+	call mbuild_set_$release_description (addr(bld)); /*   any prior description string.		        */
+
+     else do;
+
+	/* ----------------------------------------------------------------------
+	    If any prior scan, read, or analyze has occurred in this subsystem
+	    invocation, then:
+	     - re-initialize all threaded lists for those structures.
+	   ---------------------------------------------------------------------- */
+
+	string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+
+	if  bld_progress.scannedS  then
+	     call mbuild_data_$reset_build_lists (addr(bld));
+
+	bld.scan_Tb_via_request = ssu_$get_request_name (bld.sciP);
+	end;
+
+/* ----------------------------------------------------------------------
+    Look for Description: field at start of build script (if any).
+     - Since it can contain any character (including build script
+       statement delimiter (;), etc.), the Description content cannot
+       be parsed by lex_string_ (the usual tokenizer for
+       mbuild_script_parse_).
+     - If present, Description: appears at the very top of the build
+       script file.  It would be followed by the Installation_directory:
+       field, which is always present and which starts the lex_string_-parsible
+       portion of the build script file.
+   ---------------------------------------------------------------------- */
+
+  dcl  descrip char(descripL) based(descripP),		/* Region of build script (possibly) containing 	        */
+       descrip_array (descripL) char(1) based(descripP),	/*  Description: field			        */
+       descripL fixed bin(21),
+       descripLines fixed bin,
+       descripP ptr;
+
+  dcl (inst_dirI, descI, textI) fixed bin(21);
+
+
+	/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *   */
+	/*									        */
+	/* Routine:  separate_description						        */
+	/*									        */
+	/*             Procedure to find Description field (if any), and remainder of build script file.  */
+	/*             This quick internal procedure is also called by save_request (see below).	        */
+	/*									        */
+	/* Inputs:								        */
+	/*   scriptP   points to build script segment.					        */
+	/*   scriptBC  gives bit count of build script segment.				        */
+	/*									        */
+	/* Outputs:								        */
+	/*   descrip   contains any Description field.					        */
+	/*   script    contains remainder of build script file.				        */
+	/*									        */
+	/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *   */
+
+separate_description:
+     proc();		
+
+     scriptL = divide(scriptBC, BITS_PER_CHAR, 21);
+
+     inst_dirI = index(script, "Installation_directory:");  /* Find start of parsible portion of build script.        */
+     if inst_dirI = 0 then 
+	call ssu_$abort_line (AsciP, mbuild_et_$bad_build_script, "Looking for ""Installation_directory:"" label.");
+
+     descripP = scriptP;				/* Any data before parsible part is region which may      */
+     descripL = inst_dirI - 1;			/*  contain a Definition: label and text.	        */
+
+     scriptP = addr(script_array(inst_dirI));		/* script now overlays just parsible region.	        */
+     scriptL = length(script) - length(descrip);
+
+     end separate_description;
+
+
+     call separate_description();
+
+     descripLines = count_lines(descrip);
+     if length(descrip) = 0 then goto NO_DESCRIPTION;	/* Description region of build script file not present.   */
+
+     descI = index(descrip, "Description:");		/* Otherwise... look for Description: label...	        */
+     if descI = 0 then goto NO_DESCRIPTION;		/*  - Description: label missing...		        */
+						/* Some unknown stuff at beginning of file; SKIP IT.      */
+
+     descripP = addr(descrip_array(descI  + length("Description:")));
+     descripL = length(descrip) - (descI - 1) - length("Description:");
+						/* Remove Description: label from region	        */
+
+     textI = verify(descrip, NL);			/* ltrim NL from start of Description text.	        */
+     if textI = 0 then goto NO_DESCRIPTION;		/*   - Entire Description text is whitespace.	        */
+     descripP = addr(descrip_array(textI));
+     descripL = length(descrip) - (textI - 1);
+     
+     textI = verify(reverse(descrip), whitespace);	/* rtrim whitespace from end of Description text.	        */
+     descripL = length(descrip) - (textI - 1);
+     if length(descrip) = 0 then goto NO_DESCRIPTION;
+
+CAPTURE_DESCRIPTION:
+     call mbuild_set_$store_description (addr(bld), (descrip));
+
+
+NO_DESCRIPTION:
+  dcl  print_desc char(11) int static options(constant) init("print -desc");
+  dcl  print_full char(30) int static options(constant) init("print -new; print -desc; print");
+
+     if  C.descS  then do;				/* If only reading in the saved description...	        */
+	call terminate_file_ (scriptP, 0, TERM_FILE_TERM, (0));
+	revert cleanup;
+
+	if  C.printS &  mbuild_set_$description_stored (addr(bld))  then do;
+	     if  C.bannerS  then
+		call mbuild_$banner (AsciP, "^2/read -description", T);
+	     call mbuild_$request (AsciP, print_desc, F);
+	     end;
+	end;
+
+     else do;					/* Parse the remaining build script text.	        */
+	call mbuild_script_parse_ (addr(bld), scriptP, scriptL, descripLines, C.debug_operand, code);
+
+	call terminate_file_ (scriptP, 0, TERM_FILE_TERM, (0));
+	revert cleanup;
+
+	if  code ^= 0 then do;
+	     call ioa_ ("");			/* Put blank line between parse messages & this error     */
+	     call ssu_$abort_line (C.sciP, code, "Parsing build script: ^a>^a.mb", 
+	          bld.directory, bld.build_script_prefix);
+	     end;
+	
+
+	/* ----------------------------------------------------------------------
+	    Check whether any mbuild_support segments were missing from 
+	    build script.  If so:
+	     - Add them to the scan_Tb and mbuild_support_Tb threads
+	   ---------------------------------------------------------------------- */
+
+	do SegP = Tlist_first_item (addr(bld.Seg_Tb))
+	   repeat Tlist_next_item  (addr(Seg.Seg_Td)) while (SegP ^= null() );
+	     if  ^Tlist_member(addr(Seg.scan_Td))  then do;
+						/* Seg() is not in scan_Tb list, is an mbuild_support seg?*/
+		if  mbuild_data_$mbuild_support_Seg (SegP)  then do;
+		     call Tlist_add_to_tail (addr(bld.scan_Tb), SegP, addr(Seg.scan_Td));
+		     end;
+		end;
+	     end;
+
+	/* ----------------------------------------------------------------------
+	    Print results from reading the build script segment.
+	   ---------------------------------------------------------------------- */
+
+	if  C.printS then do;
+	     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+	     if  bld_progress.describedS & bld_progress.scannedS  then
+		call mbuild_$request (AsciP, print_full, F);
+	     else if bld_progress.describedS then
+		call mbuild_$request (AsciP, print_desc, F);
+	     end;
+	end;
+     return;
+
+count_lines:
+     proc (Aregion) returns (fixed bin);
+     
+  dcl  Aregion char(*);
+  dcl  count fixed bin;
+  dcl (nlI, regionI) fixed bin(21);
+     
+     count = 0;					/* Start with no NL chars found.		        */
+     regionI = 1;
+     
+     do while (regionI <= length(Aregion));
+	count = count + 1;				/*  - Increment count.			        */
+	nlI = index (substr (Aregion, regionI), NL);
+	if  nlI = 0  then				/*  - No more NLs?  Return current count.	        */
+	     return (count);
+	regionI = regionI + nlI;			/*  - Shift window beyond current NL.		        */
+	end;
+     return (count);				/*  - Last char was NL?  Return current count.	        */
+
+     end count_lines;
+%page;
+/* ======================================================================
+ *
+ *  REQUEST:  save, sv
+ *
+ *  Save the list of segments found in the install directory, plus any
+ *  current description of the install, to file:  <install-dir-entryname>.mb
+ *
+ * ====================================================================== */
+
+save_request:
+     entry (AsciP, Abuild_dataP);
+
+     C.sciP = AsciP;
+     C.S = F;
+
+     call arg_setup (AsciP);                                /* User asks to save just Description via -control_args   */
+
+     if args_remain() then
+          call save_controlArgs(C);
+
+/* ----------------------------------------------------------------------
+    save -all   If no prior analyze request has occurred since last scan 
+                or read request, then complain... need something to save.
+
+    save -desc  If -description given, then just save current description
+                value (if any is currently set) into an existing build 
+                script segment; or in a new segment if none exists now.
+   ---------------------------------------------------------------------- */
+
+
+/* ------------------------------------------------------------------------------------------
+   Analysis of control argument, progress, and situation flag impact on the save request.
+ 
+     bld_progress.analyzedS ---. .---bld_progress.describedS
+             script_createdS-. | | .-C.descS  ( -all: 0 in this column; -desc: 1 in this column)
+                             | | | |
+                             0 0 0 0  error 2:  not analyzed  
+                             0 0 0 1  error 1:  no description
+                             0 0 1 0  error 2:  not analyzed  
+                             0 0 1 1  replace/add Description in existing script (new code)
+                             0 1 0 0  print -save
+                             0 1 0 1  error 1:  no description
+                             0 1 1 0  print -save
+                             0 1 1 1  replace/add Description in existing script (new code)
+
+                             1 0 0 0  error 2:  not analyzed  
+                             1 0 0 1  error 1:  no description
+                             1 0 1 0  error 2:  not analyzed  
+                             1 0 1 1  add Description in new script (new code): print -save -description
+                             1 1 0 0  print -save
+                             1 1 0 1  error 1:  no description
+                             1 1 1 0  print -save
+                             1 1 1 1  add Description in new script (new code): print -save -description
+
+   Errors in the list above occur whether or not a build script segment already exists
+   in the installation directory.  So diagnose those errors before looking for the
+   build script segment.
+   ---------------------------------------------------------------------- */
+
+
+     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+						/* Get build progress values.			        */
+
+						/* ERROR 1: 				        */
+     if C.descS & ^bld_progress.describedS then do;         /* No description is known by mbuild for current op.      */
+          call ssu_$abort_line (AsciP, mbuild_et_$not_saveable,
+               "No description value is known by mbuild.");
+          return;
+          end;
+
+						/* ERROR 2: 				        */
+     else if ^C.descS & ^bld_progress.analyzedS then do;    /* analyze request has not be run since scan/read request.*/
+	call ssu_$abort_line (AsciP, mbuild_et_$not_saveable,
+	     "Please save build script after using the analyze request.");
+	return;
+	end;
+
+/* ----------------------------------------------------------------------
+    Bring file (briefly) into memory to ensure access rights, creating
+    file if necessary.  Any existing file will be overwritten by new content.
+   ---------------------------------------------------------------------- */
+
+     scriptEntryname = bld.build_script_prefix || mbuild_info_find_$suffix_for_build_type ("Build_script");
+     scriptP = null();
+     on cleanup call terminate_file_ (scriptP, 0, TERM_FILE_TERM, code);
+
+  dcl  script_createdS bit(1) aligned;
+
+     call initiate_file_$create (bld.directory, scriptEntryname, RW_ACCESS, scriptP, script_createdS, scriptBC, code);
+     if code ^= 0 then
+	call ssu_$abort_line (AsciP, code, "Saving build script: ^a", scriptEntryname);     
+
+     if  script_createdS then do;			/* Add the just-created build script segment to our       */
+						/*  analysis.  This includes:			        */
+						/*   - Seg_Tb thread (added by get_Seg call)	        */
+						/*   - scan_Tb scan/read thread 		        */
+						/*     (as if script were there before the scan request). */
+						/*   - mbuild_support_Tb per-paradigm thread 	        */
+						/*     (as if script were there before analyze request).  */
+	SegP = mbuild_data_$get_Seg (addr(bld), "Build_script", (scriptEntryname), 
+			         not_stored_in_library, no_library_operation, no_containing_archive);
+	call Tlist_add_to_tail (addr(bld.scan_Tb), SegP, addr(Seg.scan_Td));
+	call Tlist_add_to_tail (addr(bld.mbuild_support_Tb), SegP, addr(Seg.pdm_Td));
+	end;
+
+
+     if       ^script_createdS &  C.descS  then do;	/* Replace any Description in existing build segment, or  */
+						/*  add new Description to existing build script segment. */
+
+	call separate_description();			/* Split build script segment into Description text       */
+						/*  (descrip) and rest of build script contents (script). */
+
+COPY_SCRIPT:					/* Begin block which copies script into its stackframe,   */
+	begin;					/*  then rewrites contents of build script segment.       */
+
+  dcl  nlL fixed bin init(length(NL));
+  dcl  script_copy char(scriptL);
+	     script_copy = script;			/* Copy non-Description part of build script.	        */
+	     scriptP = pointer(scriptP, 0);		/* Point to start of build script segment.	        */
+
+	     script_descripP = bld.script_descripP;	/* Access current description value.		        */
+
+	     scriptL = nlL+ length("Description:") + nlL+ length(script_descrip.text) + nlL + nlL+ length(script_copy);
+	     script  = NL  ||      "Description:" || NL ||       script_descrip.text || NL || NL ||       script_copy;
+						/* Assign new contents to build script segment.	        */
+	     end COPY_SCRIPT;
+
+	scriptBC = length(script) * BITS_PER_CHAR;	/* Terminate build script segment, setting new bit count  */
+	call terminate_file_ (scriptP, scriptBC, TERM_FILE_BC | TERM_FILE_TERM, code);
+	revert cleanup;
+	end;
+
+
+     else if  (script_createdS &  C.descS) |		/* Add Description to new build script segment.	        */
+                                 ^C.descS  then do;	/* Add/replace entire build script segment.	        */
+	call terminate_file_ (scriptP, 0, TERM_FILE_TERM, code);
+	revert cleanup;
+
+/* ----------------------------------------------------------------------
+    Construct subsystem request to:
+     - Redirect user_output to our script file.
+     - Invoke print request to save analysis data into the build script.
+     - Revert user_output back to the terminal.
+    Run this request line.
+   ---------------------------------------------------------------------- */
+
+	on cleanup begin;				/* Use cleanup handler to ensure we're not stuck with     */
+                                                            /*  user_output redirected into the file.                 */
+	     call mbuild_$request (AsciP, "revert_output", F);
+	     end;
+
+	call mbuild_$request (AsciP, 
+	     "file_output ^a -truncate; print ^[-description^;-analyze^] -save_format; revert_output", 
+	     F, scriptEntryname, C.descS);
+                                                            /* file_output/revert_output are hidden mbuild requests.  */
+	end;
+     return;
+%page;
+/* ------------------------------------------------------------
+ * Process read -control_arg arguments.
+ * ------------------------------------------------------------ */
+
+read_controlArgs:
+     proc (c);
+
+  dcl 1 c aligned like C;				/*  control arg specification data                   (in) */
+
+     do while (args_remain());
+	call ssu_$arg_ptr (c.sciP, argI+1, argP, argL);	/* Conditionally read next arg to command/af/request      */
+					
+	if isControlArg(arg) then do;
+
+	     if       arg = "-a"      | arg = "-all"            then c.descS = F;
+	     else if  arg = "-desc"   | arg = "-description"    then c.descS = T;
+
+               else if  arg = "-pr"     | arg = "-print"          then c.printS = T;
+               else if  arg = "-npr"    | arg = "-no_print"       then c.printS = F;
+
+	     else if  arg = "-bf"     | arg = "-brief"	      then c.briefS = T;
+
+	     else if		  arg = "-banner"         then c.bannerS = T;
+
+	     else if  arg = "-db"     | arg = "-debug"	      then c.debugS = T;
+
+               else call ssu_$print_message (c.sciP, error_table_$badarg, 
+		"Ignoring unsupported control arg: ^a", arg);
+	     end;
+	
+	else do;					/* If arg is a -control_arg operand		        */
+	     if  c.debugS  then do;			/*  -debug DEBUG_VALUE  			        */
+		if  verify(arg, "012") = 0 & length(arg) = 1  then
+		     c.debug_operand = index("012", arg) - 1;
+		else call ssu_$abort_line (c.sciP, error_table_$badarg, 
+		     "Debug value may be 0, 1, or 2: -debug ^a", arg);
+		end;
+	     else call ssu_$print_message (c.sciP, 0, "Ignoring spurious operand: ^a", arg);
+	     end;
+
+	argI = argI + 1;				/* Record that we processed the arg just examined above.  */
+	end;
+
+     end read_controlArgs;
+%page;
+/* ------------------------------------------------------------
+ * Process save -control_arg arguments.
+ * ------------------------------------------------------------ */
+
+save_controlArgs:
+     proc (c);
+
+  dcl 1 c aligned like C;                                   /*  control arg specification data                   (in) */
+
+     do while (args_remain());
+          call ssu_$arg_ptr (c.sciP, argI+1, argP, argL);   /* Conditionally read next arg to command/af/request      */
+                                                  
+          if isControlArg(arg) then do;
+
+               if       arg = "-a"      | arg = "-all"            then c.descS = F;
+               else if  arg = "-desc"   | arg = "-description"    then c.descS = T;
+
+               else call ssu_$print_message (c.sciP, error_table_$badarg, 
+                    "Ignoring unsupported control arg: ^a", arg);
+               end;
+
+          argI = argI + 1;                                  /* Record that we processed the arg just examined above.  */
+          end;
+
+     end save_controlArgs;
+%page;
+%include ssu_request_dcls_;
+%page;
+%include mbuild_request_parms_;
+%page;
+%include mbuild_Tlist_;
+%page;
+%include mbuild_data_;
+%page;
+%include access_mode_values;
+%include terminate_file;
+%page;
+%include system_constants;
+
+     end mbuild_script_;

@@ -1,0 +1,479 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2019-09-09,GDixon), approve(2019-10-27,MCR10069),
+     audit(2020-01-12,Swenson), install(2020-01-20,MR12.6g-0035):
+     mbuild request:  history, hcom
+  2) change(2020-01-28,GDixon), approve(2020-01-28,MCR10079),
+     audit(2020-02-02,Swenson), install(2020-02-02,MR12.6g-0045):
+      A) Accept one starname to identify segments in the installation directory
+         whose history comment is to be processed.
+      B) Call the new mbuild_Tlist_$request_Seg_match_star to select segments
+         whose history comment is to be processed.
+  3) change(2021-03-17,GDixon), approve(2021-03-17,MCR10086),
+     audit(2021-03-17,Swenson), install(2021-03-17,MR12.6g-0051):
+      A) Eliminate Seg.operation = DELETE from the list of possible segments
+         that may be sent to the history_comment command.  They have no file
+         in the installation directory.
+                                                   END HISTORY COMMENTS */
+
+mbuild_history_:
+     proc (AsciP, Abuild_dataP) returns (bit(1) aligned);
+
+  dcl  PROC char(15) int static options(constant) init("mbuild_history_");
+
+     return (check_parms (mbuild_data_version_3));
+/* -------------------- */
+
+  dcl  check_star_name_$entry entry (char(*), fixed bin(35));
+  dcl  delete_$path entry (char(*), char(*), bit(36) aligned, char(*), fixed bin(35));
+  dcl  ioa_$rsnnl entry() options(variable);
+  dcl  ssu_$arg_list_ptr entry (ptr, ptr);
+
+  dcl  mbuild_$banner entry options(variable);
+  dcl  mbuild_$request entry options(variable);
+  dcl  mbuild_$general_active_request entry (ptr, char(*), fixed bin, char(*) var, ptr, fixed bin);
+  dcl  mbuild_$general_request entry (ptr, char(*), bit(1) aligned, ptr, fixed bin);
+
+  dcl  mbuild_Tlist_$empty_request_list entry (ptr);
+  dcl  mbuild_Tlist_$request_Seg_match_star entry (ptr, char(*), fixed bin(35)) returns(ptr);
+
+  dcl  mbuild_data_$exists_component entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$exists_Seg entry (ptr, ptr) returns(bit(1) aligned);
+  dcl  mbuild_data_$get_build_progress entry (ptr) returns(bit(*) aligned);
+
+  dcl  mbuild_library_$library_directories entry (char(*) var, (*) char(200) var, fixed bin, fixed bin(35));
+
+  dcl (addr, hbound, lbound, length, maxlength, null, string, verify, unspec) builtin;
+
+  dcl  cleanup condition;
+
+  dcl (error_table_$bigarg,
+       error_table_$noarg,
+       error_table_$noentry,
+       error_table_$nomatch,
+       mbuild_et_$archive_x_fails,
+       mbuild_et_$inexact_library,
+       mbuild_et_$segment_missing,
+       mbuild_et_$source_missing,
+       ssu_$not_af_request
+        )fixed bin(35) ext static;
+%page;
+/* ===========================================================================
+   REQUEST:  hcom HCOM_OPERATION {-hcom_control_args}
+		Invoke history_comment on all original-content
+		segments in the install directory.
+           
+             history HCOM_OPERATION SEG_NAME {-hcom_control_args}
+                    Invoke history_comment on just the given original-content
+		segment(s) in the install directory.  The language suffix
+		must be included.  The star convention is permitted.  
+
+   Display or change history comments in original-content segments (source, 
+   bindfile, Info, or Include segs).  
+
+   For history_comment operations accepting the -original control argument, it
+   is supplied by the history request; its operand is the pathname of the
+   library segment being REPLACEd.
+/* =========================================================================== */
+
+history_request:
+     entry(AsciP, Abuild_dataP);
+
+  dcl 1 C aligned,
+      2 sciP ptr,
+      2 allSegs,
+        3 operation fixed bin,			/* hcom operation index			        */
+        3 isAF bit(1) aligned,			/* T: invoked as an active function.		        */
+        3 seg_name char(32) unal,			/* SEG_NAME operand value			        */
+        3 seg_starness fixed bin(35),			/* star-ness of SEG_NAME operand value.		        */
+        3 first_control_arg fixed bin,			/* Index in our arg list of first -hcom_control_arg       */
+        3 segs_done fixed bin,			/* Count of segments processed.		        */
+      2 eachSeg,
+        3 paths,
+          4 (new_path, orig_path) char(400) var;
+
+     unspec(C) = F;			         
+     C.sciP = AsciP;
+     C.operation = NOTSET;
+     C.seg_name = "";
+     C.seg_starness = STARSTAR;
+     C.first_control_arg = 2;				/* Index of history request argument to be passed to the  */
+     						/*  history_comment command.			        */
+     call arg_setup (AsciP);
+     C.isAF = isAF;
+
+     if args_remain() then				/* User provided history_comment operation/-control_args  */
+	call controlArgs(C);
+
+     if C.operation = NOTSET then
+	call ssu_$abort_line (C.sciP, error_table_$noarg, "HCOM_OPERATION missing.  It can be:^/  ^(^a  ^)",
+	     oper(*,1));
+
+     if  C.isAF & ^canBe_AF_oper(C.operation)  then 
+	call ssu_$abort_line (C.sciP, ssu_$not_af_request, "^a", oper(C.operation,1));
+						/* ssu_$abort_line does not return.		        */
+
+/* ----------------------------------------------------------------------
+    - Ensure install directory has been scanned.
+   ---------------------------------------------------------------------- */
+
+  dcl  need_progress char(4) aligned init("scan");
+
+     do SegP = Tlist_first_item (addr(bld.Seg_Tb)) 
+        repeat Tlist_next_item  (addr(Seg.Seg_Td)) while (SegP ^= null() );
+	if  (Seg.type = "source_arch" & Seg.operation = "ADD")  then
+	     need_progress = "anal";
+	end;
+
+     string(bld_progress) = mbuild_data_$get_build_progress (addr(bld));
+     if  need_progress = "scan"  then do;
+	if  ^bld_progress.scannedS  then
+	    call ssu_$abort_line (AsciP, 0,
+	         "Please obtain data for history task with request:  scan  or  read");
+	end;					/*  Need data from scan to perform history tasks.	        */
+     else if  ^bld_progress.analyzedS  then do;
+	    call ssu_$abort_line (AsciP, 0,
+	         "Please obtain data for history task with request:  analyze");
+	end;
+
+/* ----------------------------------------------------------------------
+    - List original content Segs from thread:  scan_Tb 
+   ---------------------------------------------------------------------- */
+
+  dcl 1 req aligned like request;			/* Provide storage for request structure.	        */
+     requestP = addr(req);				/*  - per-request threaded lists are valid only during    */
+     request.info = "";				/*    execution of that one request.  At end of request,  */
+     request.struct = "req";				/*    the list must be emptied.		        */
+     request.name = ssu_$get_request_name(C.sciP);
+     call Tlist_initialize (addr(request.request_Tb), addr(request));
+						/* request_Tb is a list for Seg structures.	        */
+
+     on cleanup call history_janitor(addr(request));	/* Empty request_Tb list if this request aborts.	        */
+
+     do SegP = Tlist_first_item (addr(bld.Seg_Tb)) 
+        repeat Tlist_next_item  (addr(Seg.Seg_Td)) while (SegP ^= null() );
+	if  Seg.operation = "DELETE"  then;
+	else if  (Seg.type = "source" & Seg.produced_by_compiler = "")  then 
+	     go to INCLUDE_SOURCE;
+	else if   (Seg.type = "Include" | Seg.type = "Info" | Seg.type = "bindfile")  then do;
+INCLUDE_SOURCE:
+	     if  (C.operation = COMPARE & Seg.operation = "REPLACE") | C.operation ^= COMPARE  then
+		call Tlist_add_to_tail (addr(request.request_Tb), addr(Seg), addr(Seg.request_Td));
+	     end;
+	end;
+
+     if  Tlist_is_empty (addr(request.request_Tb))  then do;
+	call ssu_$print_message (C.sciP, mbuild_et_$segment_missing, 
+	     "No source, Include, Info, or bindfile segments ^[found^;are being REPLACEd^].", C.operation ^= COMPARE);
+	return;					/* No Segs to which hcom should be applied!	        */
+	end;
+
+/* ----------------------------------------------------------------------
+    - Do requested histories.
+   ---------------------------------------------------------------------- */
+
+     if  C.isAF  then
+	if  C.operation ^= GET  then 
+	     af_ret = "true";			/* Assume operation on all Segs will succeed.	        */
+          else af_ret = "";
+
+     SegP = mbuild_Tlist_$request_Seg_match_star (addr(request), C.seg_name, C.seg_starness);
+						/* This call removes Seg and all prior items from the     */
+						/*  request list.				        */
+     do while ( SegP ^= null() );			/* When this loop ends, entire request list is empty      */
+	call do_history (C, SegP, af_ret);
+	SegP = mbuild_Tlist_$request_Seg_match_star (addr(request), C.seg_name, C.seg_starness);
+	end;
+
+/*
+     do SegP = Tlist_first_item (addr(request.request_Tb))
+             repeat Tlist_next_item  (addr(Seg.request_Td))  while (SegP ^= null() );
+	if  (C.seg_name = "" | C.seg_starness = STARSTAR)  then
+	     call do_history (C, SegP, af_ret);
+	else if  (C.seg_starness = NONSTAR  &  C.seg_name = Seg.name)  then
+	     call do_history (C, SegP, af_ret);
+	else do;
+	     call match_star_name_ ((Seg.name), (C.seg_name), code);
+	     if code = 0 then
+		call do_history (C, SegP, af_ret);
+	     end;
+	end;
+ */
+
+     if segs_done = 0 then do;
+	if  C.isAF & C.operation ^= GET  then
+	     af_ret = "false";
+	call ssu_$print_message (C.sciP, error_table_$nomatch, 
+	     "No source, Include, Info, or bindfile segments were processed.");
+	end;
+     return;
+
+history_janitor:
+     proc (ArequestP);
+
+  dcl  ArequestP ptr;
+  dcl 1 Arequest aligned like request based(ArequestP);
+
+     call mbuild_Tlist_$empty_request_list (ArequestP);
+
+     end history_janitor;
+%page;
+/* ----------------------------------------------------------------------
+    - Process history comment in one source file.
+       - For operations that modify the segment, if the Seg() represents
+         an archive component in a new bound_segment (source archive being
+         ADDed), then history_comment command will extract component from
+         archive before modifying it; and return it into archive after
+         modification completes.
+   ---------------------------------------------------------------------- */
+do_history:
+     proc (c, hSegP, af_ret);
+
+  dcl 1 c aligned like C;
+  dcl  hSegP ptr,
+      1 hSeg aligned like Seg based (hSegP);
+  dcl  af_ret char(*) var;
+
+  dcl  arg_listP ptr;
+
+  dcl  local_af_ret char(maxlength(af_ret)) var init("");
+
+  dcl  request_line char(500);
+
+     c.segs_done = c.segs_done + 1;
+     c.eachSeg.paths = "";
+
+     call set_new_path (c, hSegP);
+     call set_orig_path (c, hSegP);			/* NOTE: orig_path may be incorrect in cases where        */
+						/*   primary name of segment is changing.  In such cases, */
+						/*   a REPLACE operation cannot be used.  Instead, the    */
+						/*   Seg.name = OLD_PRIMARY_NAME must be DELETEd and a    */
+						/*   separate Seg.name = NEW_PRIMARY_NAME must be ADDed.  */
+						/*   Nothing in current mbuild code ties these two Seg    */
+						/*   structures to one another as a meta-operation.       */
+						/*   The hcom request must be entered manually if	        */
+						/*   comparison with -orig version is required.	        */
+     if  c.new_path ^= "" then  do;
+
+	call ioa_$rsnnl ("^2/history_comment ^a ^a^[ -orig ^a^;^s^]", request_line, 0, 
+	     oper(c.operation,1), new_path, orig_path ^= "", orig_path);
+	call ssu_$arg_list_ptr (c.sciP, arg_listP);
+
+	if  ^c.isAF then
+	     call mbuild_$general_request (c.sciP, request_line, T, arg_listP, c.first_control_arg);
+	else do;
+	     call mbuild_$general_active_request (c.sciP, request_line, TOKENS_ONLY_ACTIVE_STRING, local_af_ret, 
+		arg_listP, c.first_control_arg);
+	     if c.operation = GET then do;
+		if af_ret = "" then			/* Add this string's AF result to request line's af_ret   */
+		     af_ret = local_af_ret;
+		else af_ret = af_ret || " " || local_af_ret;
+		end;
+	     else do;
+		if af_ret = "false" then;
+		else if local_af_ret = "false" then
+		     af_ret = "false";
+		end;
+	     end;
+
+	end;
+     return;
+
+%page;
+/* ----------------------------------------------------------------------
+    - Make sure source file exists in install directory.
+   ---------------------------------------------------------------------- */
+
+set_new_path:
+     proc (Ct, aSegP);
+
+  dcl 1 Ct aligned like C;
+  dcl  aSegP ptr,
+      1 aSeg aligned like Seg based (aSegP);
+
+     if  aSeg.operation = "ADD" & aSeg.archive_name ^= ""  then do;
+	if  ^mbuild_data_$exists_component (addr(bld), aSegP)  then do;
+						/* - Seg() not member of bound_seg being ADDed?           */
+	     if ^mbuild_data_$exists_Seg (addr(bld), aSegP) then do;
+						/* - Seg() not standalone in installation dir.	        */
+		call ssu_$print_message (Ct.sciP, mbuild_et_$source_missing, 
+		     "Missing source file corresponding to ^a: ^a::^a", aSeg.type, aSeg.archive_name,  aSeg.name);
+		end;
+	     else Ct.new_path = aSeg.name;	     
+	     end;
+
+	else Ct.new_path = aSeg.archive_name || "::" || aSeg.name;
+	end;
+
+     else do;
+	if  ^mbuild_data_$exists_Seg (addr(bld), aSegP) then do;
+						/* File represented by Seg(source) not in build dir.      */
+	     call ssu_$print_message (c.sciP, mbuild_et_$source_missing, 
+		"Missing source file corresponding to ^a: ^a", aSeg.type, aSeg.name);
+	     end;
+	else Ct.new_path = aSeg.name;
+	end;
+     return;
+
+     end set_new_path;
+%page;
+/* ----------------------------------------------------------------------
+    - Compare source file with library original, passing along any 
+      installer-specified control arguments.
+   ---------------------------------------------------------------------- */
+
+set_orig_path:
+     proc (Ct, aSegP);
+     
+  dcl 1 Ct aligned like C;
+  dcl  aSegP ptr,
+      1 aSeg aligned like Seg based (aSegP);
+
+  dcl  arg_listP ptr;
+  dcl  lib_dirs (20) char(200) var,
+       lib_dirsN fixed bin;
+
+     if  ^oper_accepts_ORIG(Ct.operation)  then;
+
+     else if  aSeg.operation ^= "REPLACE"  then;
+
+     else do;
+	call mbuild_library_$library_directories (aSeg.library, lib_dirs, lib_dirsN, code);
+	if lib_dirsN ^= 1 then do;		/* - Get library directory for target segment	        */
+	     call ssu_$print_message (C.sciP, mbuild_et_$inexact_library, 
+		"^a: ^a  library: ^a matches ^d paths: ^v( ^a^)", 
+		aSeg.type, aSeg.name, aSeg.library, lib_dirsN, lib_dirsN, lib_dirs(*));
+	     end;
+	else call ioa_$rsnnl ("^a>^[^a::^;^s^]^a", Ct.orig_path, 0, 
+	     lib_dirs(1), aSeg.archive_name ^= "", aSeg.archive_name, "==");
+	end;
+
+     end set_orig_path;
+
+     end do_history;
+%page;
+/* ------------------------------------------------------------
+ * Process print -control_arg arguments.
+ * ------------------------------------------------------------ */
+
+controlArgs:
+     proc (c);
+
+  dcl 1 c aligned like C;				/*  control arg specification data                   (in) */
+
+  dcl (i, j) fixed bin;
+     
+     if  args_remain()  then do;			/* Find the HCOM_OPERATION			        */
+	call ssu_$arg_ptr (c.sciP, argI+1, argP, argL);	/*  - Conditionally read first arg to command/af/request  */
+	if arg = "~" then;				/*    "~": placeholder for operations without short name  */
+	else do j = lbound (oper, 2) to hbound (oper, 2) while (c.operation = NOTSET);
+	     do i = lbound (oper, 1) to hbound (oper, 1) while (c.operation = NOTSET);
+		if  arg = oper (i, j)  then do;
+		     c.operation = i;		/*  - Remember operation index		        */
+		     argI = argI + 1;		/*  - We've processed the first arg successfully.	        */
+		     end;
+		end;
+	     end;
+	if c.operation = NOTSET then return;
+	end;
+
+     if  args_remain()  then do;
+	call ssu_$arg_ptr (c.sciP, argI+1, argP, argL);	/* Conditionally read next arg to command/af/request      */
+					
+	if isControlArg (arg) then do;		/* If it's a control argument, then no more positional    */
+	     c.first_control_arg = argI + 1;		/*   args are expected.			        */
+	     return;
+	     end;
+	
+	else if isCommentSpec (arg) then do;
+	     c.first_control_arg = argI + 1;		/*   args are expected.			        */
+	     return;
+	     end;
+
+	else if c.seg_name = "" then do;		/* If arg not a -control_arg, assume it is second	        */
+	     c.seg_name = arg;			/*   positional argument:  SEG_NAME		        */
+	     if length(arg) > maxlength(c.seg_name) then
+		call ssu_$abort_line (c.sciP, error_table_$bigarg, "^a may not be longer than ^d characters.",
+		     arg, maxlength(c.seg_name));
+	     call check_star_name_$entry (c.seg_name, c.seg_starness);
+	     if ^(c.seg_starness = NONSTAR | c.seg_starness = STAR | c.seg_starness = STARSTAR)  then
+		call ssu_$abort_line (c.sciP, c.seg_starness, "^a", c.seg_name);
+	     c.first_control_arg = argI + 2;
+	     end;
+	end;
+     return;
+%page;
+isCommentSpec:
+     proc (arg) returns (bit(1) aligned);
+
+  dcl  arg char(*);
+
+     if  verify (arg, "0123456789:") = 0  then
+	return (T);
+     
+  dcl (i, j) fixed bin;
+     do j = lbound (comment_specs, 2) to hbound (comment_specs, 2);
+	do i = lbound (comment_specs, 1) to hbound (comment_specs, 1);
+	     if  arg = comment_specs(i,j)  then
+		return (T);
+	     end;
+	end;
+     return (F);
+
+     end isCommentSpec;
+
+     end controlArgs;
+%page;
+%include ssu_request_dcls_;
+%page;
+%include mbuild_request_parms_;
+%page;
+%include mbuild_info_;
+%page;
+%include mbuild_Tlist_;
+%page;
+%include mbuild_data_;
+%page;
+%include hcom_data;
+						/* The following arrays extracted from hcom.pl1 command   */
+  dcl  canBe_AF_oper (10) bit(1) aligned int static options(constant) init (
+        F,   /* "add",	    1 */
+        F,   /* "add_field",	    2 */
+        T,   /* "check",	    3 */
+        T,   /* "compare",	    4 */
+        F,   /* "display",	    5 */
+        T,   /* "exists",	    6 */
+        F,   /* "format",	    7 */
+        T,   /* "get",	    8 */
+        T,   /* "install",	    9 */
+        F);  /* "replace_field", 10 */
+
+  dcl  oper_accepts_ORIG (10) bit(1) aligned int static options(constant) init (
+        F,   /* "add",	    1 */
+        T,   /* "add_field",	    2 */
+        T,   /* "check",	    3 */
+        T,   /* "compare",	    4 */
+        T,   /* "display",	    5 */
+        T,   /* "exists",	    6 */
+        T,   /* "format",	    7 */
+        T,   /* "get",	    8 */
+        T,   /* "install",	    9 */
+        T);  /* "replace_field", 10 */
+
+  dcl  comment_specs (11, 2) char (12) var int static options (constant) init (
+        "all",	   "a",	  /*  1 */
+        "old",	   "~",	  /*  2 */
+        "new",	   "~",	  /*  3 */
+        "complete",	   "cpt",	  /*  4 */
+        "incomplete",  "icpt",  /*  5 */
+        "approved",	   "apv",	  /*  6 */
+        "unapproved",  "unapv", /*  7 */
+        "audited",	   "aud",	  /*  8 */
+        "unaudited",   "unaud", /*  9 */
+        "installed",   "in",	  /* 10 */
+        "uninstalled", "unin"); /* 11 */
+	
+%page;
+%include cp_active_string_types;
+
+     end mbuild_history_;
